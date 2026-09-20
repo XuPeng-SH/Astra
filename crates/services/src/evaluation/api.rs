@@ -24,6 +24,11 @@ pub struct EvaluationExperimentPrepareRequest {
     pub target: EvaluationPrepareTarget,
     pub case: EvaluationPrepareCase,
     pub model_offering_id: String,
+    /// Optional trusted Edge workspace execution intent. The server freezes
+    /// this policy; the live Edge registry must still prove the same checkout
+    /// and capability surface immediately before the Run starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<EvaluationPrepareWorkspace>,
     /// Optional exact typed-judgment Offering for a SkillRoutingJudgment
     /// target. When omitted, the server freezes the configured judgment
     /// Offering (if one exists) at prepare time.
@@ -49,6 +54,16 @@ pub struct EvaluationPrepareRevision {
     pub revision_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationPrepareWorkspace {
+    pub edge_executor_id: String,
+    /// Full Git commit identity expected from the authenticated Edge checkout.
+    pub source_commit: String,
+    /// Exact model-visible workspace tool surface for both serial arms.
+    pub tool_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

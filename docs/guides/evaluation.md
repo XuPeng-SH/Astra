@@ -61,6 +61,34 @@ Send `POST /evaluation/experiments/prepare` with your revision and Offering IDs:
 }
 ```
 
+For a workspace-backed comparison, add an authenticated Edge executor, the
+full commit to evaluate, and the exact built-in tools the model may see:
+
+```json
+{
+  "workspace": {
+    "edge_executor_id": "EDGE_AGENT_ID",
+    "source_commit": "FULL_40_OR_64_HEX_COMMIT",
+    "tool_names": ["bash", "read_file", "write_file"]
+  }
+}
+```
+
+The server freezes this policy into the experiment. The selected Edge must be
+registered for the owner with the same root and materialization identity, and
+its authenticated capability advertisement must prove the current source
+checkout, a source tree, and every requested tool. Before execution, the Edge
+creates an independent clone for this trial start attempt, checks out the frozen commit, and
+returns a live source/tree/clean snapshot that must match that frozen commit.
+The server-authored clone root is carried through
+the durable tool envelope and the workspace materialization is recorded as a
+required receipt. A missing or changed proof leaves the trial unavailable; the
+server does not fall back to its own filesystem or shell. Clean clones are
+released only on the creating connection generation, while dirty clones remain
+available as evidence.
+The ordinary `astra evaluation run intent.json` command and the Web flow use
+this same request shape.
+
 Save the returned experiment ID and trial IDs. The server freezes the Skill
 content, model configuration, prompt inputs, execution budgets, and verification
 criterion. The expected value is not inserted into the trial prompt. Retrying

@@ -20,8 +20,8 @@ pub mod utils;
 pub use api::{
     EvaluationExperimentCreateRequest, EvaluationExperimentPrepareRequest,
     EvaluationExperimentPrepareResponse, EvaluationPrepareCase, EvaluationPrepareRevision,
-    EvaluationPrepareTarget, EvaluationReportQuery, EvaluationTrialStartRequest,
-    EvaluationTrialStartResponse,
+    EvaluationPrepareTarget, EvaluationPrepareWorkspace, EvaluationReportQuery,
+    EvaluationTrialStartRequest, EvaluationTrialStartResponse,
 };
 pub use assessment::{
     ASSESSMENT_SCHEMA_VERSION, CausalStrength, ComparisonArm, ComparisonReport,
@@ -55,8 +55,9 @@ pub use execution_config::{
 pub use experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase,
     EvaluationJudgmentPolicy, EvaluationTarget, EvaluationTargetKind, ExperimentSpec,
-    FrozenConditions, FrozenSkillRoutingPolicy, JUDGMENT_POLICY_SCHEMA_VERSION, MemoryIsolation,
-    RevisionRef, SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialOrder, TrialUnit,
+    FrozenConditions, FrozenSkillRoutingPolicy, FrozenWorkspaceExecution,
+    JUDGMENT_POLICY_SCHEMA_VERSION, MemoryIsolation, RevisionRef, SNAPSHOT_ENVELOPE_SCHEMA_VERSION,
+    SnapshotEnvelope, TrialOrder, TrialUnit,
 };
 pub use materialization::{
     DatabaseMaterializationReceiptStore, MATERIALIZATION_RECEIPT_SCHEMA_VERSION,

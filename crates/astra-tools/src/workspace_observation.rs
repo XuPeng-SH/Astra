@@ -23,14 +23,6 @@ use sha2::{Digest, Sha256};
 
 const MAX_MANIFEST_ENTRIES: usize = 16_384;
 const MAX_STATUS_CONTENT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_STATUS_ENTRIES: usize = 8_192;
-// Ignored build/output directories are useful deliverables, but expanding a
-// whole cache would make every Bash call expensive.  Scan a small bounded
-// tree; larger caches intentionally become Unknown rather than being treated
-// as unchanged.
-const MAX_IGNORED_ENTRIES: usize = 2_048;
-const MAX_IGNORED_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 const FINGERPRINT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_LEASE_WAIT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "linux")]
@@ -2898,10 +2890,11 @@ pub fn is_authoritative_external_effect_receipt(receipt: &serde_json::Value) -> 
 impl WorkspaceFingerprint {
     /// Capture a bounded fingerprint for `root`.
     ///
-    /// Git status is the fast path and reports tracked/untracked workspace
-    /// changes without walking file contents.  Non-git workspaces use a
-    /// bounded metadata manifest.  If the manifest exceeds its bound or any
-    /// required metadata cannot be read, return `None` so callers fail closed.
+    /// Capture a bounded metadata and content manifest. Git metadata can
+    /// contain repository callbacks, so workspace evidence must not invoke
+    /// Git status from the host process. If the manifest exceeds its bound or
+    /// any required metadata cannot be read, return `None` so callers fail
+    /// closed.
     pub fn capture(root: &Path) -> Option<Self> {
         let root = root.canonicalize().ok()?;
         let writer_state = writer_epoch_state(&root)?;
@@ -2920,14 +2913,7 @@ impl WorkspaceFingerprint {
         if active_before != 0 || quarantined_before {
             return None;
         }
-        let digest = match git_status_fingerprint(&root) {
-            GitFingerprint::Captured(digest) => Some(digest),
-            // Do not retry an over-limit/ambiguous Git workspace with a
-            // second full manifest: that only blocks the executor again and
-            // still cannot produce trustworthy evidence.
-            GitFingerprint::Unknown => None,
-            GitFingerprint::UseManifest => manifest_fingerprint(&root),
-        }?;
+        let digest = manifest_fingerprint(&root)?;
         let epoch_after = writer_state
             .epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -2983,15 +2969,6 @@ impl WorkspaceFingerprint {
             WorkspaceFingerprintComparison::Changed
         )
     }
-}
-
-enum GitFingerprint {
-    Captured(u64),
-    /// Git is unavailable/non-local to the bound root, or a parent ignore
-    /// rule represented the entire bound root by an ignored ancestor entry.
-    /// In either case the bounded root-local manifest is authoritative.
-    UseManifest,
-    Unknown,
 }
 
 struct BoundedCommandOutput {
@@ -3110,292 +3087,31 @@ fn terminate_probe_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn git_status_fingerprint(root: &Path) -> GitFingerprint {
-    let Some(mut git_root_command) = hardened_git_command(root) else {
-        // Git is optional in minimal agent images.  Falling back to the
-        // bounded manifest is safe; it is materially different from
-        // executing a program selected through the caller's PATH.
-        return GitFingerprint::UseManifest;
-    };
-    git_root_command.args(["rev-parse", "--show-toplevel"]);
-    let Some(git_root_output) =
-        run_bounded_probe(git_root_command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
-    else {
-        return GitFingerprint::Unknown;
-    };
-    if !git_root_output.success {
-        return GitFingerprint::UseManifest;
-    }
-    let Some(git_root) = String::from_utf8(git_root_output.stdout)
-        .ok()
-        .map(|path| Path::new(path.trim()).to_path_buf())
-        .and_then(|path| path.canonicalize().ok())
-    else {
-        return GitFingerprint::Unknown;
-    };
-    if !root.starts_with(&git_root) {
-        return GitFingerprint::Unknown;
-    }
-    let Ok(relative_root) = root.strip_prefix(&git_root) else {
-        return GitFingerprint::Unknown;
-    };
-    let tree_spec = if relative_root.as_os_str().is_empty() {
-        "HEAD^{tree}".to_string()
-    } else {
-        format!("HEAD:{}", relative_root.to_string_lossy())
-    };
-    let Some(mut tree_command) = hardened_git_command(root) else {
-        return GitFingerprint::UseManifest;
-    };
-    tree_command.args(["rev-parse", &tree_spec]);
-    let Some(tree_output) = run_bounded_probe(tree_command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
-    else {
-        return GitFingerprint::Unknown;
-    };
-    let tree_bytes = if tree_output.success {
-        tree_output.stdout
-    } else {
-        // A repository can legitimately have no commit yet, or the bound
-        // directory can exist only in the worktree and not in HEAD. Both are
-        // deterministic baseline states, not probe failure.
-        let Some(mut head_command) = hardened_git_command(root) else {
-            return GitFingerprint::UseManifest;
-        };
-        head_command.args(["rev-parse", "--verify", "HEAD"]);
-        let Some(head_output) =
-            run_bounded_probe(head_command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
-        else {
-            return GitFingerprint::Unknown;
-        };
-        if head_output.success {
-            b"astra-bound-subtree-missing-v1".to_vec()
-        } else {
-            b"astra-unborn-head-v1".to_vec()
-        }
-    };
-    let Some(mut status_command) = hardened_git_command(root) else {
-        return GitFingerprint::UseManifest;
-    };
-    status_command.args([
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-        // `traditional` recursively expands every ignored build/cache
-        // file.  `matching` keeps direct ignored files observable while
-        // representing ignored directories as bounded entries; an
-        // over-large/ambiguous result fails closed below.
-        "--ignored=matching",
-        "--",
-        ".",
-    ]);
-    let Some(output) = run_bounded_probe(
-        status_command,
-        MAX_STATUS_OUTPUT_BYTES,
-        FINGERPRINT_PROBE_TIMEOUT,
-    ) else {
-        return GitFingerprint::Unknown;
-    };
-    if !output.success {
-        return GitFingerprint::Unknown;
-    }
-    let mut hasher = DefaultHasher::new();
-    // A clean commit has no status entry. Include the bound subtree identity
-    // so an opaque command that edits, commits, and leaves a clean worktree
-    // still produces a delta; hashing the full repository tree would make a
-    // sibling-only commit look like a change in a nested workspace.
-    tree_bytes.hash(&mut hasher);
-    // Status alone is insufficient for a pre-dirty workspace: changing a
-    // file that was already marked `M` leaves the status bytes unchanged.
-    // Hash the bounded content of every path reported by status so a generic
-    // opaque writer still yields a delta without parsing its command text.
-    let mut content_bytes = 0usize;
-    let mut rename_target = false;
-    let mut status_entries = 0usize;
-    let mut ignored_entries = 0usize;
-    for raw_path in output.stdout.split(|byte| *byte == 0) {
-        if raw_path.is_empty() {
-            continue;
-        }
-        status_entries = status_entries.saturating_add(1);
-        if status_entries > MAX_STATUS_ENTRIES {
-            return GitFingerprint::Unknown;
-        }
-        let (status, path_bytes) = if rename_target {
-            rename_target = false;
-            (b"rename_target".as_slice(), raw_path)
-        } else if raw_path.len() >= 3 && raw_path[2] == b' ' {
-            let status = &raw_path[..2];
-            rename_target = matches!(status, b"R " | b" R" | b"C " | b" C");
-            (status, &raw_path[3..])
-        } else {
-            (b"path".as_slice(), raw_path)
-        };
-        // Git's `-z` format preserves raw path bytes.  Do not lossy-decode a
-        // non-UTF-8 name into a different path and then claim a trustworthy
-        // receipt; an ambiguous path makes this whole fingerprint unknown.
-        let Ok(path_text) = std::str::from_utf8(path_bytes) else {
-            return GitFingerprint::Unknown;
-        };
-        let path = Path::new(path_text);
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return GitFingerprint::Unknown;
-        }
-        let path_from_git_root = git_root.join(path);
-        let path_from_workspace = match path_from_git_root.strip_prefix(root) {
-            Ok(path) => path,
-            Err(_) if status == b"!!" && root.starts_with(&path_from_git_root) => {
-                // A parent repository can collapse an ignored ancestor (for
-                // example `target/`) even when Git was invoked from a deeper
-                // bound workspace. That entry contains no root-local state,
-                // so use the bounded manifest instead of claiming a stable
-                // Git digest from evidence outside the workspace.
-                return GitFingerprint::UseManifest;
-            }
-            Err(_) => {
-                // `-- .` should never return an unrelated outside entry.
-                // Treat that as ambiguous authority, not as ignorable noise.
-                return GitFingerprint::Unknown;
-            }
-        };
-        // `.astra` is executor/session coordination state, not a user
-        // deliverable. The manifest fallback already excludes this exact
-        // top-level directory; Git-backed observation must use the same
-        // scope so creating or locking workspace coordination files cannot
-        // manufacture a mutation delta.
-        if path_from_workspace
-            .components()
-            .next()
-            .is_some_and(|component| component.as_os_str() == ".astra")
-        {
-            continue;
-        }
-        status.hash(&mut hasher);
-        path_from_workspace.to_string_lossy().hash(&mut hasher);
-        // `--ignored=matching` reports ignored directories compactly. Expand
-        // each one only within a deliberately smaller bound so a small
-        // generated deliverable is observable while a large cache fails
-        // closed instead of being silently treated as unchanged.
-        let is_real_directory = fs::symlink_metadata(&path_from_git_root)
-            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            .unwrap_or(false);
-        if status == b"!!" && is_real_directory {
-            if !hash_ignored_directory(
-                &git_root,
-                &path_from_git_root,
-                &mut hasher,
-                &mut ignored_entries,
-                &mut content_bytes,
-            ) {
-                return GitFingerprint::Unknown;
-            }
-            continue;
-        }
-        if hash_path_state(&path_from_git_root, &mut hasher, &mut content_bytes).is_none() {
-            return GitFingerprint::Unknown;
-        }
-    }
-    GitFingerprint::Captured(hasher.finish())
-}
-
-fn hash_ignored_directory(
-    git_root: &Path,
-    directory: &Path,
-    hasher: &mut DefaultHasher,
-    entries: &mut usize,
-    content_bytes: &mut usize,
-) -> bool {
-    let mut children = Vec::new();
-    let Ok(read_dir) = fs::read_dir(directory) else {
-        return false;
-    };
-    for entry in read_dir {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        *entries = entries.saturating_add(1);
-        if *entries > MAX_IGNORED_ENTRIES {
-            return false;
-        }
-        children.push(entry);
-    }
-    children.sort_by_key(|entry| entry.file_name());
-
-    for entry in children {
-        let path = entry.path();
-        let Ok(relative) = path.strip_prefix(git_root) else {
-            return false;
-        };
-        relative.to_string_lossy().hash(hasher);
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            return false;
-        };
-        metadata.file_type().is_symlink().hash(hasher);
-        metadata.is_dir().hash(hasher);
-        metadata.len().hash(hasher);
-        hash_permissions(&metadata, hasher);
-        if metadata.file_type().is_symlink() {
-            let Ok(target) = fs::read_link(&path) else {
-                return false;
-            };
-            target.to_string_lossy().hash(hasher);
-        } else if metadata.is_file() {
-            let remaining = MAX_IGNORED_CONTENT_BYTES.saturating_sub(*content_bytes);
-            if metadata.len() > remaining as u64 {
-                return false;
-            }
-            let Ok(mut file) = fs::File::open(&path) else {
-                return false;
-            };
-            let mut buffer = [0u8; 8192];
-            loop {
-                let Ok(read) = file.read(&mut buffer) else {
-                    return false;
-                };
-                if read == 0 {
-                    break;
-                }
-                buffer[..read].hash(hasher);
-                *content_bytes = content_bytes.saturating_add(read);
-                if *content_bytes > MAX_IGNORED_CONTENT_BYTES {
-                    return false;
-                }
-            }
-            let Ok(after) = fs::symlink_metadata(&path) else {
-                return false;
-            };
-            if after.len() != metadata.len() {
-                return false;
-            }
-        }
-        if metadata.is_dir()
-            && !hash_ignored_directory(git_root, &path, hasher, entries, content_bytes)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-/// Construct the read-only Git probe used by the observer.
+/// Construct the Git command used by callers that need Git metadata.
 ///
-/// Repository-local `core.fsmonitor` may point at an arbitrary executable.
-/// The observer runs outside the tool sandbox, so allowing that hook here
-/// would turn a metadata probe into host code execution. Disable hook-backed
-/// acceleration and optional locks explicitly; the ordinary status result is
-/// still bounded and any ambiguity fails closed.
-fn hardened_git_command(root: &Path) -> Option<Command> {
+/// The command runs outside the tool sandbox, so repository configuration is
+/// untrusted input.  Disable hook-backed acceleration and optional locks, pin
+/// the executable and environment, and neutralize every configured filter
+/// driver before returning the command to its caller.
+pub fn hardened_git_command(root: &Path) -> Option<Command> {
+    let mut command = base_hardened_git_command(root)?;
+    for driver in configured_git_filter_drivers(root)? {
+        for operation in ["clean", "smudge", "process"] {
+            command
+                .arg("-c")
+                .arg(format!("filter.{driver}.{operation}="));
+        }
+        command
+            .arg("-c")
+            .arg(format!("filter.{driver}.required=false"));
+    }
+    Some(command)
+}
+
+fn base_hardened_git_command(root: &Path) -> Option<Command> {
     let program = trusted_git_program()?;
     let mut command = Command::new(program);
     command
-        // Do not inherit PATH, HOME, GIT_* or loader/configuration variables
-        // from the model-controlled tool environment.  In particular, a
-        // workspace-local executable named `git` must never become the
-        // observer's host process.
         .env_clear()
         .env("PATH", TRUSTED_GIT_PATH)
         .env("HOME", "/nonexistent")
@@ -3408,12 +3124,11 @@ fn hardened_git_command(root: &Path) -> Option<Command> {
         .arg("-c")
         .arg("core.untrackedCache=false")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(unix)]
     {
-        // Do not inherit a user/global config that can add include files or
-        // other process hooks to a probe running in a server host process.
         command
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null");
@@ -3421,9 +3136,47 @@ fn hardened_git_command(root: &Path) -> Option<Command> {
     Some(command)
 }
 
+fn configured_git_filter_drivers(root: &Path) -> Option<Vec<String>> {
+    let mut drivers = Vec::new();
+    for scope in ["--local", "--worktree"] {
+        let mut command = base_hardened_git_command(root)?;
+        command.args([
+            "config",
+            scope,
+            "--includes",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..+\.(clean|process|smudge)$",
+        ]);
+        let output = run_bounded_probe(command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)?;
+        if !output.success {
+            // A non-Git root and a repository without worktree-scoped
+            // configuration both report no matching local keys.
+            continue;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        for key in text.lines() {
+            let driver_and_operation = key.strip_prefix("filter.")?;
+            let (driver, operation) = driver_and_operation.rsplit_once('.')?;
+            if !matches!(operation, "clean" | "process" | "smudge")
+                || driver.is_empty()
+                || !driver
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+            {
+                return None;
+            }
+            if !drivers.iter().any(|known| known == driver) {
+                drivers.push(driver.to_string());
+            }
+        }
+    }
+    Some(drivers)
+}
+
 /// Resolve Git only from administrator-owned system locations.  Looking it
 /// up through PATH would let a task write `./git` (or a virtualenv shim) and
-/// execute that file from the observer, which runs outside the tool sandbox.
+/// execute that file from the observer's host process.
 fn trusted_git_program() -> Option<&'static Path> {
     #[cfg(unix)]
     const CANDIDATES: &[&str] = &["/usr/bin/git", "/bin/git", "/usr/local/bin/git"];
@@ -3441,12 +3194,9 @@ fn trusted_git_program() -> Option<&'static Path> {
         .find(|candidate| trusted_git_path(candidate))
 }
 
-/// The observer runs outside the tool sandbox, so a regular file at a fixed
-/// path is not sufficient provenance: a group-writable `/usr/local/bin` (or a
-/// writable parent) could still replace it between probes.  On Unix require a
-/// root-owned, non-symlink binary and root-owned, non-group/other-writable
-/// parent directories.  If the platform cannot prove this, the caller falls
-/// back to the bounded manifest instead of executing an ambiguous helper.
+/// Require a symlink-free, administrator-owned Git binary and parent path.
+/// If the platform cannot prove that property, callers fall back to the
+/// manifest or fail closed instead of executing an ambiguous helper.
 fn trusted_git_path(candidate: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(candidate) else {
         return false;
@@ -3480,10 +3230,6 @@ fn trusted_git_path(candidate: &Path) -> bool {
         }
     }
 
-    // Windows candidates are already restricted to administrator-managed
-    // installation roots.  ACL inspection is platform-specific and is not
-    // available through std::fs; a symlink-free regular file is the strongest
-    // portable check, while failure still falls back safely above.
     true
 }
 
@@ -5697,8 +5443,72 @@ mod tests {
         assert_eq!(path, std::ffi::OsStr::new(TRUSTED_GIT_PATH));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn git_fingerprint_detects_change_inside_pre_dirty_path() {
+    fn git_probe_disables_repository_clean_and_process_filters() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", workspace.path().to_str().expect("workspace path")])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+
+        let marker = workspace.path().join("filter-ran");
+        let filter = workspace.path().join("clean-filter.sh");
+        fs::write(
+            &filter,
+            format!("#!/bin/sh\nprintf x >> '{}'\ncat\n", marker.display()),
+        )
+        .expect("filter script");
+        fs::set_permissions(&filter, fs::Permissions::from_mode(0o700))
+            .expect("filter permissions");
+        run(&["config", "filter.evil.clean", filter.to_str().unwrap()]);
+        run(&["config", "filter.evil.smudge", filter.to_str().unwrap()]);
+        run(&["config", "filter.evil.required", "true"]);
+        fs::write(
+            workspace.path().join(".gitattributes"),
+            "*.txt filter=evil\n",
+        )
+        .expect("attributes");
+        fs::write(workspace.path().join("tracked.txt"), "before\n").expect("tracked file");
+        run(&["add", ".gitattributes"]);
+        run(&["add", "tracked.txt"]);
+        let _ = fs::remove_file(&marker);
+        run(&["commit", "-qm", "initial"]);
+        // Add the process driver only after setup and keep it in the
+        // worktree-scoped config; the hardened probe must enumerate both
+        // local and worktree scopes before Git considers the worktree.
+        run(&["config", "extensions.worktreeConfig", "true"]);
+        run(&[
+            "config",
+            "--worktree",
+            "filter.evil.process",
+            filter.to_str().unwrap(),
+        ]);
+        fs::write(workspace.path().join("tracked.txt"), "after\n").expect("change file");
+        let _ = fs::remove_file(&marker);
+
+        let mut command = hardened_git_command(workspace.path()).expect("trusted git installed");
+        command.args(["status", "--porcelain", "--untracked-files=no"]);
+        let output = run_bounded_probe(command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
+            .expect("bounded status probe");
+        assert!(output.success);
+        assert!(
+            !marker.exists(),
+            "Git status must not execute a repository filter"
+        );
+    }
+
+    #[test]
+    fn workspace_fingerprint_detects_change_inside_pre_dirty_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -5717,14 +5527,14 @@ mod tests {
 
         // The path is already dirty before the observation window starts.
         fs::write(temp.path().join("tracked.txt"), "one!").unwrap();
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         fs::write(temp.path().join("tracked.txt"), "two!").unwrap();
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         assert!(before.changed_from(Some(after)));
     }
 
     #[test]
-    fn git_fingerprint_detects_clean_commit_inside_bound_workspace() {
+    fn workspace_fingerprint_detects_clean_commit_inside_bound_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -5741,16 +5551,16 @@ mod tests {
         run(&["add", "tracked.txt"]);
         run(&["commit", "-qm", "initial"]);
 
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         fs::write(temp.path().join("tracked.txt"), "committed").unwrap();
         run(&["add", "tracked.txt"]);
         run(&["commit", "-qm", "change"]);
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("git fingerprint");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         assert!(before.changed_from(Some(after)));
     }
 
     #[test]
-    fn git_fingerprint_handles_unborn_head_and_detects_worktree_write() {
+    fn workspace_fingerprint_handles_unborn_head_and_detects_worktree_write() {
         let temp = tempfile::tempdir().expect("tempdir");
         let status = Command::new("git")
             .args(["-C", temp.path().to_str().unwrap(), "init", "-q"])
@@ -5758,14 +5568,16 @@ mod tests {
             .expect("git available");
         assert!(status.success());
 
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("unborn git fingerprint");
+        let before =
+            WorkspaceFingerprint::capture(temp.path()).expect("unborn workspace fingerprint");
         fs::write(temp.path().join("new.txt"), "created before first commit").unwrap();
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("unborn git fingerprint");
+        let after =
+            WorkspaceFingerprint::capture(temp.path()).expect("unborn workspace fingerprint");
         assert!(before.changed_from(Some(after)));
     }
 
     #[test]
-    fn git_fingerprint_handles_bound_subtree_missing_from_head() {
+    fn workspace_fingerprint_handles_bound_subtree_missing_from_head() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -6521,7 +6333,7 @@ mod tests {
     }
 
     #[test]
-    fn git_fingerprint_excludes_workspace_coordination_files() {
+    fn workspace_fingerprint_excludes_workspace_coordination_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             assert!(
@@ -7111,7 +6923,7 @@ mod tests {
     }
 
     #[test]
-    fn git_fingerprint_is_bound_to_subdirectory_and_observes_direct_ignored_files() {
+    fn workspace_fingerprint_is_bound_to_subdirectory_and_observes_direct_ignored_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             let status = Command::new("git")
@@ -7145,7 +6957,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_ignored_ancestor_falls_back_to_bound_manifest() {
+    fn nested_workspace_manifest_detects_change() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             assert!(
@@ -7167,43 +6979,6 @@ mod tests {
         fs::write(workspace.join("result.txt"), "two").unwrap();
         let after = WorkspaceFingerprint::capture(&workspace).expect("bounded fallback");
         assert!(before.changed_from(Some(after)));
-    }
-
-    #[test]
-    fn ignored_directory_is_bounded_without_walking_an_unbounded_tree() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(["-C", temp.path().to_str().unwrap()])
-                .args(args)
-                .status()
-                .expect("git available");
-            assert!(status.success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "astra@example.invalid"]);
-        run(&["config", "user.name", "Astra Test"]);
-        fs::write(temp.path().join(".gitignore"), "build/\n").unwrap();
-        fs::write(temp.path().join("tracked"), "base").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "initial"]);
-        fs::create_dir(temp.path().join("build")).unwrap();
-        for index in 0..100 {
-            fs::write(temp.path().join(format!("build/file-{index}")), "x").unwrap();
-        }
-        let before = WorkspaceFingerprint::capture(temp.path()).expect("bounded git fingerprint");
-        fs::write(temp.path().join("build/file-1"), "changed").unwrap();
-        let after = WorkspaceFingerprint::capture(temp.path()).expect("bounded git fingerprint");
-        assert!(before.changed_from(Some(after)));
-
-        // A cache-sized ignored tree is not silently treated as unchanged;
-        // the bounded observer fails closed once its evidence budget is
-        // exceeded.
-        fs::create_dir(temp.path().join("build/large")).unwrap();
-        for index in 0..(MAX_IGNORED_ENTRIES + 1) {
-            fs::write(temp.path().join(format!("build/large/file-{index}")), "x").unwrap();
-        }
-        assert!(WorkspaceFingerprint::capture(temp.path()).is_none());
     }
 
     #[cfg(unix)]

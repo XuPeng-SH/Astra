@@ -574,6 +574,7 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
+            evaluation_workspace_base_root: None,
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,

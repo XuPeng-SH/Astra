@@ -17608,11 +17608,7 @@ impl ServerAgenticLoopHost {
             })
             .filter(|name| {
                 let admission = self.admission_for_current_binding(name, &registry);
-                (matches!(
-                    &self.execution_inputs.policy,
-                    PreparedExecutionPolicy::Evaluation(_)
-                ) && name != crate::turn::skill_tool::SKILL_TOOL_NAME)
-                    || !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
+                !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
                     || !admission.visible
             })
             .collect()

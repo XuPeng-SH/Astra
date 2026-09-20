@@ -1033,6 +1033,10 @@ pub struct ChatRequestData {
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
+    /// Server-generated base root used to prove that a per-trial evaluation
+    /// clone belongs to the selected native Edge materialization. It is
+    /// never accepted from HTTP or serialized as user input.
+    pub evaluation_workspace_base_root: Option<String>,
     pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
     pub provider_run_owner: Option<ProviderRunOwner>,
@@ -1129,6 +1133,10 @@ impl std::fmt::Debug for ChatRequestData {
             .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
             .field("context", &self.context)
             .field("edge_executor_id", &self.edge_executor_id)
+            .field(
+                "evaluation_workspace_base_root",
+                &self.evaluation_workspace_base_root,
+            )
             .field("capabilities", &self.capabilities)
             .field("provider_run_owner", &self.provider_run_owner)
             .field(
@@ -38203,6 +38211,7 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
+            evaluation_workspace_base_root: None,
             capabilities: Vec::new(),
             forward_headers,
             execution_budget: Some(ExecutionBudget {
@@ -38289,6 +38298,7 @@ mod tests {
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
+            evaluation_workspace_base_root: None,
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
@@ -38403,6 +38413,7 @@ mod tests {
                     runtime_mcp_bindings: Vec::new(),
                     context: None,
                     edge_executor_id: None,
+                    evaluation_workspace_base_root: None,
                     capabilities: Vec::new(),
                     forward_headers: std::collections::HashMap::new(),
                     execution_budget: Some(ExecutionBudget {

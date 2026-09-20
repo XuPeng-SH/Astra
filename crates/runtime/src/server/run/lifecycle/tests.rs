@@ -8912,13 +8912,19 @@ async fn evaluation_edge_start_intent_is_resolved_only_at_canonical_binding() {
     });
 
     let error = service
-        .bind_execution_selection("eval-owner", "session-eval", &mut request, None)
+        .bind_execution_selection(
+            "eval-owner",
+            "session-eval",
+            &mut request,
+            Some("trial-attempt-test"),
+            None,
+        )
         .await
         .expect_err("native evaluation Edge still requires the durable Session binding");
     assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         error.1.error_code.as_deref(),
-        Some("execution_binding_unavailable")
+        Some("evaluation_execution_target_unavailable")
     );
     let workspace = request
         .workspace_binding
@@ -10860,6 +10866,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             cache_policy: "provider_default_recorded".to_string(),
             memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
             data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+            workspace_execution: None,
         },
         budget: astra_services::evaluation::EvaluationBudget {
             max_trials: 2,
@@ -12052,6 +12059,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             cache_policy: "provider_default_recorded".to_string(),
             memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
             data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+            workspace_execution: None,
         },
         budget: astra_services::evaluation::EvaluationBudget {
             max_trials: 2,
@@ -13252,6 +13260,7 @@ fn test_request(message: &str) -> ChatRequestData {
         runtime_mcp_bindings: Vec::new(),
         context: None,
         edge_executor_id: None,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
@@ -16507,7 +16516,13 @@ async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is
         status: Some(astra_services::runs::ExecutorStatusRequest::Online),
     });
     let denied = service
-        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .bind_execution_selection(
+            "owner-1",
+            "session-no-coordinator",
+            &mut request,
+            None,
+            None,
+        )
         .await
         .expect_err("native Edge must not bypass durable binding admission");
     assert_eq!(denied.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -16519,7 +16534,13 @@ async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is
     request.executor_binding.as_mut().unwrap().transport =
         Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
     service
-        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .bind_execution_selection(
+            "owner-1",
+            "session-no-coordinator",
+            &mut request,
+            None,
+            None,
+        )
         .await
         .expect("request-scoped EdgeLedger does not need native coordinator state");
     assert_eq!(request.execution_binding_generation, None);
@@ -24397,6 +24418,7 @@ fn extract_edge_tools_from_context() {
         runtime_mcp_bindings: Vec::new(),
         context: Some(ctx),
         edge_executor_id: None,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
@@ -24487,6 +24509,7 @@ fn extract_edge_profile_from_context() {
         runtime_mcp_bindings: Vec::new(),
         context: Some(ctx),
         edge_executor_id: None,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,

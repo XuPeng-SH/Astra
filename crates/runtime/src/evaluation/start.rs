@@ -44,6 +44,10 @@ fn build_chat_request(
     )
     .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let model_offering_id = plan.model_offering_id;
+    let allow_tools = plan
+        .workspace_execution
+        .as_ref()
+        .map(|workspace| workspace.tool_names.clone());
     Ok(ChatRequestData {
         message: plan.message,
         user_intent: None,
@@ -74,7 +78,7 @@ fn build_chat_request(
         skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,
-        allow_tools: None,
+        allow_tools,
         enabled_tools: None,
         workspace_binding: None,
         executor_binding: None,
@@ -82,6 +86,7 @@ fn build_chat_request(
         runtime_mcp_bindings: Vec::new(),
         context: None,
         edge_executor_id: plan.edge_executor_id,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         provider_run_owner: None,
@@ -207,6 +212,7 @@ mod tests {
             model_offering_id: "offering-1".to_string(),
             execution_time_budget_secs: 30,
             edge_executor_id: None,
+            workspace_execution: None,
             admission: EvaluationRunAdmission {
                 experiment_id: "exp-1".to_string(),
                 trial_id: "trial-1".to_string(),
@@ -250,6 +256,11 @@ mod tests {
             model_offering_id: "offering-1".to_string(),
             execution_time_budget_secs: 30,
             edge_executor_id: Some("edge-a".to_string()),
+            workspace_execution: Some(astra_services::evaluation::FrozenWorkspaceExecution {
+                edge_executor_id: "edge-a".to_string(),
+                source_commit: "a".repeat(40),
+                tool_names: vec!["read_file".to_string()],
+            }),
             admission: EvaluationRunAdmission {
                 experiment_id: "exp-edge".to_string(),
                 trial_id: "trial-edge".to_string(),
@@ -265,5 +276,9 @@ mod tests {
         assert!(request.workspace_binding.is_none());
         assert!(request.executor_binding.is_none());
         assert_eq!(request.edge_executor_id.as_deref(), Some("edge-a"));
+        assert_eq!(
+            request.allow_tools.as_deref(),
+            Some(["read_file".to_string()].as_slice())
+        );
     }
 }

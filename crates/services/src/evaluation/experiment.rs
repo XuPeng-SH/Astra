@@ -208,6 +208,70 @@ pub struct EvaluationCase {
     pub input_content: Option<String>,
 }
 
+/// Frozen execution policy for the first workspace-backed adapter. The Edge
+/// registry remains the authority for the live root, materialization, source
+/// proof, and advertised tool contracts at Run admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenWorkspaceExecution {
+    pub edge_executor_id: String,
+    pub source_commit: String,
+    pub tool_names: Vec<String>,
+}
+
+impl FrozenWorkspaceExecution {
+    pub fn validate(&self) -> Result<(), String> {
+        if !astra_runtime_env::is_valid_provider_id(&self.edge_executor_id) {
+            return Err("workspace edge_executor_id is invalid".to_string());
+        }
+        if !matches!(self.source_commit.len(), 40 | 64)
+            || !self.source_commit.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            return Err("workspace source_commit must be a full Git object id".to_string());
+        }
+        if self.tool_names.is_empty() || self.tool_names.len() > 32 {
+            return Err("workspace tool_names must contain between 1 and 32 tools".to_string());
+        }
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut seen = HashSet::with_capacity(self.tool_names.len());
+        for tool_name in &self.tool_names {
+            if tool_name.trim() != tool_name
+                || tool_name.is_empty()
+                || tool_name.len() > 128
+                || !seen.insert(tool_name.as_str())
+            {
+                return Err("workspace tool_names must be unique, trimmed, and non-empty".into());
+            }
+            let Some(spec) = registry.get(tool_name) else {
+                return Err(format!("workspace tool `{tool_name}` is unknown"));
+            };
+            if spec.requires_explicit_user_enablement()
+                || spec.required.executor != astra_runtime_env::RequiredExecutor::RuntimeExecutor
+                || matches!(
+                    spec.required.workspace,
+                    astra_runtime_env::RequiredWorkspace::None
+                )
+                || !matches!(
+                    spec.required.network,
+                    astra_runtime_env::RequiredNetwork::None
+                )
+            {
+                return Err(format!(
+                    "workspace tool `{tool_name}` is outside the Edge evaluation surface"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.source_commit = self.source_commit.to_ascii_lowercase();
+        self.tool_names.sort();
+        self.validate()?;
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenConditions {
@@ -222,6 +286,8 @@ pub struct FrozenConditions {
     pub cache_policy: String,
     pub memory_isolation: MemoryIsolation,
     pub data_isolation: DataIsolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_execution: Option<FrozenWorkspaceExecution>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +678,16 @@ impl ExperimentSpec {
             && base_snapshot_ref.trim().is_empty()
         {
             return Err("MatrixOne branch base_snapshot_ref must not be empty".to_string());
+        }
+        if let Some(workspace) = self.conditions.workspace_execution.as_ref() {
+            workspace.validate()?;
+            if workspace
+                .tool_names
+                .windows(2)
+                .any(|pair| pair[0] > pair[1])
+            {
+                return Err("workspace tool_names must be sorted".to_string());
+            }
         }
         let expected = self
             .cases
@@ -1129,6 +1205,7 @@ mod tests {
                 cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
+                workspace_execution: None,
             },
             budget: EvaluationBudget {
                 max_trials: 4,

@@ -301,10 +301,9 @@ The generic control-plane API exposes five owner-authenticated operations:
   freezes the resulting first-adapter plan. A `SkillRoutingJudgment` request
   must use the same Skill revision on both arms; it may provide an exact
   `judgment_model_offering_id`, otherwise the configured judgment Offering is
-  captured at prepare time. Concrete Edge selection is made
-  per trial at start time so the baseline and candidate can use independent
-  owner-scoped instances; the experiment fingerprint contains no mutable
-  executor or checkout identity;
+  captured at prepare time. An optional workspace policy freezes the
+  owner-scoped Edge executor, source commit, and exact tool surface; without
+  that policy the adapter remains prompt-only;
 * `POST /evaluation/experiments` remains the lower-level registration boundary
   for trusted/internal callers that already have a complete `ExperimentSpec`;
 * `GET /evaluation/experiments/{experiment_id}` reads a consistent projection
@@ -324,11 +323,12 @@ The execution entrypoint is also owner-authenticated and deliberately narrow:
   optional when the prepare endpoint froze them; if supplied, they must match
   those frozen bytes. Skill starts may omit the owner-scoped Skill name when
   prepare froze it; if supplied, it must match that frozen name.
-  An optional `edge_executor_id` is selection intent only. The canonical
-  binding owner resolves the owner's active registration, constructs the
-  typed workspace/executor binding, and rejects root or materialization drift
-  before claiming a new Run. An existing durable Run is replayed before that
-  dynamic check; a different executor for the same trial conflicts.
+  For a workspace-backed plan, the canonical binding owner resolves the
+  frozen Edge executor's active registration, constructs the typed
+  workspace/executor binding, and rejects root, materialization, source, or
+  tool-surface drift before claiming a new Run. An existing durable Run is
+  replayed before that dynamic check; a different executor for the same trial
+  conflicts. A plain text plan rejects Edge selection at start.
   Before creating the Run, the server re-admits the selected Offering and
   fails closed if its provider or supported cache contract has drifted. It
   derives the Session and Run identities from `(owner, experiment, trial)`,
@@ -421,17 +421,23 @@ and verifies the created HEAD/tree before switching the session. Result metadata
 contains `source_commit` and `source_tree`. This identifies the creation source;
 shared Git metadata means it is not an Eval isolation receipt.
 
-Status: the generic prepare/start contract keeps the experiment conditions
-independent of concrete Edge instances. Each trial may select an
-owner-scoped Edge at start; the canonical Session binding resolves and fences
-the actual materialization before constructing the Run request. Owner
-mismatch, an unavailable registration, a missing materialization/root, or
-root/materialization drift fails before execution. This is still only an
-execution-location fence: the registry row is not a workspace materializer,
-source commit/tree proof, or isolation receipt. The current adapter therefore
-does not claim coding Eval, Bash, Git, or workspace isolation; those capabilities
-remain fail-closed until a trusted materialization receipt and tool policy are
-attached.
+Status: the first workspace-backed adapter is now explicit in the prepare
+request. It freezes one authenticated Edge executor, one full Git source
+commit, and one sorted built-in tool allowlist into the experiment conditions.
+The canonical Session binding still resolves the owner's active registration;
+it rejects owner mismatch, an unavailable registration, a missing
+materialization/root, or root/materialization drift before execution. The Edge
+capability advertisement must also carry the authenticated source checkout
+identity, a source tree, the Edge workspace binding, and every frozen tool.
+The registry then creates an independent Git clone for this trial start
+attempt, checks out the frozen commit, and returns a live source/tree/clean
+snapshot that must match that frozen commit before the Run can claim
+Available execution. The server-authored clone root travels inside the durable
+Edge tool envelope, so replayed tools use the same trial clone. Clean clone
+release is fenced to the connection generation that created it; a dirty clone
+is retained for evidence. The registry and live clone proofs are converted into
+a `workspace` materialization receipt. An evaluation that omits this policy
+remains prompt-only and cannot select Edge or workspace tools.
 
 Developer-facing coding evaluation must be usable from TUI with an explicitly
 selected Edge or User Runner. HTTP controls the experiment; it does not determine
@@ -451,20 +457,24 @@ the selected sandbox and frozen tool policy. Unsupported isolation is reported
 before execution rather than silently using ordinary local permissions.
 
 The plan records the source identity, selected executor, effective tool and
-environment policy, and comparison inputs. An authenticated workspace
-materializer supplies the actual trial instance and executor binding generation
-as evidence. A client-provided path or hash is selection intent, not proof of
-materialization. Retry retains that instance and its outputs; cleanup may remove
-only the instance whose ownership the materializer can prove. Edge disconnect
-does not authorize Server-local fallback.
+environment policy, and comparison inputs. An authenticated Edge registration
+supplies the actual root, materialization identity, source commit/tree proof,
+and executor binding as evidence. A client-provided path or hash is frozen
+intent, not proof of materialization. Retry retains the same trial identity and
+receipt set; cleanup may remove only the instance whose ownership the
+materializer can prove. Edge disconnect does not authorize Server-local
+fallback.
 
-Acceptance requires a real client and Edge tool host to execute file and shell
-operations, produce test output and patch evidence, and preserve the source and
-other arm. Wrong owner, stale binding, unavailable runner, cancellation, and
-tool-result replay must follow their canonical contracts. Reports distinguish
-Run completion, Skill invocation, verifier success, and missing evidence. This
-delivery is required for coding Skill evaluation; completing the text adapter
-does not complete the developer-facing Eval goal.
+The adapter now admits real Edge file/shell calls through the canonical tool
+dispatch path and records the source checkout as a receipt. Acceptance still
+requires an end-to-end Edge client run that produces test output and patch
+evidence for a coding claim; the current report exposes the canonical tool
+ledger and Run/output evidence but does not synthesize a patch or infer test
+success from tool names. Wrong owner, stale binding, unavailable runner,
+cancellation, and tool-result replay must follow their canonical contracts.
+Reports distinguish Run completion, Skill invocation, verifier success, and
+missing evidence. A workspace receipt therefore enables the execution path;
+it does not by itself complete developer-facing coding evaluation.
 
 ## Materialization receipt boundary
 

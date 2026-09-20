@@ -3983,6 +3983,7 @@ pub(super) async fn post_work_branch_turn_handler(
         runtime_mcp_bindings: Vec::new(),
         context: None,
         edge_executor_id,
+        evaluation_workspace_base_root: None,
         capabilities: Vec::new(),
         forward_headers: collect_forward_headers(&headers),
         provider_run_owner: None,

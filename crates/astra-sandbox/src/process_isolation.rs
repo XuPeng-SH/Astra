@@ -1120,6 +1120,7 @@ fn mount_namespace_available() -> bool {
                 "astra-mount-probe",
                 "true",
                 "/",
+                ".",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

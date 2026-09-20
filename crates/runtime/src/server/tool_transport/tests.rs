@@ -3828,7 +3828,12 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
             } => {
                 assert_eq!(request_id, row.request_id);
                 assert_eq!(tool, "bash");
-                assert_eq!(args, serde_json::json!({}));
+                assert_eq!(
+                    args,
+                    serde_json::json!({
+                        "__astra_workspace_dir": "/Users/test/project"
+                    })
+                );
                 assert!(timeout_secs > 0);
             }
             other => panic!("expected tool request payload, got {other:?}"),

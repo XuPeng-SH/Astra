@@ -102,6 +102,98 @@ struct RuntimeEdgeDispatchAuthorizationMetadata {
     executor_id: String,
 }
 
+/// Owns one server-created per-trial Edge clone for the lifetime of the
+/// canonical Run task. The Edge preserves dirty clones for evidence and
+/// removes clean clones; dropping this guard also covers cancellation and
+/// capacity admission failures before the agent loop starts.
+#[derive(Debug)]
+struct EvaluationWorkspaceLease {
+    pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    user_id: String,
+    edge_agent_id: Option<String>,
+    connection_generation: Option<u64>,
+    workspace_dir: Option<String>,
+    source_commit: String,
+    claimed: Arc<AtomicBool>,
+}
+
+impl EvaluationWorkspaceLease {
+    fn new(
+        pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+        user_id: String,
+        edge_agent_id: Option<String>,
+        connection_generation: Option<u64>,
+        workspace_dir: Option<String>,
+        source_commit: String,
+    ) -> Self {
+        Self {
+            pool,
+            user_id,
+            edge_agent_id,
+            connection_generation,
+            workspace_dir,
+            source_commit,
+            claimed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn connection_generation(&self) -> Option<u64> {
+        self.connection_generation
+    }
+
+    fn workspace_dir(&self) -> Option<&str> {
+        self.workspace_dir.as_deref()
+    }
+
+    fn activate_after_run_claim(&self) {
+        self.claimed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for EvaluationWorkspaceLease {
+    fn drop(&mut self) {
+        // Preparation happens before the durable Run claim so the request can
+        // establish the typed workspace binding. The trial key is stable, so
+        // every exact retry refers to the same clone. Only the request that
+        // actually owns the durable Run may release it; a concurrent loser
+        // must leave the winner's clone untouched.
+        if !self.claimed.load(Ordering::Acquire) {
+            return;
+        }
+        let (Some(pool), Some(edge_agent_id), Some(connection_generation), Some(workspace_dir)) = (
+            self.pool.take(),
+            self.edge_agent_id.take(),
+            self.connection_generation.take(),
+            self.workspace_dir.take(),
+        ) else {
+            return;
+        };
+        let user_id = self.user_id.clone();
+        let source_commit = self.source_commit.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if !pool
+                    .release_evaluation_workspace(
+                        &user_id,
+                        &edge_agent_id,
+                        connection_generation,
+                        &workspace_dir,
+                        &source_commit,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        owner_id = %user_id,
+                        edge_agent_id = %edge_agent_id,
+                        workspace_dir = %workspace_dir,
+                        "evaluation workspace release was not delivered"
+                    );
+                }
+            });
+        }
+    }
+}
+
 fn valid_runtime_http_endpoint(endpoint: &str) -> bool {
     reqwest::Url::parse(endpoint).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https")
@@ -4766,6 +4858,7 @@ struct OwnedBackgroundExecution {
     pause_flag: Arc<AtomicBool>,
     llm_cancel_token: Arc<CancellationToken>,
     execution_lease_lost: Arc<AtomicBool>,
+    evaluation_workspace_lease: Option<EvaluationWorkspaceLease>,
 }
 
 #[derive(Clone)]
@@ -8033,6 +8126,8 @@ impl AgenticRunLifecycleService {
         session_id: &str,
         run_id: &str,
         execution_owner_generation: u64,
+        expected_edge_connection_generation: Option<u64>,
+        expected_edge_workspace_dir: Option<&str>,
         request: &ChatRequestData,
         admission: &EvaluationRunAdmission,
     ) -> Result<AdmittedEvaluationTrial, (StatusCode, Json<ErrorResponse>)> {
@@ -8395,6 +8490,7 @@ impl AgenticRunLifecycleService {
             .edge_executor_id
             .as_deref()
             .is_some_and(|executor_id| !executor_id.trim().is_empty());
+        let workspace_policy = experiment.spec.conditions.workspace_execution.as_ref();
         let edge_binding_complete =
             request.workspace_binding.as_ref().is_some_and(|workspace| {
                 workspace.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
@@ -8425,8 +8521,16 @@ impl AgenticRunLifecycleService {
                 "the canonical lifecycle did not establish the selected Edge binding",
             ));
         }
-        if !evaluation_edge_requested
-            && (request.workspace_binding.is_some()
+        if workspace_policy.is_some() && !evaluation_edge_requested {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_target_missing",
+                "a workspace-backed evaluation requires its frozen Edge executor",
+            ));
+        }
+        if workspace_policy.is_none()
+            && (evaluation_edge_requested
+                || request.workspace_binding.is_some()
                 || request.executor_binding.is_some()
                 || request.edge_executor_id.is_some())
         {
@@ -8435,6 +8539,22 @@ impl AgenticRunLifecycleService {
                 "evaluation_execution_surface_unsupported",
                 "evaluation does not admit workspace or Edge side effects",
             ));
+        }
+        if let Some(workspace) = workspace_policy {
+            if request.edge_executor_id.as_deref() != Some(workspace.edge_executor_id.as_str()) {
+                return Err(evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_target_mismatch",
+                    "the selected Edge does not match the frozen workspace execution",
+                ));
+            }
+            if request.allow_tools.as_deref() != Some(workspace.tool_names.as_slice()) {
+                return Err(evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_tool_policy_mismatch",
+                    "the Edge tool surface does not match the frozen workspace policy",
+                ));
+            }
         }
         if !request.runtime_mcp_bindings.is_empty()
             || !request.agent_bindings.is_empty()
@@ -8453,10 +8573,11 @@ impl AgenticRunLifecycleService {
                 .allow_skill_sources
                 .as_ref()
                 .is_some_and(|sources| !sources.is_empty())
-            || request
-                .allow_tools
-                .as_ref()
-                .is_some_and(|tools| !tools.is_empty())
+            || (workspace_policy.is_none()
+                && request
+                    .allow_tools
+                    .as_ref()
+                    .is_some_and(|tools| !tools.is_empty()))
             || request
                 .enabled_tools
                 .as_ref()
@@ -8471,6 +8592,16 @@ impl AgenticRunLifecycleService {
                 "evaluation does not admit workspace, edge, MCP, or tool side effects",
             ));
         }
+        let workspace_materialization = self
+            .prove_evaluation_workspace_materialization(
+                user_id,
+                session_id,
+                request,
+                workspace_policy,
+                expected_edge_connection_generation,
+                expected_edge_workspace_dir,
+            )
+            .await?;
         let policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
             model_binding: &experiment.spec.conditions.model_binding,
             provider_binding: &experiment.spec.conditions.provider_binding,
@@ -8572,7 +8703,7 @@ impl AgenticRunLifecycleService {
                 execution_run_id: Some(run_id.to_string()),
                 execution_run_generation: Some(execution_owner_generation),
             };
-            let mut ids = Vec::with_capacity(2);
+            let mut ids = Vec::with_capacity(if workspace_policy.is_some() { 3 } else { 2 });
             for (component_kind, fingerprint) in [
                 (MaterializationComponentKind::Context, context_hash.as_str()),
                 (MaterializationComponentKind::Policy, policy_hash.as_str()),
@@ -8599,6 +8730,47 @@ impl AgenticRunLifecycleService {
                                 run_id,
                                 execution_owner_generation,
                                 component_kind.as_str(),
+                            ),
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        evaluation_preflight_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "evaluation_materialization_failed",
+                            error,
+                        )
+                    })?;
+                ids.push(record.receipt_id);
+            }
+            if let (Some(workspace_policy), Some((materialization_id, source_tree))) =
+                (workspace_policy, workspace_materialization.as_ref())
+            {
+                let record = materializer
+                    .record_receipt(
+                        &trusted,
+                        &MaterializationReceiptRequest {
+                            trial_id: trial.trial_id.clone(),
+                            session_id: session_id.to_string(),
+                            envelope: envelope.clone(),
+                            component_kind: MaterializationComponentKind::Workspace,
+                            component_snapshot_ref: Some(format!(
+                                "edge-workspace://{materialization_id}/{}",
+                                workspace_policy.source_commit
+                            )),
+                            component_base_snapshot_ref: Some(format!(
+                                "git://{}",
+                                workspace_policy.source_commit
+                            )),
+                            component_content_fingerprint: Some(source_tree.clone()),
+                            outcome: MaterializationOutcome::Available,
+                            failure_code: None,
+                            expires_at: Some(expires_at),
+                            idempotency_key: evaluation_component_idempotency_key(
+                                &trial.trial_id,
+                                run_id,
+                                execution_owner_generation,
+                                MaterializationComponentKind::Workspace.as_str(),
                             ),
                         },
                     )
@@ -10247,19 +10419,22 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
         request: &mut ChatRequestData,
+        evaluation_workspace_key: Option<&str>,
         work_binding: Option<&ValidatedWorkRuntimeBinding>,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Option<EvaluationWorkspaceLease>, (StatusCode, Json<ErrorResponse>)> {
         // Evaluation start carries only an owner-scoped executor choice. The
         // canonical binding owner resolves the live registry record here so
         // a start retry can replay an existing Run without requiring the Edge
         // to be online, while a new claim cannot smuggle a root or
         // materialization identity through the request.
+        let mut evaluation_workspace_lease = None;
         if request.evaluation_admission.is_some()
             && request.edge_executor_id.is_some()
             && request.workspace_binding.is_none()
             && request.executor_binding.is_none()
         {
-            self.populate_evaluation_edge_binding(user_id, request)
+            evaluation_workspace_lease = self
+                .populate_evaluation_edge_binding(user_id, request, evaluation_workspace_key)
                 .await?;
         }
         let request_is_edge = request.workspace_binding.as_ref().is_some_and(|binding| {
@@ -10321,7 +10496,7 @@ impl AgenticRunLifecycleService {
                 }
             }
             request.execution_binding_generation = None;
-            return Ok(());
+            return Ok(evaluation_workspace_lease);
         }
 
         let Some(pool) = self.shared_pool.clone() else {
@@ -10343,7 +10518,7 @@ impl AgenticRunLifecycleService {
             // Work requests still fail closed until durable selection exists.
             if work_binding.is_none() && (!request_is_edge || edge_ledger || edge_offline) {
                 request.execution_binding_generation = None;
-                return Ok(());
+                return Ok(evaluation_workspace_lease);
             }
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -10430,7 +10605,7 @@ impl AgenticRunLifecycleService {
                 // explicitly selects Server), the row above is created and
                 // all subsequent writes are fenced by its claim.
                 request.execution_binding_generation = None;
-                return Ok(());
+                return Ok(evaluation_workspace_lease);
             }
             (Some(existing), _) => existing.clone(),
         };
@@ -10578,14 +10753,291 @@ impl AgenticRunLifecycleService {
         request.workspace_binding = Some(binding.workspace);
         request.executor_binding = Some(binding.executor);
         request.execution_binding_generation = Some(binding.generation);
-        Ok(())
+        Ok(evaluation_workspace_lease)
+    }
+
+    async fn prove_evaluation_workspace_materialization(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request: &ChatRequestData,
+        workspace_policy: Option<&astra_services::evaluation::FrozenWorkspaceExecution>,
+        expected_edge_connection_generation: Option<u64>,
+        expected_edge_workspace_dir: Option<&str>,
+    ) -> Result<Option<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
+        let Some(workspace_policy) = workspace_policy else {
+            return Ok(None);
+        };
+        let registry = self.edge_registry_service.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the Edge registry is temporarily unavailable",
+            )
+        })?;
+        let record = registry
+            .find_by_user_agent_and_workspace(user_id, &workspace_policy.edge_executor_id, None)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    executor_id = %workspace_policy.edge_executor_id,
+                    error = %error,
+                    "evaluation Edge registry lookup failed while proving workspace materialization"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_execution_target_unavailable",
+                    "the selected Edge registry is temporarily unavailable",
+                )
+            })?
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the frozen Edge workspace is not currently registered",
+                )
+            })?;
+        let request_root = request
+            .workspace_binding
+            .as_ref()
+            .and_then(|workspace| workspace.root.as_deref())
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_binding_mismatch",
+                    "the canonical lifecycle did not establish the frozen workspace root",
+                )
+            })?;
+        let registered_root = record
+            .worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty());
+        let materialization_id = record
+            .materialization_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty());
+        let base_root = request
+            .evaluation_workspace_base_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_binding_mismatch",
+                    "the evaluation workspace has no server-generated base root",
+                )
+            })?;
+        if !is_managed_evaluation_workspace_path(base_root, request_root)
+            || record.workspace_id.is_some()
+            || record.edge_agent_id != workspace_policy.edge_executor_id
+            || registered_root != Some(base_root)
+            || materialization_id.is_none()
+            || expected_edge_workspace_dir != Some(request_root)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the live Edge registry does not prove the frozen workspace identity",
+            ));
+        }
+        let pool = self.edge_connection_pool.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the selected Edge connection is unavailable",
+            )
+        })?;
+        let connected = pool
+            .find_user_edge_by_agent_and_workspace(
+                user_id,
+                &workspace_policy.edge_executor_id,
+                None,
+            )
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the selected Edge connection is no longer live",
+                )
+            })?;
+        if connected.workspace_dir.as_deref().map(str::trim) != Some(base_root)
+            || connected.registry_id.as_deref() != Some(record.registry_id.as_str())
+            || connected.materialization_id.as_deref() != materialization_id
+            || expected_edge_connection_generation != Some(connected.generation)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the live Edge connection and registry no longer identify the same checkout",
+            ));
+        }
+        let canonical_binding = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the canonical execution binding store is unavailable",
+            )
+        })?;
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            user_id,
+            session_id,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let binding = astra_services::DatabaseSessionContextCoordinator::new(canonical_binding)
+            .load_execution_binding(&key)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to load canonical evaluation execution binding"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_execution_target_unavailable",
+                    "the canonical evaluation execution binding is unavailable",
+                )
+            })?
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_execution_binding_mismatch",
+                    "the evaluation Run has no canonical execution binding",
+                )
+            })?;
+        let materialization_id = materialization_id.expect("materialization id checked above");
+        let expected_physical =
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                materialization_id,
+                request_root,
+            );
+        if binding.generation != request.execution_binding_generation.unwrap_or_default()
+            || binding.executor.kind != astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+            || binding.executor.executor_id.as_deref()
+                != Some(workspace_policy.edge_executor_id.as_str())
+            || binding.workspace.root.as_deref() != Some(request_root)
+            || binding.physical_workspace_id.as_deref() != Some(expected_physical.as_str())
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_binding_mismatch",
+                "the canonical execution binding does not own the prepared trial workspace",
+            ));
+        }
+        let snapshot = pool
+            .snapshot_evaluation_workspace(
+                user_id,
+                &workspace_policy.edge_executor_id,
+                request_root,
+                std::time::Duration::from_secs(15),
+            )
+            .await
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the selected Edge did not return a live workspace snapshot",
+                )
+            })?;
+        if snapshot.error.is_some()
+            || snapshot.connection_generation != connected.generation
+            || !snapshot.clean
+            || snapshot.workspace_dir.trim() != request_root
+            || snapshot.source_commit.as_deref() != Some(workspace_policy.source_commit.as_str())
+            || snapshot
+                .source_tree
+                .as_deref()
+                .is_none_or(|tree| !is_git_object_id(tree))
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the live Edge workspace is dirty or no longer matches the frozen source",
+            ));
+        }
+        let capabilities = record.capabilities.ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::PRECONDITION_FAILED,
+                "evaluation_workspace_materialization_unavailable",
+                "the selected Edge has no authenticated workspace capability proof",
+            )
+        })?;
+        let advertisement = serde_json::from_value::<
+            astra_runtime_env::RuntimeEnvironmentAdvertisement,
+        >(capabilities)
+        .map_err(|error| {
+            tracing::warn!(
+                owner_id = %user_id,
+                executor_id = %workspace_policy.edge_executor_id,
+                error = %error,
+                "evaluation Edge capability proof could not be decoded"
+            );
+            evaluation_preflight_error(
+                StatusCode::PRECONDITION_FAILED,
+                "evaluation_workspace_materialization_unavailable",
+                "the selected Edge capability proof is invalid",
+            )
+        })?;
+        let source = advertisement.workspace_source.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::PRECONDITION_FAILED,
+                "evaluation_workspace_materialization_unavailable",
+                "the selected Edge has no authenticated source checkout proof",
+            )
+        })?;
+        if advertisement.schema_version
+            != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+            || !advertisement.binding.executor.is_edge_agent()
+            || advertisement.binding.executor.executor_id != workspace_policy.edge_executor_id
+            || !matches!(
+                advertisement.binding.workspace.kind,
+                astra_runtime_env::WorkspaceBindingKind::EdgeWorkspace
+            )
+            || advertisement.binding.workspace.cwd.as_deref() != Some(base_root)
+            || advertisement.binding.workspace.authority
+                != astra_runtime_env::WorkspaceAuthority::ReadWrite
+            || !source.is_valid()
+            || !workspace_policy.tool_names.iter().all(|tool_name| {
+                advertisement
+                    .binding
+                    .tool_surface
+                    .tool_names
+                    .iter()
+                    .any(|advertised| advertised == tool_name)
+            })
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the live Edge capability proof does not match the frozen workspace policy",
+            ));
+        }
+        let trial_materialization = format!(
+            "{materialization_id}-{:x}",
+            Sha256::digest(request_root.as_bytes())
+        );
+        Ok(Some((
+            trial_materialization,
+            snapshot
+                .source_tree
+                .expect("snapshot source tree checked above"),
+        )))
     }
 
     async fn populate_evaluation_edge_binding(
         &self,
         user_id: &str,
         request: &mut ChatRequestData,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        workspace_key: Option<&str>,
+    ) -> Result<Option<EvaluationWorkspaceLease>, (StatusCode, Json<ErrorResponse>)> {
         let executor_id = request
             .edge_executor_id
             .as_deref()
@@ -10603,6 +11055,20 @@ impl AgenticRunLifecycleService {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "evaluation_execution_target_unavailable",
                 "the Edge registry is temporarily unavailable",
+            )
+        })?;
+        let admission = request.evaluation_admission.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_execution_target_invalid",
+                "workspace Edge selection requires an evaluation admission",
+            )
+        })?;
+        let workspace_key = workspace_key.ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the evaluation Run has no workspace allocation identity",
             )
         })?;
         let record = registry
@@ -10647,25 +11113,39 @@ impl AgenticRunLifecycleService {
                     "the selected Edge has no registered workspace root",
                 )
             })?;
-        if record
+        let materialization_id = record
             .materialization_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .is_none()
-        {
-            return Err(evaluation_preflight_error(
-                StatusCode::PRECONDITION_FAILED,
-                "evaluation_execution_target_incomplete",
-                "the selected Edge has no stable checkout materialization",
-            ));
-        }
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_execution_target_incomplete",
+                    "the selected Edge has no stable checkout materialization",
+                )
+            })?;
+        let base_root = root.to_string();
+        let expected_workspace =
+            expected_evaluation_workspace_path(&base_root, materialization_id, workspace_key)
+                .ok_or_else(|| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_workspace_materialization_mismatch",
+                        "the evaluation trial cannot produce a managed workspace identity",
+                    )
+                })?;
+        // Resolve the authenticated source checkout before attempting the
+        // per-trial clone. If the live Edge transport is unavailable, the
+        // request still carries the canonical provider identity that produced
+        // the typed failure; no caller can substitute a different root.
+        request.evaluation_workspace_base_root = Some(base_root.clone());
         request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
             kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
             display_name: Some(executor_id.to_string()),
-            root: Some(root.to_string()),
+            root: Some(base_root.clone()),
             source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-                path: root.to_string(),
+                path: base_root.clone(),
             }),
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
         });
@@ -10676,7 +11156,135 @@ impl AgenticRunLifecycleService {
             transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
             status: Some(astra_services::runs::ExecutorStatusRequest::Online),
         });
-        Ok(())
+        let pool = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "evaluation workspace preparation requires the durable evaluation store",
+            )
+        })?;
+        let experiment = DatabaseEvaluationPlanStore::new(pool)
+            .load_experiment(user_id, &admission.experiment_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    experiment_id = %admission.experiment_id,
+                    error = %error,
+                    "failed to load frozen workspace policy during Edge binding"
+                );
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    "the frozen evaluation workspace policy is temporarily unavailable",
+                )
+            })?;
+        let workspace_policy = experiment
+            .spec
+            .conditions
+            .workspace_execution
+            .as_ref()
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "evaluation_execution_surface_unsupported",
+                    "this evaluation has no frozen workspace execution policy",
+                )
+            })?;
+        let pool = self.edge_connection_pool.as_ref().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_execution_target_unavailable",
+                "the selected Edge has no live WebSocket connection",
+            )
+        })?;
+        let prepared = pool
+            .prepare_evaluation_workspace(
+                user_id,
+                executor_id,
+                workspace_key,
+                &workspace_policy.source_commit,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "evaluation_workspace_materialization_unavailable",
+                    "the selected Edge did not return an isolated workspace clone",
+                )
+            })?;
+        let prepared_is_invalid = prepared.error.is_some()
+            || prepared.source_commit.as_deref() != Some(workspace_policy.source_commit.as_str())
+            || prepared
+                .source_tree
+                .as_deref()
+                .is_none_or(|tree| !is_git_object_id(tree))
+            || prepared.workspace_dir.trim().is_empty()
+            || prepared.workspace_dir == base_root
+            || prepared.workspace_dir != expected_workspace;
+        if prepared_is_invalid {
+            if !prepared.workspace_dir.trim().is_empty() {
+                let _ = pool
+                    .release_evaluation_workspace(
+                        user_id,
+                        executor_id,
+                        prepared.connection_generation,
+                        &prepared.workspace_dir,
+                        &workspace_policy.source_commit,
+                    )
+                    .await;
+            }
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the selected Edge did not prove the frozen isolated workspace clone",
+            ));
+        }
+        if !is_managed_evaluation_workspace_path(&base_root, &prepared.workspace_dir) {
+            let _ = pool
+                .release_evaluation_workspace(
+                    user_id,
+                    executor_id,
+                    prepared.connection_generation,
+                    &prepared.workspace_dir,
+                    &workspace_policy.source_commit,
+                )
+                .await;
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_workspace_materialization_mismatch",
+                "the selected Edge returned an unmanaged isolated workspace path",
+            ));
+        }
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some(executor_id.to_string()),
+            root: Some(prepared.workspace_dir.clone()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+                path: prepared.workspace_dir,
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+        });
+        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some(executor_id.to_string()),
+            display_name: Some(executor_id.to_string()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        });
+        let lease_pool = (*pool).clone();
+        Ok(Some(EvaluationWorkspaceLease::new(
+            Some(lease_pool),
+            user_id.to_string(),
+            Some(executor_id.to_string()),
+            Some(prepared.connection_generation),
+            request
+                .workspace_binding
+                .as_ref()
+                .and_then(|workspace| workspace.root.clone()),
+            workspace_policy.source_commit.clone(),
+        )))
     }
 
     /// A first-party user request may select only an Edge connection that is
@@ -10727,9 +11335,15 @@ impl AgenticRunLifecycleService {
                 )
             })?;
 
+        let expected_registered_root = request
+            .evaluation_workspace_base_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(root);
         let path_matches = |path: Option<&str>| {
             path.map(str::trim)
-                .is_some_and(|candidate| candidate == root)
+                .is_some_and(|candidate| candidate == expected_registered_root)
         };
         // Native first-party registrations are intentionally unscoped. A
         // workspace-scoped Edge can only be selected through the provider
@@ -15435,6 +16049,52 @@ fn runtime_workspace_authority_from_request(
     }
 }
 
+fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn safe_evaluation_workspace_component(value: &str) -> Option<String> {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    (!sanitized.is_empty() && sanitized != "." && sanitized != ".." && sanitized.len() <= 160)
+        .then_some(sanitized)
+}
+
+fn expected_evaluation_workspace_path(
+    base_root: &str,
+    materialization_id: &str,
+    workspace_key: &str,
+) -> Option<String> {
+    let materialization = safe_evaluation_workspace_component(materialization_id)?;
+    let key = safe_evaluation_workspace_component(workspace_key)?;
+    let base = Path::new(base_root);
+    Some(
+        base.parent()?
+            .join(format!(".astra-evaluation-{materialization}-{key}"))
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn is_managed_evaluation_workspace_path(base_root: &str, candidate: &str) -> bool {
+    let base = Path::new(base_root);
+    let candidate = Path::new(candidate);
+    candidate != base
+        && candidate.parent() == base.parent()
+        && candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".astra-evaluation-"))
+}
+
 fn execution_bindings_from_workspace_record(
     record: &RuntimeWorkspaceRecord,
 ) -> ExecutionBindingSnapshot {
@@ -16311,6 +16971,7 @@ impl AgenticRunLifecycleService {
             pause_flag,
             llm_cancel_token,
             execution_lease_lost,
+            evaluation_workspace_lease,
         } = execution;
         // Keep the same session-owned descendant authority that was wired
         // into the runtime tool executor. Non-streaming settlement must not
@@ -16393,6 +17054,7 @@ impl AgenticRunLifecycleService {
                     }
                 }
                 let _guard = TaskCountGuard(bg_task_count_1);
+                let _evaluation_workspace_lease = evaluation_workspace_lease;
                 // Start fencing as soon as the durable owner enters its task,
                 // before queueing for shared execution capacity. A queued run
                 // must not let its lease expire and later begin side effects
@@ -17503,6 +18165,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let evaluation_mode = request.evaluation_admission.is_some();
+        // The trial owns one stable clone identity. Exact retries and concurrent
+        // starts therefore converge on the same prepared workspace, while the
+        // durable Run claim decides which request may keep and later release it.
+        let evaluation_workspace_key = evaluation_mode.then(|| format!("trial-{run_id}"));
         if evaluation_mode {
             self.ensure_evaluation_session_clean(&user_id, &session_id, &run_id)
                 .await?;
@@ -17533,13 +18199,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             self.validate_work_runtime_binding(&user_id, &session_id, &request)
                 .await?
         };
-        self.bind_execution_selection(
-            &user_id,
-            &session_id,
-            &mut request,
-            work_runtime_binding.as_ref(),
-        )
-        .await?;
+        let evaluation_workspace_lease = self
+            .bind_execution_selection(
+                &user_id,
+                &session_id,
+                &mut request,
+                evaluation_workspace_key.as_deref(),
+                work_runtime_binding.as_ref(),
+            )
+            .await?;
 
         let agent_binding_mode = request.has_agent_binding_runtime();
         let edge_context = Self::extract_edge_context(&request)?;
@@ -17595,6 +18263,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             {
                 DurableRunStartClaim::Started { owner_generation } => {
                     execution_owner_generation = Some(owner_generation);
+                    if evaluation_mode && let Some(lease) = evaluation_workspace_lease.as_ref() {
+                        lease.activate_after_run_claim();
+                    }
                     let confirmed = self
                         .run_engine
                         .confirm_execution_authority(
@@ -17860,7 +18531,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
                 .await
             {
-                Ok(DurableRunStartClaim::Started { owner_generation }) => owner_generation,
+                Ok(DurableRunStartClaim::Started { owner_generation }) => {
+                    if evaluation_mode && let Some(lease) = evaluation_workspace_lease.as_ref() {
+                        lease.activate_after_run_claim();
+                    }
+                    owner_generation
+                }
                 Ok(other) => unreachable!("insert-only run start returned {other:?}"),
                 Err(error) => {
                     self.runs.write().await.remove(&run_id);
@@ -17942,7 +18618,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 llm_cancel_token.clone(),
             );
         }
-
         // Spawn background agentic loop.
         // Load plan state as structured data: prompt hint for context, plus
         // an independent authoring flag for the tool gate. Ordinary session
@@ -18093,6 +18768,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &session_id,
                     &run_id,
                     execution_owner_generation,
+                    evaluation_workspace_lease
+                        .as_ref()
+                        .and_then(EvaluationWorkspaceLease::connection_generation),
+                    evaluation_workspace_lease
+                        .as_ref()
+                        .and_then(EvaluationWorkspaceLease::workspace_dir),
                     &request,
                     &admission,
                 )
@@ -18653,6 +19334,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             pause_flag,
             llm_cancel_token,
             execution_lease_lost,
+            evaluation_workspace_lease,
         })
         .await;
 
@@ -18754,6 +19436,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &user_id,
             &session_id,
             &mut request,
+            None,
             work_runtime_binding.as_ref(),
         )
         .await?;

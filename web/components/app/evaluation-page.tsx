@@ -67,6 +67,10 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
   const [versionId, setVersionId] = useState('');
   const [primaryOfferingId, setPrimaryOfferingId] = useState('');
   const [judgmentOfferingId, setJudgmentOfferingId] = useState('');
+  const [workspaceEnabled, setWorkspaceEnabled] = useState(false);
+  const [edgeExecutorId, setEdgeExecutorId] = useState('');
+  const [sourceCommit, setSourceCommit] = useState('');
+  const [workspaceTools, setWorkspaceTools] = useState('read_file,write_file,bash');
   const [caseId, setCaseId] = useState('routing-case');
   const [message, setMessage] = useState('Apply the pinned Skill and return exactly the expected JSON.');
   const [expectedJson, setExpectedJson] = useState(defaultExpected);
@@ -381,6 +385,17 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       setError('Wall time must be a positive whole number of seconds.');
       return;
     }
+    const workspace = workspaceEnabled
+      ? {
+          edge_executor_id: edgeExecutorId.trim(),
+          source_commit: sourceCommit.trim(),
+          tool_names: workspaceTools.split(',').map((tool) => tool.trim()).filter(Boolean),
+        }
+      : undefined;
+    if (workspaceEnabled && (!workspace?.edge_executor_id || !workspace.source_commit || workspace.tool_names.length === 0)) {
+      setError('Fill in the Edge executor, full source commit, and at least one workspace tool.');
+      return;
+    }
     const payload: Record<string, unknown> = {
       submission_idempotency_key: `web-skill-routing-${crypto.randomUUID()}`,
       target: {
@@ -398,9 +413,10 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
       ...(judgmentOfferingId ? { judgment_model_offering_id: judgmentOfferingId } : {}),
       max_concurrency: 1,
       max_wall_time_secs: wall,
+      ...(workspace ? { workspace } : {}),
     };
     await executeIntent(payload);
-  }, [caseId, executeIntent, expectedJson, judgmentOfferingId, message, pendingSubmission, primaryOfferingId, retryPendingSubmission, skillName, versionId, wallTimeSecs]);
+  }, [caseId, edgeExecutorId, executeIntent, expectedJson, judgmentOfferingId, message, pendingSubmission, primaryOfferingId, retryPendingSubmission, skillName, sourceCommit, versionId, wallTimeSecs, workspaceEnabled, workspaceTools]);
 
   const resumeSavedComparison = useCallback(async () => {
     if (!savedIntent) return;
@@ -496,6 +512,28 @@ export function EvaluationPage({ ownerId, runtimeKey }: EvaluationPageProps) {
                 <option value="">Use configured default</option>
                 {judgmentModels.map((model) => <option key={model.offering_id} value={model.offering_id}>{model.name} · {model.provider}</option>)}
               </SelectField>
+            </div>
+
+            <div className="mt-5 rounded-control border border-border bg-surface-muted p-4">
+              <label className="flex items-center gap-2 text-sm font-medium">
+                <input type="checkbox" checked={workspaceEnabled} onChange={(event) => setWorkspaceEnabled(event.target.checked)} disabled={busy} />
+                Run both arms on a pinned Edge workspace
+              </label>
+              <p className="mt-2 text-xs leading-5 text-text-muted">The server freezes the checkout commit and tool surface. The authenticated Edge must prove the same source and materialization before each Run.</p>
+              {workspaceEnabled ? (
+                <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                  <label className="text-sm font-medium">Edge executor ID
+                    <Input value={edgeExecutorId} onChange={(event) => setEdgeExecutorId(event.target.value)} disabled={busy} placeholder="edge-agent-id" className="mt-1.5" />
+                  </label>
+                  <label className="text-sm font-medium">Source commit
+                    <Input value={sourceCommit} onChange={(event) => setSourceCommit(event.target.value)} disabled={busy} placeholder="40 or 64 hex characters" className="mt-1.5 font-mono text-xs" />
+                  </label>
+                  <label className="text-sm font-medium sm:col-span-2">Workspace tools
+                    <Input value={workspaceTools} onChange={(event) => setWorkspaceTools(event.target.value)} disabled={busy} placeholder="read_file,write_file,bash" className="mt-1.5 font-mono text-xs" />
+                    <span className="mt-1.5 block text-xs font-normal text-text-muted">Comma-separated built-in tools. Only the frozen list is visible to the model.</span>
+                  </label>
+                </div>
+              ) : null}
             </div>
 
             <div className="mt-4 grid gap-4 sm:grid-cols-[minmax(0,1fr)_150px]">

@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::edge_ws_protocol::{
     EDGE_TOOL_RESULT_GRACE_SECS, EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage,
@@ -187,6 +188,11 @@ pub struct EdgeConnectionPool {
     /// Global FIFO of dispatched request IDs for O(1)-amortized eviction when
     /// the pending set reaches capacity. Stale IDs are lazily skipped.
     pending_request_order: Arc<Mutex<VecDeque<String>>>,
+    /// Live request/response waiters for evaluation workspace management.
+    /// These are intentionally separate from tool invocation waiters: a
+    /// workspace probe has no model tool identity and must never become a
+    /// replayable tool result.
+    workspace_operations: Arc<DashMap<String, PendingWorkspaceOperation>>,
     /// Maximum number of inflight dispatched tool requests. When exceeded,
     /// the oldest entry is evicted before insertion.
     max_pending: usize,
@@ -213,6 +219,23 @@ struct PendingRequestEntry {
     request: DispatchedToolRequest,
 }
 
+#[derive(Debug)]
+struct PendingWorkspaceOperation {
+    connection_generation: u64,
+    sender: oneshot::Sender<EdgeWorkspaceOperationResult>,
+}
+
+/// Result returned by a live Edge workspace management operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeWorkspaceOperationResult {
+    pub connection_generation: u64,
+    pub workspace_dir: String,
+    pub source_commit: Option<String>,
+    pub source_tree: Option<String>,
+    pub clean: bool,
+    pub error: Option<String>,
+}
+
 impl EdgeConnectionPool {
     pub fn new() -> Self {
         Self {
@@ -220,6 +243,7 @@ impl EdgeConnectionPool {
             pending_requests: Arc::new(DashMap::new()),
             pending_request_ids_by_user: Arc::new(DashMap::new()),
             pending_request_order: Arc::new(Mutex::new(VecDeque::new())),
+            workspace_operations: Arc::new(DashMap::new()),
             max_pending: MAX_PENDING_REQUESTS,
             max_pending_per_user: MAX_PENDING_REQUESTS_PER_USER,
             next_connection_generation: Arc::new(AtomicU64::new(0)),
@@ -765,6 +789,153 @@ impl EdgeConnectionPool {
                 }
             })
             .collect()
+    }
+
+    /// Ask a live Edge to create an isolated, per-trial workspace clone.
+    pub async fn prepare_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_key: &str,
+        source_commit: &str,
+        timeout: Duration,
+    ) -> Option<EdgeWorkspaceOperationResult> {
+        self.request_workspace_operation(
+            user_id,
+            edge_agent_id,
+            timeout,
+            |request_id, connection_generation| EdgeServerMessage::WorkspacePrepare {
+                request_id,
+                connection_generation,
+                workspace_key: workspace_key.to_string(),
+                source_commit: source_commit.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Ask a live Edge for an immediate source/cleanliness proof of one
+    /// prepared evaluation workspace.
+    pub async fn snapshot_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_dir: &str,
+        timeout: Duration,
+    ) -> Option<EdgeWorkspaceOperationResult> {
+        self.request_workspace_operation(
+            user_id,
+            edge_agent_id,
+            timeout,
+            |request_id, connection_generation| EdgeServerMessage::WorkspaceSnapshotRequest {
+                request_id,
+                connection_generation,
+                workspace_dir: workspace_dir.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Best-effort release of one per-trial evaluation workspace. Edge keeps a
+    /// dirty clone for post-run evidence and removes a clean clone.
+    pub async fn release_evaluation_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        connection_generation: u64,
+        workspace_dir: &str,
+        source_commit: &str,
+    ) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        let (generation, sender) = {
+            let Some(entry) = self.connections.get(&key) else {
+                return false;
+            };
+            if entry.sender.is_closed() || entry.generation != connection_generation {
+                return false;
+            }
+            (entry.generation, entry.sender.clone())
+        };
+        sender
+            .send(EdgeServerMessage::WorkspaceRelease {
+                connection_generation: generation,
+                workspace_dir: workspace_dir.to_string(),
+                source_commit: source_commit.to_string(),
+            })
+            .await
+            .is_ok()
+    }
+
+    async fn request_workspace_operation<F>(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        timeout: Duration,
+        build_message: F,
+    ) -> Option<EdgeWorkspaceOperationResult>
+    where
+        F: FnOnce(String, u64) -> EdgeServerMessage,
+    {
+        let key = pool_key(user_id, edge_agent_id);
+        let (generation, sender) = {
+            let entry = self.connections.get(&key)?;
+            if entry.sender.is_closed() {
+                return None;
+            }
+            (entry.generation, entry.sender.clone())
+        };
+        let request_id = format!("edge-workspace-{}", Uuid::new_v4());
+        let (tx, rx) = oneshot::channel();
+        self.workspace_operations.insert(
+            request_id.clone(),
+            PendingWorkspaceOperation {
+                connection_generation: generation,
+                sender: tx,
+            },
+        );
+        if sender
+            .send(build_message(request_id.clone(), generation))
+            .await
+            .is_err()
+        {
+            self.workspace_operations.remove(&request_id);
+            return None;
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Some(result),
+            _ => {
+                self.workspace_operations.remove(&request_id);
+                None
+            }
+        }
+    }
+
+    /// Deliver a workspace operation result only to the connection generation
+    /// that received the request. A reconnect therefore cannot answer an old
+    /// probe or release a newer materialization by accident.
+    pub fn deliver_workspace_operation(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        connection_generation: u64,
+        result: EdgeWorkspaceOperationResult,
+    ) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        if self
+            .connections
+            .get(&key)
+            .is_none_or(|entry| entry.generation != connection_generation)
+        {
+            return false;
+        }
+        let Some((_, pending)) = self.workspace_operations.remove(request_id) else {
+            return false;
+        };
+        if pending.connection_generation != connection_generation {
+            return false;
+        }
+        pending.sender.send(result).is_ok()
     }
 
     /// Deliver an invocation whose exact identity, edge owner, and payload

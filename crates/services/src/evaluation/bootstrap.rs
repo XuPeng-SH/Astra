@@ -13,7 +13,8 @@ use super::execution::{EvaluationRunAdmission, EvaluationSkillRevision};
 use super::experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase,
     EvaluationJudgmentPolicy, EvaluationTarget, EvaluationTargetKind, ExperimentSpec,
-    FrozenConditions, FrozenSkillRoutingPolicy, MemoryIsolation, RevisionRef, TrialOrder,
+    FrozenConditions, FrozenSkillRoutingPolicy, FrozenWorkspaceExecution, MemoryIsolation,
+    RevisionRef, TrialOrder,
 };
 use super::{
     EvaluationPolicyFingerprintInput, content_fingerprint, evaluation_policy_fingerprint,
@@ -87,6 +88,9 @@ pub fn prepared_request_matches_spec(
         || spec.adapter_profile_version.as_deref() != Some(EVALUATION_ADAPTER_PROFILE_VERSION)
         || spec.cases.len() != 1
     {
+        return false;
+    }
+    if prepared_workspace(request).ok().as_ref() != Some(&spec.conditions.workspace_execution) {
         return false;
     }
     let case = &spec.cases[0];
@@ -190,11 +194,29 @@ pub struct EvaluationTrialStartPlan {
     pub revision_content: Option<String>,
     pub model_offering_id: String,
     pub execution_time_budget_secs: u64,
-    /// The caller's requested Edge identity. The canonical Run binding owner
-    /// resolves and authenticates the current materialization; this field
-    /// never carries a workspace path or materialization identity.
+    /// The frozen Edge identity used by the canonical Run binding owner. The
+    /// plan never carries a workspace path or materialization identity.
     pub edge_executor_id: Option<String>,
+    pub workspace_execution: Option<FrozenWorkspaceExecution>,
     pub admission: EvaluationRunAdmission,
+}
+
+fn prepared_workspace(
+    request: &EvaluationExperimentPrepareRequest,
+) -> Result<Option<FrozenWorkspaceExecution>, EvaluationBootstrapError> {
+    request
+        .workspace
+        .as_ref()
+        .map(|workspace| {
+            FrozenWorkspaceExecution {
+                edge_executor_id: workspace.edge_executor_id.clone(),
+                source_commit: workspace.source_commit.clone(),
+                tool_names: workspace.tool_names.clone(),
+            }
+            .normalized()
+            .map_err(EvaluationBootstrapError::InvalidInput)
+        })
+        .transpose()
 }
 
 fn judgment_policy_for_trial(
@@ -274,6 +296,7 @@ pub fn build_prepared_experiment_spec(
         offering_id: model.offering_id.clone(),
         model_name: model.model_name.clone(),
     };
+    let workspace_execution = prepared_workspace(request)?;
     let execution_policy = crate::runs::ExecutionPolicyRequest::default();
     let tool_policy_hash = evaluation_policy_fingerprint(&EvaluationPolicyFingerprintInput {
         model_binding: &model.offering_id,
@@ -285,7 +308,9 @@ pub fn build_prepared_experiment_spec(
         execution_policy: &execution_policy,
         allow_skills: None,
         allow_skill_sources: None,
-        allow_tools: None,
+        allow_tools: workspace_execution
+            .as_ref()
+            .map(|workspace| workspace.tool_names.as_slice()),
         enabled_tools: None,
         runtime_profile: None,
     });
@@ -308,7 +333,11 @@ pub fn build_prepared_experiment_spec(
         order: TrialOrder::BaselineFirst,
         conditions: FrozenConditions {
             execution_config: execution_config.clone(),
-            isolation_profile: "prompt_only_private".to_string(),
+            isolation_profile: if workspace_execution.is_some() {
+                "edge_workspace_private_v1".to_string()
+            } else {
+                "prompt_only_private".to_string()
+            },
             model_binding: model.offering_id.clone(),
             provider_binding: model.provider.clone(),
             context_snapshot_hash: input_content_hash,
@@ -316,6 +345,7 @@ pub fn build_prepared_experiment_spec(
             cache_policy,
             memory_isolation: MemoryIsolation::Disabled,
             data_isolation: DataIsolation::Disabled,
+            workspace_execution,
         },
         budget: EvaluationBudget {
             max_trials: 2,
@@ -454,6 +484,25 @@ pub fn prepare_trial_start(
             "edge_executor_id must not be empty".to_string(),
         ));
     }
+    let workspace_execution = experiment.spec.conditions.workspace_execution.clone();
+    let edge_executor_id = match workspace_execution.as_ref() {
+        Some(workspace) => {
+            if let Some(requested) = edge_executor_id.as_deref()
+                && requested != workspace.edge_executor_id
+            {
+                return Err(EvaluationBootstrapError::Conflict(
+                    "edge_executor_id does not match the frozen workspace execution".to_string(),
+                ));
+            }
+            Some(workspace.edge_executor_id.clone())
+        }
+        None if edge_executor_id.is_some() => {
+            return Err(EvaluationBootstrapError::Unsupported(
+                "Edge evaluation requires a frozen workspace execution policy".to_string(),
+            ));
+        }
+        None => None,
+    };
     if experiment.owner_user_id != owner_user_id || trial.owner_user_id != owner_user_id {
         return Err(EvaluationBootstrapError::Conflict(
             "evaluation plan is owned by another user".to_string(),
@@ -663,6 +712,7 @@ pub fn prepare_trial_start(
         "skill_name": skill_revision.as_ref().map(|revision| &revision.skill_name),
         "execution_time_budget_secs": execution_time_budget_secs,
         "edge_executor_id": edge_executor_id,
+        "workspace_execution": workspace_execution,
         "judgment_policy": judgment_policy_for_trial(&experiment.spec.target, &trial.trial.arm),
     });
     let request_fingerprint = format!(
@@ -690,6 +740,7 @@ pub fn prepare_trial_start(
         model_offering_id: experiment.spec.conditions.model_binding.clone(),
         execution_time_budget_secs,
         edge_executor_id,
+        workspace_execution,
         admission,
     })
 }
@@ -759,6 +810,7 @@ mod tests {
                 cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
+                workspace_execution: None,
             },
             budget: EvaluationBudget {
                 max_trials: 2,
@@ -917,6 +969,7 @@ mod tests {
                 },
             },
             model_offering_id: "model-1".to_string(),
+            workspace: None,
             judgment_model_offering_id: None,
             max_concurrency: 2,
             max_wall_time_secs: 30,
@@ -1000,8 +1053,13 @@ mod tests {
     }
 
     #[test]
-    fn trial_start_keeps_edge_selection_out_of_the_shared_experiment_spec() {
-        let request = prepared_request(EvaluationTargetKind::Prompt);
+    fn trial_start_uses_the_frozen_edge_workspace_policy() {
+        let mut request = prepared_request(EvaluationTargetKind::Prompt);
+        request.workspace = Some(super::super::api::EvaluationPrepareWorkspace {
+            edge_executor_id: "edge-a".to_string(),
+            source_commit: "a".repeat(40),
+            tool_names: vec!["read_file".to_string()],
+        });
         let spec = build_prepared_experiment_spec(
             "owner-1",
             "evx_edge",
@@ -1049,12 +1107,22 @@ mod tests {
         )
         .expect("trial Edge selection");
         assert_eq!(plan.edge_executor_id.as_deref(), Some("edge-a"));
+        assert_eq!(
+            plan.workspace_execution
+                .as_ref()
+                .map(|workspace| workspace.tool_names.as_slice()),
+            Some(["read_file".to_string()].as_slice())
+        );
         assert!(
             experiment
                 .spec
                 .conditions
                 .tool_policy_hash
                 .starts_with("sha256:")
+        );
+        assert_eq!(
+            experiment.spec.conditions.isolation_profile,
+            "edge_workspace_private_v1"
         );
     }
 

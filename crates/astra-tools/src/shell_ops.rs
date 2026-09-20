@@ -1,5 +1,6 @@
 //! Shell operations: bash execution, grep, glob.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -1139,6 +1140,22 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     environment: &[(String, String)],
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
+    execute_bash_with_observation(ctx, args, workdir, || async {
+        execute_bash_inner(ctx, args, environment, workdir).await
+    })
+    .await
+}
+
+async fn execute_bash_with_observation<F, Fut>(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    workdir: &PreparedBashWorkdir,
+    execute: F,
+) -> ToolResult
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ToolResult>,
+{
     let explicit_verification =
         crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
     let needs_observation = args
@@ -1213,7 +1230,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         return crate::cancelled_tool_result("bash", false);
     }
 
-    let mut result = execute_bash_inner(ctx, args, environment, workdir).await;
+    let mut result = execute().await;
     attach_bash_workdir_evidence(&mut result, &ctx.workspace_root, workdir, args);
     let scope_settled = result
         .metadata
@@ -1915,11 +1932,19 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
     read_only_paths: &[PathBuf],
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
+    execute_bash_with_observation(ctx, args, workdir, || async {
+        execute_bash_with_filesystem_boundary_inner(ctx, args, read_only_paths, workdir).await
+    })
+    .await
+}
+
+async fn execute_bash_with_filesystem_boundary_inner(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    read_only_paths: &[PathBuf],
+    workdir: &PreparedBashWorkdir,
+) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
-    let with_workdir_evidence = |mut result: ToolResult| {
-        attach_bash_workdir_evidence(&mut result, workspace_root, workdir, args);
-        result
-    };
     let command = match args.get("command").and_then(Value::as_str) {
         Some(command) if !command.trim().is_empty() => command,
         _ => {
@@ -1933,13 +1958,52 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
         return ToolResult::error(reason);
     }
 
+    let explicit_source_artifacts = args
+        .get(crate::source_preimage::SOURCE_ARTIFACTS_FIELD)
+        .is_some();
+    let mut source_preimages = match crate::source_preimage::prepare_with_inspection(
+        workspace_root,
+        args,
+        &format!("{}:{}", ctx.user_id, ctx.session_id),
+        #[cfg(unix)]
+        workdir.inspection(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return ToolResult::error(format!("Error: {reason}")),
+    };
+    if source_preimages.is_none() && !explicit_source_artifacts {
+        #[cfg(unix)]
+        {
+            source_preimages = crate::source_preimage::prepare_inferred_with_inspection(
+                workspace_root,
+                workdir.inspection(),
+                command,
+                &format!("{}:{}", ctx.user_id, ctx.session_id),
+            )
+            .unwrap_or(None);
+        }
+        #[cfg(not(unix))]
+        {
+            source_preimages = crate::source_preimage::prepare_inferred(
+                workspace_root,
+                workdir.path(),
+                command,
+                &format!("{}:{}", ctx.user_id, ctx.session_id),
+            )
+            .unwrap_or(None);
+        }
+    }
+
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
     let boundary_root = match workspace_root.canonicalize() {
         Ok(root) => root,
         Err(error) => {
-            return ToolResult::error(format!(
-                "Error: cannot resolve managed workspace boundary: {error}; no command was run"
-            ));
+            return attach_source_preimage(
+                ToolResult::error(format!(
+                    "Error: cannot resolve managed workspace boundary: {error}; no command was run"
+                )),
+                source_preimages,
+            );
         }
     };
     let mut canonical_read_only_paths = Vec::with_capacity(read_only_paths.len());
@@ -1947,10 +2011,13 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
         match path.canonicalize() {
             Ok(path) => canonical_read_only_paths.push(path),
             Err(error) => {
-                return ToolResult::error(format!(
-                    "Error: cannot resolve managed read-only path '{}': {error}; no command was run",
-                    path.display()
-                ));
+                return attach_source_preimage(
+                    ToolResult::error(format!(
+                        "Error: cannot resolve managed read-only path '{}': {error}; no command was run",
+                        path.display()
+                    )),
+                    source_preimages,
+                );
             }
         }
     }
@@ -1963,21 +2030,59 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
     config.max_output_bytes = per_tool_output_limit("bash");
     let mut environment = std::env::vars().collect::<std::collections::HashMap<_, _>>();
     astra_sandbox::scrub_secrets_from_env(&mut environment);
-    let output = astra_sandbox::execute_isolated(command, &environment, &config).await;
+    let output = astra_sandbox::execute_isolated_with_cancel(
+        command,
+        &environment,
+        &config,
+        ctx.cancel_token.as_deref(),
+    )
+    .await;
     let rendered = output.combined_output();
     if !output.namespace_active {
-        return with_workdir_evidence(ToolResult::error(if rendered.is_empty() {
-            "Error: managed filesystem write isolation is unavailable".to_string()
-        } else {
-            rendered
-        }));
+        return attach_source_preimage(
+            ToolResult::error(if rendered.is_empty() {
+                "Error: managed filesystem write isolation is unavailable".to_string()
+            } else {
+                rendered
+            }),
+            source_preimages,
+        );
     }
+    let scope_settled = output.scope_settled;
+    let scope_ownership = output.scope_ownership;
+    let descendants_terminated = output.descendants_terminated;
     let exit_code = output.exit_code.unwrap_or(-1);
     if output.timed_out {
-        return with_workdir_evidence(
-            ToolResult::error(rendered)
-                .with_exit_semantics(ExitSemantics::TimedOut)
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(rendered)
+                    .with_exit_semantics(ExitSemantics::TimedOut)
+                    .with_exit_code(exit_code),
+                source_preimages,
+            ),
+            scope_settled,
+            scope_ownership,
+            false,
+            descendants_terminated,
+        );
+    }
+    if output.cancelled {
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(if rendered.is_empty() {
+                    "Error: managed filesystem write isolation was cancelled before output was captured"
+                        .to_string()
+                } else {
+                    rendered
+                })
+                .with_exit_semantics(ExitSemantics::Cancelled)
                 .with_exit_code(exit_code),
+                source_preimages,
+            ),
+            scope_settled,
+            scope_ownership,
+            false,
+            descendants_terminated,
         );
     }
     let exit_semantics = classify_exit(command, exit_code);
@@ -1989,22 +2094,36 @@ pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
         } else {
             ToolResult::text(rendered)
         };
-        return with_workdir_evidence(
-            result
-                .with_exit_semantics(exit_semantics)
-                .with_result_class(result_class)
-                .with_exit_code(exit_code),
+        return attach_scope_settled(
+            attach_source_preimage(
+                result
+                    .with_exit_semantics(exit_semantics)
+                    .with_result_class(result_class)
+                    .with_exit_code(exit_code),
+                source_preimages,
+            ),
+            scope_settled,
+            scope_ownership,
+            false,
+            descendants_terminated,
         );
     }
-    with_workdir_evidence(
-        ToolResult::text(if rendered.is_empty() {
-            "(command completed with no output)".to_string()
-        } else {
-            rendered
-        })
-        .with_exit_semantics(ExitSemantics::Success)
-        .with_result_class(result_class)
-        .with_exit_code(exit_code),
+    attach_scope_settled(
+        attach_source_preimage(
+            ToolResult::text(if rendered.is_empty() {
+                "(command completed with no output)".to_string()
+            } else {
+                rendered
+            })
+            .with_exit_semantics(ExitSemantics::Success)
+            .with_result_class(result_class)
+            .with_exit_code(exit_code),
+            source_preimages,
+        ),
+        scope_settled,
+        scope_ownership,
+        false,
+        descendants_terminated,
     )
 }
 

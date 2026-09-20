@@ -60,12 +60,25 @@ impl EdgeBoundExecutionPlan {
             &request.turn_chain_id,
             &request.tool_call_id,
         )?;
+        let mut args = request.args.clone();
+        if let Some(workspace_dir) = request.workspace.cwd.as_deref()
+            && let Some(object) = args.as_object_mut()
+        {
+            // The workspace root is server-authored binding state, not a
+            // model argument. It travels inside the durable Edge envelope so
+            // replayed invocations execute in the exact trial clone selected
+            // by canonical admission; the Edge strips it before tool code.
+            object.insert(
+                "__astra_workspace_dir".to_string(),
+                Value::String(workspace_dir.to_string()),
+            );
+        }
         Ok(Self {
             selected_executor_id: edge_executor_id(request).map(ToString::to_string),
             dispatch_request_id: identity.storage_key(),
             identity,
             tool_name: request.tool_name.clone(),
-            args: request.args.clone(),
+            args,
             timeout_secs: Self::DEFAULT_TIMEOUT_SECS,
             workspace: request.workspace.clone(),
             executor: request.executor.clone(),
@@ -85,6 +98,10 @@ impl EdgeBoundExecutionPlan {
 
     pub(crate) fn dispatch_request_id(&self) -> &str {
         &self.dispatch_request_id
+    }
+
+    pub(crate) fn args(&self) -> &Value {
+        &self.args
     }
 
     pub(crate) fn identity(&self) -> &astra_turn_types::ToolInvocationIdentity {

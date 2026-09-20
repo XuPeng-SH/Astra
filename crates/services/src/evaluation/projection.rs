@@ -404,6 +404,7 @@ mod tests {
                 cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
+                workspace_execution: None,
             },
             budget: EvaluationBudget {
                 max_trials: 2,

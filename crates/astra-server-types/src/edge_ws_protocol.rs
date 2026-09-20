@@ -134,6 +134,31 @@ pub enum EdgeClientMessage {
         tool_result_fields: Option<Map<String, Value>>,
     },
 
+    /// Result of creating an isolated evaluation workspace clone.
+    #[serde(rename = "edge_workspace_prepared")]
+    WorkspacePrepared {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+        source_commit: Option<String>,
+        source_tree: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+
+    /// Fresh source proof for an already prepared evaluation workspace.
+    #[serde(rename = "edge_workspace_snapshot")]
+    WorkspaceSnapshot {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+        source_commit: Option<String>,
+        source_tree: Option<String>,
+        clean: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
+
     /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
     Ping {},
@@ -176,6 +201,31 @@ pub enum EdgeServerMessage {
         timeout_secs: u64,
     },
 
+    /// Create a per-trial clone from the requested immutable source commit.
+    #[serde(rename = "edge_workspace_prepare")]
+    WorkspacePrepare {
+        request_id: String,
+        connection_generation: u64,
+        workspace_key: String,
+        source_commit: String,
+    },
+
+    /// Ask the Edge to prove the current source identity of a prepared clone.
+    #[serde(rename = "edge_workspace_snapshot_request")]
+    WorkspaceSnapshotRequest {
+        request_id: String,
+        connection_generation: u64,
+        workspace_dir: String,
+    },
+
+    /// Release a clean per-trial clone after the Run has settled.
+    #[serde(rename = "edge_workspace_release")]
+    WorkspaceRelease {
+        connection_generation: u64,
+        workspace_dir: String,
+        source_commit: String,
+    },
+
     /// Server heartbeat response.
     #[serde(rename = "edge_pong")]
     Pong {},
@@ -210,6 +260,9 @@ impl EdgeServerMessage {
             EdgeServerMessage::AuthOk { .. } => "auth_ok",
             EdgeServerMessage::AuthError { .. } => "auth_error",
             EdgeServerMessage::ToolRequest { .. } => "tool_request",
+            EdgeServerMessage::WorkspacePrepare { .. } => "workspace_prepare",
+            EdgeServerMessage::WorkspaceSnapshotRequest { .. } => "workspace_snapshot_request",
+            EdgeServerMessage::WorkspaceRelease { .. } => "workspace_release",
             EdgeServerMessage::Pong {} => "pong",
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
@@ -519,6 +572,38 @@ mod tests {
             "args": {}
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn edge_workspace_operations_round_trip() {
+        let prepare = EdgeServerMessage::WorkspacePrepare {
+            request_id: "workspace-request".to_string(),
+            connection_generation: 4,
+            workspace_key: "trial-1".to_string(),
+            source_commit: "a".repeat(40),
+        };
+        let decoded: EdgeServerMessage =
+            serde_json::from_value(serde_json::to_value(&prepare).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeServerMessage::WorkspacePrepare { .. }
+        ));
+
+        let snapshot = EdgeClientMessage::WorkspaceSnapshot {
+            request_id: "workspace-request".to_string(),
+            connection_generation: 4,
+            workspace_dir: "/workspace/.astra-evaluation-trial-1".to_string(),
+            source_commit: Some("a".repeat(40)),
+            source_tree: Some("b".repeat(40)),
+            clean: true,
+            error: None,
+        };
+        let decoded: EdgeClientMessage =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeClientMessage::WorkspaceSnapshot { clean: true, .. }
+        ));
     }
 
     #[test]

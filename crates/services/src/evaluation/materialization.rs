@@ -227,6 +227,9 @@ pub fn required_components_for_spec(spec: &ExperimentSpec) -> Vec<Materializatio
         MaterializationComponentKind::Context,
         MaterializationComponentKind::Policy,
     ];
+    if spec.conditions.workspace_execution.is_some() {
+        required.push(MaterializationComponentKind::Workspace);
+    }
     if matches!(
         spec.conditions.memory_isolation,
         MemoryIsolation::BranchPerTrial { .. }
@@ -810,13 +813,42 @@ fn validate_component_against_envelope(
             ));
         }
         MaterializationComponentKind::Workspace => {
-            return Err(MaterializationReceiptError::Conflict(
-                "workspace materialization is not declared by this frozen isolation profile"
-                    .to_string(),
-            ));
+            let Some(workspace) = spec.conditions.workspace_execution.as_ref() else {
+                return Err(MaterializationReceiptError::Conflict(
+                    "workspace materialization is not declared by this frozen isolation profile"
+                        .to_string(),
+                ));
+            };
+            let expected_base = format!("git://{}", workspace.source_commit);
+            if component_base_snapshot_ref != Some(expected_base.as_str()) {
+                return Err(MaterializationReceiptError::Conflict(
+                    "workspace receipt must carry the frozen source commit".to_string(),
+                ));
+            }
+            let Some(tree) = component_content_fingerprint else {
+                return Err(MaterializationReceiptError::Conflict(
+                    "workspace receipt must carry the authenticated source tree".to_string(),
+                ));
+            };
+            if !is_git_object_id(tree) {
+                return Err(MaterializationReceiptError::Conflict(
+                    "workspace receipt source tree must be a full Git object id".to_string(),
+                ));
+            }
+            if !component_snapshot_ref
+                .is_some_and(|snapshot| snapshot.starts_with("edge-workspace://"))
+            {
+                return Err(MaterializationReceiptError::Conflict(
+                    "workspace receipt must carry an Edge materialization address".to_string(),
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn validate_new_expiry(
@@ -1360,6 +1392,7 @@ mod tests {
                 cache_policy: "provider_default_recorded".to_string(),
                 memory_isolation: MemoryIsolation::Disabled,
                 data_isolation: DataIsolation::Disabled,
+                workspace_execution: None,
             },
             budget: super::super::experiment::EvaluationBudget {
                 max_trials: 2,

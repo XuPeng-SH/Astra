@@ -2595,6 +2595,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         runtime_mcp_bindings: request.runtime_mcp_bindings,
         context,
         edge_executor_id,
+        evaluation_workspace_base_root: None,
         capabilities: request.capabilities,
         forward_headers: std::collections::HashMap::new(),
         provider_run_owner: None,
