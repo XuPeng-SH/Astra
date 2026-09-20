@@ -490,10 +490,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("pre_turn_compaction", 4_096),
-                (
-                    "request_judgment",
-                    super::REQUEST_JUDGMENT_MAX_OUTPUT_TOKENS
-                ),
+                ("request_judgment", 8_000),
                 (
                     "required_compaction",
                     astra_turn_types::context_execution::CompactConfig::default()
