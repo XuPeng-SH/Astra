@@ -15086,6 +15086,7 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
 
     #[derive(Default)]
     struct MockSkillService {
+        list_calls: std::sync::atomic::AtomicUsize,
         unsupported_calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -15110,6 +15111,8 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
             limit: u32,
             cursor: Option<SkillListCursor>,
         ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if cursor.is_some() {
                 return Ok(SkillListRecord {
                     skills: Vec::new(),
@@ -15207,7 +15210,31 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
     let skill_service = Arc::new(MockSkillService::default());
     let svc = test_service().with_skill_service(skill_service.clone());
 
-    let default_request = test_request("hello");
+    let default_request = prepared_test_request("hello");
+    svc.validate_request_constraints("test-user", &default_request)
+        .await
+        .expect("unrestricted request should not need skill catalog validation");
+    assert_eq!(
+        skill_service
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "unrestricted request validation must not discover the full skill catalog"
+    );
+
+    let mut validation_request = prepared_test_request("hello");
+    validation_request.allow_skills = Some(vec!["remote-db".to_string()]);
+    svc.validate_request_constraints("test-user", &validation_request)
+        .await
+        .expect("known skill allowlist should be validated against the catalog");
+    assert_eq!(
+        skill_service
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "non-empty skill allowlist should perform exactly one catalog discovery"
+    );
+
     let default_state = svc.build_initial_state(
         "test-user",
         &default_request,

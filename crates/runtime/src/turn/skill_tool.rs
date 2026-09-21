@@ -217,6 +217,23 @@ impl SkillSurfacingPolicy {
         self.allowed_names.is_none() && self.allowed_sources.is_none()
     }
 
+    /// Whether applying this policy needs a catalog snapshot to validate it.
+    ///
+    /// Explicitly empty allowlists are meaningful (they deny every skill),
+    /// but they do not need a catalog read. A non-empty name or source
+    /// allowlist does: names must be checked against the visible catalog, and
+    /// source filters must preserve the existing "no configured skills" error
+    /// when the catalog is unavailable.
+    pub fn requires_catalog_validation(&self) -> bool {
+        self.allowed_names
+            .as_ref()
+            .is_some_and(|names| !names.is_empty())
+            || self
+                .allowed_sources
+                .as_ref()
+                .is_some_and(|sources| !sources.is_empty())
+    }
+
     fn allowed_names(&self) -> Option<&HashSet<String>> {
         self.allowed_names.as_ref()
     }
@@ -404,9 +421,7 @@ pub fn apply_skill_surfacing_policy(
     }
 
     let Some(inner) = resolver else {
-        return if matches!(policy.allowed_names.as_ref(), Some(names) if !names.is_empty())
-            || matches!(policy.allowed_sources.as_ref(), Some(sources) if !sources.is_empty())
-        {
+        return if policy.requires_catalog_validation() {
             let mut fields = Vec::new();
             if matches!(policy.allowed_names.as_ref(), Some(names) if !names.is_empty()) {
                 fields.push("allow_skills");
@@ -2353,6 +2368,32 @@ mod tests {
         assert!(
             filtered.available_skills().is_empty(),
             "explicit empty allowlists should deny all surfaced skills"
+        );
+    }
+
+    #[test]
+    fn catalog_validation_is_needed_only_for_non_empty_filters() {
+        assert!(!SkillSurfacingPolicy::default().requires_catalog_validation());
+        assert!(
+            !SkillSurfacingPolicy {
+                allowed_names: Some(HashSet::new()),
+                allowed_sources: Some(HashSet::new()),
+            }
+            .requires_catalog_validation()
+        );
+        assert!(
+            SkillSurfacingPolicy {
+                allowed_names: Some(HashSet::from(["review".to_string()])),
+                allowed_sources: None,
+            }
+            .requires_catalog_validation()
+        );
+        assert!(
+            SkillSurfacingPolicy {
+                allowed_names: None,
+                allowed_sources: Some(HashSet::from([SkillSourceKind::Database])),
+            }
+            .requires_catalog_validation()
         );
     }
 

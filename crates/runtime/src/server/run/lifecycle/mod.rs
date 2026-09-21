@@ -8838,9 +8838,13 @@ impl AgenticRunLifecycleService {
                 .await?;
         }
         if !request.has_agent_binding_runtime() && request.runtime_skill_binding.is_none() {
-            let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
-            apply_normalized_skill_allowlist(resolver, &request_constraints)
-                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+            let skill_policy = request_constraints.skill_surfacing_policy();
+            if skill_policy.requires_catalog_validation() {
+                let (_, resolver) =
+                    build_server_skill_resolver(self.skill_service.clone(), user_id);
+                apply_normalized_skill_allowlist(resolver, &request_constraints)
+                    .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+            }
         }
         Ok(request_constraints)
     }
