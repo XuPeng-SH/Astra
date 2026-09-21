@@ -422,10 +422,9 @@ mod tests {
             "known primary usage should remain visible: {out}"
         );
         assert!(
-            out.contains("≥98.8k cached"),
-            "known cache reads missing: {out}"
+            out.contains("≥98.8k cached · 98% of known input"),
+            "known cache reads/rate missing: {out}"
         );
-        assert!(!out.contains("%"), "partial cache rate leaked: {out}");
         let restored = TurnSummaryCell::from_persist(c.to_persist().unwrap()).unwrap();
         assert_eq!(
             render(&restored, 120),

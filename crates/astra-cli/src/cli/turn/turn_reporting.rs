@@ -183,8 +183,13 @@ pub(crate) fn format_primary_usage_summary(
     Some(summary)
 }
 
-/// Shared CLI/TUI cache presentation. Partial usage retains known cache reads,
-/// but cannot establish the whole turn's input denominator or hit rate.
+/// Shared CLI/TUI cache presentation.
+///
+/// A complete attribution can report the whole-turn cache rate. A partial
+/// attribution still has useful information when both fresh input and cache
+/// reads are known: show the rate over the observed input lanes and scope it
+/// explicitly to `known input`. This keeps the useful percentage visible
+/// without presenting an incomplete turn as an exact whole-turn measurement.
 pub(crate) fn format_cache_usage_summary(
     fresh: Option<u64>,
     cache_read: Option<u64>,
@@ -192,13 +197,26 @@ pub(crate) fn format_cache_usage_summary(
     complete: bool,
 ) -> Option<String> {
     let cache_read = cache_read?;
-    if complete && let Some(fresh) = fresh {
-        let input =
-            u128::from(fresh) + u128::from(cache_read) + u128::from(cache_creation.unwrap_or(0));
-        if let Some(percent) = (u128::from(cache_read) * 100).checked_div(input) {
+    let Some(fresh) = fresh else {
+        return Some(format!(
+            "{} cached",
+            format_usage_count(cache_read, complete)
+        ));
+    };
+
+    let known_input = u128::from(fresh)
+        .saturating_add(u128::from(cache_read))
+        .saturating_add(u128::from(cache_creation.unwrap_or(0)));
+    if let Some(percent) = (u128::from(cache_read) * 100).checked_div(known_input) {
+        if complete && cache_creation.is_some() {
             return Some(format!("{percent}% cached"));
         }
+        return Some(format!(
+            "{} cached · {percent}% of known input",
+            format_usage_count(cache_read, complete)
+        ));
     }
+
     Some(format!(
         "{} cached",
         format_usage_count(cache_read, complete)
@@ -574,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_primary_metrics_are_wired_through_as_known_usage() {
+    fn incomplete_primary_metrics_show_a_scoped_cache_rate() {
         let state = crate::cli::session::session_state::SessionState::default();
         let mut result = crate::tests::stub_stream_result("answer");
         result.usage_attribution.primary =
@@ -587,8 +605,23 @@ mod tests {
         result.usage_attribution.primary_complete = false;
 
         let parts = compact_completion_parts(&state, &result, Duration::from_millis(5_200));
-        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached".to_string()));
-        assert!(!parts.iter().any(|part| part.contains("%")));
+        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached · 90% of known input".to_string()));
+    }
+
+    #[test]
+    fn observed_partial_usage_keeps_the_session_cache_rate_visible() {
+        assert_eq!(
+            super::format_primary_usage_summary(
+                Some(10_392),
+                Some(926),
+                Some(34_944),
+                Some(0),
+                true,
+                false,
+            )
+            .as_deref(),
+            Some("≥46.2k tokens · ≥34.9k cached · 77% of known input")
+        );
     }
 
     #[test]
@@ -620,30 +653,27 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_primary_usage_retains_known_cache_without_a_hit_rate() {
-        assert_eq!(
-            super::format_primary_usage_summary(
-                Some(100),
-                Some(20),
-                Some(900),
-                Some(0),
-                true,
-                false,
-            )
-            .as_deref(),
-            Some("≥1.0k tokens · ≥900 cached")
-        );
-    }
-
-    #[test]
     fn cache_summary_distinguishes_unknown_zero_partial_and_complete() {
         assert_eq!(super::format_usage_count(19_999, false), "≥19.9k");
         assert_eq!(super::format_usage_count(1_999_999, false), "≥1.9M");
         assert_eq!(super::format_usage_count(19_999, true), "20.0k");
         for (fresh, read, write, complete, expected) in [
             (Some(100), None, None, false, None),
-            (Some(100), Some(0), None, false, Some("≥0 cached")),
+            (
+                Some(100),
+                Some(0),
+                None,
+                false,
+                Some("≥0 cached · 0% of known input"),
+            ),
             (None, Some(900), None, false, Some("≥900 cached")),
+            (
+                Some(100),
+                Some(900),
+                Some(1000),
+                false,
+                Some("≥900 cached · 45% of known input"),
+            ),
             (Some(100), Some(900), Some(1000), true, Some("45% cached")),
             (Some(0), Some(0), Some(0), true, Some("0 cached")),
             (
