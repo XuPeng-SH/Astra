@@ -1,3 +1,4 @@
+use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as PromptDeltaDbRow;
 use astra_core::{
     SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape,
@@ -6,6 +7,7 @@ use astra_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::Acquire;
 
 pub(crate) const PROMPT_DIAGNOSTIC_RETENTION_DAYS: u32 = 90;
 const EXPIRED_PROMPT_REQUESTS_SQL: &str =
@@ -305,10 +307,14 @@ pub struct PromptRequestObservability {
     pub delta_counts: PromptDeltaCounts,
 }
 
-async fn rollback_prompt_delta_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, context: &'static str) {
-    if let Err(error) = tx.rollback().await {
+async fn rollback_prompt_delta_tx(
+    tx: sqlx::Transaction<'_, sqlx::MySql>,
+    context: &'static str,
+) -> Result<(), String> {
+    tx.rollback().await.map_err(|error| {
         tracing::warn!(target: "astra_services::prompt_delta", context, %error, "prompt delta transaction rollback failed");
-    }
+        format!("{context}: transaction rollback failed: {error}")
+    })
 }
 
 fn prompt_delta_row_string(row: &impl PromptDeltaDbRow, column: &str) -> Result<String, String> {
@@ -556,13 +562,23 @@ pub async fn persist_prompt_request(
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
     let db = pool.get();
-    let mut tx = db.begin().await.map_err(|error| error.to_string())?;
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut tx = connection
+        .connection_mut()
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
     crate::storage::lock_agent_session_write_fence(&mut tx, &input.session_id, &input.user_id)
         .await
         .map_err(|error| format!("lock prompt diagnostic session fence: {error}"))?;
     ensure_session_owner(&mut tx, &input.session_id, &input.user_id).await?;
     if let Some(existing) = load_existing_request(&mut tx, input, &plan.request_id).await? {
-        return existing_prompt_request_or_conflict(input, plan, existing);
+        let persisted = existing_prompt_request_or_conflict(input, plan, existing)?;
+        rollback_prompt_delta_tx(tx, "persist_prompt_request replay").await?;
+        connection.release();
+        return Ok(persisted);
     }
 
     let previous_request = load_previous_request(&mut tx, input).await?;
@@ -763,17 +779,22 @@ pub async fn persist_prompt_request(
     .await;
 
     if let Err(error) = write_result {
-        rollback_prompt_delta_tx(tx, "persist_prompt_request write failure").await;
-        let mut recovery = db.acquire().await.map_err(|source| source.to_string())?;
-        if let Some(existing) =
-            load_existing_request(&mut recovery, input, &plan.request_id).await?
+        if let Err(rollback_error) =
+            rollback_prompt_delta_tx(tx, "persist_prompt_request write failure").await
         {
+            return Err(format!("{error}; {rollback_error}"));
+        }
+        let recovered =
+            load_existing_request(connection.connection_mut(), input, &plan.request_id).await?;
+        connection.release();
+        if let Some(existing) = recovered {
             return existing_prompt_request_or_conflict(input, plan, existing);
         }
         return Err(error);
     }
 
     tx.commit().await.map_err(|error| error.to_string())?;
+    connection.release();
     if astra_core::history_work::instrumentation_enabled() {
         astra_core::history_work::record_rows(
             astra_core::history_work::HistoryWorkSite::PromptDeltaRows,
