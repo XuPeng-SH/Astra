@@ -226,11 +226,30 @@ use astra_core::SharedPool;
 
 pub struct DatabaseResourceGovernor {
     pool: SharedPool,
+    #[cfg(test)]
+    test_faults: DatabaseResourceGovernorTestFaults,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DatabaseResourceGovernorTestFaults {
+    fail_batched_snapshot: bool,
+    fail_active_session_count: bool,
 }
 
 impl DatabaseResourceGovernor {
     pub fn new(pool: SharedPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            test_faults: DatabaseResourceGovernorTestFaults::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_faults(mut self, faults: DatabaseResourceGovernorTestFaults) -> Self {
+        self.test_faults = faults;
+        self
     }
 
     /// Create tables if they don't exist.  Called once at startup from state_builder.
@@ -282,6 +301,10 @@ impl DatabaseResourceGovernor {
     /// active run only; otherwise a user who has more than five persisted chats
     /// would be unable to start a new turn.
     async fn count_active_sessions(&self, user_id: &str) -> u32 {
+        #[cfg(test)]
+        if self.test_faults.fail_active_session_count {
+            return 0;
+        }
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COUNT(DISTINCT session_id) FROM agent_runs \
              WHERE user_id = ? \
@@ -290,12 +313,91 @@ impl DatabaseResourceGovernor {
         .bind(user_id)
         .fetch_optional(self.pool.get())
         .await
-        .unwrap_or(None);
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id,
+                error = %error,
+                "failed to read concurrent session usage; treating that source as unavailable"
+            );
+            None
+        });
         row.map(|r| r.0 as u32).unwrap_or(0)
     }
 
     fn today() -> String {
         chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    async fn load_limit_usage_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<(i64, i64, i64, i64, i64), sqlx::Error> {
+        #[cfg(test)]
+        if self.test_faults.fail_batched_snapshot {
+            return Err(sqlx::Error::Protocol(
+                "injected batched quota snapshot failure".into(),
+            ));
+        }
+        // Limits and daily counters are each keyed rows. Join them to read
+        // every needed scalar once; active-run counting stays separate because
+        // it is unnecessary when the concurrent cap is unlimited.
+        let today = Self::today();
+        sqlx::query_as(
+            "SELECT \
+                CAST(COALESCE(limits.max_concurrent_sessions, ?) AS SIGNED), \
+                CAST(COALESCE(limits.max_sessions_per_day, ?) AS SIGNED), \
+                CAST(COALESCE(limits.max_tokens_per_day, ?) AS SIGNED), \
+                CAST(COALESCE(daily.sessions_created, 0) AS SIGNED), \
+                CAST(COALESCE(daily.tokens_consumed, 0) AS SIGNED) \
+             FROM (SELECT 1 AS singleton) seed \
+             LEFT JOIN resource_limits limits ON limits.user_id = ? \
+             LEFT JOIN resource_usage daily \
+               ON daily.user_id = ? AND daily.usage_date = ?",
+        )
+        .bind(ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS as i32)
+        .bind(ResourceLimits::DEFAULT_MAX_SESSIONS_PER_DAY as i32)
+        .bind(ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY as i64)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(&today)
+        .fetch_one(self.pool.get())
+        .await
+    }
+
+    fn evaluate_session_create_snapshot(
+        max_concurrent_sessions: i64,
+        max_sessions_per_day: i64,
+        max_tokens_per_day: i64,
+        sessions_created: i64,
+        tokens_consumed: i64,
+        active_sessions: i64,
+    ) -> LimitCheck {
+        if max_concurrent_sessions > 0 && active_sessions >= max_concurrent_sessions {
+            return LimitCheck::Denied {
+                limit: ResourceLimitKind::ConcurrentSessions,
+                reason: format!(
+                    "concurrent session limit reached ({active_sessions}/{max_concurrent_sessions})"
+                ),
+            };
+        }
+        if max_sessions_per_day > 0 && sessions_created >= max_sessions_per_day {
+            return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailySessions,
+                reason: format!(
+                    "daily session limit reached ({sessions_created}/{max_sessions_per_day})"
+                ),
+            };
+        }
+        if max_tokens_per_day > 0 && tokens_consumed >= max_tokens_per_day {
+            return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
+                reason: format!(
+                    "daily token budget exhausted ({tokens_consumed}/{max_tokens_per_day})"
+                ),
+            };
+        }
+        LimitCheck::Allowed
     }
 }
 
@@ -386,41 +488,35 @@ impl ResourceGovernor for DatabaseResourceGovernor {
     }
 
     async fn check_run_start(&self, user_id: &str) -> LimitCheck {
-        // Run admission needs three authoritative facts, but not the rest of
-        // ResourceUsage. Fetch them in one statement so a remote database does
-        // not turn an observational quota check into three network round trips.
-        let today = Self::today();
-        let row: Result<(i32, i64, i64, i64), sqlx::Error> = sqlx::query_as(
-            "SELECT \
-                CAST(COALESCE((SELECT max_concurrent_sessions FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
-                CAST(COALESCE((SELECT max_tokens_per_day FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
-                CAST(COALESCE((SELECT tokens_consumed FROM resource_usage WHERE user_id = ? AND usage_date = ?), 0) AS SIGNED), \
-                CAST((SELECT COUNT(DISTINCT session_id) FROM agent_runs WHERE user_id = ? AND status IN ('running', 'paused', 'waiting')) AS SIGNED)",
-        )
-        .bind(user_id)
-        .bind(ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS as i32)
-        .bind(user_id)
-        .bind(ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY as i64)
-        .bind(user_id)
-        .bind(&today)
-        .bind(user_id)
-        .fetch_one(self.pool.get())
-        .await;
-        let (max_concurrent_sessions, max_tokens_per_day, tokens_consumed, active_sessions) =
-            match row {
-                Ok(row) => row,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_services::resource_governor",
-                        user_id,
-                        error = %error,
-                        "failed to read run-start quota snapshot; preserving fail-open admission"
-                    );
-                    return LimitCheck::Allowed;
-                }
-            };
+        let (
+            max_concurrent_sessions,
+            _max_sessions_per_day,
+            max_tokens_per_day,
+            _sessions_created,
+            tokens_consumed,
+        ) = match self.load_limit_usage_snapshot(user_id).await {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_services::resource_governor",
+                    user_id,
+                    error = %error,
+                    "failed to read run-start quota snapshot; preserving fail-open admission"
+                );
+                return LimitCheck::Allowed;
+            }
+        };
+        // A finite concurrent cap intentionally pays one additional, focused
+        // count query after the keyed snapshot. Keeping that count out of the
+        // common unlimited path avoids scanning agent_runs for every turn;
+        // this helper must not be described as universally lower-latency.
+        let active_sessions = if max_concurrent_sessions > 0 {
+            i64::from(self.count_active_sessions(user_id).await)
+        } else {
+            0
+        };
 
-        if max_concurrent_sessions > 0 && active_sessions >= i64::from(max_concurrent_sessions) {
+        if max_concurrent_sessions > 0 && active_sessions >= max_concurrent_sessions {
             return LimitCheck::Denied {
                 limit: ResourceLimitKind::ConcurrentSessions,
                 reason: format!(
@@ -480,43 +576,59 @@ impl ResourceGovernor for DatabaseResourceGovernor {
     }
 
     async fn check_session_create(&self, user_id: &str) -> LimitCheck {
-        let limits = self.get_limits(user_id).await;
-        let usage = self.get_usage(user_id).await;
+        // Session admission needs five scalar facts from two keyed tables.
+        // Read those rows together so the common path does not spend separate
+        // pool checkouts for limits and daily usage. Active-run counting is
+        // conditional: an unlimited concurrent cap does not need that scan.
+        let (
+            max_concurrent_sessions,
+            max_sessions_per_day,
+            max_tokens_per_day,
+            sessions_created,
+            tokens_consumed,
+        ) = match self.load_limit_usage_snapshot(user_id).await {
+            Ok(row) => row,
+            Err(error) => {
+                // Preserve the old independent fail-open behavior if the
+                // batched statement cannot produce a snapshot: a failure in
+                // one source must not hide a denial from another source.
+                tracing::warn!(
+                    target: "astra_services::resource_governor",
+                    user_id,
+                    error = %error,
+                    "failed to read batched session-create quota snapshot; retrying independent reads"
+                );
+                let limits = self.get_limits(user_id).await;
+                let usage = self.get_usage(user_id).await;
+                return Self::evaluate_session_create_snapshot(
+                    i64::from(limits.max_concurrent_sessions),
+                    i64::from(limits.max_sessions_per_day),
+                    i64::try_from(limits.max_tokens_per_day).unwrap_or(i64::MAX),
+                    i64::from(usage.sessions_created),
+                    i64::try_from(usage.tokens_consumed).unwrap_or(i64::MAX),
+                    i64::from(usage.active_sessions),
+                );
+            }
+        };
+        // As above, only users with an explicitly finite concurrent cap need
+        // the active-run scan. Unlimited users keep the one-query path.
+        let active_sessions = if max_concurrent_sessions > 0 {
+            i64::from(self.count_active_sessions(user_id).await)
+        } else {
+            0
+        };
 
-        if limits.max_concurrent_sessions > 0
-            && usage.active_sessions >= limits.max_concurrent_sessions
-        {
-            return LimitCheck::Denied {
-                limit: ResourceLimitKind::ConcurrentSessions,
-                reason: format!(
-                    "concurrent session limit reached ({}/{})",
-                    usage.active_sessions, limits.max_concurrent_sessions
-                ),
-            };
-        }
-
-        if limits.max_sessions_per_day > 0 && usage.sessions_created >= limits.max_sessions_per_day
-        {
-            return LimitCheck::Denied {
-                limit: ResourceLimitKind::DailySessions,
-                reason: format!(
-                    "daily session limit reached ({}/{})",
-                    usage.sessions_created, limits.max_sessions_per_day
-                ),
-            };
-        }
-
-        if limits.max_tokens_per_day > 0 && usage.tokens_consumed >= limits.max_tokens_per_day {
-            return LimitCheck::Denied {
-                limit: ResourceLimitKind::DailyTokens,
-                reason: format!(
-                    "daily token budget exhausted ({}/{})",
-                    usage.tokens_consumed, limits.max_tokens_per_day
-                ),
-            };
-        }
-
-        LimitCheck::Allowed
+        // This remains an observational, non-reserving check. Hard concurrent
+        // enforcement still requires an atomic quota reservation with the
+        // session insert; a read-only check cannot close that race.
+        Self::evaluate_session_create_snapshot(
+            max_concurrent_sessions,
+            max_sessions_per_day,
+            max_tokens_per_day,
+            sessions_created,
+            tokens_consumed,
+            active_sessions,
+        )
     }
 
     async fn record_session_created(&self, user_id: &str) {
@@ -744,6 +856,130 @@ mod tests {
         assert_eq!(limits.max_disk_bytes, 1_073_741_824);
         assert_eq!(limits.max_concurrent_bash, 3);
         assert_eq!(limits.max_sessions_per_day, 0);
+    }
+
+    #[test]
+    fn session_create_fallback_preserves_independent_daily_denials() {
+        let daily_sessions =
+            DatabaseResourceGovernor::evaluate_session_create_snapshot(0, 1, 0, 1, 0, 0);
+        assert!(matches!(
+            daily_sessions,
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailySessions,
+                ..
+            }
+        ));
+
+        let daily_tokens =
+            DatabaseResourceGovernor::evaluate_session_create_snapshot(0, 0, 1, 0, 1, 0);
+        assert!(matches!(
+            daily_tokens,
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
+                ..
+            }
+        ));
+    }
+
+    /// The batch read is an optimization, not a new fail-open policy. This
+    /// live test forces that read to fail and verifies the independent reads
+    /// still preserve the applicable daily denials.
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn database_quota_snapshot_failure_preserves_independent_denials() {
+        let _ = dotenvy::dotenv();
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for the live quota fallback test"
+        );
+        let settings = astra_core::MatrixOneSettings::from_env();
+        let pool = astra_core::SharedPool::new(&settings)
+            .await
+            .expect("create MatrixOne resource governor pool");
+        let governor = DatabaseResourceGovernor::new(pool.clone()).with_test_faults(
+            DatabaseResourceGovernorTestFaults {
+                fail_batched_snapshot: true,
+                fail_active_session_count: false,
+            },
+        );
+        governor
+            .ensure_tables()
+            .await
+            .expect("ensure resource tables");
+        let user_id = format!("quota-fallback-{}", uuid::Uuid::new_v4());
+
+        governor
+            .set_limits(
+                &user_id,
+                ResourceLimits {
+                    max_sessions_per_day: 1,
+                    max_tokens_per_day: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        governor.record_session_created(&user_id).await;
+        governor.record_tokens(&user_id, 1).await;
+        assert!(matches!(
+            governor.check_session_create(&user_id).await,
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailySessions,
+                ..
+            }
+        ));
+
+        sqlx::query(
+            "UPDATE resource_usage SET sessions_created = 0
+             WHERE user_id = ? AND usage_date = ?",
+        )
+        .bind(&user_id)
+        .bind(DatabaseResourceGovernor::today())
+        .execute(pool.get())
+        .await
+        .expect("reset session counter for token fallback assertion");
+        assert!(matches!(
+            governor.check_session_create(&user_id).await,
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
+                ..
+            }
+        ));
+
+        let run_governor = DatabaseResourceGovernor::new(pool.clone()).with_test_faults(
+            DatabaseResourceGovernorTestFaults {
+                fail_batched_snapshot: false,
+                fail_active_session_count: true,
+            },
+        );
+        run_governor
+            .set_limits(
+                &user_id,
+                ResourceLimits {
+                    max_concurrent_sessions: 1,
+                    max_tokens_per_day: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            run_governor.check_run_start(&user_id).await,
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
+                ..
+            }
+        ));
+
+        sqlx::query("DELETE FROM resource_usage WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("clean quota fallback usage");
+        sqlx::query("DELETE FROM resource_limits WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("clean quota fallback limits");
     }
 
     #[tokio::test]

@@ -1072,6 +1072,50 @@ where
     Ok(row.is_some())
 }
 
+/// Facts established while admitting a session-scoped write.
+///
+/// These values are valid only for the immediate mutation in the surrounding
+/// transaction, before that transaction mutates the admitted session row.
+/// They are deliberately not a process-wide cache: the row lock held by the
+/// admission transaction is what makes the snapshot safe to reuse.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SessionWriteAdmissionFacts {
+    session_status: String,
+}
+
+impl SessionWriteAdmissionFacts {
+    pub(crate) fn session_status(&self) -> &str {
+        &self.session_status
+    }
+}
+
+/// Facts established by the canonical session -> execution-slot admission
+/// order. The slot tuple is already protected by the transaction's row/key
+/// lock and can be reused by the immediate run mutation for this exact
+/// session. It must not outlive that transaction or be reused after the slot
+/// is mutated.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SessionExecutionAdmissionFacts {
+    user_id: String,
+    session_id: String,
+    session_status: String,
+    slot: Option<(String, chrono::NaiveDateTime)>,
+}
+
+impl SessionExecutionAdmissionFacts {
+    pub(crate) fn belongs_to(&self, user_id: &str, session_id: &str) -> bool {
+        self.user_id == user_id && self.session_id == session_id
+    }
+
+    pub(crate) fn session_is_active(&self) -> bool {
+        self.session_status == "active"
+    }
+
+    pub(crate) fn slot(&self) -> Option<&(String, chrono::NaiveDateTime)> {
+        self.slot.as_ref()
+    }
+}
+
 /// Admit one transaction that will append owner-scoped session child rows.
 ///
 /// Existing sessions are locked before any child insert and deleting or
@@ -1084,6 +1128,25 @@ pub async fn admit_session_event_write<T>(
     user_id: &str,
     allow_lazy_create: bool,
 ) -> Result<(), sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    admit_session_event_write_with_facts(tx, session_id, user_id, allow_lazy_create)
+        .await
+        .map(|_| ())
+}
+
+/// Admit a session-child write and return the locked session status.
+///
+/// The unit-returning wrapper above remains the default for callers that do
+/// not need the fact. Transaction boundaries that immediately inspect the
+/// same row should use this variant to avoid a duplicate `FOR UPDATE` read.
+pub(crate) async fn admit_session_event_write_with_facts<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+    allow_lazy_create: bool,
+) -> Result<SessionWriteAdmissionFacts, sqlx::Error>
 where
     T: TransactionConnection,
 {
@@ -1121,7 +1184,9 @@ where
         .fetch_optional(&mut **tx)
         .await?;
         return if tombstoned.is_none() {
-            Ok(())
+            Ok(SessionWriteAdmissionFacts {
+                session_status: status,
+            })
         } else {
             Err(sqlx::Error::RowNotFound)
         };
@@ -1133,8 +1198,8 @@ where
         Ok(()) | Err(sqlx::Error::RowNotFound) => {}
         Err(error) => return Err(error),
     }
-    let created: Option<i32> = query_scalar(
-        "SELECT 1 FROM agent_sessions
+    let created: Option<String> = query_scalar(
+        "SELECT status FROM agent_sessions
          WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
          LIMIT 1 FOR UPDATE",
     )
@@ -1150,8 +1215,8 @@ where
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if created.is_some() && tombstoned.is_none() {
-        Ok(())
+    if let (Some(session_status), true) = (created, tombstoned.is_none()) {
+        Ok(SessionWriteAdmissionFacts { session_status })
     } else {
         Err(sqlx::Error::RowNotFound)
     }
@@ -1172,20 +1237,48 @@ pub async fn admit_session_execution_write<T>(
 where
     T: TransactionConnection,
 {
-    admit_session_event_write(tx, session_id, user_id, false).await?;
+    admit_session_execution_write_with_facts(tx, session_id, user_id)
+        .await
+        .map(|_| ())
+}
+
+/// Establish the session and execution-slot locks once and return the facts
+/// needed by the immediate mutation. The returned slot is not a cache; it is
+/// a transaction-local snapshot protected by the locks acquired below.
+pub(crate) async fn admit_session_execution_write_with_facts<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+) -> Result<SessionExecutionAdmissionFacts, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let session = admit_session_event_write_with_facts(tx, session_id, user_id, false).await?;
 
     // Lock the derived slot before any run row. A missing slot is a valid
     // state; the SELECT still establishes the canonical access order for
     // engines that protect the key range on FOR UPDATE.
-    let _: Option<String> = query_scalar(
-        "SELECT run_id FROM agent_session_execution_slots
+    let slot = query(
+        "SELECT run_id, updated_at FROM agent_session_execution_slots
          WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
     .fetch_optional(&mut **tx)
-    .await?;
-    Ok(())
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>((
+            row.try_get::<String, _>("run_id")?,
+            row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
+        ))
+    })
+    .transpose()?;
+    Ok(SessionExecutionAdmissionFacts {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+        session_status: session.session_status,
+        slot,
+    })
 }
 
 /// Admit the session and execution slot before locking an exact run.
@@ -1200,7 +1293,24 @@ pub async fn admit_session_scoped_run_write<T>(
 where
     T: TransactionConnection,
 {
-    admit_session_execution_write(tx, session_id, user_id).await?;
+    admit_session_scoped_run_write_with_facts(tx, session_id, user_id, run_id, allow_missing_run)
+        .await
+        .map(|(run_exists, _)| run_exists)
+}
+
+/// Admit a session-scoped run and return the already-locked execution facts
+/// for callers that immediately mutate the same run/slot.
+pub(crate) async fn admit_session_scoped_run_write_with_facts<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+    run_id: &str,
+    allow_missing_run: bool,
+) -> Result<(bool, SessionExecutionAdmissionFacts), sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let facts = admit_session_execution_write_with_facts(tx, session_id, user_id).await?;
     let run_exists: Option<i32> = query_scalar(
         "SELECT 1 FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
@@ -1213,7 +1323,7 @@ where
     if run_exists.is_none() && !allow_missing_run {
         return Err(sqlx::Error::RowNotFound);
     }
-    Ok(run_exists.is_some())
+    Ok((run_exists.is_some(), facts))
 }
 
 pub async fn agent_event_exists_for_user_session<'e, E>(
@@ -1417,12 +1527,13 @@ where
 {
     // Session creation/backfill establishes the fence before normal child
     // writes. Fast-path the common case so every manifest/event write does not
-    // pay an INSERT IGNORE round trip. Keep the insert as a repair path for
-    // lazy-created or externally provisioned sessions, then lock the row again
-    // before inspecting its lifecycle state.
+    // pay an INSERT IGNORE round trip. If this transaction inserted the fence,
+    // the inserted row is already write-locked until commit and its nullable
+    // deletion fields are known to be clear. Only the duplicate-key path needs
+    // a second read to inspect a fence owned by an earlier transaction.
     let state = match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
         AgentSessionWriteFenceState::Missing => {
-            query(
+            let result = query(
                 "INSERT IGNORE INTO agent_session_lifecycle_fences \
                  (session_id, user_id, created_at, updated_at) \
                  VALUES (?, ?, NOW(6), NOW(6))",
@@ -1431,7 +1542,11 @@ where
             .bind(user_id)
             .execute(&mut **tx)
             .await?;
-            lock_existing_agent_session_write_fence(tx, session_id, user_id).await?
+            if result.rows_affected() > 0 {
+                AgentSessionWriteFenceState::Writable
+            } else {
+                lock_existing_agent_session_write_fence(tx, session_id, user_id).await?
+            }
         }
         state => state,
     };

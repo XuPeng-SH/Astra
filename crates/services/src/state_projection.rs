@@ -1235,33 +1235,22 @@ impl DatabaseStateProjectionStore {
                 entity: session_id.to_string(),
                 source,
             })?;
-        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false)
-            .await
-            .map_err(|_| StateProjectionError::SessionNotActive {
+        let session_admission = crate::storage::admit_session_event_write_with_facts(
+            &mut tx, session_id, user_id, false,
+        )
+        .await
+        .map_err(|source| match source {
+            sqlx::Error::RowNotFound => StateProjectionError::SessionNotActive {
                 user_id: user_id.to_string(),
                 session_id: session_id.to_string(),
-            })?;
-        let session_status = sqlx::query(
-            "SELECT status FROM agent_sessions
-             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "validate_skill_activation_session",
-            entity: session_id.to_string(),
-            source,
-        })?
-        .map(|row| row.try_get::<String, _>("status"))
-        .transpose()
-        .map_err(|source| StateProjectionError::Database {
-            operation: "validate_skill_activation_session",
-            entity: session_id.to_string(),
-            source,
+            },
+            source => StateProjectionError::Database {
+                operation: "validate_skill_activation_session",
+                entity: session_id.to_string(),
+                source,
+            },
         })?;
-        if session_status.as_deref() != Some("active") {
+        if session_admission.session_status() != "active" {
             return Err(StateProjectionError::SessionNotActive {
                 user_id: user_id.to_string(),
                 session_id: session_id.to_string(),
