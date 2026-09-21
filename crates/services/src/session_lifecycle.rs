@@ -172,12 +172,6 @@ const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[
              WHERE (session_id = ? AND user_id = ?)
                 OR (origin_session_id = ? AND user_id = ?)",
     },
-    SessionDeleteStatement {
-        label: "session_history_chunks",
-        sql: "DELETE FROM session_history_chunks
-             WHERE (session_id = ? AND user_id = ?)
-                OR (source_session_id = ? AND user_id = ?)",
-    },
 ];
 
 const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
@@ -323,10 +317,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM edge_pending_dispatch WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_artifacts_grants",
-        sql: "DELETE FROM session_artifacts_grants WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "tool_invocation_archive_chunks",
         sql: "DELETE FROM tool_invocation_archive_chunks WHERE session_id = ? AND user_id = ?",
     },
@@ -373,10 +363,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "ctx_decision_audits",
         sql: "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "session_state_revisions",
-        sql: "DELETE FROM session_state_revisions WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "session_delegations",

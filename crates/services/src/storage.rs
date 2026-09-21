@@ -122,7 +122,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-21-v86";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v87";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2350,6 +2350,45 @@ async fn retire_session_deletion_tombstones(
     Ok(())
 }
 
+/// Retire state-projection tables whose supported runtime owners were removed.
+///
+/// These tables are intentionally handled only while moving to a new schema
+/// contract. The current contract has no reader or writer for them, and their
+/// rows cannot be losslessly converted into an authoritative current table.
+/// Drop both empty and populated instances explicitly: retaining a renamed
+/// archive would let session-owned rows escape the normal owner/session hard
+/// delete boundary.
+async fn retire_unused_session_projection_tables(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    for table in [
+        "session_state_revisions",
+        "session_history_chunks",
+        "session_artifacts_grants",
+    ] {
+        if !table_exists(pool, database, table).await? {
+            continue;
+        }
+
+        let table_sql = crate::snapshot_sql::quote_mysql_identifier(table);
+        let has_rows = query(&format!("SELECT 1 FROM {table_sql} LIMIT 1"))
+            .fetch_optional(pool)
+            .await?
+            .is_some();
+
+        query(&format!("DROP TABLE IF EXISTS {table_sql}"))
+            .execute(pool)
+            .await?;
+        tracing::info!(
+            retired_table = table,
+            retired_rows_present = has_rows,
+            "retired obsolete session projection table from the current contract"
+        );
+    }
+    Ok(())
+}
+
 /// The current admission protocol stores materialized usage beside the
 /// durable gate. `CREATE TABLE IF NOT EXISTS` cannot add those columns to a
 /// database created by an older contract, and this branch intentionally has
@@ -4158,6 +4197,7 @@ async fn ensure_core_schema_while_leased(
     // them before table-specific shape checks run so every persistence path
     // observes the same principal contract during startup.
     migrate_user_identity_column_widths(&pool, &settings.database).await?;
+    retire_unused_session_projection_tables(&pool, &settings.database).await?;
 
     // The executor observes the exact CREATE TABLE statements that bootstrap
     // executes. This makes DDL the declaration and the ownership catalog its
@@ -6272,34 +6312,6 @@ async fn ensure_core_schema_while_leased(
     }
     core_schema_create!(
         pool,
-        "session_state_revisions",
-        "CREATE TABLE IF NOT EXISTS session_state_revisions (
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            monotonic_id BIGINT NOT NULL DEFAULT 0,
-            revision_hash VARCHAR(96) NOT NULL,
-            device_fingerprint VARCHAR(128) NOT NULL,
-            transcript_high_watermark BIGINT NOT NULL DEFAULT 0,
-            run_event_high_watermark BIGINT NOT NULL DEFAULT 0,
-            state_projection_hash VARCHAR(96) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id),
-            INDEX idx_state_revisions_user_updated (user_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "session_state_revisions",
-        &["user_id", "session_id"],
-        "ALTER TABLE session_state_revisions ADD PRIMARY KEY (user_id, session_id)",
-    )
-    .await?;
-    core_schema_create!(
-        pool,
         "session_device_leases",
         "CREATE TABLE IF NOT EXISTS session_device_leases (
             lease_id VARCHAR(128) NOT NULL,
@@ -7118,139 +7130,9 @@ async fn ensure_core_schema_while_leased(
         .await?;
     }
 
-    core_schema_create!(pool, "session_history_chunks",
-        "CREATE TABLE IF NOT EXISTS session_history_chunks (
-            chunk_id VARCHAR(128) PRIMARY KEY,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            source_session_id VARCHAR(128) NULL,
-            seq_start BIGINT NOT NULL DEFAULT 0,
-            seq_end BIGINT NOT NULL DEFAULT 0,
-            item_seq_start BIGINT NULL,
-            item_seq_end BIGINT NULL,
-            turn_start BIGINT NULL,
-            turn_end BIGINT NULL,
-            chunk_type VARCHAR(64) NOT NULL,
-            source_table VARCHAR(64) NOT NULL,
-            source_id VARCHAR(128) NOT NULL,
-            content_text LONGTEXT NOT NULL,
-            content_hash VARCHAR(128) NOT NULL,
-            token_estimate INT NOT NULL DEFAULT 0,
-            provenance_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_history_user_chunk_created (user_id, chunk_type, created_at),
-            INDEX idx_history_owner_session_seq (user_id, session_id, seq_start, seq_end),
-            INDEX idx_history_owner_source_session (user_id, source_session_id, chunk_type, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    for removed_index in ["idx_history_session_seq", "idx_history_source_session"] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "session_history_chunks",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_history_owner_session_seq",
-            &["user_id", "session_id", "seq_start", "seq_end"][..],
-            "ALTER TABLE session_history_chunks ADD INDEX idx_history_owner_session_seq (user_id, session_id, seq_start, seq_end)",
-        ),
-        (
-            "idx_history_owner_source_session",
-            &["user_id", "source_session_id", "chunk_type", "created_at"][..],
-            "ALTER TABLE session_history_chunks ADD INDEX idx_history_owner_source_session (user_id, source_session_id, chunk_type, created_at)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_history_chunks",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-
     query("DROP TABLE IF EXISTS session_artifact_grants")
         .execute(&pool)
         .await?;
-
-    core_schema_create!(pool, "session_artifacts_grants",
-        "CREATE TABLE IF NOT EXISTS session_artifacts_grants (
-            grant_id VARCHAR(128) PRIMARY KEY,
-            artifact_id VARCHAR(128) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            root_run_id VARCHAR(128) NOT NULL,
-            source_run_id VARCHAR(128) NOT NULL,
-            target_run_id VARCHAR(128) NULL,
-            target_delegation_id VARCHAR(128) NULL,
-            grant_scope VARCHAR(32) NOT NULL,
-            granted_by VARCHAR(128) NOT NULL,
-            reason VARCHAR(128) NULL,
-            expires_at DATETIME(6) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_artifacts_grant_target (user_id, session_id, artifact_id, grant_scope, target_run_id, target_delegation_id),
-            INDEX idx_artifacts_grants_root (user_id, root_run_id, grant_scope, created_at),
-            INDEX idx_artifacts_grants_target (user_id, session_id, target_run_id, artifact_id, expires_at),
-            INDEX idx_artifacts_grants_delegation_target (user_id, session_id, target_delegation_id, artifact_id, expires_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    for (index, expected_columns, ddl) in [
-        (
-            "uq_artifacts_grant_target",
-            &[
-                "user_id",
-                "session_id",
-                "artifact_id",
-                "grant_scope",
-                "target_run_id",
-                "target_delegation_id",
-            ][..],
-            "ALTER TABLE session_artifacts_grants ADD UNIQUE KEY uq_artifacts_grant_target (user_id, session_id, artifact_id, grant_scope, target_run_id, target_delegation_id)",
-        ),
-        (
-            "idx_artifacts_grants_target",
-            &[
-                "user_id",
-                "session_id",
-                "target_run_id",
-                "artifact_id",
-                "expires_at",
-            ][..],
-            "ALTER TABLE session_artifacts_grants ADD INDEX idx_artifacts_grants_target (user_id, session_id, target_run_id, artifact_id, expires_at)",
-        ),
-        (
-            "idx_artifacts_grants_delegation_target",
-            &[
-                "user_id",
-                "session_id",
-                "target_delegation_id",
-                "artifact_id",
-                "expires_at",
-            ][..],
-            "ALTER TABLE session_artifacts_grants ADD INDEX idx_artifacts_grants_delegation_target (user_id, session_id, target_delegation_id, artifact_id, expires_at)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_artifacts_grants",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
 
     fail_if_obsolete_shape(
         &pool,

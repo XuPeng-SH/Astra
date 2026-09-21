@@ -2369,26 +2369,6 @@ async fn phase2_web_hydration_schema_contract() {
         ["user_id", "session_id", "state", "last_accessed_at"],
         "capacity and deterministic LRU operations require one session/state/access index"
     );
-
-    let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
-    for expected in [
-        "monotonic_id",
-        "revision_hash",
-        "device_fingerprint",
-        "transcript_high_watermark",
-        "run_event_high_watermark",
-        "state_projection_hash",
-    ] {
-        assert!(
-            revision_columns.iter().any(|column| column == expected),
-            "session_state_revisions missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_state_revisions").await,
-        ["user_id", "session_id"],
-        "session_state_revisions primary key must carry the owner boundary"
-    );
 }
 
 #[tokio::test]
@@ -2771,50 +2751,6 @@ async fn phase4_state_projection_schema_contract() {
         "plan_step_runs must not keep an ownerless session scan index"
     );
 
-    let history_chunks = column_names(&pool, &schema, "session_history_chunks").await;
-    for expected in [
-        "user_id",
-        "session_id",
-        "source_session_id",
-        "seq_start",
-        "seq_end",
-    ] {
-        assert!(
-            history_chunks.iter().any(|column| column == expected),
-            "session_history_chunks missing {expected}"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_history_chunks",
-            "idx_history_owner_session_seq"
-        )
-        .await,
-        ["user_id", "session_id", "seq_start", "seq_end"],
-        "history chunk seq lookup must stay owner/session-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_history_chunks",
-            "idx_history_owner_source_session"
-        )
-        .await,
-        ["user_id", "source_session_id", "chunk_type", "created_at"],
-        "history source-session lookup must stay owner-bound"
-    );
-    for removed_index in ["idx_history_session_seq", "idx_history_source_session"] {
-        assert!(
-            index_columns(&pool, &schema, "session_history_chunks", removed_index)
-                .await
-                .is_empty(),
-            "session_history_chunks must not keep ownerless history index {removed_index}"
-        );
-    }
-
     let state_items = column_names(&pool, &schema, "session_state_items").await;
     for expected in [
         "scope",
@@ -3076,74 +3012,6 @@ async fn phase4_state_projection_schema_contract() {
             "artifact_id"
         ],
         "artifact same-root ACL must use root/scope index"
-    );
-
-    let grants = column_names(&pool, &schema, "session_artifacts_grants").await;
-    for expected in [
-        "grant_id",
-        "artifact_id",
-        "root_run_id",
-        "source_run_id",
-        "target_run_id",
-        "target_delegation_id",
-        "grant_scope",
-    ] {
-        assert!(
-            grants.iter().any(|column| column == expected),
-            "session_artifacts_grants missing {expected}"
-        );
-    }
-    assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "session_artifacts_grants",
-            "uq_artifacts_grant_target"
-        )
-        .await,
-        [
-            "user_id",
-            "session_id",
-            "artifact_id",
-            "grant_scope",
-            "target_run_id",
-            "target_delegation_id"
-        ],
-        "artifact grant idempotency must include owner/session"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_artifacts_grants",
-            "idx_artifacts_grants_target"
-        )
-        .await,
-        [
-            "user_id",
-            "session_id",
-            "target_run_id",
-            "artifact_id",
-            "expires_at"
-        ],
-        "run artifact grants must use a target/artifact/expiry index"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_artifacts_grants",
-            "idx_artifacts_grants_delegation_target"
-        )
-        .await,
-        [
-            "user_id",
-            "session_id",
-            "target_delegation_id",
-            "artifact_id",
-            "expires_at"
-        ],
-        "delegation artifact grants must use a target/artifact/expiry index"
     );
 }
 

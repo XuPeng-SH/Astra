@@ -1827,7 +1827,6 @@ async fn cleanup_session_delete_fixture_for_owner(
         "ctx_decision_audits",
         "ctx_snapshots",
         "transcript_pages",
-        "session_artifacts_grants",
         "session_artifacts",
         "eval_calibration_assessments",
         "conversation_log",
@@ -7670,8 +7669,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let foreign_skill_eval_id = Uuid::new_v4().to_string();
     let owner_artifact_id = Uuid::new_v4().to_string();
     let foreign_artifact_id = Uuid::new_v4().to_string();
-    let owner_artifact_grant_id = Uuid::new_v4().to_string();
-    let foreign_artifact_grant_id = Uuid::new_v4().to_string();
     let owner_workspace_id = format!("workspace-{}", Uuid::new_v4());
     let owner_workspace_without_debt_id = format!("workspace-{}", Uuid::new_v4());
     let foreign_workspace_id = format!("workspace-{}", Uuid::new_v4());
@@ -7875,19 +7872,12 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert session execution slot");
     }
 
-    for (user_id, run_id, artifact_id, grant_id, marker) in [
-        (
-            &owner_user_id,
-            &owner_run_id,
-            &owner_artifact_id,
-            &owner_artifact_grant_id,
-            "owner",
-        ),
+    for (user_id, run_id, artifact_id, marker) in [
+        (&owner_user_id, &owner_run_id, &owner_artifact_id, "owner"),
         (
             &other_user_id,
             &foreign_run_id,
             &foreign_artifact_id,
-            &foreign_artifact_grant_id,
             "foreign",
         ),
     ] {
@@ -7906,22 +7896,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .execute(&pool)
         .await
         .expect("insert session artifact");
-
-        sqlx::query(
-            "INSERT INTO session_artifacts_grants \
-             (grant_id, artifact_id, user_id, session_id, root_run_id, source_run_id, grant_scope, granted_by, reason) \
-             VALUES (?, ?, ?, ?, ?, ?, 'same_root_tree', ?, 'session_delete_fixture')",
-        )
-        .bind(grant_id)
-        .bind(artifact_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .bind(run_id)
-        .bind(user_id)
-        .execute(&pool)
-        .await
-        .expect("insert session artifact grant");
     }
 
     for (user_id, event_id, context_capture_id, decision_id, marker) in [
@@ -8105,10 +8079,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
     assert_eq!(deleted_rows_for_table(&delete_audit, "harness_items"), 1);
     assert_eq!(
-        deleted_rows_for_table(&delete_audit, "session_artifacts_grants"),
-        1
-    );
-    assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
         1
     );
@@ -8129,7 +8099,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
             "agent_session_execution_slots",
         ),
         ("conversation_log", "conversation_log"),
-        ("session_artifacts_grants", "session_artifacts_grants"),
         ("session_artifacts", "session_artifacts"),
         ("transcript_pages", "transcript_pages"),
         (

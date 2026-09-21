@@ -551,35 +551,15 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / runtime session persistence",
         product_owner="web/session transcript pagination",
     ),
-    "session_history_chunks": TableMetadata(
-        semantic_owner="astra_services::session_lifecycle / history search",
-        state_class="derived search/history projection",
-        primary_query="history chunk lookup by owner/session/source metadata",
-        retention_policy="retain while history search and session cleanup need chunk metadata",
-        rebuildability="rebuildable only if source transcript/history remains complete",
-        merge_guidance="do not merge with transcript until search/query owners and retention are unified",
-        migration_owner="astra_services::storage",
-        product_owner="session history search and lifecycle cleanup",
-    ),
     "session_artifacts": TableMetadata(
         semantic_owner="astra_services::session_artifact_store / artifact_retention_sweeper",
         state_class="durable session artifact fact",
         primary_query="artifact lookup/list by user_id, session_id, artifact_id, artifact_kind, source, owner_run_id, root_run_id, access_scope, status, and retention_until",
-        retention_policy="retain while artifact previews, manifest refs, state items, citations, grants, and project retention need the content_json; retention sweeper marks expiring/expired and session hard delete removes owner/session rows after grants",
+        retention_policy="retain while artifact previews, manifest refs, state items, citations, and project retention need the content_json; retention sweeper marks expiring/expired and session hard delete removes owner/session rows",
         rebuildability="not rebuildable after content_json, metadata, cold_storage_ref, derived_from_artifact_id, and reference counters are lost",
-        merge_guidance="keep separate from session_artifacts_grants; artifacts own content and retention state while grants own cross-run/delegation visibility",
+        merge_guidance="keep separate from context manifests and state items; artifacts own content and retention state while callers enforce owner/run visibility",
         migration_owner="astra_services::storage / session_artifact_store",
         product_owner="work surface artifacts, previews, retention, delegation visibility",
-    ),
-    "session_artifacts_grants": TableMetadata(
-        semantic_owner="astra_services::state_projection / artifact grants",
-        state_class="durable artifact visibility grant fact",
-        primary_query="artifact grant lookup by user_id, session_id, artifact_id, grant_scope, target_run_id, target_delegation_id, root_run_id, and expires_at",
-        retention_policy="retain while delegated runs or sibling tasks may access granted artifacts; session hard delete removes grants before artifact rows",
-        rebuildability="not rebuildable after grant_scope, target_run_id/delegation_id, reason, and expires_at are lost",
-        merge_guidance="keep separate from session_artifacts; grants are visibility/control-plane facts with many targets per artifact",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="artifact sharing across delegation tree and work surface permissions",
     ),
     "prompt_request_records": TableMetadata(
         semantic_owner="astra_services::prompt_delta",
@@ -850,16 +830,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from agent_events and context_manifests; rejected identity claims must not overwrite canonical observations or grow one row per attempted hash",
         migration_owner="astra_services::storage / observation_capture",
         product_owner="observation integrity diagnostics and runtime maintenance",
-    ),
-    "session_state_revisions": TableMetadata(
-        semantic_owner="astra_services::state_projection",
-        state_class="durable session state revision watermark",
-        primary_query="current revision and projection hash by user_id/session_id; updated sessions by user_id/updated_at",
-        retention_policy="retain with the session while device sync, state projection integrity checks, and high-watermark reconciliation need monotonic revision state; session hard delete removes owner/session row",
-        rebuildability="not safely rebuildable once monotonic_id, transcript/run high-watermarks, and device fingerprint lineage are lost",
-        merge_guidance="keep separate from session_state_items; this is the session-level revision/watermark authority, not individual projected state",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="session state sync and projection integrity",
     ),
     "session_device_leases": TableMetadata(
         semantic_owner="runtime::server::session_handlers",
@@ -1942,6 +1912,100 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         rationale=(
             "session_sync_log was a best-effort audit side effect, not a recovery or product fact; "
             "removing it reduces schema surface without losing durable sync state"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_state_revisions",
+        decision="removed",
+        current_read_paths=[
+            "none; the session-state endpoint derives the revision from request input and live transcript/run watermarks"
+        ],
+        current_write_paths=[
+            "none; the hydration write-only snapshot path was removed from session_handlers"
+        ],
+        user_api_impact=(
+            "the response still returns monotonic_id and revision_hash, while rollback detection "
+            "continues to compare the request hash with the freshly derived revision"
+        ),
+        migration_backfill=(
+            "v87 explicitly retires and drops the obsolete table during contract upgrade; no "
+            "lossy row conversion is attempted because no runtime reader consumes these snapshots"
+        ),
+        rollback=(
+            "rollback requires explicitly restoring the retired persistence path; the endpoint's "
+            "revision calculation is independent of the retired snapshot"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/runtime/src/server/session/session_handlers.rs::get_session_state_handler",
+            "crates/services/src/storage.rs::retire_unused_session_projection_tables",
+        ],
+        rationale=(
+            "the table was write-only state projection baggage: every hydration paid an UPDATE/INSERT "
+            "race, but no production path read it for sync, recovery, or authorization"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_history_chunks",
+        decision="removed",
+        current_read_paths=[
+            "none; history page/search/around now use session_transcript_items as the canonical history source"
+        ],
+        current_write_paths=[
+            "none in production; repository writes were confined to ignored fixtures and obsolete benchmarks"
+        ],
+        user_api_impact=(
+            "history tools retain canonical transcript paging, root-run filtering, search, and around-turn "
+            "behavior; obsolete chunk-only rows are not part of the supported history API"
+        ),
+        migration_backfill=(
+            "v87 explicitly retires and drops the obsolete table during contract upgrade; no "
+            "lossy conversion into transcript rows is attempted"
+        ),
+        rollback=(
+            "rollback requires reintroducing the chunk reader and schema; retired rows are available "
+            "only if an external export was made before the clean-contract upgrade"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/runtime/src/server/tool_session_history.rs::history_search",
+            "crates/runtime/src/server/tool_session_history.rs::session_history_tools_filter_child_agent_rows_on_matrixone",
+            "crates/services/src/storage.rs::retire_unused_session_projection_tables",
+        ],
+        rationale=(
+            "the chunk projection had a production reader but no production population path; it added a "
+            "second history source and an extra search query without being part of the canonical transcript"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_artifacts_grants",
+        decision="removed",
+        current_read_paths=[
+            "none; no production caller remains after removing the unused grant ACL method"
+        ],
+        current_write_paths=[
+            "none; grant inserts existed only in ignored integration fixtures and had no product creation API"
+        ],
+        user_api_impact=(
+            "artifact access remains owner/session/run scoped through session_artifacts and existing artifact "
+            "retrieval paths; the unexposed grant-only cross-run feature is retired"
+        ),
+        migration_backfill=(
+            "v87 explicitly retires and drops the obsolete table during contract upgrade; grant "
+            "records are not silently converted into artifact content"
+        ),
+        rollback=(
+            "rollback requires a deliberate grant API, writer, revocation semantics, and enforcement path; "
+            "the retired grant rows are not a supported permission source"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/services/src/state_projection.rs::DatabaseStateProjectionStore",
+            "crates/services/src/storage.rs::retire_unused_session_projection_tables",
+        ],
+        rationale=(
+            "this was an overdesigned control-plane table with an enforcement reader but no production grant "
+            "creation path or caller, so it could not provide a supported permission capability"
         ),
     ),
     ConsolidationReview(
