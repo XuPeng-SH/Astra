@@ -650,6 +650,143 @@ async fn assert_checkpoint_history_migration(db: &IsolatedDatabase) -> Result<()
     Ok(())
 }
 
+async fn assert_legacy_memoria_identity_migration(db: &IsolatedDatabase) -> Result<(), String> {
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("bootstrap current Memoria identity schema fixture: {error}"))?;
+
+    query(
+        "CREATE TABLE auth_memoria_identities (
+            memoria_user_id VARCHAR(128) PRIMARY KEY,
+            astra_user_id VARCHAR(128) NOT NULL UNIQUE,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_auth_memoria_astra_user (astra_user_id)
+        )",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("create legacy Memoria identity table: {error}"))?;
+    query(
+        "INSERT INTO auth_memoria_identities
+         (memoria_user_id, astra_user_id, created_at)
+         VALUES ('legacy-memoria-subject', 'legacy-astra-user', '2026-09-21 12:34:56.123456')",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("seed legacy Memoria identity: {error}"))?;
+    query(
+        "UPDATE astra_schema_contracts
+         SET contract_version = '2026-09-21-v85'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("mark schema before Memoria identity migration: {error}"))?;
+
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("migrate legacy Memoria identity: {error}"))?;
+
+    let old_table_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'auth_memoria_identities'",
+    )
+    .bind(&db.settings.database)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("check retired Memoria identity table: {error}"))?;
+    if old_table_count != 0 {
+        return Err("legacy Memoria identity table survived migration".to_string());
+    }
+
+    let migrated: i64 = query_scalar(
+        "SELECT COUNT(*) FROM auth_external_identities
+         WHERE provider_id = 'memoria:legacy'
+           AND external_subject = 'legacy-memoria-subject'
+           AND astra_user_id = 'legacy-astra-user'
+           AND created_at = '2026-09-21 12:34:56.123456'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("check migrated Memoria identity: {error}"))?;
+    if migrated != 1 {
+        return Err(format!("migrated Memoria identities = {migrated}, want 1"));
+    }
+
+    query(
+        "UPDATE astra_schema_contracts
+         SET contract_version = '2026-09-21-v85'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("mark schema for repeated Memoria migration: {error}"))?;
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("repeat legacy Memoria identity migration: {error}"))?;
+    let repeated: i64 = query_scalar(
+        "SELECT COUNT(*) FROM auth_external_identities
+         WHERE provider_id = 'memoria:legacy'
+           AND external_subject = 'legacy-memoria-subject'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("count repeated Memoria identity migration: {error}"))?;
+    if repeated != 1 {
+        return Err(format!("repeated Memoria identities = {repeated}, want 1"));
+    }
+
+    query(
+        "CREATE TABLE auth_memoria_identities (
+            memoria_user_id VARCHAR(128) PRIMARY KEY,
+            astra_user_id VARCHAR(128) NOT NULL UNIQUE,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_auth_memoria_astra_user (astra_user_id)
+        )",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("create conflicting legacy Memoria table: {error}"))?;
+    query(
+        "INSERT INTO auth_memoria_identities (memoria_user_id, astra_user_id)
+         VALUES ('legacy-memoria-subject', 'different-astra-user')",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("seed conflicting legacy Memoria identity: {error}"))?;
+    query(
+        "UPDATE astra_schema_contracts
+         SET contract_version = '2026-09-21-v85'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("mark schema before conflict check: {error}"))?;
+    let error = ensure_core_schema(&db.settings, "mysql")
+        .await
+        .expect_err("conflicting legacy Memoria mapping must block migration");
+    if !error
+        .to_string()
+        .contains("legacy Memoria identity conflicts")
+    {
+        return Err(format!(
+            "unexpected legacy identity conflict error: {error}"
+        ));
+    }
+    let source_table_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'auth_memoria_identities'",
+    )
+    .bind(&db.settings.database)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("check retained conflicting source table: {error}"))?;
+    if source_table_count != 1 {
+        return Err("conflicting migration dropped the source table".to_string());
+    }
+    Ok(())
+}
+
 async fn assert_deletion_tombstone_migration(db: &IsolatedDatabase) -> Result<(), String> {
     ensure_core_schema(&db.settings, "mysql")
         .await
@@ -820,4 +957,13 @@ async fn deletion_tombstone_schema_upgrade_migrates_rows_and_drops_redundant_tab
     let result = assert_deletion_tombstone_migration(&db).await;
     db.cleanup().await;
     result.expect("deletion tombstone schema upgrade");
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn legacy_memoria_identity_schema_upgrade_migrates_rows_and_drops_source_table() {
+    let db = IsolatedDatabase::new().await;
+    let result = assert_legacy_memoria_identity_migration(&db).await;
+    db.cleanup().await;
+    result.expect("legacy Memoria identity schema upgrade");
 }

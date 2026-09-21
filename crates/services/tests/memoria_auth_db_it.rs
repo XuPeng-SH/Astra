@@ -4,7 +4,7 @@ mod isolated_database;
 use astra_core::JwtSettings;
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelService,
-    auth::{AuthRefreshRequestData, AuthService, DatabaseAuthService},
+    auth::{AuthRefreshRequestData, AuthService, DatabaseAuthService, LEGACY_MEMORIA_PROVIDER_ID},
 };
 use axum::{
     Json, Router,
@@ -192,13 +192,12 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         "auth_tokens",
         "auth_refresh_tokens",
         "auth_user_roles",
-        "auth_memoria_identities",
         "auth_external_identities",
         "auth_users",
     ] {
         let column = match table {
             "auth_tokens" => "scope_user_id",
-            "auth_memoria_identities" | "auth_external_identities" => "astra_user_id",
+            "auth_external_identities" => "astra_user_id",
             _ => "user_id",
         };
         sqlx::query(&format!("DELETE FROM {table} WHERE {column} = ?"))
@@ -418,8 +417,10 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
         .bind(&legacy_user).bind(&legacy_user).bind(format!("{legacy_user}@test.invalid"))
         .execute(shared.get()).await.unwrap();
     sqlx::query(
-        "INSERT INTO auth_memoria_identities (memoria_user_id,astra_user_id) VALUES (?, ?)",
+        "INSERT INTO auth_external_identities
+         (provider_id,external_subject,astra_user_id) VALUES (?, ?, ?)",
     )
+    .bind(LEGACY_MEMORIA_PROVIDER_ID)
     .bind(&legacy_subject)
     .bind(&legacy_user)
     .execute(shared.get())
@@ -454,12 +455,15 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
             .user_id,
         legacy_user
     );
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_memoria_identities WHERE astra_user_id = ?")
-            .bind(&legacy_user)
-            .fetch_one(shared.get())
-            .await
-            .unwrap();
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_external_identities
+         WHERE provider_id = ? AND astra_user_id = ?",
+    )
+    .bind(LEGACY_MEMORIA_PROVIDER_ID)
+    .bind(&legacy_user)
+    .fetch_one(shared.get())
+    .await
+    .unwrap();
     assert_eq!(remaining, 0);
     migrator.disconnect_memoria(&legacy_user).await.unwrap();
 

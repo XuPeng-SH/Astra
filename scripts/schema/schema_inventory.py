@@ -1041,16 +1041,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / auth",
         product_owner="authentication and account continuity",
     ),
-    "auth_memoria_identities": TableMetadata(
-        semantic_owner="astra_services::auth / Memoria integration",
-        state_class="durable external-to-Astra identity mapping fact",
-        primary_query="read-only legacy migration lookup; never insert new identities",
-        retention_policy="remove the legacy row atomically after explicitly issuer-authorized migration to auth_external_identities",
-        rebuildability="cannot infer missing issuer; require administrator-confirmed original provenance",
-        merge_guidance="migration source only; canonical provider identity belongs to auth_external_identities",
-        migration_owner="astra_services::storage / auth",
-        product_owner="Memoria sign-in and Astra account continuity",
-    ),
     "auth_audit_logs": TableMetadata(
         semantic_owner="astra_services::auth::admin / auth session audit",
         state_class="durable auth audit event",
@@ -1982,6 +1972,36 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         rationale=(
             "the tombstone duplicated the lifecycle fence's irreversible delete fact and added "
             "a read to every admitted session write plus a write to every deletion"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="auth_memoria_identities",
+        decision="removed",
+        current_read_paths=[
+            "none in steady-state auth; v86 bootstrap reads the legacy source only during migration",
+        ],
+        current_write_paths=[
+            "v86 bootstrap backfills auth_external_identities with the reserved memoria:legacy provider id and drops the source table",
+        ],
+        user_api_impact=(
+            "legacy Memoria accounts remain reconnectable only with an explicit legacy issuer; "
+            "current issuer-scoped identity and disconnect behavior remain in auth_external_identities"
+        ),
+        migration_backfill=(
+            "copy memoria_user_id/astra_user_id into auth_external_identities, fail closed on a "
+            "conflicting canonical mapping, then drop the migration-only source table"
+        ),
+        rollback=(
+            "rollback requires restoring the source rows from the reserved memoria:legacy mappings; "
+            "the canonical rows retain the complete legacy identity pair"
+        ),
+        test_evidence=[
+            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::legacy_memoria_identity_schema_upgrade_migrates_rows_and_drops_source_table",
+            "crates/services/tests/memoria_auth_db_it.rs::memoria_issuer_atomicity_concurrent_binding_and_disconnect",
+        ],
+        rationale=(
+            "the table is a read-only migration source with no independent authority; keeping it "
+            "forces runtime auth and model eligibility to maintain a second identity lookup"
         ),
     ),
     ConsolidationReview(

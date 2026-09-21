@@ -1,5 +1,7 @@
 //! Application-scoped Memoria verification and credential lifecycle.
-use super::{AuthHttpError, AuthTokenRecord, DatabaseAuthService, sha256_hex};
+use super::{
+    AuthHttpError, AuthTokenRecord, DatabaseAuthService, LEGACY_MEMORIA_PROVIDER_ID, sha256_hex,
+};
 use crate::FernetTokenEncryptor;
 use astra_core::{MemoriaSettings, SharedPool, error_response, internal_error};
 use axum::http::StatusCode;
@@ -278,8 +280,7 @@ impl MemoriaCredentialResolver {
              JOIN auth_users u ON u.user_id = e.astra_user_id \
              WHERE e.astra_user_id = ? AND e.provider_id = ? AND u.is_active = 1 \
              AND NOT EXISTS (SELECT 1 FROM auth_tokens t WHERE t.type = 'memoria_connection' AND t.provider = 'memoria' AND t.scope_user_id = u.user_id) \
-             AND NOT EXISTS (SELECT 1 FROM auth_external_identities m WHERE m.astra_user_id = u.user_id AND m.provider_id LIKE 'memoria:%') \
-             AND NOT EXISTS (SELECT 1 FROM auth_memoria_identities l WHERE l.astra_user_id = u.user_id) LIMIT 2",
+             AND NOT EXISTS (SELECT 1 FROM auth_external_identities m WHERE m.astra_user_id = u.user_id AND m.provider_id LIKE 'memoria:%') LIMIT 2",
         ).bind(user).bind(format!("uc:{}", uc.settings.issuer))
             .fetch_all(self.pool.get()).await
             .map_err(|_| "UC memory identity lookup failed")?;
@@ -382,7 +383,6 @@ impl MemoriaCredentialResolver {
              WHERE u.user_id = ? AND u.is_active = 1 AND u.password_hash <> '' \
              AND NOT EXISTS (SELECT 1 FROM auth_tokens t WHERE t.type = 'memoria_connection' AND t.provider = 'memoria' AND t.scope_user_id = u.user_id) \
              AND NOT EXISTS (SELECT 1 FROM auth_external_identities e WHERE e.astra_user_id = u.user_id AND e.provider_id LIKE 'memoria:%') \
-             AND NOT EXISTS (SELECT 1 FROM auth_memoria_identities l WHERE l.astra_user_id = u.user_id) \
              LIMIT 1",
         )
         .bind(user)
@@ -534,9 +534,24 @@ impl DatabaseAuthService {
         pool: &sqlx::MySqlPool,
         user: &str,
     ) -> Result<Option<String>, AuthHttpError> {
+        let current_provider_id = self
+            .memoria_provider
+            .as_ref()
+            .map(|provider| provider.provider_id.as_str())
+            .unwrap_or("");
         let identity: Option<(String, String)> = sqlx::query_as(
-            "SELECT provider_id, external_subject FROM auth_external_identities WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' LIMIT 1")
-            .bind(user).fetch_optional(pool).await.map_err(internal_error)?;
+            "SELECT provider_id, external_subject
+             FROM auth_external_identities
+             WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%'
+             ORDER BY CASE WHEN provider_id = ? THEN 0 ELSE 1 END,
+                      updated_at DESC, provider_id ASC
+             LIMIT 1",
+        )
+        .bind(user)
+        .bind(current_provider_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal_error)?;
         if let Some((provider, subject)) = identity {
             if self
                 .memoria_provider
@@ -546,16 +561,6 @@ impl DatabaseAuthService {
                 return Err(reconnect());
             }
             return Ok(Some(subject));
-        }
-        let legacy: Option<String> = sqlx::query_scalar(
-            "SELECT memoria_user_id FROM auth_memoria_identities WHERE astra_user_id = ? LIMIT 1",
-        )
-        .bind(user)
-        .fetch_optional(pool)
-        .await
-        .map_err(internal_error)?;
-        if legacy.is_some() {
-            return Err(reconnect());
         }
         Ok(None)
     }
@@ -617,8 +622,10 @@ impl DatabaseAuthService {
     ) -> Result<AuthTokenRecord, AuthHttpError> {
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let legacy: Option<String> = sqlx::query_scalar(
-            "SELECT astra_user_id FROM auth_memoria_identities WHERE memoria_user_id = ? LIMIT 1",
+            "SELECT astra_user_id FROM auth_external_identities
+             WHERE provider_id = ? AND external_subject = ? LIMIT 1",
         )
+        .bind(LEGACY_MEMORIA_PROVIDER_ID)
         .bind(&identity.memoria_user_id)
         .fetch_optional(&mut *tx)
         .await
@@ -672,11 +679,15 @@ impl DatabaseAuthService {
             .bind(resolver.token_id(&user.user_id)).bind(ciphertext).bind(&user.user_id)
             .bind(serde_json::to_string(&stored_identity).map_err(internal_error)?).execute(&mut *tx).await.map_err(internal_error)?;
         if legacy.is_some() {
-            sqlx::query("DELETE FROM auth_memoria_identities WHERE astra_user_id = ?")
-                .bind(&user.user_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal_error)?;
+            sqlx::query(
+                "DELETE FROM auth_external_identities
+                 WHERE provider_id = ? AND astra_user_id = ?",
+            )
+            .bind(LEGACY_MEMORIA_PROVIDER_ID)
+            .bind(&user.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
             sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
                 .bind(&user.user_id)
                 .execute(&mut *tx)

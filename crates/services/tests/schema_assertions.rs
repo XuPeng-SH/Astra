@@ -73,6 +73,16 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         !existing.contains("session_deletion_tombstones"),
         "the redundant deletion tombstone table must be retired during bootstrap"
     );
+    assert!(
+        !contracts
+            .iter()
+            .any(|table| table.name == "auth_memoria_identities"),
+        "the migration-only Memoria identity table must not remain a schema owner"
+    );
+    assert!(
+        !existing.contains("auth_memoria_identities"),
+        "the migration-only Memoria identity table must be retired during bootstrap"
+    );
     let proposal_columns = column_names(&pool, &schema, "work_proposals").await;
     for expected in [
         "proposal_kind",

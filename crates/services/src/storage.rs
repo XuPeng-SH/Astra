@@ -122,7 +122,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-21-v85";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-21-v86";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2234,6 +2234,59 @@ async fn table_exists(
     .map(|row| row.is_some())
 }
 
+/// Migrate the pre-issuer Memoria mapping into the canonical external
+/// identity table and retire its one-purpose source table.
+///
+/// The old table has no issuer namespace, so its rows are deliberately
+/// represented by the reserved `memoria:legacy` provider id. Runtime login
+/// still requires an explicit legacy issuer before it can replace that row
+/// with the current issuer-derived identity. A conflicting pre-existing row
+/// fails the bootstrap rather than silently relinking an account.
+async fn retire_auth_memoria_identities(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    if !table_exists(pool, database, "auth_memoria_identities").await? {
+        return Ok(());
+    }
+
+    let conflict = query(
+        "SELECT 1
+         FROM auth_memoria_identities legacy
+         JOIN auth_external_identities canonical
+           ON canonical.provider_id = ?
+          AND canonical.external_subject = legacy.memoria_user_id
+         WHERE canonical.astra_user_id <> legacy.astra_user_id
+         LIMIT 1",
+    )
+    .bind(crate::auth::LEGACY_MEMORIA_PROVIDER_ID)
+    .fetch_optional(pool)
+    .await?;
+    if conflict.is_some() {
+        return Err(sqlx::Error::Protocol(
+            "legacy Memoria identity conflicts with canonical provider mapping".into(),
+        ));
+    }
+
+    query(
+        "INSERT INTO auth_external_identities
+             (provider_id, external_subject, astra_user_id, created_at, updated_at)
+         SELECT ?, memoria_user_id, astra_user_id, created_at, created_at
+         FROM auth_memoria_identities
+         ON DUPLICATE KEY UPDATE
+             astra_user_id = VALUES(astra_user_id),
+             created_at = LEAST(created_at, VALUES(created_at)),
+             updated_at = GREATEST(updated_at, VALUES(updated_at))",
+    )
+    .bind(crate::auth::LEGACY_MEMORIA_PROVIDER_ID)
+    .execute(pool)
+    .await?;
+    query("DROP TABLE IF EXISTS auth_memoria_identities")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Fold the legacy deletion tombstone projection into the lifecycle fence.
 ///
 /// Both tables represented the same fact: a session identity must never be
@@ -4297,19 +4350,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // Read-only migration source. Never create new unnamespaced identities.
-    core_schema_create!(
-        pool,
-        "auth_memoria_identities",
-        "CREATE TABLE IF NOT EXISTS auth_memoria_identities (
-            memoria_user_id VARCHAR(128) PRIMARY KEY,
-            astra_user_id VARCHAR(128) NOT NULL UNIQUE,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_auth_memoria_astra_user (astra_user_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    retire_auth_memoria_identities(&pool.pool, &settings.database).await?;
 
     core_schema_create!(pool, "auth_provider_request_replay",
         "CREATE TABLE IF NOT EXISTS auth_provider_request_replay (

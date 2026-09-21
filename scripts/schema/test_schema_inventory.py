@@ -532,7 +532,6 @@ fn char_literal() { let slash = '/'; }
             "auth_roles",
             "auth_refresh_tokens",
             "auth_tokens",
-            "auth_memoria_identities",
             "auth_audit_logs",
             "infra_llm_models",
             "runtime_llm_trusted_domains",
@@ -969,6 +968,7 @@ fn char_literal() { let slash = '/'; }
         expected = {
             "session_sync_log",
             "session_deletion_tombstones",
+            "auth_memoria_identities",
             "data_versioning_checkpoints",
             "preview_template_registry + raw_ref_scheme_registry",
             "harness_skill_drafts + harness_skill_rules",
@@ -995,6 +995,10 @@ fn char_literal() { let slash = '/'; }
                     self.assertNotIn("TBD", review[field])
 
         self.assertIn("tracing-only", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
+        self.assertIn(
+            "legacy issuer",
+            self.p1_5_reviews["auth_memoria_identities"]["user_api_impact"],
+        )
         self.assertIn(
             "rollback/list",
             self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
@@ -1030,10 +1034,16 @@ fn char_literal() { let slash = '/'; }
                 "list_checkpoints",
             ],
             "crates/services/src/storage.rs": [
+                "retire_auth_memoria_identities",
+                "DROP TABLE IF EXISTS auth_memoria_identities",
                 "preview_template_registry",
                 "raw_ref_scheme_registry",
                 "INSERT IGNORE INTO raw_ref_scheme_registry",
                 "INSERT IGNORE INTO preview_template_registry",
+            ],
+            "crates/services/src/auth/memoria.rs": [
+                "LEGACY_MEMORIA_PROVIDER_ID",
+                "auth_external_identities",
             ],
             "crates/services/src/harness.rs": [
                 "harness_skill_drafts",

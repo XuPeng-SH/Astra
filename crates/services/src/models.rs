@@ -1833,9 +1833,10 @@ async fn deployment_models_allowed(pool: &sqlx::MySqlPool, user_id: &str) -> Res
         return Ok(false);
     }
     let mapped: Option<String> = sqlx::query_scalar(
-        "SELECT external_subject FROM auth_external_identities WHERE astra_user_id = ? AND (provider_id LIKE 'memoria:%' OR provider_id LIKE 'uc:%') UNION ALL SELECT memoria_user_id FROM auth_memoria_identities WHERE astra_user_id = ? LIMIT 1",
+        "SELECT external_subject FROM auth_external_identities
+         WHERE astra_user_id = ? AND (provider_id LIKE 'memoria:%' OR provider_id LIKE 'uc:%')
+         LIMIT 1",
     )
-    .bind(user_id)
     .bind(user_id)
     .fetch_optional(pool)
     .await
