@@ -22,6 +22,12 @@ from pathlib import Path
 
 SYSTEM_TEST_RE = re.compile(r'\bsystem_test:\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 FUNCTION_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+MATRIX_TEST_RE = re.compile(
+    r"\b(?:current_thread_)?matrix_test!\s*\{\s*"
+    r"(?:#\[[^\]]*\]\s*)*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*,",
+    re.DOTALL,
+)
 
 
 def collect_system_tests(matrix: Path) -> list[str]:
@@ -33,7 +39,12 @@ def collect_rust_functions(crate_root: Path) -> set[str]:
     for path in crate_root.rglob("*.rs"):
         if any(part in {"target", ".git"} for part in path.parts):
             continue
-        functions.update(FUNCTION_RE.findall(path.read_text()))
+        source = path.read_text()
+        functions.update(FUNCTION_RE.findall(source))
+        # The system matrix registers tests through macros which expand to
+        # functions.  The source-only validator must recognize the registration
+        # name because macro expansion is not available here.
+        functions.update(MATRIX_TEST_RE.findall(source))
     return functions
 
 
