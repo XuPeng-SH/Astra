@@ -26,6 +26,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::TransactionConnection;
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::db_row::RowExt as RunStateDbRow;
 use crate::models::AdmittedModelExecution;
@@ -2007,12 +2008,15 @@ pub(crate) async fn lock_claimed_execution_handoff_tx(
     }))
 }
 
-async fn load_run_metadata_for_exact_session_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+async fn load_run_metadata_for_exact_session_tx<T>(
+    tx: &mut T,
     user_id: &str,
     expected_session_id: &str,
     run_id: &str,
-) -> DbStoreResult<Option<DurableRunRecord>> {
+) -> DbStoreResult<Option<DurableRunRecord>>
+where
+    T: TransactionConnection,
+{
     match crate::storage::admit_session_scoped_run_write(
         tx,
         expected_session_id,
@@ -2122,14 +2126,17 @@ pub(crate) enum ExecutionHandoffReferenceError {
     Unavailable(String),
 }
 
-pub(crate) async fn lock_and_validate_execution_handoff_reference_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+pub(crate) async fn lock_and_validate_execution_handoff_reference_tx<T>(
+    tx: &mut T,
     user_id: &str,
     session_id: &str,
     run_id: &str,
     checkpoint_id: &str,
     producer_generation: u64,
-) -> Result<(), ExecutionHandoffReferenceError> {
+) -> Result<(), ExecutionHandoffReferenceError>
+where
+    T: TransactionConnection,
+{
     let run = load_run_metadata_for_exact_session_tx(tx, user_id, session_id, run_id)
         .await
         .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?
@@ -2681,20 +2688,6 @@ fn execution_owner_cancellation_terminal_event(
             "owner_generation": request.expected_owner_generation,
         }
     })
-}
-
-/// Fixed-size facts required to admit one active-run user intent.
-///
-/// This deliberately excludes the run event log. A long run may contain tens
-/// of thousands of provider/tool events, none of which may make guidance
-/// admission O(N). The only relevant control facts are the exact retry
-/// identity, the latest settlement fence, and current execution liveness.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DurableRunGuidanceAdmissionRecord {
-    pub run: DurableRunRecord,
-    pub duplicate_intent: Option<serde_json::Value>,
-    pub settlement_fenced: bool,
-    pub owner_lease_live: bool,
 }
 
 /// Immutable request for one linearized current-run guidance admission.
@@ -3693,10 +3686,13 @@ fn validated_durable_lineage_segments_for_identity(
     Ok(segments)
 }
 
-async fn lock_durable_lineage_cancellation_markers_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+async fn lock_durable_lineage_cancellation_markers_tx<T>(
+    tx: &mut T,
     run: &DurableRunRecord,
-) -> Result<DurableLineageCancellationMarkers, String> {
+) -> Result<DurableLineageCancellationMarkers, String>
+where
+    T: TransactionConnection,
+{
     let segments = validated_durable_lineage_segments(run)?;
     lock_durable_lineage_cancellation_markers_for_segments_tx(
         tx,
@@ -3708,13 +3704,16 @@ async fn lock_durable_lineage_cancellation_markers_tx(
     .await
 }
 
-async fn lock_durable_lineage_cancellation_markers_for_segments_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+async fn lock_durable_lineage_cancellation_markers_for_segments_tx<T>(
+    tx: &mut T,
     user_id: &str,
     session_id: &str,
     target_run_id: &str,
     segments: &[String],
-) -> Result<DurableLineageCancellationMarkers, String> {
+) -> Result<DurableLineageCancellationMarkers, String>
+where
+    T: TransactionConnection,
+{
     let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "SELECT run_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
                 CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested
@@ -4764,90 +4763,23 @@ pub trait RunStateStore: Send + Sync {
     /// Load the current interaction wait frontier and its indexed facts. This
     /// read is deliberately narrower than a general run projection so a Web
     /// observer can poll a long-running Work without scanning transcript
-    /// history. Stores that cannot provide the indexed form may fall back to
-    /// their process-local run representation.
+    /// history.
     async fn load_run_interaction_projection(
         &self,
         user_id: &str,
         run_id: &str,
         kind: DurableRunInteractionKind,
-    ) -> Result<Option<DurableRunInteractionProjection>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        let request_id = run.events.iter().rev().find_map(|event| {
-            (extract_event_type(event) == "interaction_wait_started"
-                && event
-                    .pointer("/data/waiting_for")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(kind.waiting_for()))
-            .then(|| extract_interaction_request_id(event))
-            .flatten()
-        });
-        let recent_events = request_id
-            .as_deref()
-            .map(|request_id| {
-                run.events
-                    .iter()
-                    .filter(|event| {
-                        extract_interaction_request_id(event).as_deref() == Some(request_id)
-                            && (extract_event_type(event) == kind.required_event_type()
-                                || (kind == DurableRunInteractionKind::AskUser
-                                    && extract_event_type(event) == "user_prompt_required")
-                                || extract_event_type(event) == kind.resolved_event_type())
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Some(DurableRunInteractionProjection {
-            run_id: run.run_id,
-            session_id: run.session_id,
-            status: run.status,
-            waiting_for: run.waiting_for,
-            recent_events,
-        }))
-    }
+    ) -> Result<Option<DurableRunInteractionProjection>, String>;
 
     /// Find the newest root run that explicitly requested Explain Analyze.
     /// Shared stores must answer this from their durable indexed
     /// authority; callers must never infer it from a bounded UI run tree.
     ///
-    /// The default is intentionally fail-closed when the session projection
-    /// is truncated. It remains useful for deterministic in-memory stores,
-    /// while a production store can override it with a direct indexed query.
     async fn find_latest_explain_analyze_root(
         &self,
         user_id: &str,
         session_id: &str,
-    ) -> Result<Option<(String, u64)>, String> {
-        const FALLBACK_LIMIT: u32 = 100;
-        let page = self
-            .list_session_runs(user_id, session_id, FALLBACK_LIMIT)
-            .await?;
-        if page.truncated {
-            return Err(
-                "authoritative Explain Analyze discovery is unavailable because the session run projection is truncated"
-                    .to_string(),
-            );
-        }
-        let mut candidates = page
-            .runs
-            .into_iter()
-            .filter(|run| run.depth == 0 && run_requested_explain_analyze(run))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| right.created_at.cmp(&left.created_at))
-                .then_with(|| right.run_id.cmp(&left.run_id))
-        });
-        Ok(candidates
-            .into_iter()
-            .next()
-            .map(|run| (run.run_id, run.run_generation)))
-    }
+    ) -> Result<Option<(String, u64)>, String>;
 
     /// Read only the newest typed terminal cancellation origin.
     ///
@@ -4857,12 +4789,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableCancellationOrigin>, String> {
-        Ok(self
-            .load_run(user_id, run_id)
-            .await?
-            .and_then(|run| latest_typed_terminal_cancellation_origin(&run.events)))
-    }
+    ) -> Result<Option<DurableCancellationOrigin>, String>;
 
     /// Return whether a run has an accepted user intent that has not yet been
     /// applied or returned. Implementations should keep this on the control
@@ -4873,12 +4800,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<bool>, String> {
-        Ok(self
-            .load_run(user_id, run_id)
-            .await?
-            .map(|run| run_events_have_unsettled_user_intent(&run.events)))
-    }
+    ) -> Result<Option<bool>, String>;
 
     async fn request_run_cancellation(
         &self,
@@ -4944,50 +4866,6 @@ pub trait RunStateStore: Send + Sync {
         Ok(false)
     }
 
-    async fn load_run_guidance_admission(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        intent_id: &str,
-    ) -> Result<Option<DurableRunGuidanceAdmissionRecord>, String> {
-        let Some(mut run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        let idempotency_key = format!("user_intent:{intent_id}");
-        let duplicate_intent = run.events.iter().enumerate().find_map(|(position, event)| {
-            if extract_event_type(event) != "user_intent"
-                || extract_optional_string(event, "idempotency_key").as_deref()
-                    != Some(idempotency_key.as_str())
-            {
-                return None;
-            }
-            let mut event = event.clone();
-            if let Some(object) = event.as_object_mut() {
-                object
-                    .entry("index".to_string())
-                    .or_insert_with(|| serde_json::json!(position));
-            }
-            Some(event)
-        });
-        let mut settlement_fenced = false;
-        for event in &run.events {
-            match extract_event_type(event).as_str() {
-                "user_intent_settlement_fenced" => settlement_fenced = true,
-                "user_intent_admission_reopened" => settlement_fenced = false,
-                _ => {}
-            }
-        }
-        let owner_lease_live =
-            run.owner_pod_id.is_some() && in_memory_action_owner_lease_is_active(&run)?;
-        run.events.clear();
-        Ok(Some(DurableRunGuidanceAdmissionRecord {
-            duplicate_intent,
-            settlement_fenced,
-            owner_lease_live,
-            run,
-        }))
-    }
-
     /// Atomically admit one immutable current-run guidance event.
     ///
     /// Implementations must serialize this operation with settlement fencing
@@ -5042,12 +4920,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableRunStatusSnapshot>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        Ok(Some(run_status_snapshot_from_run(&run)))
-    }
+    ) -> Result<Option<DurableRunStatusSnapshot>, String>;
 
     /// Load only the bounded identity needed by delegation projection.
     /// Shared stores should override this with a metadata-only lookup.
@@ -5055,17 +4928,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableRunDelegationProjectionTarget>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        Ok(Some(DurableRunDelegationProjectionTarget {
-            user_id: run.user_id,
-            parent_run_id: run.parent_run_id,
-            delegation_id: run.delegation_id,
-            agent_id: run.agent_id,
-        }))
-    }
+    ) -> Result<Option<DurableRunDelegationProjectionTarget>, String>;
 
     /// Load durable events strictly after an event-index cursor together with
     /// the current run status. This is the cross-process live-attach primitive.
@@ -5094,13 +4957,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         user_id: &str,
         run_id: &str,
-    ) -> Result<Option<DurableRunControlRecord>, String> {
-        Ok(self
-            .load_run(user_id, run_id)
-            .await?
-            .as_ref()
-            .map(DurableRunControlRecord::from))
-    }
+    ) -> Result<Option<DurableRunControlRecord>, String>;
 
     async fn load_run_controls(
         &self,
@@ -10698,13 +10555,9 @@ impl DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("transition_run_status_with_events_acquire", run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("transition_run_status_with_events_begin", run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("transition_run_status_with_events_begin", run_id, source).to_string()
+        })?;
 
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
@@ -12313,17 +12166,13 @@ impl DatabaseRunStateStore {
                     source,
                 )
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error(
-                    "begin_record_preview_template_missing_for_tools",
-                    run_id,
-                    source,
-                )
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error(
+                "begin_record_preview_template_missing_for_tools",
+                run_id,
+                source,
+            )
+        })?;
         crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true)
             .await
             .map_err(|source| {
@@ -12893,7 +12742,6 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("acquire_sync_run_projection", run_id, source))?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("begin_sync_run_projection", run_id, source))?;
@@ -13095,7 +12943,6 @@ impl DatabaseRunStateStore {
                 db_error("acquire_append_run_events_batch_connection", run_id, source)
             })?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("begin_append_run_events_batch", run_id, source))?;
@@ -13348,6 +13195,105 @@ impl DatabaseRunStateStore {
         ))
     }
 
+    async fn insert_run_row_tx(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        record: &DurableRunRecord,
+        retry_scope: &str,
+        null_shape: &[bool],
+    ) -> Result<sqlx::mysql::MySqlQueryResult, sqlx::Error> {
+        let insert_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+              delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+              checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+              total_prompt_tokens, total_completion_tokens, total_tool_calls,
+              agent_binding_id, agent_binding_name, agent_binding_schema_version,
+              model_offering_id, resolved_model_name,
+              runtime_profile, start_request_fingerprint,
+              work_id, work_branch_id, work_graph_revision,
+              work_item_id, work_item_revision, work_item_attempt_id,
+              created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+            null_shape.iter().copied(),
+        );
+        sqlx::query(&insert_sql)
+            .bind(&record.run_id)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.parent_run_id)
+            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+            .bind(record.depth as i64)
+            .bind(&record.delegation_id)
+            .bind(&record.agent_id)
+            .bind(&record.retry_of)
+            .bind(retry_scope)
+            .bind(&record.status)
+            .bind(&record.waiting_for)
+            .bind(&self.owner_pod_id)
+            .bind(self.lease_ttl_micros())
+            .bind(record.run_generation as i64)
+            .bind(record.last_event_idx)
+            .bind(&record.checkpoint_version)
+            .bind(&record.checkpoint_json)
+            .bind(&record.error_code)
+            .bind(&record.error_message)
+            .bind(record.retry_count as i64)
+            .bind(record.total_prompt_tokens as i64)
+            .bind(record.total_completion_tokens as i64)
+            .bind(record.total_tool_calls as i64)
+            .bind(&record.agent_binding_id)
+            .bind(&record.agent_binding_name)
+            .bind(&record.agent_binding_schema_version)
+            .bind(&record.model_offering_id)
+            .bind(&record.resolved_model_name)
+            .bind(&record.runtime_profile)
+            .bind(&record.start_request_fingerprint)
+            .bind(
+                record
+                    .work_binding
+                    .as_ref()
+                    .map(|binding| binding.work_id().as_str()),
+            )
+            .bind(
+                record
+                    .work_binding
+                    .as_ref()
+                    .map(|binding| binding.branch_id().as_str()),
+            )
+            .bind(
+                record
+                    .work_binding
+                    .as_ref()
+                    .map(|binding| binding.graph_revision().get()),
+            )
+            .bind(
+                record
+                    .work_binding
+                    .as_ref()
+                    .and_then(DurableWorkRunBinding::item)
+                    .map(|item| item.item_id().as_str()),
+            )
+            .bind(
+                record
+                    .work_binding
+                    .as_ref()
+                    .and_then(DurableWorkRunBinding::item)
+                    .map(|item| item.item_revision().get()),
+            )
+            .bind(
+                record
+                    .work_binding
+                    .as_ref()
+                    .and_then(DurableWorkRunBinding::item)
+                    .map(|item| item.attempt_id().as_str()),
+            )
+            .execute(&mut **tx)
+            .await
+    }
+
     async fn insert_run_record(
         &self,
         mut record: DurableRunRecord,
@@ -13415,7 +13361,6 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("insert_run_acquire", &record.run_id, source).to_string())?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
@@ -13511,129 +13456,38 @@ impl DatabaseRunStateStore {
             work_item_present,
         ];
 
-        let insert_result = if run_requires_session_execution_slot(&record)
-            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref())
+        let requires_execution_slot = run_requires_session_execution_slot(&record)
+            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
+        let insert_result = match self
+            .insert_run_row_tx(&mut tx, &record, &retry_scope, &run_insert_null_shape)
+            .await
         {
-            let insert_sql = matrixone_statement_with_null_shape(
-                "INSERT INTO agent_runs
-                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-                  total_prompt_tokens, total_completion_tokens, total_tool_calls,
-                  agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  model_offering_id, resolved_model_name,
-                  runtime_profile, start_request_fingerprint,
-                  work_id, work_branch_id, work_graph_revision,
-                  work_item_id, work_item_revision, work_item_attempt_id,
-                  created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-                run_insert_null_shape,
-            );
-            let result = sqlx::query(&insert_sql)
-                .bind(&record.run_id)
-                .bind(&record.user_id)
-                .bind(&record.session_id)
-                .bind(&record.parent_run_id)
-                .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-                .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-                .bind(record.depth as i64)
-                .bind(&record.delegation_id)
-                .bind(&record.agent_id)
-                .bind(&record.retry_of)
-                .bind(&retry_scope)
-                .bind(&record.status)
-                .bind(&record.waiting_for)
-                .bind(&self.owner_pod_id)
-                .bind(self.lease_ttl_micros())
-                .bind(record.run_generation as i64)
-                .bind(record.last_event_idx)
-                .bind(&record.checkpoint_version)
-                .bind(&record.checkpoint_json)
-                .bind(&record.error_code)
-                .bind(&record.error_message)
-                .bind(record.retry_count as i64)
-                .bind(record.total_prompt_tokens as i64)
-                .bind(record.total_completion_tokens as i64)
-                .bind(record.total_tool_calls as i64)
-                .bind(&record.agent_binding_id)
-                .bind(&record.agent_binding_name)
-                .bind(&record.agent_binding_schema_version)
-                .bind(&record.model_offering_id)
-                .bind(&record.resolved_model_name)
-                .bind(&record.runtime_profile)
-                .bind(&record.start_request_fingerprint)
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .map(|binding| binding.work_id().as_str()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .map(|binding| binding.branch_id().as_str()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .map(|binding| binding.graph_revision().get()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .and_then(DurableWorkRunBinding::item)
-                        .map(|item| item.item_id().as_str()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .and_then(DurableWorkRunBinding::item)
-                        .map(|item| item.item_revision().get()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .and_then(DurableWorkRunBinding::item)
-                        .map(|item| item.attempt_id().as_str()),
-                )
-                .execute(&mut *tx)
-                .await;
-            let result = match result {
-                Ok(result) => result,
-                Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
-                    tx.rollback().await.map_err(|rollback_error| {
-                        db_error(
-                            "insert_run_rollback_existing_claim",
-                            &record.run_id,
-                            rollback_error,
-                        )
+            Ok(result) => result,
+            Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
+                tx.rollback().await.map_err(|rollback_error| {
+                    db_error(
+                        "insert_run_rollback_existing_claim",
+                        &record.run_id,
+                        rollback_error,
+                    )
+                    .to_string()
+                })?;
+                connection.release();
+                return self
+                    .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
+                    .await;
+            }
+            Err(source) => {
+                tx.rollback().await.map_err(|rollback_error| {
+                    db_error("insert_run_rollback_error", &record.run_id, rollback_error)
                         .to_string()
-                    })?;
-                    connection.release();
-                    return self
-                        .existing_run_start_claim(
-                            &record.user_id,
-                            &record.run_id,
-                            requested_session_id,
-                        )
-                        .await;
-                }
-                Err(source) => {
-                    tx.rollback().await.map_err(|rollback_error| {
-                        db_error("insert_run_rollback_error", &record.run_id, rollback_error)
-                            .to_string()
-                    })?;
-                    connection.release();
-                    return Err(db_error("insert_run", &record.run_id, source).to_string());
-                }
-            };
-            if !self
+                })?;
+                connection.release();
+                return Err(db_error("insert_run", &record.run_id, source).to_string());
+            }
+        };
+        if requires_execution_slot
+            && !self
                 .acquire_session_execution_slot_tx(
                     &mut tx,
                     &record.user_id,
@@ -13642,135 +13496,13 @@ impl DatabaseRunStateStore {
                 )
                 .await
                 .map_err(|e| e.to_string())?
-            {
-                tx.rollback().await.map_err(|source| {
-                    db_error("insert_run_rollback_slot_blocked", &record.run_id, source).to_string()
-                })?;
-                connection.release();
-                return Err("session already has an active run".to_string());
-            }
-            result
-        } else {
-            let insert_sql = matrixone_statement_with_null_shape(
-                "INSERT INTO agent_runs
-                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-                  total_prompt_tokens, total_completion_tokens, total_tool_calls,
-                  agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  model_offering_id, resolved_model_name,
-                  runtime_profile, start_request_fingerprint,
-                  work_id, work_branch_id, work_graph_revision,
-                  work_item_id, work_item_revision, work_item_attempt_id,
-                  created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-                run_insert_null_shape,
-            );
-            let result = sqlx::query(&insert_sql)
-                .bind(&record.run_id)
-                .bind(&record.user_id)
-                .bind(&record.session_id)
-                .bind(&record.parent_run_id)
-                .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-                .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-                .bind(record.depth as i64)
-                .bind(&record.delegation_id)
-                .bind(&record.agent_id)
-                .bind(&record.retry_of)
-                .bind(&retry_scope)
-                .bind(&record.status)
-                .bind(&record.waiting_for)
-                .bind(&self.owner_pod_id)
-                .bind(self.lease_ttl_micros())
-                .bind(record.run_generation as i64)
-                .bind(record.last_event_idx)
-                .bind(&record.checkpoint_version)
-                .bind(&record.checkpoint_json)
-                .bind(&record.error_code)
-                .bind(&record.error_message)
-                .bind(record.retry_count as i64)
-                .bind(record.total_prompt_tokens as i64)
-                .bind(record.total_completion_tokens as i64)
-                .bind(record.total_tool_calls as i64)
-                .bind(&record.agent_binding_id)
-                .bind(&record.agent_binding_name)
-                .bind(&record.agent_binding_schema_version)
-                .bind(&record.model_offering_id)
-                .bind(&record.resolved_model_name)
-                .bind(&record.runtime_profile)
-                .bind(&record.start_request_fingerprint)
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .map(|binding| binding.work_id().as_str()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .map(|binding| binding.branch_id().as_str()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .map(|binding| binding.graph_revision().get()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .and_then(DurableWorkRunBinding::item)
-                        .map(|item| item.item_id().as_str()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .and_then(DurableWorkRunBinding::item)
-                        .map(|item| item.item_revision().get()),
-                )
-                .bind(
-                    record
-                        .work_binding
-                        .as_ref()
-                        .and_then(DurableWorkRunBinding::item)
-                        .map(|item| item.attempt_id().as_str()),
-                )
-                .execute(&mut *tx)
-                .await;
-            match result {
-                Ok(result) => result,
-                Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
-                    tx.rollback().await.map_err(|rollback_error| {
-                        db_error(
-                            "insert_run_rollback_existing_claim",
-                            &record.run_id,
-                            rollback_error,
-                        )
-                        .to_string()
-                    })?;
-                    connection.release();
-                    return self
-                        .existing_run_start_claim(
-                            &record.user_id,
-                            &record.run_id,
-                            requested_session_id,
-                        )
-                        .await;
-                }
-                Err(source) => {
-                    tx.rollback().await.map_err(|rollback_error| {
-                        db_error("insert_run_rollback_error", &record.run_id, rollback_error)
-                            .to_string()
-                    })?;
-                    connection.release();
-                    return Err(db_error("insert_run", &record.run_id, source).to_string());
-                }
-            }
-        };
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error("insert_run_rollback_slot_blocked", &record.run_id, source).to_string()
+            })?;
+            connection.release();
+            return Err("session already has an active run".to_string());
+        }
         if insert_result.rows_affected() == 0 {
             tx.rollback().await.map_err(|source| {
                 db_error("insert_run_rollback_noop", &record.run_id, source).to_string()
@@ -13975,7 +13707,6 @@ impl DatabaseRunStateStore {
                 db_error("acquire_run_recovery_claim", "active", source).to_string()
             })?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("begin_run_recovery_claim", "active", source).to_string())?;
@@ -15777,317 +15508,6 @@ impl RunStateStore for DatabaseRunStateStore {
         }))
     }
 
-    #[cfg(test)]
-    async fn begin_action(
-        &self,
-        request: AtomicRunActionAdmissionRequest<'_>,
-    ) -> Result<AtomicRunActionAdmission, String> {
-        validate_action_admission_request(request)?;
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("begin_atomic_action_admission", request.run_id, source).to_string()
-        })?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_atomic_action_admission_missing",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(AtomicRunActionAdmission::Missing);
-        };
-
-        // Exact retries are resolved first: once the admission grant committed it
-        // remains the durable ordering fact even if later guidance arrived.
-        let idempotency_key = action_admission_granted_idempotency_key(request.action_id);
-        if let Some(row) = sqlx::query(
-            "SELECT event_idx, payload_json
-             FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND idempotency_key = ?
-             LIMIT 1",
-        )
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .bind(&idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "load_existing_atomic_action_admission",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })? {
-            let event_index: i64 = row.try_get("event_idx").map_err(|source| {
-                db_error(
-                    "decode_existing_atomic_action_admission_index",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            let event = decode_run_event_payload(&row, request.run_id)
-                .map_err(|error| error.to_string())?;
-            validate_existing_action_admission_grant(request, &event)?;
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_existing_atomic_action_admission",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(AtomicRunActionAdmission::AlreadyStarted { event_index });
-        }
-
-        if run.run_generation != request.expected_owner_generation {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_atomic_action_admission_owner_conflict",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(AtomicRunActionAdmission::OwnerGenerationMismatch {
-                actual_owner_generation: run.run_generation,
-            });
-        }
-        if !matches!(run.status.as_str(), STATUS_RUNNING | STATUS_WAITING) {
-            let status = run.status.clone();
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_atomic_action_admission_inactive",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(AtomicRunActionAdmission::Inactive { status });
-        }
-        if request.expected_control_epoch > run.last_event_idx {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_atomic_action_admission_future_epoch",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Err(format!(
-                "control epoch {} is ahead of durable run {} event index {}",
-                request.expected_control_epoch, request.run_id, run.last_event_idx
-            ));
-        }
-
-        // The unique (user_id, run_id, event_idx) index turns this into a
-        // bounded range seek rather than a run-history hydration.
-        let newer_user_intent = sqlx::query_scalar::<_, i64>(
-            "SELECT event_idx
-             FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx > ?
-               AND event_type = 'user_intent'
-             ORDER BY event_idx ASC
-             LIMIT 1",
-        )
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .bind(request.expected_control_epoch)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "seek_newer_user_intent_for_action_admission",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if let Some(user_intent_event_index) = newer_user_intent {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_superseded_atomic_action_admission",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Ok(AtomicRunActionAdmission::Superseded {
-                user_intent_event_index,
-            });
-        }
-
-        let event_index = run.last_event_idx.saturating_add(1);
-        let event = action_admission_granted_event(request);
-        let producer_pod_id = run.owner_pod_id.as_deref().ok_or_else(|| {
-            format!(
-                "run {} has generation {} but no durable owner pod",
-                request.run_id, request.expected_owner_generation
-            )
-        })?;
-        let event_row = build_run_event_insert_row(
-            request.user_id,
-            request.run_id,
-            &run.session_id,
-            run.agent_id.as_deref(),
-            event_index,
-            producer_pod_id,
-            &event,
-        )
-        .map_err(|error| error.to_string())?;
-
-        let mut update =
-            sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET last_event_idx = ");
-        update.push_bind(event_index);
-        update.push(", updated_at = NOW(6) WHERE user_id = ");
-        update.push_bind(request.user_id);
-        update.push(" AND session_id = ");
-        update.push_bind(request.expected_session_id);
-        update.push(" AND run_id = ");
-        update.push_bind(request.run_id);
-        update.push(" AND last_event_idx = ");
-        update.push_bind(run.last_event_idx);
-        update.push(" AND status = ");
-        update.push_bind(STATUS_RUNNING);
-        update.push(" AND owner_pod_id = ");
-        update.push_bind(&self.owner_pod_id);
-        update.push(" AND run_generation = ");
-        update.push_bind(request.expected_owner_generation as i64);
-        update.push(" AND owner_lease_expires_at >= NOW(6)");
-        update.push(" AND cancellation_requested_at IS NULL");
-        let updated = update.build().execute(&mut *tx).await.map_err(|source| {
-            db_error("update_atomic_action_admission", request.run_id, source).to_string()
-        })?;
-        if updated.rows_affected() == 0 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_atomic_action_admission_authority_lost",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            return Err(format!(
-                "run {} lost active execution authority during action admission",
-                request.run_id
-            ));
-        }
-
-        Self::insert_run_event_rows_tx(
-            &mut tx,
-            request.run_id,
-            std::slice::from_ref(&event_row),
-            "insert_atomic_action_admission",
-        )
-        .await?;
-
-        if let Err(source) = tx.commit().await {
-            let commit_error =
-                db_error("commit_atomic_action_admission", request.run_id, source).to_string();
-            // COMMIT acknowledgement loss is an unknown outcome, not a safe
-            // reason to retry the external action. Reconcile the exact durable
-            // identity through the unique idempotency index. Only a byte-stable
-            // match authored by this request can recover fresh authorization.
-            let recovered = sqlx::query(
-                "SELECT event_idx, event_id, event_hash, payload_json
-                 FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND idempotency_key = ?
-                 LIMIT 1",
-            )
-            .bind(request.user_id)
-            .bind(request.run_id)
-            .bind(&idempotency_key)
-            .fetch_optional(self.pool.get())
-            .await
-            .map_err(|reconcile_source| {
-                format!(
-                    "{commit_error}; {}",
-                    db_error(
-                        "reconcile_atomic_action_admission_commit",
-                        request.run_id,
-                        reconcile_source,
-                    )
-                )
-            })?;
-            let Some(row) = recovered else {
-                return Err(commit_error);
-            };
-            let recovered_event_id: String = row.try_get("event_id").map_err(|decode_source| {
-                format!(
-                    "{commit_error}; {}",
-                    db_error(
-                        "decode_reconciled_atomic_action_admission_event_id",
-                        request.run_id,
-                        decode_source,
-                    )
-                )
-            })?;
-            let recovered_event_hash: String =
-                row.try_get("event_hash").map_err(|decode_source| {
-                    format!(
-                        "{commit_error}; {}",
-                        db_error(
-                            "decode_reconciled_atomic_action_admission_event_hash",
-                            request.run_id,
-                            decode_source,
-                        )
-                    )
-                })?;
-            if recovered_event_id != event_row.event_id
-                || recovered_event_hash != event_row.event_hash
-            {
-                return Err(format!(
-                    "{commit_error}; action admission identity was committed by a different attempt"
-                ));
-            }
-            let recovered_event_index: i64 = row.try_get("event_idx").map_err(|decode_source| {
-                format!(
-                    "{commit_error}; {}",
-                    db_error(
-                        "decode_reconciled_atomic_action_admission_index",
-                        request.run_id,
-                        decode_source,
-                    )
-                )
-            })?;
-            let recovered_event = decode_run_event_payload(&row, request.run_id)
-                .map_err(|error| format!("{commit_error}; {error}"))?;
-            validate_existing_action_admission_grant(request, &recovered_event)
-                .map_err(|error| format!("{commit_error}; {error}"))?;
-            self.patch_run_projection_event_metadata_for_user(
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-                recovered_event_index,
-                ACTION_ADMISSION_GRANTED_EVENT_TYPE,
-            )
-            .await;
-            return Ok(AtomicRunActionAdmission::AckRecoveredStarted {
-                event_index: recovered_event_index,
-            });
-        }
-        self.patch_run_projection_event_metadata_for_user(
-            request.user_id,
-            request.expected_session_id,
-            request.run_id,
-            event_index,
-            ACTION_ADMISSION_GRANTED_EVENT_TYPE,
-        )
-        .await;
-        Ok(AtomicRunActionAdmission::Started { event_index })
-    }
-
     async fn has_run_event(
         &self,
         user_id: &str,
@@ -16137,60 +15557,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|error| error.to_string())
     }
 
-    async fn load_run_guidance_admission(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        intent_id: &str,
-    ) -> Result<Option<DurableRunGuidanceAdmissionRecord>, String> {
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        let idempotency_key = format!("user_intent:{intent_id}");
-        let duplicate_intent = self
-            .load_run_event_by_idempotency_key(user_id, run_id, "user_intent", &idempotency_key)
-            .await?;
-        let latest_fence = sqlx::query(
-            "SELECT event_type FROM agent_run_events
-             WHERE user_id = ? AND run_id = ?
-               AND event_type IN ('user_intent_settlement_fenced',
-                                  'user_intent_admission_reopened')
-             ORDER BY event_idx DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_guidance_fence", run_id, source).to_string())?;
-        let settlement_fenced = latest_fence
-            .as_ref()
-            .and_then(|row| row.try_get::<String, _>("event_type").ok())
-            .as_deref()
-            == Some("user_intent_settlement_fenced");
-        let owner_lease_live: i64 = sqlx::query_scalar(
-            "SELECT CAST(CASE
-                 WHEN owner_pod_id IS NOT NULL
-                  AND owner_lease_expires_at >= NOW(6)
-                 THEN 1 ELSE 0 END AS SIGNED)
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_one(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_guidance_owner_lease", run_id, source).to_string())?;
-        Ok(Some(DurableRunGuidanceAdmissionRecord {
-            run,
-            duplicate_intent,
-            settlement_fenced,
-            owner_lease_live: owner_lease_live == 1,
-        }))
-    }
-
     async fn admit_run_guidance(
         &self,
         request: AtomicRunGuidanceAdmissionRequest<'_>,
@@ -16201,13 +15567,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("admit_run_guidance_acquire", request.run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("admit_run_guidance_begin", request.run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("admit_run_guidance_begin", request.run_id, source).to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -16474,18 +15836,14 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error(
-                    "begin_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error(
+                "begin_user_intent_admission_transition",
+                request.run_id,
+                source,
+            )
+            .to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -16815,13 +16173,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("acquire_terminal_intent_returns", request.run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("begin_terminal_intent_returns", request.run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_terminal_intent_returns", request.run_id, source).to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -17130,13 +16484,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("acquire_user_intent_apply", request.run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("begin_user_intent_apply", request.run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_user_intent_apply", request.run_id, source).to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -17892,7 +17242,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("update_run_status_acquire", run_id, source).to_string())?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("update_run_status_begin", run_id, source).to_string())?;
@@ -18032,13 +17381,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("update_run_status_if_current_acquire", run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("update_run_status_if_current_begin", run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("update_run_status_if_current_begin", run_id, source).to_string()
+        })?;
         // Load run metadata inside the transaction so the slot ownership
         // check sees the same row version as the UPDATE, closing the TOCTOU
         // window where a concurrent agent_id flip could misattribute the slot.
@@ -18208,13 +17553,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("transition_run_status_with_event_acquire", run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("transition_run_status_with_event_begin", run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("transition_run_status_with_event_begin", run_id, source).to_string()
+        })?;
 
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
@@ -18429,18 +17770,14 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error(
-                    "guarded_transition_run_status_with_event_begin",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error(
+                "guarded_transition_run_status_with_event_begin",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
 
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
@@ -18820,13 +18157,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("generation_fenced_append_acquire", run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("generation_fenced_append_begin", run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("generation_fenced_append_begin", run_id, source).to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
             .await
@@ -19245,7 +18578,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("acquire_save_checkpoint", run_id, source).to_string())?;
         let mut tx = connection
-            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("begin_save_checkpoint", run_id, source).to_string())?;
@@ -19499,18 +18831,14 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error(
-                    "begin_atomic_guarded_tool_request",
-                    request.action.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error(
+                "begin_atomic_guarded_tool_request",
+                request.action.run_id,
+                source,
+            )
+            .to_string()
+        })?;
         let admission =
             admit_run_action_in_existing_transaction(&mut tx, request.action, &self.owner_pod_id)
                 .await?;
@@ -19904,13 +19232,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("acquire_guarded_interaction_batch", request.run_id, source).to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("begin_guarded_interaction_batch", request.run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_guarded_interaction_batch", request.run_id, source).to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -20497,13 +19821,9 @@ impl RunStateStore for DatabaseRunStateStore {
                 .map_err(|source| {
                     db_error("acquire_run_interaction_wait", run_id, source).to_string()
                 })?;
-            let mut tx = connection
-                .connection_mut()
-                .begin()
-                .await
-                .map_err(|source| {
-                    db_error("begin_run_interaction_wait", run_id, source).to_string()
-                })?;
+            let mut tx = connection.begin().await.map_err(|source| {
+                db_error("begin_run_interaction_wait", run_id, source).to_string()
+            })?;
             let Some(run) = self
                 .load_run_metadata_for_exact_session_tx(
                     &mut tx,
@@ -21341,13 +20661,9 @@ impl RunStateStore for DatabaseRunStateStore {
                 .map_err(|source| {
                     db_error("resolve_run_interaction_acquire", run_id, source).to_string()
                 })?;
-            let mut tx = connection
-                .connection_mut()
-                .begin()
-                .await
-                .map_err(|source| {
-                    db_error("resolve_run_interaction_begin", run_id, source).to_string()
-                })?;
+            let mut tx = connection.begin().await.map_err(|source| {
+                db_error("resolve_run_interaction_begin", run_id, source).to_string()
+            })?;
             let Some(run) = self
                 .load_run_metadata_for_exact_session_tx(
                     &mut tx,
@@ -22867,13 +22183,9 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("begin_reconcile_user_intent_reopen", request.run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_reconcile_user_intent_reopen", request.run_id, source).to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -23063,13 +22375,9 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|source| {
-                db_error("begin_reconcile_user_intent_apply", request.run_id, source).to_string()
-            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_reconcile_user_intent_apply", request.run_id, source).to_string()
+        })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -37434,96 +36742,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_guidance_rechecks_fence_after_a_stale_snapshot_barrier() {
-        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
-        store
-            .insert_run(durable_run_record("guidance-fence-barrier"))
-            .await
-            .unwrap();
-        let snapshot_observed = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-        let fence_committed = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-        let submitter = {
-            let store = store.clone();
-            let snapshot_observed = snapshot_observed.clone();
-            let fence_committed = fence_committed.clone();
-            tokio::spawn(async move {
-                let stale = store
-                    .load_run_guidance_admission(
-                        "u1",
-                        "guidance-fence-barrier",
-                        "intent-after-fence",
-                    )
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(!stale.settlement_fenced);
-                snapshot_observed.wait().await;
-                fence_committed.wait().await;
-                let event = user_intent_event("intent-after-fence");
-                store
-                    .admit_run_guidance(guidance_admission_request(
-                        "guidance-fence-barrier",
-                        "intent-after-fence",
-                        &event,
-                        true,
-                    ))
-                    .await
-                    .unwrap()
-            })
-        };
-        snapshot_observed.wait().await;
-        store
-            .append_event(
-                "u1",
-                "s1",
-                "guidance-fence-barrier",
-                make_event("user_intent_settlement_fenced", json!({})),
-            )
-            .await
-            .unwrap();
-        fence_committed.wait().await;
-        assert_eq!(
-            submitter.await.unwrap(),
-            AtomicRunGuidanceAdmission::SettlementFenced
-        );
-        let run = store
-            .load_run("u1", "guidance-fence-barrier")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            !run.events
-                .iter()
-                .any(|event| extract_event_type(event) == "user_intent")
-        );
-    }
-
-    #[tokio::test]
-    async fn atomic_guidance_rechecks_lease_after_a_stale_snapshot_barrier() {
-        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
-        let mut run = durable_run_record("guidance-lease-barrier");
+    async fn atomic_guidance_rejects_expired_consumer_lease() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("guidance-expired-lease");
         run.owner_pod_id = Some("local-owner".to_string());
         run.owner_lease_expires_at =
-            Some((chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339());
+            Some((chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339());
         store.insert_run(run).await.unwrap();
-        let snapshot = store
-            .load_run_guidance_admission("u1", "guidance-lease-barrier", "intent-after-expiry")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(snapshot.owner_lease_live);
-        {
-            let mut runs = store.runs.write().await;
-            runs.get_mut("guidance-lease-barrier")
-                .unwrap()
-                .owner_lease_expires_at =
-                Some((chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339());
-        }
+
         let event = user_intent_event("intent-after-expiry");
         assert!(matches!(
             store
                 .admit_run_guidance(guidance_admission_request(
-                    "guidance-lease-barrier",
+                    "guidance-expired-lease",
                     "intent-after-expiry",
                     &event,
                     false,
@@ -37533,15 +36764,11 @@ mod tests {
             AtomicRunGuidanceAdmission::ConsumerNotLive { .. }
         ));
         let run = store
-            .load_run("u1", "guidance-lease-barrier")
+            .load_run("u1", "guidance-expired-lease")
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            !run.events
-                .iter()
-                .any(|event| extract_event_type(event) == "user_intent")
-        );
+        assert!(run.events.is_empty());
     }
 
     #[tokio::test]
@@ -38319,192 +37546,6 @@ mod tests {
             .unwrap()
             .expect("interaction event");
         assert_eq!(event["index"], 1);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_atomic_action_admission_orders_intent_races_and_ack_retries_on_matrixone() {
-        let (store, pool) = setup_database_run_state_store_it().await;
-        let user_id = format!("runs-it-action-user-{}", Uuid::new_v4());
-
-        let insert_run = |run_id: &str, session_id: &str| {
-            let mut record = durable_run_record(run_id);
-            record.user_id = user_id.clone();
-            record.session_id = session_id.to_string();
-            record.root_run_id = Some(run_id.to_string());
-            record.ancestor_path = Some(run_id.to_string());
-            record
-        };
-
-        let action_first_run = format!("runs-it-action-first-{}", Uuid::new_v4());
-        let action_first_session = format!("runs-it-action-s1-{}", Uuid::new_v4());
-        cleanup_database_run_fixture(&pool, &user_id, &action_first_run).await;
-        insert_active_database_session_fixture(&pool, &user_id, &action_first_session).await;
-        store
-            .insert_run(insert_run(&action_first_run, &action_first_session))
-            .await
-            .expect("insert action-first run");
-        let action_first_request = AtomicRunActionAdmissionRequest {
-            user_id: &user_id,
-            run_id: &action_first_run,
-            expected_session_id: &action_first_session,
-            action_id: "tool-batch-action-first",
-            expected_control_epoch: -1,
-            expected_owner_generation: 0,
-        };
-        let started = store
-            .begin_action(action_first_request)
-            .await
-            .expect("admit action before guidance");
-        assert_eq!(
-            started,
-            AtomicRunActionAdmission::Started { event_index: 1 }
-        );
-        assert!(started.is_fresh_grant());
-        // Simulate the caller retrying after losing the first response. A
-        // pre-existing fact is observable but never authorizes replay.
-        let ack_loss_retry = store
-            .begin_action(action_first_request)
-            .await
-            .expect("reconcile exact action retry");
-        assert_eq!(
-            ack_loss_retry,
-            AtomicRunActionAdmission::AlreadyStarted { event_index: 1 }
-        );
-        assert!(!ack_loss_retry.is_fresh_grant());
-
-        let intent_first_run = format!("runs-it-intent-first-{}", Uuid::new_v4());
-        let intent_first_session = format!("runs-it-intent-s1-{}", Uuid::new_v4());
-        cleanup_database_run_fixture(&pool, &user_id, &intent_first_run).await;
-        insert_active_database_session_fixture(&pool, &user_id, &intent_first_session).await;
-        store
-            .insert_run(insert_run(&intent_first_run, &intent_first_session))
-            .await
-            .expect("insert intent-first run");
-        assert!(
-            store
-                .update_run_status_with_events_if_current(
-                    &user_id,
-                    &intent_first_session,
-                    &intent_first_run,
-                    &[STATUS_RUNNING],
-                    Some(0),
-                    STATUS_RUNNING,
-                    None,
-                    None,
-                    &[user_intent_event("matrix-intent-first")],
-                )
-                .await
-                .expect("commit user intent first")
-        );
-        assert_eq!(
-            store
-                .begin_action(AtomicRunActionAdmissionRequest {
-                    user_id: &user_id,
-                    run_id: &intent_first_run,
-                    expected_session_id: &intent_first_session,
-                    action_id: "tool-batch-intent-first",
-                    expected_control_epoch: -1,
-                    expected_owner_generation: 0,
-                })
-                .await
-                .expect("intent must supersede stale action"),
-            AtomicRunActionAdmission::Superseded {
-                user_intent_event_index: 1
-            }
-        );
-
-        let race_run = format!("runs-it-action-race-{}", Uuid::new_v4());
-        let race_session = format!("runs-it-action-race-session-{}", Uuid::new_v4());
-        cleanup_database_run_fixture(&pool, &user_id, &race_run).await;
-        insert_active_database_session_fixture(&pool, &user_id, &race_session).await;
-        store
-            .insert_run(insert_run(&race_run, &race_session))
-            .await
-            .expect("insert race run");
-        let action = store.begin_action(AtomicRunActionAdmissionRequest {
-            user_id: &user_id,
-            run_id: &race_run,
-            expected_session_id: &race_session,
-            action_id: "tool-batch-race",
-            expected_control_epoch: -1,
-            expected_owner_generation: 0,
-        });
-        let expected_running = [STATUS_RUNNING];
-        let race_intent_events = [user_intent_event("matrix-intent-race")];
-        let intent = store.update_run_status_with_events_if_current(
-            &user_id,
-            &race_session,
-            &race_run,
-            &expected_running,
-            Some(0),
-            STATUS_RUNNING,
-            None,
-            None,
-            &race_intent_events,
-        );
-        let (action_outcome, intent_outcome) = tokio::join!(action, intent);
-        let action_outcome = action_outcome.expect("race action outcome");
-        assert!(intent_outcome.expect("race intent outcome"));
-        let race = store
-            .load_run(&user_id, &race_run)
-            .await
-            .expect("load race run")
-            .expect("race run exists");
-        let action_index = race
-            .events
-            .iter()
-            .position(|event| extract_event_type(event) == ACTION_ADMISSION_GRANTED_EVENT_TYPE);
-        let intent_index = race
-            .events
-            .iter()
-            .position(|event| extract_event_type(event) == "user_intent")
-            .expect("race intent exists");
-        match action_outcome {
-            AtomicRunActionAdmission::Started { event_index } => {
-                assert_eq!(Some(event_index as usize), action_index);
-                assert!(action_index.unwrap() < intent_index);
-            }
-            AtomicRunActionAdmission::Superseded {
-                user_intent_event_index,
-            } => {
-                assert_eq!(user_intent_event_index as usize, intent_index);
-                assert!(action_index.is_none());
-            }
-            other => panic!("unexpected Matrix action race outcome: {other:?}"),
-        }
-        assert_eq!(
-            store
-                .begin_action(AtomicRunActionAdmissionRequest {
-                    user_id: &user_id,
-                    run_id: &race_run,
-                    expected_session_id: &race_session,
-                    action_id: "stale-owner-action",
-                    expected_control_epoch: race.last_event_idx,
-                    expected_owner_generation: 99,
-                })
-                .await
-                .expect("stale owner outcome"),
-            AtomicRunActionAdmission::OwnerGenerationMismatch {
-                actual_owner_generation: 0
-            }
-        );
-
-        for (run_id, session_id) in [
-            (&action_first_run, &action_first_session),
-            (&intent_first_run, &intent_first_session),
-            (&race_run, &race_session),
-        ] {
-            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
-            sqlx::query(
-                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(session_id)
-            .execute(pool.get())
-            .await
-            .expect("clean action admission execution slot");
-        }
     }
 
     #[tokio::test]
@@ -42094,51 +41135,6 @@ mod tests {
         assert!(USER_INTENT_CONTROL_DELTA_SELECT_SQL.contains("event_idx <= ?"));
         assert!(USER_INTENT_CONTROL_DELTA_SELECT_SQL.contains("ORDER BY event_idx ASC LIMIT ?"));
         assert!(!USER_INTENT_CONTROL_DELTA_SELECT_SQL.contains("SELECT *"));
-    }
-
-    #[tokio::test]
-    async fn guidance_admission_snapshot_excludes_large_unrelated_event_history() {
-        let store = InMemoryRunStateStore::new();
-        let mut run = durable_run_record("guidance-large-tail");
-        run.events = (0..34_000)
-            .map(|index| make_event("agent_progress", json!({"index": index})))
-            .collect();
-        run.events.push(json!({
-            "event_type": "user_intent",
-            "idempotency_key": "user_intent:intent-exact",
-            "data": {
-                "intent_id": "intent-exact",
-                "delivery": "guide_current_run",
-                "input": {"content": "wait"}
-            }
-        }));
-        run.events.push(make_event(
-            "user_intent_settlement_fenced",
-            json!({"reason": "terminal settlement"}),
-        ));
-        run.last_event_idx = run.events.len() as i64 - 1;
-        store.insert_run(run).await.unwrap();
-
-        let snapshot = store
-            .load_run_guidance_admission("u1", "guidance-large-tail", "intent-exact")
-            .await
-            .unwrap()
-            .expect("guidance admission snapshot");
-
-        assert!(snapshot.run.events.is_empty(), "control snapshot is O(1)");
-        assert!(snapshot.settlement_fenced);
-        assert!(
-            !snapshot.owner_lease_live,
-            "a process-local run without a durable owner lease is not cross-process live"
-        );
-        assert_eq!(
-            snapshot
-                .duplicate_intent
-                .as_ref()
-                .and_then(|event| event.get("index"))
-                .and_then(serde_json::Value::as_i64),
-            Some(34_000)
-        );
     }
 
     #[tokio::test]

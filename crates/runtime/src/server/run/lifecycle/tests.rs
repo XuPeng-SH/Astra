@@ -206,8 +206,8 @@ fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
 }
 
 use crate::server::run::lifecycle::persistence::{
-    build_tool_trace_events, extract_prev_assistant_text, extract_session_state_compact,
-    messages_for_csl_persist, redact_trace_value, transcript_page_bounds, transcript_page_seq,
+    build_tool_trace_events, extract_session_state_compact, messages_for_csl_persist,
+    redact_trace_value, transcript_page_bounds, transcript_page_seq,
 };
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
@@ -4205,7 +4205,7 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     assert_eq!(signal["executor"]["executor_id"], "edge-macbook-1");
 }
 
-// ── extract_prev_assistant_text + implicit feedback wiring ──
+// ── implicit feedback wiring ──
 
 #[test]
 fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
@@ -4442,57 +4442,6 @@ fn unexecuted_tool_trace_events_preserve_canonical_terminal_dispositions() {
     assert_eq!(events[3].metadata["disposition"], "reused");
     assert_eq!(events[5].metadata["disposition"], "suppressed");
     assert_eq!(events[7].metadata["disposition"], "deferred");
-}
-
-#[test]
-fn extract_prev_assistant_text_picks_latest_assistant_string() {
-    let messages = vec![
-        serde_json::json!({"role": "user", "content": "hi"}),
-        serde_json::json!({"role": "assistant", "content": "first answer"}),
-        serde_json::json!({"role": "user", "content": "follow up"}),
-        serde_json::json!({"role": "assistant", "content": "latest answer"}),
-    ];
-    assert_eq!(
-        extract_prev_assistant_text(&messages).as_deref(),
-        Some("latest answer")
-    );
-}
-
-#[test]
-fn extract_prev_assistant_text_handles_content_parts_array() {
-    let messages = vec![
-        serde_json::json!({"role": "user", "content": "hi"}),
-        serde_json::json!({
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "part one"},
-                {"type": "text", "text": "part two"},
-            ],
-        }),
-    ];
-    assert_eq!(
-        extract_prev_assistant_text(&messages).as_deref(),
-        Some("part one\npart two")
-    );
-}
-
-#[test]
-fn extract_prev_assistant_text_returns_none_when_no_assistant_turn() {
-    let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-    assert!(extract_prev_assistant_text(&messages).is_none());
-}
-
-#[test]
-fn extract_prev_assistant_text_skips_empty_assistant_bodies() {
-    let messages = vec![
-        serde_json::json!({"role": "assistant", "content": "real answer"}),
-        serde_json::json!({"role": "user", "content": "ok"}),
-        serde_json::json!({"role": "assistant", "content": "   "}),
-    ];
-    assert_eq!(
-        extract_prev_assistant_text(&messages).as_deref(),
-        Some("real answer")
-    );
 }
 
 #[test]
@@ -7841,6 +7790,24 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.inner.load_run_control(user_id, run_id).await
     }
 
+    async fn load_latest_terminal_cancellation_origin(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::DurableCancellationOrigin>, String> {
+        self.inner
+            .load_latest_terminal_cancellation_origin(user_id, run_id)
+            .await
+    }
+
+    async fn has_unsettled_user_intent(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<bool>, String> {
+        self.inner.has_unsettled_user_intent(user_id, run_id).await
+    }
+
     async fn claim_run_start(
         &self,
         record: DurableRunRecord,
@@ -7874,6 +7841,17 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.inner.load_run(user_id, run_id).await
     }
 
+    async fn load_run_interaction_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) -> Result<Option<astra_services::runs::DurableRunInteractionProjection>, String> {
+        self.inner
+            .load_run_interaction_projection(user_id, run_id, kind)
+            .await
+    }
+
     async fn load_run_status_snapshot(
         &self,
         user_id: &str,
@@ -7884,6 +7862,16 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .expect("status snapshot counter lock")
             .status_snapshot_calls += 1;
         self.inner.load_run_status_snapshot(user_id, run_id).await
+    }
+
+    async fn load_run_delegation_projection_target(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::DurableRunDelegationProjectionTarget>, String> {
+        self.inner
+            .load_run_delegation_projection_target(user_id, run_id)
+            .await
     }
 
     async fn load_run_interaction_event(
@@ -8222,6 +8210,16 @@ impl RunStateStore for FaultInjectedRunStateStore {
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
         self.inner.load_run_projection(user_id, run_id).await
+    }
+
+    async fn find_latest_explain_analyze_root(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        self.inner
+            .find_latest_explain_analyze_root(user_id, session_id)
+            .await
     }
 
     async fn rebuild_run_projection(
@@ -23944,7 +23942,6 @@ async fn db_explain_publication_is_discoverable_and_readable() {
         generation,
     )
     .await
-    .unwrap()
     .unwrap();
     assert!(context.contains(&artifact));
     let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
@@ -24097,8 +24094,7 @@ async fn db_explain_discovery_reads_an_existing_snapshot_once() {
         generation,
     )
     .await
-    .expect("validate Explain snapshot")
-    .expect("readable Explain notice");
+    .expect("validate Explain snapshot");
     assert!(expected_notice.contains(&handle));
     assert!(expected_notice.contains("status=complete"));
     let mut edge_profile = serde_json::Map::new();
@@ -24306,7 +24302,6 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
         durable.run_generation,
     )
     .await
-    .unwrap()
     .unwrap();
     assert!(notice.contains(&handle));
     let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
