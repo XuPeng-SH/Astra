@@ -3428,10 +3428,19 @@ fn hash_tracked_metadata(root: &Path, hasher: &mut DefaultHasher) -> bool {
         {
             continue;
         }
-        let Ok(metadata) = fs::symlink_metadata(&path_from_git_root) else {
-            return false;
-        };
         path_from_workspace.to_string_lossy().hash(hasher);
+        let metadata = match fs::symlink_metadata(&path_from_git_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // `git ls-files` retains an index entry for an unstaged
+                // deletion. Keep the same deterministic missing sentinel as
+                // the status-path content observer so the deletion remains
+                // observable instead of disabling the whole fast path.
+                b"missing".hash(hasher);
+                continue;
+            }
+            Err(_) => return false,
+        };
         let state_before = tracked_metadata_state(&metadata, hasher);
         if metadata.file_type().is_symlink() {
             let Ok(target) = fs::read_link(&path_from_git_root) else {
@@ -6217,6 +6226,30 @@ mod tests {
         permissions.set_mode(0o600);
         fs::set_permissions(temp.path().join("tracked.txt"), permissions)
             .expect("change tracked permissions");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn unstaged_tracked_deletion_remains_observable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
+        fs::remove_file(temp.path().join("tracked.txt")).expect("delete tracked file");
         let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
         assert!(before.changed_from(Some(after)));
     }
