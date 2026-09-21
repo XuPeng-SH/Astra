@@ -3809,7 +3809,12 @@ async fn backfill_legacy_checkpoints(pool: &sqlx::Pool<MySql>) -> Result<(), sql
             "SELECT user_id, run_id
              FROM agent_runs
              WHERE checkpoint_version IS NOT NULL
-               AND checkpoint_json IS NOT NULL",
+               AND checkpoint_json IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM run_checkpoints AS canonical
+                   WHERE canonical.user_id = agent_runs.user_id
+                     AND canonical.run_id = agent_runs.run_id
+               )",
         );
         if let Some((last_user_id, last_run_id)) = &last_key {
             select
@@ -3849,6 +3854,21 @@ async fn backfill_legacy_checkpoints(pool: &sqlx::Pool<MySql>) -> Result<(), sql
                 tx.rollback().await?;
                 continue;
             };
+            // The paging query is only an optimization. Recheck after locking
+            // the run because a canonical writer may have committed since the
+            // page was read.
+            let has_canonical_history: Option<i64> = query_scalar(
+                "SELECT 1 FROM run_checkpoints
+                 WHERE user_id = ? AND run_id = ? LIMIT 1",
+            )
+            .bind(&user_id)
+            .bind(&run_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_canonical_history.is_some() {
+                tx.commit().await?;
+                continue;
+            }
             let run_id: String = row.try_get("run_id")?;
             let user_id: String = row.try_get("user_id")?;
             let session_id: String = row.try_get("session_id")?;
@@ -3869,22 +3889,6 @@ async fn backfill_legacy_checkpoints(pool: &sqlx::Pool<MySql>) -> Result<(), sql
                         continue;
                     }
                 };
-            // The embedded snapshot has no checkpoint timestamp. Once a run
-            // already has canonical history, that history is the only
-            // trustworthy ordering source; do not invent a competing row
-            // whose position would depend on the run's later updates.
-            let has_canonical_history: Option<i64> = query_scalar(
-                "SELECT 1 FROM run_checkpoints
-                 WHERE user_id = ? AND run_id = ? LIMIT 1",
-            )
-            .bind(&user_id)
-            .bind(&run_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if has_canonical_history.is_some() {
-                tx.commit().await?;
-                continue;
-            }
             query(
                 "INSERT INTO run_checkpoints
                  (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,

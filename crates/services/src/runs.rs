@@ -10064,27 +10064,8 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         let checkpoints = self.checkpoints.read().await;
         let mut claim_events = std::collections::HashMap::new();
-        let mut graceful_resume = std::collections::HashMap::new();
         for (_, _, run_id, _) in &candidates {
             let run = &runs[run_id];
-            let available = checkpoints
-                .get(run_id)
-                .and_then(|rows| {
-                    rows.iter()
-                        .filter(|checkpoint| checkpoint.checkpoint_kind == "resume")
-                        .max_by(|left, right| {
-                            left.created_at
-                                .cmp(&right.created_at)
-                                .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
-                        })
-                })
-                .is_some_and(|checkpoint| {
-                    is_graceful_resume_checkpoint(
-                        &checkpoint.checkpoint_version,
-                        &checkpoint.checkpoint_json,
-                    )
-                });
-            graceful_resume.insert(run_id.clone(), available);
             if let Some(identity) = execution_handoff_checkpoint_identity(run)?
                 && let Some(checkpoint) = checkpoints
                     .get(run_id)
@@ -10112,12 +10093,27 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.last_event_idx += 1;
                 }
                 run.updated_at = chrono::Utc::now().to_rfc3339();
+                let has_graceful_resume_checkpoint = checkpoints
+                    .get(&run_id)
+                    .and_then(|rows| {
+                        rows.iter()
+                            .filter(|checkpoint| checkpoint.checkpoint_kind == "resume")
+                            .max_by(|left, right| {
+                                left.created_at
+                                    .cmp(&right.created_at)
+                                    .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
+                            })
+                    })
+                    .is_some_and(|checkpoint| {
+                        is_graceful_resume_checkpoint(
+                            &checkpoint.checkpoint_version,
+                            &checkpoint.checkpoint_json,
+                        )
+                    });
                 claimed.push(RecoveryClaim {
                     run: run.clone(),
                     claimed_from_generation: generation,
-                    has_graceful_resume_checkpoint: graceful_resume
-                        .remove(&run_id)
-                        .unwrap_or(false),
+                    has_graceful_resume_checkpoint,
                 });
             }
         }
@@ -10593,10 +10589,6 @@ async fn attach_graceful_resume_checkpoint_flags(
     tx: &mut Transaction<'_, MySql>,
     claims: &mut [RecoveryClaim],
 ) -> Result<(), String> {
-    let claim_keys = claims
-        .iter()
-        .map(|claim| (&claim.run.user_id, &claim.run.run_id))
-        .collect::<Vec<_>>();
     if claims.is_empty() {
         return Ok(());
     }
@@ -10607,15 +10599,15 @@ async fn attach_graceful_resume_checkpoint_flags(
          FROM run_checkpoints AS checkpoint
          WHERE checkpoint.checkpoint_kind = 'resume' AND (",
     );
-    for (index, (user_id, run_id)) in claim_keys.iter().enumerate() {
+    for (index, claim) in claims.iter().enumerate() {
         if index > 0 {
             query.push(" OR ");
         }
         query
             .push("(checkpoint.user_id = ")
-            .push_bind(*user_id)
+            .push_bind(&claim.run.user_id)
             .push(" AND checkpoint.run_id = ")
-            .push_bind(*run_id)
+            .push_bind(&claim.run.run_id)
             .push(")");
     }
     query.push(
@@ -10635,26 +10627,32 @@ async fn attach_graceful_resume_checkpoint_flags(
         .fetch_all(&mut **tx)
         .await
         .map_err(|error| format!("load latest resume checkpoints for recovery: {error}"))?;
-    for row in rows {
-        let user_id: String = row
-            .try_get("user_id")
-            .map_err(|error| format!("decode resume checkpoint user: {error}"))?;
-        let run_id: String = row
-            .try_get("run_id")
-            .map_err(|error| format!("decode resume checkpoint run: {error}"))?;
-        let checkpoint_version: String = row
-            .try_get("checkpoint_version")
-            .map_err(|error| format!("decode resume checkpoint version: {error}"))?;
-        let checkpoint_json: String = row
-            .try_get("checkpoint_json")
-            .map_err(|error| format!("decode resume checkpoint payload: {error}"))?;
-        if let Some(claim) = claims
-            .iter_mut()
-            .find(|claim| claim.run.user_id == user_id && claim.run.run_id == run_id)
-        {
-            claim.has_graceful_resume_checkpoint =
-                is_graceful_resume_checkpoint(&checkpoint_version, &checkpoint_json);
-        }
+    let flags = rows
+        .into_iter()
+        .map(|row| {
+            let user_id: String = row
+                .try_get("user_id")
+                .map_err(|error| format!("decode resume checkpoint user: {error}"))?;
+            let run_id: String = row
+                .try_get("run_id")
+                .map_err(|error| format!("decode resume checkpoint run: {error}"))?;
+            let checkpoint_version: String = row
+                .try_get("checkpoint_version")
+                .map_err(|error| format!("decode resume checkpoint version: {error}"))?;
+            let checkpoint_json: String = row
+                .try_get("checkpoint_json")
+                .map_err(|error| format!("decode resume checkpoint payload: {error}"))?;
+            Ok::<_, String>((
+                (user_id, run_id),
+                is_graceful_resume_checkpoint(&checkpoint_version, &checkpoint_json),
+            ))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, String>>()?;
+    for claim in claims {
+        claim.has_graceful_resume_checkpoint = flags
+            .get(&(claim.run.user_id.clone(), claim.run.run_id.clone()))
+            .copied()
+            .unwrap_or(false);
     }
     Ok(())
 }
