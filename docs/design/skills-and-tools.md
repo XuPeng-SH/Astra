@@ -111,6 +111,62 @@ remain encrypted and server-owned. This binding never selects a memory extractio
 model or changes agent/tool policy. See [the pilot guide](../guides/memory-judgment-pilot.md)
 for configuration, fallback and validation limitations.
 
+## Intent-first authoring journey
+
+The normal user entrypoint accepts an outcome in natural language. The user
+does not select a Harness, Session, Offering, verifier, snapshot, or provider
+route. For example, these are complete requests:
+
+* “帮我生成一个 Skill。”
+* “帮我优化这个能力。”
+* “把刚才反复做的流程变成可复用能力。”
+
+The system resolves the internal work from that intent:
+
+```text
+user intent
+  -> classify the target and operation
+  -> resolve the relevant conversation, current artifact, and evidence
+  -> generate one candidate
+  -> compare it with the appropriate baseline through the shared Evaluation
+  -> return the candidate, verdict, evidence, cost, and limitations
+```
+
+Classification is a judgment decision point. When the configured JEV Offering
+is available, it may make the decision quickly and cheaply; when it is
+unavailable, the base path still performs the work with the information it can
+prove. JEV is an enhancement to the decision path, not a prerequisite for
+ordinary authoring and not a source of permission to use tools.
+
+The first object is an owner-scoped instruction-only Skill, but the entrypoint
+is intentionally named and modeled as authoring intent. Future adapters can
+resolve a prompt, workflow, routing policy, or other capability without
+teaching users a different control-plane vocabulary. Skillify generates a
+candidate and its source evidence; the shared Evaluation owner creates trials,
+settles the canonical Runs, and builds the report.
+
+The user-visible result is small and concrete:
+
+* the generated or improved candidate, with an immutable revision after publish;
+* the evaluation outcome, including baseline/candidate behavior and whether
+  the evidence is complete;
+* links to the source evidence and the measured tool, context, provider,
+  safety, reliability, and cost facts; and
+* a clear next action such as use, publish, revise, or inspect evidence.
+
+The UI may show progress such as “理解目标”, “生成候选”, and “真实评估”,
+but it does not expose the implementation controls above. The existing
+`/harnesses` and `/evaluations` surfaces remain operator and diagnostic views
+until the intent entrypoint is wired end to end; they are not the normal user
+journey.
+
+The current first adapter returns a reviewable Skill candidate and its source
+evidence. It reports Evaluation as unavailable when the context does not
+contain a replayable case and a server-owned verifier; that state is explicit
+and never becomes a pass. Publishing an immutable Skill revision and running
+the shared Evaluation are the next durable steps for a candidate with enough
+evidence.
+
 ## Evidence-backed evaluation and Skillify adapter
 
 Evaluation is a shared capability for prompts, skills, routing, provider/model

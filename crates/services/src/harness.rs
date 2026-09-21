@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{MySql, QueryBuilder, Row};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 use uuid::Uuid;
 
 use astra_core::{ErrorResponse, SharedPool, error_response, internal_error};
 
+use crate::models::parse_pricing_snapshot;
 use crate::personal_skills::{
     CreateUserSkillSource, DatabasePersonalSkillStore, SubmitUserSkillVersion,
 };
@@ -255,6 +256,8 @@ pub struct SkillifyRunRequest {
     pub skill_name: Option<String>,
     pub topic: Option<String>,
     pub target_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -279,6 +282,57 @@ pub struct SkillifyDraftRecord {
     pub version_id: String,
     pub content_markdown: String,
     pub approved_item_count: usize,
+}
+
+/// Natural-language authoring input. The current first adapter resolves this
+/// intent to Skillify; the caller does not choose a Harness, model, verifier,
+/// or source projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoringIntentRequest {
+    pub goal: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoringEvaluationSummary {
+    pub status: String,
+    pub reason: String,
+    pub experiment_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoringInferenceEvidence {
+    pub schema_version: u32,
+    pub invocation_count: usize,
+    pub physical_attempt_count: usize,
+    pub priced_attempt_count: usize,
+    pub exact_usage_attempt_count: usize,
+    pub complete: bool,
+    pub settlement_pending: bool,
+    pub usage_status: String,
+    pub providers: Vec<String>,
+    pub models: Vec<String>,
+    pub offering_ids: Vec<String>,
+    pub operations: Vec<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub estimated_cost_usd: Option<f64>,
+    pub completeness_reasons: Vec<String>,
+    pub evidence_fingerprint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthoringIntentRecord {
+    pub target: String,
+    pub operation: String,
+    pub classification_source: String,
+    pub goal: String,
+    pub harness_run: HarnessRunRecord,
+    pub skill_drafts: Vec<HarnessSkillDraftRecord>,
+    pub evaluation: AuthoringEvaluationSummary,
+    pub inference: AuthoringInferenceEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -364,6 +418,16 @@ pub trait SkillifyAgentExecutor: Send + Sync {
 }
 
 #[async_trait]
+pub trait AuthoringIntentClassifier: Send + Sync {
+    async fn classify(
+        &self,
+        user_id: &str,
+        harness_run_id: &str,
+        goal: &str,
+    ) -> Result<Option<String>, String>;
+}
+
+#[async_trait]
 pub trait HarnessService: Send + Sync {
     async fn list_templates(
         &self,
@@ -378,6 +442,13 @@ pub trait HarnessService: Send + Sync {
         user_id: String,
         request: SkillifyRunRequest,
     ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    async fn create_authoring_intent(
+        &self,
+        user_id: String,
+        session_id: String,
+        request: AuthoringIntentRequest,
+    ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn get_run(
         &self,
@@ -449,6 +520,7 @@ pub trait HarnessService: Send + Sync {
 pub struct DatabaseHarnessService {
     pool: SharedPool,
     skillify_agent_executor: Option<Arc<dyn SkillifyAgentExecutor>>,
+    authoring_intent_classifier: Option<Arc<dyn AuthoringIntentClassifier>>,
 }
 
 impl DatabaseHarnessService {
@@ -456,6 +528,7 @@ impl DatabaseHarnessService {
         Self {
             pool,
             skillify_agent_executor: None,
+            authoring_intent_classifier: None,
         }
     }
 
@@ -464,6 +537,14 @@ impl DatabaseHarnessService {
         executor: Arc<dyn SkillifyAgentExecutor>,
     ) -> Self {
         self.skillify_agent_executor = Some(executor);
+        self
+    }
+
+    pub fn with_authoring_intent_classifier(
+        mut self,
+        classifier: Arc<dyn AuthoringIntentClassifier>,
+    ) -> Self {
+        self.authoring_intent_classifier = Some(classifier);
         self
     }
 
@@ -931,27 +1012,391 @@ impl DatabaseHarnessService {
     }
 }
 
-#[async_trait]
-impl HarnessService for DatabaseHarnessService {
-    async fn list_templates(
+impl DatabaseHarnessService {
+    async fn load_authoring_inference_evidence(
         &self,
-    ) -> Result<Vec<HarnessTemplateRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(vec![skillify_template()])
+        user_id: &str,
+        harness_run_id: &str,
+    ) -> HarnessResult<AuthoringInferenceEvidence> {
+        const MAX_FACTS: i64 = 32_768;
+        let invocations = sqlx::query(
+            "SELECT i.invocation_id, i.operation_id, i.status, i.usage_status,
+                    i.provider_delivery_state,
+                    r.offering_id, r.resolved_model_name AS model_name,
+                    r.provider, CAST(r.pricing_json AS CHAR) AS pricing_json
+             FROM inference_invocations AS i
+             LEFT JOIN inference_routes AS r
+               ON r.user_id = i.user_id AND r.route_id = i.route_id
+             WHERE i.user_id = ? AND i.harness_run_id = ?
+             ORDER BY i.created_at ASC, i.invocation_id ASC
+             LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(harness_run_id)
+        .bind(MAX_FACTS + 1)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+        let attempts = sqlx::query(
+            "SELECT a.attempt_id, a.invocation_id, a.provider, a.status,
+                    a.usage_status, a.input_tokens, a.output_tokens,
+                    a.cache_read_tokens, a.cache_creation_tokens,
+                    r.offering_id, r.resolved_model_name AS model_name,
+                    r.provider AS route_provider,
+                    CAST(r.pricing_json AS CHAR) AS pricing_json
+             FROM inference_provider_attempts AS a
+             INNER JOIN inference_invocations AS i
+               ON i.user_id = a.user_id AND i.invocation_id = a.invocation_id
+             LEFT JOIN inference_routes AS r
+               ON r.user_id = i.user_id AND r.route_id = i.route_id
+             WHERE a.user_id = ? AND a.harness_run_id = ?
+             ORDER BY a.invocation_id ASC, a.attempt_index ASC, a.attempt_id ASC
+             LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(harness_run_id)
+        .bind(MAX_FACTS + 1)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+
+        let mut providers = BTreeSet::new();
+        let mut models = BTreeSet::new();
+        let mut offering_ids = BTreeSet::new();
+        let mut operations = BTreeSet::new();
+        let mut invocation_ids = HashSet::new();
+        let mut attempt_counts = HashMap::<String, usize>::new();
+        let mut fingerprint_parts = vec![
+            "authoring-inference-v1".to_string(),
+            user_id.to_string(),
+            harness_run_id.to_string(),
+        ];
+        let invocations_truncated = invocations.len() > MAX_FACTS as usize;
+        let attempts_truncated = attempts.len() > MAX_FACTS as usize;
+        let mut settlement_pending = invocations_truncated || attempts_truncated;
+        let mut topology_complete = !invocations.is_empty() && !settlement_pending;
+        let mut usage_complete = !invocations.is_empty() && !settlement_pending;
+        let mut pricing_complete = !invocations.is_empty() && !settlement_pending;
+        let mut completeness_reasons = Vec::new();
+        let mut seen_reasons = HashSet::new();
+        let mut prompt_tokens = 0_u64;
+        let mut completion_tokens = 0_u64;
+        let mut cache_read_tokens = 0_u64;
+        let mut cache_creation_tokens = 0_u64;
+        let mut exact_usage_attempt_count = 0_usize;
+        let mut priced_attempt_count = 0_usize;
+        let mut estimated_cost_usd = 0_f64;
+
+        let add_reason = |reasons: &mut Vec<String>, seen: &mut HashSet<String>, reason: String| {
+            if seen.insert(reason.clone()) {
+                reasons.push(reason);
+            }
+        };
+        let non_negative = |value: i64, field: &str| -> HarnessResult<u64> {
+            u64::try_from(value).map_err(|_| {
+                error_response(
+                    StatusCode::CONFLICT,
+                    format!("authoring inference evidence contains a negative {field}"),
+                )
+            })
+        };
+        let add_total = |total: &mut u64, value: u64| {
+            if let Some(next) = total.checked_add(value) {
+                *total = next;
+                true
+            } else {
+                false
+            }
+        };
+
+        for row in invocations.iter().take(MAX_FACTS as usize) {
+            let invocation_id: String = row.try_get("invocation_id").map_err(internal_error)?;
+            let operation_id: String = row.try_get("operation_id").map_err(internal_error)?;
+            let status: String = row.try_get("status").map_err(internal_error)?;
+            let usage_status: String = row.try_get("usage_status").map_err(internal_error)?;
+            let delivery_state: String = row
+                .try_get("provider_delivery_state")
+                .map_err(internal_error)?;
+            let provider: Option<String> = row.try_get("provider").map_err(internal_error)?;
+            let model: Option<String> = row.try_get("model_name").map_err(internal_error)?;
+            let offering_id: Option<String> = row.try_get("offering_id").map_err(internal_error)?;
+            invocation_ids.insert(invocation_id.clone());
+            operations.insert(operation_id.clone());
+            if let Some(value) = provider.as_deref() {
+                providers.insert(value.to_string());
+            }
+            if let Some(value) = model.as_deref() {
+                models.insert(value.to_string());
+            }
+            if let Some(value) = offering_id.as_deref() {
+                offering_ids.insert(value.to_string());
+            }
+            if status == "admitted" || delivery_state == "unknown" {
+                settlement_pending = true;
+                topology_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("invocation_not_terminal:{invocation_id}"),
+                );
+            }
+            if provider.is_none() || model.is_none() || offering_id.is_none() {
+                topology_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("route_missing:{invocation_id}"),
+                );
+            }
+            if status != "succeeded" {
+                usage_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("invocation_status:{status}:{invocation_id}"),
+                );
+            }
+            fingerprint_parts.push(format!(
+                "invocation:{invocation_id}:{operation_id}:{status}:{usage_status}:{delivery_state}:{}:{}:{}",
+                offering_id.as_deref().unwrap_or(""),
+                model.as_deref().unwrap_or(""),
+                provider.as_deref().unwrap_or(""),
+            ));
+        }
+
+        let mut attempts_by_invocation = HashSet::new();
+        for row in attempts.iter().take(MAX_FACTS as usize) {
+            let attempt_id: String = row.try_get("attempt_id").map_err(internal_error)?;
+            let invocation_id: String = row.try_get("invocation_id").map_err(internal_error)?;
+            let provider: String = row.try_get("provider").map_err(internal_error)?;
+            let status: String = row.try_get("status").map_err(internal_error)?;
+            let usage_status: String = row.try_get("usage_status").map_err(internal_error)?;
+            let route_provider: Option<String> =
+                row.try_get("route_provider").map_err(internal_error)?;
+            let input_tokens = non_negative(
+                row.try_get("input_tokens").map_err(internal_error)?,
+                "input_tokens",
+            )?;
+            let output_tokens = non_negative(
+                row.try_get("output_tokens").map_err(internal_error)?,
+                "output_tokens",
+            )?;
+            let cache_read = non_negative(
+                row.try_get("cache_read_tokens").map_err(internal_error)?,
+                "cache_read_tokens",
+            )?;
+            let cache_creation = non_negative(
+                row.try_get("cache_creation_tokens")
+                    .map_err(internal_error)?,
+                "cache_creation_tokens",
+            )?;
+            let pricing_json: Option<String> =
+                row.try_get("pricing_json").map_err(internal_error)?;
+            attempts_by_invocation.insert(invocation_id.clone());
+            *attempt_counts.entry(invocation_id.clone()).or_default() += 1;
+            providers.insert(provider.clone());
+            if let Some(route_provider) = route_provider.as_deref()
+                && provider != route_provider
+            {
+                pricing_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("provider_fallback_pricing_unbound:{attempt_id}"),
+                );
+            }
+            if status == "started" || status == "delivery_unknown" {
+                settlement_pending = true;
+                topology_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("attempt_not_terminal:{attempt_id}"),
+                );
+            }
+            if usage_status == "provider_exact" {
+                exact_usage_attempt_count = exact_usage_attempt_count.saturating_add(1);
+                let totals_ok = add_total(&mut prompt_tokens, input_tokens)
+                    && add_total(&mut completion_tokens, output_tokens)
+                    && add_total(&mut cache_read_tokens, cache_read)
+                    && add_total(&mut cache_creation_tokens, cache_creation);
+                if !totals_ok {
+                    usage_complete = false;
+                    add_reason(
+                        &mut completeness_reasons,
+                        &mut seen_reasons,
+                        "inference_token_total_overflow".to_string(),
+                    );
+                }
+            } else {
+                usage_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("usage_{usage_status}:{attempt_id}"),
+                );
+            }
+            let pricing = pricing_json
+                .as_deref()
+                .map(parse_pricing_snapshot)
+                .transpose()
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "invalid pricing snapshot for authoring attempt {attempt_id}: {error}"
+                        ),
+                    )
+                })?
+                .flatten();
+            let cost = (route_provider.as_deref() == Some(provider.as_str()))
+                .then(|| {
+                    pricing.as_ref()?.estimated_cost_usd(
+                        input_tokens,
+                        output_tokens,
+                        cache_read,
+                        cache_creation,
+                    )
+                })
+                .flatten();
+            if let Some(cost) = cost {
+                priced_attempt_count = priced_attempt_count.saturating_add(1);
+                estimated_cost_usd += cost;
+                if !estimated_cost_usd.is_finite() {
+                    pricing_complete = false;
+                    add_reason(
+                        &mut completeness_reasons,
+                        &mut seen_reasons,
+                        "inference_cost_overflow".to_string(),
+                    );
+                }
+            } else {
+                pricing_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("pricing_unavailable:{attempt_id}"),
+                );
+            }
+            fingerprint_parts.push(format!(
+                "attempt:{attempt_id}:{invocation_id}:{provider}:{status}:{usage_status}:{input_tokens}:{output_tokens}:{cache_read}:{cache_creation}",
+            ));
+        }
+
+        if invocations.is_empty() {
+            add_reason(
+                &mut completeness_reasons,
+                &mut seen_reasons,
+                "inference_ledger_empty".to_string(),
+            );
+        }
+        if attempts.is_empty() {
+            topology_complete = false;
+            usage_complete = false;
+            pricing_complete = false;
+            add_reason(
+                &mut completeness_reasons,
+                &mut seen_reasons,
+                "inference_attempts_empty".to_string(),
+            );
+        }
+        for invocation_id in &invocation_ids {
+            if !attempts_by_invocation.contains(invocation_id) {
+                topology_complete = false;
+                usage_complete = false;
+                pricing_complete = false;
+                add_reason(
+                    &mut completeness_reasons,
+                    &mut seen_reasons,
+                    format!("terminal_attempt_missing:{invocation_id}"),
+                );
+            }
+        }
+        if priced_attempt_count != attempt_counts.values().sum::<usize>() {
+            pricing_complete = false;
+        }
+        if exact_usage_attempt_count != attempt_counts.values().sum::<usize>() {
+            usage_complete = false;
+        }
+        let physical_attempt_count = attempt_counts.values().sum::<usize>();
+        let invocation_count = invocation_ids.len();
+        let complete = topology_complete
+            && usage_complete
+            && pricing_complete
+            && !settlement_pending
+            && physical_attempt_count > 0;
+        let usage_status = if complete
+            || (physical_attempt_count > 0
+                && exact_usage_attempt_count == physical_attempt_count
+                && !settlement_pending)
+        {
+            "provider_exact"
+        } else if exact_usage_attempt_count > 0 {
+            "provider_partial"
+        } else {
+            "unavailable"
+        };
+        let evidence_fingerprint = stable_hash(&fingerprint_parts.join("\n"));
+        Ok(AuthoringInferenceEvidence {
+            schema_version: 1,
+            invocation_count,
+            physical_attempt_count,
+            priced_attempt_count,
+            exact_usage_attempt_count,
+            complete,
+            settlement_pending,
+            usage_status: usage_status.to_string(),
+            providers: providers.into_iter().collect(),
+            models: models.into_iter().collect(),
+            offering_ids: offering_ids.into_iter().collect(),
+            operations: operations.into_iter().collect(),
+            prompt_tokens: (usage_complete && topology_complete && !settlement_pending)
+                .then_some(prompt_tokens),
+            completion_tokens: (usage_complete && topology_complete && !settlement_pending)
+                .then_some(completion_tokens),
+            cache_read_tokens: (usage_complete && topology_complete && !settlement_pending)
+                .then_some(cache_read_tokens),
+            cache_creation_tokens: (usage_complete && topology_complete && !settlement_pending)
+                .then_some(cache_creation_tokens),
+            estimated_cost_usd: complete.then_some(estimated_cost_usd),
+            completeness_reasons,
+            evidence_fingerprint,
+        })
     }
 
-    async fn list_node_catalog(
+    async fn classify_authoring_operation(
         &self,
-    ) -> Result<Vec<HarnessNodeCatalogRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(node_catalog())
+        user_id: &str,
+        harness_run_id: &str,
+        goal: &str,
+    ) -> (String, String) {
+        let Some(classifier) = self.authoring_intent_classifier.as_ref() else {
+            return ("create_or_improve".to_string(), "base_fallback".to_string());
+        };
+        match classifier.classify(user_id, harness_run_id, goal).await {
+            Ok(Some(operation)) if matches!(operation.as_str(), "create" | "improve") => {
+                (operation, "jev".to_string())
+            }
+            _ => ("create_or_improve".to_string(), "base_fallback".to_string()),
+        }
     }
 
-    async fn create_skillify_run(
+    async fn create_skillify_run_internal(
         &self,
         user_id: String,
         request: SkillifyRunRequest,
+        authoring_goal: Option<&str>,
     ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
         let session_ids = normalize_session_ids(request.session_ids);
         let source_files = self.normalize_source_files(request.source_files.clone())?;
+        let harness_run_id = skillify_harness_run_id(&user_id, request.idempotency_key.as_deref());
+        if request.idempotency_key.is_some() {
+            match self.ensure_run_owner(&user_id, &harness_run_id).await {
+                Ok(existing) => return Ok(existing),
+                Err((status, _)) if status == StatusCode::NOT_FOUND => {}
+                Err(error) => return Err(error),
+            }
+        }
         if session_ids.is_empty() && source_files.is_empty() {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
@@ -984,16 +1429,16 @@ impl HarnessService for DatabaseHarnessService {
                 "Skillify agent executor is not configured",
             )
         })?;
-        let harness_run_id = format!("harness-run-{}", Uuid::new_v4());
         let input_json = json!({
             "template_id": SKILLIFY_TEMPLATE_ID,
             "session_ids": &session_ids,
             "source_file_count": request.source_files.as_ref().map(Vec::len).unwrap_or(0),
             "skill_name": &request.skill_name,
             "topic": &request.topic,
-            "target_scope": &target_scope
+            "target_scope": &target_scope,
+            "idempotency_key": &request.idempotency_key
         });
-        sqlx::query(
+        let insert_result = sqlx::query(
             "INSERT INTO harness_runs
              (harness_run_id, harness_id, version_id, user_id, session_id, status,
               input_json, output_json, created_at, updated_at)
@@ -1005,8 +1450,55 @@ impl HarnessService for DatabaseHarnessService {
         .bind(&user_id)
         .bind(input_json.to_string())
         .execute(self.pool.get())
-        .await
-        .map_err(internal_error)?;
+        .await;
+        match insert_result {
+            Ok(_) => {}
+            Err(error) if request.idempotency_key.is_some() && is_duplicate_key(&error) => {
+                return self.ensure_run_owner(&user_id, &harness_run_id).await;
+            }
+            Err(error) => return Err(internal_error(error)),
+        }
+
+        // The durable HarnessRun must exist before JEV or Skillify provider I/O.
+        // This keeps judgment accounting inside the same owner-scoped lifecycle.
+        let (topic, authoring_metadata) = if let Some(goal) = authoring_goal {
+            let (operation, classification_source) = self
+                .classify_authoring_operation(&user_id, &harness_run_id, goal)
+                .await;
+            let topic = match operation.as_str() {
+                "create" => {
+                    "Create a new reusable Skill from the user's goal and available context."
+                }
+                "improve" => {
+                    "Improve the existing reusable capability described by the user's goal and available context."
+                }
+                _ => "Resolve the user's authoring goal into one reusable capability.",
+            };
+            let metadata = json!({
+                "target": "skill",
+                "operation": &operation,
+                "classification_source": &classification_source,
+            });
+            let updated = sqlx::query(
+                "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
+                 WHERE user_id = ? AND harness_run_id = ? AND status = 'running'",
+            )
+            .bind(json!({"stage": "model_execution", "authoring": &metadata}).to_string())
+            .bind(&user_id)
+            .bind(&harness_run_id)
+            .execute(self.pool.get())
+            .await
+            .map_err(internal_error)?;
+            if updated.rows_affected() != 1 {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "authoring harness run is no longer in running state",
+                ));
+            }
+            (Some(topic.to_string()), Some(metadata))
+        } else {
+            (request.topic.clone(), None)
+        };
 
         let source_packets = events
             .iter()
@@ -1021,7 +1513,7 @@ impl HarnessService for DatabaseHarnessService {
                 user_id: user_id.clone(),
                 harness_run_id: harness_run_id.clone(),
                 skill_name: request.skill_name.clone(),
-                topic: request.topic.clone(),
+                topic: topic.clone(),
                 target_scope: target_scope.clone(),
                 source_packets,
             })
@@ -1050,7 +1542,7 @@ impl HarnessService for DatabaseHarnessService {
             .iter()
             .map(|draft| draft.rules.len())
             .sum();
-        let output_json = json!({
+        let mut output_json = json!({
             "extractor": agent_output.extractor,
             "subagent_strategy": agent_output.subagent_strategy,
             "skill_draft_count": agent_output.drafts.len(),
@@ -1058,6 +1550,9 @@ impl HarnessService for DatabaseHarnessService {
             "approved_rule_count": 0,
             "draft_version_id": null
         });
+        if let Some(authoring) = authoring_metadata.as_ref() {
+            output_json["authoring"] = authoring.clone();
+        }
         let status = if agent_output.drafts.is_empty() {
             "completed"
         } else {
@@ -1220,6 +1715,143 @@ impl HarnessService for DatabaseHarnessService {
                 .record_skillify_run_failure(&user_id, &harness_run_id, failure)
                 .await),
         }
+    }
+}
+
+#[async_trait]
+impl HarnessService for DatabaseHarnessService {
+    async fn list_templates(
+        &self,
+    ) -> Result<Vec<HarnessTemplateRecord>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(vec![skillify_template()])
+    }
+
+    async fn list_node_catalog(
+        &self,
+    ) -> Result<Vec<HarnessNodeCatalogRecord>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(node_catalog())
+    }
+
+    async fn create_skillify_run(
+        &self,
+        user_id: String,
+        request: SkillifyRunRequest,
+    ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.create_skillify_run_internal(user_id, request, None)
+            .await
+    }
+    async fn create_authoring_intent(
+        &self,
+        user_id: String,
+        session_id: String,
+        request: AuthoringIntentRequest,
+    ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)> {
+        let goal = request.goal.trim().to_string();
+        if goal.is_empty() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "authoring goal must not be empty",
+            ));
+        }
+        if goal.chars().count() > MAX_SKILLIFY_SOURCE_FILE_CHARS {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "authoring goal exceeds the {MAX_SKILLIFY_SOURCE_FILE_CHARS} character limit"
+                ),
+            ));
+        }
+
+        let idempotency_key = format!("authoring:v1:{}:{}", session_id.trim(), stable_hash(&goal));
+        let harness_run = self
+            .create_skillify_run_internal(
+                user_id.clone(),
+                SkillifyRunRequest {
+                    session_ids: session_id
+                        .trim()
+                        .is_empty()
+                        .then(Vec::new)
+                        .unwrap_or_else(|| vec![session_id.clone()]),
+                    source_files: Some(vec![SkillifySourceFile {
+                        file_name: "authoring-intent.txt".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        content: goal.clone(),
+                    }]),
+                    skill_name: None,
+                    topic: None,
+                    target_scope: Some("personal".to_string()),
+                    idempotency_key: Some(idempotency_key),
+                },
+                Some(&goal),
+            )
+            .await?;
+        let (operation, classification_source) = harness_run
+            .output_json
+            .get("authoring")
+            .and_then(Value::as_object)
+            .map(|authoring| {
+                (
+                    authoring
+                        .get("operation")
+                        .and_then(Value::as_str)
+                        .unwrap_or("create_or_improve")
+                        .to_string(),
+                    authoring
+                        .get("classification_source")
+                        .and_then(Value::as_str)
+                        .unwrap_or("base_fallback")
+                        .to_string(),
+                )
+            })
+            .unwrap_or_else(|| ("create_or_improve".to_string(), "base_fallback".to_string()));
+        let skill_drafts = self
+            .list_skill_drafts(user_id.clone(), harness_run.harness_run_id.clone())
+            .await?;
+        let inference = self
+            .load_authoring_inference_evidence(&user_id, &harness_run.harness_run_id)
+            .await?;
+
+        // A candidate is useful even when the current evidence cannot support
+        // a replayable comparison. Keep that distinction visible instead of
+        // turning generation into a fake Evaluation success.
+        let evaluation = AuthoringEvaluationSummary {
+            status: "unavailable".to_string(),
+            reason: "no replayable task case and server-owned verifier were resolved from the authoring context".to_string(),
+            experiment_id: None,
+        };
+        let mut output_json = harness_run.output_json.clone();
+        output_json["authoring"] = json!({
+            "target": "skill",
+            "operation": &operation,
+            "classification_source": &classification_source,
+            "evaluation": &evaluation,
+            "skill_draft_count": skill_drafts.len(),
+            "inference": &inference,
+        });
+        sqlx::query(
+            "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
+             WHERE user_id = ? AND harness_run_id = ?",
+        )
+        .bind(output_json.to_string())
+        .bind(&user_id)
+        .bind(&harness_run.harness_run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+        let harness_run = self
+            .get_run(user_id, harness_run.harness_run_id.clone())
+            .await?;
+
+        Ok(AuthoringIntentRecord {
+            target: "skill".to_string(),
+            operation,
+            classification_source,
+            goal,
+            harness_run,
+            skill_drafts,
+            evaluation,
+            inference,
+        })
     }
 
     async fn get_run(
@@ -1994,6 +2626,15 @@ impl HarnessService for UnconfiguredHarnessService {
         _user_id: String,
         _request: SkillifyRunRequest,
     ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("harness service not configured"))
+    }
+
+    async fn create_authoring_intent(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _request: AuthoringIntentRequest,
+    ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("harness service not configured"))
     }
 
@@ -2901,6 +3542,20 @@ fn stable_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn is_duplicate_key(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("1062")
+    )
+}
+
+fn skillify_harness_run_id(user_id: &str, idempotency_key: Option<&str>) -> String {
+    idempotency_key
+        .map(|key| format!("harness-run-{}", stable_hash(&format!("{user_id}:{key}"))))
+        .unwrap_or_else(|| format!("harness-run-{}", Uuid::new_v4()))
 }
 
 #[cfg(test)]

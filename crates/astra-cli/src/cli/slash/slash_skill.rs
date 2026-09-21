@@ -3,46 +3,47 @@ use crate::cli::{cli_config::cli_output, session::session_state::SessionState, t
 use astra_runtime::prompts;
 use crossterm::style::Stylize;
 
-async fn start_skillify_from_session(
+async fn start_authoring_from_session(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
     state: &SessionState,
 ) -> Result<(), String> {
-    let skill_name = arg.split_whitespace().next().unwrap_or("").trim();
-    if skill_name.is_empty()
-        || skill_name.len() > 128
-        || skill_name.contains('/')
-        || skill_name.contains('\\')
-        || skill_name.contains("..")
-    {
-        return Err("Usage: /skill create <safe-skill-name>".to_string());
+    let goal = arg.trim();
+    if goal.is_empty() {
+        return Err("Usage: /skill create <what you want to create or improve>".to_string());
     }
     let session_id = state
         .session_id
         .as_deref()
-        .ok_or_else(|| "no active session is available for Skillify".to_string())?;
-    let body = serde_json::json!({
-        "session_ids": [session_id],
-        "skill_name": skill_name,
-        "topic": "Extract a reusable workflow from the selected session; preserve failures and cite the source events.",
-        "target_scope": "personal"
-    });
+        .ok_or_else(|| "no active session is available for authoring".to_string())?;
+    let body = serde_json::json!({"goal": goal});
     let response = api
-        .post_bearer_path_json_text(token.unwrap_or(""), "/harnesses/skillify/runs", &body)
+        .post_bearer_path_json_text(
+            token.unwrap_or(""),
+            &format!("/harnesses/authoring/{session_id}"),
+            &body,
+        )
         .await
-        .map_err(|error| format!("Skillify request failed: {error}"))?;
-    let run: astra_services::HarnessRunRecord = serde_json::from_str(&response)
-        .map_err(|error| format!("Skillify returned invalid run metadata: {error}"))?;
+        .map_err(|error| format!("Authoring request failed: {error}"))?;
+    let record: astra_services::AuthoringIntentRecord = serde_json::from_str(&response)
+        .map_err(|error| format!("Authoring returned invalid result metadata: {error}"))?;
     eprintln!(
-        "  {} Skillify run {} ({})",
+        "  {} {} {} via {} ({})",
         theme::icon_ok(),
-        run.harness_run_id,
-        run.status
+        record.operation,
+        record.target,
+        record.classification_source,
+        record.harness_run.status,
     );
     eprintln!(
-        "  Review the durable evidence and draft at /harnesses/runs/{}/skill-drafts",
-        run.harness_run_id
+        "  Evaluation: {} — {}",
+        record.evaluation.status, record.evaluation.reason
+    );
+    eprintln!(
+        "  {} Skill candidate(s) at /harnesses/runs/{}/skill-drafts",
+        record.skill_drafts.len(),
+        record.harness_run.harness_run_id
     );
     eprintln!("  Nothing was activated; publishing/adoption remains an explicit reviewed action.");
     Ok(())
@@ -139,8 +140,8 @@ pub(crate) async fn handle_skill_command(
             );
             eprintln!(
                 "    {}  {}",
-                "/skill create <name>".magenta(),
-                "Create a Skillify draft from this session".dim()
+                "/skill create <goal>".magenta(),
+                "Create or improve a capability from this session".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -1252,8 +1253,13 @@ Follow these steps:
             rollback_skill(sub_arg.trim(), api, token, state).await;
         }
 
-        "create" => {
-            start_skillify_from_session(sub_arg, api, token, state).await?;
+        "create" | "improve" => {
+            let goal = if sub == "improve" && !sub_arg.is_empty() {
+                format!("Improve this capability: {sub_arg}")
+            } else {
+                sub_arg.to_string()
+            };
+            start_authoring_from_session(&goal, api, token, state).await?;
         }
 
         "feedback" => {
@@ -2084,7 +2090,7 @@ mod tests {
         }
     }
 
-    mod skillify_tests {
+    mod authoring_tests {
         use super::super::handle_skill_command;
         use crate::cli::session::session_state::SessionState;
         use wiremock::matchers::{body_json, header, method, path};
@@ -2094,26 +2100,56 @@ mod tests {
         async fn create_delegates_the_current_session_without_local_activation() {
             let srv = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/harnesses/skillify/runs"))
+                .and(path("/harnesses/authoring/session-123"))
                 .and(header("authorization", "Bearer tok"))
                 .and(body_json(serde_json::json!({
-                    "session_ids": ["session-123"],
-                    "skill_name": "review-helper",
-                    "topic": "Extract a reusable workflow from the selected session; preserve failures and cite the source events.",
-                    "target_scope": "personal"
+                    "goal": "帮我生成一个 review helper"
                 })))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "harness_run_id": "run-123",
-                    "harness_id": "skillify",
-                    "version_id": "skillify.v1",
-                    "user_id": "user-1",
-                    "session_id": "session-123",
-                    "status": "completed",
-                    "input_json": {},
-                    "output_json": {},
-                    "error": null,
-                    "created_at": "2026-09-18T00:00:00Z",
-                    "updated_at": "2026-09-18T00:00:01Z"
+                    "target": "skill",
+                    "operation": "create",
+                    "classification_source": "jev",
+                    "goal": "帮我生成一个 review helper",
+                    "harness_run": {
+                        "harness_run_id": "run-123",
+                        "harness_id": "skillify",
+                        "version_id": "skillify.v1",
+                        "user_id": "user-1",
+                        "session_id": null,
+                        "status": "waiting_for_review",
+                        "input_json": {},
+                        "output_json": {},
+                        "error": null,
+                        "created_at": "2026-09-18T00:00:00Z",
+                        "updated_at": "2026-09-18T00:00:01Z"
+                    },
+                    "skill_drafts": [],
+                    "evaluation": {
+                        "status": "unavailable",
+                        "reason": "no replayable task case",
+                        "experiment_id": null
+                    },
+                    "inference": {
+                        "schema_version": 1,
+                        "invocation_count": 0,
+                        "physical_attempt_count": 0,
+                        "priced_attempt_count": 0,
+                        "exact_usage_attempt_count": 0,
+                        "complete": false,
+                        "settlement_pending": false,
+                        "usage_status": "unavailable",
+                        "providers": [],
+                        "models": [],
+                        "offering_ids": [],
+                        "operations": [],
+                        "prompt_tokens": null,
+                        "completion_tokens": null,
+                        "cache_read_tokens": null,
+                        "cache_creation_tokens": null,
+                        "estimated_cost_usd": null,
+                        "completeness_reasons": ["inference_ledger_empty"],
+                        "evidence_fingerprint": "sha256:test"
+                    }
                 })))
                 .expect(1)
                 .mount(&srv)
@@ -2123,7 +2159,7 @@ mod tests {
             let mut state = SessionState::default();
             state.session_id = Some("session-123".to_string());
             handle_skill_command(
-                "create review-helper",
+                "create 帮我生成一个 review helper",
                 &client,
                 &mut state,
                 None,
@@ -2140,7 +2176,7 @@ mod tests {
         async fn create_without_a_session_fails_before_calling_the_service() {
             let srv = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/harnesses/skillify/runs"))
+                .and(path("/harnesses/authoring/session-123"))
                 .respond_with(ResponseTemplate::new(500))
                 .expect(0)
                 .mount(&srv)
@@ -2148,10 +2184,15 @@ mod tests {
 
             let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
             let mut state = SessionState::default();
-            let error =
-                handle_skill_command("create review-helper", &client, &mut state, None, None)
-                    .await
-                    .unwrap_err();
+            let error = handle_skill_command(
+                "create 帮我生成一个 review helper",
+                &client,
+                &mut state,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
             assert!(error.contains("no active session"));
         }
     }

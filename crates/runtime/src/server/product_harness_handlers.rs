@@ -34,6 +34,35 @@ pub async fn create_skillify_harness_run_handler(
         .map(|run| (StatusCode::CREATED, Json(run)))
 }
 
+/// High-level authoring entrypoint. The session is an authenticated route
+/// boundary; the request body contains only the user's natural-language goal.
+pub async fn create_authoring_intent_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(request): Json<AuthoringIntentRequest>,
+) -> Result<(StatusCode, Json<AuthoringIntentRecord>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .harness_service
+        .create_authoring_intent(user.user_id, session_id, request)
+        .await
+        .map(|record| (StatusCode::CREATED, Json(record)))
+}
+
+pub async fn create_standalone_authoring_intent_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AuthoringIntentRequest>,
+) -> Result<(StatusCode, Json<AuthoringIntentRecord>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .harness_service
+        .create_authoring_intent(user.user_id, String::new(), request)
+        .await
+        .map(|record| (StatusCode::CREATED, Json(record)))
+}
+
 pub async fn get_harness_run_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

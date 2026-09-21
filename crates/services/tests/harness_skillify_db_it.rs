@@ -3,9 +3,10 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use astra_services::{
-    DatabaseHarnessService, HarnessDecisionRequest, HarnessService, SkillifyAgentCitation,
-    SkillifyAgentDraft, SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest,
-    SkillifyAgentRule, SkillifyRunRequest, SkillifySourceFile,
+    AuthoringIntentClassifier, AuthoringIntentRequest, DatabaseHarnessService,
+    HarnessDecisionRequest, HarnessService, SkillifyAgentCitation, SkillifyAgentDraft,
+    SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
+    SkillifyRunRequest, SkillifySourceFile,
 };
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -73,6 +74,104 @@ impl SkillifyAgentExecutor for CapturingSkillifyExecutor {
     }
 }
 
+#[derive(Default)]
+struct CapturingAuthoringClassifier {
+    pool: Mutex<Option<sqlx::Pool<sqlx::MySql>>>,
+    observed_running: Mutex<bool>,
+}
+
+#[async_trait]
+impl AuthoringIntentClassifier for CapturingAuthoringClassifier {
+    async fn classify(
+        &self,
+        user_id: &str,
+        harness_run_id: &str,
+        _goal: &str,
+    ) -> Result<Option<String>, String> {
+        let pool = self
+            .pool
+            .lock()
+            .expect("classifier pool lock")
+            .clone()
+            .ok_or_else(|| "classifier pool is not configured".to_string())?;
+        let row = sqlx::query(
+            "SELECT user_id, status FROM harness_runs WHERE harness_run_id = ? LIMIT 1",
+        )
+        .bind(harness_run_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|error| format!("load durable authoring owner: {error}"))?
+        .ok_or_else(|| "durable authoring owner was not created before judgment".to_string())?;
+        if row.get::<String, _>("user_id") != user_id || row.get::<String, _>("status") != "running"
+        {
+            return Err("durable authoring owner was not running for this user".to_string());
+        }
+        *self
+            .observed_running
+            .lock()
+            .expect("classifier observation lock") = true;
+        Ok(Some("improve".to_string()))
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn database_authoring_judgment_runs_after_durable_harness_admission() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get().clone();
+    let user_id = Uuid::new_v4().to_string();
+    let executor = Arc::new(CapturingSkillifyExecutor::default());
+    *executor.pool.lock().expect("executor pool lock") = Some(pool.clone());
+    let classifier = Arc::new(CapturingAuthoringClassifier::default());
+    *classifier.pool.lock().expect("classifier pool lock") = Some(pool.clone());
+
+    let service = DatabaseHarnessService::new(shared_pool)
+        .with_skillify_agent_executor(executor.clone())
+        .with_authoring_intent_classifier(classifier.clone());
+    let request = AuthoringIntentRequest {
+        goal: "帮我优化这个能力".to_string(),
+    };
+    let first = service
+        .create_authoring_intent(user_id.clone(), String::new(), request.clone())
+        .await
+        .expect("create authoring intent");
+
+    assert_eq!(first.operation, "improve");
+    assert_eq!(first.classification_source, "jev");
+    assert_eq!(first.evaluation.status, "unavailable");
+    assert!(
+        *classifier
+            .observed_running
+            .lock()
+            .expect("classifier observation lock"),
+        "JEV must observe the durable HarnessRun before provider execution"
+    );
+    let captured = executor
+        .request
+        .lock()
+        .expect("executor capture lock")
+        .clone()
+        .expect("Skillify executor request captured");
+    assert!(
+        captured
+            .topic
+            .as_deref()
+            .is_some_and(|topic| topic.contains("Improve the existing reusable capability"))
+    );
+
+    let retry = service
+        .create_authoring_intent(user_id, String::new(), request)
+        .await
+        .expect("retry authoring intent");
+    assert_eq!(
+        retry.harness_run.harness_run_id,
+        first.harness_run.harness_run_id
+    );
+    assert_eq!(retry.operation, "improve");
+    cleanup_skillify_run(&pool, &first.harness_run.harness_run_id, "", "").await;
+}
+
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
@@ -122,6 +221,7 @@ async fn database_skillify_uses_event_level_sources_and_rejects_corrupt_events()
                 skill_name: None,
                 topic: None,
                 target_scope: Some("personal".to_string()),
+                idempotency_key: None,
             },
         )
         .await
@@ -164,6 +264,7 @@ async fn database_skillify_uses_event_level_sources_and_rejects_corrupt_events()
                 skill_name: None,
                 topic: None,
                 target_scope: Some("personal".to_string()),
+                idempotency_key: None,
             },
         )
         .await
@@ -262,6 +363,7 @@ async fn database_skillify_citations_point_to_review_items() {
                 skill_name: None,
                 topic: None,
                 target_scope: Some("personal".to_string()),
+                idempotency_key: None,
             },
         )
         .await
@@ -407,6 +509,7 @@ async fn database_skillify_model_failure_persists_a_recoverable_terminal_run() {
                 skill_name: Some("concise-review".to_string()),
                 topic: None,
                 target_scope: Some("personal".to_string()),
+                idempotency_key: None,
             },
         )
         .await
@@ -457,6 +560,26 @@ async fn cleanup_skillify_run(
     event_id: &str,
     session_id: &str,
 ) {
+    let _ = sqlx::query(
+        "DELETE debt
+         FROM inference_invocation_settlement_debts AS debt
+         INNER JOIN inference_invocations AS invocation
+           ON invocation.user_id = debt.user_id
+          AND invocation.invocation_id = debt.invocation_id
+         WHERE invocation.harness_run_id = ?",
+    )
+    .bind(harness_run_id)
+    .execute(pool)
+    .await;
+    for table in [
+        "model_request_context_events",
+        "inference_provider_attempts",
+        "inference_invocations",
+        "inference_routes",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE harness_run_id = ?");
+        let _ = sqlx::query(&sql).bind(harness_run_id).execute(pool).await;
+    }
     for table in [
         "harness_citations",
         "harness_items",

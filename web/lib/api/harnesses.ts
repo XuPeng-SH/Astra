@@ -1,6 +1,8 @@
 import { requestJson } from '@/lib/api/request';
 import type {
   HarnessDecisionRequest,
+  AuthoringIntentRecord,
+  AuthoringIntentRequest,
   HarnessItem,
   HarnessNodeCatalogItem,
   HarnessRun,
@@ -26,6 +28,19 @@ export function createSkillifyRun(payload: SkillifyRunRequest) {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+export function createAuthoringIntent(payload: AuthoringIntentRequest, sessionId?: string) {
+  const path = sessionId
+    ? `/api/chats/${encodeURIComponent(sessionId)}/authoring`
+    : '/api/authoring';
+  return requestJson<AuthoringIntentRecord>(
+    path,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export function getHarnessRun(runId: string) {

@@ -5,6 +5,7 @@ pub mod agent_lessons;
 pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
+pub mod authoring_intent;
 pub mod branches;
 pub mod byok_endpoint;
 mod cancellation_safe_db;
@@ -219,12 +220,14 @@ pub use events::{
 };
 pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
 pub use harness::{
-    DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
-    HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
-    HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
-    SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
-    SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
-    SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
+    AuthoringEvaluationSummary, AuthoringInferenceEvidence, AuthoringIntentClassifier,
+    AuthoringIntentRecord, AuthoringIntentRequest, DatabaseHarnessService, HarnessCitationRecord,
+    HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord, HarnessRunRecord,
+    HarnessService, HarnessSkillDraftRecord, HarnessSkillRuleRecord, HarnessTemplateRecord,
+    SkillifyAgentCitation, SkillifyAgentDraft, SkillifyAgentExecutor, SkillifyAgentOutput,
+    SkillifyAgentRequest, SkillifyAgentRule, SkillifyDraftRecord, SkillifyDraftRequest,
+    SkillifyPublishRecord, SkillifyPublishRequest, SkillifyRunRequest, SkillifySourceFile,
+    SkillifySourcePacket, UnconfiguredHarnessService,
 };
 pub use inference_execution::{
     AuxiliaryExecutionAttemptFact, EVALUATION_INFERENCE_EVIDENCE_SCHEMA_VERSION,
@@ -392,6 +395,11 @@ pub use skill_auto_route_judge::{
     parse_skill_auto_route_response_with_status, skill_auto_route_judge_messages,
     skill_auto_route_judgment_contract_fingerprint, skill_auto_route_judgment_request,
     skill_auto_route_judgment_request_fingerprint,
+};
+
+pub use authoring_intent::{
+    AUTHORING_JUDGMENT_OPERATION_ID, AUTHORING_JUDGMENT_OUTPUT_TOKENS, AuthoringOperation,
+    authoring_judgment_messages, authoring_judgment_request, parse_authoring_operation,
 };
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,

@@ -449,6 +449,49 @@ export type SkillifyRunRequest = {
   target_scope?: 'personal' | 'project';
 };
 
+export type AuthoringIntentRequest = {
+  goal: string;
+};
+
+export type AuthoringEvaluationSummary = {
+  status: string;
+  reason: string;
+  experiment_id: string | null;
+};
+
+export type AuthoringInferenceEvidence = {
+  schema_version: number;
+  invocation_count: number;
+  physical_attempt_count: number;
+  priced_attempt_count: number;
+  exact_usage_attempt_count: number;
+  complete: boolean;
+  settlement_pending: boolean;
+  usage_status: string;
+  providers: string[];
+  models: string[];
+  offering_ids: string[];
+  operations: string[];
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+  estimated_cost_usd: number | null;
+  completeness_reasons: string[];
+  evidence_fingerprint: string;
+};
+
+export type AuthoringIntentRecord = {
+  target: string;
+  operation: string;
+  classification_source: string;
+  goal: string;
+  harness_run: HarnessRun;
+  skill_drafts: HarnessSkillDraft[];
+  evaluation: AuthoringEvaluationSummary;
+  inference: AuthoringInferenceEvidence;
+};
+
 export type HarnessDecisionRequest = {
   decision: 'approve' | 'reject' | 'edit' | 'request_revision';
   after_json?: Record<string, unknown>;

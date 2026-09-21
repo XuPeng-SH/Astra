@@ -8,7 +8,6 @@ mod debug;
 mod reflect;
 mod remember;
 mod review;
-mod skillify;
 mod stuck;
 mod verify;
 
@@ -22,7 +21,6 @@ pub fn all_dynamic_skills() -> Vec<String> {
         debug::skill_content(),
         reflect::skill_content(),
         review::skill_content(),
-        skillify::skill_content(),
         stuck::skill_content(),
         verify::skill_content(),
         remember::skill_content(),
@@ -35,12 +33,10 @@ mod tests {
 
     #[test]
     fn dynamic_skills_are_valid_unique_manifests() {
-        let expected = [
-            "debug", "reflect", "remember", "review", "skillify", "stuck", "verify",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+        let expected = ["debug", "reflect", "remember", "review", "stuck", "verify"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let mut actual = std::collections::BTreeSet::new();
 
         for content in all_dynamic_skills() {

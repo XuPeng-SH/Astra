@@ -7,8 +7,8 @@ use tokio::task::JoinSet;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
-    AdminConfigService, FernetTokenEncryptor, SkillifyAgentDraft, SkillifyAgentExecutor,
-    SkillifyAgentOutput, SkillifyAgentRequest, SkillifySourcePacket,
+    AdminConfigService, AuthoringIntentClassifier, FernetTokenEncryptor, SkillifyAgentDraft,
+    SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifySourcePacket,
 };
 use astra_turn_core::thinking_config::ThinkingConfig;
 
@@ -28,6 +28,7 @@ pub(super) struct RuntimeSkillifyAgentExecutor {
     encryptor: Arc<FernetTokenEncryptor>,
     admin_config_service: Arc<dyn AdminConfigService>,
     pool: SharedPool,
+    model_service: Arc<dyn astra_services::ModelService>,
 }
 
 #[derive(Clone)]
@@ -42,12 +43,14 @@ impl RuntimeSkillifyAgentExecutor {
         encryptor: Arc<FernetTokenEncryptor>,
         admin_config_service: Arc<dyn AdminConfigService>,
         pool: SharedPool,
+        model_service: Arc<dyn astra_services::ModelService>,
     ) -> Self {
         Self {
             matrixone,
             encryptor,
             admin_config_service,
             pool,
+            model_service,
         }
     }
 
@@ -77,6 +80,7 @@ impl RuntimeSkillifyAgentExecutor {
         system_prompt: &str,
         user_prompt: &str,
         max_output_tokens: usize,
+        purpose: astra_turn_types::InferencePurpose,
     ) -> Result<String, String> {
         let messages = vec![
             json!({"role": "system", "content": system_prompt}),
@@ -89,7 +93,7 @@ impl RuntimeSkillifyAgentExecutor {
                 scope,
                 LlmCall {
                     transport: &transport,
-                    purpose: astra_turn_types::InferencePurpose::SkillSynthesis,
+                    purpose,
                     messages: &messages,
                     tools: &[],
                     cache_capability: None,
@@ -116,6 +120,32 @@ impl RuntimeSkillifyAgentExecutor {
             return Err("LLM returned empty content".to_string());
         }
         Ok(text.to_string())
+    }
+
+    async fn prepare_judgment_execution(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<SkillifyInferenceExecution>, String> {
+        let offering = astra_services::admin_config::resolve_judgment_offering(
+            self.admin_config_service.as_ref(),
+            self.model_service.as_ref(),
+            user_id,
+        )
+        .await
+        .map_err(|(_, body)| body.0.detail)?;
+        let Some(offering) = offering else {
+            return Ok(None);
+        };
+        astra_services::models::validate_model_execution_purpose(
+            &offering,
+            astra_core::model_wire::purpose::ModelRequestPurpose::TypedJudgment,
+        )
+        .map_err(|(_, body)| body.0.detail)?;
+        let admitted = offering;
+        Ok(Some(SkillifyInferenceExecution {
+            ledger: DurableInferenceLedger::new(self.pool.clone(), user_id, admitted.clone()),
+            admitted,
+        }))
     }
 }
 
@@ -172,6 +202,38 @@ impl SkillifyAgentExecutor for RuntimeSkillifyAgentExecutor {
     }
 }
 
+#[async_trait]
+impl AuthoringIntentClassifier for RuntimeSkillifyAgentExecutor {
+    async fn classify(
+        &self,
+        user_id: &str,
+        harness_run_id: &str,
+        goal: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(execution) = self.prepare_judgment_execution(user_id).await? else {
+            return Ok(None);
+        };
+        let response = Self::call_json_agent(
+            &execution,
+            astra_turn_types::InferenceInvocationScope::HarnessRun {
+                harness_run_id: harness_run_id.to_string(),
+                operation_id: astra_services::AUTHORING_JUDGMENT_OPERATION_ID.to_string(),
+                logical_attempt: 0,
+            },
+            astra_turn_types::TYPED_JUDGMENT_SYSTEM_PROMPT,
+            &serde_json::to_string(
+                &astra_services::authoring_intent::authoring_judgment_request(goal),
+            )
+            .map_err(|error| format!("failed to encode authoring judgment: {error}"))?,
+            astra_services::AUTHORING_JUDGMENT_OUTPUT_TOKENS,
+            astra_turn_types::InferencePurpose::Introspection,
+        )
+        .await?;
+        Ok(astra_services::parse_authoring_operation(&response, goal)?
+            .map(|operation| operation.as_str().to_string()))
+    }
+}
+
 async fn drain_skillify_extractions(
     mut tasks: JoinSet<(usize, Result<ExtractionResponse, String>)>,
 ) -> Result<Vec<(usize, ExtractionResponse)>, String> {
@@ -216,6 +278,7 @@ impl RuntimeSkillifyAgentExecutor {
             system_prompt,
             &user_prompt,
             SKILLIFY_EXTRACTION_OUTPUT_TOKENS,
+            astra_turn_types::InferencePurpose::SkillSynthesis,
         )
         .await?;
         parse_json_response::<ExtractionResponse>(&response)
@@ -239,6 +302,7 @@ impl RuntimeSkillifyAgentExecutor {
             system_prompt,
             &user_prompt,
             SKILLIFY_SYNTHESIS_OUTPUT_TOKENS,
+            astra_turn_types::InferencePurpose::SkillSynthesis,
         )
         .await?;
         parse_json_response::<SynthesisResponse>(&response)
@@ -712,6 +776,7 @@ mod tests {
             "Extract typed signals.",
             "Use this source.",
             256,
+            astra_turn_types::InferencePurpose::SkillSynthesis,
         )
         .await
         .expect("durable Skillify inference");

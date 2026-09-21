@@ -131,11 +131,17 @@ fn install_skillify_harness_service(
             Arc::clone(shared_encryptor),
             state.admin.config_service.clone(),
             shared_pool.clone(),
+            state.model_service.clone(),
         ),
     );
+    let skillify_executor: Arc<dyn astra_services::SkillifyAgentExecutor> =
+        skillify_agent_executor.clone();
+    let authoring_classifier: Arc<dyn astra_services::AuthoringIntentClassifier> =
+        skillify_agent_executor;
     state.with_harness_service(Arc::new(
         DatabaseHarnessService::new(shared_pool.clone())
-            .with_skillify_agent_executor(skillify_agent_executor),
+            .with_skillify_agent_executor(skillify_executor)
+            .with_authoring_intent_classifier(authoring_classifier),
     ))
 }
 
