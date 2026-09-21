@@ -1384,16 +1384,6 @@ async fn mark_session_deleting(
         .await
         .map_err(|source| format!("delete_session.mark_deleting.persist_fence: {source}"))?;
 
-    query(
-        "INSERT INTO session_deletion_tombstones (user_id, session_id, deleted_at)
-         VALUES (?, ?, CURRENT_TIMESTAMP(6))
-         ON DUPLICATE KEY UPDATE deleted_at = VALUES(deleted_at)",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|source| format!("delete_session.mark_deleting.tombstone: {source}"))?;
     tx.commit()
         .await
         .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;

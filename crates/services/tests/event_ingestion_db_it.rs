@@ -489,12 +489,6 @@ async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_
     .bind(user_id)
     .execute(pool)
     .await;
-    let _ =
-        sqlx::query("DELETE FROM session_deletion_tombstones WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(pool)
-            .await;
 }
 
 async fn cleanup_config_version(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, version_id: &str) {
@@ -1496,14 +1490,15 @@ async fn event_ingest_drops_late_events_for_deleted_session_without_recreating_r
     let event_id = format!("evt-deleted-session-{}", Uuid::new_v4());
     cleanup_session(&pool, TEST_USER_ID, &session_id).await;
     sqlx::query(
-        "INSERT INTO session_deletion_tombstones (user_id, session_id, deleted_at)
-         VALUES (?, ?, CURRENT_TIMESTAMP(6))",
+        "INSERT INTO agent_session_lifecycle_fences
+         (user_id, session_id, delete_requested_at, database_deleted_at)
+         VALUES (?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
     )
     .bind(TEST_USER_ID)
     .bind(&session_id)
     .execute(&pool)
     .await
-    .expect("seed deletion tombstone");
+    .expect("seed completed deletion fence");
 
     let (sender, shutdown, stats, handle) =
         EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
@@ -1549,14 +1544,15 @@ async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_pe
     cleanup_session(&pool, &user_id, &healthy_session).await;
     cleanup_config_version(&pool, &user_id, &version_id).await;
     sqlx::query(
-        "INSERT INTO session_deletion_tombstones (user_id, session_id, deleted_at)
-         VALUES (?, ?, CURRENT_TIMESTAMP(6))",
+        "INSERT INTO agent_session_lifecycle_fences
+         (user_id, session_id, delete_requested_at, database_deleted_at)
+         VALUES (?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
     )
     .bind(&user_id)
     .bind(&rejected_session)
     .execute(&pool)
     .await
-    .expect("seed rejected session tombstone");
+    .expect("seed rejected session fence");
     insert_session_root(&pool, &user_id, &healthy_session).await;
 
     let payload = ConfigVersionPayload {

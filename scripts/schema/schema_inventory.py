@@ -80,6 +80,9 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         startup_owner="DatabaseResourceGovernor::ensure_tables",
         state_class_hint="quota fact",
         hot_path_hint="warm quota read/write",
+        # Test-only fault knobs appear before the production impl in this
+        # module; stopping at the first cfg(test) marker would hide its DDL.
+        stop_at_cfg_test=False,
     ),
     SchemaSource(
         owner="astra_services::workspace_records",
@@ -477,16 +480,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from agent_sessions; the fence must survive removal of the session aggregate and serialize every session-root writer",
         migration_owner="astra_services::storage / session_lifecycle",
         product_owner="irreversible session deletion, delayed-write fencing, and crash recovery",
-    ),
-    "session_deletion_tombstones": TableMetadata(
-        semantic_owner="astra_services::session_lifecycle",
-        state_class="durable session deletion compatibility tombstone",
-        primary_query="deleted-session lookup by user_id/session_id and retention scan by deleted_at",
-        retention_policy="retain as compatibility evidence while legacy readers and delayed event-ingestion paths can encounter the deleted identity",
-        rebuildability="not rebuildable after deletion without the surviving lifecycle fence or another durable deletion record",
-        merge_guidance="migrate consumers toward agent_session_lifecycle_fences before consolidation; do not remove while any path still checks tombstones",
-        migration_owner="astra_services::storage / session_lifecycle",
-        product_owner="session deletion compatibility and resurrection prevention",
     ),
     "agent_runs": TableMetadata(
         semantic_owner="astra_services::runs::DatabaseRunStateStore",
@@ -1962,6 +1955,36 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ),
     ),
     ConsolidationReview(
+        candidate="session_deletion_tombstones",
+        decision="removed",
+        current_read_paths=[
+            "none; session admission now relies on the locked agent_session_lifecycle_fences row",
+        ],
+        current_write_paths=[
+            "none; session deletion records delete intent and completion on agent_session_lifecycle_fences",
+        ],
+        user_api_impact=(
+            "no user-visible deletion state is removed; the lifecycle fence remains the durable "
+            "anti-resurrection and recovery authority"
+        ),
+        migration_backfill=(
+            "legacy rows are copied into agent_session_lifecycle_fences before the redundant table "
+            "is dropped during the v85 schema bootstrap"
+        ),
+        rollback=(
+            "rollback would require explicitly restoring the legacy table and its readers; "
+            "the surviving lifecycle fence retains the deletion fact"
+        ),
+        test_evidence=[
+            "crates/services/tests/schema_assertions.rs::core_schema_catalog_matches_live_idempotent_bootstrap",
+            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::deletion_tombstone_schema_upgrade_migrates_rows_and_drops_redundant_table",
+        ],
+        rationale=(
+            "the tombstone duplicated the lifecycle fence's irreversible delete fact and added "
+            "a read to every admitted session write plus a write to every deletion"
+        ),
+    ),
+    ConsolidationReview(
         candidate="data_versioning_checkpoints",
         decision="keep",
         current_read_paths=[
@@ -2093,11 +2116,18 @@ def repository_root() -> Path:
 def discover_production_ddl_source_paths(root: Path | None = None) -> list[str]:
     root = root or REPO_ROOT
     crates_dir = root / "crates"
+    manifest_by_path = {source.path: source for source in SCHEMA_SOURCES}
     discovered: list[str] = []
     for path in sorted(crates_dir.glob("*/src/**/*.rs")):
-        text = production_source(path.read_text(encoding="utf-8"), stop_at_cfg_test=True)
+        relative_path = path.relative_to(root).as_posix()
+        source = manifest_by_path.get(relative_path)
+        stop_at_cfg_test = True if source is None else source.stop_at_cfg_test
+        text = production_source(
+            path.read_text(encoding="utf-8"),
+            stop_at_cfg_test=stop_at_cfg_test,
+        )
         if CREATE_TABLE_RE.search(text):
-            discovered.append(path.relative_to(root).as_posix())
+            discovered.append(relative_path)
     # Path.glob ordering is filesystem/path-object dependent for a sibling
     # module directory and its parent Rust file (for example `work/` and
     # `work.rs`).  Keep the discovery contract deterministic and comparable to

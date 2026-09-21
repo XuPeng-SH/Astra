@@ -122,7 +122,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-21-v84";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-21-v85";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1118,9 +1118,9 @@ impl SessionExecutionAdmissionFacts {
 
 /// Admit one transaction that will append owner-scoped session child rows.
 ///
-/// Existing sessions are locked before any child insert and deleting or
-/// tombstoned identities fail closed. Callers that support offline/lazy roots
-/// may create a missing parent, but only through the tombstone-gated canonical
+/// Existing sessions are locked before any child insert and deleting
+/// identities fail closed. Callers that support offline/lazy roots may create
+/// a missing parent, but only through the lifecycle-fence-gated canonical
 /// upsert. The lock is held until the caller commits or rolls back.
 pub async fn admit_session_event_write<T>(
     tx: &mut T,
@@ -1175,21 +1175,9 @@ where
         if status == "deleting" {
             return Err(sqlx::Error::RowNotFound);
         }
-        let tombstoned: Option<i32> = query_scalar(
-            "SELECT 1 FROM session_deletion_tombstones
-             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        return if tombstoned.is_none() {
-            Ok(SessionWriteAdmissionFacts {
-                session_status: status,
-            })
-        } else {
-            Err(sqlx::Error::RowNotFound)
-        };
+        return Ok(SessionWriteAdmissionFacts {
+            session_status: status,
+        });
     }
     if !allow_lazy_create {
         return Err(sqlx::Error::RowNotFound);
@@ -1207,15 +1195,7 @@ where
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let tombstoned: Option<i32> = query_scalar(
-        "SELECT 1 FROM session_deletion_tombstones
-         WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let (Some(session_status), true) = (created, tombstoned.is_none()) {
+    if let Some(session_status) = created {
         Ok(SessionWriteAdmissionFacts { session_status })
     } else {
         Err(sqlx::Error::RowNotFound)
@@ -1226,7 +1206,7 @@ where
 /// run and any session-scoped execution authority derived from it.
 ///
 /// The caller supplies the session identity it already owns. We first fence
-/// the active, non-tombstoned session, then the session execution slot, and
+/// the active, non-deleted session, then the session execution slot, and
 /// only then may the caller lock run rows. Sessions without an active run
 /// still use this fence, so run creation cannot race an idle handoff check.
 pub async fn admit_session_execution_write<T>(
@@ -1401,13 +1381,7 @@ where
 
 const ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL: &str = "INSERT INTO agent_sessions \
          (session_id, user_id, status, event_count, last_event_id, created_at, updated_at, last_active_at) \
-         SELECT ?, ?, 'active', ?, ?, NOW(6), NOW(6), NOW(6) \
-         FROM DUAL \
-         WHERE NOT EXISTS ( \
-             SELECT 1 FROM session_deletion_tombstones \
-             WHERE session_id = ? AND user_id = ? \
-             LIMIT 1 \
-         ) \
+         VALUES (?, ?, 'active', ?, ?, NOW(6), NOW(6), NOW(6)) \
          ON DUPLICATE KEY UPDATE \
          event_count = event_count + VALUES(event_count), \
          last_event_id = COALESCE(VALUES(last_event_id), last_event_id), \
@@ -1427,7 +1401,7 @@ pub enum AgentSessionWriteFenceState {
 ///
 /// Maintenance uses this form to serialize with session-bound writers while
 /// retaining the distinction between a delete still owned by reconciliation
-/// and a completed durable tombstone.
+/// and a completed durable deletion fence.
 pub async fn lock_existing_agent_session_write_fence<T>(
     tx: &mut T,
     session_id: &str,
@@ -1462,7 +1436,7 @@ where
 ///
 /// A historical prompt diagnostic can outlive both its session row and fence.
 /// The claim is serialized with every session writer: if no root exists while
-/// holding the fence, record a completed tombstone before deleting the
+/// holding the fence, record a completed deletion fence before deleting the
 /// diagnostic so a later writer cannot recreate that session identity.
 pub(crate) async fn lock_or_claim_orphaned_agent_session_write_fence(
     tx: &mut Transaction<'_, MySql>,
@@ -1515,7 +1489,7 @@ pub(crate) async fn lock_or_claim_orphaned_agent_session_write_fence(
 /// The fence row is created before the session root and survives hard delete.
 /// Every session-bound write must call this in the same transaction. A delete
 /// request locks the same row before removing data, so an already-queued
-/// writer either commits before the delete or observes the tombstone and rolls
+/// writer either commits before the delete or observes the completed fence and rolls
 /// its whole transaction back.
 pub async fn lock_agent_session_write_fence<T>(
     tx: &mut T,
@@ -1586,8 +1560,6 @@ where
         .bind(user_id)
         .bind(delta)
         .bind(last_event_id)
-        .bind(session_id)
-        .bind(user_id)
         .execute(&mut **tx)
         .await?;
     if result.rows_affected() == 0 {
@@ -2260,6 +2232,69 @@ async fn table_exists(
     .fetch_optional(pool)
     .await
     .map(|row| row.is_some())
+}
+
+/// Fold the legacy deletion tombstone projection into the lifecycle fence.
+///
+/// Both tables represented the same fact: a session identity must never be
+/// recreated after deletion. The lifecycle fence is already the lock held by
+/// every session-bound writer, so keeping a second permanent table only added
+/// a write and an extra read to the admission path. This migration is
+/// deliberately one-way: old rows are preserved in the fence, pending rows
+/// remain eligible for the existing delete-intent reconciler, and the
+/// redundant table is then removed.
+///
+/// This is a coordinated clean-contract cutover. A pre-v85 process that still
+/// queries or writes the retired table must not run against the v85 schema.
+async fn retire_session_deletion_tombstones(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    if !table_exists(pool, database, "session_deletion_tombstones").await? {
+        return Ok(());
+    }
+
+    // Keep the pending and completed cases as separate INSERT...SELECT
+    // statements. MatrixOne's conditional expression inference can coerce a
+    // DATETIME(6) branch to second precision; a deletion timestamp is part of
+    // the recovery evidence, so do not route it through CASE/IF.
+    query(
+        "INSERT INTO agent_session_lifecycle_fences
+         (session_id, user_id, delete_requested_at, database_deleted_at, created_at, updated_at)
+         SELECT tombstones.session_id, tombstones.user_id, tombstones.deleted_at, NULL,
+                tombstones.deleted_at, tombstones.deleted_at
+         FROM session_deletion_tombstones tombstones
+         JOIN agent_sessions sessions
+           ON sessions.user_id = tombstones.user_id
+          AND sessions.session_id = tombstones.session_id
+         ON DUPLICATE KEY UPDATE
+           delete_requested_at = COALESCE(delete_requested_at, VALUES(delete_requested_at)),
+           database_deleted_at = COALESCE(database_deleted_at, VALUES(database_deleted_at)),
+           updated_at = GREATEST(updated_at, VALUES(updated_at))",
+    )
+    .execute(pool)
+    .await?;
+    query(
+        "INSERT INTO agent_session_lifecycle_fences
+         (session_id, user_id, delete_requested_at, database_deleted_at, created_at, updated_at)
+         SELECT tombstones.session_id, tombstones.user_id, tombstones.deleted_at,
+                tombstones.deleted_at, tombstones.deleted_at, tombstones.deleted_at
+         FROM session_deletion_tombstones tombstones
+         LEFT JOIN agent_sessions sessions
+           ON sessions.user_id = tombstones.user_id
+          AND sessions.session_id = tombstones.session_id
+         WHERE sessions.session_id IS NULL
+         ON DUPLICATE KEY UPDATE
+           delete_requested_at = COALESCE(delete_requested_at, VALUES(delete_requested_at)),
+           database_deleted_at = COALESCE(database_deleted_at, VALUES(database_deleted_at)),
+           updated_at = GREATEST(updated_at, VALUES(updated_at))",
+    )
+    .execute(pool)
+    .await?;
+    query("DROP TABLE IF EXISTS session_deletion_tombstones")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// The current admission protocol stores materialized usage beside the
@@ -4463,19 +4498,7 @@ async fn ensure_core_schema_while_leased(
         &[("last_event_id", AGENT_EVENT_ID_LEN as u64)],
     )
     .await?;
-    core_schema_create!(
-        pool,
-        "session_deletion_tombstones",
-        "CREATE TABLE IF NOT EXISTS session_deletion_tombstones (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            deleted_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id),
-            INDEX idx_session_deletion_tombstones_deleted (deleted_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    retire_session_deletion_tombstones(&pool.pool, &settings.database).await?;
 
     // Work is the canonical product root. Bootstrap creates the current
     // schema; an older shape is rejected below instead of being rewritten.

@@ -63,6 +63,16 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             "retired proposal table must not survive the clean schema cut: {retired}"
         );
     }
+    assert!(
+        !contracts
+            .iter()
+            .any(|table| table.name == "session_deletion_tombstones"),
+        "the redundant deletion tombstone must not remain a schema owner"
+    );
+    assert!(
+        !existing.contains("session_deletion_tombstones"),
+        "the redundant deletion tombstone table must be retired during bootstrap"
+    );
     let proposal_columns = column_names(&pool, &schema, "work_proposals").await;
     for expected in [
         "proposal_kind",

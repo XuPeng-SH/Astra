@@ -10037,6 +10037,27 @@ impl AgenticRunLifecycleService {
         Ok(request)
     }
 
+    async fn plan_resume_snapshot_for_request(
+        &self,
+        request: &ChatRequestData,
+        user_id: &str,
+        session_id: &str,
+    ) -> astra_plan::PlanResumeSnapshot {
+        let Some(shared) = &self.shared_pool else {
+            return astra_plan::PlanResumeSnapshot::default();
+        };
+        let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
+        if let Some(facts) = request.session_admission_facts.as_ref() {
+            return match facts.active_plan_id.as_deref() {
+                Some(plan_id) => {
+                    astra_plan::plan_resume_snapshot_for_plan(&repo, user_id, plan_id).await
+                }
+                None => astra_plan::PlanResumeSnapshot::default(),
+            };
+        }
+        astra_plan::plan_resume_snapshot_for_session(&repo, user_id, session_id).await
+    }
+
     fn validate_effective_user_input(
         request: &ChatRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -15428,12 +15449,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Load plan state as structured data: prompt hint for context, plus
         // an independent authoring flag for the tool gate. Ordinary session
         // resume context must not activate plan-mode blocking.
-        let plan_resume_snapshot = if let Some(shared) = &self.shared_pool {
-            let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
-        } else {
-            astra_plan::PlanResumeSnapshot::default()
-        };
+        let plan_resume_snapshot = self
+            .plan_resume_snapshot_for_request(&request, &user_id, &session_id)
+            .await;
         let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
         let plan_resume_hint = plan_snapshot_resume_hint.clone();
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
@@ -16832,12 +16850,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             (csl_manager, session_resume_hint)
         };
         let plan_resume = async {
-            if let Some(shared) = &self.shared_pool {
-                let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-                astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
-            } else {
-                astra_plan::PlanResumeSnapshot::default()
-            }
+            self.plan_resume_snapshot_for_request(&request, &user_id, &session_id)
+                .await
         };
         let ((csl_manager, session_resume_hint), plan_resume_snapshot) =
             tokio::join!(history_restore, plan_resume);

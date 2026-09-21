@@ -1317,7 +1317,7 @@ async fn lock_invocation_scope_authority(
     // This is an ownership/lifecycle observation inside the admission
     // transaction. MatrixOne's supported row-lock primitive here is
     // `FOR UPDATE`; the shared storage primitive establishes the global
-    // session -> tombstone -> execution-slot -> exact-run order before this
+    // session -> lifecycle-fence -> execution-slot -> exact-run order before this
     // function observes run events. Keep those locks only through the durable
     // invocation insert. Sibling fanout admissions may briefly queue on this
     // scope lock, but provider I/O never occurs inside the transaction, so the
@@ -1444,7 +1444,7 @@ async fn lock_invocation_scope_authority(
                     InvocationScopeAuthority::Unavailable
                 } else {
                     // The run row is held before its event range, preserving
-                    // canonical session -> tombstone/slot -> run -> run-events
+                    // canonical session -> lifecycle-fence/slot -> run -> run-events
                     // lock order. Any
                     // later guidance is an execution fence. User cancellation
                     // is represented by the run row marker locked above;

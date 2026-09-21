@@ -650,6 +650,136 @@ async fn assert_checkpoint_history_migration(db: &IsolatedDatabase) -> Result<()
     Ok(())
 }
 
+async fn assert_deletion_tombstone_migration(db: &IsolatedDatabase) -> Result<(), String> {
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("bootstrap current deletion schema fixture: {error}"))?;
+
+    let completed_user = "legacy-completed-user";
+    let completed_session = format!("legacy-completed-session-{}", Uuid::new_v4().simple());
+    let pending_user = "legacy-pending-user";
+    let pending_session = format!("legacy-pending-session-{}", Uuid::new_v4().simple());
+    query(
+        "CREATE TABLE session_deletion_tombstones (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            deleted_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id),
+            INDEX idx_session_deletion_tombstones_deleted (deleted_at)
+        )",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("create legacy deletion tombstone table: {error}"))?;
+
+    query(
+        "INSERT INTO session_deletion_tombstones (user_id, session_id, deleted_at) VALUES
+         (?, ?, '2026-09-21 12:34:56.123456'),
+         (?, ?, '2026-09-21 12:34:56.123456')",
+    )
+    .bind(completed_user)
+    .bind(&completed_session)
+    .bind(pending_user)
+    .bind(&pending_session)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("seed legacy deletion tombstone: {error}"))?;
+
+    query(
+        "INSERT INTO agent_sessions
+         (session_id, user_id, status, delete_requested_at)
+         VALUES (?, ?, 'deleting', '2026-09-21 12:34:56.123456')",
+    )
+    .bind(&pending_session)
+    .bind(pending_user)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("seed pending deleting session: {error}"))?;
+    query(
+        "INSERT INTO session_transcript_items
+         (session_id, item_seq, user_id, role, content, content_hash)
+         VALUES (?, 1, ?, 'user', 'pending delete child', 'pending-delete-child-hash')",
+    )
+    .bind(&pending_session)
+    .bind(pending_user)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("seed pending session child row: {error}"))?;
+    query(
+        "UPDATE astra_schema_contracts
+         SET contract_version = '2026-09-21-v84'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("mark schema before deletion tombstone migration: {error}"))?;
+
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("migrate legacy deletion tombstone: {error}"))?;
+
+    let old_table_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'session_deletion_tombstones'",
+    )
+    .bind(&db.settings.database)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("check retired deletion tombstone table: {error}"))?;
+    if old_table_count != 0 {
+        return Err("legacy deletion tombstone table survived migration".to_string());
+    }
+
+    let migrated_completed: i64 = query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?
+           AND delete_requested_at = '2026-09-21 12:34:56.123456'
+           AND database_deleted_at = '2026-09-21 12:34:56.123456'",
+    )
+    .bind(completed_user)
+    .bind(&completed_session)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("check migrated deletion fence: {error}"))?;
+    if migrated_completed != 1 {
+        return Err(format!(
+            "migrated completed deletion fences = {migrated_completed}, want 1"
+        ));
+    }
+
+    let migrated_pending: i64 = query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?
+           AND delete_requested_at = '2026-09-21 12:34:56.123456'
+           AND database_deleted_at IS NULL",
+    )
+    .bind(pending_user)
+    .bind(&pending_session)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("check pending deletion fence: {error}"))?;
+    if migrated_pending != 1 {
+        return Err(format!(
+            "migrated pending deletion fences = {migrated_pending}, want 1"
+        ));
+    }
+    let pending_child_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM session_transcript_items
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(pending_user)
+    .bind(&pending_session)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("check pending session child row: {error}"))?;
+    if pending_child_count != 1 {
+        return Err(format!(
+            "pending session child rows = {pending_child_count}, want 1"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_pending_dispatch_schema_upgrade_preserves_terminal_rows_and_rejects_active_rows() {
@@ -681,4 +811,13 @@ async fn checkpoint_history_schema_upgrade_is_idempotent_and_skips_bad_rows() {
     let result = assert_checkpoint_history_migration(&db).await;
     db.cleanup().await;
     result.expect("checkpoint history schema upgrade");
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn deletion_tombstone_schema_upgrade_migrates_rows_and_drops_redundant_table() {
+    let db = IsolatedDatabase::new().await;
+    let result = assert_deletion_tombstone_migration(&db).await;
+    db.cleanup().await;
+    result.expect("deletion tombstone schema upgrade");
 }

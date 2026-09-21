@@ -3944,6 +3944,7 @@ pub(super) async fn post_work_branch_turn_handler(
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id: Some(binding.session_id.as_str().to_string()),
+        session_admission_facts: None,
         work_binding: Some(WorkRuntimeBindingRequest {
             work_id: binding.work_id.as_str().to_string(),
             branch_id: binding.branch_id.as_str().to_string(),

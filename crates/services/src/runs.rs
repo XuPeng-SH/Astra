@@ -952,6 +952,17 @@ pub struct ProviderRunOwner {
     pub provider_scope_id: String,
 }
 
+/// Facts loaded while authenticating and resolving an existing Session.
+///
+/// These facts are an optimization for the request path, not an execution
+/// authority. Mutating plan tools still re-check the durable plan binding when
+/// required; callers that do not have this snapshot fall back to the repository
+/// lookup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionAdmissionFacts {
+    pub active_plan_id: Option<String>,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
@@ -961,6 +972,9 @@ pub struct ChatRequestData {
     pub stable_runtime_system_prompt: Option<String>,
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
+    /// Server-derived facts from authenticated Session resolution. Never
+    /// accepted from a client transport.
+    pub session_admission_facts: Option<SessionAdmissionFacts>,
     pub work_binding: Option<WorkRuntimeBindingRequest>,
     pub run_start_idempotency: Option<RunStartIdempotency>,
     pub full_llm_capture: bool,
@@ -1048,6 +1062,10 @@ impl std::fmt::Debug for ChatRequestData {
             )
             .field("runtime_system_prompt", &self.runtime_system_prompt)
             .field("session_id", &self.session_id)
+            .field(
+                "session_admission_facts_present",
+                &self.session_admission_facts.is_some(),
+            )
             .field("work_binding", &self.work_binding)
             .field("run_start_idempotency", &self.run_start_idempotency)
             .field("agent_id", &self.agent_id)
@@ -12796,7 +12814,7 @@ impl DatabaseRunStateStore {
     /// authoritative run, event, and checkpoint tables.
     ///
     /// Full projection refreshes never trust a caller snapshot. Taking the
-    /// session -> tombstone -> slot -> run lock before the projection row
+    /// session -> lifecycle-fence -> slot -> run lock before the projection row
     /// serializes delayed post-commit callbacks with the transition that made
     /// their snapshot stale. This also keeps the lock order compatible with
     /// transactions that update the run and projection together.
@@ -12986,7 +13004,7 @@ impl DatabaseRunStateStore {
     }
 
     /// Append one immutable event batch under the canonical
-    /// session -> tombstone -> slot -> run -> events lock order. Counter
+    /// session -> lifecycle-fence -> slot -> run -> events lock order. Counter
     /// advancement and every child row are one commit: neither gaps nor partial
     /// batches are a supported durable state.
     async fn append_events_batch_for_user(
@@ -36420,6 +36438,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
+            session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -36516,6 +36535,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
+            session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -36635,6 +36655,7 @@ mod tests {
                     stable_runtime_system_prompt: None,
                     runtime_system_prompt: None,
                     session_id: None,
+                    session_admission_facts: None,
                     work_binding: None,
                     run_start_idempotency: None,
                     agent_id: None,

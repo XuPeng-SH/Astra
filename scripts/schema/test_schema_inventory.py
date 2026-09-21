@@ -948,9 +948,27 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("Audit is intentionally not persisted to MatrixOne", state_sync)
         self.assertNotIn("session_sync_log", state_sync)
 
+    def test_session_deletion_tombstones_are_removed_from_production_schema(self) -> None:
+        self.assertNotIn(
+            "session_deletion_tombstones",
+            self.tables,
+            "the lifecycle fence is the sole durable deletion authority",
+        )
+
+        storage = (schema_inventory.REPO_ROOT / "crates/services/src/storage.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "CREATE TABLE IF NOT EXISTS session_deletion_tombstones",
+            storage,
+        )
+        self.assertIn("DROP TABLE IF EXISTS session_deletion_tombstones", storage)
+        self.assertIn("agent_session_lifecycle_fences", storage)
+
     def test_p1_5_consolidation_reviews_are_evidence_backed(self) -> None:
         expected = {
             "session_sync_log",
+            "session_deletion_tombstones",
             "data_versioning_checkpoints",
             "preview_template_registry + raw_ref_scheme_registry",
             "harness_skill_drafts + harness_skill_rules",
