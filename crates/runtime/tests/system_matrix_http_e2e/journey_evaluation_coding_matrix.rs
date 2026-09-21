@@ -10,7 +10,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::post};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
 use super::harness::{
@@ -46,26 +45,25 @@ fn run_git(workspace: &Path, args: &[&str]) -> String {
         .to_string()
 }
 
-fn create_workspace() -> (TempDir, PathBuf, String) {
-    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    std::fs::create_dir_all(&target).expect("workspace target directory");
-    let fixture = tempfile::Builder::new()
-        .prefix("evaluation-coding-")
-        .tempdir_in(target)
-        .expect("evaluation workspace fixture");
-    let workspace = fixture.path().join("source");
-    std::fs::create_dir(&workspace).expect("evaluation source workspace");
-    run_git(&workspace, &["init", "--initial-branch=main"]);
-    run_git(
-        &workspace,
-        &["config", "user.email", "evaluation@example.invalid"],
+fn configured_workspace() -> (PathBuf, String) {
+    let workspace = std::env::var_os("ASTRA_EVALUATION_EDGE_WORKSPACE_DIR")
+        .map(PathBuf::from)
+        .expect("ASTRA_EVALUATION_EDGE_WORKSPACE_DIR must name the dedicated source mount");
+    assert!(
+        workspace.is_dir(),
+        "missing dedicated source mount: {}",
+        workspace.display()
     );
-    run_git(&workspace, &["config", "user.name", "Evaluation E2E"]);
-    std::fs::write(workspace.join("answer.txt"), "wrong\n").expect("seed answer");
-    run_git(&workspace, &["add", "answer.txt"]);
-    run_git(&workspace, &["commit", "-m", "seed evaluation fixture"]);
-    let commit = run_git(&workspace, &["rev-parse", "HEAD"]);
-    (fixture, workspace, commit)
+    let source_commit = run_git(&workspace, &["rev-parse", "HEAD"]);
+    let status = run_git(
+        &workspace,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    assert!(
+        status.is_empty(),
+        "dedicated source mount must be a clean checkout before the journey"
+    );
+    (workspace, source_commit)
 }
 
 async fn spawn_provider(skill_name: String) -> String {
@@ -261,7 +259,15 @@ pub async fn run_evaluation_coding_real_edge() {
         }
     });
 
-    let (_fixture, workspace, source_commit) = create_workspace();
+    let evaluation_config = std::env::var_os("ASTRA_EVALUATION_EDGE_CONFIG")
+        .map(PathBuf::from)
+        .expect("ASTRA_EVALUATION_EDGE_CONFIG must name the dedicated deployment config");
+    assert!(
+        evaluation_config.is_file(),
+        "missing dedicated evaluation config: {}",
+        evaluation_config.display()
+    );
+    let (workspace, source_commit) = configured_workspace();
     let edge_bin = std::env::var_os("ASTRA_EVALUATION_EDGE_BIN")
         .map(PathBuf::from)
         .expect("ASTRA_EVALUATION_EDGE_BIN must name the built astra-edge binary");
@@ -282,6 +288,8 @@ pub async fn run_evaluation_coding_real_edge() {
         .arg(format!("http://{addr}"))
         .arg("--token")
         .arg(token)
+        .arg("--evaluation-config")
+        .arg(&evaluation_config)
         .arg("--workspace-dir")
         .arg(&workspace)
         .arg("--edge-id")

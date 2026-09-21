@@ -563,8 +563,14 @@ const EVALUATION_TOOLS: &[&str] = &[
     "multi_edit",
 ];
 
-fn dedicated_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Value {
+fn dedicated_runtime_environment_capabilities(
+    edge_id: &str,
+    workspace: &Path,
+    confinement: &astra_runtime_env::WorkspaceConfinementContract,
+) -> Value {
     let mut value = edge_runtime_environment_capabilities(edge_id, workspace);
+    value["workspace_confinement"] =
+        serde_json::to_value(confinement).expect("workspace confinement serializes");
     value["protocol_capabilities"] = serde_json::json!({});
     if let Some(names) = value["binding"]["tool_surface"]["tool_names"].as_array_mut() {
         names.retain(|name| {
@@ -2415,17 +2421,23 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let workspace = canonical_workspace_dir(&config.workspace_dir).map_err(|e| {
         Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<dyn std::error::Error>
     })?;
+    let capabilities = if let Some(evaluation) = &config.evaluation {
+        let evaluation = evaluation.lock().await;
+        dedicated_runtime_environment_capabilities(
+            &config.edge_id,
+            &workspace,
+            evaluation.provider.contract(),
+        )
+    } else {
+        edge_runtime_environment_capabilities(&config.edge_id, &workspace)
+    };
     let auth_msg = EdgeClientMessage::Auth {
         edge_agent_id: config.edge_id.clone(),
         materialization_id: config.materialization_id.clone(),
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
-        capabilities: Some(if config.evaluation.is_some() {
-            dedicated_runtime_environment_capabilities(&config.edge_id, &workspace)
-        } else {
-            edge_runtime_environment_capabilities(&config.edge_id, &workspace)
-        }),
+        capabilities: Some(capabilities),
     };
     write
         .send(Message::Text(serde_json::to_string(&auth_msg)?.into()))
@@ -3300,9 +3312,7 @@ async fn run() {
         config.evaluation = Some(Arc::new(Mutex::new(
             evaluation_allocation::Allocations::new(provider),
         )));
-        tracing::warn!(
-            "Evaluation capability withheld: allocation/tool/finalization runtime receipts are not yet persisted and admitted end to end"
-        );
+        tracing::info!("Dedicated evaluation provider capability is active");
     }
 
     eprintln!(
@@ -4034,10 +4044,25 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_advertisement_withholds_incomplete_capabilities() {
+    fn dedicated_advertisement_includes_the_verified_confinement_contract() {
         let root = tempfile::tempdir().unwrap();
-        let value = dedicated_runtime_environment_capabilities("test", root.path());
-        assert!(value.get("workspace_confinement").is_none());
+        let confinement = astra_runtime_env::WorkspaceConfinementContract {
+            profile_id: astra_runtime_env::WORKSPACE_CONFINEMENT_PROFILE.into(),
+            toolchain_manifest: astra_runtime_env::ToolchainManifest {
+                schema_version: 1,
+                inputs: vec![astra_runtime_env::ToolchainInput {
+                    guest_mount_path: "/usr/bin".into(),
+                    content_digest: format!("sha256:{}", "a".repeat(64)),
+                }],
+                launcher_digest: format!("sha256:{}", "b".repeat(64)),
+                supervisor_digest: format!("sha256:{}", "c".repeat(64)),
+            },
+        };
+        let value = dedicated_runtime_environment_capabilities("test", root.path(), &confinement);
+        assert_eq!(
+            value["workspace_confinement"],
+            serde_json::to_value(&confinement).unwrap()
+        );
         assert_eq!(value["protocol_capabilities"], serde_json::json!({}));
         for name in value["binding"]["tool_surface"]["tool_names"]
             .as_array()

@@ -10739,16 +10739,18 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
     let pool = setup_lifecycle_run_db_it().await;
     let owner = format!("eval-runtime-owner-{}", Uuid::new_v4());
     let session_id = format!("eval-runtime-session-{}", Uuid::new_v4());
+    let offering_id = format!("eval-runtime-model-{}", Uuid::new_v4());
+    let model_name = format!("eval-runtime-model-{}", Uuid::new_v4());
     crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session_id).await;
     let llm = spawn_terminal_test_llm().await;
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
-        .bind("model-test-model")
+        .bind(&offering_id)
         .execute(pool.get())
         .await
         .expect("clear runtime evaluation model fixture");
     sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
-        .bind("model-test-model")
-        .bind("test-model")
+        .bind(&offering_id)
+        .bind(&model_name)
         .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
         .bind(&llm.base_url)
         .bind(r#"["text"]"#)
@@ -10763,7 +10765,11 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
     let memory = Arc::new(EvaluationMemorySpy::default());
     let metrics = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
     let service = db_backed_test_service(&pool, &format!("eval-runtime-pod-{}", Uuid::new_v4()))
-        .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())))
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
         .with_memory_extraction_service(memory.extraction_service())
         .with_observer_worker(memory.clone())
         .with_metrics_registry(metrics.clone())
@@ -10771,6 +10777,10 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
 
     let mut request = test_request("evaluate this fixed input");
     request.session_id = Some(session_id.clone());
+    request.model = Some(model_name.clone());
+    request.model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: offering_id.clone(),
+    });
     request.stable_runtime_system_prompt = Some("Frozen revision text".to_string());
     request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
         remaining_seconds: 60,
@@ -10787,7 +10797,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
         &owner,
         &astra_turn_types::ModelSelection {
-            offering_id: "model-test-model".into(),
+            offering_id: offering_id.clone(),
         },
         None,
         None,
@@ -10801,7 +10811,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
     };
     let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
         &astra_services::evaluation::EvaluationPolicyFingerprintInput {
-            model_binding: "model-test-model",
+            model_binding: &offering_id,
             provider_binding: "openai",
             cache_policy: "provider_default_recorded",
             resolved_model_selection: Some(&resolved_model),
@@ -10861,7 +10871,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
                 )
                 .expect("freeze the actual admitted fixture execution"),
             isolation_profile: "prompt_only_private".to_string(),
-            model_binding: "model-test-model".to_string(),
+            model_binding: offering_id.clone(),
             provider_binding: "openai".to_string(),
             context_snapshot_hash: input_hash,
             tool_policy_hash: policy_hash,
@@ -11074,6 +11084,10 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         .expect("hold the only runtime evaluation slot");
     let mut cancel_request = test_request("evaluate this fixed input");
     cancel_request.session_id = Some(cancel_session_id.clone());
+    cancel_request.model = Some(model_name.clone());
+    cancel_request.model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: offering_id.clone(),
+    });
     cancel_request.stable_runtime_system_prompt = Some("Candidate revision text".to_string());
     cancel_request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
         remaining_seconds: 60,
@@ -11275,11 +11289,16 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         TrialStatus::Failed
     );
     assert!(recovered_observation.materialization_receipt_ids.is_empty());
+    let measurements = &recovered_observation.observation.measurements;
+    assert!(measurements.iter().any(|measurement| {
+        measurement.name == "run_completed"
+            && measurement.value == Some(0.0)
+            && measurement.status == astra_services::evaluation::MeasurementStatus::Observed
+    }));
     assert!(
-        recovered_observation
-            .observation
-            .measurements
+        measurements
             .iter()
+            .filter(|measurement| measurement.name != "run_completed")
             .all(|measurement| {
                 measurement.value.is_none()
                     && measurement.status == astra_services::evaluation::MeasurementStatus::Missing
@@ -11380,7 +11399,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &cancel_session_id).await;
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
-        .bind("model-test-model")
+        .bind(&offering_id)
         .execute(pool.get())
         .await
         .expect("clean runtime evaluation model fixture");
@@ -11890,16 +11909,18 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
     let owner = format!("eval-skill-owner-{}", Uuid::new_v4());
     let session_id = format!("eval-skill-session-{}", Uuid::new_v4());
     let skill_name = format!("eval-skill-{}", Uuid::new_v4());
+    let offering_id = format!("eval-skill-model-{}", Uuid::new_v4());
+    let model_name = format!("eval-skill-model-{}", Uuid::new_v4());
     crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session_id).await;
     let llm = spawn_skill_invoking_test_llm(&skill_name).await;
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
-        .bind("model-test-model")
+        .bind(&offering_id)
         .execute(pool.get())
         .await
         .expect("clear Skill evaluation model fixture");
     sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
-        .bind("model-test-model")
-        .bind("test-model")
+        .bind(&offering_id)
+        .bind(&model_name)
         .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
         .bind(&llm.base_url)
         .bind(r#"["text"]"#)
@@ -11912,7 +11933,11 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         .await
         .expect("seed Skill evaluation model fixture");
     let service = db_backed_test_service(&pool, &format!("eval-skill-pod-{}", Uuid::new_v4()))
-        .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())))
+        .with_model_service(Arc::new(ActiveTestModelService::with_model(
+            llm.base_url.clone(),
+            offering_id.clone(),
+            model_name.clone(),
+        )))
         .with_run_concurrency_limit(1);
     let skill_store = astra_services::DatabasePersonalSkillStore::new(pool.clone());
     let manifest = json!({
@@ -11950,6 +11975,10 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         .expect("publish candidate evaluation Skill");
     let mut request = test_request("evaluate the pinned Skill");
     request.session_id = Some(session_id.clone());
+    request.model = Some(model_name.clone());
+    request.model_selection = Some(astra_turn_types::ModelSelection {
+        offering_id: offering_id.clone(),
+    });
     request.execution_policy.turn_intent =
         astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
     request.execution_policy.skill_auto_route =
@@ -11973,7 +12002,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
         &owner,
         &astra_turn_types::ModelSelection {
-            offering_id: "model-test-model".into(),
+            offering_id: offering_id.clone(),
         },
         None,
         None,
@@ -11987,7 +12016,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
     };
     let policy_hash = astra_services::evaluation::evaluation_policy_fingerprint(
         &astra_services::evaluation::EvaluationPolicyFingerprintInput {
-            model_binding: "model-test-model",
+            model_binding: &offering_id,
             provider_binding: "openai",
             cache_policy: "provider_default_recorded",
             resolved_model_selection: Some(&resolved_model),
@@ -12047,7 +12076,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
                 )
                 .expect("freeze the actual admitted fixture execution"),
             isolation_profile: "skill_inline_private".to_string(),
-            model_binding: "model-test-model".to_string(),
+            model_binding: offering_id.clone(),
             provider_binding: "openai".to_string(),
             context_snapshot_hash: input_hash,
             tool_policy_hash: policy_hash,
@@ -12446,7 +12475,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &candidate_session_id).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &rejected_session_id).await;
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
-        .bind("model-test-model")
+        .bind(&offering_id)
         .execute(pool.get())
         .await
         .expect("clean Skill evaluation model fixture");

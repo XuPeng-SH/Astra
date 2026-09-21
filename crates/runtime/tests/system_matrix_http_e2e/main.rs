@@ -330,7 +330,7 @@ matrix_test! {
 }
 matrix_test! {
     e2e_matrix_evaluation_coding_real_edge, 4,
-    "live MatrixOne + real astra-edge; ASTRA_TEST_DB_IT=1 and ASTRA_EVALUATION_EDGE_BIN required",
+    "live MatrixOne + dedicated astra-edge; ASTRA_TEST_DB_IT=1, ASTRA_EVALUATION_EDGE_BIN, ASTRA_EVALUATION_EDGE_CONFIG, and ASTRA_EVALUATION_EDGE_WORKSPACE_DIR required",
     journey_evaluation_coding_matrix::run_evaluation_coding_real_edge
 }
 matrix_test! {

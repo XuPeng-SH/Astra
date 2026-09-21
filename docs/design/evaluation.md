@@ -455,16 +455,17 @@ by content digest. Prepare and Run admission share capability checks and policy
 fingerprinting; a changed live contract cannot replace the frozen inputs. Exact
 submission retries return the stored experiment without resolving a new capability.
 Missing confinement capability rejects new workspace preparations. Ordinary Edge
-registration makes no confinement claim; dedicated provider deployment and
-execution-receipt integration remain required before advertising this capability.
+registration makes no confinement claim. A dedicated provider publishes the
+exact confinement contract it verified at startup; the Server then freezes that
+contract into the experiment and rechecks it at allocation and Run admission.
 
 The dedicated Edge entrypoint is `astra-edge --evaluation-config
 /etc/astra/evaluation.json --workspace-dir /var/lib/astra-eval/allocations/source`
-with the usual authenticated connection arguments. This mode is currently
-integration-only: it withholds the confinement advertisement until allocation,
-tool, and verifier receipts are admitted and persisted end to end. Ordinary
-Edge execution remains a separate provider mode and cannot be selected as a
-fallback from a dedicated allocation.
+with the usual authenticated connection arguments. This mode requires the
+verified deployment described below. It publishes no confinement capability
+when startup verification fails, and it never falls back to ordinary Edge
+execution. Allocation, tool, finalization, and verifier receipts remain bound
+to the existing evaluation materialization and Run evidence path.
 
 Its first supported deployment is Linux x86-64 with an exclusive non-root
 service UID, no supplementary groups or capabilities, and a root-owned,

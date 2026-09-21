@@ -23,6 +23,14 @@ use sha2::{Digest, Sha256};
 
 const MAX_MANIFEST_ENTRIES: usize = 16_384;
 const MAX_STATUS_CONTENT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STATUS_ENTRIES: usize = 8_192;
+// Ignored build/output directories are useful deliverables, but expanding a
+// whole cache would make every Bash call expensive.  Scan a small bounded
+// tree; larger caches intentionally become Unknown rather than being treated
+// as unchanged.
+const MAX_IGNORED_ENTRIES: usize = 2_048;
+const MAX_IGNORED_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 const FINGERPRINT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_LEASE_WAIT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "linux")]
@@ -2890,11 +2898,10 @@ pub fn is_authoritative_external_effect_receipt(receipt: &serde_json::Value) -> 
 impl WorkspaceFingerprint {
     /// Capture a bounded fingerprint for `root`.
     ///
-    /// Capture a bounded metadata and content manifest. Git metadata can
-    /// contain repository callbacks, so workspace evidence must not invoke
-    /// Git status from the host process. If the manifest exceeds its bound or
-    /// any required metadata cannot be read, return `None` so callers fail
-    /// closed.
+    /// Git status is the fast path and reports tracked/untracked workspace
+    /// changes without walking file contents.  Non-git workspaces use a
+    /// bounded metadata manifest.  If the manifest exceeds its bound or any
+    /// required metadata cannot be read, return `None` so callers fail closed.
     pub fn capture(root: &Path) -> Option<Self> {
         let root = root.canonicalize().ok()?;
         let writer_state = writer_epoch_state(&root)?;
@@ -2913,7 +2920,14 @@ impl WorkspaceFingerprint {
         if active_before != 0 || quarantined_before {
             return None;
         }
-        let digest = manifest_fingerprint(&root)?;
+        let digest = match git_status_fingerprint(&root) {
+            GitFingerprint::Captured(digest) => Some(digest),
+            // Do not retry an over-limit/ambiguous Git workspace with a
+            // second full manifest: that only blocks the executor again and
+            // still cannot produce trustworthy evidence.
+            GitFingerprint::Unknown => None,
+            GitFingerprint::UseManifest => manifest_fingerprint(&root),
+        }?;
         let epoch_after = writer_state
             .epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -2969,6 +2983,15 @@ impl WorkspaceFingerprint {
             WorkspaceFingerprintComparison::Changed
         )
     }
+}
+
+enum GitFingerprint {
+    Captured(u64),
+    /// Git is unavailable/non-local to the bound root, or a parent ignore
+    /// rule represented the entire bound root by an ignored ancestor entry.
+    /// In either case the bounded root-local manifest is authoritative.
+    UseManifest,
+    Unknown,
 }
 
 struct BoundedCommandOutput {
@@ -3085,6 +3108,312 @@ fn terminate_probe_child(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn git_status_fingerprint(root: &Path) -> GitFingerprint {
+    let Some(mut git_root_command) = hardened_git_command(root) else {
+        // Git is optional in minimal agent images.  Falling back to the
+        // bounded manifest is safe; it is materially different from
+        // executing a program selected through the caller's PATH.
+        return GitFingerprint::UseManifest;
+    };
+    git_root_command.args(["rev-parse", "--show-toplevel"]);
+    let Some(git_root_output) =
+        run_bounded_probe(git_root_command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
+    else {
+        return GitFingerprint::Unknown;
+    };
+    if !git_root_output.success {
+        return GitFingerprint::UseManifest;
+    }
+    let Some(git_root) = String::from_utf8(git_root_output.stdout)
+        .ok()
+        .map(|path| Path::new(path.trim()).to_path_buf())
+        .and_then(|path| path.canonicalize().ok())
+    else {
+        return GitFingerprint::Unknown;
+    };
+    if !root.starts_with(&git_root) {
+        return GitFingerprint::Unknown;
+    }
+    let Ok(relative_root) = root.strip_prefix(&git_root) else {
+        return GitFingerprint::Unknown;
+    };
+    let tree_spec = if relative_root.as_os_str().is_empty() {
+        "HEAD^{tree}".to_string()
+    } else {
+        format!("HEAD:{}", relative_root.to_string_lossy())
+    };
+    let Some(mut tree_command) = hardened_git_command(root) else {
+        return GitFingerprint::UseManifest;
+    };
+    tree_command.args(["rev-parse", &tree_spec]);
+    let Some(tree_output) = run_bounded_probe(tree_command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
+    else {
+        return GitFingerprint::Unknown;
+    };
+    let tree_bytes = if tree_output.success {
+        tree_output.stdout
+    } else {
+        // A repository can legitimately have no commit yet, or the bound
+        // directory can exist only in the worktree and not in HEAD. Both are
+        // deterministic baseline states, not probe failure.
+        let Some(mut head_command) = hardened_git_command(root) else {
+            return GitFingerprint::UseManifest;
+        };
+        head_command.args(["rev-parse", "--verify", "HEAD"]);
+        let Some(head_output) =
+            run_bounded_probe(head_command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
+        else {
+            return GitFingerprint::Unknown;
+        };
+        if head_output.success {
+            b"astra-bound-subtree-missing-v1".to_vec()
+        } else {
+            b"astra-unborn-head-v1".to_vec()
+        }
+    };
+    if !git_index_is_observable(root) {
+        return GitFingerprint::Unknown;
+    }
+    let Some(mut status_command) = hardened_git_command(root) else {
+        return GitFingerprint::UseManifest;
+    };
+    status_command.args([
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        // `traditional` recursively expands every ignored build/cache
+        // file.  `matching` keeps direct ignored files observable while
+        // representing ignored directories as bounded entries; an
+        // over-large/ambiguous result fails closed below.
+        "--ignored=matching",
+        "--",
+        ".",
+    ]);
+    let Some(output) = run_bounded_probe(
+        status_command,
+        MAX_STATUS_OUTPUT_BYTES,
+        FINGERPRINT_PROBE_TIMEOUT,
+    ) else {
+        return GitFingerprint::Unknown;
+    };
+    if !output.success {
+        return GitFingerprint::Unknown;
+    }
+    let mut hasher = DefaultHasher::new();
+    // A clean commit has no status entry. Include the bound subtree identity
+    // so an opaque command that edits, commits, and leaves a clean worktree
+    // still produces a delta; hashing the full repository tree would make a
+    // sibling-only commit look like a change in a nested workspace.
+    tree_bytes.hash(&mut hasher);
+    // Status alone is insufficient for a pre-dirty workspace: changing a
+    // file that was already marked `M` leaves the status bytes unchanged.
+    // Hash the bounded content of every path reported by status so a generic
+    // opaque writer still yields a delta without parsing its command text.
+    let mut content_bytes = 0usize;
+    let mut rename_target = false;
+    let mut status_entries = 0usize;
+    let mut ignored_entries = 0usize;
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        status_entries = status_entries.saturating_add(1);
+        if status_entries > MAX_STATUS_ENTRIES {
+            return GitFingerprint::Unknown;
+        }
+        let (status, path_bytes) = if rename_target {
+            rename_target = false;
+            (b"rename_target".as_slice(), raw_path)
+        } else if raw_path.len() >= 3 && raw_path[2] == b' ' {
+            let status = &raw_path[..2];
+            rename_target = matches!(status, b"R " | b" R" | b"C " | b" C");
+            (status, &raw_path[3..])
+        } else {
+            (b"path".as_slice(), raw_path)
+        };
+        // Git's `-z` format preserves raw path bytes.  Do not lossy-decode a
+        // non-UTF-8 name into a different path and then claim a trustworthy
+        // receipt; an ambiguous path makes this whole fingerprint unknown.
+        let Ok(path_text) = std::str::from_utf8(path_bytes) else {
+            return GitFingerprint::Unknown;
+        };
+        let path = Path::new(path_text);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return GitFingerprint::Unknown;
+        }
+        let path_from_git_root = git_root.join(path);
+        let path_from_workspace = match path_from_git_root.strip_prefix(root) {
+            Ok(path) => path,
+            Err(_) if status == b"!!" && root.starts_with(&path_from_git_root) => {
+                // A parent repository can collapse an ignored ancestor (for
+                // example `target/`) even when Git was invoked from a deeper
+                // bound workspace. That entry contains no root-local state,
+                // so use the bounded manifest instead of claiming a stable
+                // Git digest from evidence outside the workspace.
+                return GitFingerprint::UseManifest;
+            }
+            Err(_) => {
+                // `-- .` should never return an unrelated outside entry.
+                // Treat that as ambiguous authority, not as ignorable noise.
+                return GitFingerprint::Unknown;
+            }
+        };
+        // `.astra` is executor/session coordination state, not a user
+        // deliverable. The manifest fallback already excludes this exact
+        // top-level directory; Git-backed observation must use the same
+        // scope so creating or locking workspace coordination files cannot
+        // manufacture a mutation delta.
+        if path_from_workspace
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == ".astra")
+        {
+            continue;
+        }
+        status.hash(&mut hasher);
+        path_from_workspace.to_string_lossy().hash(&mut hasher);
+        // `--ignored=matching` reports ignored directories compactly. Expand
+        // each one only within a deliberately smaller bound so a small
+        // generated deliverable is observable while a large cache fails
+        // closed instead of being silently treated as unchanged.
+        let is_real_directory = fs::symlink_metadata(&path_from_git_root)
+            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if status == b"!!" && is_real_directory {
+            if !hash_ignored_directory(
+                &git_root,
+                &path_from_git_root,
+                &mut hasher,
+                &mut ignored_entries,
+                &mut content_bytes,
+            ) {
+                return GitFingerprint::Unknown;
+            }
+            continue;
+        }
+        if hash_path_state(&path_from_git_root, &mut hasher, &mut content_bytes).is_none() {
+            return GitFingerprint::Unknown;
+        }
+    }
+    GitFingerprint::Captured(hasher.finish())
+}
+
+fn git_index_is_observable(root: &Path) -> bool {
+    let Some(mut command) = hardened_git_command(root) else {
+        return false;
+    };
+    command.args(["ls-files", "-v", "-z", "--", "."]);
+    let Some(output) =
+        run_bounded_probe(command, MAX_STATUS_OUTPUT_BYTES, FINGERPRINT_PROBE_TIMEOUT)
+    else {
+        return false;
+    };
+    if !output.success {
+        return false;
+    }
+    let mut entries = 0usize;
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        if entries > MAX_STATUS_ENTRIES || entry.get(1) != Some(&b' ') {
+            return false;
+        }
+        // `git status` intentionally trusts these index bits. A task can set
+        // them and then rewrite a file without producing a status entry, so
+        // an authoritative receipt is impossible until the checkout is reset.
+        if matches!(entry[0], b'h' | b'S') {
+            return false;
+        }
+    }
+    true
+}
+
+fn hash_ignored_directory(
+    git_root: &Path,
+    directory: &Path,
+    hasher: &mut DefaultHasher,
+    entries: &mut usize,
+    content_bytes: &mut usize,
+) -> bool {
+    let mut children = Vec::new();
+    let Ok(read_dir) = fs::read_dir(directory) else {
+        return false;
+    };
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        *entries = entries.saturating_add(1);
+        if *entries > MAX_IGNORED_ENTRIES {
+            return false;
+        }
+        children.push(entry);
+    }
+    children.sort_by_key(|entry| entry.file_name());
+
+    for entry in children {
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(git_root) else {
+            return false;
+        };
+        relative.to_string_lossy().hash(hasher);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return false;
+        };
+        metadata.file_type().is_symlink().hash(hasher);
+        metadata.is_dir().hash(hasher);
+        metadata.len().hash(hasher);
+        hash_permissions(&metadata, hasher);
+        if metadata.file_type().is_symlink() {
+            let Ok(target) = fs::read_link(&path) else {
+                return false;
+            };
+            target.to_string_lossy().hash(hasher);
+        } else if metadata.is_file() {
+            let remaining = MAX_IGNORED_CONTENT_BYTES.saturating_sub(*content_bytes);
+            if metadata.len() > remaining as u64 {
+                return false;
+            }
+            let Ok(mut file) = fs::File::open(&path) else {
+                return false;
+            };
+            let mut buffer = [0u8; 8192];
+            loop {
+                let Ok(read) = file.read(&mut buffer) else {
+                    return false;
+                };
+                if read == 0 {
+                    break;
+                }
+                buffer[..read].hash(hasher);
+                *content_bytes = content_bytes.saturating_add(read);
+                if *content_bytes > MAX_IGNORED_CONTENT_BYTES {
+                    return false;
+                }
+            }
+            let Ok(after) = fs::symlink_metadata(&path) else {
+                return false;
+            };
+            if after.len() != metadata.len() {
+                return false;
+            }
+        }
+        if metadata.is_dir()
+            && !hash_ignored_directory(git_root, &path, hasher, entries, content_bytes)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Construct the Git command used by callers that need Git metadata.
@@ -5706,6 +6035,70 @@ mod tests {
         run(&["commit", "-qm", "change"]);
         let after = WorkspaceFingerprint::capture(temp.path()).expect("workspace fingerprint");
         assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn clean_git_workspace_with_large_tracked_content_remains_observable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(
+            temp.path().join("large.bin"),
+            vec![0_u8; MAX_STATUS_CONTENT_BYTES + 1],
+        )
+        .expect("large tracked file");
+        run(&["add", "large.bin"]);
+        run(&["commit", "-qm", "large tracked file"]);
+
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_some(),
+            "a clean tracked file must not consume the uncommitted-content budget"
+        );
+    }
+
+    #[test]
+    fn hidden_git_index_flags_fail_closed_for_workspace_observation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+
+        run(&["update-index", "--assume-unchanged", "tracked.txt"]);
+        fs::write(temp.path().join("tracked.txt"), "assume-unchanged rewrite")
+            .expect("assume-unchanged rewrite");
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_none(),
+            "assume-unchanged hides worktree changes from git status"
+        );
+
+        run(&["update-index", "--no-assume-unchanged", "tracked.txt"]);
+        run(&["update-index", "--skip-worktree", "tracked.txt"]);
+        fs::write(temp.path().join("tracked.txt"), "skip-worktree rewrite")
+            .expect("skip-worktree rewrite");
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_none(),
+            "skip-worktree hides worktree changes from git status"
+        );
     }
 
     #[test]

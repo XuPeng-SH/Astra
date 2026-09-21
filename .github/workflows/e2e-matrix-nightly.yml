@@ -74,9 +74,13 @@ jobs:
           if [ -n "$FILTER" ]; then
             cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features e2e-hooks -- "$FILTER" --ignored --nocapture
-          else
+          elif [ -n "${ASTRA_EVALUATION_EDGE_CONFIG:-}" ] && [ -n "${ASTRA_EVALUATION_EDGE_WORKSPACE_DIR:-}" ]; then
             cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features e2e-hooks -- --ignored --nocapture
+          else
+            cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
+              --features e2e-hooks -- --ignored --nocapture \
+              --skip e2e_matrix_evaluation_coding_real_edge
           fi
 
       - name: Dump dependency logs
