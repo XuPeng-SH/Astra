@@ -858,36 +858,36 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
 
     let checkpoint_json =
         r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"canonical-only"}"#;
-    sqlx::query(
-        "INSERT INTO run_checkpoints
-         (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
-          checkpoint_version, idempotency_key, checkpoint_json, created_at)
-         VALUES (?, ?, ?, ?, 4, 'resume', 'checkpoint_v1', ?, ?, NOW(6))",
-    )
-    .bind(format!("ckpt-recovery-history-{}", uuid::Uuid::new_v4()))
-    .bind(&run_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(format!("checkpoint:{run_id}:resume:canonical-only"))
-    .bind(checkpoint_json)
-    .execute(_pool.get())
-    .await
-    .expect("insert canonical-only recovery checkpoint");
-    sqlx::query(
-        "INSERT INTO run_checkpoints
-         (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
-          checkpoint_version, idempotency_key, checkpoint_json, created_at)
-         VALUES (?, ?, ?, ?, 4, 'resume', 'checkpoint_v1', ?, ?, NOW(6))",
-    )
-    .bind(format!("ckpt-recovery-malformed-{}", uuid::Uuid::new_v4()))
-    .bind(&malformed_run_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(format!("checkpoint:{malformed_run_id}:resume:malformed"))
-    .bind(r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":7}"#)
-    .execute(_pool.get())
-    .await
-    .expect("insert malformed canonical recovery checkpoint");
+    for (run_id, checkpoint_id, idempotency_key, checkpoint_json) in [
+        (
+            run_id.as_str(),
+            format!("ckpt-recovery-history-{}", uuid::Uuid::new_v4()),
+            format!("checkpoint:{run_id}:resume:canonical-only"),
+            checkpoint_json.to_string(),
+        ),
+        (
+            malformed_run_id.as_str(),
+            format!("ckpt-recovery-malformed-{}", uuid::Uuid::new_v4()),
+            format!("checkpoint:{malformed_run_id}:resume:malformed"),
+            r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":7}"#.to_string(),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+              checkpoint_version, idempotency_key, checkpoint_json, created_at)
+             VALUES (?, ?, ?, ?, 4, 'resume', 'checkpoint_v1', ?, ?, NOW(6))",
+        )
+        .bind(checkpoint_id)
+        .bind(run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(idempotency_key)
+        .bind(checkpoint_json)
+        .execute(_pool.get())
+        .await
+        .expect("insert recovery checkpoint fixture");
+    }
 
     let claims = store
         .claim_recoverable_active_runs(256)
@@ -907,36 +907,19 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         .expect("malformed canonical recovery run should be claimed");
     assert!(!malformed_claim.has_graceful_resume_checkpoint);
 
-    let _ = sqlx::query("DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?")
-        .bind(&user_id)
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?")
-        .bind(&user_id)
-        .bind(&malformed_run_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?")
-        .bind(&user_id)
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?")
-        .bind(&user_id)
-        .bind(&malformed_run_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
-        .bind(&user_id)
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
-        .bind(&user_id)
-        .bind(&malformed_run_id)
-        .execute(_pool.get())
-        .await;
+    for run_id in [run_id.as_str(), malformed_run_id.as_str()] {
+        for statement in [
+            "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            let _ = sqlx::query(statement)
+                .bind(&user_id)
+                .bind(run_id)
+                .execute(_pool.get())
+                .await;
+        }
+    }
 }
 
 /// Owner isolation: dirty tool output rows for another user/session with the

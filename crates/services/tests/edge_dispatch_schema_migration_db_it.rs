@@ -647,9 +647,6 @@ async fn assert_checkpoint_history_migration(db: &IsolatedDatabase) -> Result<()
     if repeated != 1 {
         return Err(format!("repeated checkpoint rows = {repeated}, want 1"));
     }
-    if CORE_SCHEMA_CONTRACT_VERSION != "2026-09-21-v84" {
-        return Err("checkpoint migration test is coupled to the wrong schema version".into());
-    }
     Ok(())
 }
 

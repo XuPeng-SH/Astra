@@ -3839,7 +3839,7 @@ async fn backfill_legacy_checkpoints(pool: &sqlx::Pool<MySql>) -> Result<(), sql
             let run_id: String = key_row.try_get("run_id")?;
             let mut tx = pool.begin().await?;
             let Some(row) = query(
-                "SELECT run_id, user_id, session_id, last_event_idx, checkpoint_json, updated_at
+                "SELECT session_id, last_event_idx, checkpoint_json, updated_at
                  FROM agent_runs
                  WHERE user_id = ? AND run_id = ?
                    AND checkpoint_version IS NOT NULL
@@ -3869,8 +3869,6 @@ async fn backfill_legacy_checkpoints(pool: &sqlx::Pool<MySql>) -> Result<(), sql
                 tx.commit().await?;
                 continue;
             }
-            let run_id: String = row.try_get("run_id")?;
-            let user_id: String = row.try_get("user_id")?;
             let session_id: String = row.try_get("session_id")?;
             let node_seq: i64 = row.try_get("last_event_idx")?;
             let checkpoint_json: String = row.try_get("checkpoint_json")?;
