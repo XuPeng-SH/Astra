@@ -917,90 +917,6 @@ async fn assert_deletion_tombstone_migration(db: &IsolatedDatabase) -> Result<()
     Ok(())
 }
 
-async fn assert_retired_session_projection_migration(db: &IsolatedDatabase) -> Result<(), String> {
-    ensure_core_schema(&db.settings, "mysql")
-        .await
-        .map_err(|error| format!("bootstrap current session projection schema: {error}"))?;
-
-    for table in [
-        "session_state_revisions",
-        "session_history_chunks",
-        "session_artifacts_grants",
-    ] {
-        query(&format!(
-            "CREATE TABLE {table} (marker VARCHAR(32) NOT NULL)"
-        ))
-        .execute(&db.pool)
-        .await
-        .map_err(|error| format!("create retired table {table}: {error}"))?;
-    }
-    query("INSERT INTO session_state_revisions (marker) VALUES ('state-history')")
-        .execute(&db.pool)
-        .await
-        .map_err(|error| format!("seed retired state revision row: {error}"))?;
-    query("INSERT INTO session_artifacts_grants (marker) VALUES ('grant-history')")
-        .execute(&db.pool)
-        .await
-        .map_err(|error| format!("seed retired artifact grant row: {error}"))?;
-    query(
-        "UPDATE astra_schema_contracts
-         SET contract_version = '2026-09-21-v86'
-         WHERE component = 'astra-core'",
-    )
-    .execute(&db.pool)
-    .await
-    .map_err(|error| format!("mark schema before retired projection migration: {error}"))?;
-
-    ensure_core_schema(&db.settings, "mysql")
-        .await
-        .map_err(|error| format!("migrate retired session projection tables: {error}"))?;
-
-    for table in [
-        "session_state_revisions",
-        "session_history_chunks",
-        "session_artifacts_grants",
-    ] {
-        let current_count: i64 = query_scalar(
-            "SELECT COUNT(*) FROM information_schema.TABLES
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-        )
-        .bind(&db.settings.database)
-        .bind(table)
-        .fetch_one(&db.pool)
-        .await
-        .map_err(|error| format!("check retired table {table}: {error}"))?;
-        if current_count != 0 {
-            return Err(format!("retired table {table} survived migration"));
-        }
-    }
-
-    for archive in [
-        "session_state_revisions_legacy_v1",
-        "session_history_chunks_legacy_v1",
-        "session_artifacts_grants_legacy_v1",
-    ] {
-        let archive_count: i64 = query_scalar(
-            "SELECT COUNT(*) FROM information_schema.TABLES
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-        )
-        .bind(&db.settings.database)
-        .bind(archive)
-        .fetch_one(&db.pool)
-        .await
-        .map_err(|error| format!("check retired projection archive {archive}: {error}"))?;
-        if archive_count != 0 {
-            return Err(format!(
-                "retired projection archive {archive} unexpectedly exists"
-            ));
-        }
-    }
-
-    ensure_core_schema(&db.settings, "mysql")
-        .await
-        .map_err(|error| format!("repeat retired session projection migration: {error}"))?;
-    Ok(())
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_pending_dispatch_schema_upgrade_preserves_terminal_rows_and_rejects_active_rows() {
@@ -1050,13 +966,4 @@ async fn legacy_memoria_identity_schema_upgrade_migrates_rows_and_drops_source_t
     let result = assert_legacy_memoria_identity_migration(&db).await;
     db.cleanup().await;
     result.expect("legacy Memoria identity schema upgrade");
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn retired_session_projection_schema_upgrade_drops_legacy_tables() {
-    let db = IsolatedDatabase::new().await;
-    let result = assert_retired_session_projection_migration(&db).await;
-    db.cleanup().await;
-    result.expect("retired session projection schema upgrade");
 }

@@ -965,11 +965,15 @@ fn char_literal() { let slash = '/'; }
         storage = (schema_inventory.REPO_ROOT / "crates/services/src/storage.rs").read_text(
             encoding="utf-8"
         )
-        self.assertIn("retire_unused_session_projection_tables", storage)
         for table in retired:
             self.assertNotIn(
                 f"CREATE TABLE IF NOT EXISTS {table}",
                 storage,
+            )
+            self.assertNotIn(
+                f"DROP TABLE IF EXISTS {table}",
+                storage,
+                "retired projections have no compatibility cleanup path",
             )
 
     def test_p1_5_consolidation_reviews_are_evidence_backed(self) -> None:
@@ -1058,7 +1062,6 @@ fn char_literal() { let slash = '/'; }
             ],
             "crates/services/src/storage.rs": [
                 "retire_auth_memoria_identities",
-                "retire_unused_session_projection_tables",
                 "DROP TABLE IF EXISTS auth_memoria_identities",
                 "preview_template_registry",
                 "raw_ref_scheme_registry",

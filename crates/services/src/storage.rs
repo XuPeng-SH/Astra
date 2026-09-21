@@ -2350,45 +2350,6 @@ async fn retire_session_deletion_tombstones(
     Ok(())
 }
 
-/// Retire state-projection tables whose supported runtime owners were removed.
-///
-/// These tables are intentionally handled only while moving to a new schema
-/// contract. The current contract has no reader or writer for them, and their
-/// rows cannot be losslessly converted into an authoritative current table.
-/// Drop both empty and populated instances explicitly: retaining a renamed
-/// archive would let session-owned rows escape the normal owner/session hard
-/// delete boundary.
-async fn retire_unused_session_projection_tables(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    for table in [
-        "session_state_revisions",
-        "session_history_chunks",
-        "session_artifacts_grants",
-    ] {
-        if !table_exists(pool, database, table).await? {
-            continue;
-        }
-
-        let table_sql = crate::snapshot_sql::quote_mysql_identifier(table);
-        let has_rows = query(&format!("SELECT 1 FROM {table_sql} LIMIT 1"))
-            .fetch_optional(pool)
-            .await?
-            .is_some();
-
-        query(&format!("DROP TABLE IF EXISTS {table_sql}"))
-            .execute(pool)
-            .await?;
-        tracing::info!(
-            retired_table = table,
-            retired_rows_present = has_rows,
-            "retired obsolete session projection table from the current contract"
-        );
-    }
-    Ok(())
-}
-
 /// The current admission protocol stores materialized usage beside the
 /// durable gate. `CREATE TABLE IF NOT EXISTS` cannot add those columns to a
 /// database created by an older contract, and this branch intentionally has
@@ -4197,7 +4158,6 @@ async fn ensure_core_schema_while_leased(
     // them before table-specific shape checks run so every persistence path
     // observes the same principal contract during startup.
     migrate_user_identity_column_widths(&pool, &settings.database).await?;
-    retire_unused_session_projection_tables(&pool, &settings.database).await?;
 
     // The executor observes the exact CREATE TABLE statements that bootstrap
     // executes. This makes DDL the declaration and the ownership catalog its

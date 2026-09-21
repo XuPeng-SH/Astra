@@ -1928,8 +1928,8 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "continues to compare the request hash with the freshly derived revision"
         ),
         migration_backfill=(
-            "v87 explicitly retires and drops the obsolete table during contract upgrade; no "
-            "lossy row conversion is attempted because no runtime reader consumes these snapshots"
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "write-only projection"
         ),
         rollback=(
             "rollback requires explicitly restoring the retired persistence path; the endpoint's "
@@ -1938,7 +1938,6 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         test_evidence=[
             "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
             "crates/runtime/src/server/session/session_handlers.rs::get_session_state_handler",
-            "crates/services/src/storage.rs::retire_unused_session_projection_tables",
         ],
         rationale=(
             "the table was write-only state projection baggage: every hydration paid an UPDATE/INSERT "
@@ -1959,18 +1958,17 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "behavior; obsolete chunk-only rows are not part of the supported history API"
         ),
         migration_backfill=(
-            "v87 explicitly retires and drops the obsolete table during contract upgrade; no "
-            "lossy conversion into transcript rows is attempted"
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "secondary history projection"
         ),
         rollback=(
-            "rollback requires reintroducing the chunk reader and schema; retired rows are available "
-            "only if an external export was made before the clean-contract upgrade"
+            "rollback requires reintroducing the chunk reader and schema; that unsupported path is "
+            "not part of the current contract"
         ),
         test_evidence=[
             "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
             "crates/runtime/src/server/tool_session_history.rs::history_search",
             "crates/runtime/src/server/tool_session_history.rs::session_history_tools_filter_child_agent_rows_on_matrixone",
-            "crates/services/src/storage.rs::retire_unused_session_projection_tables",
         ],
         rationale=(
             "the chunk projection had a production reader but no production population path; it added a "
@@ -1991,8 +1989,8 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "retrieval paths; the unexposed grant-only cross-run feature is retired"
         ),
         migration_backfill=(
-            "v87 explicitly retires and drops the obsolete table during contract upgrade; grant "
-            "records are not silently converted into artifact content"
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "grant-only projection"
         ),
         rollback=(
             "rollback requires a deliberate grant API, writer, revocation semantics, and enforcement path; "
@@ -2001,7 +1999,6 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         test_evidence=[
             "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
             "crates/services/src/state_projection.rs::DatabaseStateProjectionStore",
-            "crates/services/src/storage.rs::retire_unused_session_projection_tables",
         ],
         rationale=(
             "this was an overdesigned control-plane table with an enforcement reader but no production grant "
