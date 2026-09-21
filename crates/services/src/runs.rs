@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Executor, MySql, Row};
+use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -1580,6 +1580,9 @@ pub struct DurableRunInteractionAttachmentGuard {
 pub struct RecoveryClaim {
     pub run: DurableRunRecord,
     pub claimed_from_generation: u64,
+    /// Whether the canonical checkpoint history contains the newest valid
+    /// graceful resume checkpoint for this claimed run.
+    pub has_graceful_resume_checkpoint: bool,
 }
 
 /// The immutable checkpoint associated with one recovery ownership transition.
@@ -6867,7 +6870,7 @@ fn session_execution_slot_owner_reclaimable(
         && slot_is_stale
 }
 
-fn checkpoint_metadata(
+pub(crate) fn checkpoint_metadata(
     run_id: &str,
     checkpoint_json: &str,
 ) -> Result<(String, String, String), String> {
@@ -6925,6 +6928,13 @@ fn checkpoint_metadata(
             format!("checkpoint:{run_id}:{checkpoint_kind}:{hash}")
         });
     Ok((checkpoint_kind, checkpoint_version, idempotency_key))
+}
+
+pub fn is_graceful_resume_checkpoint(checkpoint_version: &str, checkpoint_json: &str) -> bool {
+    matches!(
+        checkpoint_metadata("recovery", checkpoint_json),
+        Ok((kind, version, _)) if kind == "resume" && version == checkpoint_version
+    )
 }
 
 fn checkpoint_write_is_authorized(
@@ -10054,8 +10064,27 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         let checkpoints = self.checkpoints.read().await;
         let mut claim_events = std::collections::HashMap::new();
+        let mut graceful_resume = std::collections::HashMap::new();
         for (_, _, run_id, _) in &candidates {
             let run = &runs[run_id];
+            let available = checkpoints
+                .get(run_id)
+                .and_then(|rows| {
+                    rows.iter()
+                        .filter(|checkpoint| checkpoint.checkpoint_kind == "resume")
+                        .max_by(|left, right| {
+                            left.created_at
+                                .cmp(&right.created_at)
+                                .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
+                        })
+                })
+                .is_some_and(|checkpoint| {
+                    is_graceful_resume_checkpoint(
+                        &checkpoint.checkpoint_version,
+                        &checkpoint.checkpoint_json,
+                    )
+                });
+            graceful_resume.insert(run_id.clone(), available);
             if let Some(identity) = execution_handoff_checkpoint_identity(run)?
                 && let Some(checkpoint) = checkpoints
                     .get(run_id)
@@ -10086,6 +10115,9 @@ impl RunStateStore for InMemoryRunStateStore {
                 claimed.push(RecoveryClaim {
                     run: run.clone(),
                     claimed_from_generation: generation,
+                    has_graceful_resume_checkpoint: graceful_resume
+                        .remove(&run_id)
+                        .unwrap_or(false),
                 });
             }
         }
@@ -10556,6 +10588,76 @@ const RUN_STATUS_BINDING_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM
 const RUN_STATUS_ACCOUNTING_SELECT_SQL: &str = "SELECT payload_json FROM agent_run_events
      WHERE user_id = ? AND run_id = ? AND event_type = ?
      ORDER BY event_idx DESC LIMIT 1";
+
+async fn attach_graceful_resume_checkpoint_flags(
+    tx: &mut Transaction<'_, MySql>,
+    claims: &mut [RecoveryClaim],
+) -> Result<(), String> {
+    let claim_keys = claims
+        .iter()
+        .map(|claim| (&claim.run.user_id, &claim.run.run_id))
+        .collect::<Vec<_>>();
+    if claims.is_empty() {
+        return Ok(());
+    }
+
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT checkpoint.user_id, checkpoint.run_id,
+                checkpoint.checkpoint_version, checkpoint.checkpoint_json
+         FROM run_checkpoints AS checkpoint
+         WHERE checkpoint.checkpoint_kind = 'resume' AND (",
+    );
+    for (index, (user_id, run_id)) in claim_keys.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(checkpoint.user_id = ")
+            .push_bind(*user_id)
+            .push(" AND checkpoint.run_id = ")
+            .push_bind(*run_id)
+            .push(")");
+    }
+    query.push(
+        ") AND NOT EXISTS (
+             SELECT 1
+             FROM run_checkpoints AS newer
+             WHERE newer.user_id = checkpoint.user_id
+               AND newer.run_id = checkpoint.run_id
+               AND newer.checkpoint_kind = 'resume'
+               AND (newer.created_at > checkpoint.created_at
+                    OR (newer.created_at = checkpoint.created_at
+                        AND newer.checkpoint_id > checkpoint.checkpoint_id))
+         )",
+    );
+    let rows = query
+        .build()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| format!("load latest resume checkpoints for recovery: {error}"))?;
+    for row in rows {
+        let user_id: String = row
+            .try_get("user_id")
+            .map_err(|error| format!("decode resume checkpoint user: {error}"))?;
+        let run_id: String = row
+            .try_get("run_id")
+            .map_err(|error| format!("decode resume checkpoint run: {error}"))?;
+        let checkpoint_version: String = row
+            .try_get("checkpoint_version")
+            .map_err(|error| format!("decode resume checkpoint version: {error}"))?;
+        let checkpoint_json: String = row
+            .try_get("checkpoint_json")
+            .map_err(|error| format!("decode resume checkpoint payload: {error}"))?;
+        if let Some(claim) = claims
+            .iter_mut()
+            .find(|claim| claim.run.user_id == user_id && claim.run.run_id == run_id)
+        {
+            claim.has_graceful_resume_checkpoint =
+                is_graceful_resume_checkpoint(&checkpoint_version, &checkpoint_json);
+        }
+    }
+    Ok(())
+}
 
 impl DatabaseRunStateStore {
     #[allow(clippy::too_many_arguments)]
@@ -13737,10 +13839,10 @@ impl DatabaseRunStateStore {
             })?;
         let mut candidates = candidates;
         candidates.sort_by(|left, right| {
-            (&left.user_id, &left.session_id, &left.run_id).cmp(&(
+            (&left.user_id, &left.run_id, &left.session_id).cmp(&(
                 &right.user_id,
-                &right.session_id,
                 &right.run_id,
+                &right.session_id,
             ))
         });
         let mut locked_candidates = Vec::with_capacity(candidates.len());
@@ -13878,10 +13980,10 @@ impl DatabaseRunStateStore {
             .map(|run| {
                 let previous = candidates
                     .binary_search_by(|candidate| {
-                        (&candidate.user_id, &candidate.session_id, &candidate.run_id).cmp(&(
+                        (&candidate.user_id, &candidate.run_id, &candidate.session_id).cmp(&(
                             &run.user_id,
-                            &run.session_id,
                             &run.run_id,
+                            &run.session_id,
                         ))
                     })
                     .ok()
@@ -13890,9 +13992,11 @@ impl DatabaseRunStateStore {
                 Ok(RecoveryClaim {
                     claimed_from_generation: previous.run_generation,
                     run,
+                    has_graceful_resume_checkpoint: false,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        attach_graceful_resume_checkpoint_flags(&mut tx, &mut records).await?;
         for receipt in &mut records {
             let run = &mut receipt.run;
             let Some(identity) = execution_handoff_checkpoint_identity(run)? else {
