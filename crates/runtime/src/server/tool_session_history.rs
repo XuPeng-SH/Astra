@@ -34,11 +34,6 @@ const ROOT_CONVERSATION_TRANSCRIPT_JOIN: &str = " LEFT JOIN agent_runs ON agent_
 
 const ROOT_CONVERSATION_TRANSCRIPT_FILTER: &str = " AND (session_transcript_items.run_id IS NULL OR (agent_runs.run_id IS NOT NULL AND agent_runs.parent_run_id IS NULL))";
 
-const ROOT_CONVERSATION_CHUNK_JOIN: &str = " LEFT JOIN agent_runs ON session_history_chunks.source_table = 'agent_runs' AND agent_runs.user_id = session_history_chunks.user_id AND agent_runs.session_id = session_history_chunks.session_id AND agent_runs.run_id = session_history_chunks.source_id";
-
-const ROOT_CONVERSATION_CHUNK_FILTER: &str =
-    " AND (agent_runs.run_id IS NULL OR agent_runs.parent_run_id IS NULL)";
-
 fn json_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
@@ -251,84 +246,6 @@ async fn query_session_history_rows(
     Ok(out)
 }
 
-async fn query_session_history_chunk_rows(
-    context: &SessionHistoryContext<'_>,
-    query_text: &str,
-    limit: usize,
-) -> Result<Vec<SessionHistoryRow>, sqlx::Error> {
-    let Some(pool) = context.pool else {
-        return Ok(Vec::new());
-    };
-
-    let mut patterns = vec![format!("%{}%", query_text.trim())];
-    for token in query_text
-        .split(|ch: char| ch.is_whitespace() || ",.;:!?()[]{}\"'`/\\|".contains(ch))
-        .filter(|token| token.chars().count() >= 2)
-        .take(4)
-    {
-        patterns.push(format!("%{token}%"));
-    }
-    patterns.sort();
-    patterns.dedup();
-
-    let mut sql = String::from(
-        "SELECT session_history_chunks.chunk_type, session_history_chunks.source_id, \
-                session_history_chunks.content_text, \
-                COALESCE(session_history_chunks.item_seq_start, session_history_chunks.seq_start) AS item_seq, \
-                DATE_FORMAT(session_history_chunks.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-         FROM session_history_chunks",
-    );
-    sql.push_str(ROOT_CONVERSATION_CHUNK_JOIN);
-    sql.push_str(
-        " WHERE session_history_chunks.user_id = ? AND session_history_chunks.session_id = ?",
-    );
-    sql.push_str(ROOT_CONVERSATION_CHUNK_FILTER);
-    sql.push_str(" AND (");
-    for idx in 0..patterns.len() {
-        if idx > 0 {
-            sql.push_str(" OR ");
-        }
-        sql.push_str("content_text LIKE ?");
-    }
-    sql.push_str(&format!(
-        ") ORDER BY created_at DESC LIMIT {}",
-        limit.max(1)
-    ));
-
-    let mut query = sqlx::query(&sql)
-        .bind(context.user_id)
-        .bind(context.session_id);
-    for pattern in patterns {
-        query = query.bind(pattern);
-    }
-
-    let rows = query.fetch_all(pool.get()).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let content: String = row.try_get("content_text")?;
-        if content.trim().is_empty() {
-            continue;
-        }
-        let chunk_type: String = row.try_get("chunk_type")?;
-        out.push(SessionHistoryRow {
-            item_seq: row.try_get("item_seq")?,
-            source: "history_chunk".to_string(),
-            role: chunk_type,
-            content,
-            run_id: row.try_get::<Option<String>, _>("source_id")
-                .inspect_err(|e| tracing::warn!(column="source_id", session_id=%context.session_id, error=%e, "session_history: column type mismatch"))
-                .ok()
-                .flatten(),
-            created_at: row
-                .try_get::<Option<String>, _>("created_at")
-                .inspect_err(|e| tracing::warn!(column="created_at", session_id=%context.session_id, error=%e, "session_history: column type mismatch"))
-                .ok()
-                .flatten(),
-        });
-    }
-    Ok(out)
-}
-
 pub(crate) async fn history_page(
     context: SessionHistoryContext<'_>,
     args: &Value,
@@ -412,26 +329,6 @@ pub(crate) async fn history_search(
     };
 
     let scanned = rows.len();
-    let chunk_rows = if role.is_none() {
-        match query_session_history_chunk_rows(&context, pattern, limit.saturating_mul(4).max(20))
-            .await
-        {
-            Ok(chunk_rows) => chunk_rows,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::session_history",
-                    session_id = %context.session_id,
-                    error = %error,
-                    "failed to query session_history_chunks during history search"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    let chunk_candidates = chunk_rows.len();
-    rows.extend(chunk_rows);
     rows.retain(|row| session_history_match_score(pattern, &row.content) > 0);
     rows.sort_by(|left, right| {
         let right_score = session_history_match_score(pattern, &right.content);
@@ -446,7 +343,7 @@ pub(crate) async fn history_search(
         "session_history_search",
         &rows,
         Some(format!(
-            "pattern={pattern:?} scanned_transcript_rows={scanned} chunk_candidates={chunk_candidates}; call session_history_around(item_seq=<seq>) to inspect exact surrounding turns"
+            "pattern={pattern:?} scanned_transcript_rows={scanned}; call session_history_around(item_seq=<seq>) to inspect exact surrounding turns"
         )),
     ))
 }
@@ -584,40 +481,6 @@ mod tests {
             .await
             .expect("insert transcript row");
         }
-        for (chunk_id, source_table, source_id, content) in [
-            ("root-chunk", "agent_runs", &root_run, "root chunk keep"),
-            ("child-chunk", "agent_runs", &child_run, "child chunk leak"),
-            (
-                "non-run-chunk",
-                "runtime_messages",
-                &session_id,
-                "non run chunk keep",
-            ),
-            (
-                "non-run-collision",
-                "runtime_messages",
-                &child_run,
-                "non run collision chunk keep",
-            ),
-        ] {
-            sqlx::query(
-                "INSERT INTO session_history_chunks
-                 (chunk_id, user_id, session_id, seq_start, seq_end, chunk_type,
-                  source_table, source_id, content_text, content_hash, token_estimate)
-                 VALUES (?, ?, ?, 1, 3, 'summary', ?, ?, ?, ?, 1)",
-            )
-            .bind(format!("{chunk_id}-{}", uuid::Uuid::new_v4()))
-            .bind(&user_id)
-            .bind(&session_id)
-            .bind(source_table)
-            .bind(source_id)
-            .bind(content)
-            .bind(format!("hash-{chunk_id}"))
-            .execute(pool.get())
-            .await
-            .expect("insert history chunk");
-        }
-
         let result = history_page(
             context(&user_id, &session_id, Some(&pool)),
             &json!({"order": "asc", "limit": 10}),
@@ -633,19 +496,15 @@ mod tests {
 
         let search = history_search(
             context(&user_id, &session_id, Some(&pool)),
-            &json!({"pattern": "chunk", "limit": 10, "scan_limit": 50}),
+            &json!({"pattern": "root", "limit": 10, "scan_limit": 50}),
         )
         .await
         .output;
-        assert!(search.contains("root chunk keep"), "{search}");
-        assert!(search.contains("non run chunk keep"), "{search}");
+        assert!(search.contains("root user request"), "{search}");
+        assert!(search.contains("root assistant answer"), "{search}");
         assert!(
-            search.contains("non run collision chunk keep"),
-            "non-run chunk source_id collisions must not be filtered as child runs: {search}"
-        );
-        assert!(
-            !search.contains("child chunk leak"),
-            "child run chunk leaked into session history search: {search}"
+            !search.contains("child agent private answer"),
+            "child transcript row leaked into session history search: {search}"
         );
 
         let around = history_around(

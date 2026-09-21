@@ -819,6 +819,7 @@ async fn handle_chat_message(
     };
     request.session_id = resolved.session_id;
     request.full_llm_capture = resolved.full_llm_capture;
+    request.session_admission_facts = resolved.session_admission_facts;
     if let Err((status, err)) = inject_ws_effective_runtime_context(state, conn, &mut request).await
     {
         send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
@@ -1271,6 +1272,7 @@ fn build_ws_chat_request(
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id,
+        session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,
         full_llm_capture: false,

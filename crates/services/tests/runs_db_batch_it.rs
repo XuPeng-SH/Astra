@@ -6,6 +6,7 @@
 mod common;
 
 use astra_core::SharedPool;
+use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunRecord, RunStateStore, ToolOutputBatchItem,
 };
@@ -1157,6 +1158,232 @@ async fn concurrent_append_no_event_idx_gaps() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
+}
+
+/// Run creation admits the session and execution slot under one lock order.
+/// Two different run identities may race, but only one can commit a blocking
+/// run for the session; the losing transaction must roll back its run row and
+/// retain the first transaction's lifecycle fence.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn concurrent_run_inserts_share_one_session_slot() {
+    let (pool, store) = setup().await;
+    let user_id = format!("run-admission-user-{}", uuid::Uuid::new_v4());
+    let session_id = format!("run-admission-session-{}", uuid::Uuid::new_v4());
+    let run_a = format!("run-admission-a-{}", uuid::Uuid::new_v4());
+    let run_b = format!("run-admission-b-{}", uuid::Uuid::new_v4());
+
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (user_id, session_id, status, created_at, updated_at, last_active_at)
+         VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .expect("insert concurrent run admission session");
+
+    let mut record_a = durable_run_record(run_a, user_id.clone(), session_id.clone());
+    let mut record_b = durable_run_record(run_b, user_id.clone(), session_id.clone());
+    record_a.agent_id = None;
+    record_b.agent_id = None;
+    let store_a = store.clone();
+    let store_b = store.clone();
+    let (result_a, result_b) =
+        tokio::join!(store_a.insert_run(record_a), store_b.insert_run(record_b),);
+    assert_eq!(
+        [result_a.as_ref(), result_b.as_ref()]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "exactly one run may win the session slot: {result_a:?}; {result_b:?}"
+    );
+
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .fetch_one(pool.get())
+            .await
+            .expect("count admitted runs");
+    assert_eq!(
+        run_count, 1,
+        "the losing transaction must roll back its run"
+    );
+
+    let slot_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_execution_slots
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count session execution slots");
+    assert_eq!(slot_count, 1, "one durable slot must own the winning run");
+
+    let fence_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count session lifecycle fences");
+    assert_eq!(fence_count, 1, "the first admission must create one fence");
+
+    for table in [
+        "run_display_projections",
+        "agent_run_events",
+        "agent_session_execution_slots",
+        "agent_runs",
+        "agent_session_lifecycle_fences",
+        "agent_sessions",
+    ] {
+        let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
+        sqlx::query(&statement)
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
+    }
+}
+
+/// A failed admission must not leave behind the lifecycle fence that it
+/// inserted before discovering that the session does not exist.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn failed_run_admission_rolls_back_a_new_lifecycle_fence() {
+    let (pool, store) = setup().await;
+    let user_id = format!("run-admission-rollback-user-{}", uuid::Uuid::new_v4());
+    let session_id = format!("run-admission-rollback-session-{}", uuid::Uuid::new_v4());
+    let run_id = format!("run-admission-rollback-run-{}", uuid::Uuid::new_v4());
+
+    let error = store
+        .insert_run(durable_run_record(
+            run_id,
+            user_id.clone(),
+            session_id.clone(),
+        ))
+        .await
+        .expect_err("a missing session must fail run admission");
+    assert_eq!(error, "session is not active");
+
+    let fence_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count rolled-back lifecycle fences");
+    assert_eq!(
+        fence_count, 0,
+        "failed admission must roll back its new fence"
+    );
+}
+
+/// The lifecycle fence must serialize deletion with run admission. Regardless
+/// of which transaction wins the first lock, a completed deletion may not
+/// leave an admitted run, slot, or display projection behind.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn session_deletion_competes_safely_with_run_admission() {
+    let (pool, store) = setup().await;
+    let settings = astra_core::MatrixOneSettings::from_env();
+    let user_id = format!("run-admission-delete-user-{}", uuid::Uuid::new_v4());
+    let session_id = format!("delete-session-{}", uuid::Uuid::new_v4());
+    let run_id = format!("run-admission-delete-run-{}", uuid::Uuid::new_v4());
+
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (user_id, session_id, status, created_at, updated_at, last_active_at)
+         VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .expect("insert deletion race session");
+
+    let delete_service = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    let delete_user_id = user_id.clone();
+    let delete_session_id = session_id.clone();
+    let delete_task = tokio::spawn(async move {
+        delete_service
+            .delete_session(delete_session_id, delete_user_id)
+            .await
+    });
+    let insert_store = store.clone();
+    let insert_user_id = user_id.clone();
+    let insert_session_id = session_id.clone();
+    let insert_run_id = run_id.clone();
+    let insert_task = tokio::spawn(async move {
+        let mut record = durable_run_record(insert_run_id, insert_user_id, insert_session_id);
+        record.agent_id = None;
+        insert_store.insert_run(record).await
+    });
+    let (delete_result, insert_result) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(delete_task, insert_task)
+    })
+    .await
+    .expect("deletion and admission must not deadlock");
+    delete_result
+        .expect("deletion task join")
+        .expect("session deletion must complete");
+    let _ = insert_result.expect("run admission task join");
+
+    for (table, predicate) in [
+        (
+            "agent_runs",
+            "user_id = ? AND session_id = ? AND run_id = ?",
+        ),
+        (
+            "agent_run_events",
+            "user_id = ? AND session_id = ? AND run_id = ?",
+        ),
+        (
+            "run_display_projections",
+            "user_id = ? AND session_id = ? AND run_id = ?",
+        ),
+    ] {
+        let statement = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
+        let count: i64 = sqlx::query_scalar(&statement)
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(&run_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap_or_else(|error| panic!("count {table} after deletion race: {error}"));
+        assert_eq!(count, 0, "deleted session must not retain rows in {table}");
+    }
+    let session_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count deleted session root");
+    assert_eq!(session_count, 0, "session deletion must remove the root");
+
+    for table in [
+        "agent_session_execution_slots",
+        "agent_session_lifecycle_fences",
+    ] {
+        let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
+        sqlx::query(&statement)
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
+    }
 }
 
 /// Large batch: 50 events in a single `append_events_batch` must all be stored

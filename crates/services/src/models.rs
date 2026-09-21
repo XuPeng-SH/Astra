@@ -1828,24 +1828,29 @@ pub async fn revalidate_admitted_model_execution(
 /// Shared eligibility gate for catalog and execution, including resumed runs.
 /// Memoria identities are personal BYOK even on a self-hosted deployment.
 async fn deployment_models_allowed(pool: &sqlx::MySqlPool, user_id: &str) -> Result<bool, String> {
-    let mode = std::env::var("ASTRA_DEPLOYMENT_MODE")
-        .map(Some)
-        .or_else(|error| match error {
-            std::env::VarError::NotPresent => Ok(None),
-            _ => Err("Invalid ASTRA_DEPLOYMENT_MODE".to_string()),
-        })?;
+    let mode = configured_deployment_mode()?;
     if !deployment_mode_allows_shared_models(mode.as_deref())? {
         return Ok(false);
     }
     let mapped: Option<String> = sqlx::query_scalar(
-        "SELECT external_subject FROM auth_external_identities WHERE astra_user_id = ? AND (provider_id LIKE 'memoria:%' OR provider_id LIKE 'uc:%') UNION ALL SELECT memoria_user_id FROM auth_memoria_identities WHERE astra_user_id = ? LIMIT 1",
+        "SELECT external_subject FROM auth_external_identities
+         WHERE astra_user_id = ? AND (provider_id LIKE 'memoria:%' OR provider_id LIKE 'uc:%')
+         LIMIT 1",
     )
-    .bind(user_id)
     .bind(user_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| format!("Model ownership lookup failed: {error}"))?;
     Ok(mapped.is_none())
+}
+
+fn configured_deployment_mode() -> Result<Option<String>, String> {
+    std::env::var("ASTRA_DEPLOYMENT_MODE")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            _ => Err("Invalid ASTRA_DEPLOYMENT_MODE".to_string()),
+        })
 }
 
 fn deployment_mode_allows_shared_models(mode: Option<&str>) -> Result<bool, String> {
@@ -2451,6 +2456,51 @@ pub trait ModelService: Send + Sync {
     ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
         read_user_model_catalog(self, user_id).await
     }
+
+    /// Resolve only the effective Chat default. Implementations may use a
+    /// targeted query instead of materializing the complete catalog; the
+    /// returned Offering is still revalidated by `admit_model_offering`
+    /// immediately before provider I/O.
+    async fn default_chat_model_offering_id(
+        &self,
+        user_id: String,
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        let catalog = self.user_model_catalog(user_id).await?;
+        let offerings = model_catalog_for_purpose(
+            catalog.items,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        );
+        let declared = server_model_access_declarations(
+            catalog.allows_deployment,
+            offerings.iter().map(|item| item.access_kind),
+        );
+        let user_default = catalog
+            .default_offering_id
+            .map(|offering_id| ModelDefaultCandidate {
+                offering_id,
+                source: ModelDefaultSource::Astra,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            });
+        let offering_views = offerings
+            .into_iter()
+            .map(ModelListItemResponse::from)
+            .collect::<Vec<_>>();
+        project_model_access_with_default(
+            declared,
+            offering_views,
+            user_default,
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .map(|projection| projection.default_offering_id)
+        .map_err(|error| {
+            tracing::error!(error = %error, "Server Model Access default resolution is invalid");
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server default model policy is unavailable",
+                "model_default_unavailable",
+            )
+        })
+    }
     /// Credential-free preflight. This is not authorization for later requests.
     async fn validate_user_model_endpoint(
         &self,
@@ -2634,6 +2684,16 @@ struct CatalogRevisionFingerprint {
     total: i64,
     min_updated_at: Option<String>,
     max_updated_at: Option<String>,
+}
+
+#[derive(Debug)]
+struct ChatDefaultCandidateRow {
+    offering_id: String,
+    model_name: String,
+    provider: String,
+    is_default: bool,
+    is_user_model: bool,
+    updated_at: String,
 }
 
 /// Parse a required JSON column without degrading malformed persisted data to defaults.
@@ -2829,6 +2889,121 @@ impl DatabaseModelService {
         .await
         .map_err(internal_error)
     }
+
+    /// Materialize the effective server catalog after the caller has already
+    /// established deployment eligibility for this request. The eligibility
+    /// result is intentionally passed in, rather than cached: identity
+    /// revocation must remain visible at every admission boundary while a
+    /// single catalog read must not repeat the same authorization lookup.
+    async fn list_models_with_deployment_access(
+        &self,
+        user_id: String,
+        is_admin: bool,
+        deployment_allowed: bool,
+    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+
+        let sql = if is_admin {
+            format!(
+                "SELECT {} FROM infra_llm_models ORDER BY provider, model_name, model_id",
+                MODEL_LIST_SELECT_COLS
+            )
+        } else {
+            format!(
+                "SELECT {} FROM infra_llm_models WHERE is_active = 1 ORDER BY provider, model_name, model_id",
+                MODEL_LIST_SELECT_COLS
+            )
+        };
+        let rows = if is_admin || deployment_allowed {
+            query(&sql).fetch_all(&pool).await.map_err(internal_error)?
+        } else {
+            Vec::new()
+        };
+
+        let mut models = Vec::with_capacity(rows.len());
+        for row in rows {
+            let is_active_int: i16 = row.try_get("is_active").map_err(internal_error)?;
+            let name: String = row.try_get("model_name").map_err(internal_error)?;
+            let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
+            let context_window =
+                model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
+            models.push(ModelListItem {
+                offering_id: row.try_get("model_id").map_err(internal_error)?,
+                access_id: "self-hosted".to_string(),
+                access_kind: ModelAccessKind::SelfHosted,
+                access_label: "Self-hosted".to_string(),
+                execution_placement: ModelExecutionPlacement::Server,
+                name,
+                provider: row.try_get("provider").map_err(internal_error)?,
+                description: row.try_get("description").map_err(internal_error)?,
+                is_active: is_active_int != 0,
+                context_window,
+                max_completion_tokens: row
+                    .try_get("max_completion_tokens")
+                    .map_err(internal_error)?,
+                architecture: row.try_get("architecture").map_err(internal_error)?,
+                thinking_capability: {
+                    let cap_str: Option<String> =
+                        row.try_get("thinking_capability").map_err(internal_error)?;
+                    ThinkingCapability::try_from_db_column(cap_str.as_deref())
+                        .map_err(internal_error)?
+                },
+            });
+        }
+        if !is_admin && !user_id.is_empty() {
+            let user_rows = query(&format!(
+                "SELECT {USER_MODEL_SELECT_COLS} \
+                 FROM user_llm_models WHERE user_id = ? AND is_active = 1 \
+                 ORDER BY provider, model_alias, model_id",
+            ))
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+            for row in user_rows {
+                let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
+                let thinking_capability = Self::user_model_record_from_row(&row)?
+                    .thinking_probe
+                    .filter(|result| {
+                        result.error.is_none() || result.capability != ThinkingCapability::None
+                    })
+                    .map(|result| result.capability);
+                models.push(ModelListItem {
+                    offering_id: row.try_get("model_id").map_err(internal_error)?,
+                    access_id: "cloud-byok".to_string(),
+                    access_kind: ModelAccessKind::CloudByok,
+                    access_label: "Cloud BYOK".to_string(),
+                    execution_placement: ModelExecutionPlacement::Server,
+                    name: row.try_get("model_alias").map_err(internal_error)?,
+                    provider: row.try_get("provider").map_err(internal_error)?,
+                    description: Some("Personal BYOK model".to_string()),
+                    is_active: is_active != 0,
+                    context_window: row.try_get("context_window").map_err(internal_error)?,
+                    max_completion_tokens: None,
+                    architecture: None,
+                    thinking_capability,
+                });
+            }
+        }
+        sort_model_list_items(&mut models);
+        Ok(models)
+    }
+
+    async fn default_user_model_offering_id_from_rows(
+        &self,
+        user_id: String,
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        query_scalar(
+            "SELECT model_id FROM user_llm_models \
+             WHERE user_id = ? AND is_default = 1 AND is_active = 1 \
+             ORDER BY updated_at DESC, model_id ASC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)
+    }
 }
 
 pub const MODEL_SELECT_COLS: &str = "\
@@ -2865,6 +3040,172 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)
     }
+
+    async fn user_model_catalog(
+        &self,
+        user_id: String,
+    ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            let catalog = self.genesis_catalog(&subject).await?;
+            return Ok(UserModelCatalog {
+                items: catalog.items,
+                default_offering_id: catalog.default_offering_id,
+                allows_deployment: false,
+            });
+        }
+
+        // `list_models` historically performed this lookup internally, and
+        // the generic catalog builder then asked for it again. Keep one
+        // request-local authorization fact for the two catalog components;
+        // execution admission still revalidates independently later.
+        let allows_deployment = self.allows_deployment_models(user_id.clone()).await?;
+        let items = self
+            .list_models_with_deployment_access(user_id.clone(), false, allows_deployment)
+            .await?;
+        Ok(UserModelCatalog {
+            items,
+            // UC identity was already checked above. Reuse that branch fact
+            // so the non-UC row lookup does not repeat the identity query.
+            default_offering_id: self
+                .default_user_model_offering_id_from_rows(user_id)
+                .await?,
+            allows_deployment,
+        })
+    }
+
+    async fn default_chat_model_offering_id(
+        &self,
+        user_id: String,
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            let catalog = self.genesis_catalog(&subject).await?;
+            return Ok(catalog
+                .default_offering_id
+                .or_else(|| {
+                    catalog
+                        .items
+                        .into_iter()
+                        .find(|item| {
+                            astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+                                .supported_by(&item.provider)
+                        })
+                        .map(|item| item.offering_id)
+                })
+                .filter(|offering_id| validate_model_offering_id(offering_id).is_ok()));
+        }
+
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let deployment_allowed = deployment_models_allowed(&pool, &user_id)
+            .await
+            .map_err(internal_error)?;
+        let candidate_sql = if deployment_allowed {
+            "SELECT offering_id, model_name, provider, is_default, is_user_model, updated_at_text
+             FROM (
+                 SELECT model_id AS offering_id, model_alias AS model_name, provider,
+                        is_default, 1 AS is_user_model,
+                        CAST(updated_at AS CHAR) AS updated_at_text
+                 FROM user_llm_models
+                 WHERE user_id = ? AND is_active = 1
+                 UNION ALL
+                 SELECT model_id AS offering_id, model_name, provider,
+                        0 AS is_default, 0 AS is_user_model,
+                        CAST(updated_at AS CHAR) AS updated_at_text
+                 FROM infra_llm_models
+                 WHERE is_active = 1
+             ) AS candidate_offerings"
+        } else {
+            "SELECT model_id AS offering_id, model_alias AS model_name, provider,
+                    is_default, 1 AS is_user_model,
+                    CAST(updated_at AS CHAR) AS updated_at_text
+             FROM user_llm_models
+             WHERE user_id = ? AND is_active = 1"
+        };
+        let rows = query(candidate_sql)
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                Ok::<_, (StatusCode, Json<ErrorResponse>)>(ChatDefaultCandidateRow {
+                    offering_id: row.try_get("offering_id").map_err(internal_error)?,
+                    model_name: row.try_get("model_name").map_err(internal_error)?,
+                    provider: row.try_get("provider").map_err(internal_error)?,
+                    is_default: row
+                        .try_get::<i64, _>("is_default")
+                        .map_err(internal_error)?
+                        != 0,
+                    is_user_model: row
+                        .try_get::<i64, _>("is_user_model")
+                        .map_err(internal_error)?
+                        != 0,
+                    updated_at: row.try_get("updated_at_text").map_err(internal_error)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let unavailable = || {
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server default model policy is unavailable",
+                "model_default_unavailable",
+            )
+        };
+        let chat = astra_core::model_wire::purpose::ModelRequestPurpose::Chat;
+        let mut effective_ids = BTreeSet::new();
+        let mut effective = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            if !chat.supported_by(&candidate.provider) {
+                continue;
+            }
+            if validate_model_offering_id(&candidate.offering_id).is_err() {
+                tracing::error!(
+                    offering_id = %candidate.offering_id,
+                    "effective Chat catalog contains an invalid Offering identity"
+                );
+                return Err(unavailable());
+            }
+            if !effective_ids.insert(candidate.offering_id.clone()) {
+                tracing::error!(
+                    offering_id = %candidate.offering_id,
+                    "effective Chat catalog contains a duplicate Offering identity"
+                );
+                return Err(unavailable());
+            }
+            effective.push(candidate);
+        }
+
+        // The single candidate statement gives default and fallback rows one
+        // database snapshot. Preserve the old default query's precedence for
+        // malformed data that contains more than one active user default:
+        // newest updated_at wins, then the smallest Offering ID.
+        if let Some(default) = candidates
+            .iter()
+            .filter(|candidate| candidate.is_user_model && candidate.is_default)
+            .max_by(|left, right| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| right.offering_id.cmp(&left.offering_id))
+            })
+        {
+            if !chat.supported_by(&default.provider) {
+                return Ok(None);
+            }
+            return Ok(Some(default.offering_id.clone()));
+        }
+
+        effective.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then_with(|| left.model_name.cmp(&right.model_name))
+                .then_with(|| left.offering_id.cmp(&right.offering_id))
+        });
+        Ok(effective
+            .first()
+            .map(|candidate| candidate.offering_id.clone()))
+    }
+
     async fn validate_user_model_endpoint(
         &self,
         _user_id: String,
@@ -3202,21 +3543,6 @@ impl ModelService for DatabaseModelService {
         self.get_user_model(user_id, model_id).await
     }
 
-    async fn user_model_catalog(
-        &self,
-        user_id: String,
-    ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
-        if let Some(subject) = self.uc_subject(&user_id).await? {
-            let catalog = self.genesis_catalog(&subject).await?;
-            return Ok(UserModelCatalog {
-                items: catalog.items,
-                default_offering_id: catalog.default_offering_id,
-                allows_deployment: false,
-            });
-        }
-        read_user_model_catalog(self, user_id).await
-    }
-
     async fn default_user_model_offering_id(
         &self,
         user_id: String,
@@ -3224,16 +3550,7 @@ impl ModelService for DatabaseModelService {
         if let Some(subject) = self.uc_subject(&user_id).await? {
             return Ok(self.genesis_catalog(&subject).await?.default_offering_id);
         }
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        query_scalar(
-            "SELECT model_id FROM user_llm_models \
-             WHERE user_id = ? AND is_default = 1 AND is_active = 1 \
-             ORDER BY updated_at DESC, model_id ASC LIMIT 1",
-        )
-        .bind(user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)
+        self.default_user_model_offering_id_from_rows(user_id).await
     }
 
     async fn admit_model_offering(
@@ -3389,92 +3706,9 @@ impl ModelService for DatabaseModelService {
         if let Some(subject) = self.uc_subject(&user_id).await? {
             return Ok(self.genesis_catalog(&subject).await?.items);
         }
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let sql = if is_admin {
-            format!(
-                "SELECT {} FROM infra_llm_models ORDER BY provider, model_name, model_id",
-                MODEL_LIST_SELECT_COLS
-            )
-        } else {
-            format!(
-                "SELECT {} FROM infra_llm_models WHERE is_active = 1 ORDER BY provider, model_name, model_id",
-                MODEL_LIST_SELECT_COLS
-            )
-        };
-        let rows = if is_admin || self.allows_deployment_models(user_id.clone()).await? {
-            query(&sql).fetch_all(&pool).await.map_err(internal_error)?
-        } else {
-            Vec::new()
-        };
-
-        let mut models = Vec::with_capacity(rows.len());
-        for row in rows {
-            let is_active_int: i16 = row.try_get("is_active").map_err(internal_error)?;
-            let name: String = row.try_get("model_name").map_err(internal_error)?;
-            let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
-            let context_window =
-                model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
-            models.push(ModelListItem {
-                offering_id: row.try_get("model_id").map_err(internal_error)?,
-                access_id: "self-hosted".to_string(),
-                access_kind: ModelAccessKind::SelfHosted,
-                access_label: "Self-hosted".to_string(),
-                execution_placement: ModelExecutionPlacement::Server,
-                name,
-                provider: row.try_get("provider").map_err(internal_error)?,
-                description: row.try_get("description").map_err(internal_error)?,
-                is_active: is_active_int != 0,
-                context_window,
-                max_completion_tokens: row
-                    .try_get("max_completion_tokens")
-                    .map_err(internal_error)?,
-                architecture: row.try_get("architecture").map_err(internal_error)?,
-                thinking_capability: {
-                    let cap_str: Option<String> =
-                        row.try_get("thinking_capability").map_err(internal_error)?;
-                    ThinkingCapability::try_from_db_column(cap_str.as_deref())
-                        .map_err(internal_error)?
-                },
-            });
-        }
-        if !is_admin && !user_id.is_empty() {
-            let user_rows = query(&format!(
-                "SELECT {USER_MODEL_SELECT_COLS} \
-                 FROM user_llm_models WHERE user_id = ? AND is_active = 1 \
-                 ORDER BY provider, model_alias, model_id",
-            ))
-            .bind(&user_id)
-            .fetch_all(&pool)
+        let deployment_allowed = is_admin || self.allows_deployment_models(user_id.clone()).await?;
+        self.list_models_with_deployment_access(user_id, is_admin, deployment_allowed)
             .await
-            .map_err(internal_error)?;
-            for row in user_rows {
-                let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
-                let thinking_capability = Self::user_model_record_from_row(&row)?
-                    .thinking_probe
-                    .filter(|result| {
-                        result.error.is_none() || result.capability != ThinkingCapability::None
-                    })
-                    .map(|result| result.capability);
-                models.push(ModelListItem {
-                    offering_id: row.try_get("model_id").map_err(internal_error)?,
-                    access_id: "cloud-byok".to_string(),
-                    access_kind: ModelAccessKind::CloudByok,
-                    access_label: "Cloud BYOK".to_string(),
-                    execution_placement: ModelExecutionPlacement::Server,
-                    name: row.try_get("model_alias").map_err(internal_error)?,
-                    provider: row.try_get("provider").map_err(internal_error)?,
-                    description: Some("Personal BYOK model".to_string()),
-                    is_active: is_active != 0,
-                    context_window: row.try_get("context_window").map_err(internal_error)?,
-                    max_completion_tokens: None,
-                    architecture: None,
-                    thinking_capability,
-                });
-            }
-        }
-        sort_model_list_items(&mut models);
-        Ok(models)
     }
 
     async fn list_models_page(

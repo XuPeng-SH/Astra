@@ -619,27 +619,6 @@ pub(crate) async fn get_session_state_handler(
         ));
     }
 
-    persist_session_state_revision(
-        pool,
-        SessionStateRevisionWrite {
-            session_id: &session.session_id,
-            user_id: &session.user_id,
-            monotonic_id: monotonic_id as i64,
-            revision_hash: &revision_hash,
-            device_fingerprint: &device_fingerprint,
-            transcript_high_watermark,
-            run_event_high_watermark,
-            state_projection_hash: &state_projection_hash,
-        },
-    )
-    .await
-    .map_err(|error| {
-        internal_error(format!(
-            "persist session state revision failed for session {}: {error}",
-            session.session_id
-        ))
-    })?;
-
     let cold_start = query.known_state_revision == 0 || query.client_cache_empty;
     let transcript_replay_required = cold_start && transcript_high_watermark > 0;
     let run_event_replay_required = cold_start && run_event_high_watermark > 0;
@@ -3378,84 +3357,6 @@ struct DeviceLeaseRow {
     device_id: String,
     device_fingerprint: String,
     status: String,
-}
-
-struct SessionStateRevisionWrite<'a> {
-    session_id: &'a str,
-    user_id: &'a str,
-    monotonic_id: i64,
-    revision_hash: &'a str,
-    device_fingerprint: &'a str,
-    transcript_high_watermark: i64,
-    run_event_high_watermark: i64,
-    state_projection_hash: &'a str,
-}
-
-async fn persist_session_state_revision(
-    pool: &SharedPool,
-    revision: SessionStateRevisionWrite<'_>,
-) -> Result<(), sqlx::Error> {
-    if update_session_state_revision(pool, &revision).await? {
-        return Ok(());
-    }
-
-    let insert_result = sqlx::query(
-        "INSERT INTO session_state_revisions
-         (session_id, user_id, monotonic_id, revision_hash, device_fingerprint,
-          transcript_high_watermark, run_event_high_watermark, state_projection_hash, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-    )
-    .bind(revision.session_id)
-    .bind(revision.user_id)
-    .bind(revision.monotonic_id)
-    .bind(revision.revision_hash)
-    .bind(revision.device_fingerprint)
-    .bind(revision.transcript_high_watermark)
-    .bind(revision.run_event_high_watermark)
-    .bind(revision.state_projection_hash)
-    .execute(pool.get())
-    .await;
-
-    match insert_result {
-        Ok(_) => Ok(()),
-        Err(error) if is_duplicate_key_error(&error) => {
-            match update_session_state_revision(pool, &revision).await? {
-                true => Ok(()),
-                false => Err(sqlx::Error::RowNotFound),
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn update_session_state_revision(
-    pool: &SharedPool,
-    revision: &SessionStateRevisionWrite<'_>,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE session_state_revisions
-         SET user_id = ?,
-             monotonic_id = ?,
-             revision_hash = ?,
-             device_fingerprint = ?,
-             transcript_high_watermark = ?,
-             run_event_high_watermark = ?,
-             state_projection_hash = ?,
-             updated_at = NOW(6)
-         WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(revision.user_id)
-    .bind(revision.monotonic_id)
-    .bind(revision.revision_hash)
-    .bind(revision.device_fingerprint)
-    .bind(revision.transcript_high_watermark)
-    .bind(revision.run_event_high_watermark)
-    .bind(revision.state_projection_hash)
-    .bind(revision.session_id)
-    .bind(revision.user_id)
-    .execute(pool.get())
-    .await?;
-    Ok(result.rows_affected() > 0)
 }
 
 fn validate_device_protocol_value<'a>(

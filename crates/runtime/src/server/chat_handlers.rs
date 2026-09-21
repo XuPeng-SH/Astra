@@ -145,6 +145,7 @@ pub(super) async fn resolve_or_create_chat_session_id(
 pub(super) struct ResolvedChatSession {
     pub(super) session_id: Option<String>,
     pub(super) full_llm_capture: bool,
+    pub(super) session_admission_facts: Option<astra_services::SessionAdmissionFacts>,
 }
 
 pub(super) async fn resolve_or_create_chat_session(
@@ -164,24 +165,27 @@ pub(super) async fn resolve_or_create_chat_session(
                     .session_service
                     .get_session_for_provider_request(session_id.clone(), user.user_id.clone())
                     .await
+                    .map(|session| (session, None))
             } else {
                 state
                     .session_service
-                    .get_session(session_id.clone(), user.user_id.clone())
+                    .get_session_with_admission_facts(session_id.clone(), user.user_id.clone())
                     .await
             };
             match session {
-                Ok(session) => Ok(ResolvedChatSession {
+                Ok((session, session_admission_facts)) => Ok(ResolvedChatSession {
                     session_id: Some(session_id),
                     full_llm_capture:
                         crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                             &session.metadata,
                         )),
+                    session_admission_facts,
                 }),
                 Err(error) if is_session_service_unconfigured_error(&error) => {
                     Ok(ResolvedChatSession {
                         session_id: session_id_is_trusted.then_some(session_id),
                         full_llm_capture: false,
+                        session_admission_facts: None,
                     })
                 }
                 Err(error) => Err(normalize_chat_session_error(error)),
@@ -212,11 +216,17 @@ pub(super) async fn resolve_or_create_chat_session(
                         crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                             &session.metadata,
                         )),
+                    // A custom SessionService may establish an active plan
+                    // while creating the session. Without an explicit fact
+                    // returned by that service, keep the lifecycle's
+                    // authoritative fallback enabled.
+                    session_admission_facts: None,
                 }),
                 Err(error) if is_session_service_unconfigured_error(&error) => {
                     Ok(ResolvedChatSession {
                         session_id: None,
                         full_llm_capture: false,
+                        session_admission_facts: None,
                     })
                 }
                 Err(error) => Err(error),
@@ -300,6 +310,7 @@ pub(super) async fn chat_handler(
     .await?;
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    chat_data.session_admission_facts = resolved.session_admission_facts;
     validate_conversation_authority(
         &state,
         &user.user_id,
@@ -399,6 +410,7 @@ pub(super) async fn chat_stream_handler(
     };
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    chat_data.session_admission_facts = resolved.session_admission_facts;
     if let Err((status, error)) = validate_conversation_authority(
         &state,
         &user.user_id,
@@ -693,17 +705,22 @@ mod session_resolution_tests {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
             .with_session_service(Arc::new(session_service.clone()));
 
-        let session_id = resolve_or_create_chat_session_id(
+        let resolved = resolve_or_create_chat_session(
             &state,
             &test_user(),
             None,
             Some("agent-1".to_string()),
             false,
+            false,
         )
         .await
         .expect("session resolution should succeed");
 
-        assert_eq!(session_id.as_deref(), Some("s-created"));
+        assert_eq!(resolved.session_id.as_deref(), Some("s-created"));
+        assert!(
+            resolved.session_admission_facts.is_none(),
+            "a custom session creator without admission facts must retain the lifecycle fallback"
+        );
 
         let created = session_service.created_requests().await;
         assert_eq!(created.len(), 1);
@@ -741,6 +758,30 @@ mod session_resolution_tests {
         assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert_eq!(error.1.0.detail, "Session not found");
         assert_eq!(error.1.0.error_code, None);
+    }
+
+    #[tokio::test]
+    async fn custom_session_service_keeps_authoritative_plan_fallback_available() {
+        let session_service = RecordingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service));
+
+        let resolved = resolve_or_create_chat_session(
+            &state,
+            &test_user(),
+            Some("existing-session".to_string()),
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("custom session service should resolve an existing session");
+
+        assert_eq!(resolved.session_id.as_deref(), Some("existing-session"));
+        assert!(
+            resolved.session_admission_facts.is_none(),
+            "implementations without the optimized admission read must let the lifecycle perform its authoritative plan lookup"
+        );
     }
 
     #[tokio::test]

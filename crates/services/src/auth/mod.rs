@@ -19,6 +19,10 @@ use std::sync::{Arc, Mutex};
 
 const MOI_USER_TOKEN_PREFIX: &str = "moi-user-token-v1";
 
+/// Provider namespace used only while migrating pre-issuer Memoria links.
+/// New logins always use the issuer-derived provider id.
+pub const LEGACY_MEMORIA_PROVIDER_ID: &str = "memoria:legacy";
+
 /// Resolve bcrypt cost from `ASTRA_BCRYPT_COST`, falling back to `bcrypt::DEFAULT_COST` (12).
 /// Tests set a low cost (e.g. `4`) to avoid multi-hundred-millisecond hashing in debug builds;
 /// production leaves the env var unset. Cached after first read via OnceLock.

@@ -952,6 +952,17 @@ pub struct ProviderRunOwner {
     pub provider_scope_id: String,
 }
 
+/// Facts loaded while authenticating and resolving an existing Session.
+///
+/// These facts are an optimization for the request path, not an execution
+/// authority. Mutating plan tools still re-check the durable plan binding when
+/// required; callers that do not have this snapshot fall back to the repository
+/// lookup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionAdmissionFacts {
+    pub active_plan_id: Option<String>,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
@@ -961,6 +972,9 @@ pub struct ChatRequestData {
     pub stable_runtime_system_prompt: Option<String>,
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
+    /// Server-derived facts from authenticated Session resolution. Never
+    /// accepted from a client transport.
+    pub session_admission_facts: Option<SessionAdmissionFacts>,
     pub work_binding: Option<WorkRuntimeBindingRequest>,
     pub run_start_idempotency: Option<RunStartIdempotency>,
     pub full_llm_capture: bool,
@@ -1048,6 +1062,10 @@ impl std::fmt::Debug for ChatRequestData {
             )
             .field("runtime_system_prompt", &self.runtime_system_prompt)
             .field("session_id", &self.session_id)
+            .field(
+                "session_admission_facts_present",
+                &self.session_admission_facts.is_some(),
+            )
             .field("work_binding", &self.work_binding)
             .field("run_start_idempotency", &self.run_start_idempotency)
             .field("agent_id", &self.agent_id)
@@ -11763,44 +11781,65 @@ impl DatabaseRunStateStore {
         user_id: &str,
         session_id: &str,
         run_id: &str,
+        admission_facts: Option<crate::storage::SessionExecutionAdmissionFacts>,
     ) -> DbStoreResult<bool> {
         // Deletion fencing locks this same session row before proving the slot
         // empty. Execution authority exists only for the exact active,
         // owner-scoped durable session; missing, foreign, or terminal session
         // identities must fail closed before any slot write.
-        let session_status: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM agent_sessions
-             WHERE user_id = ? AND session_id = ? FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|source| db_error("load_session_execution_status", session_id, source))?;
-        if session_status.as_deref() != Some("active") {
+        let session_is_active = if let Some(facts) = admission_facts.as_ref() {
+            if !facts.belongs_to(user_id, session_id) {
+                return Err(db_error(
+                    "session_execution_admission_facts_identity",
+                    session_id,
+                    sqlx::Error::Protocol(
+                        "session execution admission facts do not match the requested session"
+                            .into(),
+                    ),
+                ));
+            }
+            facts.session_is_active()
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM agent_sessions
+                 WHERE user_id = ? AND session_id = ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("load_session_execution_status", session_id, source))?
+            .as_deref()
+                == Some("active")
+        };
+        if !session_is_active {
             return Ok(false);
         }
         crate::session_context_coordinator::ensure_run_execution_workspace_claim_in_tx(
             tx, user_id, session_id,
         )
         .await?;
-        let slot = sqlx::query(
-            "SELECT run_id, updated_at FROM agent_session_execution_slots
-             WHERE user_id = ? AND session_id = ? FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|source| db_error("load_session_execution_slot", session_id, source))?
-        .map(|row| {
-            Ok::<_, sqlx::Error>((
-                row.try_get::<String, _>("run_id")?,
-                row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
-            ))
-        })
-        .transpose()
-        .map_err(|source| db_error("decode_session_execution_slot", session_id, source))?;
+        let slot = if let Some(facts) = admission_facts {
+            facts.slot().cloned()
+        } else {
+            sqlx::query(
+                "SELECT run_id, updated_at FROM agent_session_execution_slots
+                 WHERE user_id = ? AND session_id = ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("load_session_execution_slot", session_id, source))?
+            .map(|row| {
+                Ok::<_, sqlx::Error>((
+                    row.try_get::<String, _>("run_id")?,
+                    row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
+                ))
+            })
+            .transpose()
+            .map_err(|source| db_error("decode_session_execution_slot", session_id, source))?
+        };
 
         let Some((owner, slot_updated_at)) = slot else {
             sqlx::query(
@@ -11953,8 +11992,14 @@ impl DatabaseRunStateStore {
                     || waiting_for.is_some(),
                 "paused without waiting_for must release the session execution slot"
             );
-            self.acquire_session_execution_slot_tx(tx, &run.user_id, &run.session_id, &run.run_id)
-                .await
+            self.acquire_session_execution_slot_tx(
+                tx,
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                None,
+            )
+            .await
         } else {
             Self::release_session_execution_slot_tx(tx, &run.user_id, &run.session_id, &run.run_id)
                 .await?;
@@ -12769,7 +12814,7 @@ impl DatabaseRunStateStore {
     /// authoritative run, event, and checkpoint tables.
     ///
     /// Full projection refreshes never trust a caller snapshot. Taking the
-    /// session -> tombstone -> slot -> run lock before the projection row
+    /// session -> lifecycle-fence -> slot -> run lock before the projection row
     /// serializes delayed post-commit callbacks with the transition that made
     /// their snapshot stale. This also keeps the lock order compatible with
     /// transactions that update the run and projection together.
@@ -12959,7 +13004,7 @@ impl DatabaseRunStateStore {
     }
 
     /// Append one immutable event batch under the canonical
-    /// session -> tombstone -> slot -> run -> events lock order. Counter
+    /// session -> lifecycle-fence -> slot -> run -> events lock order. Counter
     /// advancement and every child row are one commit: neither gaps nor partial
     /// batches are a supported durable state.
     async fn append_events_batch_for_user(
@@ -13454,21 +13499,22 @@ impl DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
-        crate::storage::admit_session_scoped_run_write(
-            &mut tx,
-            &record.session_id,
-            &record.user_id,
-            &record.run_id,
-            true,
-        )
-        .await
-        .map_err(|source| {
-            if matches!(source, sqlx::Error::RowNotFound) {
-                "session is not active".to_string()
-            } else {
-                db_error("insert_run_session_admission", &record.run_id, source).to_string()
-            }
-        })?;
+        let (_, execution_admission_facts) =
+            crate::storage::admit_session_scoped_run_write_with_facts(
+                &mut tx,
+                &record.session_id,
+                &record.user_id,
+                &record.run_id,
+                true,
+            )
+            .await
+            .map_err(|source| {
+                if matches!(source, sqlx::Error::RowNotFound) {
+                    "session is not active".to_string()
+                } else {
+                    db_error("insert_run_session_admission", &record.run_id, source).to_string()
+                }
+            })?;
         let existing_session: Option<String> = sqlx::query_scalar(
             "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
         )
@@ -13583,6 +13629,7 @@ impl DatabaseRunStateStore {
                     &record.user_id,
                     &record.session_id,
                     &record.run_id,
+                    Some(execution_admission_facts),
                 )
                 .await
                 .map_err(|e| e.to_string())?
@@ -27616,7 +27663,7 @@ mod tests {
                 .await
                 .expect("begin execution-slot fixture");
             let acquired = store
-                .acquire_session_execution_slot_tx(&mut tx, &user_id, &session_id, &run_id)
+                .acquire_session_execution_slot_tx(&mut tx, &user_id, &session_id, &run_id, None)
                 .await
                 .expect("evaluate exact-session execution-slot admission");
             assert_eq!(acquired, expected, "unexpected admission for {case}");
@@ -36391,6 +36438,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
+            session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -36487,6 +36535,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
+            session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -36606,6 +36655,7 @@ mod tests {
                     stable_runtime_system_prompt: None,
                     runtime_system_prompt: None,
                     session_id: None,
+                    session_admission_facts: None,
                     work_binding: None,
                     run_start_idempotency: None,
                     agent_id: None,

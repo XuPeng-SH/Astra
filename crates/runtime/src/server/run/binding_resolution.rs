@@ -545,6 +545,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: None,
+            session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
             full_llm_capture: false,

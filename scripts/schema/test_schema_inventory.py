@@ -371,7 +371,6 @@ fn char_literal() { let slash = '/'; }
             "conversation_log",
             "session_transcript_items",
             "transcript_pages",
-            "session_history_chunks",
             "session_tool_output_batches",
             "session_tool_outputs",
             "tool_invocation_ledger",
@@ -458,7 +457,6 @@ fn char_literal() { let slash = '/'; }
         second_batch = {
             "config_versions",
             "context_manifests",
-            "session_state_revisions",
             "session_device_leases",
             "session_device_lease_events",
             "session_state_items",
@@ -497,10 +495,6 @@ fn char_literal() { let slash = '/'; }
             self.tables["session_state_items"]["merge_guidance"],
         )
         self.assertIn(
-            "session-level revision",
-            self.tables["session_state_revisions"]["merge_guidance"],
-        )
-        self.assertIn(
             "mutable current state",
             self.tables["session_device_leases"]["merge_guidance"],
         )
@@ -532,7 +526,6 @@ fn char_literal() { let slash = '/'; }
             "auth_roles",
             "auth_refresh_tokens",
             "auth_tokens",
-            "auth_memoria_identities",
             "auth_audit_logs",
             "infra_llm_models",
             "runtime_llm_trusted_domains",
@@ -697,7 +690,6 @@ fn char_literal() { let slash = '/'; }
         session_workflow_tables = {
             "agent_event_edges",
             "session_artifacts",
-            "session_artifacts_grants",
             "session_artifact_content_chunks",
             "session_artifact_content_refs",
             "session_artifact_content_reservations",
@@ -740,10 +732,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "content and retention state",
             self.tables["session_artifacts"]["merge_guidance"],
-        )
-        self.assertIn(
-            "visibility/control-plane facts",
-            self.tables["session_artifacts_grants"]["merge_guidance"],
         )
         self.assertIn(
             "session-level restore snapshots",
@@ -948,9 +936,54 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("Audit is intentionally not persisted to MatrixOne", state_sync)
         self.assertNotIn("session_sync_log", state_sync)
 
+    def test_session_deletion_tombstones_are_removed_from_production_schema(self) -> None:
+        self.assertNotIn(
+            "session_deletion_tombstones",
+            self.tables,
+            "the lifecycle fence is the sole durable deletion authority",
+        )
+
+        storage = (schema_inventory.REPO_ROOT / "crates/services/src/storage.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "CREATE TABLE IF NOT EXISTS session_deletion_tombstones",
+            storage,
+        )
+        self.assertIn("DROP TABLE IF EXISTS session_deletion_tombstones", storage)
+        self.assertIn("agent_session_lifecycle_fences", storage)
+
+    def test_retired_session_projection_tables_are_absent_from_production_schema(self) -> None:
+        retired = {
+            "session_state_revisions",
+            "session_history_chunks",
+            "session_artifacts_grants",
+        }
+        for table in retired:
+            self.assertNotIn(table, self.tables)
+
+        storage = (schema_inventory.REPO_ROOT / "crates/services/src/storage.rs").read_text(
+            encoding="utf-8"
+        )
+        for table in retired:
+            self.assertNotIn(
+                f"CREATE TABLE IF NOT EXISTS {table}",
+                storage,
+            )
+            self.assertNotIn(
+                f"DROP TABLE IF EXISTS {table}",
+                storage,
+                "retired projections have no compatibility cleanup path",
+            )
+
     def test_p1_5_consolidation_reviews_are_evidence_backed(self) -> None:
         expected = {
             "session_sync_log",
+            "session_deletion_tombstones",
+            "auth_memoria_identities",
+            "session_state_revisions",
+            "session_history_chunks",
+            "session_artifacts_grants",
             "data_versioning_checkpoints",
             "preview_template_registry + raw_ref_scheme_registry",
             "harness_skill_drafts + harness_skill_rules",
@@ -977,6 +1010,22 @@ fn char_literal() { let slash = '/'; }
                     self.assertNotIn("TBD", review[field])
 
         self.assertIn("tracing-only", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
+        self.assertIn(
+            "legacy issuer",
+            self.p1_5_reviews["auth_memoria_identities"]["user_api_impact"],
+        )
+        self.assertIn(
+            "hydration",
+            self.p1_5_reviews["session_state_revisions"]["rationale"],
+        )
+        self.assertIn(
+            "canonical transcript",
+            self.p1_5_reviews["session_history_chunks"]["rationale"],
+        )
+        self.assertIn(
+            "creation path",
+            self.p1_5_reviews["session_artifacts_grants"]["rationale"],
+        )
         self.assertIn(
             "rollback/list",
             self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
@@ -1012,10 +1061,16 @@ fn char_literal() { let slash = '/'; }
                 "list_checkpoints",
             ],
             "crates/services/src/storage.rs": [
+                "retire_auth_memoria_identities",
+                "DROP TABLE IF EXISTS auth_memoria_identities",
                 "preview_template_registry",
                 "raw_ref_scheme_registry",
                 "INSERT IGNORE INTO raw_ref_scheme_registry",
                 "INSERT IGNORE INTO preview_template_registry",
+            ],
+            "crates/services/src/auth/memoria.rs": [
+                "LEGACY_MEMORIA_PROVIDER_ID",
+                "auth_external_identities",
             ],
             "crates/services/src/harness.rs": [
                 "harness_skill_drafts",

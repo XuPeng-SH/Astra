@@ -241,6 +241,15 @@ async fn user_byok_models_are_owner_scoped_encrypted_and_admitted_for_owner_only
         "aliases are unique per owner, not globally"
     );
 
+    assert_eq!(
+        service
+            .default_chat_model_offering_id(user_a.clone())
+            .await
+            .expect("resolve the targeted Chat default"),
+        Some(model_a.clone()),
+        "server-default admission should use the owner-scoped active default without materializing the full catalog"
+    );
+
     let admitted = service
         .admit_model_offering(user_a.clone(), model_a.clone())
         .await
@@ -263,6 +272,156 @@ async fn user_byok_models_are_owner_scoped_encrypted_and_admitted_for_owner_only
             .execute(&pool)
             .await
             .expect("clean user model fixture");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn targeted_chat_default_uses_lightweight_owner_fallback_query() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let encryptor = FernetTokenEncryptor::new("targeted-default-db-it-key").unwrap();
+    let service =
+        DatabaseModelService::new(settings, Arc::new(encryptor.clone())).with_pool(shared_pool);
+    let owner = format!("targeted_default_{}", Uuid::new_v4().simple());
+    let model_id = Uuid::new_v4().to_string();
+    let previous_mode = std::env::var_os("ASTRA_DEPLOYMENT_MODE");
+    unsafe { std::env::set_var("ASTRA_DEPLOYMENT_MODE", "cloud-byok") };
+
+    sqlx::query(
+        "INSERT INTO user_llm_models \
+         (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+          context_window, is_default, is_active) \
+         VALUES (?, ?, 'fallback', 'deepseek-chat', 'deepseek', ?, \
+                 'https://api.deepseek.com', 128000, 0, 1)",
+    )
+    .bind(&model_id)
+    .bind(&owner)
+    .bind(encryptor.encrypt("targeted-default-secret").unwrap())
+    .execute(&pool)
+    .await
+    .expect("seed non-default user model");
+
+    assert_eq!(
+        service
+            .default_chat_model_offering_id(owner.clone())
+            .await
+            .expect("resolve the lightweight owner fallback"),
+        Some(model_id.clone())
+    );
+
+    sqlx::query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .expect("clean targeted default fixture");
+    match previous_mode {
+        Some(value) => unsafe { std::env::set_var("ASTRA_DEPLOYMENT_MODE", value) },
+        None => unsafe { std::env::remove_var("ASTRA_DEPLOYMENT_MODE") },
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn targeted_chat_default_rejects_malformed_or_duplicate_effective_offerings() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let encryptor = FernetTokenEncryptor::new("targeted-default-integrity-db-it-key").unwrap();
+    let service =
+        DatabaseModelService::new(settings, Arc::new(encryptor.clone())).with_pool(shared_pool);
+    let owner = format!("targeted_integrity_{}", Uuid::new_v4().simple());
+    let duplicate_id = Uuid::new_v4().to_string();
+    let malformed_id = "malformed\noffering";
+    let previous_mode = std::env::var_os("ASTRA_DEPLOYMENT_MODE");
+    unsafe { std::env::set_var("ASTRA_DEPLOYMENT_MODE", "self-hosted") };
+
+    sqlx::query(
+        "INSERT INTO infra_llm_models \
+         (model_id, model_name, provider, base_url, is_active, context_window, \
+          input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) \
+         VALUES (?, 'duplicate-infra', 'mock', 'http://127.0.0.1:1', 1, 128000, \
+                 ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&duplicate_id)
+    .bind(r#"["text"]"#)
+    .bind(r#"["text"]"#)
+    .bind("[]")
+    .bind("{}")
+    .bind("[]")
+    .bind("{}")
+    .execute(&pool)
+    .await
+    .expect("seed duplicate infra offering");
+    sqlx::query(
+        "INSERT INTO user_llm_models \
+         (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+          context_window, is_default, is_active) \
+         VALUES (?, ?, 'duplicate-user', 'deepseek-chat', 'deepseek', ?, \
+                 'https://api.deepseek.com', 128000, 0, 1)",
+    )
+    .bind(&duplicate_id)
+    .bind(&owner)
+    .bind(encryptor.encrypt("duplicate-secret").unwrap())
+    .execute(&pool)
+    .await
+    .expect("seed duplicate user offering");
+    let duplicate_error = service
+        .default_chat_model_offering_id(owner.clone())
+        .await
+        .expect_err("duplicate effective Offering IDs must fail closed");
+    assert_eq!(duplicate_error.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        duplicate_error.1.error_code.as_deref(),
+        Some("model_default_unavailable")
+    );
+
+    sqlx::query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&duplicate_id)
+        .execute(&pool)
+        .await
+        .expect("clean duplicate user offering");
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&duplicate_id)
+        .execute(&pool)
+        .await
+        .expect("clean duplicate infra offering");
+
+    sqlx::query(
+        "INSERT INTO user_llm_models \
+         (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+          context_window, is_default, is_active) \
+         VALUES (?, ?, 'malformed', 'deepseek-chat', 'deepseek', ?, \
+                 'https://api.deepseek.com', 128000, 0, 1)",
+    )
+    .bind(malformed_id)
+    .bind(&owner)
+    .bind(encryptor.encrypt("malformed-secret").unwrap())
+    .execute(&pool)
+    .await
+    .expect("seed malformed user offering");
+    let malformed_error = service
+        .default_chat_model_offering_id(owner.clone())
+        .await
+        .expect_err("malformed effective Offering IDs must fail closed");
+    assert_eq!(malformed_error.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        malformed_error.1.error_code.as_deref(),
+        Some("model_default_unavailable")
+    );
+    sqlx::query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(malformed_id)
+        .execute(&pool)
+        .await
+        .expect("clean malformed user offering");
+
+    match previous_mode {
+        Some(value) => unsafe { std::env::set_var("ASTRA_DEPLOYMENT_MODE", value) },
+        None => unsafe { std::env::remove_var("ASTRA_DEPLOYMENT_MODE") },
     }
 }
 

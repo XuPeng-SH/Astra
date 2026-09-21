@@ -1,5 +1,6 @@
 use crate::CancellationSafePoolConnection;
 use crate::pagination::MAX_API_LIST_LIMIT;
+use crate::runs::SessionAdmissionFacts;
 use crate::session_lifecycle::{SessionTableDeleteOutcome, hard_delete_session};
 use crate::storage::{log_session_audit, session_record_from_row};
 use astra_core::{
@@ -64,6 +65,21 @@ pub trait SessionService: Send + Sync {
         session_id: String,
         user_id: String,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Resolve an owned Session and return request-local facts that were
+    /// already present in that same authenticated read. Implementations that
+    /// cannot provide extra facts retain the safe fallback: the lifecycle
+    /// performs its own authoritative lookup when needed.
+    async fn get_session_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.get_session(session_id, user_id)
+            .await
+            .map(|session| (session, None))
+    }
 
     /// Resolve a session for an already authenticated provider request.
     /// Implementations may classify confirmed absence as `session_not_found`;
@@ -542,8 +558,21 @@ impl DatabaseSessionService {
         session_id: &str,
         user_id: &str,
     ) -> Result<Option<SessionRecord>, (StatusCode, Json<ErrorResponse>)> {
-        query(
+        self.fetch_session_for_user_with_admission_facts(executor, session_id, user_id)
+            .await
+            .map(|record| record.map(|(session, _)| session))
+    }
+
+    async fn fetch_session_for_user_with_admission_facts(
+        &self,
+        executor: impl sqlx::Executor<'_, Database = MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<Option<(SessionRecord, SessionAdmissionFacts)>, (StatusCode, Json<ErrorResponse>)>
+    {
+        let row = query(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
+             active_plan_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
              DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
@@ -554,9 +583,13 @@ impl DatabaseSessionService {
         .bind(user_id)
         .fetch_optional(executor)
         .await
-        .map_err(internal_error)?
-        .map(session_record_from_row)
-        .transpose()
+        .map_err(internal_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let active_plan_id = row.try_get("active_plan_id").map_err(internal_error)?;
+        let session = session_record_from_row(row)?;
+        Ok(Some((session, SessionAdmissionFacts { active_plan_id })))
     }
 
     async fn delete_session_lifecycle(
@@ -771,6 +804,24 @@ impl SessionService for DatabaseSessionService {
             })?;
 
         Ok(session)
+    }
+
+    async fn get_session_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        self.fetch_session_for_user_with_admission_facts(&pool, &session_id, &user_id)
+            .await?
+            .map(|(session, facts)| (session, Some(facts)))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                )
+            })
     }
 
     async fn get_session_for_provider_request(

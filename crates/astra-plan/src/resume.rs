@@ -92,17 +92,31 @@ pub async fn plan_resume_snapshot_for_session(
             return PlanResumeSnapshot::default();
         }
     };
-    match repo.load(user_id, &plan_id).await {
+    plan_resume_snapshot_for_plan(repo, user_id, &plan_id).await
+}
+
+/// Build a resume snapshot when the caller already has the active-plan
+/// identity from Session admission.
+///
+/// This avoids re-reading `agent_sessions.active_plan_id` on the same request.
+/// The plan row is still loaded from the repository, and the write-tool guard
+/// continues to perform its own durable check when a mutating tool is reached.
+pub async fn plan_resume_snapshot_for_plan(
+    repo: &dyn PlanRepository,
+    user_id: &str,
+    plan_id: &str,
+) -> PlanResumeSnapshot {
+    match repo.load(user_id, plan_id).await {
         Ok(state) => PlanResumeSnapshot {
             authoring_active: plan_mode_authoring_active(&state),
             prompt_hint: plan_resume_prompt_hint(&state),
         },
         Err(err) => {
             tracing::warn!(
-                %session_id,
+                %user_id,
                 %plan_id,
                 error = %err,
-                "plan resume: active plan exists but draft load failed; retaining write guard without hint"
+                "plan resume: active binding exists but draft load failed; retaining write guard without hint"
             );
             PlanResumeSnapshot {
                 authoring_active: true,

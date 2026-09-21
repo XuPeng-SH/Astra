@@ -1210,21 +1210,18 @@ async fn e2e_joint_1_s01_rust_60_turn_refactor_chain() {
     }
 
     sqlx::query(
-        "INSERT INTO session_history_chunks
-         (chunk_id, user_id, session_id, source_session_id, seq_start, seq_end, chunk_type,
-          source_table, source_id, content_text, content_hash, token_estimate, provenance_json, created_at)
-         VALUES (?, ?, ?, ?, 1, 50, 'code_decision', 'session_transcript_items',
-                 'turn-17', 'borrow checker detail from early refactor', ?, 180, ?, NOW(6))",
+        "INSERT INTO session_transcript_items
+         (session_id, item_seq, user_id, run_id, role, content, content_hash, created_at)
+         VALUES (?, 17, ?, ?, 'assistant', ?, ?, NOW(6))",
     )
-    .bind(id("chunk"))
+    .bind(&session_id)
     .bind(&user_id)
-    .bind(&session_id)
-    .bind(&session_id)
+    .bind(&run_id)
+    .bind("borrow checker detail from early refactor")
     .bind(id("hash"))
-    .bind(json!({"retrieval_stage": "structured"}).to_string())
     .execute(pool.get())
     .await
-    .expect("S01 retrieval seed chunk must be inserted");
+    .expect("S01 retrieval seed transcript item must be inserted");
 
     let artifact_id = id("artifact");
     sqlx::query(
@@ -1293,15 +1290,15 @@ async fn e2e_joint_1_s01_rust_60_turn_refactor_chain() {
                 session_id: session_id.clone(),
                 item_order: 1,
                 zone: "retrieved_facts".to_string(),
-                source_table: "session_history_chunks".to_string(),
-                source_id: format!("{session_id}:turn-17"),
+                source_table: "session_transcript_items".to_string(),
+                source_id: format!("{session_id}:17"),
                 source_hash: None,
                 included: true,
                 token_estimate: 220,
                 budget_tokens: 1_000,
                 reason: "history_recall_structured".to_string(),
                 render_mode: "summary".to_string(),
-                raw_ref: Some(format!("chunk://{session_id}/turn-17")),
+                raw_ref: Some(format!("transcript://{session_id}/17")),
             });
             "history_recall_structured"
         } else if turn == 44 {

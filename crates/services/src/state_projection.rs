@@ -399,39 +399,6 @@ fn decode_user_anchor_memory_item(
     })
 }
 
-#[derive(Clone, Debug)]
-struct ArtifactAclRow {
-    user_id: String,
-    access_scope: String,
-    owner_run_id: Option<String>,
-    root_run_id: Option<String>,
-    status: String,
-}
-
-fn decode_artifact_acl_row(
-    row: &impl StateProjectionDbRow,
-    artifact_id: &str,
-) -> Result<ArtifactAclRow, StateProjectionError> {
-    const OPERATION: &str = "load_artifact_acl";
-    Ok(ArtifactAclRow {
-        user_id: state_projection_row_string(row, OPERATION, artifact_id, "user_id")?,
-        access_scope: state_projection_row_string(row, OPERATION, artifact_id, "access_scope")?,
-        owner_run_id: state_projection_row_optional_string(
-            row,
-            OPERATION,
-            artifact_id,
-            "owner_run_id",
-        )?,
-        root_run_id: state_projection_row_optional_string(
-            row,
-            OPERATION,
-            artifact_id,
-            "root_run_id",
-        )?,
-        status: state_projection_row_string(row, OPERATION, artifact_id, "status")?,
-    })
-}
-
 fn decode_run_acl_row(
     row: &impl StateProjectionDbRow,
     run_id: &str,
@@ -1235,33 +1202,22 @@ impl DatabaseStateProjectionStore {
                 entity: session_id.to_string(),
                 source,
             })?;
-        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false)
-            .await
-            .map_err(|_| StateProjectionError::SessionNotActive {
+        let session_admission = crate::storage::admit_session_event_write_with_facts(
+            &mut tx, session_id, user_id, false,
+        )
+        .await
+        .map_err(|source| match source {
+            sqlx::Error::RowNotFound => StateProjectionError::SessionNotActive {
                 user_id: user_id.to_string(),
                 session_id: session_id.to_string(),
-            })?;
-        let session_status = sqlx::query(
-            "SELECT status FROM agent_sessions
-             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "validate_skill_activation_session",
-            entity: session_id.to_string(),
-            source,
-        })?
-        .map(|row| row.try_get::<String, _>("status"))
-        .transpose()
-        .map_err(|source| StateProjectionError::Database {
-            operation: "validate_skill_activation_session",
-            entity: session_id.to_string(),
-            source,
+            },
+            source => StateProjectionError::Database {
+                operation: "validate_skill_activation_session",
+                entity: session_id.to_string(),
+                source,
+            },
         })?;
-        if session_status.as_deref() != Some("active") {
+        if session_admission.session_status() != "active" {
             return Err(StateProjectionError::SessionNotActive {
                 user_id: user_id.to_string(),
                 session_id: session_id.to_string(),
@@ -1423,95 +1379,6 @@ impl DatabaseStateProjectionStore {
         Ok(())
     }
 
-    pub async fn can_access_artifact(
-        &self,
-        artifact_id: &str,
-        requester_user_id: &str,
-        requester_run_id: &str,
-        requester_delegation_id: Option<&str>,
-    ) -> Result<bool, StateProjectionError> {
-        let Some(requester_run) = self
-            .load_run_acl_for_user(requester_user_id, requester_run_id)
-            .await?
-        else {
-            return Ok(false);
-        };
-        let Some(artifact) = sqlx::query(
-            "SELECT artifact_id, user_id, session_id, access_scope, owner_run_id, root_run_id, status
-             FROM session_artifacts
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-             LIMIT 1",
-        )
-        .bind(requester_user_id)
-        .bind(&requester_run.session_id)
-        .bind(artifact_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "load_artifact_acl",
-            entity: artifact_id.to_string(),
-            source,
-        })?
-        else {
-            return Ok(false);
-        };
-        let artifact = decode_artifact_acl_row(&artifact, artifact_id)?;
-        let status = artifact.status;
-        if status != "active" {
-            return Ok(false);
-        }
-        let artifact_user = artifact.user_id;
-        let scope = artifact.access_scope;
-        let owner_run_id = artifact.owner_run_id;
-        let artifact_root_run_id = artifact.root_run_id;
-
-        if owner_run_id.as_deref() == Some(requester_run_id) {
-            return Ok(true);
-        }
-        if scope == "user" {
-            return Ok(artifact_user == requester_user_id);
-        }
-        if artifact_user != requester_user_id {
-            return Ok(false);
-        }
-        if self
-            .has_artifact_grant(
-                artifact_id,
-                requester_user_id,
-                &requester_run.session_id,
-                requester_run_id,
-                requester_delegation_id,
-            )
-            .await?
-        {
-            return Ok(true);
-        }
-        let artifact_root = artifact_root_run_id.unwrap_or_default();
-        match scope.as_str() {
-            "private" => Ok(false),
-            "delegation" | "same_root_tree" => Ok(!artifact_root.is_empty()
-                && requester_run.root_run_id.as_deref() == Some(artifact_root.as_str())),
-            "delegation_direct" => {
-                let Some(owner_run_id) = owner_run_id else {
-                    return Ok(false);
-                };
-                let Some(owner_run) = self
-                    .load_run_acl_for_user(requester_user_id, &owner_run_id)
-                    .await?
-                else {
-                    return Ok(false);
-                };
-                let same_root = requester_run.root_run_id == owner_run.root_run_id;
-                let requester_path = requester_run.ancestor_path.unwrap_or_default();
-                let owner_path = owner_run.ancestor_path.unwrap_or_default();
-                Ok(same_root
-                    && (owner_path.starts_with(&requester_path)
-                        || requester_path.starts_with(&owner_path)))
-            }
-            _ => Ok(false),
-        }
-    }
-
     pub async fn create_retry_run_and_supersede(
         &self,
         user_id: &str,
@@ -1597,94 +1464,6 @@ impl DatabaseStateProjectionStore {
             })?;
         connection.release();
         Ok(())
-    }
-
-    async fn has_artifact_grant(
-        &self,
-        artifact_id: &str,
-        user_id: &str,
-        session_id: &str,
-        requester_run_id: &str,
-        requester_delegation_id: Option<&str>,
-    ) -> Result<bool, StateProjectionError> {
-        if self
-            .has_artifact_run_grant(artifact_id, user_id, session_id, requester_run_id)
-            .await?
-        {
-            return Ok(true);
-        }
-
-        let Some(requester_delegation_id) = requester_delegation_id else {
-            return Ok(false);
-        };
-
-        self.has_artifact_delegation_grant(
-            artifact_id,
-            user_id,
-            session_id,
-            requester_delegation_id,
-        )
-        .await
-    }
-
-    async fn has_artifact_run_grant(
-        &self,
-        artifact_id: &str,
-        user_id: &str,
-        session_id: &str,
-        requester_run_id: &str,
-    ) -> Result<bool, StateProjectionError> {
-        let row = sqlx::query(
-            "SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_target)
-             WHERE user_id = ?
-               AND session_id = ?
-               AND target_run_id = ?
-               AND artifact_id = ?
-               AND (expires_at IS NULL OR expires_at > NOW(6))
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(requester_run_id)
-        .bind(artifact_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "load_artifact_run_grant",
-            entity: artifact_id.to_string(),
-            source,
-        })?;
-        Ok(row.is_some())
-    }
-
-    async fn has_artifact_delegation_grant(
-        &self,
-        artifact_id: &str,
-        user_id: &str,
-        session_id: &str,
-        requester_delegation_id: &str,
-    ) -> Result<bool, StateProjectionError> {
-        let row = sqlx::query(
-            "SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_delegation_target)
-             WHERE user_id = ?
-               AND session_id = ?
-               AND target_delegation_id = ?
-               AND artifact_id = ?
-               AND (expires_at IS NULL OR expires_at > NOW(6))
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(requester_delegation_id)
-        .bind(artifact_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "load_artifact_delegation_grant",
-            entity: artifact_id.to_string(),
-            source,
-        })?;
-        Ok(row.is_some())
     }
 
     async fn load_run_acl_for_user(
@@ -2197,30 +1976,6 @@ mod tests {
             ),
             "token_estimate",
         );
-    }
-
-    #[test]
-    fn artifact_acl_decode_fails_loudly() {
-        let artifact = decode_artifact_acl_row(&FakeStateProjectionRow::complete(), "artifact-1")
-            .expect("artifact acl decodes");
-        assert_eq!(artifact.user_id, "user-1");
-        assert_eq!(artifact.access_scope, "delegation");
-        assert_eq!(artifact.owner_run_id.as_deref(), Some("owner-run"));
-        assert_eq!(artifact.root_run_id.as_deref(), Some("root-run"));
-        assert_eq!(artifact.status, "active");
-
-        for column in [
-            "user_id",
-            "access_scope",
-            "owner_run_id",
-            "root_run_id",
-            "status",
-        ] {
-            assert_database_error_mentions(
-                decode_artifact_acl_row(&FakeStateProjectionRow::fail_on(column), "artifact-1"),
-                column,
-            );
-        }
     }
 
     #[test]

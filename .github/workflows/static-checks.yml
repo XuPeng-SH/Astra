@@ -117,6 +117,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/load -p 'test_*.py'
           python3 scripts/schema/test_schema_inventory.py
+          python3 -m unittest scripts.e2e.test_validate_capability_matrix
           python3 scripts/e2e/validate_capability_matrix.py
       - uses: ./.github/actions/rust-setup
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}

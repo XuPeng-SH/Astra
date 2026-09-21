@@ -80,6 +80,9 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         startup_owner="DatabaseResourceGovernor::ensure_tables",
         state_class_hint="quota fact",
         hot_path_hint="warm quota read/write",
+        # Test-only fault knobs appear before the production impl in this
+        # module; stopping at the first cfg(test) marker would hide its DDL.
+        stop_at_cfg_test=False,
     ),
     SchemaSource(
         owner="astra_services::workspace_records",
@@ -478,16 +481,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / session_lifecycle",
         product_owner="irreversible session deletion, delayed-write fencing, and crash recovery",
     ),
-    "session_deletion_tombstones": TableMetadata(
-        semantic_owner="astra_services::session_lifecycle",
-        state_class="durable session deletion compatibility tombstone",
-        primary_query="deleted-session lookup by user_id/session_id and retention scan by deleted_at",
-        retention_policy="retain as compatibility evidence while legacy readers and delayed event-ingestion paths can encounter the deleted identity",
-        rebuildability="not rebuildable after deletion without the surviving lifecycle fence or another durable deletion record",
-        merge_guidance="migrate consumers toward agent_session_lifecycle_fences before consolidation; do not remove while any path still checks tombstones",
-        migration_owner="astra_services::storage / session_lifecycle",
-        product_owner="session deletion compatibility and resurrection prevention",
-    ),
     "agent_runs": TableMetadata(
         semantic_owner="astra_services::runs::DatabaseRunStateStore",
         state_class="durable run lifecycle authority",
@@ -558,35 +551,15 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / runtime session persistence",
         product_owner="web/session transcript pagination",
     ),
-    "session_history_chunks": TableMetadata(
-        semantic_owner="astra_services::session_lifecycle / history search",
-        state_class="derived search/history projection",
-        primary_query="history chunk lookup by owner/session/source metadata",
-        retention_policy="retain while history search and session cleanup need chunk metadata",
-        rebuildability="rebuildable only if source transcript/history remains complete",
-        merge_guidance="do not merge with transcript until search/query owners and retention are unified",
-        migration_owner="astra_services::storage",
-        product_owner="session history search and lifecycle cleanup",
-    ),
     "session_artifacts": TableMetadata(
         semantic_owner="astra_services::session_artifact_store / artifact_retention_sweeper",
         state_class="durable session artifact fact",
         primary_query="artifact lookup/list by user_id, session_id, artifact_id, artifact_kind, source, owner_run_id, root_run_id, access_scope, status, and retention_until",
-        retention_policy="retain while artifact previews, manifest refs, state items, citations, grants, and project retention need the content_json; retention sweeper marks expiring/expired and session hard delete removes owner/session rows after grants",
+        retention_policy="retain while artifact previews, manifest refs, state items, citations, and project retention need the content_json; retention sweeper marks expiring/expired and session hard delete removes owner/session rows",
         rebuildability="not rebuildable after content_json, metadata, cold_storage_ref, derived_from_artifact_id, and reference counters are lost",
-        merge_guidance="keep separate from session_artifacts_grants; artifacts own content and retention state while grants own cross-run/delegation visibility",
+        merge_guidance="keep separate from context manifests and state items; artifacts own content and retention state while callers enforce owner/run visibility",
         migration_owner="astra_services::storage / session_artifact_store",
         product_owner="work surface artifacts, previews, retention, delegation visibility",
-    ),
-    "session_artifacts_grants": TableMetadata(
-        semantic_owner="astra_services::state_projection / artifact grants",
-        state_class="durable artifact visibility grant fact",
-        primary_query="artifact grant lookup by user_id, session_id, artifact_id, grant_scope, target_run_id, target_delegation_id, root_run_id, and expires_at",
-        retention_policy="retain while delegated runs or sibling tasks may access granted artifacts; session hard delete removes grants before artifact rows",
-        rebuildability="not rebuildable after grant_scope, target_run_id/delegation_id, reason, and expires_at are lost",
-        merge_guidance="keep separate from session_artifacts; grants are visibility/control-plane facts with many targets per artifact",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="artifact sharing across delegation tree and work surface permissions",
     ),
     "prompt_request_records": TableMetadata(
         semantic_owner="astra_services::prompt_delta",
@@ -858,16 +831,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / observation_capture",
         product_owner="observation integrity diagnostics and runtime maintenance",
     ),
-    "session_state_revisions": TableMetadata(
-        semantic_owner="astra_services::state_projection",
-        state_class="durable session state revision watermark",
-        primary_query="current revision and projection hash by user_id/session_id; updated sessions by user_id/updated_at",
-        retention_policy="retain with the session while device sync, state projection integrity checks, and high-watermark reconciliation need monotonic revision state; session hard delete removes owner/session row",
-        rebuildability="not safely rebuildable once monotonic_id, transcript/run high-watermarks, and device fingerprint lineage are lost",
-        merge_guidance="keep separate from session_state_items; this is the session-level revision/watermark authority, not individual projected state",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="session state sync and projection integrity",
-    ),
     "session_device_leases": TableMetadata(
         semantic_owner="runtime::server::session_handlers",
         state_class="durable device lease current state",
@@ -1047,16 +1010,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="canonical mapping shared by verified providers; do not add provider-specific identity state machines",
         migration_owner="astra_services::storage / auth",
         product_owner="authentication and account continuity",
-    ),
-    "auth_memoria_identities": TableMetadata(
-        semantic_owner="astra_services::auth / Memoria integration",
-        state_class="durable external-to-Astra identity mapping fact",
-        primary_query="read-only legacy migration lookup; never insert new identities",
-        retention_policy="remove the legacy row atomically after explicitly issuer-authorized migration to auth_external_identities",
-        rebuildability="cannot infer missing issuer; require administrator-confirmed original provenance",
-        merge_guidance="migration source only; canonical provider identity belongs to auth_external_identities",
-        migration_owner="astra_services::storage / auth",
-        product_owner="Memoria sign-in and Astra account continuity",
     ),
     "auth_audit_logs": TableMetadata(
         semantic_owner="astra_services::auth::admin / auth session audit",
@@ -1962,6 +1915,157 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ),
     ),
     ConsolidationReview(
+        candidate="session_state_revisions",
+        decision="removed",
+        current_read_paths=[
+            "none; the session-state endpoint derives the revision from request input and live transcript/run watermarks"
+        ],
+        current_write_paths=[
+            "none; the hydration write-only snapshot path was removed from session_handlers"
+        ],
+        user_api_impact=(
+            "the response still returns monotonic_id and revision_hash, while rollback detection "
+            "continues to compare the request hash with the freshly derived revision"
+        ),
+        migration_backfill=(
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "write-only projection"
+        ),
+        rollback=(
+            "rollback requires explicitly restoring the retired persistence path; the endpoint's "
+            "revision calculation is independent of the retired snapshot"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/runtime/src/server/session/session_handlers.rs::get_session_state_handler",
+        ],
+        rationale=(
+            "the table was write-only state projection baggage: every hydration paid an UPDATE/INSERT "
+            "race, but no production path read it for sync, recovery, or authorization"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_history_chunks",
+        decision="removed",
+        current_read_paths=[
+            "none; history page/search/around now use session_transcript_items as the canonical history source"
+        ],
+        current_write_paths=[
+            "none in production; repository writes were confined to ignored fixtures and obsolete benchmarks"
+        ],
+        user_api_impact=(
+            "history tools retain canonical transcript paging, root-run filtering, search, and around-turn "
+            "behavior; obsolete chunk-only rows are not part of the supported history API"
+        ),
+        migration_backfill=(
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "secondary history projection"
+        ),
+        rollback=(
+            "rollback requires reintroducing the chunk reader and schema; that unsupported path is "
+            "not part of the current contract"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/runtime/src/server/tool_session_history.rs::history_search",
+            "crates/runtime/src/server/tool_session_history.rs::session_history_tools_filter_child_agent_rows_on_matrixone",
+        ],
+        rationale=(
+            "the chunk projection had a production reader but no production population path; it added a "
+            "second history source and an extra search query without being part of the canonical transcript"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_artifacts_grants",
+        decision="removed",
+        current_read_paths=[
+            "none; no production caller remains after removing the unused grant ACL method"
+        ],
+        current_write_paths=[
+            "none; grant inserts existed only in ignored integration fixtures and had no product creation API"
+        ],
+        user_api_impact=(
+            "artifact access remains owner/session/run scoped through session_artifacts and existing artifact "
+            "retrieval paths; the unexposed grant-only cross-run feature is retired"
+        ),
+        migration_backfill=(
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "grant-only projection"
+        ),
+        rollback=(
+            "rollback requires a deliberate grant API, writer, revocation semantics, and enforcement path; "
+            "the retired grant rows are not a supported permission source"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/services/src/state_projection.rs::DatabaseStateProjectionStore",
+        ],
+        rationale=(
+            "this was an overdesigned control-plane table with an enforcement reader but no production grant "
+            "creation path or caller, so it could not provide a supported permission capability"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_deletion_tombstones",
+        decision="removed",
+        current_read_paths=[
+            "none; session admission now relies on the locked agent_session_lifecycle_fences row",
+        ],
+        current_write_paths=[
+            "none; session deletion records delete intent and completion on agent_session_lifecycle_fences",
+        ],
+        user_api_impact=(
+            "no user-visible deletion state is removed; the lifecycle fence remains the durable "
+            "anti-resurrection and recovery authority"
+        ),
+        migration_backfill=(
+            "legacy rows are copied into agent_session_lifecycle_fences before the redundant table "
+            "is dropped during the v85 schema bootstrap"
+        ),
+        rollback=(
+            "rollback would require explicitly restoring the legacy table and its readers; "
+            "the surviving lifecycle fence retains the deletion fact"
+        ),
+        test_evidence=[
+            "crates/services/tests/schema_assertions.rs::core_schema_catalog_matches_live_idempotent_bootstrap",
+            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::deletion_tombstone_schema_upgrade_migrates_rows_and_drops_redundant_table",
+        ],
+        rationale=(
+            "the tombstone duplicated the lifecycle fence's irreversible delete fact and added "
+            "a read to every admitted session write plus a write to every deletion"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="auth_memoria_identities",
+        decision="removed",
+        current_read_paths=[
+            "none in steady-state auth; v86 bootstrap reads the legacy source only during migration",
+        ],
+        current_write_paths=[
+            "v86 bootstrap backfills auth_external_identities with the reserved memoria:legacy provider id and drops the source table",
+        ],
+        user_api_impact=(
+            "legacy Memoria accounts remain reconnectable only with an explicit legacy issuer; "
+            "current issuer-scoped identity and disconnect behavior remain in auth_external_identities"
+        ),
+        migration_backfill=(
+            "copy memoria_user_id/astra_user_id into auth_external_identities, fail closed on a "
+            "conflicting canonical mapping, then drop the migration-only source table"
+        ),
+        rollback=(
+            "rollback requires restoring the source rows from the reserved memoria:legacy mappings; "
+            "the canonical rows retain the complete legacy identity pair"
+        ),
+        test_evidence=[
+            "crates/services/tests/edge_dispatch_schema_migration_db_it.rs::legacy_memoria_identity_schema_upgrade_migrates_rows_and_drops_source_table",
+            "crates/services/tests/memoria_auth_db_it.rs::memoria_issuer_atomicity_concurrent_binding_and_disconnect",
+        ],
+        rationale=(
+            "the table is a read-only migration source with no independent authority; keeping it "
+            "forces runtime auth and model eligibility to maintain a second identity lookup"
+        ),
+    ),
+    ConsolidationReview(
         candidate="data_versioning_checkpoints",
         decision="keep",
         current_read_paths=[
@@ -2093,11 +2197,18 @@ def repository_root() -> Path:
 def discover_production_ddl_source_paths(root: Path | None = None) -> list[str]:
     root = root or REPO_ROOT
     crates_dir = root / "crates"
+    manifest_by_path = {source.path: source for source in SCHEMA_SOURCES}
     discovered: list[str] = []
     for path in sorted(crates_dir.glob("*/src/**/*.rs")):
-        text = production_source(path.read_text(encoding="utf-8"), stop_at_cfg_test=True)
+        relative_path = path.relative_to(root).as_posix()
+        source = manifest_by_path.get(relative_path)
+        stop_at_cfg_test = True if source is None else source.stop_at_cfg_test
+        text = production_source(
+            path.read_text(encoding="utf-8"),
+            stop_at_cfg_test=stop_at_cfg_test,
+        )
         if CREATE_TABLE_RE.search(text):
-            discovered.append(path.relative_to(root).as_posix())
+            discovered.append(relative_path)
     # Path.glob ordering is filesystem/path-object dependent for a sibling
     # module directory and its parent Rust file (for example `work/` and
     # `work.rs`).  Keep the discovery contract deterministic and comparable to

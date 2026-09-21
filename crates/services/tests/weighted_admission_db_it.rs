@@ -739,12 +739,12 @@ async fn gate_first_session_delete_does_not_deadlock_with_release() {
     .await
     .expect("count deleted session");
     assert_eq!(remaining_sessions, 0);
-    sqlx::query("DELETE FROM session_deletion_tombstones WHERE session_id = ? AND user_id = ?")
+    sqlx::query("DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?")
         .bind(&session_id)
         .bind(&owner)
         .execute(&pool)
         .await
-        .expect("clean canonical delete tombstone");
+        .expect("clean canonical delete fence");
     reset_admission_scope(&shared).await;
 }
 
@@ -794,12 +794,12 @@ async fn session_delete_without_reservation_keeps_materialized_usage_clean() {
         usage_initialized, 1,
         "deleting a session with no reservation must not force a rebuild"
     );
-    sqlx::query("DELETE FROM session_deletion_tombstones WHERE session_id = ? AND user_id = ?")
+    sqlx::query("DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
         .bind(owner)
         .execute(&pool)
         .await
-        .expect("clean empty session tombstone");
+        .expect("clean empty session fence");
     reset_admission_scope(&shared).await;
 }
 

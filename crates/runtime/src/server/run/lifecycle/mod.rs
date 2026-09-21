@@ -8838,9 +8838,13 @@ impl AgenticRunLifecycleService {
                 .await?;
         }
         if !request.has_agent_binding_runtime() && request.runtime_skill_binding.is_none() {
-            let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
-            apply_normalized_skill_allowlist(resolver, &request_constraints)
-                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+            let skill_policy = request_constraints.skill_surfacing_policy();
+            if skill_policy.requires_catalog_validation() {
+                let (_, resolver) =
+                    build_server_skill_resolver(self.skill_service.clone(), user_id);
+                apply_normalized_skill_allowlist(resolver, &request_constraints)
+                    .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+            }
         }
         Ok(request_constraints)
     }
@@ -9924,51 +9928,17 @@ impl AgenticRunLifecycleService {
                     "model_selection_invalid",
                 ));
             }
-            let catalog = self
+            let offering_id = self
                 .model_service
-                .user_model_catalog(user_id.to_string())
-                .await?;
-            let offerings = astra_services::models::model_catalog_for_purpose(
-                catalog.items,
-                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-            );
-            let declared = astra_services::models::server_model_access_declarations(
-                catalog.allows_deployment,
-                offerings.iter().map(|item| item.access_kind),
-            );
-            let user_default = catalog.default_offering_id.map(|offering_id| {
-                astra_services::ModelDefaultCandidate {
-                    offering_id,
-                    source: astra_services::ModelDefaultSource::Astra,
-                    scope: astra_services::ModelDefaultScope::EffectiveCatalog,
-                }
-            });
-            let offering_views = offerings
-                .into_iter()
-                .filter(|offering| offering.is_active)
-                .map(astra_services::ModelListItemResponse::from)
-                .collect::<Vec<_>>();
-            let projection = astra_services::project_model_access_with_default(
-                declared,
-                offering_views,
-                user_default,
-                chrono::Utc::now().to_rfc3339(),
-            )
-            .map_err(|error| {
-                tracing::error!(error = %error, "Server Model Access projection is invalid");
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Server default model policy is unavailable",
-                    "model_default_unavailable",
-                )
-            })?;
-            let offering_id = projection.default_offering_id.ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Server default model is unavailable",
-                    "model_default_unavailable",
-                )
-            })?;
+                .default_chat_model_offering_id(user_id.to_string())
+                .await?
+                .ok_or_else(|| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Server default model is unavailable",
+                        "model_default_unavailable",
+                    )
+                })?;
             let selection = ModelSelection { offering_id };
             let admitted = crate::server::model_execution_admission::admit_model_execution(
                 &self.model_service,
@@ -10065,6 +10035,27 @@ impl AgenticRunLifecycleService {
         request.resolved_model_selection = Some(resolved);
         request.admitted_model_execution = Some(admitted);
         Ok(request)
+    }
+
+    async fn plan_resume_snapshot_for_request(
+        &self,
+        request: &ChatRequestData,
+        user_id: &str,
+        session_id: &str,
+    ) -> astra_plan::PlanResumeSnapshot {
+        let Some(shared) = &self.shared_pool else {
+            return astra_plan::PlanResumeSnapshot::default();
+        };
+        let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
+        if let Some(facts) = request.session_admission_facts.as_ref() {
+            return match facts.active_plan_id.as_deref() {
+                Some(plan_id) => {
+                    astra_plan::plan_resume_snapshot_for_plan(&repo, user_id, plan_id).await
+                }
+                None => astra_plan::PlanResumeSnapshot::default(),
+            };
+        }
+        astra_plan::plan_resume_snapshot_for_session(&repo, user_id, session_id).await
     }
 
     fn validate_effective_user_input(
@@ -15458,12 +15449,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Load plan state as structured data: prompt hint for context, plus
         // an independent authoring flag for the tool gate. Ordinary session
         // resume context must not activate plan-mode blocking.
-        let plan_resume_snapshot = if let Some(shared) = &self.shared_pool {
-            let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
-        } else {
-            astra_plan::PlanResumeSnapshot::default()
-        };
+        let plan_resume_snapshot = self
+            .plan_resume_snapshot_for_request(&request, &user_id, &session_id)
+            .await;
         let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
         let plan_resume_hint = plan_snapshot_resume_hint.clone();
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
@@ -16862,12 +16850,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             (csl_manager, session_resume_hint)
         };
         let plan_resume = async {
-            if let Some(shared) = &self.shared_pool {
-                let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-                astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
-            } else {
-                astra_plan::PlanResumeSnapshot::default()
-            }
+            self.plan_resume_snapshot_for_request(&request, &user_id, &session_id)
+                .await
         };
         let ((csl_manager, session_resume_hint), plan_resume_snapshot) =
             tokio::join!(history_restore, plan_resume);

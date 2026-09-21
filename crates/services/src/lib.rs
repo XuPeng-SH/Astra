@@ -310,9 +310,10 @@ pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
     DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, RunContinuationRecord,
     RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
-    RunStateStore, RunStatusRecord, UnconfiguredRunLifecycleService, WorkItemRuntimeBindingRequest,
-    WorkRuntimeBindingRequest, extract_event_type, run_list_cursor_db_updated_at,
-    run_list_cursor_run_id, transform_run_event_for_client, validate_run_list_limit,
+    RunStateStore, RunStatusRecord, SessionAdmissionFacts, UnconfiguredRunLifecycleService,
+    WorkItemRuntimeBindingRequest, WorkRuntimeBindingRequest, extract_event_type,
+    run_list_cursor_db_updated_at, run_list_cursor_run_id, transform_run_event_for_client,
+    validate_run_list_limit,
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,
