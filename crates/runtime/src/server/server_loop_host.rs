@@ -9226,7 +9226,7 @@ impl ServerAgenticLoopHost {
                 format!("{}/judgment/{span_id}", context.root_node_id),
                 Some(context.root_node_id.clone()),
                 astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation,
-                observation.fact.preparation_label(),
+                observation.fact.presentation_label(),
                 now,
                 Some(observation.correlation.round),
                 None,
