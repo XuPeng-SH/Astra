@@ -25,6 +25,10 @@ const MAX_MANIFEST_ENTRIES: usize = 16_384;
 const MAX_STATUS_CONTENT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STATUS_ENTRIES: usize = 8_192;
+// Permission observation reads only tracked path metadata, not tracked file
+// contents. Keep the index listing bounded independently from status output.
+const MAX_TRACKED_METADATA_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRACKED_METADATA_ENTRIES: usize = 131_072;
 // Ignored build/output directories are useful deliverables, but expanding a
 // whole cache would make every Bash call expensive.  Scan a small bounded
 // tree; larger caches intentionally become Unknown rather than being treated
@@ -3208,6 +3212,9 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
     // still produces a delta; hashing the full repository tree would make a
     // sibling-only commit look like a change in a nested workspace.
     tree_bytes.hash(&mut hasher);
+    if !hash_tracked_metadata(root, &mut hasher) {
+        return GitFingerprint::Unknown;
+    }
     // Status alone is insufficient for a pre-dirty workspace: changing a
     // file that was already marked `M` leaves the status bytes unchanged.
     // Hash the bounded content of every path reported by status so a generic
@@ -3306,6 +3313,41 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
 }
 
 fn git_index_is_observable(root: &Path) -> bool {
+    let Some(mut stage_command) = hardened_git_command(root) else {
+        return false;
+    };
+    stage_command.args(["ls-files", "--stage", "-z", "--", "."]);
+    let Some(stage_output) = run_bounded_probe(
+        stage_command,
+        MAX_STATUS_OUTPUT_BYTES,
+        FINGERPRINT_PROBE_TIMEOUT,
+    ) else {
+        return false;
+    };
+    if !stage_output.success {
+        return false;
+    }
+    let mut stage_entries = 0usize;
+    for entry in stage_output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        stage_entries = stage_entries.saturating_add(1);
+        if stage_entries > MAX_STATUS_ENTRIES
+            || entry.len() < 7
+            || entry[6] != b' '
+            || !entry[7..].contains(&b'\t')
+        {
+            return false;
+        }
+        // A populated submodule has a gitlink (mode 160000). Its own
+        // repository configuration can run filters during the parent status
+        // probe, so the parent fast path cannot safely observe it.
+        if &entry[..6] == b"160000" {
+            return false;
+        }
+    }
+
     let Some(mut command) = hardened_git_command(root) else {
         return false;
     };
@@ -3335,6 +3377,87 @@ fn git_index_is_observable(root: &Path) -> bool {
         }
     }
     true
+}
+
+fn hash_tracked_metadata(root: &Path, hasher: &mut DefaultHasher) -> bool {
+    let Some(mut command) = hardened_git_command(root) else {
+        return false;
+    };
+    command.args(["ls-files", "-z", "--cached", "--", "."]);
+    let Some(output) = run_bounded_probe(
+        command,
+        MAX_TRACKED_METADATA_OUTPUT_BYTES,
+        FINGERPRINT_PROBE_TIMEOUT,
+    ) else {
+        return false;
+    };
+    if !output.success {
+        return false;
+    }
+
+    b"astra-tracked-metadata-v1".hash(hasher);
+    let mut entries = 0usize;
+    for path_bytes in output.stdout.split(|byte| *byte == 0) {
+        if path_bytes.is_empty() {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        if entries > MAX_TRACKED_METADATA_ENTRIES {
+            return false;
+        }
+        let Ok(path_text) = std::str::from_utf8(path_bytes) else {
+            return false;
+        };
+        let path = Path::new(path_text);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return false;
+        }
+        // `git -C root ls-files -- .` emits paths relative to the bound
+        // working directory, unlike `git status` when a parent ignore rule
+        // collapses an ignored entry. Resolve tracked paths from `root`.
+        let path_from_workspace = path;
+        let path_from_git_root = root.join(path);
+        if path_from_workspace
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == ".astra")
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path_from_git_root) else {
+            return false;
+        };
+        path_from_workspace.to_string_lossy().hash(hasher);
+        let state_before = tracked_metadata_state(&metadata, hasher);
+        if metadata.file_type().is_symlink() {
+            let Ok(target) = fs::read_link(&path_from_git_root) else {
+                return false;
+            };
+            target.to_string_lossy().hash(hasher);
+        }
+        let Ok(state_after) = fs::symlink_metadata(&path_from_git_root) else {
+            return false;
+        };
+        if state_before != tracked_metadata_state(&state_after, &mut DefaultHasher::new()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn tracked_metadata_state(metadata: &fs::Metadata, hasher: &mut DefaultHasher) -> u64 {
+    let mut state = DefaultHasher::new();
+    metadata.file_type().is_symlink().hash(&mut state);
+    metadata.is_dir().hash(&mut state);
+    metadata.len().hash(&mut state);
+    hash_permissions(metadata, &mut state);
+    let value = state.finish();
+    value.hash(hasher);
+    value
 }
 
 fn hash_ignored_directory(
@@ -6063,6 +6186,78 @@ mod tests {
             WorkspaceFingerprint::capture(temp.path()).is_some(),
             "a clean tracked file must not consume the uncommitted-content budget"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_tracked_permission_change_is_observable_when_git_ignores_filemode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        run(&["config", "core.filemode", "false"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
+        let mut permissions = fs::metadata(temp.path().join("tracked.txt"))
+            .expect("tracked metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(temp.path().join("tracked.txt"), permissions)
+            .expect("change tracked permissions");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn gitlink_entries_fail_closed_for_workspace_observation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap()])
+                .args(args)
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "astra@example.invalid"]);
+        run(&["config", "user.name", "Astra Test"]);
+        fs::write(temp.path().join("tracked.txt"), "base").expect("tracked file");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-qm", "tracked file"]);
+        let output = Command::new("git")
+            .args(["-C", temp.path().to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .expect("git available");
+        assert!(output.status.success());
+        let commit = String::from_utf8(output.stdout)
+            .expect("commit id")
+            .trim()
+            .to_string();
+        let cacheinfo = format!("160000,{commit},nested");
+        run(&[
+            "update-index",
+            "--add",
+            "--info-only",
+            "--cacheinfo",
+            &cacheinfo,
+        ]);
+
+        assert!(!git_index_is_observable(temp.path()));
+        assert!(WorkspaceFingerprint::capture(temp.path()).is_none());
     }
 
     #[test]
