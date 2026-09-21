@@ -3330,7 +3330,7 @@ fn git_index_is_observable(root: &Path) -> bool {
         // `git status` intentionally trusts these index bits. A task can set
         // them and then rewrite a file without producing a status entry, so
         // an authoritative receipt is impossible until the checkout is reset.
-        if matches!(entry[0], b'h' | b'S') {
+        if matches!(entry[0], b'h' | b'S' | b's') {
             return false;
         }
     }
@@ -6098,6 +6098,25 @@ mod tests {
         assert!(
             WorkspaceFingerprint::capture(temp.path()).is_none(),
             "skip-worktree hides worktree changes from git status"
+        );
+
+        run(&[
+            "update-index",
+            "--no-assume-unchanged",
+            "--no-skip-worktree",
+            "tracked.txt",
+        ]);
+        run(&[
+            "update-index",
+            "--assume-unchanged",
+            "--skip-worktree",
+            "tracked.txt",
+        ]);
+        fs::write(temp.path().join("tracked.txt"), "combined-flags rewrite")
+            .expect("combined-flags rewrite");
+        assert!(
+            WorkspaceFingerprint::capture(temp.path()).is_none(),
+            "combined assume-unchanged and skip-worktree flags hide worktree changes from git status"
         );
     }
 
