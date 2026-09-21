@@ -9924,51 +9924,17 @@ impl AgenticRunLifecycleService {
                     "model_selection_invalid",
                 ));
             }
-            let catalog = self
+            let offering_id = self
                 .model_service
-                .user_model_catalog(user_id.to_string())
-                .await?;
-            let offerings = astra_services::models::model_catalog_for_purpose(
-                catalog.items,
-                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-            );
-            let declared = astra_services::models::server_model_access_declarations(
-                catalog.allows_deployment,
-                offerings.iter().map(|item| item.access_kind),
-            );
-            let user_default = catalog.default_offering_id.map(|offering_id| {
-                astra_services::ModelDefaultCandidate {
-                    offering_id,
-                    source: astra_services::ModelDefaultSource::Astra,
-                    scope: astra_services::ModelDefaultScope::EffectiveCatalog,
-                }
-            });
-            let offering_views = offerings
-                .into_iter()
-                .filter(|offering| offering.is_active)
-                .map(astra_services::ModelListItemResponse::from)
-                .collect::<Vec<_>>();
-            let projection = astra_services::project_model_access_with_default(
-                declared,
-                offering_views,
-                user_default,
-                chrono::Utc::now().to_rfc3339(),
-            )
-            .map_err(|error| {
-                tracing::error!(error = %error, "Server Model Access projection is invalid");
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Server default model policy is unavailable",
-                    "model_default_unavailable",
-                )
-            })?;
-            let offering_id = projection.default_offering_id.ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Server default model is unavailable",
-                    "model_default_unavailable",
-                )
-            })?;
+                .default_chat_model_offering_id(user_id.to_string())
+                .await?
+                .ok_or_else(|| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Server default model is unavailable",
+                        "model_default_unavailable",
+                    )
+                })?;
             let selection = ModelSelection { offering_id };
             let admitted = crate::server::model_execution_admission::admit_model_execution(
                 &self.model_service,
