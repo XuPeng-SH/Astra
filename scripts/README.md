@@ -237,8 +237,10 @@ python3 scripts/schema/test_schema_inventory.py
 
 ### `scripts/e2e/validate_capability_matrix.py`
 Validates that every `system_test` name in the product capability matrix still
-resolves to a real Rust function somewhere under `crates/`. This is an
-offline, dependency-free guard against renamed or deleted evidence anchors:
+resolves to a real Rust function somewhere under `crates/`. It also understands
+the `matrix_test!` and `current_thread_matrix_test!` registrations used by the
+system E2E crate. This is an offline, dependency-free guard against renamed or
+deleted evidence anchors:
 
 ```sh
 python3 scripts/e2e/validate_capability_matrix.py
