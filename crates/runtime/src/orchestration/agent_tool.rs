@@ -1370,28 +1370,39 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .iter()
         .map(|(_, _, _, input)| input.clone())
         .collect();
-    if let Err(error) = ctx.spawner.validate_spawn_inputs(
-        &resolved_inputs,
-        &SpawnContext {
-            parent_run_id: ctx.run_id.clone(),
-            parent_agent_id: ctx.agent_id.clone(),
-            resolved_model_name: ctx.current_model.clone(),
-            recursion_depth: ctx.recursion_depth,
-            parent_is_fork_child: ctx.is_fork_child,
-            working_dir: ctx.working_dir.clone(),
-            inherited_permissions: ctx.inherited_permissions.clone(),
-            inherited_skills: ctx.active_skills.clone(),
-            live_event_sink: ctx.live_event_sink.clone(),
-            client_tool_delivery_tx: ctx.client_tool_delivery_tx.clone(),
-            trace_context: ctx.trace_context.clone(),
-            spawn_tool_call_id: tool_call_id.clone(),
-            execution_metadata: ctx.execution_metadata.clone(),
-            workspace_mutation: ctx.workspace_mutation.get(),
-            delegation_chain: ctx.delegation_chain.clone(),
-        },
-    ) {
+    let spawn_context = SpawnContext {
+        parent_run_id: ctx.run_id.clone(),
+        parent_agent_id: ctx.agent_id.clone(),
+        resolved_model_name: ctx.current_model.clone(),
+        recursion_depth: ctx.recursion_depth,
+        parent_is_fork_child: ctx.is_fork_child,
+        working_dir: ctx.working_dir.clone(),
+        inherited_permissions: ctx.inherited_permissions.clone(),
+        inherited_skills: ctx.active_skills.clone(),
+        live_event_sink: ctx.live_event_sink.clone(),
+        client_tool_delivery_tx: ctx.client_tool_delivery_tx.clone(),
+        trace_context: ctx.trace_context.clone(),
+        spawn_tool_call_id: tool_call_id.clone(),
+        execution_metadata: ctx.execution_metadata.clone(),
+        workspace_mutation: ctx.workspace_mutation.get(),
+        delegation_chain: ctx.delegation_chain.clone(),
+    };
+    if let Err(error) = ctx
+        .spawner
+        .validate_spawn_inputs(&resolved_inputs, &spawn_context)
+    {
         return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
     }
+    let preparations = match ctx
+        .spawner
+        .prepare_spawn_batch(&resolved_inputs, &spawn_context)
+        .await
+    {
+        Ok(preparations) => preparations,
+        Err(error) => {
+            return render_agent_tool_error(None, &format!("fanout admission failed: {error}"));
+        }
+    };
     let _capacity_reservation = match ctx
         .spawner
         .reserve_spawn_capacity(&group_id, input.target_count, &ctx.run_id)
@@ -1426,7 +1437,8 @@ async fn handle_agent_fanout_start_action_with_deadline(
     // Spawn all slots concurrently — no head-of-line blocking.
     let futs: Vec<_> = planned_slots
         .into_iter()
-        .map(|(slot_index, slot_id, spawn_args, _)| {
+        .zip(preparations)
+        .map(|((slot_index, slot_id, spawn_args, _), preparation)| {
             let capacity_reservation_owner = capacity_reservation_owner.clone();
             Box::pin(async move {
                 let rendered = handle_agent_spawn_action_with_controls(
@@ -1434,6 +1446,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
                     Some(ctx),
                     SpawnDeadline::Explicit(child_execution_deadline),
                     capacity_reservation_owner.as_deref(),
+                    Some(preparation),
                 )
                 .await;
                 let rendered_value = parsed_agent_output_or_bounded_error(rendered);
@@ -2461,7 +2474,7 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
 
 /// Handle `agent(action='spawn')`.
 pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
-    handle_agent_spawn_action_with_controls(args, ctx, SpawnDeadline::Derive, None).await
+    handle_agent_spawn_action_with_controls(args, ctx, SpawnDeadline::Derive, None, None).await
 }
 
 #[derive(Clone, Copy)]
@@ -2517,6 +2530,7 @@ async fn handle_agent_spawn_action_with_controls(
     ctx: Option<&AgentToolContext>,
     deadline_policy: SpawnDeadline,
     reservation_owner_id: Option<&str>,
+    preparation: Option<Box<dyn super::spawner::PreparedSpawn>>,
 ) -> String {
     let input: SpawnAgentInput = match normalize_agent_spawn_args(args)
         .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
@@ -2636,11 +2650,12 @@ async fn handle_agent_spawn_action_with_controls(
     let spawn_future = Box::pin(async move {
         let _fanout_admission = fanout_admission;
         spawner
-            .spawn_with_controls(
+            .spawn_with_prepared_controls(
                 input,
                 &spawn_ctx,
                 execution_deadline,
                 reservation_owner_id.as_deref(),
+                preparation,
             )
             .await
     });
