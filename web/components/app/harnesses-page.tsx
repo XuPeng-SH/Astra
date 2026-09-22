@@ -47,6 +47,7 @@ import { PageHeader } from '@/components/ui/page-header';
 import { Textarea } from '@/components/ui/textarea';
 import { RuleEvidence, SkillContentComparison, frozenSkillSources } from '@/components/app/skill-evidence';
 import { cn } from '@/lib/utils/cn';
+import { SkillUseAction } from '@/components/app/skill-use-action';
 
 type HarnessView = 'catalog' | 'skillify' | 'custom';
 type SkillifySourceFileInput = {
@@ -243,6 +244,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
+        expected_revision: draft.revision,
         decision,
         reason: decision === 'approve' ? 'Approved rule from Skillify review UI.' : 'Rejected rule from Skillify review UI.',
       });
@@ -272,6 +274,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
+        expected_revision: draft.revision,
         decision: edit.decision,
         after_json: { statement, rationale, content_markdown: edit.content_markdown },
         reason: 'Edited rule from Skillify review UI.',
@@ -294,6 +297,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        expected_revision: draft.revision,
         decision,
         reason: decision === 'approve' ? 'Approved skill from Skillify review UI.' : 'Rejected skill from Skillify review UI.',
       });
@@ -318,6 +322,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        expected_revision: draft.revision,
         decision: 'edit',
         after_json: { content_markdown },
         reason: 'Edited skill content from Skillify review UI.',
@@ -340,6 +345,7 @@ export function HarnessesPage() {
     setError(null);
     try {
       const record = await publishSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        expected_revision: draft.revision,
         visibility,
       });
       setPublished((current) => [...current, record]);
@@ -1042,11 +1048,15 @@ function SkillifyView({
                 </Card>
               ) : null}
 
+                  {activeDraft?.published_version_id && run ? <Card>
+                    <p>{activeDraft.candidate_name} 已保存为个人 Skill</p>
+                    <SkillUseAction key={activeDraft.published_version_id} run={run} skillName={activeDraft.candidate_name} versionId={activeDraft.published_version_id} />
+                  </Card> : null}
 	              {activeDraft ? (
 	                <Card>
 	                  <div>
-	                    <h2 className="text-base font-semibold">Publish Queue</h2>
-	                    <p className="mt-1 text-sm text-text-secondary">Approved skills can be published privately or publicly.</p>
+	                    <h2 className="text-base font-semibold">保存已审核的 Skill</h2>
+	                    <p className="mt-1 text-sm text-text-secondary">保存后可在来源会话中明确启用新版本。</p>
 	                  </div>
 	                  {readyDrafts.length ? (
 	                    <div className="mt-3 space-y-2">
@@ -1068,15 +1078,7 @@ function SkillifyView({
 	                            >
 	                              Private
 	                            </Button>
-	                            <Button
-	                              size="sm"
-	                              variant="ghost"
-	                              leadingIcon={UploadCloud}
-	                              onClick={() => onPublishDraft(draft, 'public')}
-	                              disabled={busy}
-	                            >
-	                              Public
-	                            </Button>
+
 	                          </div>
 	                        </div>
 	                      ))}

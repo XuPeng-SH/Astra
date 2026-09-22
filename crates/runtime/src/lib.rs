@@ -170,9 +170,8 @@ pub use astra_services::{
         HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord, HarnessRunRecord,
         HarnessService, HarnessSkillDraftRecord, HarnessSkillRuleRecord, HarnessTemplateRecord,
         SkillifyAgentCitation, SkillifyAgentDraft, SkillifyAgentExecutor, SkillifyAgentOutput,
-        SkillifyAgentRequest, SkillifyAgentRule, SkillifyDraftRecord, SkillifyDraftRequest,
-        SkillifyPublishRecord, SkillifyPublishRequest, SkillifyRunRequest, SkillifySourceFile,
-        SkillifySourcePacket, UnconfiguredHarnessService,
+        SkillifyAgentRequest, SkillifyAgentRule, SkillifyPublishRecord, SkillifyPublishRequest,
+        SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
     },
     jobs::{
         InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,

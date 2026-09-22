@@ -56,3 +56,12 @@ export function SkillContentComparison({ before, after }: { before: string; afte
     </div>
   </details>;
 }
+
+export function SkillSourceCoverage({ run }: { run: HarnessRun }) {
+  const coverage = run.input_json?.source_coverage as { selected_event_count: number; older_events_omitted: boolean } | undefined;
+  if (!coverage) return null;
+  return <p className="mt-3 text-xs text-text-muted" role={coverage.older_events_omitted ? 'status' : undefined}>
+    使用最近 {coverage.selected_event_count} 条会话记录。
+    {coverage.older_events_omitted ? '较早记录已省略；这是有限证据窗口，不能代表完整会话。如需早期材料，请在详细审核中选择或上传来源后重新生成。' : '所选会话中可读取的记录均已包含。'}
+  </p>;
+}

@@ -223,9 +223,8 @@ pub use harness::{
     HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord, HarnessRunRecord,
     HarnessService, HarnessSkillDraftRecord, HarnessSkillRuleRecord, HarnessTemplateRecord,
     SkillifyAgentCitation, SkillifyAgentDraft, SkillifyAgentExecutor, SkillifyAgentOutput,
-    SkillifyAgentRequest, SkillifyAgentRule, SkillifyDraftRecord, SkillifyDraftRequest,
-    SkillifyPublishRecord, SkillifyPublishRequest, SkillifyRunRequest, SkillifySourceFile,
-    SkillifySourcePacket, UnconfiguredHarnessService,
+    SkillifyAgentRequest, SkillifyAgentRule, SkillifyPublishRecord, SkillifyPublishRequest,
+    SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
 pub use inference_execution::{
     AuxiliaryExecutionAttemptFact, EVALUATION_INFERENCE_EVIDENCE_SCHEMA_VERSION,

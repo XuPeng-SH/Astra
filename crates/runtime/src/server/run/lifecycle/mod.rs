@@ -3605,42 +3605,57 @@ struct CachedServerSkillRegistry {
     refreshed_at: Instant,
 }
 
+type ServerSkillRegistryCache = Arc<StdMutex<HashMap<String, Arc<ServerSkillRegistryCacheEntry>>>>;
+
+struct ServerSkillRegistryCacheEntry {
+    value: StdMutex<Option<CachedServerSkillRegistry>>,
+    inserted_at: Instant,
+}
+
 fn cached_server_skill_registry_for(
-    cache: &Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    cache: &ServerSkillRegistryCache,
     skill_service: Option<Arc<dyn SkillService>>,
     user_id: &str,
 ) -> Option<Arc<crate::skills::UnifiedSkillRegistry>> {
-    let now = Instant::now();
-    let Ok(mut cache_guard) = cache.lock() else {
-        return crate::capabilities::build_server_skill_registry(skill_service, user_id);
+    let entry = {
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.contains_key(user_id)
+            && entries.len() >= SERVER_SKILL_REGISTRY_CACHE_MAX_USERS
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(user, _)| user.clone())
+        {
+            entries.remove(&oldest);
+        }
+        entries
+            .entry(user_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(ServerSkillRegistryCacheEntry {
+                    value: StdMutex::new(None),
+                    inserted_at: Instant::now(),
+                })
+            })
+            .clone()
     };
-    if let Some(entry) = cache_guard.get(user_id)
-        && now.duration_since(entry.refreshed_at) < SERVER_SKILL_REGISTRY_CACHE_TTL
+    // Only this user's cold discovery is single-flight. Other users, including
+    // cache hits, never wait on its database query under the global map lock.
+    let mut value = entry
+        .value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cached) = value.as_ref()
+        && cached.refreshed_at.elapsed() < SERVER_SKILL_REGISTRY_CACHE_TTL
     {
-        return entry.registry.clone();
+        return cached.registry.clone();
     }
-
-    // Keep the short synchronous critical section single-flight. Discovery is
-    // already bridged through the runtime by `build_server_skill_registry`;
-    // releasing this guard before that call would let a burst of first turns
-    // perform the same database walk concurrently.
     let registry = crate::capabilities::build_server_skill_registry(skill_service, user_id);
-    if !cache_guard.contains_key(user_id)
-        && cache_guard.len() >= SERVER_SKILL_REGISTRY_CACHE_MAX_USERS
-        && let Some(oldest_user_id) = cache_guard
-            .iter()
-            .min_by_key(|(_, entry)| entry.refreshed_at)
-            .map(|(user_id, _)| user_id.clone())
-    {
-        cache_guard.remove(&oldest_user_id);
-    }
-    cache_guard.insert(
-        user_id.to_string(),
-        CachedServerSkillRegistry {
-            registry: registry.clone(),
-            refreshed_at: Instant::now(),
-        },
-    );
+    *value = Some(CachedServerSkillRegistry {
+        registry: registry.clone(),
+        refreshed_at: Instant::now(),
+    });
     registry
 }
 
@@ -5588,7 +5603,7 @@ pub struct AgenticRunLifecycleService {
     /// User-scoped server skill snapshots reused across turns. The registry
     /// itself still owns provider and loaded-skill caches; this outer cache
     /// keeps a new loop environment from reconstructing those caches.
-    server_skill_registry_cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    server_skill_registry_cache: ServerSkillRegistryCache,
     /// Standard server service for the model-facing Skill Creator tool.
     /// Authoring is coordinator-owned and is intentionally absent from
     /// delegated task executors.
@@ -23904,7 +23919,7 @@ pub struct ServerSpawnAgentExecutor {
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
-    server_skill_registry_cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    server_skill_registry_cache: ServerSkillRegistryCache,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
@@ -24039,10 +24054,7 @@ impl ServerSpawnAgentExecutor {
         self
     }
 
-    fn with_server_skill_registry_cache(
-        mut self,
-        cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
-    ) -> Self {
+    fn with_server_skill_registry_cache(mut self, cache: ServerSkillRegistryCache) -> Self {
         self.server_skill_registry_cache = cache;
         self
     }
@@ -25699,7 +25711,7 @@ pub struct ServerSubRunExecutor {
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
-    server_skill_registry_cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    server_skill_registry_cache: ServerSkillRegistryCache,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
@@ -25797,10 +25809,7 @@ impl ServerSubRunExecutor {
         self
     }
 
-    fn with_server_skill_registry_cache(
-        mut self,
-        cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
-    ) -> Self {
+    fn with_server_skill_registry_cache(mut self, cache: ServerSkillRegistryCache) -> Self {
         self.server_skill_registry_cache = cache;
         self
     }

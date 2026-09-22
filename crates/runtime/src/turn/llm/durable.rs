@@ -2612,6 +2612,7 @@ pub(crate) struct DurableInferenceLedger {
     user_id: String,
     admitted_execution: astra_services::AdmittedModelExecution,
     run_authority: Option<DurableInferenceRunAuthority>,
+    dispatch_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 struct InvocationAdmissionGuard {
@@ -2659,6 +2660,7 @@ impl DurableInferenceLedger {
             user_id: user_id.into(),
             admitted_execution,
             run_authority: None,
+            dispatch_cancel: None,
         }
     }
 
@@ -2702,12 +2704,22 @@ impl DurableInferenceLedger {
             user_id: user_id.to_string(),
             admitted_execution: admitted_execution.clone(),
             run_authority: None,
+            dispatch_cancel: None,
         })
     }
 
     #[must_use]
     pub(crate) fn with_run_authority(mut self, authority: DurableInferenceRunAuthority) -> Self {
         self.run_authority = Some(authority);
+        self
+    }
+
+    /// Prevent new physical requests while allowing dispatched requests to settle.
+    pub(crate) fn with_dispatch_cancel(
+        mut self,
+        token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        self.dispatch_cancel = token;
         self
     }
 
@@ -2941,7 +2953,8 @@ impl DurableInferenceLedger {
                                 self.settlement_coordinator.clone(),
                                 settlement_reservation.clone(),
                                 owner_lease.clone(),
-                            ),
+                            )
+                            .with_dispatch_cancel(self.dispatch_cancel.clone()),
                         ),
                         persistence: self.persistence.clone(),
                         plan: plan.clone(),
@@ -4052,6 +4065,7 @@ struct DurableProviderAttemptObserver {
     state: Arc<tokio::sync::Mutex<ProviderAttemptState>>,
     operations: ProviderOperationGate,
     owner_lease: Arc<InferenceOwnerLease>,
+    dispatch_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Default)]
@@ -4204,6 +4218,25 @@ where
 }
 
 impl DurableProviderAttemptObserver {
+    fn with_dispatch_cancel(mut self, token: Option<tokio_util::sync::CancellationToken>) -> Self {
+        self.dispatch_cancel = token;
+        self
+    }
+
+    fn ensure_dispatch_allowed(&self) -> Result<(), astra_core::ClassifiedError> {
+        if self
+            .dispatch_cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "Inference cancelled before provider delivery authorization",
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn new_with_persistence(
         persistence: Arc<dyn InferenceLedgerPersistence>,
@@ -4234,6 +4267,7 @@ impl DurableProviderAttemptObserver {
         owner_lease: Arc<InferenceOwnerLease>,
     ) -> Self {
         Self {
+            dispatch_cancel: None,
             persistence,
             settlement_coordinator,
             settlement_reservation,
@@ -4429,6 +4463,7 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
         // and releases the permit instead of leaking an unbounded Tokio task.
         // A commit whose acknowledgement was lost is recovered from the
         // invocation settlement debt before any provider request can be sent.
+        self.ensure_dispatch_allowed()?;
         self.owner_lease.ensure_live("provider attempt admission")?;
         let _permit = self.operations.register("provider attempt admission")?;
         let attempt_index = self.next_attempt.fetch_add(1, Ordering::AcqRel);
@@ -4513,11 +4548,9 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
                 "settlement began before provider delivery was authorized",
             ));
         }
-        self.state
-            .lock()
-            .await
-            .delivery_authorized
-            .insert(attempt_index);
+        let mut state = self.state.lock().await;
+        self.ensure_dispatch_allowed()?;
+        state.delivery_authorized.insert(attempt_index);
         Ok(attempt_index)
     }
 
@@ -7811,95 +7844,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settlement_closing_during_ambiguous_admission_never_authorizes_delivery() {
-        let persistence = Arc::new(DelayedTrackedAdmissionPersistence::default());
-        let plan = test_invocation_plan();
-        persistence
-            .admit_invocation(&plan)
-            .await
-            .expect("admit logical invocation");
-        let observer = Arc::new(DurableProviderAttemptObserver::new_with_persistence(
-            persistence.clone(),
-            plan.clone(),
-            astra_services::ModelRequestContextSeed::server_default(),
-        ));
-        let invocation = DurableInferenceInvocation {
-            persistence: persistence.clone(),
-            plan,
-            observer: observer.clone(),
-            settlement_coordinator: observer.settlement_coordinator.clone(),
-            owner_lease: observer.owner_lease.clone(),
-        };
-        let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
-            provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .into(),
-            provider_wire_bytes: 2,
-            composition: crate::turn::llm::client::ProviderWireComposition {
-                provider_envelope_bytes: 2,
-                ..Default::default()
-            },
-            fingerprints: Default::default(),
-            tool_result_projections: Vec::new(),
-        };
+    async fn cancellation_or_settlement_during_admission_never_authorizes_delivery() {
+        for cancel_dispatch in [false, true] {
+            let token = tokio_util::sync::CancellationToken::new();
+            let persistence = Arc::new(DelayedTrackedAdmissionPersistence::default());
+            let plan = test_invocation_plan();
+            persistence
+                .admit_invocation(&plan)
+                .await
+                .expect("admit logical invocation");
+            let observer = Arc::new(
+                DurableProviderAttemptObserver::new_with_persistence(
+                    persistence.clone(),
+                    plan.clone(),
+                    astra_services::ModelRequestContextSeed::server_default(),
+                )
+                .with_dispatch_cancel(Some(token.clone())),
+            );
+            let invocation = DurableInferenceInvocation {
+                persistence: persistence.clone(),
+                plan,
+                observer: observer.clone(),
+                settlement_coordinator: observer.settlement_coordinator.clone(),
+                owner_lease: observer.owner_lease.clone(),
+            };
+            let wire = ProviderWireRequestIdentity {
+                protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+                provider_wire_hash:
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                provider_wire_bytes: 2,
+                composition: crate::turn::llm::client::ProviderWireComposition {
+                    provider_envelope_bytes: 2,
+                    ..Default::default()
+                },
+                fingerprints: Default::default(),
+                tool_result_projections: Vec::new(),
+            };
 
-        let admitting_observer = observer.clone();
-        let admission = tokio::spawn(async move { admitting_observer.begin_attempt(&wire).await });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while persistence.begin_entered.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
+            let admitting_observer = observer.clone();
+            let admission =
+                tokio::spawn(async move { admitting_observer.begin_attempt(&wire).await });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while persistence.begin_entered.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("provider-attempt row should commit before its acknowledgement is released");
+
+            if cancel_dispatch {
+                token.cancel();
+            } else {
+                invocation
+                    .finish_error(&ledger_timeout_error("provider_attempt_admission"))
+                    .await
+                    .expect("foreground timeout must transfer settlement ownership");
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !observer.operations.is_closed() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("settlement must close admission before recovery");
             }
-        })
-        .await
-        .expect("provider-attempt row should commit before its acknowledgement is released");
-
-        invocation
-            .finish_error(&ledger_timeout_error("provider_attempt_admission"))
-            .await
-            .expect("foreground timeout must transfer settlement ownership");
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !observer.operations.is_closed() {
-                tokio::task::yield_now().await;
+            persistence.release_begin.notify_one();
+            let admission_error = admission
+                .await
+                .expect("admission task should not panic")
+                .expect_err("a late acknowledgement cannot authorize provider delivery");
+            assert_eq!(
+                admission_error.kind,
+                if cancel_dispatch {
+                    astra_core::ErrorKind::Cancelled
+                } else {
+                    astra_core::ErrorKind::ContractViolation
+                }
+            );
+            if cancel_dispatch {
+                invocation
+                    .finish_error(&admission_error)
+                    .await
+                    .expect("settle cancelled pre-delivery attempt");
             }
-        })
-        .await
-        .expect("settlement must close admission before recovery");
 
-        persistence.release_begin.notify_one();
-        let admission_error = admission
-            .await
-            .expect("admission task should not panic")
-            .expect_err("a late acknowledgement cannot authorize provider delivery");
-        assert_eq!(
-            admission_error.kind,
-            astra_core::ErrorKind::ContractViolation
-        );
-
-        wait_for_quiescent(&persistence.inner).await;
-        let state = persistence.inner.lock();
-        assert_eq!(state.attempts.len(), 1);
-        assert!(state.attempts.values().all(|attempt| {
-            attempt.terminal.as_ref().map(|terminal| terminal.status)
-                == Some(astra_services::InferenceTerminalStatus::Cancelled)
-        }));
-        assert_eq!(
-            state
-                .invocations
-                .values()
-                .filter_map(|invocation| invocation.terminal.as_ref())
-                .map(|terminal| terminal.status)
-                .collect::<Vec<_>>(),
-            vec![astra_services::InferenceTerminalStatus::Cancelled]
-        );
-        assert!(
-            observer
-                .state
-                .try_lock()
-                .expect("observer state should be quiescent")
-                .delivery_authorized
-                .is_empty(),
-            "an admission acknowledged after settlement closed must never permit HTTP delivery"
-        );
+            wait_for_quiescent(&persistence.inner).await;
+            let state = persistence.inner.lock();
+            assert_eq!(state.attempts.len(), 1);
+            assert!(state.attempts.values().all(|attempt| {
+                attempt.terminal.as_ref().map(|terminal| terminal.status)
+                    == Some(astra_services::InferenceTerminalStatus::Cancelled)
+            }));
+            assert_eq!(
+                state
+                    .invocations
+                    .values()
+                    .filter_map(|invocation| invocation.terminal.as_ref())
+                    .map(|terminal| terminal.status)
+                    .collect::<Vec<_>>(),
+                vec![astra_services::InferenceTerminalStatus::Cancelled]
+            );
+            assert!(
+                observer
+                    .state
+                    .try_lock()
+                    .expect("observer state should be quiescent")
+                    .delivery_authorized
+                    .is_empty(),
+                "an admission acknowledged after settlement closed must never permit HTTP delivery"
+            );
+        }
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
@@ -78,7 +79,13 @@ impl RuntimeSkillifyAgentExecutor {
         user_prompt: &str,
         max_output_tokens: usize,
         purpose: astra_turn_types::InferencePurpose,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<String, String> {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Err(
+                "Skill Creator cancelled before dispatching the next generation phase".into(),
+            );
+        }
         let messages = vec![
             json!({"role": "system", "content": system_prompt}),
             json!({"role": "user", "content": user_prompt}),
@@ -86,6 +93,8 @@ impl RuntimeSkillifyAgentExecutor {
         let transport = shared_llm_transport()?;
         let result = execution
             .ledger
+            .clone()
+            .with_dispatch_cancel(cancel_token.cloned())
             .execute_nonstream(
                 scope,
                 LlmCall {
@@ -125,6 +134,7 @@ impl SkillifyAgentExecutor for RuntimeSkillifyAgentExecutor {
     async fn synthesize_skill_drafts(
         &self,
         request: SkillifyAgentRequest,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<SkillifyAgentOutput, String> {
         let execution = self.prepare_inference_execution(&request.user_id).await?;
         let chunks = chunk_source_packets(&request.source_packets)?;
@@ -137,9 +147,12 @@ impl SkillifyAgentExecutor for RuntimeSkillifyAgentExecutor {
                 let executor = self.clone();
                 let execution = execution.clone();
                 let req = request.clone();
+                let cancel_token = cancel_token.clone();
                 tasks.spawn(async move {
                     let index = chunk.index;
-                    let output = executor.extract_chunk(&execution, &req, &chunk).await;
+                    let output = executor
+                        .extract_chunk(&execution, &req, &chunk, cancel_token.as_ref())
+                        .await;
                     (index, output)
                 });
             }
@@ -148,7 +161,8 @@ impl SkillifyAgentExecutor for RuntimeSkillifyAgentExecutor {
             for chunk in chunks {
                 extraction_results.push((
                     chunk.index,
-                    self.extract_chunk(&execution, &request, &chunk).await?,
+                    self.extract_chunk(&execution, &request, &chunk, cancel_token.as_ref())
+                        .await?,
                 ));
             }
         }
@@ -158,7 +172,7 @@ impl SkillifyAgentExecutor for RuntimeSkillifyAgentExecutor {
             .map(|(_, output)| output)
             .collect::<Vec<_>>();
         let synthesis = self
-            .synthesize_parent(&execution, &request, &extractions)
+            .synthesize_parent(&execution, &request, &extractions, cancel_token.as_ref())
             .await?;
 
         Ok(SkillifyAgentOutput {
@@ -201,6 +215,7 @@ impl RuntimeSkillifyAgentExecutor {
         execution: &SkillifyInferenceExecution,
         request: &SkillifyAgentRequest,
         chunk: &SourceChunk,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<ExtractionResponse, String> {
         let system_prompt = skillify_extraction_system_prompt();
         let user_prompt = skillify_extraction_user_prompt(request, chunk)?;
@@ -218,6 +233,7 @@ impl RuntimeSkillifyAgentExecutor {
             &user_prompt,
             SKILLIFY_EXTRACTION_OUTPUT_TOKENS,
             astra_turn_types::InferencePurpose::SkillSynthesis,
+            cancel_token,
         )
         .await?;
         parse_json_response::<ExtractionResponse>(&response)
@@ -228,6 +244,7 @@ impl RuntimeSkillifyAgentExecutor {
         execution: &SkillifyInferenceExecution,
         request: &SkillifyAgentRequest,
         extractions: &[ExtractionResponse],
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<SynthesisResponse, String> {
         let system_prompt = skillify_synthesis_system_prompt();
         let user_prompt = skillify_synthesis_user_prompt(request, extractions)?;
@@ -242,6 +259,7 @@ impl RuntimeSkillifyAgentExecutor {
             &user_prompt,
             SKILLIFY_SYNTHESIS_OUTPUT_TOKENS,
             astra_turn_types::InferencePurpose::SkillSynthesis,
+            cancel_token,
         )
         .await?;
         parse_json_response::<SynthesisResponse>(&response)
@@ -648,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires live MatrixOne: run with ASTRA_TEST_DB_IT=1"]
-    async fn skillify_provider_call_is_attributed_to_its_durable_harness_owner() {
+    async fn skillify_cancellation_settles_dispatched_inference_and_blocks_next_phase() {
         use axum::{Json, Router, routing::post};
         use sqlx::Row;
 
@@ -683,17 +701,27 @@ mod tests {
         .await
         .expect("seed harness owner");
 
+        let cancel_token = CancellationToken::new();
+        let provider_cancel = cancel_token.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
         let provider = Router::new().route(
             "/v1/chat/completions",
-            post(|| async {
-                Json(json!({
-                    "id": "provider-skillify",
-                    "choices": [{
-                        "message": {"role": "assistant", "content": "{\"signals\":[]}"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 11, "completion_tokens": 3}
-                }))
+            post(move || {
+                let cancel = provider_cancel.clone();
+                let calls = provider_calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    cancel.cancel();
+                    Json(json!({
+                        "id": "provider-skillify",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "{\"signals\":[]}"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 11, "completion_tokens": 3}
+                    }))
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -730,10 +758,37 @@ mod tests {
             "Use this source.",
             256,
             astra_turn_types::InferencePurpose::SkillSynthesis,
+            Some(&cancel_token),
         )
         .await
         .expect("durable Skillify inference");
         assert_eq!(output, "{\"signals\":[]}");
+        let stopped = RuntimeSkillifyAgentExecutor::call_json_agent(
+            &execution,
+            astra_turn_types::InferenceInvocationScope::HarnessRun {
+                harness_run_id: harness_run_id.clone(),
+                operation_id: "skillify_synthesize".into(),
+                logical_attempt: 0,
+            },
+            "Synthesize a candidate.",
+            "Use extracted signals.",
+            256,
+            astra_turn_types::InferencePurpose::SkillSynthesis,
+            Some(&cancel_token),
+        )
+        .await
+        .expect_err("cancelled extraction must not dispatch synthesis");
+        assert!(stopped.contains("cancelled"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let invocation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_invocations WHERE user_id = ? AND harness_run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&harness_run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(invocation_count, 1);
 
         let row = sqlx::query(
             "SELECT r.scope_kind, r.session_id, r.run_id, r.harness_run_id, r.purpose,

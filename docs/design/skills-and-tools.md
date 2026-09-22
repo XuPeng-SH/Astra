@@ -150,6 +150,9 @@ owner-scoped Skill name and immutable version; otherwise a single active session
 Skill supplies the target. Multiple active Skills require a target selection.
 The authenticated authoring GET lists active names and version IDs for that
 session; Web offers a target selector when more than one is active.
+The CLI shortcut `/skill create <goal>` explicitly requests creation;
+`/skill improve [--skill <name>] <goal>` resolves the immutable target through
+that same authorized endpoint and requires a selection when ambiguous.
 `create_new` explicitly requests a new Skill. The old version's complete body is
 an input to generation, and an improvement must retain its name. The same frozen
 version is the Evaluation baseline; a model-generated name never chooses it. The generic
@@ -195,6 +198,26 @@ expected JSON result in the authoring page. This bounded verification uses the
 existing exact-JSON verifier, not an inferred success criterion. Task, verifier,
 and candidate are frozen before Evaluation preparation. The candidate and its
 evidence appear before trial execution completes; the report updates afterward.
+The primary result page also supports explicit private publication and use in
+the originating session. It shows bounded baseline/candidate criterion outcomes
+without presenting them as causal improvement. Generation cost is labeled
+separately from trial cost.
+
+Browser recovery stores only the run reference, scoped by authenticated owner,
+runtime, and originating session. The existing run metadata retains the original
+submission request so conversation links can also continue validation. Recovery reads
+authorized run/draft records and refreshes Evaluation bindings before continuing
+the existing comparison; it never regenerates a candidate. A changed draft
+invalidates the previous comparison. Leaving the page stops subsequent client
+dispatch while already-started Runs retain their durable lifecycle. Polling
+backs off to five seconds instead of repeatedly loading the projection every
+half second.
+The standard tool returns an Authoring `result_url` with the durable run ID;
+opening it reads the same candidate and offers explicit evaluation continuation.
+`prepared` is not an evaluated result. The CLI shortcut prints the candidate
+body before waiting for the report. This authoring adapter requires an
+authenticated Server; local file-based Skill authoring/loading remains with the
+existing file tools and local loader, without a second version database.
 
 ## Evidence-backed evaluation and Skillify adapter
 
@@ -256,6 +279,10 @@ review and publication flow. The standard tool returns the same persisted run
 and draft IDs and review URL in both CLI and Server. Evaluation submission keys
 hash the frozen run, draft, and candidate identity to remain within the shared
 preparation boundary's length limit.
+Server tool cancellation propagates to generation admission: admitted inference
+settles durably, but subsequent extraction/synthesis phases do not start after
+cancellation is observed. The cancelled tool result retains its run reference
+for inspection even when settlement outlives the caller's bounded wait.
 
 Publication remains an explicit user action. Without an explicit version, each
 draft receives a distinct immutable version derived from its ID. Retrying the
@@ -263,10 +290,16 @@ same publication returns that version, including concurrent retries; conflicting
 content cannot replace a published version. Version, visibility, and draft linkage
 commit on one transaction connection; identical retries perform no publication
 writes. Publication does not activate the candidate or alter the pinned baseline.
+Explicit use sends the published revision and expected active baseline through
+the existing activation CAS. Conflicts require reading the current version and
+another user action; they never silently overwrite concurrent adoption. Returning
+to the baseline uses the same CAS path.
 
 Database catalog discovery preserves user-owned precedence, then creation order,
 and caches the exact selected record ID. Loading uses that ID so a newer public
 version cannot replace a private override. This adds no per-turn database reads.
+Cold discovery is single-flight per user; the global cache map lock is released
+before any discovery or database wait.
 
 Skillify citations must be exact, nonempty excerpts of their referenced frozen
 source. The server locates the excerpt and persists UTF-8 byte offsets; a model's
@@ -274,8 +307,17 @@ locator is not authoritative. An absent excerpt rejects the generated output.
 The authoring and review pages share rule evidence, including the original source
 and its kind. User goals and statements support requirements, not claims of
 execution success. Model confidence is not a verification result.
+Conversation evidence selects the most recent bounded event window in
+deterministic timestamp/ID order, then restores chronological order within it.
+The frozen input records selected count, boundary IDs, and whether older events
+were omitted; the UI exposes this limitation. A single extra fetched row detects
+truncation without another count query or any execution hot-path reads.
 
 Approving a rule or draft changes review state without rewriting its body.
+Draft/rule decisions require `expected_revision`; publication carries the same
+reviewed revision. The existing locked transaction rejects a stale review or
+publication; a recognized committed decision retry remains idempotent after
+the revision advances. Published drafts are immutable; improvement starts a new draft.
 Editing or rejecting a rule requires the reviewed full Markdown; the UI shows
 old and new content explicitly. Body changes increment the draft revision and
 mark previous Evaluation as applying to earlier content. They also invalidate
@@ -283,3 +325,5 @@ the current candidate reference, preventing late preparation from attaching an
 old report to the edited draft. Review counter updates preserve frozen baseline,
 case, and Evaluation metadata. These writes occur only on explicit authoring or
 review actions, never on the agent execution hot path.
+The obsolete item-to-Markdown `skillify/draft` publication route is removed;
+publication always uses the explicitly reviewed full draft.

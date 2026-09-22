@@ -57,8 +57,4 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/publish",
             post(crate::server::product_harness_handlers::publish_skill_draft_handler),
         )
-        .route(
-            "/harnesses/runs/{harness_run_id}/skillify/draft",
-            post(crate::server::product_harness_handlers::create_skillify_draft_handler),
-        )
 }

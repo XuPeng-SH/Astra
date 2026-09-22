@@ -519,27 +519,15 @@ export type AuthoringIntentRecord = {
 };
 
 export type HarnessDecisionRequest = {
+  expected_revision?: number;
   decision: 'approve' | 'reject' | 'edit' | 'request_revision';
   after_json?: Record<string, unknown>;
   reason?: string;
   idempotency_key?: string;
 };
 
-export type SkillifyDraftRequest = {
-  skill_name?: string | null;
-  version?: string | null;
-  description?: string | null;
-};
-
-export type SkillifyDraft = {
-  harness_run_id: string;
-  skill_name: string;
-  version_id: string;
-  content_markdown: string;
-  approved_item_count: number;
-};
-
 export type SkillifyPublishRequest = {
+  expected_revision: number;
   visibility?: 'private' | 'public';
   version?: string | null;
   description?: string | null;

@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use astra_core::{ErrorResponse, SharedPool, error_response, internal_error};
@@ -142,12 +143,6 @@ pub struct HarnessSkillDraftRecord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HarnessItemStatusKind {
-    Approved,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HarnessSkillRuleStatusKind {
     Proposed,
     Conflicted,
@@ -166,13 +161,6 @@ enum HarnessSkillDraftStatusKind {
     NeedsRevision,
     Rejected,
     Other,
-}
-
-fn harness_item_status_kind(status: &str) -> HarnessItemStatusKind {
-    match status {
-        "approved" => HarnessItemStatusKind::Approved,
-        _ => HarnessItemStatusKind::Other,
-    }
 }
 
 fn harness_skill_rule_status_kind(status: &str) -> HarnessSkillRuleStatusKind {
@@ -267,26 +255,11 @@ pub struct SkillifyRunRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HarnessDecisionRequest {
+    pub expected_revision: Option<i64>,
     pub decision: String,
     pub after_json: Option<Value>,
     pub reason: Option<String>,
     pub idempotency_key: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SkillifyDraftRequest {
-    pub skill_name: Option<String>,
-    pub version: Option<String>,
-    pub description: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SkillifyDraftRecord {
-    pub harness_run_id: String,
-    pub skill_name: String,
-    pub version_id: String,
-    pub content_markdown: String,
-    pub approved_item_count: usize,
 }
 
 /// Natural-language authoring input. The caller does not choose a Harness,
@@ -301,6 +274,32 @@ pub struct AuthoringIntentRequest {
     pub validation_task: Option<AuthoringValidationTask>,
     /// Replay one operation with the same key; omit it to start a fresh attempt.
     pub idempotency_key: Option<String>,
+}
+
+impl AuthoringIntentRequest {
+    fn operation_key(&self, session_id: &str) -> Option<String> {
+        self.idempotency_key.as_ref().map(|key| {
+            format!(
+                "authoring:{}",
+                stable_hash(
+                    &json!([
+                        session_id.trim(),
+                        self.goal.trim(),
+                        self.target_skill,
+                        self.create_new,
+                        key
+                    ])
+                    .to_string()
+                )
+            )
+        })
+    }
+
+    /// A transport can retain this reference even when it stops waiting.
+    pub fn harness_run_id(&self, user_id: &str, session_id: &str) -> Option<String> {
+        self.operation_key(session_id)
+            .map(|key| skillify_harness_run_id(user_id, Some(&key)))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +383,7 @@ impl AuthoringIntentRecord {
         json!({
             "status": "candidate_ready", "target": self.target, "operation": self.operation,
             "harness_run_id": self.harness_run.harness_run_id,
+            "result_url": format!("/authoring?runId={}", self.harness_run.harness_run_id),
             "candidates": self.skill_drafts.iter().map(|draft| json!({
                 "skill_draft_id": draft.skill_draft_id,
                 "review_url": format!("/harnesses?runId={}&draftId={}", self.harness_run.harness_run_id, draft.skill_draft_id),
@@ -391,18 +391,20 @@ impl AuthoringIntentRecord {
                 "content_markdown": draft.content_markdown, "status": draft.status,
             })).collect::<Vec<_>>(),
             "evaluation": self.evaluation,
+            "source_coverage": self.harness_run.input_json.get("source_coverage"),
             "evidence": {
                 "inference_complete": self.inference.complete,
                 "usage_status": self.inference.usage_status,
                 "estimated_cost_usd": self.inference.estimated_cost_usd,
             },
-            "next_step": "The candidate is private and inactive. Follow its review_url to review evidence and publish this exact candidate.",
+            "next_step": "The candidate is private and inactive. Follow result_url to inspect or continue this same evaluation, review evidence, save and explicitly use this candidate. Prepared means trials have not yet been evaluated.",
         })
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillifyPublishRequest {
+    pub expected_revision: i64,
     pub visibility: Option<String>,
     pub version: Option<String>,
     pub description: Option<String>,
@@ -480,6 +482,7 @@ pub trait SkillifyAgentExecutor: Send + Sync {
     async fn synthesize_skill_drafts(
         &self,
         request: SkillifyAgentRequest,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<SkillifyAgentOutput, String>;
 }
 
@@ -504,6 +507,7 @@ pub trait HarnessService: Send + Sync {
         user_id: String,
         session_id: String,
         request: AuthoringIntentRequest,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn persist_authoring_evaluation(
@@ -572,13 +576,6 @@ pub trait HarnessService: Send + Sync {
         skill_draft_id: String,
         request: SkillifyPublishRequest,
     ) -> Result<SkillifyPublishRecord, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn create_skillify_draft(
-        &self,
-        user_id: String,
-        harness_run_id: String,
-        request: SkillifyDraftRequest,
-    ) -> Result<SkillifyDraftRecord, (StatusCode, Json<ErrorResponse>)>;
 }
 
 #[derive(Clone)]
@@ -624,8 +621,8 @@ impl DatabaseHarnessService {
     ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
         let row = sqlx::query(
             "SELECT harness_run_id, harness_id, version_id, user_id, session_id, status,
-                    IFNULL(CAST(input_json AS CHAR), '{}') AS input_json,
-                    IFNULL(CAST(output_json AS CHAR), '{}') AS output_json,
+                    IFNULL(input_json, '{}') AS input_json,
+                    IFNULL(output_json, '{}') AS output_json,
                     error,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -662,11 +659,11 @@ impl DatabaseHarnessService {
     ) -> Result<HarnessItemRecord, (StatusCode, Json<ErrorResponse>)> {
         let row = sqlx::query(
             "SELECT item_id, harness_run_id, item_type,
-                    IFNULL(CAST(locator_json AS CHAR), '{}') AS locator_json,
-                    IFNULL(CAST(input_json AS CHAR), '{}') AS input_json,
-                    IFNULL(CAST(proposed_output_json AS CHAR), '{}') AS proposed_output_json,
-                    IFNULL(CAST(final_output_json AS CHAR), '{}') AS final_output_json,
-                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    IFNULL(locator_json, '{}') AS locator_json,
+                    IFNULL(input_json, '{}') AS input_json,
+                    IFNULL(proposed_output_json, '{}') AS proposed_output_json,
+                    IFNULL(final_output_json, '{}') AS final_output_json,
+                    IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, assigned_to,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -693,8 +690,8 @@ impl DatabaseHarnessService {
         let row = sqlx::query(
             "SELECT skill_draft_id, harness_run_id, candidate_name, description,
                     target_scope, publish_visibility, content_markdown,
-                    IFNULL(CAST(source_summary_json AS CHAR), '{}') AS source_summary_json,
-                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    IFNULL(source_summary_json, '{}') AS source_summary_json,
+                    IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, created_by_node_id, revision, published_version_id,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -724,8 +721,8 @@ impl DatabaseHarnessService {
         let rows = sqlx::query(
             "SELECT skill_draft_id, harness_run_id, candidate_name, description,
                     target_scope, publish_visibility, content_markdown,
-                    IFNULL(CAST(source_summary_json AS CHAR), '{}') AS source_summary_json,
-                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    IFNULL(source_summary_json, '{}') AS source_summary_json,
+                    IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, created_by_node_id, revision, published_version_id,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -748,7 +745,7 @@ impl DatabaseHarnessService {
 
         let rule_rows = sqlx::query(
             "SELECT skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement,
-                    rationale, IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    rationale, IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, source_count, created_by_node_id,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -771,9 +768,9 @@ impl DatabaseHarnessService {
 
         let citation_rows = sqlx::query(
             "SELECT citation_id, harness_run_id, item_id, skill_draft_id, skill_rule_id,
-                    source_id, IFNULL(CAST(source_locator_json AS CHAR), '{}') AS source_locator_json,
+                    source_id, IFNULL(source_locator_json, '{}') AS source_locator_json,
                     source_snapshot_ref, source_content_hash,
-                    IFNULL(CAST(source_metadata_json AS CHAR), '{}') AS source_metadata_json,
+                    IFNULL(source_metadata_json, '{}') AS source_metadata_json,
                     artifact_id, quote_hash, evidence_text_preview, relevance_score,
                     created_by_node_id, CAST(created_at AS CHAR) AS created_at
              FROM harness_citations
@@ -816,7 +813,7 @@ impl DatabaseHarnessService {
     ) -> Result<Vec<HarnessSkillRuleRecord>, (StatusCode, Json<ErrorResponse>)> {
         let rows = sqlx::query(
             "SELECT skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement,
-                    rationale, IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    rationale, IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, source_count, created_by_node_id,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -848,9 +845,9 @@ impl DatabaseHarnessService {
     ) -> Result<Vec<HarnessCitationRecord>, (StatusCode, Json<ErrorResponse>)> {
         let rows = sqlx::query(
             "SELECT citation_id, harness_run_id, item_id, skill_draft_id, skill_rule_id,
-                    source_id, IFNULL(CAST(source_locator_json AS CHAR), '{}') AS source_locator_json,
+                    source_id, IFNULL(source_locator_json, '{}') AS source_locator_json,
                     source_snapshot_ref, source_content_hash,
-                    IFNULL(CAST(source_metadata_json AS CHAR), '{}') AS source_metadata_json,
+                    IFNULL(source_metadata_json, '{}') AS source_metadata_json,
                     artifact_id, quote_hash, evidence_text_preview, relevance_score,
                     created_by_node_id, CAST(created_at AS CHAR) AS created_at
              FROM harness_citations
@@ -873,11 +870,11 @@ impl DatabaseHarnessService {
     ) -> Result<HarnessItemRecord, (StatusCode, Json<ErrorResponse>)> {
         let row = sqlx::query(
             "SELECT item_id, harness_run_id, item_type,
-                    IFNULL(CAST(locator_json AS CHAR), '{}') AS locator_json,
-                    IFNULL(CAST(input_json AS CHAR), '{}') AS input_json,
-                    IFNULL(CAST(proposed_output_json AS CHAR), '{}') AS proposed_output_json,
-                    IFNULL(CAST(final_output_json AS CHAR), '{}') AS final_output_json,
-                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    IFNULL(locator_json, '{}') AS locator_json,
+                    IFNULL(input_json, '{}') AS input_json,
+                    IFNULL(proposed_output_json, '{}') AS proposed_output_json,
+                    IFNULL(final_output_json, '{}') AS final_output_json,
+                    IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, assigned_to,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -903,7 +900,7 @@ impl DatabaseHarnessService {
     ) -> Result<Vec<HarnessSkillRuleRecord>, (StatusCode, Json<ErrorResponse>)> {
         let rows = sqlx::query(
             "SELECT skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement,
-                    rationale, IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    rationale, IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, source_count, created_by_node_id,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -928,8 +925,8 @@ impl DatabaseHarnessService {
         let row = sqlx::query(
             "SELECT skill_draft_id, harness_run_id, candidate_name, description,
                     target_scope, publish_visibility, content_markdown,
-                    IFNULL(CAST(source_summary_json AS CHAR), '{}') AS source_summary_json,
-                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    IFNULL(source_summary_json, '{}') AS source_summary_json,
+                    IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, created_by_node_id, revision, published_version_id,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -949,34 +946,6 @@ impl DatabaseHarnessService {
             .load_skill_rules_locked(tx, harness_run_id, skill_draft_id)
             .await?;
         Ok(draft)
-    }
-
-    async fn load_skill_rule_locked(
-        &self,
-        tx: &mut sqlx::Transaction<'_, MySql>,
-        harness_run_id: &str,
-        skill_draft_id: &str,
-        skill_rule_id: &str,
-    ) -> Result<HarnessSkillRuleRecord, (StatusCode, Json<ErrorResponse>)> {
-        let row = sqlx::query(
-            "SELECT skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement,
-                    rationale, IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
-                    status, confidence, source_count, created_by_node_id,
-                    CAST(created_at AS CHAR) AS created_at,
-                    CAST(updated_at AS CHAR) AS updated_at
-             FROM harness_skill_rules
-             WHERE harness_run_id = ? AND skill_draft_id = ? AND skill_rule_id = ?
-             LIMIT 1 FOR UPDATE",
-        )
-        .bind(harness_run_id)
-        .bind(skill_draft_id)
-        .bind(skill_rule_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(internal_error)?;
-        let row =
-            row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "skill rule not found"))?;
-        skill_rule_from_row(row)
     }
 
     async fn validate_session_ownership(
@@ -1020,7 +989,7 @@ impl DatabaseHarnessService {
         &self,
         user_id: &str,
         session_ids: &[String],
-    ) -> Result<Vec<SkillifyEvent>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<(Vec<SkillifyEvent>, bool), (StatusCode, Json<ErrorResponse>)> {
         let mut builder = QueryBuilder::<MySql>::new(
             "SELECT event_id, session_id, event_type, content
              FROM agent_events
@@ -1035,16 +1004,20 @@ impl DatabaseHarnessService {
             separated.push_bind(session_id);
         }
         separated.push_unseparated(")");
-        builder.push(" ORDER BY session_id ASC, created_at ASC LIMIT ");
-        builder.push_bind(MAX_SKILLIFY_EVENTS);
+        builder.push(" ORDER BY created_at DESC, event_id DESC LIMIT ");
+        builder.push_bind(MAX_SKILLIFY_EVENTS + 1);
 
-        let rows = builder
+        let mut rows = builder
             .build()
             .fetch_all(self.pool.get())
             .await
             .map_err(internal_error)?;
 
-        rows.into_iter()
+        let truncated = rows.len() > MAX_SKILLIFY_EVENTS as usize;
+        rows.truncate(MAX_SKILLIFY_EVENTS as usize);
+        rows.reverse();
+        let events = rows
+            .into_iter()
             .map(|row| {
                 let event_id = required_harness_string(&row, "agent_events", "event_id")?;
                 let session_id = required_harness_string(&row, "agent_events", "session_id")?;
@@ -1060,7 +1033,8 @@ impl DatabaseHarnessService {
                     content,
                 })
             })
-            .collect::<HarnessResult<Vec<_>>>()
+            .collect::<HarnessResult<Vec<_>>>()?;
+        Ok((events, truncated))
     }
 
     fn normalize_source_files(
@@ -1777,6 +1751,7 @@ impl DatabaseHarnessService {
         user_id: String,
         request: SkillifyRunRequest,
         authoring: Option<&AuthoringGenerationContext>,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
         let session_ids = normalize_session_ids(request.session_ids);
         let source_files = self.normalize_source_files(request.source_files.clone())?;
@@ -1796,11 +1771,19 @@ impl DatabaseHarnessService {
         }
         self.validate_session_ownership(&user_id, &session_ids)
             .await?;
-        let mut events = if session_ids.is_empty() {
-            Vec::new()
+        let (mut events, truncated) = if session_ids.is_empty() {
+            (Vec::new(), false)
         } else {
             self.load_skillify_events(&user_id, &session_ids).await?
         };
+        let source_coverage = json!({
+            "selection": "most_recent",
+            "event_limit": MAX_SKILLIFY_EVENTS,
+            "selected_event_count": events.len(),
+            "older_events_omitted": truncated,
+            "first_event_id": events.first().map(|event| &event.event_id),
+            "last_event_id": events.last().map(|event| &event.event_id),
+        });
         events.extend(source_files);
         if events.is_empty() {
             return Err(error_response(
@@ -1837,6 +1820,7 @@ impl DatabaseHarnessService {
             .collect::<Vec<_>>();
         let input_json = json!({
             "source_packets": &source_packets,
+            "source_coverage": source_coverage,
             "template_id": SKILLIFY_TEMPLATE_ID,
             "session_ids": &session_ids,
             "source_file_count": request.source_files.as_ref().map(Vec::len).unwrap_or(0),
@@ -1909,14 +1893,17 @@ impl DatabaseHarnessService {
             .map(|packet| (packet.source_id.clone(), packet.clone()))
             .collect::<HashMap<_, _>>();
         let agent_output = match executor
-            .synthesize_skill_drafts(SkillifyAgentRequest {
-                user_id: user_id.clone(),
-                harness_run_id: harness_run_id.clone(),
-                skill_name: request.skill_name.clone(),
-                topic: topic.clone(),
-                target_scope: target_scope.clone(),
-                source_packets,
-            })
+            .synthesize_skill_drafts(
+                SkillifyAgentRequest {
+                    user_id: user_id.clone(),
+                    harness_run_id: harness_run_id.clone(),
+                    skill_name: request.skill_name.clone(),
+                    topic: topic.clone(),
+                    target_scope: target_scope.clone(),
+                    source_packets,
+                },
+                cancel_token,
+            )
             .await
         {
             Ok(output) => output,
@@ -2154,14 +2141,15 @@ impl HarnessService for DatabaseHarnessService {
         user_id: String,
         request: SkillifyRunRequest,
     ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.create_skillify_run_internal(user_id, request, None)
+        self.create_skillify_run_internal(user_id, request, None, None)
             .await
     }
     async fn create_authoring_intent(
         &self,
         user_id: String,
         session_id: String,
-        request: AuthoringIntentRequest,
+        mut request: AuthoringIntentRequest,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)> {
         let goal = request.goal.trim().to_string();
         if goal.is_empty() {
@@ -2179,21 +2167,10 @@ impl HarnessService for DatabaseHarnessService {
             ));
         }
 
-        let idempotency_key = request.idempotency_key.map(|key| {
-            format!(
-                "authoring:{}",
-                stable_hash(
-                    &json!([
-                        session_id.trim(),
-                        goal,
-                        request.target_skill,
-                        request.create_new,
-                        key
-                    ])
-                    .to_string()
-                )
-            )
-        });
+        request
+            .idempotency_key
+            .get_or_insert_with(|| Uuid::new_v4().to_string());
+        let idempotency_key = request.operation_key(&session_id);
         let replay = if let Some(key) = idempotency_key.as_deref() {
             match self
                 .ensure_run_owner(&user_id, &skillify_harness_run_id(&user_id, Some(key)))
@@ -2276,6 +2253,7 @@ impl HarnessService for DatabaseHarnessService {
                     idempotency_key,
                 },
                 Some(&context),
+                cancel_token,
             )
             .await?;
         if matches!(harness_run.status.as_str(), "running" | "failed") {
@@ -2521,6 +2499,7 @@ impl HarnessService for DatabaseHarnessService {
             "target": "skill",
             "operation": &operation,
             "resolution_source": &resolution_source,
+            "request": &request,
             "baseline": resolution_run.output_json["authoring"]["baseline"].clone(),
             "validation_task": request.validation_task.as_ref().map(|task| json!(task)).unwrap_or_else(|| resolution_run.output_json["authoring"]["validation_task"].clone()),
             "evaluated_draft_revision": skill_drafts.first().map(|draft| draft.revision),
@@ -2715,11 +2694,11 @@ impl HarnessService for DatabaseHarnessService {
         self.ensure_run_owner(&user_id, &harness_run_id).await?;
         let rows = sqlx::query(
             "SELECT item_id, harness_run_id, item_type,
-                    IFNULL(CAST(locator_json AS CHAR), '{}') AS locator_json,
-                    IFNULL(CAST(input_json AS CHAR), '{}') AS input_json,
-                    IFNULL(CAST(proposed_output_json AS CHAR), '{}') AS proposed_output_json,
-                    IFNULL(CAST(final_output_json AS CHAR), '{}') AS final_output_json,
-                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    IFNULL(locator_json, '{}') AS locator_json,
+                    IFNULL(input_json, '{}') AS input_json,
+                    IFNULL(proposed_output_json, '{}') AS proposed_output_json,
+                    IFNULL(final_output_json, '{}') AS final_output_json,
+                    IFNULL(decision_history_json, '[]') AS decision_history_json,
                     status, confidence, assigned_to,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
@@ -2742,6 +2721,12 @@ impl HarnessService for DatabaseHarnessService {
         request: HarnessDecisionRequest,
     ) -> Result<HarnessItemRecord, (StatusCode, Json<ErrorResponse>)> {
         self.ensure_run_owner(&user_id, &harness_run_id).await?;
+        let item = self.load_item(&harness_run_id, &item_id).await?;
+        if let Some((draft_id, rule_id)) = skill_rule_review_item_ids(&item)? {
+            self.decide_skill_rule(user_id, harness_run_id.clone(), draft_id, rule_id, request)
+                .await?;
+            return self.load_item(&harness_run_id, &item_id).await;
+        }
         let mut tx = self.pool.get().begin().await.map_err(internal_error)?;
         let current = self
             .load_item_locked(&mut tx, &harness_run_id, &item_id)
@@ -2756,7 +2741,6 @@ impl HarnessService for DatabaseHarnessService {
             return Ok(current);
         }
         let decision = request.decision.trim();
-        let skill_rule_link = skill_rule_review_item_ids(&current)?;
         let (status, final_output) = match decision {
             "approve" => ("approved", current.proposed_output_json.clone()),
             "reject" => ("rejected", json!({})),
@@ -2808,79 +2792,7 @@ impl HarnessService for DatabaseHarnessService {
         .await
         .map_err(internal_error)?;
 
-        if let Some((skill_draft_id, skill_rule_id)) = skill_rule_link {
-            let current_rule = self
-                .load_skill_rule_locked(&mut tx, &harness_run_id, &skill_draft_id, &skill_rule_id)
-                .await?;
-            let rule_status = skill_rule_status_for_item_decision(decision);
-            let statement = final_output
-                .get("statement")
-                .and_then(Value::as_str)
-                .unwrap_or(&current_rule.statement)
-                .trim()
-                .to_string();
-            if statement.is_empty() {
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "rule statement must not be empty",
-                ));
-            }
-            let rationale = final_output
-                .get("rationale")
-                .and_then(Value::as_str)
-                .unwrap_or(&current_rule.rationale)
-                .trim()
-                .to_string();
-            let rule_before_json = json!({
-                "status": current_rule.status.clone(),
-                "statement": current_rule.statement.clone(),
-                "rationale": current_rule.rationale.clone(),
-            });
-            let rule_after_json = json!({
-                "status": rule_status,
-                "statement": statement.clone(),
-                "rationale": rationale.clone(),
-                "payload": final_output.clone(),
-            });
-            let rule_decision_history_json = append_decision_history(
-                &current_rule.decision_history_json,
-                decision_history_entry(
-                    decision,
-                    &user_id,
-                    request.reason.as_deref(),
-                    request.idempotency_key.as_deref(),
-                    rule_before_json,
-                    rule_after_json,
-                ),
-            );
-            sqlx::query(
-                "UPDATE harness_skill_rules
-                 SET status = ?, statement = ?, rationale = ?, decision_history_json = ?, updated_at = NOW(6)
-                 WHERE harness_run_id = ? AND skill_draft_id = ? AND skill_rule_id = ?",
-            )
-            .bind(rule_status)
-            .bind(statement)
-            .bind(rationale)
-            .bind(rule_decision_history_json.to_string())
-            .bind(&harness_run_id)
-            .bind(&skill_draft_id)
-            .bind(&skill_rule_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(internal_error)?;
-            refresh_skill_draft_after_rule_decision(
-                &mut tx,
-                &harness_run_id,
-                &skill_draft_id,
-                decision,
-                request.after_json.as_ref(),
-            )
-            .await?;
-        }
         update_skillify_run_counts(&mut tx, &harness_run_id).await?;
-        if skill_rule_review_item_ids(&current)?.is_some() {
-            update_skillify_draft_counts(&mut tx, &harness_run_id).await?;
-        }
         tx.commit().await.map_err(internal_error)?;
         self.load_item(&harness_run_id, &item_id).await
     }
@@ -2917,6 +2829,7 @@ impl HarnessService for DatabaseHarnessService {
         let current = self
             .load_skill_draft_locked(&mut tx, &harness_run_id, &skill_draft_id)
             .await?;
+
         if let Some(idempotency_key) = request.idempotency_key.as_deref()
             && decision_history_contains_idempotency(
                 &current.decision_history_json,
@@ -2927,6 +2840,13 @@ impl HarnessService for DatabaseHarnessService {
             return self
                 .load_skill_draft(&harness_run_id, &skill_draft_id)
                 .await;
+        }
+        validate_reviewed_revision(&current, request.expected_revision)?;
+        if current.published_version_id.is_some() {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "published drafts are immutable; create an improvement instead",
+            ));
         }
         let decision = request.decision.trim();
         let (status, content_markdown, decision_after_json) = match decision {
@@ -3064,9 +2984,15 @@ impl HarnessService for DatabaseHarnessService {
     ) -> Result<HarnessSkillDraftRecord, (StatusCode, Json<ErrorResponse>)> {
         self.ensure_run_owner(&user_id, &harness_run_id).await?;
         let mut tx = self.pool.get().begin().await.map_err(internal_error)?;
-        let current = self
-            .load_skill_rule_locked(&mut tx, &harness_run_id, &skill_draft_id, &skill_rule_id)
+        let mut draft = self
+            .load_skill_draft_locked(&mut tx, &harness_run_id, &skill_draft_id)
             .await?;
+
+        let current = draft
+            .rules
+            .iter()
+            .find(|rule| rule.skill_rule_id == skill_rule_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "skill rule not found"))?;
         if let Some(idempotency_key) = request.idempotency_key.as_deref()
             && decision_history_contains_idempotency(
                 &current.decision_history_json,
@@ -3077,6 +3003,13 @@ impl HarnessService for DatabaseHarnessService {
             return self
                 .load_skill_draft(&harness_run_id, &skill_draft_id)
                 .await;
+        }
+        validate_reviewed_revision(&draft, request.expected_revision)?;
+        if draft.published_version_id.is_some() {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "published drafts are immutable; create an improvement instead",
+            ));
         }
         let decision = request.decision.trim();
         let (status, statement, rationale, decision_after_json) = match decision {
@@ -3218,10 +3151,14 @@ impl HarnessService for DatabaseHarnessService {
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
+        for rule in &mut draft.rules {
+            if rule.skill_rule_id == skill_rule_id {
+                rule.status = status.to_string();
+            }
+        }
         refresh_skill_draft_after_rule_decision(
             &mut tx,
-            &harness_run_id,
-            &skill_draft_id,
+            &draft,
             decision,
             request.after_json.as_ref(),
         )
@@ -3251,6 +3188,7 @@ impl HarnessService for DatabaseHarnessService {
         let draft = self
             .load_skill_draft_locked(&mut tx, &harness_run_id, &skill_draft_id)
             .await?;
+        validate_reviewed_revision(&draft, Some(request.expected_revision))?;
         if draft.status != "published" && !harness_skill_draft_is_publishable(&draft.status) {
             return Err(error_response(
                 StatusCode::CONFLICT,
@@ -3385,104 +3323,6 @@ impl HarnessService for DatabaseHarnessService {
             approved_rule_count,
         })
     }
-
-    async fn create_skillify_draft(
-        &self,
-        user_id: String,
-        harness_run_id: String,
-        request: SkillifyDraftRequest,
-    ) -> Result<SkillifyDraftRecord, (StatusCode, Json<ErrorResponse>)> {
-        let run = self.ensure_run_owner(&user_id, &harness_run_id).await?;
-        if run.harness_id != SKILLIFY_HARNESS_ID {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "skill draft can only be created from a skillify harness run",
-            ));
-        }
-        let items = self
-            .list_run_items(user_id.clone(), harness_run_id.clone())
-            .await?;
-        let approved: Vec<_> = items
-            .into_iter()
-            .filter(|item| {
-                harness_item_status_kind(&item.status) == HarnessItemStatusKind::Approved
-            })
-            .collect();
-        if approved.is_empty() {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "at least one approved skill candidate is required",
-            ));
-        }
-        let skill_name = request
-            .skill_name
-            .or_else(|| {
-                run.input_json
-                    .get("skill_name")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| default_skill_name(&harness_run_id));
-        validate_skill_name(&skill_name)?;
-        let version = request.version.unwrap_or_else(|| "0.1.0".to_string());
-        let description = request.description.unwrap_or_else(|| {
-            "Draft skill generated from reviewed Skillify harness candidates.".to_string()
-        });
-        let content_markdown = render_skill_markdown(&skill_name, &description, &approved);
-        let manifest = json!({
-            "name": skill_name,
-            "description": description,
-            "version": version
-        });
-        let store = DatabasePersonalSkillStore::new(self.pool.clone());
-        store
-            .create_source(
-                &user_id,
-                CreateUserSkillSource {
-                    skill_name: skill_name.clone(),
-                    visibility: Some("private".to_string()),
-                },
-            )
-            .await
-            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let version_record = store
-            .submit_version(
-                &user_id,
-                &skill_name,
-                SubmitUserSkillVersion {
-                    version,
-                    manifest_json: manifest,
-                    content_markdown: content_markdown.clone(),
-                    status: Some("draft".to_string()),
-                },
-            )
-            .await
-            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let output_json = json!({
-            "candidate_count": run.output_json.get("candidate_count").and_then(Value::as_u64).unwrap_or(approved.len() as u64),
-            "approved_count": approved.len(),
-            "draft_skill_name": skill_name,
-            "draft_version_id": version_record.version_id
-        });
-        sqlx::query(
-            "UPDATE harness_runs SET status = 'completed', output_json = ?, updated_at = NOW(6)
-             WHERE harness_run_id = ?",
-        )
-        .bind(output_json.to_string())
-        .bind(&harness_run_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(internal_error)?;
-
-        Ok(SkillifyDraftRecord {
-            harness_run_id,
-            skill_name,
-            version_id: version_record.version_id,
-            content_markdown,
-            approved_item_count: approved.len(),
-        })
-    }
 }
 
 pub struct UnconfiguredHarnessService;
@@ -3514,6 +3354,7 @@ impl HarnessService for UnconfiguredHarnessService {
         _user_id: String,
         _session_id: String,
         _request: AuthoringIntentRequest,
+        _cancel_token: Option<CancellationToken>,
     ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("harness service not configured"))
     }
@@ -3602,15 +3443,6 @@ impl HarnessService for UnconfiguredHarnessService {
     ) -> Result<SkillifyPublishRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("harness service not configured"))
     }
-
-    async fn create_skillify_draft(
-        &self,
-        _user_id: String,
-        _harness_run_id: String,
-        _request: SkillifyDraftRequest,
-    ) -> Result<SkillifyDraftRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("harness service not configured"))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -3689,16 +3521,6 @@ fn skill_rule_review_item_ids(
         skill_draft_id.to_string(),
         skill_rule_id.to_string(),
     )))
-}
-
-fn skill_rule_status_for_item_decision(decision: &str) -> &'static str {
-    match decision {
-        "approve" => "approved",
-        "reject" => "rejected",
-        "edit" => "edited",
-        "request_revision" => "needs_revision",
-        _ => "proposed",
-    }
 }
 
 fn item_status_for_skill_rule_status(status: &str) -> &'static str {
@@ -4264,28 +4086,14 @@ async fn mark_authoring_evaluation_stale(
 
 async fn refresh_skill_draft_after_rule_decision(
     tx: &mut sqlx::Transaction<'_, MySql>,
-    harness_run_id: &str,
-    skill_draft_id: &str,
+    draft: &HarnessSkillDraftRecord,
     decision: &str,
     after: Option<&Value>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let harness_run_id = &draft.harness_run_id;
+    let skill_draft_id = &draft.skill_draft_id;
     let edits_body = matches!(decision, "edit" | "reject");
-    let previous = if edits_body {
-        let draft_row = sqlx::query(
-            "SELECT content_markdown
-         FROM harness_skill_drafts
-         WHERE harness_run_id = ? AND skill_draft_id = ?
-         LIMIT 1",
-        )
-        .bind(harness_run_id)
-        .bind(skill_draft_id)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(internal_error)?;
-        required_harness_string(&draft_row, "harness_skill_drafts", "content_markdown")?
-    } else {
-        String::new()
-    };
+    let previous = &draft.content_markdown;
     let content_markdown =
         if edits_body {
             after.and_then(|value| value.get("content_markdown")).and_then(Value::as_str)
@@ -4293,35 +4101,16 @@ async fn refresh_skill_draft_after_rule_decision(
             .ok_or_else(|| error_response(StatusCode::BAD_REQUEST,
                 "rule edit or rejection requires the explicitly reviewed full content_markdown"))?
         } else {
-            &previous
+            previous
         };
-    let changed = content_markdown != previous;
+    let changed = content_markdown != previous.as_str();
     if decision == "reject" && !changed {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             "revise the full Skill body to remove the rejected rule before saving",
         ));
     }
-    let rule_rows = sqlx::query(
-        "SELECT skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement,
-                rationale, IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
-                status, confidence, source_count, created_by_node_id,
-                CAST(created_at AS CHAR) AS created_at,
-                CAST(updated_at AS CHAR) AS updated_at
-         FROM harness_skill_rules
-         WHERE harness_run_id = ? AND skill_draft_id = ?
-         ORDER BY created_at ASC",
-    )
-    .bind(harness_run_id)
-    .bind(skill_draft_id)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(internal_error)?;
-    let rules = rule_rows
-        .into_iter()
-        .map(skill_rule_from_row)
-        .collect::<HarnessResult<Vec<_>>>()?;
-    let status = derive_harness_skill_draft_status(&rules);
+    let status = derive_harness_skill_draft_status(&draft.rules);
     sqlx::query(
         "UPDATE harness_skill_drafts
          SET status = ?, content_markdown = IF(?, ?, content_markdown), revision = revision + ?, updated_at = NOW(6)
@@ -4368,52 +4157,17 @@ fn validate_publish_visibility(visibility: &str) -> Result<(), (StatusCode, Json
     }
 }
 
-fn default_skill_name(harness_run_id: &str) -> String {
-    let suffix = harness_run_id
-        .rsplit('-')
-        .next()
-        .unwrap_or(harness_run_id)
-        .chars()
-        .take(8)
-        .collect::<String>();
-    format!("skillify-{suffix}")
-}
-
-fn render_skill_markdown(
-    skill_name: &str,
-    description: &str,
-    approved: &[HarnessItemRecord],
-) -> String {
-    let mut lines = vec![
-        "---".to_string(),
-        format!("name: {skill_name}"),
-        format!("description: {description}"),
-        "version: \"0.1.0\"".to_string(),
-        "---".to_string(),
-        String::new(),
-        "# Skill Instructions".to_string(),
-        String::new(),
-        "Use these reviewed preferences when they are relevant to the user's current task."
-            .to_string(),
-        String::new(),
-    ];
-    for item in approved {
-        if let Some(statement) = item
-            .final_output_json
-            .get("statement")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                item.proposed_output_json
-                    .get("statement")
-                    .and_then(Value::as_str)
-            })
-        {
-            lines.push(format!("- {}", statement.trim()));
-        }
+fn validate_reviewed_revision(
+    draft: &HarnessSkillDraftRecord,
+    expected: Option<i64>,
+) -> HarnessResult<()> {
+    if expected != Some(draft.revision) {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "skill draft changed or expected_revision is missing; reload the draft and review its current revision",
+        ));
     }
-    lines.push(String::new());
-    lines.push("Do not apply these preferences when they conflict with explicit user instructions in the current conversation.".to_string());
-    lines.join("\n")
+    Ok(())
 }
 
 fn stable_hash(text: &str) -> String {

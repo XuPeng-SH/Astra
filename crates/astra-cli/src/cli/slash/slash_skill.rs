@@ -9,19 +9,62 @@ use crossterm::style::Stylize;
 
 async fn start_authoring_from_session(
     arg: &str,
+    create_new: bool,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
     state: &SessionState,
 ) -> Result<(), String> {
-    let goal = arg.trim();
+    let (target_name, goal) = if !create_new && arg.trim().starts_with("--skill ") {
+        let (name, goal) = arg.trim()[8..].split_once(' ').unwrap_or(("", ""));
+        (Some(name), goal.trim())
+    } else {
+        (None, arg.trim())
+    };
     if goal.is_empty() {
-        return Err("Usage: /skill create <what you want to create or improve>".to_string());
+        return Err(
+            "Usage: /skill create <goal> or /skill improve [--skill <name>] <goal>".to_string(),
+        );
     }
     let session_id = state
         .session_id
         .as_deref()
         .ok_or_else(|| "no active session is available for authoring".to_string())?;
-    let body = serde_json::json!({"goal": goal});
+    let target = if create_new {
+        None
+    } else {
+        let targets: Vec<astra_services::harness::AuthoringSkillTarget> = api
+            .get_bearer_path_query_json(
+                token.unwrap_or(""),
+                &format!("/harnesses/authoring/{session_id}"),
+                &[],
+            )
+            .await
+            .map_err(|error| format!("Cannot read active Skills: {error}"))?;
+        match target_name {
+            Some(name) => Some(
+                targets
+                    .iter()
+                    .find(|target| target.skill_name == name)
+                    .cloned()
+                    .ok_or_else(|| format!("No active Skill named {name}."))?,
+            ),
+            None if targets.len() == 1 => targets.into_iter().next(),
+            None if targets.is_empty() => {
+                return Err("No active Skill to improve. Use /skill create <goal>.".into());
+            }
+            None => {
+                return Err(format!(
+                    "Choose a Skill: /skill improve --skill <name> <goal>. Active Skills: {}",
+                    targets
+                        .iter()
+                        .map(|target| target.skill_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    };
+    let body = serde_json::json!({"goal": goal, "create_new": create_new, "target_skill": target});
     let response = api
         .post_bearer_path_json_text(
             token.unwrap_or(""),
@@ -45,10 +88,13 @@ async fn start_authoring_from_session(
         record.evaluation.status, record.evaluation.reason
     );
     eprintln!(
-        "  {} Skill candidate(s) at /harnesses/runs/{}/skill-drafts",
+        "  {} Skill candidate(s): /authoring?runId={}",
         record.skill_drafts.len(),
         record.harness_run.harness_run_id
     );
+    for draft in &record.skill_drafts {
+        eprintln!("\n{}\n", draft.content_markdown);
+    }
     if let Some(prepared) = record.evaluation_plan {
         let wait_secs = 300u64
             .checked_mul(prepared.trials.len() as u64)
@@ -1274,12 +1320,7 @@ Follow these steps:
         }
 
         "create" | "improve" => {
-            let goal = if sub == "improve" && !sub_arg.is_empty() {
-                format!("Improve this capability: {sub_arg}")
-            } else {
-                sub_arg.to_string()
-            };
-            start_authoring_from_session(&goal, api, token, state).await?;
+            start_authoring_from_session(sub_arg, sub == "create", api, token, state).await?;
         }
 
         "feedback" => {
@@ -2123,7 +2164,7 @@ mod tests {
                 .and(path("/harnesses/authoring/session-123"))
                 .and(header("authorization", "Bearer tok"))
                 .and(body_json(serde_json::json!({
-                    "goal": "帮我生成一个 review helper"
+                    "goal": "帮我生成一个 review helper", "create_new": true, "target_skill": null
                 })))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "target": "skill",
@@ -2189,6 +2230,54 @@ mod tests {
             .unwrap();
 
             assert!(state.skill_dev.is_none());
+            assert!(state.active_system_skills.is_empty());
+        }
+
+        #[tokio::test]
+        async fn improve_requires_an_explicit_ambiguous_target_and_pins_its_version() {
+            let srv = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/harnesses/authoring/session-123"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"skill_name":"review","version_id":"review-v1"},
+                    {"skill_name":"deploy","version_id":"deploy-v2"}
+                ])))
+                .expect(2)
+                .mount(&srv)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/authoring/session-123"))
+                .and(body_json(
+                    serde_json::json!({"goal":"Keep examples", "create_new":false,
+                    "target_skill":{"skill_name":"review","version_id":"review-v1"}}),
+                ))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&srv)
+                .await;
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            state.session_id = Some("session-123".into());
+            let ambiguous = handle_skill_command(
+                "improve Keep examples",
+                &client,
+                &mut state,
+                None,
+                Some("tok"),
+            )
+            .await
+            .unwrap_err();
+            assert!(ambiguous.contains("--skill <name>"));
+            let selected = handle_skill_command(
+                "improve --skill review Keep examples",
+                &client,
+                &mut state,
+                None,
+                Some("tok"),
+            )
+            .await
+            .unwrap_err();
+            assert!(selected.contains("Authoring request failed"));
             assert!(state.active_system_skills.is_empty());
         }
 

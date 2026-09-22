@@ -2,14 +2,15 @@
 
 import { AlertTriangle, CheckCircle2, Loader2, Sparkles } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
-import { useEffect, useState } from 'react';
-import { createAuthoringIntent, listAuthoringTargets } from '@/lib/api/harnesses';
-import { runPreparedEvaluation, type EvaluationReport } from '@/lib/api/evaluations';
+import { useEffect, useRef, useState } from 'react';
+import { createAuthoringIntent, listAuthoringTargets, loadAuthoringResult, decideSkillDraft, publishSkillDraft } from '@/lib/api/harnesses';
+import { runPreparedEvaluation, getEvaluationExperiment, type EvaluationProjection, type EvaluationReport } from '@/lib/api/evaluations';
 import type { AuthoringIntentRecord, AuthoringIntentRequest } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { PageHeader } from '@/components/ui/page-header';
-import { SkillEvidence, SkillContentComparison, frozenSkillSources } from '@/components/app/skill-evidence';
+import { SkillEvidence, SkillContentComparison, SkillSourceCoverage, frozenSkillSources } from '@/components/app/skill-evidence';
+import { SkillUseAction } from '@/components/app/skill-use-action';
 import { Textarea } from '@/components/ui/textarea';
 
 function countDraftCitations(draft: AuthoringIntentRecord['skill_drafts'][number]) {
@@ -28,9 +29,21 @@ type AuthoringResult = AuthoringIntentRecord & {
   evaluation_error?: string;
 };
 
-export function AuthoringPage() {
-  const searchParams = useSearchParams();
-  const sessionId = searchParams.get('sessionId');
+type AuthoringScope = { ownerId: string; runtimeKey: string };
+export function AuthoringPage(scope: AuthoringScope) {
+  const params = useSearchParams();
+  const sessionId = params.get('sessionId');
+  const runId = params.get('runId');
+  return <AuthoringSession key={JSON.stringify([scope.ownerId, scope.runtimeKey, sessionId, runId])} {...scope} sessionId={sessionId} runId={runId} />;
+}
+
+function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringScope & { sessionId: string | null; runId: string | null }) {
+  const storageKey = `astra:authoring:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(sessionId ?? '')}:${encodeURIComponent(runId ?? '')}`;
+  const evaluationAbort = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
+  const [recovering, setRecovering] = useState(true);
+  const [savedRunId, setSavedRunId] = useState<string | null>(null);
+  const [projection, setProjection] = useState<EvaluationProjection | null>(null);
   const [targets, setTargets] = useState<Array<NonNullable<AuthoringIntentRequest['target_skill']>>>([]);
   const [targetVersion, setTargetVersion] = useState('');
   const [targetsLoading, setTargetsLoading] = useState(Boolean(sessionId));
@@ -60,19 +73,79 @@ export function AuthoringPage() {
   const tasks = sources.filter((source) => source.event_type === 'user_query');
   const baseline = result?.harness_run.output_json?.authoring as { baseline?: { content_markdown?: string; version_id?: string } } | undefined;
 
+  useEffect(() => {
+    mounted.current = true;
+    let active = true;
+    async function recover() {
+      try {
+        const raw = window.localStorage.getItem(storageKey);
+        const saved = raw ? JSON.parse(raw) as { runId?: string } : {};
+        const reference = runId ?? saved.runId;
+        if (typeof reference !== 'string') return;
+        setSavedRunId(reference);
+        const loaded = await loadAuthoringResult(reference);
+        if (!active) return;
+        setResult(loaded); setGoal(loaded.goal);
+        setSubmittedRequest((loaded.harness_run.output_json.authoring as { request?: AuthoringIntentRequest } | undefined)?.request ?? null);
+      } catch (reason) { if (active) setError(reason instanceof Error ? reason.message : '无法恢复已有结果'); }
+      finally { if (active) setRecovering(false); }
+    }
+    void recover();
+    return () => { active = false; mounted.current = false; evaluationAbort.current?.abort(); };
+  }, [storageKey, runId]);
+
+  function remember(created: AuthoringIntentRecord) {
+    setSavedRunId(created.harness_run.harness_run_id);
+    try { window.localStorage.setItem(storageKey, JSON.stringify({ runId: created.harness_run.harness_run_id })); }
+    catch { setError('浏览器无法保存恢复引用；请保留候选的审核链接。'); }
+  }
+
   async function showAndEvaluate(created: AuthoringIntentRecord) {
-    // Deliver the candidate and its evidence immediately, before replay settles.
-    setResult(created);
+    if (!mounted.current) return;
+    setResult(created); setProjection(null);
+    setSubmittedRequest((created.harness_run.output_json.authoring as { request?: AuthoringIntentRequest } | undefined)?.request ?? null);
     if (!created.evaluation_plan) return;
     setEvaluating(true);
+    const controller = new AbortController();
+    evaluationAbort.current = controller;
     try {
-      const report = await runPreparedEvaluation(created.evaluation_plan, {
-        waitSecs: Math.max(300, created.evaluation_plan.trials.length * 300 + 60),
+      // Persisted preparation bindings are a snapshot; recover live binding status before starting anything.
+      const current = await getEvaluationExperiment(created.evaluation_plan.experiment.experiment_id, { signal: controller.signal });
+      setProjection(current);
+      const report = await runPreparedEvaluation({ ...created.evaluation_plan,
+        experiment: current.experiment, trials: current.trials.map((trial) => trial.binding),
+      }, {
+        waitSecs: Math.max(300, current.trials.length * 300 + 60), signal: controller.signal, onProjection: setProjection,
       });
       setResult({ ...created, evaluation_report: report });
+      setProjection(await getEvaluationExperiment(current.experiment.experiment_id, { signal: controller.signal }));
     } catch (reason) {
-      setResult({ ...created, evaluation_error: reason instanceof Error ? reason.message : 'Evaluation did not settle.' });
+      if (!controller.signal.aborted) setResult((current) => ({ ...(current ?? created), evaluation_error: reason instanceof Error ? reason.message : 'Evaluation did not settle.' }));
     } finally { setEvaluating(false); }
+  }
+
+  async function resume() {
+    if (!savedRunId) return;
+    setBusy(true); setError(null);
+    try { await showAndEvaluate(await loadAuthoringResult(savedRunId)); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : '无法恢复已有结果'); }
+    finally { setBusy(false); }
+  }
+
+  async function approveAndPublish(draftId: string) {
+    const draft = result?.skill_drafts.find((entry) => entry.skill_draft_id === draftId);
+    if (!result || !draft) return;
+    setBusy(true); setError(null);
+    try {
+      const runId = result.harness_run.harness_run_id;
+      await decideSkillDraft(runId, draftId, { expected_revision: draft.revision, decision: 'approve', reason: 'User reviewed the exact candidate and its source evidence.' });
+      if (!mounted.current) return;
+      await publishSkillDraft(runId, draftId, { expected_revision: draft.revision, visibility: 'private' });
+      const loaded = await loadAuthoringResult(runId);
+      setResult((current) => current && loaded.skill_drafts.find((entry) => entry.skill_draft_id === draftId)?.revision === draft.revision
+        ? { ...current, ...loaded } : loaded);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存已审核的 Skill'); }
+    finally { setBusy(false); }
   }
 
   async function validateTask() {
@@ -83,7 +156,9 @@ export function AuthoringPage() {
       const expected = JSON.parse(expectedResult);
       const created = await createAuthoringIntent({ ...submittedRequest,
         validation_task: { source_id: taskSourceId, expected_result: expected },
-      }, sessionId ?? undefined);
+      }, (result?.harness_run.input_json.session_ids as string[] | undefined)?.[0]);
+      if (!mounted.current) return;
+      remember(created);
       await showAndEvaluate(created);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '无法准备验证任务');
@@ -105,7 +180,9 @@ export function AuthoringPage() {
       };
       setSubmittedRequest(request);
       const created = await createAuthoringIntent(request, sessionId ?? undefined);
+      if (!mounted.current) return;
       if (created.skill_drafts.length === 0) throw new Error('本次生成没有产生 Skill 候选，请调整目标后重试。');
+      remember(created);
       await showAndEvaluate(created);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Failed to start authoring.');
@@ -156,12 +233,14 @@ export function AuthoringPage() {
             <Button
               type="button"
               onClick={() => void submit()}
-              disabled={busy || !goal.trim() || (!createNew && (targetsLoading || !!targetsError || (targets.length > 1 && !targetVersion)))}
+              disabled={busy || recovering || !goal.trim() || (!createNew && (targetsLoading || !!targetsError || (targets.length > 1 && !targetVersion)))}
               leadingIcon={busy ? Loader2 : Sparkles}
             >
-              {evaluating ? '正在评估' : busy ? '正在生成' : '生成结果'}
+              {evaluating ? '正在评估' : busy ? '正在生成' : result ? '另生成一个候选' : '生成结果'}
             </Button>
           </div>
+          {recovering ? <p className="mt-3 text-sm">正在恢复已保存的结果…</p> : null}
+          {savedRunId && !evaluating ? <Button variant="ghost" className="mt-3" disabled={busy || recovering} onClick={() => void resume()}>恢复已有结果与评估</Button> : null}
           {error ? <p className="mt-3 text-sm text-danger">{error}</p> : null}
         </Card>
 
@@ -211,9 +290,16 @@ export function AuthoringPage() {
                       评估未完成：{result.evaluation_error}
                     </p>
                   ) : null}
+                  {projection ? <div className="mt-3 text-sm">
+                    {projection.trials.map((trial) => <p key={trial.binding.trial_id}>
+                      {trial.binding.trial.arm === 'baseline' ? '原版本 / 无此 Skill' : '候选版本'}：
+                      {trial.task_assessment?.outcome.status === 'pass' ? '通过此任务判定' : trial.task_assessment?.outcome.status === 'fail' ? '未通过此任务判定' : trial.lifecycle}
+                    </p>)}
+                    <p className="mt-2 text-xs text-text-muted">仅描述这些任务的实际结果，不证明普遍改进。</p>
+                  </div> : null}
                   <details className="mt-3">
                     <summary className="cursor-pointer text-xs text-text-muted">
-                      查看证据与成本详情
+                      查看生成证据与生成成本（不含评估运行）
                     </summary>
                     <p className="mt-2 text-xs leading-5 text-text-muted">{result.evaluation.reason}</p>
                     <p className="mt-2 text-xs leading-5 text-text-muted">
@@ -242,7 +328,7 @@ export function AuthoringPage() {
                 </select>
                 {taskSourceId ? <pre className="my-2 max-h-48 overflow-auto whitespace-pre-wrap text-xs">{tasks.find((task) => task.source_id === taskSourceId)?.content}</pre> : null}
                 <Textarea aria-label="预期 JSON 结果" placeholder='预期 JSON 结果，例如 {"ok": true}' value={expectedResult} disabled={busy} onChange={(event) => setExpectedResult(event.target.value)} />
-                <Button className="mt-3" disabled={busy || !taskSourceId || !expectedResult.trim()} onClick={() => void validateTask()}>用这个任务验证</Button>
+                <Button className="mt-3" disabled={busy || !submittedRequest || !taskSourceId || !expectedResult.trim()} onClick={() => void validateTask()}>用这个任务验证</Button>
               </> : <p className="text-sm">缺少可复用的原始用户任务。请在包含实际任务的会话中生成或优化 Skill；当前候选仍可审阅。</p>}
             </Card> : null}
 
@@ -261,6 +347,7 @@ export function AuthoringPage() {
                   </span>
                 </div>
                 {baseline?.baseline?.content_markdown ? <SkillContentComparison before={baseline.baseline.content_markdown} after={draft.content_markdown} /> : null}
+                <SkillSourceCoverage run={result.harness_run} />
                 <SkillEvidence rules={draft.rules} sources={sources} />
                 <pre className="mt-4 max-h-[520px] overflow-auto whitespace-pre-wrap rounded-control border border-border bg-surface-muted p-4 text-xs leading-5 text-text-secondary">
                   {draft.content_markdown}
@@ -268,6 +355,8 @@ export function AuthoringPage() {
                 <p className="mt-3 text-xs text-text-muted">
                   基于 {draft.rules.length} 条证据规则 · {countDraftCitations(draft)} 条引用
                 </p>
+                {draft.published_version_id ? <SkillUseAction key={draft.published_version_id} run={result.harness_run} skillName={draft.candidate_name} versionId={draft.published_version_id} /> :
+                  <Button className="mt-4" disabled={busy} onClick={() => void approveAndPublish(draft.skill_draft_id)}>我已审核，保存为私有 Skill</Button>}
                 <Button
                   className="mt-4"
                   href={`/harnesses?runId=${encodeURIComponent(result.harness_run.harness_run_id)}&draftId=${encodeURIComponent(draft.skill_draft_id)}`}

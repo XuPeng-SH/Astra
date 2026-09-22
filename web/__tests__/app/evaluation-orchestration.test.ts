@@ -1,5 +1,6 @@
 import { requestJson } from '@/lib/api/request';
 import { runPreparedEvaluation, type EvaluationPrepareResponse } from '@/lib/api/evaluations';
+import { loadAuthoringResult } from '@/lib/api/harnesses';
 
 vi.mock('@/lib/api/request', () => ({ requestJson: vi.fn() }));
 
@@ -17,6 +18,19 @@ const prepared: EvaluationPrepareResponse = {
 
 describe('Evaluation browser orchestration', () => {
   beforeEach(() => vi.resetAllMocks());
+
+  it('invalidates a recovered comparison when the durable draft revision changed', async () => {
+    request.mockImplementation(async (path) => path.endsWith('/skill-drafts')
+      ? [{ revision: 2 }]
+      : { input_json: {}, output_json: { authoring: {
+        inference: { usage_status: 'unavailable' }, evaluation: { status: 'prepared' },
+        evaluated_draft_revision: 1, evaluation_plan: prepared,
+      } } });
+    const recovered = await loadAuthoringResult('frozen');
+    expect(recovered.evaluation_plan).toBeNull();
+    expect(recovered.evaluation.status).toBe('unavailable');
+    expect(request.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
+  });
 
   it('resumes the bound baseline and repairs its observation before starting the candidate', async () => {
     let repaired = false;

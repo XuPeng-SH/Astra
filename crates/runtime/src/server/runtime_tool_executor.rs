@@ -59,6 +59,7 @@ pub trait SkillCreatorToolService: Send + Sync {
         user_id: &str,
         session_id: &str,
         request: astra_services::AuthoringIntentRequest,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<astra_services::AuthoringIntentRecord, String>;
 }
 
@@ -1179,7 +1180,7 @@ impl RuntimeToolExecutor {
         let service = Arc::clone(service);
         let user_id = self.user_id.clone();
         let session_id = self.session_id.clone();
-        let request =
+        let mut request =
             match serde_json::from_value::<astra_services::AuthoringIntentRequest>(args.clone()) {
                 Ok(request) => request,
                 Err(error) => {
@@ -1188,33 +1189,57 @@ impl RuntimeToolExecutor {
                     ));
                 }
             };
-        // Keep the application operation alive after transport cancellation so
-        // its durable HarnessRun can reach a terminal state. The transport may
-        // stop waiting, but dropping the in-flight provider future here would
-        // leave a running authoring record behind.
-        let mut operation =
-            tokio::spawn(async move { service.create_skill(&user_id, &session_id, request).await });
+        request
+            .idempotency_key
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        let harness_run_id = request.harness_run_id(&user_id, &session_id);
+        let cancelled_result = |candidate| {
+            let mut result = astra_tools::cancelled_tool_result("skill_creator", true);
+            result.output = serde_json::json!({
+                "status": "cancelled",
+                "harness_run_id": harness_run_id,
+                "review_url": harness_run_id.as_ref().map(|id| format!("/harnesses?runId={id}")),
+                "candidate": candidate,
+                "message": "No further generation phases will start; dispatched inference is settling. Open the saved run to inspect its outcome.",
+            }).to_string();
+            result
+        };
+        let operation_cancel = cancel_token.cloned();
+        // Drain dispatched inference durably, while cancellation prevents new phases.
+        let mut operation = tokio::spawn(async move {
+            service
+                .create_skill(&user_id, &session_id, request, operation_cancel)
+                .await
+        });
         let joined = if let Some(cancel_token) = cancel_token {
             tokio::select! {
                 biased;
                 result = &mut operation => result,
                 _ = cancel_token.cancelled() => {
-                    let _ = tokio::time::timeout(
-                        SKILL_CREATOR_CANCEL_SETTLE_TIMEOUT,
-                        &mut operation,
-                    )
-                    .await;
-                    return astra_tools::cancelled_tool_result("skill_creator", false);
+                    let settled = tokio::time::timeout(SKILL_CREATOR_CANCEL_SETTLE_TIMEOUT, &mut operation).await;
+                    return cancelled_result(match settled { Ok(Ok(Ok(record))) => Some(record.tool_output()), _ => None });
                 }
             }
         } else {
             operation.await
         };
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_result(match joined {
+                Ok(Ok(record)) => Some(record.tool_output()),
+                _ => None,
+            });
+        }
+        let failed_result = |error: String| {
+            astra_tools::ToolResult::error(serde_json::json!({
+                "status": "failed", "error": error, "harness_run_id": harness_run_id,
+                "result_url": harness_run_id.as_ref().map(|id| format!("/authoring?runId={id}")),
+            }).to_string())
+        };
         let record = match joined {
             Ok(Ok(record)) => record,
-            Ok(Err(error)) => return astra_tools::ToolResult::error(error),
+            Ok(Err(error)) => return failed_result(error),
             Err(error) => {
-                return astra_tools::ToolResult::error(format!(
+                return failed_result(format!(
                     "Skill Creator operation terminated unexpectedly: {error}"
                 ));
             }
@@ -8845,6 +8870,39 @@ esac
             .is_none(),
             "a server commit in a revoked generation must issue zero durable receipt"
         );
+    }
+
+    #[tokio::test]
+    async fn skill_creator_cancelled_join_keeps_the_recovery_reference() {
+        struct CancelDuringCreation;
+        #[async_trait]
+        impl SkillCreatorToolService for CancelDuringCreation {
+            async fn create_skill(
+                &self,
+                _: &str,
+                _: &str,
+                _: astra_services::AuthoringIntentRequest,
+                token: Option<CancellationToken>,
+            ) -> Result<astra_services::AuthoringIntentRecord, String> {
+                token.expect("cancellation must reach the service").cancel();
+                Err("generation stopped".into())
+            }
+        }
+        let (executor, _dir) = test_executor();
+        let executor = executor.with_skill_creator_service(Arc::new(CancelDuringCreation));
+        let request = json!({"goal":"Create review skill", "idempotency_key":"cancel-race"});
+        let expected =
+            serde_json::from_value::<astra_services::AuthoringIntentRequest>(request.clone())
+                .unwrap()
+                .harness_run_id(&executor.user_id, &executor.session_id)
+                .unwrap();
+        let result = executor
+            .execute_skill_creator(&request, Some(&CancellationToken::new()))
+            .await;
+        assert!(result.is_error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["status"], "cancelled");
+        assert_eq!(output["harness_run_id"], expected);
     }
 
     fn test_executor_with_agent_context() -> (RuntimeToolExecutor, TempDir) {

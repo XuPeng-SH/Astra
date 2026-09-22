@@ -39,6 +39,7 @@ impl SkillifyAgentExecutor for CapturingSkillifyExecutor {
     async fn synthesize_skill_drafts(
         &self,
         request: SkillifyAgentRequest,
+        _cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<SkillifyAgentOutput, String> {
         let pool = self.pool.lock().expect("pool lock").clone();
         if let Some(pool) = pool {
@@ -312,6 +313,7 @@ async fn database_skillify_citations_point_to_review_items() {
             run.harness_run_id.clone(),
             items[0].item_id.clone(),
             HarnessDecisionRequest {
+                expected_revision: Some(1),
                 decision: "approve".to_string(),
                 after_json: None,
                 reason: Some("approve through item API".to_string()),
@@ -352,6 +354,7 @@ async fn database_skillify_citations_point_to_review_items() {
             drafts_after_item_decision[0].skill_draft_id.clone(),
             approved_rule.skill_rule_id.clone(),
             HarnessDecisionRequest {
+                expected_revision: Some(1),
                 decision: "request_revision".to_string(),
                 after_json: None,
                 reason: Some("request revision through rule API".to_string()),
@@ -370,13 +373,104 @@ async fn database_skillify_citations_point_to_review_items() {
     sqlx::query("UPDATE harness_runs SET output_json = JSON_SET(output_json, '$.authoring', CAST(? AS JSON)) WHERE harness_run_id = ?")
         .bind(json!({"evaluation": {"status": "prepared"}, "candidate_revision_id": "before-review", "baseline": {"version_id":"old-version"}}).to_string())
         .bind(&run.harness_run_id).execute(&pool).await.unwrap();
-    let edited = service.decide_skill_rule(user_id.clone(), run.harness_run_id.clone(),
-        draft_after_rule_decision.skill_draft_id.clone(), approved_rule.skill_rule_id.clone(),
-        HarnessDecisionRequest { decision: "edit".into(), after_json: Some(json!({
-            "statement": "Cite sources and keep examples.", "content_markdown": &revised_body,
-        })), reason: None, idempotency_key: None }).await.unwrap();
+    let edit_request = HarnessDecisionRequest {
+        expected_revision: Some(draft_after_rule_decision.revision),
+        decision: "edit".into(),
+        after_json: Some(
+            json!({"statement": "Cite sources and keep examples.", "content_markdown": &revised_body}),
+        ),
+        reason: None,
+        idempotency_key: Some("rule-edit-retry".into()),
+    };
+    let edited = service
+        .decide_skill_rule(
+            user_id.clone(),
+            run.harness_run_id.clone(),
+            draft_after_rule_decision.skill_draft_id.clone(),
+            approved_rule.skill_rule_id.clone(),
+            edit_request.clone(),
+        )
+        .await
+        .unwrap();
+    let retry = service
+        .decide_skill_rule(
+            user_id.clone(),
+            run.harness_run_id.clone(),
+            draft_after_rule_decision.skill_draft_id.clone(),
+            approved_rule.skill_rule_id.clone(),
+            edit_request,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.revision, edited.revision,
+        "lost edit ACK must not reapply the edit or reject its retry"
+    );
     assert_eq!(edited.content_markdown, revised_body);
     assert_eq!(edited.revision, drafts[0].revision + 1);
+    let stale_approval = service
+        .decide_skill_draft(
+            user_id.clone(),
+            run.harness_run_id.clone(),
+            edited.skill_draft_id.clone(),
+            HarnessDecisionRequest {
+                expected_revision: Some(drafts[0].revision),
+                decision: "approve".into(),
+                after_json: None,
+                reason: None,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        stale_approval.0,
+        StatusCode::CONFLICT,
+        "an old page cannot approve unseen content"
+    );
+    let stale_publish = service
+        .publish_skill_draft(
+            user_id.clone(),
+            run.harness_run_id.clone(),
+            edited.skill_draft_id.clone(),
+            astra_services::SkillifyPublishRequest {
+                expected_revision: drafts[0].revision,
+                visibility: Some("private".into()),
+                version: None,
+                description: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stale_publish.0, StatusCode::CONFLICT);
+    let draft_edit = HarnessDecisionRequest {
+        expected_revision: Some(edited.revision),
+        decision: "edit".into(),
+        after_json: Some(
+            json!({"content_markdown": format!("{}\nKeep the original examples.", edited.content_markdown)}),
+        ),
+        reason: None,
+        idempotency_key: Some("draft-edit-retry".into()),
+    };
+    let changed = service
+        .decide_skill_draft(
+            user_id.clone(),
+            run.harness_run_id.clone(),
+            edited.skill_draft_id.clone(),
+            draft_edit.clone(),
+        )
+        .await
+        .unwrap();
+    let retried = service
+        .decide_skill_draft(
+            user_id.clone(),
+            run.harness_run_id.clone(),
+            edited.skill_draft_id.clone(),
+            draft_edit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.revision, changed.revision);
     let updated_run = service
         .get_run(user_id.clone(), run.harness_run_id.clone())
         .await
@@ -587,22 +681,42 @@ async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
     };
     assert!(
         service
-            .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-1")))
+            .create_authoring_intent(
+                owner.clone(),
+                String::new(),
+                request(Some("attempt-1")),
+                None
+            )
             .await
             .is_err()
     );
     *executor.failure.lock().unwrap() = None;
     let failure = service
-        .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-1")))
+        .create_authoring_intent(
+            owner.clone(),
+            String::new(),
+            request(Some("attempt-1")),
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(failure.0, StatusCode::CONFLICT);
     let recovered = service
-        .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-2")))
+        .create_authoring_intent(
+            owner.clone(),
+            String::new(),
+            request(Some("attempt-2")),
+            None,
+        )
         .await
         .unwrap();
     let replay = service
-        .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-2")))
+        .create_authoring_intent(
+            owner.clone(),
+            String::new(),
+            request(Some("attempt-2")),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -610,7 +724,7 @@ async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
         replay.harness_run.harness_run_id
     );
     let fresh = service
-        .create_authoring_intent(owner.clone(), String::new(), request(None))
+        .create_authoring_intent(owner.clone(), String::new(), request(None), None)
         .await
         .unwrap();
     assert_ne!(
@@ -653,10 +767,31 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
     .unwrap();
     let payload = json!({"event_id": &event_id, "session_id": &session_id, "user_id": &owner,
         "event_type":"user_query", "content":"Return {\"ok\":true} as JSON."});
-    sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'user_query', ?, ?, ?)")
-        .bind(&event_id).bind(&session_id).bind(&owner).bind(payload["content"].as_str().unwrap())
-        .bind(agent_event_fixture_payload_hash(payload.clone())).bind(Uuid::new_v4().to_string())
-        .execute(&pool).await.unwrap();
+    // The latest correction must survive a source window larger than its bound.
+    let history = (0..2000)
+        .map(|index| {
+            let id = format!("{owner}-history-{index:04}");
+            let hash = agent_event_fixture_payload_hash(
+                json!({"event_id": &id, "session_id": &session_id,
+            "user_id": &owner, "event_type": "llm_response", "content": "Earlier observation"}),
+            );
+            (id, hash, Uuid::new_v4().to_string())
+        })
+        .collect::<Vec<_>>();
+    let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, payload_hash, ingestion_write_id, created_at) ",
+    );
+    insert.push_values(&history, |mut row, (id, hash, write_id)| {
+        row.push_bind(id)
+            .push_bind(&session_id)
+            .push_bind(&owner)
+            .push_bind("llm_response")
+            .push_bind("Earlier observation")
+            .push_bind(hash)
+            .push_bind(write_id)
+            .push("'2020-01-01 00:00:00'");
+    });
+    insert.build().execute(&pool).await.unwrap();
     let store = DatabasePersonalSkillStore::new(shared.clone());
     store
         .ensure_source(
@@ -685,6 +820,11 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         .activate_version_with_expected(&owner, &session_id, "review", &baseline.version_id, None)
         .await
         .unwrap();
+    // Correct the task after activation, so this is genuinely the latest event.
+    sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'user_query', ?, ?, ?)")
+        .bind(&event_id).bind(&session_id).bind(&owner).bind(payload["content"].as_str().unwrap())
+        .bind(agent_event_fixture_payload_hash(payload.clone())).bind(Uuid::new_v4().to_string())
+        .execute(&pool).await.unwrap();
     assert_eq!(
         store
             .load_active_for_session(&owner, &session_id)
@@ -738,7 +878,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         idempotency_key: Some("frozen-attempt".into()),
     };
     let result = service
-        .create_authoring_intent(owner.clone(), session_id.clone(), request.clone())
+        .create_authoring_intent(owner.clone(), session_id.clone(), request.clone(), None)
         .await
         .unwrap();
     assert_eq!(result.operation, "improve");
@@ -768,6 +908,23 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         )
     );
     let captured = executor.request.lock().unwrap().take().unwrap();
+    let coverage = &result.harness_run.input_json["source_coverage"];
+    assert_eq!(coverage["selected_event_count"], 2000);
+    assert_eq!(coverage["older_events_omitted"], true);
+    assert_eq!(coverage["last_event_id"], event_id);
+    assert!(
+        captured
+            .source_packets
+            .iter()
+            .any(|source| source.source_id == event_id)
+    );
+    assert!(
+        !captured
+            .source_packets
+            .iter()
+            .any(|source| source.source_id == history[0].0)
+    );
+
     assert_eq!(captured.skill_name.as_deref(), Some("review"));
     assert!(
         captured
@@ -777,7 +934,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
                 && source.content == baseline.content_markdown)
     );
     let replay = service
-        .create_authoring_intent(owner.clone(), session_id.clone(), request.clone())
+        .create_authoring_intent(owner.clone(), session_id.clone(), request.clone(), None)
         .await
         .unwrap();
     assert_eq!(
@@ -799,7 +956,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         expected_result: json!({"ok":true}),
     });
     let selected = service
-        .create_authoring_intent(owner.clone(), session_id.clone(), validation.clone())
+        .create_authoring_intent(owner.clone(), session_id.clone(), validation.clone(), None)
         .await
         .unwrap();
     let input = selected.evaluation_input.as_ref().unwrap();
@@ -845,7 +1002,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
     assert_eq!(spec.target.baseline.revision_id, baseline.version_id);
     validation.validation_task.as_mut().unwrap().expected_result = json!({"ok":false});
     let conflict = service
-        .create_authoring_intent(owner.clone(), session_id.clone(), validation)
+        .create_authoring_intent(owner.clone(), session_id.clone(), validation, None)
         .await
         .unwrap_err();
     assert_eq!(
@@ -854,10 +1011,17 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         "task identity must freeze before a plan exists"
     );
     let resumed = service
-        .create_authoring_intent(owner.clone(), session_id.clone(), request)
+        .create_authoring_intent(owner.clone(), session_id.clone(), request, None)
         .await
         .unwrap();
     assert_eq!(resumed.evaluation_input, selected.evaluation_input);
+    let saved_request: astra_services::AuthoringIntentRequest =
+        serde_json::from_value(result.harness_run.output_json["authoring"]["request"].clone())
+            .unwrap();
+    assert_eq!(
+        saved_request.harness_run_id(&owner, &session_id).as_deref(),
+        Some(result.harness_run.harness_run_id.as_str())
+    );
     let run_id = result.harness_run.harness_run_id.clone();
     let draft_id = result.skill_drafts[0].skill_draft_id.clone();
     service
@@ -866,6 +1030,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
             run_id.clone(),
             draft_id.clone(),
             HarnessDecisionRequest {
+                expected_revision: Some(1),
                 decision: "approve".into(),
                 after_json: None,
                 reason: None,
@@ -885,6 +1050,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
             run_id.clone(),
             draft_id.clone(),
             astra_services::SkillifyPublishRequest {
+                expected_revision: result.skill_drafts[0].revision,
                 visibility: Some("private".into()),
                 version: Some("0.1.0".into()),
                 description: None,
@@ -899,6 +1065,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         "failed publication must not change the old Skill's visibility"
     );
     let publish = || astra_services::SkillifyPublishRequest {
+        expected_revision: result.skill_drafts[0].revision,
         visibility: Some("private".into()),
         version: None,
         description: None,
@@ -908,6 +1075,26 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         service.publish_skill_draft(owner.clone(), run_id.clone(), draft_id.clone(), publish()),
     );
     let published = first.unwrap();
+    let edit_published = service
+        .decide_skill_draft(
+            owner.clone(),
+            run_id.clone(),
+            draft_id.clone(),
+            HarnessDecisionRequest {
+                expected_revision: Some(result.skill_drafts[0].revision),
+                decision: "edit".into(),
+                after_json: Some(json!({"content_markdown":"Unreviewed replacement"})),
+                reason: None,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        edit_published.0,
+        StatusCode::CONFLICT,
+        "published drafts are immutable through the API too"
+    );
     assert_eq!(
         published.version_id,
         retry.unwrap().version_id,
@@ -937,6 +1124,12 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         baseline.version_id,
         "publishing must not implicitly activate the improvement"
     );
+    sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND session_id = ?")
+        .bind(&owner)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     cleanup_skillify_run(
         &pool,
         &result.harness_run.harness_run_id,

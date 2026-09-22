@@ -1,19 +1,22 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { AuthoringPage } from '@/components/app/authoring-page';
-import { createAuthoringIntent, listAuthoringTargets } from '@/lib/api/harnesses';
-import { runPreparedEvaluation } from '@/lib/api/evaluations';
+import { SkillUseAction } from '@/components/app/skill-use-action';
+import { createAuthoringIntent, listAuthoringTargets, loadAuthoringResult, decideSkillDraft, publishSkillDraft, activatePersonalSkill } from '@/lib/api/harnesses';
+import { runPreparedEvaluation, getEvaluationExperiment } from '@/lib/api/evaluations';
 import type { AuthoringIntentRecord } from '@/lib/api/types';
 
-vi.mock('next/navigation', () => ({ useSearchParams: () => new URLSearchParams('sessionId=session') }));
-vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn(), listAuthoringTargets: vi.fn() }));
-vi.mock('@/lib/api/evaluations', () => ({ runPreparedEvaluation: vi.fn() }));
+const navigation = vi.hoisted(() => ({ query: 'sessionId=session' }));
+vi.mock('next/navigation', () => ({ useSearchParams: () => new URLSearchParams(navigation.query) }));
+vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn(), listAuthoringTargets: vi.fn(), loadAuthoringResult: vi.fn(), decideSkillDraft: vi.fn(), publishSkillDraft: vi.fn(), activatePersonalSkill: vi.fn() }));
+vi.mock('@/lib/api/evaluations', () => ({ runPreparedEvaluation: vi.fn(), getEvaluationExperiment: vi.fn() }));
 
 const record = {
-  harness_run: { harness_run_id: 'frozen', input_json: { source_packets: [
+  goal: 'Create a review skill',
+  harness_run: { harness_run_id: 'frozen', input_json: { session_ids: ['session'], source_packets: [
     { source_id: 'task', event_type: 'user_query', title: 'Original task', content: 'Return a JSON verdict.' },
     { source_id: 'guidance', event_type: 'user_message', title: 'Guidance', content: 'Please hurry.' },
-  ] }, output_json: {} },
-  skill_drafts: [{ skill_draft_id: 'draft', candidate_name: 'Review', description: 'Review carefully',
+  ] }, output_json: { authoring: { request: { goal: 'Create a review skill', create_new: false, idempotency_key: '00000000-0000-4000-8000-000000000001' } } } },
+  skill_drafts: [{ skill_draft_id: 'draft', revision: 1, candidate_name: 'Review', description: 'Review carefully',
     content_markdown: '# Review\nPreserve examples.', rules: [{ skill_rule_id: 'rule', statement: 'Return JSON',
       rationale: 'The user requested a structured verdict.', citations: [{ citation_id: 'quote', source_id: 'task',
         source_locator_json: { validation: 'exact_source_match', start_byte: 0, end_byte: 22 },
@@ -23,10 +26,53 @@ const record = {
   inference: { providers: [], usage_status: 'unavailable', estimated_cost_usd: null },
 } as unknown as AuthoringIntentRecord;
 
-beforeEach(() => { vi.resetAllMocks(); vi.mocked(listAuthoringTargets).mockResolvedValue([]); });
+beforeEach(() => {
+  vi.resetAllMocks(); window.localStorage.clear();
+  navigation.query = 'sessionId=session';
+  vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000001');
+  vi.mocked(listAuthoringTargets).mockResolvedValue([]);
+  vi.mocked(getEvaluationExperiment).mockResolvedValue({ experiment: { experiment_id: 'comparison', spec_fingerprint: 'frozen' }, trials: [] } as unknown as Awaited<ReturnType<typeof getEvaluationExperiment>>);
+});
+
+it('opens the standard tool result link through authorized durable reads without generating again', async () => {
+  navigation.query = 'runId=tool-run';
+  vi.mocked(loadAuthoringResult).mockResolvedValue(record);
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('Review carefully');
+  expect(loadAuthoringResult).toHaveBeenCalledWith('tool-run');
+  expect(createAuthoringIntent).not.toHaveBeenCalled();
+  expect(runPreparedEvaluation).not.toHaveBeenCalled();
+  vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+  fireEvent.change(screen.getByLabelText('验证任务'), { target: { value: 'task' } });
+  fireEvent.change(screen.getByLabelText('预期 JSON 结果'), { target: { value: '{"ok":true}' } });
+  fireEvent.click(screen.getByRole('button', { name: '用这个任务验证' }));
+  await waitFor(() => expect(createAuthoringIntent).toHaveBeenCalledWith(expect.objectContaining({
+    idempotency_key: '00000000-0000-4000-8000-000000000001', validation_task: { source_id: 'task', expected_result: { ok: true } },
+  }), 'session'));
+});
+
+it('requires explicit confirmation after an activation conflict and uses CAS when returning to the baseline', async () => {
+  const run = { ...record.harness_run, input_json: { session_ids: ['session'] },
+    output_json: { authoring: { baseline: { skill_name: 'review', version_id: 'old' } } } };
+  vi.mocked(activatePersonalSkill).mockRejectedValueOnce(new Error('Active version changed'))
+    .mockResolvedValueOnce({ version_id: 'published', content_hash: 'hash' })
+    .mockResolvedValueOnce({ version_id: 'old', content_hash: 'old-hash' });
+  vi.mocked(listAuthoringTargets).mockResolvedValue([{ skill_name: 'review', version_id: 'concurrent' }]);
+  render(<SkillUseAction run={run} skillName="review" versionId="published" />);
+  fireEvent.click(screen.getByRole('button', { name: '在此会话使用此版本' }));
+  await screen.findByRole('alert');
+  expect(activatePersonalSkill).toHaveBeenLastCalledWith('review', 'session', 'published', 'old');
+  fireEvent.click(screen.getByRole('button', { name: '读取当前版本后重选' }));
+  await screen.findByText(/当前版本：concurrent/);
+  expect(activatePersonalSkill).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole('button', { name: '在此会话使用此版本' }));
+  fireEvent.click(await screen.findByRole('button', { name: '切回原版本' }));
+  await waitFor(() => expect(activatePersonalSkill).toHaveBeenLastCalledWith('review', 'session', 'old', 'published'));
+  expect(activatePersonalSkill).toHaveBeenNthCalledWith(2, 'review', 'session', 'published', 'concurrent');
+});
 
 async function submit() {
-  render(<AuthoringPage />);
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
   fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Create a review skill' } });
   await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
   fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
@@ -35,7 +81,7 @@ async function submit() {
 
 it('shows candidate and source evidence while evaluation is still running', async () => {
   vi.mocked(createAuthoringIntent).mockResolvedValue({ ...record,
-    evaluation_plan: { trials: [] } as unknown as NonNullable<AuthoringIntentRecord['evaluation_plan']> });
+    evaluation_plan: { experiment: { experiment_id: 'comparison' }, trials: [] } as unknown as NonNullable<AuthoringIntentRecord['evaluation_plan']> });
   let reject!: (reason: Error) => void;
   vi.mocked(runPreparedEvaluation).mockReturnValue(new Promise((_, fail) => { reject = fail; }));
   await submit();
@@ -47,6 +93,23 @@ it('shows candidate and source evidence while evaluation is still running', asyn
   await act(async () => reject(new Error('Trial unavailable')));
   expect(screen.getByText(/Trial unavailable/)).toBeInTheDocument();
   expect(screen.getByText('Review carefully')).toBeInTheDocument();
+});
+
+it('does not launch evaluation from an authoring response after the owner changes', async () => {
+  let resolve!: (record: AuthoringIntentRecord) => void;
+  vi.mocked(createAuthoringIntent).mockReturnValue(new Promise((done) => { resolve = done; }));
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Create a review skill' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  view.rerender(<AuthoringPage ownerId="other-owner" runtimeKey="runtime" />);
+  await act(async () => resolve({ ...record, evaluation_plan: {
+    experiment: { experiment_id: 'comparison' }, trials: [],
+  } as unknown as NonNullable<AuthoringIntentRecord['evaluation_plan']> }));
+  expect(runPreparedEvaluation).not.toHaveBeenCalled();
+  expect(getEvaluationExperiment).not.toHaveBeenCalled();
+  expect(screen.queryByText('Review carefully')).not.toBeInTheDocument();
+  expect(window.localStorage.length).toBe(0);
 });
 
 it('reuses the candidate when selecting an original task and explicit expected result', async () => {
@@ -65,7 +128,7 @@ it('asks for an ambiguous active Skill and sends its frozen identity', async () 
   const targets = [{ skill_name: 'review', version_id: 'v-review' }, { skill_name: 'deploy', version_id: 'v-deploy' }];
   vi.mocked(listAuthoringTargets).mockResolvedValue(targets);
   vi.mocked(createAuthoringIntent).mockResolvedValue(record);
-  render(<AuthoringPage />);
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
   fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Improve my skill' } });
   const selection = await screen.findByLabelText('要优化的 Skill');
   expect(screen.getByRole('button', { name: '生成结果' })).toBeDisabled();
@@ -74,4 +137,72 @@ it('asks for an ambiguous active Skill and sends its frozen identity', async () 
   fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
   await screen.findByText('Review carefully');
   expect(createAuthoringIntent).toHaveBeenCalledWith(expect.objectContaining({ target_skill: targets[0] }), 'session');
+});
+
+it('resumes the persisted comparison after a lost response and reload without regenerating', async () => {
+  const prepared = { ...record, evaluation_plan: { experiment: { experiment_id: 'comparison', spec_fingerprint: 'frozen' },
+    trials: [], adapter_profile_version: 'test' } };
+  vi.mocked(createAuthoringIntent).mockResolvedValue(prepared);
+  vi.mocked(loadAuthoringResult).mockResolvedValue(prepared);
+  vi.mocked(runPreparedEvaluation).mockRejectedValueOnce(new Error('Polling response lost'));
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Improve review' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  await screen.findByText(/Polling response lost/);
+  view.unmount();
+  const recovered = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('Review carefully');
+  expect(loadAuthoringResult).toHaveBeenCalledWith('frozen');
+  expect(createAuthoringIntent).toHaveBeenCalledTimes(1);
+  expect(runPreparedEvaluation).toHaveBeenCalledTimes(1);
+  const binding = { trial_id: 'trial', binding_status: 'bound', session_id: 'trial-session', run_id: 'trial-run',
+    trial: { sequence: 0, case_id: 'case', arm: 'candidate', repetition: 0 } };
+  vi.mocked(getEvaluationExperiment).mockResolvedValue({ experiment: prepared.evaluation_plan.experiment,
+    trials: [{ binding, lifecycle: 'observed', task_assessment: { outcome: { status: 'pass' } } }] } as unknown as Awaited<ReturnType<typeof getEvaluationExperiment>>);
+  vi.mocked(runPreparedEvaluation).mockResolvedValue({ report: { conclusion: 'One task passed', causal_strength: 'unknown' },
+    manifest: { coverage: { evidence_incomplete: false } }, markdown: 'bounded observation' } as unknown as Awaited<ReturnType<typeof runPreparedEvaluation>>);
+  fireEvent.click(screen.getByRole('button', { name: '恢复已有结果与评估' }));
+  await screen.findByText('One task passed');
+  expect(runPreparedEvaluation).toHaveBeenLastCalledWith(expect.objectContaining({ trials: [binding] }), expect.anything());
+  expect(createAuthoringIntent).toHaveBeenCalledTimes(1);
+  recovered.unmount();
+  render(<AuthoringPage ownerId="another-owner" runtimeKey="runtime" />);
+  await waitFor(() => expect(screen.queryByText('正在恢复已保存的结果…')).not.toBeInTheDocument());
+  expect(screen.queryByText('Review carefully')).not.toBeInTheDocument();
+  expect(loadAuthoringResult).toHaveBeenCalledTimes(2);
+});
+
+it('reviews and privately publishes the exact candidate before explicitly adopting it', async () => {
+  const owned = { ...record, harness_run: { ...record.harness_run,
+    input_json: { ...record.harness_run.input_json, session_ids: ['session'], source_coverage: { selected_event_count: 2000, older_events_omitted: true } } } };
+  vi.mocked(createAuthoringIntent).mockResolvedValue(owned);
+  vi.mocked(decideSkillDraft).mockResolvedValue(owned.skill_drafts[0]);
+  vi.mocked(publishSkillDraft).mockResolvedValue({ version_id: 'published' } as unknown as Awaited<ReturnType<typeof publishSkillDraft>>);
+  vi.mocked(loadAuthoringResult).mockResolvedValue({ ...owned, skill_drafts: [{ ...owned.skill_drafts[0], published_version_id: 'published' }] });
+  vi.mocked(activatePersonalSkill).mockResolvedValue({ version_id: 'published', content_hash: 'hash' });
+  await submit();
+  expect(screen.getByText(/较早记录已省略/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  const use = await screen.findByRole('button', { name: '在此会话使用此版本' });
+  expect(decideSkillDraft).toHaveBeenCalledWith('frozen', 'draft', expect.objectContaining({ decision: 'approve' }));
+  expect(publishSkillDraft).toHaveBeenCalledWith('frozen', 'draft', { expected_revision: 1, visibility: 'private' });
+  expect(activatePersonalSkill).not.toHaveBeenCalled();
+  fireEvent.click(use);
+  await screen.findByText(/已启用 Review/);
+  expect(activatePersonalSkill).toHaveBeenCalledWith('Review', 'session', 'published', null);
+});
+
+it('does not publish after the owner changes while approval is pending', async () => {
+  vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+  let approve!: (draft: AuthoringIntentRecord['skill_drafts'][number]) => void;
+  vi.mocked(decideSkillDraft).mockReturnValue(new Promise((done) => { approve = done; }));
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Create a review skill' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  fireEvent.click(await screen.findByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  view.rerender(<AuthoringPage ownerId="other-owner" runtimeKey="runtime" />);
+  await act(async () => approve(record.skill_drafts[0]));
+  expect(publishSkillDraft).not.toHaveBeenCalled();
 });

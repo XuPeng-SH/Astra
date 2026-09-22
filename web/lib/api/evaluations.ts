@@ -182,6 +182,7 @@ export async function runPreparedEvaluation(
   prepared: EvaluationPrepareResponse,
   options: {
     pollMs?: number;
+    signal?: AbortSignal;
     waitSecs: number;
     onProjection?: (projection: EvaluationProjection) => void;
   },
@@ -190,19 +191,25 @@ export async function runPreparedEvaluation(
   const deadline = Date.now() + options.waitSecs * 1000;
   const remainingMs = () => Math.max(1, deadline - Date.now());
   const ensureTime = (label: string) => {
+    options.signal?.throwIfAborted();
     if (Date.now() >= deadline) throw new Error(`${label} deadline exceeded`);
+  };
+  let pollDelay = options.pollMs ?? 1000;
+  const waitForProgress = async () => {
+    await new Promise((resolve) => window.setTimeout(resolve, Math.min(pollDelay, remainingMs())));
+    if (options.pollMs === undefined) pollDelay = Math.min(pollDelay * 2, 5000);
   };
   const trials = [...prepared.trials].sort((left, right) => left.trial.sequence - right.trial.sequence);
   for (const trial of trials) {
     ensureTime(`Evaluation at trial ${trial.trial_id}`);
     if (trial.binding_status === 'planned') {
-      await startEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
+      await startEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs(), signal: options.signal });
     } else if (trial.binding_status !== 'bound') {
       throw new Error(`Trial ${trial.trial_id} has unsupported binding status ${trial.binding_status}.`);
     }
     while (true) {
       ensureTime(`Evaluation wait at trial ${trial.trial_id}`);
-      const projection = await getEvaluationExperiment(experimentId, { timeoutMs: remainingMs() });
+      const projection = await getEvaluationExperiment(experimentId, { timeoutMs: remainingMs(), signal: options.signal });
       options.onProjection?.(projection);
       const current = projection.trials.find((entry) => entry.binding.trial_id === trial.trial_id);
       if (!current) {
@@ -212,26 +219,26 @@ export async function runPreparedEvaluation(
         break;
       }
       if (current.lifecycle === 'terminal_awaiting_observation') {
-        await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
+        await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs(), signal: options.signal });
       }
       if (current.lifecycle === 'unavailable' || current.lifecycle === 'planned') {
         throw new Error(`Trial ${trial.trial_id} became ${current.lifecycle}.`);
       }
       ensureTime(`Evaluation wait at trial ${trial.trial_id}`);
-      await new Promise((resolve) => window.setTimeout(resolve, Math.min(options.pollMs ?? 500, remainingMs())));
+      await waitForProgress();
     }
-    await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
+    await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs(), signal: options.signal });
   }
 
   for (const trial of trials) {
     while (true) {
       ensureTime(`Assessment at trial ${trial.trial_id}`);
-      const assessment = await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs() });
+      const assessment = await assessEvaluationTrial(experimentId, trial.trial_id, { timeoutMs: remainingMs(), signal: options.signal });
       if (assessment.status === 'recorded') break;
       ensureTime(`Assessment wait at trial ${trial.trial_id}`);
-      await new Promise((resolve) => window.setTimeout(resolve, Math.min(options.pollMs ?? 500, remainingMs())));
+      await waitForProgress();
     }
   }
   ensureTime('Evaluation report');
-  return getEvaluationReport(experimentId, { timeoutMs: remainingMs() });
+  return getEvaluationReport(experimentId, { timeoutMs: remainingMs(), signal: options.signal });
 }

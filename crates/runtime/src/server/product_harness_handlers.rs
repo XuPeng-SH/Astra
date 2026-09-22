@@ -27,12 +27,14 @@ impl crate::server::runtime_tool_executor::SkillCreatorToolService
         user_id: &str,
         session_id: &str,
         request: astra_services::AuthoringIntentRequest,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<astra_services::AuthoringIntentRecord, String> {
         run_authoring_intent(
             &self.state,
             user_id.to_string(),
             session_id.to_string(),
             request,
+            cancel_token,
         )
         .await
         .map_err(|(_, body)| body.0.detail)
@@ -201,11 +203,18 @@ pub(crate) async fn run_authoring_intent(
     user_id: String,
     session_id: String,
     request: AuthoringIntentRequest,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)> {
     let record = state
         .harness_service
-        .create_authoring_intent(user_id.clone(), session_id, request)
+        .create_authoring_intent(user_id.clone(), session_id, request, cancel_token.clone())
         .await?;
+    if cancel_token
+        .as_ref()
+        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    {
+        return Ok(record);
+    }
     prepare_authoring_evaluation(state, user_id, record).await
 }
 
@@ -274,7 +283,7 @@ pub async fn create_authoring_intent_handler(
     Json(request): Json<AuthoringIntentRequest>,
 ) -> Result<(StatusCode, Json<AuthoringIntentRecord>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    run_authoring_intent(&state, user.user_id, session_id, request)
+    run_authoring_intent(&state, user.user_id, session_id, request, None)
         .await
         .map(|record| (StatusCode::CREATED, Json(record)))
 }
@@ -285,7 +294,7 @@ pub async fn create_standalone_authoring_intent_handler(
     Json(request): Json<AuthoringIntentRequest>,
 ) -> Result<(StatusCode, Json<AuthoringIntentRecord>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    run_authoring_intent(&state, user.user_id, String::new(), request)
+    run_authoring_intent(&state, user.user_id, String::new(), request, None)
         .await
         .map(|record| (StatusCode::CREATED, Json(record)))
 }
@@ -402,18 +411,4 @@ pub async fn publish_skill_draft_handler(
         .publish_skill_draft(user.user_id, harness_run_id, skill_draft_id, request)
         .await
         .map(|record| (StatusCode::CREATED, Json(record)))
-}
-
-pub async fn create_skillify_draft_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(harness_run_id): Path<String>,
-    Json(request): Json<SkillifyDraftRequest>,
-) -> Result<(StatusCode, Json<SkillifyDraftRecord>), (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    state
-        .harness_service
-        .create_skillify_draft(user.user_id, harness_run_id, request)
-        .await
-        .map(|draft| (StatusCode::CREATED, Json(draft)))
 }
