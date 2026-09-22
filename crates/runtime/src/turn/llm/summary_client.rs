@@ -991,7 +991,8 @@ mod tests {
                 Some(Arc::new(RecoverFirstAdmissionPersistence::default())),
             ).unwrap().with_run_authority(summary_authority());
             let client = RuntimeSummaryClient::new_with_attempt_allocator(
-                summary_route(&execution), 1024, ledger, summary_scope(),
+                Arc::new(crate::turn::llm::client::test_llm_transport()),
+                summary_route(&execution), 1024, InferencePurpose::Introspection, ledger, summary_scope(),
                 DurableSummaryAttemptAllocator::default(),
             );
             let response = client.summarize(InferencePurpose::Introspection,
