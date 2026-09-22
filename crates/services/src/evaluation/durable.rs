@@ -121,14 +121,94 @@ impl DatabaseEvaluationPlanStore {
         Self { pool }
     }
 
+    /// Release Evaluation retention without bypassing the Session deletion lifecycle.
+    pub async fn delete_experiment(
+        &self,
+        owner_user_id: &str,
+        experiment_id: &str,
+    ) -> Result<(), EvaluationPersistenceError> {
+        validate_owner(owner_user_id)?;
+        let db_error = |source| EvaluationPersistenceError::Database {
+            operation: "delete_evaluation_experiment",
+            source,
+        };
+        let mut tx = self.pool.get().begin().await.map_err(db_error)?;
+        // Start takes this same mutex before any Session locks. New bindings
+        // cannot appear while we discover and lock the existing evidence.
+        load_experiment_tx(&mut tx, owner_user_id, experiment_id)
+            .await?
+            .ok_or_else(|| EvaluationPersistenceError::NotFound(experiment_id.to_string()))?;
+        let runs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT session_id, run_id FROM evaluation_trial_bindings
+             WHERE owner_user_id = ? AND experiment_id = ? AND binding_status = 'bound'
+             ORDER BY session_id, run_id",
+        )
+        .bind(owner_user_id)
+        .bind(experiment_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let sessions: std::collections::BTreeSet<_> =
+            runs.iter().map(|(session, _)| session).collect();
+        // Keep the canonical fence -> Session -> Run -> Trial lock order used
+        // by deletion and evidence writers. Hold every lock through the purge.
+        for session in &sessions {
+            sqlx::query("SELECT session_id FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ? FOR UPDATE")
+                .bind(owner_user_id).bind(session)
+                .fetch_optional(&mut *tx).await.map_err(db_error)?;
+        }
+        for session in &sessions {
+            sqlx::query("SELECT session_id FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE")
+                .bind(owner_user_id).bind(session)
+                .fetch_optional(&mut *tx).await.map_err(db_error)?;
+        }
+        for (_, run) in &runs {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM agent_runs WHERE user_id = ? AND run_id = ? FOR UPDATE",
+            )
+            .bind(owner_user_id)
+            .bind(run)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+            if status
+                .as_deref()
+                .is_some_and(|status| !crate::runs::durable_run_status_is_terminal(status))
+            {
+                return Err(EvaluationPersistenceError::Conflict(format!(
+                    "cancel active trial run {run} before deleting the experiment"
+                )));
+            }
+        }
+        sqlx::query("SELECT trial_id FROM evaluation_trial_bindings WHERE owner_user_id = ? AND experiment_id = ? ORDER BY trial_id FOR UPDATE")
+            .bind(owner_user_id).bind(experiment_id)
+            .fetch_all(&mut *tx).await.map_err(db_error)?;
+        for table in [
+            "evaluation_task_assessments",
+            "evaluation_trial_observations",
+            "evaluation_materialization_receipts",
+            "evaluation_trial_bindings",
+            "evaluation_experiments",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE owner_user_id = ? AND experiment_id = ?"
+            ))
+            .bind(owner_user_id)
+            .bind(experiment_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        }
+        tx.commit().await.map_err(db_error)
+    }
+
     pub(crate) fn shared_pool(&self) -> SharedPool {
         self.pool.clone()
     }
 
     /// Evaluation sessions retain their Run and inference evidence while a
     /// trial binding remains active. Session lifecycle code uses this single
-    /// owner-scoped query to suppress destructive close governance; the current
-    /// durable API has no release operation.
+    /// owner-scoped query to suppress destructive close governance until the owner deletes the experiment.
     pub async fn session_has_bound_trial(
         &self,
         owner_user_id: &str,

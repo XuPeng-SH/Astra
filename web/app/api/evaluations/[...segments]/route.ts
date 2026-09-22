@@ -4,7 +4,7 @@ import { RuntimeClientError, requireRuntimeClient, runtimeErrorDetail } from '@/
 export const dynamic = 'force-dynamic';
 
 type RouteContext = { params: Promise<{ segments: string[] }> };
-type HttpMethod = 'GET' | 'POST';
+type HttpMethod = 'GET' | 'POST' | 'DELETE';
 
 function encodedSegments(segments: string[]) {
   return segments.map((segment) => encodeURIComponent(segment)).join('/');
@@ -34,7 +34,7 @@ function runtimePath(segments: string[], method: HttpMethod) {
   if (segments.length === 3 && segments[1] === 'by-submission' && method === 'GET') {
     return `/evaluation/experiments/by-submission/${encodedSegments([segments[2]])}`;
   }
-  if (segments.length === 2 && method === 'GET') {
+  if (segments.length === 2 && (method === 'GET' || method === 'DELETE')) {
     return `/evaluation/experiments/${encodedSegments([segments[1]])}`;
   }
   if (segments.length === 3 && segments[2] === 'report' && method === 'GET') {
@@ -94,4 +94,8 @@ export async function GET(request: NextRequest, context: RouteContext) {
 
 export async function POST(request: NextRequest, context: RouteContext) {
   return handle(request, 'POST', context);
+}
+
+export async function DELETE(request: NextRequest, context: RouteContext) {
+  return handle(request, 'DELETE', context);
 }

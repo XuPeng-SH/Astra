@@ -396,6 +396,7 @@ impl SkillService for TestSkillService {
 
         Ok(SkillListRecord {
             skills: vec![SkillListItem {
+                is_owned: false,
                 skill_id: "test-skill@1.0.0".to_string(),
                 skill_name: "test-skill".to_string(),
                 version: "1.0.0".to_string(),

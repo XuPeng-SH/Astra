@@ -18,10 +18,12 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react';
+import { useSearchParams } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { listChats } from '@/lib/api/chats';
 import {
   createSkillifyRun,
+  getHarnessRun,
   decideSkillDraft,
   decideSkillRule,
   listHarnessNodeCatalog,
@@ -114,6 +116,9 @@ function sourceCitationLabel(count: number) {
 }
 
 export function HarnessesPage() {
+  const searchParams = useSearchParams();
+  const requestedRunId = searchParams.get('runId');
+  const requestedDraftId = searchParams.get('draftId');
   const [view, setView] = useState<HarnessView>('catalog');
   const [templates, setTemplates] = useState<HarnessTemplate[]>([]);
   const [nodeCatalog, setNodeCatalog] = useState<HarnessNodeCatalogItem[]>([]);
@@ -166,6 +171,29 @@ export function HarnessesPage() {
   useEffect(() => {
     void loadInitial();
   }, [loadInitial]);
+
+  useEffect(() => {
+    if (!requestedRunId) return;
+    let cancelled = false;
+    setView('skillify');
+    setBusy(true);
+    setError(null);
+    setRun(null);
+    setSkillDrafts([]);
+    setPublished([]);
+    void Promise.all([getHarnessRun(requestedRunId), listSkillDrafts(requestedRunId)])
+      .then(([existingRun, drafts]) => {
+        if (cancelled) return;
+        setRun(existingRun);
+        setSkillDrafts(drafts);
+        setActiveDraftId(drafts.find((draft) => draft.skill_draft_id === requestedDraftId)?.skill_draft_id ?? drafts[0]?.skill_draft_id ?? null);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load the candidate.');
+      })
+      .finally(() => { if (!cancelled) setBusy(false); });
+    return () => { cancelled = true; };
+  }, [requestedRunId, requestedDraftId]);
 
   const refreshDrafts = useCallback(async (runId: string) => {
     const drafts = await listSkillDrafts(runId);

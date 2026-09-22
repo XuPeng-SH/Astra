@@ -24,7 +24,8 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/evaluation/experiments/{experiment_id}",
-            get(evaluation::get_experiment_projection_handler),
+            get(evaluation::get_experiment_projection_handler)
+                .delete(evaluation::delete_experiment_handler),
         )
         .route(
             "/evaluation/experiments/{experiment_id}/report",

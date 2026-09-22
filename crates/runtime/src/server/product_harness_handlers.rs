@@ -33,6 +33,7 @@ impl crate::server::runtime_tool_executor::SkillCreatorToolService
             user_id.to_string(),
             session_id.to_string(),
             astra_services::AuthoringIntentRequest {
+                idempotency_key: None,
                 goal: goal.to_string(),
             },
         )

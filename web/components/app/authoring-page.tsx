@@ -45,7 +45,10 @@ export function AuthoringPage() {
     setError(null);
     setResult(null);
     try {
-      const created = await createAuthoringIntent({ goal: trimmed }, sessionId ?? undefined);
+      const created = await createAuthoringIntent({ goal: trimmed, idempotency_key: crypto.randomUUID() }, sessionId ?? undefined);
+      if (created.skill_drafts.length === 0) {
+        throw new Error("本次生成没有产生 Skill 候选，请调整目标后重试。");
+      }
       if (!created.evaluation_plan) {
         setResult(created);
         return;
@@ -193,6 +196,12 @@ export function AuthoringPage() {
                 <p className="mt-3 text-xs text-text-muted">
                   基于 {draft.rules.length} 条证据规则 · {countDraftCitations(draft)} 条引用
                 </p>
+                <Button
+                  className="mt-4"
+                  href={`/harnesses?runId=${encodeURIComponent(result.harness_run.harness_run_id)}&draftId=${encodeURIComponent(draft.skill_draft_id)}`}
+                >
+                  审阅并发布此 Skill
+                </Button>
               </Card>
             ))}
           </section>

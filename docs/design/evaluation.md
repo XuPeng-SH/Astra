@@ -426,8 +426,8 @@ without changing its fact or identity contract.
 An evaluation Session with a bound trial retains its Run and inference
 evidence. Session close skips ordinary post-session governance for that
 boundary, and hard deletion returns a conflict while the bound experiment is
-retained. The current durable API has no release operation yet, so deletion
-cannot clear this boundary through a reviewed state.
+retained. The owner can delete the experiment after its Runs are terminal,
+then delete the released Sessions through the ordinary lifecycle.
 Retention is checked under the same Session fence used by trial start, before
 recording deletion intent and again before deleting rows. A binding committed
 while deletion waits for that fence must therefore retain its evidence.
@@ -675,3 +675,17 @@ schedule passive LSP, Cargo, or TypeScript checks. Required formatter/verifier
 commands must run explicitly through confined shell so their execution appears
 in the trial evidence. Other delegated tools still need constraint-aware
 admission before enabling a complete workspace evaluation profile.
+
+### Owner-requested deletion
+
+`DELETE /evaluation/experiments/{experiment_id}` deletes the authenticated owner's
+experiment, trial bindings, observations, assessments, and materialization receipts
+in one transaction. Missing or foreign experiments return 404. Active trial Runs
+return 409: cancel them and wait for terminal status before retrying. Planned and
+failed experiments do not require an assessment to be deleted.
+
+Deletion takes the experiment mutex followed by Session fences, Session rows, Run
+rows, and trial rows, so concurrent starts and evidence writers cannot recreate
+orphan evidence. Session retention remains enforced until this transaction commits.
+Delete the released Sessions through the ordinary Session API to clean up runtime
+evidence; experiment deletion does not bypass that lifecycle.

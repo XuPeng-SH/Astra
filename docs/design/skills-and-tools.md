@@ -240,3 +240,13 @@ preserves both revisions and is visible to the user. Running trials keep their
 pinned revision. Rollback is another recorded adoption, and a follow-up real
 invocation must prove that the adopted revision is loaded with its version/hash
 identity intact.
+
+Authoring requests may carry an `idempotency_key` to replay one attempt. Each new
+user submission uses a new key; omitting it creates a fresh attempt. Replaying a
+running or failed attempt returns a conflict, rather than claiming a candidate is
+ready. The authoring result links directly to the persisted candidate's existing
+review and publication flow. Publication remains an explicit user action.
+
+Database catalog discovery preserves user-owned precedence, then creation order,
+and caches the exact selected record ID. Loading uses that ID so a newer public
+version cannot replace a private override. This adds no per-turn database reads.

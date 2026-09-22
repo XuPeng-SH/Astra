@@ -295,6 +295,8 @@ pub struct SkillifyDraftRecord {
 #[serde(deny_unknown_fields)]
 pub struct AuthoringIntentRequest {
     pub goal: String,
+    /// Replay one operation with the same key; omit it to start a fresh attempt.
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2108,7 +2110,12 @@ impl HarnessService for DatabaseHarnessService {
             ));
         }
 
-        let idempotency_key = format!("authoring:v1:{}:{}", session_id.trim(), stable_hash(&goal));
+        let idempotency_key = request.idempotency_key.map(|key| {
+            format!(
+                "authoring:{}",
+                stable_hash(&json!([session_id.trim(), goal, key]).to_string())
+            )
+        });
         let harness_run = self
             .create_skillify_run_internal(
                 user_id.clone(),
@@ -2126,11 +2133,20 @@ impl HarnessService for DatabaseHarnessService {
                     skill_name: None,
                     topic: None,
                     target_scope: Some("personal".to_string()),
-                    idempotency_key: Some(idempotency_key),
+                    idempotency_key,
                 },
                 Some(&goal),
             )
             .await?;
+        if matches!(harness_run.status.as_str(), "running" | "failed") {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "authoring run {} is {}; use a new idempotency key for a fresh attempt after failure",
+                    harness_run.harness_run_id, harness_run.status
+                ),
+            ));
+        }
         let skill_drafts = self
             .load_skill_drafts_for_run(&harness_run.harness_run_id)
             .await?;

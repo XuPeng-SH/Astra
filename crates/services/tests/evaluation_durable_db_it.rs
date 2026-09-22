@@ -2585,3 +2585,102 @@ async fn workspace_admission_resolves_allocation_artifacts_and_rejects_missing_o
         "retry cannot replace changed evidence"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn evaluation_delete_is_owner_scoped_rejects_live_runs_and_releases_retention() {
+    let pool = common::setup_pool().await;
+    let owner = format!("eval-release-{}", Uuid::new_v4());
+    let experiment = spec(&format!("release-{}", Uuid::new_v4()));
+    let plans = DatabaseEvaluationPlanStore::new(pool.clone());
+    plans
+        .register_experiment(&owner, &experiment, "release")
+        .await
+        .unwrap();
+    assert!(matches!(
+        plans
+            .delete_experiment("other-owner", &experiment.experiment_id)
+            .await,
+        Err(EvaluationPersistenceError::NotFound(_))
+    ));
+    let trial = plans
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let session = insert_session(&pool, &owner).await;
+    let mut run = evaluation_run_record(&owner, &session, &experiment, &trial.trial);
+    run.status = "running".into();
+    let runs = DatabaseRunStateStore::new(pool.clone());
+    runs.claim_run_start(run.clone(), Some(&session))
+        .await
+        .unwrap();
+    assert!(matches!(
+        plans
+            .delete_experiment(&owner, &experiment.experiment_id)
+            .await,
+        Err(EvaluationPersistenceError::Conflict(_))
+    ));
+    assert!(
+        plans
+            .session_has_bound_trial(&owner, &session)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE agent_runs SET status = 'failed' WHERE user_id = ? AND run_id = ?")
+        .bind(&owner)
+        .bind(&run.run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    plans
+        .delete_experiment(&owner, &experiment.experiment_id)
+        .await
+        .unwrap();
+    assert!(
+        !plans
+            .session_has_bound_trial(&owner, &session)
+            .await
+            .unwrap()
+    );
+    for table in [
+        "evaluation_experiments",
+        "evaluation_trial_bindings",
+        "evaluation_trial_observations",
+        "evaluation_task_assessments",
+        "evaluation_materialization_receipts",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE owner_user_id = ?"
+        ))
+        .bind(&owner)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    use astra_services::{DatabaseSessionService, SessionService};
+    DatabaseSessionService::new(astra_core::MatrixOneSettings::default())
+        .with_pool(pool.clone())
+        .delete_session(session.clone(), owner.clone())
+        .await
+        .expect("released Session can be deleted through the normal lifecycle");
+    // Planned comparisons need no Run or observation to be disposable.
+    plans
+        .register_experiment(&owner, &experiment, "release")
+        .await
+        .unwrap();
+    plans
+        .delete_experiment(&owner, &experiment.experiment_id)
+        .await
+        .unwrap();
+    let new_session = insert_session(&pool, &owner).await;
+    let stale_start = evaluation_run_record(&owner, &new_session, &experiment, &trial.trial);
+    assert!(
+        runs.claim_run_start(stale_start, Some(&new_session))
+            .await
+            .is_err(),
+        "a stale start cannot recreate a binding after deletion"
+    );
+    cleanup(&pool, &owner).await;
+}

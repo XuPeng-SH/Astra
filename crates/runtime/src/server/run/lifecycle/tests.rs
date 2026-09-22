@@ -17619,6 +17619,7 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
             }
             Ok(SkillListRecord {
                 skills: vec![SkillListItem {
+                    is_owned: false,
                     skill_id: "remote-db@1.0.0".to_string(),
                     skill_name: "remote-db".to_string(),
                     version: "1.0.0".to_string(),

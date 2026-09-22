@@ -451,6 +451,7 @@ export type SkillifyRunRequest = {
 
 export type AuthoringIntentRequest = {
   goal: string;
+  idempotency_key?: string;
 };
 
 export type AuthoringEvaluationSummary = {

@@ -500,3 +500,63 @@ async fn cleanup_skillify_run(
         .execute(pool)
         .await;
 }
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get().clone();
+    let owner = Uuid::new_v4().to_string();
+    let executor = Arc::new(CapturingSkillifyExecutor::default());
+    *executor.failure.lock().unwrap() = Some("transient provider failure".into());
+    let service =
+        DatabaseHarnessService::new(shared_pool).with_skillify_agent_executor(executor.clone());
+    let request = |key: Option<&str>| astra_services::AuthoringIntentRequest {
+        goal: "Create a concise review skill".into(),
+        idempotency_key: key.map(str::to_string),
+    };
+    assert!(
+        service
+            .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-1")))
+            .await
+            .is_err()
+    );
+    *executor.failure.lock().unwrap() = None;
+    let failure = service
+        .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-1")))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.0, StatusCode::CONFLICT);
+    let recovered = service
+        .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-2")))
+        .await
+        .unwrap();
+    let replay = service
+        .create_authoring_intent(owner.clone(), String::new(), request(Some("attempt-2")))
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.harness_run.harness_run_id,
+        replay.harness_run.harness_run_id
+    );
+    let fresh = service
+        .create_authoring_intent(owner.clone(), String::new(), request(None))
+        .await
+        .unwrap();
+    assert_ne!(
+        recovered.harness_run.harness_run_id,
+        fresh.harness_run.harness_run_id
+    );
+    for run in [
+        recovered.harness_run.harness_run_id,
+        fresh.harness_run.harness_run_id,
+    ] {
+        cleanup_skillify_run(&pool, &run, "", "").await;
+    }
+    sqlx::query("DELETE FROM harness_runs WHERE user_id = ?")
+        .bind(&owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

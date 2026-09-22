@@ -3319,7 +3319,7 @@ fn git_index_is_observable(root: &Path) -> bool {
     stage_command.args(["ls-files", "--stage", "-z", "--", "."]);
     let Some(stage_output) = run_bounded_probe(
         stage_command,
-        MAX_STATUS_OUTPUT_BYTES,
+        MAX_TRACKED_METADATA_OUTPUT_BYTES,
         FINGERPRINT_PROBE_TIMEOUT,
     ) else {
         return false;
@@ -3333,7 +3333,7 @@ fn git_index_is_observable(root: &Path) -> bool {
             continue;
         }
         stage_entries = stage_entries.saturating_add(1);
-        if stage_entries > MAX_STATUS_ENTRIES
+        if stage_entries > MAX_TRACKED_METADATA_ENTRIES
             || entry.len() < 7
             || entry[6] != b' '
             || !entry[7..].contains(&b'\t')
@@ -3352,9 +3352,11 @@ fn git_index_is_observable(root: &Path) -> bool {
         return false;
     };
     command.args(["ls-files", "-v", "-z", "--", "."]);
-    let Some(output) =
-        run_bounded_probe(command, MAX_STATUS_OUTPUT_BYTES, FINGERPRINT_PROBE_TIMEOUT)
-    else {
+    let Some(output) = run_bounded_probe(
+        command,
+        MAX_TRACKED_METADATA_OUTPUT_BYTES,
+        FINGERPRINT_PROBE_TIMEOUT,
+    ) else {
         return false;
     };
     if !output.success {
@@ -3366,7 +3368,7 @@ fn git_index_is_observable(root: &Path) -> bool {
             continue;
         }
         entries = entries.saturating_add(1);
-        if entries > MAX_STATUS_ENTRIES || entry.get(1) != Some(&b' ') {
+        if entries > MAX_TRACKED_METADATA_ENTRIES || entry.get(1) != Some(&b' ') {
             return false;
         }
         // `git status` intentionally trusts these index bits. A task can set
@@ -6251,6 +6253,41 @@ mod tests {
         let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
         fs::remove_file(temp.path().join("tracked.txt")).expect("delete tracked file");
         let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn clean_large_index_is_observable_above_dirty_status_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(temp.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        run(&["init", "-q"]);
+        for index in 0..=MAX_STATUS_ENTRIES {
+            fs::write(temp.path().join(format!("file-{index}")), "x").unwrap();
+        }
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=Astra",
+            "-c",
+            "user.email=astra@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        assert!(git_index_is_observable(temp.path()));
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("clean large index");
+        fs::write(temp.path().join("file-0"), "changed").unwrap();
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("one dirty entry");
         assert!(before.changed_from(Some(after)));
     }
 

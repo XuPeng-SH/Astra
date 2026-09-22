@@ -1434,7 +1434,7 @@ async fn ensure_evaluation_evidence_retained(
     // The caller holds the same Session fence used by atomic Run/trial start.
     // A locking read observes a binding committed while waiting for that fence.
     let retained: Option<String> = query_scalar(
-        "SELECT trial_id FROM evaluation_trial_bindings
+        "SELECT experiment_id FROM evaluation_trial_bindings
          WHERE owner_user_id = ? AND session_id = ? AND binding_status = 'bound'
          LIMIT 1 FOR UPDATE",
     )
@@ -1443,9 +1443,9 @@ async fn ensure_evaluation_evidence_retained(
     .fetch_optional(&mut **tx)
     .await
     .map_err(|source| format!("delete_session.check_evaluation_evidence: {source}"))?;
-    if let Some(trial_id) = retained {
+    if let Some(experiment_id) = retained {
         return Err(format!(
-            "delete_session.evaluation_evidence_retained: session has bound evaluation trial {trial_id}; review the experiment before deleting the Session"
+            "delete_session.evaluation_evidence_retained: session retains evaluation experiment {experiment_id}; cancel active trials, then DELETE /evaluation/experiments/{experiment_id} before deleting the Session"
         ));
     }
     Ok(())

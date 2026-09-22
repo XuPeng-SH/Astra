@@ -97,6 +97,19 @@ fn evaluation_pool(
     })
 }
 
+pub async fn delete_experiment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(experiment_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    DatabaseEvaluationPlanStore::new(evaluation_pool(&state)?)
+        .delete_experiment(&user.user_id, &experiment_id)
+        .await
+        .map_err(map_evaluation_persistence_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn create_experiment_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
