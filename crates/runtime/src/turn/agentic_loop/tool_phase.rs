@@ -2000,30 +2000,36 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 ),
             );
         }
-        let wrapup_origin = state
-            .hooks
-            .completion_settlement
-            .wrapup_origin
-            .unwrap_or(BudgetWrapupOrigin::RoundSlice);
-        let (interruption_kind, detail) = match wrapup_origin {
-            BudgetWrapupOrigin::TokenRail => (
-                astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
-                format!(
-                    "The current request exceeded its token budget after the model ignored repeated wrap-up advisories, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved."
+        // A closer may already have recorded why the turn is incomplete, for
+        // example an unverified external write. The second ignored tool
+        // response still ends the turn, but it must not replace that
+        // explanation with the generic wrap-up abort.
+        if state.interruption.is_none() {
+            let wrapup_origin = state
+                .hooks
+                .completion_settlement
+                .wrapup_origin
+                .unwrap_or(BudgetWrapupOrigin::RoundSlice);
+            let (interruption_kind, detail) = match wrapup_origin {
+                BudgetWrapupOrigin::TokenRail => (
+                    astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
+                    format!(
+                        "The current request exceeded its token budget after the model ignored repeated wrap-up advisories, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved."
+                    ),
                 ),
-            ),
-            BudgetWrapupOrigin::RoundSlice => (
-                astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
-                format!(
-                    "The bounded execution slice ended after the model ignored repeated wrap-up advisories, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved; continue by summarizing verified work or one concrete missing fact."
+                BudgetWrapupOrigin::RoundSlice => (
+                    astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+                    format!(
+                        "The bounded execution slice ended after the model ignored repeated wrap-up advisories, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved; continue by summarizing verified work or one concrete missing fact."
+                    ),
                 ),
-            ),
-        };
-        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-            interruption_kind,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            super::lifecycle::interruption_state_summary(state, Some(detail)),
-        ));
+            };
+            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                interruption_kind,
+                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                super::lifecycle::interruption_state_summary(state, Some(detail)),
+            ));
+        }
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "budget_wrapup_abort",

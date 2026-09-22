@@ -157,7 +157,7 @@ impl HeadlessResolvedExecution {
 /// foreground Bash invocation when the model omitted the field.  This is a
 /// typed recovery mechanism, not a command classifier: only the exact Bash
 /// tool, an active recovery scope, and an absent structured field qualify.
-pub(super) fn inherit_external_effect_recovery_scope(
+pub(crate) fn inherit_external_effect_recovery_scope(
     tool_name: &str,
     args: &mut Value,
     recovery_paths: Option<&[String]>,
