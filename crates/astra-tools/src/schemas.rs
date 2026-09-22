@@ -676,6 +676,29 @@ pub fn submit_task_resolution_schema() -> Value {
     })
 }
 
+fn skill_creator_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "skill_creator",
+            "description": "Create or improve a reusable Skill from the user's natural-language goal and the current authorized context. Return a private candidate and an evaluation plan or evidence status when a server-owned replay case exists. Do not publish or activate the candidate.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 16384,
+                        "description": "The user's request in their own words, including the capability they want created or improved."
+                    }
+                },
+                "required": ["goal"]
+            }
+        }
+    })
+}
+
 fn start_work_schema() -> Value {
     json!({
         "type": "function",
@@ -1295,6 +1318,7 @@ macro_rules! heap_schema_vec {
 
 fn all_tool_schemas_core() -> Vec<Value> {
     heap_schema_vec![
+        skill_creator_schema(),
         submit_task_resolution_schema(),
         start_work_schema(),
         run_next_work_item_schema(),
@@ -2415,6 +2439,7 @@ mod tests {
             .expect("fresh schema construction must fit a default Tokio worker stack");
         assert!(find_schema(&schemas, "tool_search").is_some());
         assert!(find_schema(&schemas, "agent").is_some());
+        assert!(find_schema(&schemas, "skill_creator").is_some());
     }
 
     fn schema_names(schemas: &[Value]) -> Vec<&str> {

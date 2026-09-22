@@ -14,8 +14,8 @@ use astra_services::evaluation::{
     DatabaseEvaluationPlanStore, EVALUATION_ADAPTER_PROFILE_VERSION, EvaluationBootstrapError,
     EvaluationExperimentPrepareRequest, EvaluationExperimentPrepareResponse,
     EvaluationJudgmentPolicy, EvaluationTargetKind, FrozenSkillRoutingPolicy,
-    PreparedSkillIdentity, build_prepared_experiment_spec, prepared_experiment_id,
-    prepared_request_matches_spec,
+    NO_SKILL_CONTENT_HASH, NO_SKILL_REVISION_ID, PreparedSkillIdentity,
+    build_prepared_experiment_spec, prepared_experiment_id, prepared_request_matches_spec,
 };
 use astra_services::{DatabasePersonalSkillStore, PersonalSkillError};
 use astra_turn_types::ModelSelection;
@@ -180,20 +180,26 @@ pub async fn prepare_experiment(
             )
         })?;
         let store = DatabasePersonalSkillStore::new(pool.clone());
-        let baseline = store
-            .load_version(
-                owner_user_id,
-                skill_name,
-                &request.target.baseline.revision_id,
+        let baseline = if request.target.baseline.revision_id == NO_SKILL_REVISION_ID {
+            None
+        } else {
+            Some(
+                store
+                    .load_version(
+                        owner_user_id,
+                        skill_name,
+                        &request.target.baseline.revision_id,
+                    )
+                    .await
+                    .map_err(map_skill_error)?
+                    .ok_or_else(|| {
+                        error_response(
+                            StatusCode::NOT_FOUND,
+                            "baseline Skill revision was not found for this user",
+                        )
+                    })?,
             )
-            .await
-            .map_err(map_skill_error)?
-            .ok_or_else(|| {
-                error_response(
-                    StatusCode::NOT_FOUND,
-                    "baseline Skill revision was not found for this user",
-                )
-            })?;
+        };
         let candidate = store
             .load_version(
                 owner_user_id,
@@ -208,23 +214,29 @@ pub async fn prepare_experiment(
                     "candidate Skill revision was not found for this user",
                 )
             })?;
-        if baseline.status != "published" || candidate.status != "published" {
+        if candidate.version_id == NO_SKILL_REVISION_ID
+            || !matches!(candidate.status.as_str(), "published" | "draft")
+            || baseline
+                .as_ref()
+                .is_some_and(|revision| revision.status != "published")
+        {
             return Err(error_response(
                 StatusCode::CONFLICT,
-                "evaluation requires published Skill revisions",
+                "evaluation requires a published baseline and a published or evaluation-draft candidate",
             ));
         }
-        if baseline.owner_user_id != owner_user_id
-            || candidate.owner_user_id != owner_user_id
-            || baseline.skill_name != skill_name
+        if candidate.owner_user_id != owner_user_id
             || candidate.skill_name != skill_name
+            || baseline.as_ref().is_some_and(|revision| {
+                revision.owner_user_id != owner_user_id || revision.skill_name != skill_name
+            })
         {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 "Skill revision ownership does not match the authenticated user",
             ));
         }
-        for revision in [&baseline, &candidate] {
+        for revision in baseline.iter().chain(std::iter::once(&candidate)) {
             if revision.content_hash
                 != astra_services::skill_md_content_hash(
                     &revision.manifest_json,
@@ -246,8 +258,14 @@ pub async fn prepare_experiment(
         }
         Some(PreparedSkillIdentity {
             skill_name: skill_name.to_string(),
-            baseline_revision_id: baseline.version_id,
-            baseline_content_hash: baseline.content_hash,
+            baseline_revision_id: baseline
+                .as_ref()
+                .map(|revision| revision.version_id.clone())
+                .unwrap_or_else(|| NO_SKILL_REVISION_ID.to_string()),
+            baseline_content_hash: baseline
+                .as_ref()
+                .map(|revision| revision.content_hash.clone())
+                .unwrap_or_else(|| NO_SKILL_CONTENT_HASH.to_string()),
             candidate_revision_id: candidate.version_id,
             candidate_content_hash: candidate.content_hash,
         })

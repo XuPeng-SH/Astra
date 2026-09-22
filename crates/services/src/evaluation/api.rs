@@ -38,7 +38,7 @@ pub struct EvaluationExperimentPrepareRequest {
     pub max_wall_time_secs: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationPrepareTarget {
     pub kind: EvaluationTargetKind,
@@ -48,7 +48,7 @@ pub struct EvaluationPrepareTarget {
     pub skill_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationPrepareRevision {
     pub revision_id: String,
@@ -66,7 +66,7 @@ pub struct EvaluationPrepareWorkspace {
     pub tool_names: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationPrepareCase {
     pub case_id: String,

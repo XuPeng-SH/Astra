@@ -1,5 +1,9 @@
 use crate::cli::surface::skill_install_status_surface::skill_install_status_surface;
-use crate::cli::{cli_config::cli_output, session::session_state::SessionState, theme};
+use crate::cli::{
+    cli_config::{cli_output, cli_utils::print_json_or_raw},
+    session::session_state::SessionState,
+    theme,
+};
 use astra_runtime::prompts;
 use crossterm::style::Stylize;
 
@@ -33,7 +37,7 @@ async fn start_authoring_from_session(
         theme::icon_ok(),
         record.operation,
         record.target,
-        record.classification_source,
+        record.resolution_source,
         record.harness_run.status,
     );
     eprintln!(
@@ -45,6 +49,22 @@ async fn start_authoring_from_session(
         record.skill_drafts.len(),
         record.harness_run.harness_run_id
     );
+    if let Some(prepared) = record.evaluation_plan {
+        let wait_secs = 300u64
+            .checked_mul(prepared.trials.len() as u64)
+            .and_then(|seconds| seconds.checked_add(60))
+            .ok_or_else(|| "evaluation wait budget overflows".to_string())?;
+        let report = crate::cli::evaluation::run_prepared_evaluation(
+            api,
+            token.unwrap_or(""),
+            prepared,
+            wait_secs,
+            500,
+        )
+        .await?;
+        eprintln!("  Evaluation report:");
+        print_json_or_raw(&report);
+    }
     eprintln!("  Nothing was activated; publishing/adoption remains an explicit reviewed action.");
     Ok(())
 }
@@ -2108,7 +2128,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "target": "skill",
                     "operation": "create",
-                    "classification_source": "jev",
+                    "resolution_source": "no_matching_active_skill",
                     "goal": "帮我生成一个 review helper",
                     "harness_run": {
                         "harness_run_id": "run-123",

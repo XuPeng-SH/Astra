@@ -2279,9 +2279,9 @@ mod tests {
         current_access_token, current_git_root, default_model_selection_from_access,
         ensure_state_default_model, fetch_server_model_catalog, fresh_access_token, git_root_from,
         initialize_session_state, load_server_model_access, model_default_invalid_reason_message,
-        model_selection_for_name_from_catalog, pending_recovery_status_line,
-        resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
-        restore_session_state_from_journal, restored_journal_state,
+        model_selection_for_name_from_catalog, model_selection_from_exact_response,
+        pending_recovery_status_line, resolve_server_default_model, resolve_server_model_selection,
+        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error, style_banner_text,
     };
     use crate::cli::cli_config::cli_utils::{

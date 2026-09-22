@@ -5,7 +5,6 @@ pub mod agent_lessons;
 pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
-pub mod authoring_intent;
 pub mod branches;
 pub mod byok_endpoint;
 mod cancellation_safe_db;
@@ -68,7 +67,6 @@ pub mod session_memory_inventory;
 pub mod session_restore;
 pub mod session_workspace;
 pub mod skill_auto_route_judge;
-pub mod skill_config;
 pub mod skills;
 pub mod snapshot_sql;
 pub mod state_projection;
@@ -220,7 +218,7 @@ pub use events::{
 };
 pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
 pub use harness::{
-    AuthoringEvaluationSummary, AuthoringInferenceEvidence, AuthoringIntentClassifier,
+    AuthoringEvaluationInput, AuthoringEvaluationSummary, AuthoringInferenceEvidence,
     AuthoringIntentRecord, AuthoringIntentRequest, DatabaseHarnessService, HarnessCitationRecord,
     HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord, HarnessRunRecord,
     HarnessService, HarnessSkillDraftRecord, HarnessSkillRuleRecord, HarnessTemplateRecord,
@@ -397,13 +395,6 @@ pub use skill_auto_route_judge::{
     skill_auto_route_judgment_request_fingerprint,
 };
 
-pub use authoring_intent::{
-    AUTHORING_JUDGMENT_OPERATION_ID, AUTHORING_JUDGMENT_OUTPUT_TOKENS, AuthoringOperation,
-    authoring_judgment_messages, authoring_judgment_request, parse_authoring_operation,
-};
-pub use skill_config::{
-    DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
-};
 pub use skills::{
     DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillService,
     UnconfiguredSkillService,

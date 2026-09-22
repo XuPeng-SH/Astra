@@ -92,6 +92,7 @@ fn build_chat_request(
         provider_run_owner: None,
         provider_workspace_id: None,
         execution_budget: None,
+        session_admission_facts: None,
         execution_time_budget: Some(ExecutionTimeBudget {
             remaining_seconds: plan.execution_time_budget_secs,
         }),

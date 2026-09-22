@@ -44,10 +44,11 @@ pub use execution::{
     DatabaseEvaluationObservationStore, EVALUATION_EXECUTION_SCHEMA_VERSION,
     EvaluationAdmissionMarker, EvaluationExecutionError, EvaluationObservationRecord,
     EvaluationObservationRequest, EvaluationPolicyFingerprintInput, EvaluationRunAdmission,
-    EvaluationSkillRevision, apply_context_evidence, apply_inference_evidence,
-    apply_tool_outcome_evidence, content_fingerprint, evaluation_component_idempotency_key,
-    evaluation_policy_fingerprint, prompt_context_fingerprint, prompt_only_snapshot_envelope,
-    prompt_policy_fingerprint, terminal_run_observation,
+    EvaluationSkillRevision, NO_SKILL_CONTENT_HASH, NO_SKILL_REVISION_ID, apply_context_evidence,
+    apply_inference_evidence, apply_tool_outcome_evidence, content_fingerprint,
+    evaluation_component_idempotency_key, evaluation_policy_fingerprint, is_no_skill_revision,
+    prompt_context_fingerprint, prompt_only_snapshot_envelope, prompt_policy_fingerprint,
+    terminal_run_observation,
 };
 pub use execution_config::{
     EVALUATION_EXECUTION_CONFIG_SCHEMA_VERSION, EVALUATION_RUNTIME_CONTRACT_VERSION,

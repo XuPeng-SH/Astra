@@ -459,6 +459,26 @@ export type AuthoringEvaluationSummary = {
   experiment_id: string | null;
 };
 
+export type AuthoringEvaluationPlan = {
+  experiment: {
+    experiment_id: string;
+    spec_fingerprint: string;
+  };
+  trials: Array<{
+    trial_id: string;
+    binding_status: string;
+    session_id: string | null;
+    run_id: string | null;
+    trial: {
+      sequence: number;
+      case_id: string;
+      arm: string;
+      repetition: number;
+    };
+  }>;
+  adapter_profile_version: string;
+};
+
 export type AuthoringInferenceEvidence = {
   schema_version: number;
   invocation_count: number;
@@ -484,11 +504,12 @@ export type AuthoringInferenceEvidence = {
 export type AuthoringIntentRecord = {
   target: string;
   operation: string;
-  classification_source: string;
+  resolution_source: string;
   goal: string;
   harness_run: HarnessRun;
   skill_drafts: HarnessSkillDraft[];
   evaluation: AuthoringEvaluationSummary;
+  evaluation_plan?: AuthoringEvaluationPlan | null;
   inference: AuthoringInferenceEvidence;
 };
 

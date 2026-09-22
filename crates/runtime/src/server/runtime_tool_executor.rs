@@ -50,6 +50,17 @@ use async_trait::async_trait;
 
 const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROVIDER_INTERACTION_ROUNDS_PER_TOOL_CALL: usize = 16;
+const SKILL_CREATOR_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[async_trait]
+pub trait SkillCreatorToolService: Send + Sync {
+    async fn create_skill(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        goal: &str,
+    ) -> Result<astra_services::AuthoringIntentRecord, String>;
+}
 
 /// Normalize authenticated, durable Edge evidence without inferring execution
 /// from output text. Interrupted dispatches need affirmative execution evidence.
@@ -785,6 +796,10 @@ pub struct RuntimeToolExecutor {
     pub(super) default_executor: DefaultToolExecutor,
     /// Canonical handler registry for server-local tools.
     tool_engine: ToolEngine<RuntimeToolExecutor>,
+    /// Product-owned Skill Creator orchestration. The tool engine remains the
+    /// only model-facing route; this service supplies the application use
+    /// case without granting any additional tool or workspace authority.
+    skill_creator_service: Option<Arc<dyn SkillCreatorToolService>>,
     /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Immutable request-admission deadline for durable tool-result writes.
@@ -1015,6 +1030,7 @@ impl RuntimeToolExecutor {
             sandbox_policy,
             default_executor,
             tool_engine,
+            skill_creator_service: None,
             file_journal: Arc::new(Mutex::new(FileEditJournal::new(500))),
             convergence_tracker: Default::default(),
             database_snapshot_journal: Arc::new(Mutex::new(
@@ -1129,6 +1145,98 @@ impl RuntimeToolExecutor {
     ) -> Self {
         self.reflect_service = service;
         self
+    }
+
+    pub fn with_skill_creator_service(mut self, service: Arc<dyn SkillCreatorToolService>) -> Self {
+        self.skill_creator_service = Some(service);
+        self
+    }
+
+    pub(super) async fn execute_skill_creator(
+        &self,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("skill_creator", false);
+        }
+        let Some(goal) = args
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty())
+        else {
+            return astra_tools::ToolResult::error(
+                "skill_creator requires a non-empty goal".to_string(),
+            );
+        };
+        let Some(service) = self.skill_creator_service.as_ref() else {
+            return astra_tools::ToolResult::error(
+                "Skill Creator is unavailable because its server service is not configured"
+                    .to_string(),
+            );
+        };
+        let service = Arc::clone(service);
+        let user_id = self.user_id.clone();
+        let session_id = self.session_id.clone();
+        let goal = goal.to_string();
+        // Keep the application operation alive after transport cancellation so
+        // its durable HarnessRun can reach a terminal state. The transport may
+        // stop waiting, but dropping the in-flight provider future here would
+        // leave a running authoring record behind.
+        let mut operation =
+            tokio::spawn(async move { service.create_skill(&user_id, &session_id, &goal).await });
+        let joined = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                biased;
+                result = &mut operation => result,
+                _ = cancel_token.cancelled() => {
+                    let _ = tokio::time::timeout(
+                        SKILL_CREATOR_CANCEL_SETTLE_TIMEOUT,
+                        &mut operation,
+                    )
+                    .await;
+                    return astra_tools::cancelled_tool_result("skill_creator", false);
+                }
+            }
+        } else {
+            operation.await
+        };
+        let record = match joined {
+            Ok(Ok(record)) => record,
+            Ok(Err(error)) => return astra_tools::ToolResult::error(error),
+            Err(error) => {
+                return astra_tools::ToolResult::error(format!(
+                    "Skill Creator operation terminated unexpectedly: {error}"
+                ));
+            }
+        };
+        let candidates = record
+            .skill_drafts
+            .iter()
+            .map(|draft| {
+                json!({
+                    "name": draft.candidate_name,
+                    "description": draft.description,
+                    "content_markdown": draft.content_markdown,
+                    "status": draft.status,
+                })
+            })
+            .collect::<Vec<_>>();
+        let output = json!({
+            "status": "candidate_ready",
+            "target": record.target,
+            "operation": record.operation,
+            "candidates": candidates,
+            "evaluation": record.evaluation,
+            "evidence": {
+                "inference_complete": record.inference.complete,
+                "usage_status": record.inference.usage_status,
+                "estimated_cost_usd": record.inference.estimated_cost_usd,
+            },
+            "next_step": "The candidate is private and inactive. Review the candidate and evaluation evidence before publishing it.",
+        });
+        astra_tools::ToolResult::text(output.to_string())
     }
 
     /// Configure semantic read reuse from exact provider capabilities.
@@ -2286,6 +2394,9 @@ impl RuntimeToolExecutor {
     }
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
+        if name == "skill_creator" && self.skill_creator_service.is_none() {
+            return ExecutorToolReadiness::MissingService(Capability::SkillsCatalog);
+        }
         if self.current_edge_provider_binding() && self.current_edge_provider_schema_contains(name)
         {
             // The websocket handshake still advertises and authorizes only
@@ -7736,6 +7847,9 @@ mod tests {
             if work_service_unavailable {
                 continue;
             }
+            if handler_name == "skill_creator" && exec.skill_creator_service.is_none() {
+                continue;
+            }
             if (handler_name == "run_script"
                 && (cfg!(not(unix)) || !astra_sandbox::process_scope_available()))
                 || runtime_spec.requires_explicit_user_enablement()
@@ -7821,6 +7935,9 @@ mod tests {
                         })
                     }) && !exec.work_service_available();
                 if work_service_unavailable {
+                    return false;
+                }
+                if *n == "skill_creator" && exec.skill_creator_service.is_none() {
                     return false;
                 }
                 !schema_names.contains(*n)

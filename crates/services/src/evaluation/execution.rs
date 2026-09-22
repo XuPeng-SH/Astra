@@ -29,6 +29,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const EVALUATION_EXECUTION_SCHEMA_VERSION: u32 = 2;
+/// Baseline identity for an authoring comparison where the user asked to
+/// create a new Skill. It represents the absence of a Skill, not an empty
+/// published revision.
+pub const NO_SKILL_REVISION_ID: &str = "no-skill";
+pub const NO_SKILL_CONTENT_HASH: &str =
+    "sha256:3ba9af61d4e368db678f01de7fe4bd24aa793280109e9734de22376d06aa8e7b";
 const MAX_ID_BYTES: usize = 128;
 const MAX_SESSION_ID_BYTES: usize = 64;
 const MAX_RUN_ID_BYTES: usize = 128;
@@ -827,6 +833,8 @@ fn validate_admission_for_trial_with_policy_validation(
     }
     match (&spec.target.kind, &admission.skill_revision) {
         (EvaluationTargetKind::Prompt, None) => {}
+        (EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment, None)
+            if is_no_skill_revision(&revision.revision_id, &revision.content_hash) => {}
         (EvaluationTargetKind::Skill | EvaluationTargetKind::SkillRoutingJudgment, Some(skill))
             if Some(skill.skill_name.as_str()) == spec.target.skill_name.as_deref()
                 && skill.revision_id == revision.revision_id
@@ -1546,6 +1554,10 @@ pub fn evaluation_policy_fingerprint(
 
 pub fn content_fingerprint(content: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(content.as_bytes()))
+}
+
+pub fn is_no_skill_revision(revision_id: &str, content_hash: &str) -> bool {
+    revision_id == NO_SKILL_REVISION_ID && content_hash == NO_SKILL_CONTENT_HASH
 }
 
 pub fn evaluation_component_idempotency_key(

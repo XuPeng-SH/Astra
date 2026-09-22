@@ -589,13 +589,12 @@ impl SkillService for DatabaseSkillService {
             )
         })?;
 
-        let install_count_row = query(
-            "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'"
-        )
-        .bind(&skill_name)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
+        let install_count_row =
+            query("SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ?")
+                .bind(&skill_name)
+                .fetch_one(&pool)
+                .await
+                .map_err(internal_error)?;
         let install_count: i64 = install_count_row.try_get("cnt").map_err(internal_error)?;
 
         Ok(SkillInfoRecord {
@@ -1035,13 +1034,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_count_query_uses_status_not_is_active() {
-        let sql = "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'";
+    fn install_count_query_counts_the_current_installation_row() {
+        let sql = "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ?";
         assert!(
             !sql.contains("is_active"),
-            "skill_installations has no is_active column; use status = 'installed'"
+            "skill_installations has no is_active column"
         );
-        assert!(sql.contains("status = 'installed'"));
+        assert!(!sql.contains("status"));
     }
 
     #[test]

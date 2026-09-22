@@ -58,7 +58,7 @@ use astra_services::evaluation::{
     JudgmentExecutionStatus, MaterializationComponentKind, MaterializationOutcome,
     MaterializationReceiptRequest, TrialStatus, TrustedMaterializerContext,
     apply_inference_evidence, apply_tool_outcome_evidence, content_fingerprint,
-    evaluation_component_idempotency_key, evaluation_policy_fingerprint,
+    evaluation_component_idempotency_key, evaluation_policy_fingerprint, is_no_skill_revision,
     prompt_context_fingerprint, prompt_only_snapshot_envelope, terminal_run_observation,
 };
 use astra_services::runs::{
@@ -3592,6 +3592,58 @@ type ServerSkillResolverBundle = (
     Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
 );
 
+/// The database catalog is a user-scoped snapshot. A turn may rebuild its
+/// process-local loop state, but it must not repeat the catalog walk for every
+/// turn. The short TTL lets a normal server observe publishes without making
+/// the hot path depend on a database read; explicit refresh removes the entry
+/// immediately when a caller needs a new snapshot.
+const SERVER_SKILL_REGISTRY_CACHE_TTL: Duration = Duration::from_secs(60);
+const SERVER_SKILL_REGISTRY_CACHE_MAX_USERS: usize = 256;
+
+struct CachedServerSkillRegistry {
+    registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
+    refreshed_at: Instant,
+}
+
+fn cached_server_skill_registry_for(
+    cache: &Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    skill_service: Option<Arc<dyn SkillService>>,
+    user_id: &str,
+) -> Option<Arc<crate::skills::UnifiedSkillRegistry>> {
+    let now = Instant::now();
+    let Ok(mut cache_guard) = cache.lock() else {
+        return crate::capabilities::build_server_skill_registry(skill_service, user_id);
+    };
+    if let Some(entry) = cache_guard.get(user_id)
+        && now.duration_since(entry.refreshed_at) < SERVER_SKILL_REGISTRY_CACHE_TTL
+    {
+        return entry.registry.clone();
+    }
+
+    // Keep the short synchronous critical section single-flight. Discovery is
+    // already bridged through the runtime by `build_server_skill_registry`;
+    // releasing this guard before that call would let a burst of first turns
+    // perform the same database walk concurrently.
+    let registry = crate::capabilities::build_server_skill_registry(skill_service, user_id);
+    if !cache_guard.contains_key(user_id)
+        && cache_guard.len() >= SERVER_SKILL_REGISTRY_CACHE_MAX_USERS
+        && let Some(oldest_user_id) = cache_guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.refreshed_at)
+            .map(|(user_id, _)| user_id.clone())
+    {
+        cache_guard.remove(&oldest_user_id);
+    }
+    cache_guard.insert(
+        user_id.to_string(),
+        CachedServerSkillRegistry {
+            registry: registry.clone(),
+            refreshed_at: Instant::now(),
+        },
+    );
+    registry
+}
+
 /// Post-loop session-memory settlement shared by `create_run` and
 /// `stream_chat`. A terminal turn is not a session close: this worker drains
 /// run-scoped extraction and writes settlement evidence, while session-scoped
@@ -3970,14 +4022,12 @@ async fn run_post_loop_memory_cleanup_work(
 /// skills visible to the authenticated user. Request `allow_skills` is a
 /// selector/execution filter over that catalog, not a switch that enables the
 /// catalog.
-fn build_server_skill_resolver(
-    skill_service: Option<Arc<dyn SkillService>>,
-    user_id: &str,
+fn build_server_skill_resolver_from_registry(
+    registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
 ) -> ServerSkillResolverBundle {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    let Some(registry) = crate::capabilities::build_server_skill_registry(skill_service, user_id)
-    else {
+    let Some(registry) = registry else {
         return (None, None);
     };
 
@@ -5535,6 +5585,14 @@ pub struct AgenticRunLifecycleService {
     workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
+    /// User-scoped server skill snapshots reused across turns. The registry
+    /// itself still owns provider and loaded-skill caches; this outer cache
+    /// keeps a new loop environment from reconstructing those caches.
+    server_skill_registry_cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    /// Standard server service for the model-facing Skill Creator tool.
+    /// Authoring is coordinator-owned and is intentionally absent from
+    /// delegated task executors.
+    skill_creator_service: Option<Arc<dyn runtime_tool_executor::SkillCreatorToolService>>,
     /// Exact model catalog used to resolve client-visible Offering IDs.
     model_service: Arc<dyn ModelService>,
     /// Registry-backed MCP bindings available to server-side chat loops.
@@ -5669,6 +5727,8 @@ impl AgenticRunLifecycleService {
             edge_connection_pool: None,
             workspace_record_store: None,
             skill_service: None,
+            server_skill_registry_cache: Arc::new(StdMutex::new(HashMap::new())),
+            skill_creator_service: None,
             model_service: Arc::new(astra_services::UnconfiguredModelService),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
@@ -5694,6 +5754,29 @@ impl AgenticRunLifecycleService {
             tool_execution_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
         }
+    }
+
+    fn cached_server_skill_registry(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<crate::skills::UnifiedSkillRegistry>> {
+        cached_server_skill_registry_for(
+            &self.server_skill_registry_cache,
+            self.skill_service.clone(),
+            user_id,
+        )
+    }
+
+    /// Drop one user's server catalog snapshot so the next turn performs an
+    /// explicit fresh discovery.
+    pub fn refresh_server_skill_catalog(&self, user_id: &str) {
+        if let Ok(mut cache) = self.server_skill_registry_cache.lock() {
+            cache.remove(user_id);
+        }
+    }
+
+    fn cached_server_skill_resolver(&self, user_id: &str) -> ServerSkillResolverBundle {
+        build_server_skill_resolver_from_registry(self.cached_server_skill_registry(user_id))
     }
 
     async fn prepare_canonical_turn(
@@ -6440,6 +6523,17 @@ impl AgenticRunLifecycleService {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
+        if let Ok(mut cache) = self.server_skill_registry_cache.lock() {
+            cache.clear();
+        }
+        self
+    }
+
+    pub fn with_skill_creator_service(
+        mut self,
+        service: Arc<dyn runtime_tool_executor::SkillCreatorToolService>,
+    ) -> Self {
+        self.skill_creator_service = Some(service);
         self
     }
 
@@ -6763,6 +6857,7 @@ impl AgenticRunLifecycleService {
         .with_model_service(Some(self.model_service.clone()))
         .with_edge_connection_pool(self.edge_connection_pool.clone())
         .with_skill_service(self.skill_service.clone())
+        .with_server_skill_registry_cache(Arc::clone(&self.server_skill_registry_cache))
         .with_memory_extraction_service(self.memory_extraction_service.clone())
         .with_reflect_service(Arc::clone(&self.reflect_service))
         .with_auxiliary_event_writer(self.auxiliary_event_writer.clone())
@@ -8333,13 +8428,6 @@ impl AgenticRunLifecycleService {
             }
             astra_services::evaluation::EvaluationTargetKind::Skill
             | astra_services::evaluation::EvaluationTargetKind::SkillRoutingJudgment => {
-                let Some(skill_revision) = admission.skill_revision.as_ref() else {
-                    return Err(evaluation_preflight_error(
-                        StatusCode::BAD_REQUEST,
-                        "evaluation_skill_revision_missing",
-                        "Skill evaluation requires an owner-scoped immutable revision identity",
-                    ));
-                };
                 if request.stable_runtime_system_prompt.is_some() {
                     return Err(evaluation_preflight_error(
                         StatusCode::NOT_IMPLEMENTED,
@@ -8355,66 +8443,94 @@ impl AgenticRunLifecycleService {
                         &experiment.spec.target.candidate.revision_id
                     }
                 };
-                if skill_revision.revision_id != *expected_revision_id {
-                    return Err(evaluation_preflight_error(
-                        StatusCode::CONFLICT,
-                        "evaluation_skill_revision_mismatch",
-                        "Skill revision id does not match the frozen baseline/candidate",
-                    ));
-                }
-                let skill_store = astra_services::DatabasePersonalSkillStore::new(pool.clone());
-                let revision = skill_store
-                    .load_version(
-                        user_id,
-                        &skill_revision.skill_name,
-                        &skill_revision.revision_id,
-                    )
-                    .await
-                    .map_err(|error| {
-                        evaluation_preflight_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "evaluation_skill_revision_unavailable",
-                            error,
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        evaluation_preflight_error(
-                            StatusCode::CONFLICT,
-                            "evaluation_skill_revision_not_found",
-                            "the requested owner-scoped Skill revision no longer exists",
-                        )
-                    })?;
-                if !evaluation_skill_revision_matches(
-                    &revision,
-                    user_id,
-                    skill_revision,
-                    &admission.revision_content_hash,
+                if is_no_skill_revision(
+                    expected_revision_id,
+                    match trial.arm {
+                        astra_services::evaluation::ComparisonArm::Baseline => {
+                            &experiment.spec.target.baseline.content_hash
+                        }
+                        astra_services::evaluation::ComparisonArm::Candidate => {
+                            &experiment.spec.target.candidate.content_hash
+                        }
+                    },
                 ) {
-                    return Err(evaluation_preflight_error(
-                        StatusCode::CONFLICT,
-                        "evaluation_skill_revision_mismatch",
-                        "loaded Skill content does not match the frozen owner/version/hash identity",
-                    ));
-                }
-                if revision.status != "published" {
-                    return Err(evaluation_preflight_error(
-                        StatusCode::CONFLICT,
-                        "evaluation_skill_revision_unavailable",
-                        "only published Skill revisions can enter an evaluation",
-                    ));
-                }
-                let resolver =
-                    crate::turn::skill_tool::PinnedSkillResolver::from_user_skill_revision(
-                        &revision,
-                    )
-                    .map_err(|error| {
-                        evaluation_preflight_error(
-                            StatusCode::NOT_IMPLEMENTED,
-                            "evaluation_skill_surface_unsupported",
-                            error,
+                    if admission.skill_revision.is_some() {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_unexpected",
+                            "the no-skill baseline cannot carry a Skill revision identity",
+                        ));
+                    }
+                    None
+                } else {
+                    let Some(skill_revision) = admission.skill_revision.as_ref() else {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::BAD_REQUEST,
+                            "evaluation_skill_revision_missing",
+                            "Skill evaluation requires an owner-scoped immutable revision identity",
+                        ));
+                    };
+                    if skill_revision.revision_id != *expected_revision_id {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_mismatch",
+                            "Skill revision id does not match the frozen baseline/candidate",
+                        ));
+                    }
+                    let skill_store = astra_services::DatabasePersonalSkillStore::new(pool.clone());
+                    let revision = skill_store
+                        .load_version(
+                            user_id,
+                            &skill_revision.skill_name,
+                            &skill_revision.revision_id,
                         )
-                    })?;
-                Some(Arc::new(resolver) as Arc<dyn crate::turn::skill_tool::SkillResolver>)
+                        .await
+                        .map_err(|error| {
+                            evaluation_preflight_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "evaluation_skill_revision_unavailable",
+                                error,
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            evaluation_preflight_error(
+                                StatusCode::CONFLICT,
+                                "evaluation_skill_revision_not_found",
+                                "the requested owner-scoped Skill revision no longer exists",
+                            )
+                        })?;
+                    if !evaluation_skill_revision_matches(
+                        &revision,
+                        user_id,
+                        skill_revision,
+                        &admission.revision_content_hash,
+                    ) {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_mismatch",
+                            "loaded Skill content does not match the frozen owner/version/hash identity",
+                        ));
+                    }
+                    if !matches!(revision.status.as_str(), "published" | "draft") {
+                        return Err(evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_unavailable",
+                            "only published or evaluation-draft Skill revisions can enter an evaluation",
+                        ));
+                    }
+                    let resolver =
+                        crate::turn::skill_tool::PinnedSkillResolver::from_user_skill_revision(
+                            &revision,
+                        )
+                        .map_err(|error| {
+                            evaluation_preflight_error(
+                                StatusCode::NOT_IMPLEMENTED,
+                                "evaluation_skill_surface_unsupported",
+                                error,
+                            )
+                        })?;
+                    Some(Arc::new(resolver) as Arc<dyn crate::turn::skill_tool::SkillResolver>)
+                }
             }
             _ => {
                 return Err(evaluation_preflight_error(
@@ -10000,8 +10116,7 @@ impl AgenticRunLifecycleService {
         {
             let skill_policy = request_constraints.skill_surfacing_policy();
             if skill_policy.requires_catalog_validation() {
-                let (_, resolver) =
-                    build_server_skill_resolver(self.skill_service.clone(), user_id);
+                let (_, resolver) = self.cached_server_skill_resolver(user_id);
                 apply_normalized_skill_allowlist(resolver, &request_constraints)
                     .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
             }
@@ -14086,8 +14201,7 @@ impl AgenticRunLifecycleService {
         } else if let Some(skill_resolver) = request_scoped_skill_resolver {
             (None, Some(skill_resolver))
         } else {
-            let (skill_registry, raw_skill_resolver) =
-                build_server_skill_resolver(self.skill_service.clone(), user_id);
+            let (skill_registry, raw_skill_resolver) = self.cached_server_skill_resolver(user_id);
             let skill_resolver =
                     apply_normalized_skill_allowlist(raw_skill_resolver, request_constraints)
                         .unwrap_or_else(|err| {
@@ -14612,7 +14726,6 @@ impl AgenticRunLifecycleService {
                     })
                 }),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks: facts.tool_event_hooks,
                 session_event_hooks: facts.session_event_hooks,
                 ..Default::default()
@@ -19321,6 +19434,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .with_evaluation_workspace(evaluation_workspace)
             .with_admitted_execution_deadline(request.admitted_execution_deadline);
+            if let Some(service) = self.skill_creator_service.clone() {
+                executor = executor.with_skill_creator_service(service);
+            }
             if let Some(memoria_port) = RuntimeProductionStatePolicy::for_request(&request)
                 .select(self.memory_extraction_service.as_ref())
                 .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
@@ -20827,6 +20943,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 ),
             )
             .with_admitted_execution_deadline(request.admitted_execution_deadline);
+            if let Some(service) = self.skill_creator_service.clone() {
+                executor = executor.with_skill_creator_service(service);
+            }
             if let Some(memoria_port) = RuntimeProductionStatePolicy::for_request(&request)
                 .select(self.memory_extraction_service.as_ref())
                 .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
@@ -23785,6 +23904,7 @@ pub struct ServerSpawnAgentExecutor {
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
+    server_skill_registry_cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
@@ -23881,6 +24001,7 @@ impl ServerSpawnAgentExecutor {
             edge_dispatch_service: None,
             edge_registry_service: None,
             skill_service: None,
+            server_skill_registry_cache: Arc::new(StdMutex::new(HashMap::new())),
             memory_extraction_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             auxiliary_event_writer: None,
@@ -23915,6 +24036,14 @@ impl ServerSpawnAgentExecutor {
         pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     ) -> Self {
         self.edge_connection_pool = pool;
+        self
+    }
+
+    fn with_server_skill_registry_cache(
+        mut self,
+        cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    ) -> Self {
+        self.server_skill_registry_cache = cache;
         self
     }
 
@@ -24402,7 +24531,8 @@ impl ServerSpawnAgentExecutor {
             self.matrixone.clone(),
             Arc::clone(&self.encryptor),
             Arc::clone(&self.edge_callback_ledger),
-        );
+        )
+        .with_server_skill_registry_cache(Arc::clone(&self.server_skill_registry_cache));
         if let Some(run_engine) = self.run_engine.clone() {
             executor = executor.with_run_engine(run_engine);
         }
@@ -25569,6 +25699,7 @@ pub struct ServerSubRunExecutor {
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
+    server_skill_registry_cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
@@ -25633,6 +25764,7 @@ impl ServerSubRunExecutor {
             edge_dispatch_service: None,
             edge_registry_service: None,
             skill_service: None,
+            server_skill_registry_cache: Arc::new(StdMutex::new(HashMap::new())),
             memory_extraction_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             auxiliary_event_writer: None,
@@ -25662,6 +25794,14 @@ impl ServerSubRunExecutor {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    fn with_server_skill_registry_cache(
+        mut self,
+        cache: Arc<StdMutex<HashMap<String, CachedServerSkillRegistry>>>,
+    ) -> Self {
+        self.server_skill_registry_cache = cache;
         self
     }
 
@@ -25771,6 +25911,14 @@ struct DurableSubrunAdmission {
 }
 
 impl ServerSubRunExecutor {
+    fn cached_server_skill_resolver(&self, user_id: &str) -> ServerSkillResolverBundle {
+        build_server_skill_resolver_from_registry(cached_server_skill_registry_for(
+            &self.server_skill_registry_cache,
+            self.skill_service.clone(),
+            user_id,
+        ))
+    }
+
     fn durable_run_engine(&self) -> Option<RunEngine> {
         self.run_engine.clone()
     }
@@ -27102,7 +27250,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .unwrap_or_default();
 
         let (skill_registry, raw_skill_resolver) =
-            build_server_skill_resolver(self.skill_service.clone(), &config.user_id);
+            self.cached_server_skill_resolver(&config.user_id);
         let skill_resolver =
             apply_normalized_skill_allowlist(raw_skill_resolver, &config.request_constraints)?;
 
@@ -27179,7 +27327,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 resolver: skill_resolver,
                 request_constraints: config.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks,
                 session_event_hooks,
                 ..Default::default()

@@ -135,6 +135,9 @@ pub(super) async fn build_runtime_wiring(
     .with_workspace_record_store(workspace_record_store)
     .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
+    .with_skill_creator_service(Arc::new(
+        crate::server::product_harness_handlers::AppStateSkillCreatorToolService::new(state),
+    ))
     .with_model_service(state.model_service.clone())
     .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())

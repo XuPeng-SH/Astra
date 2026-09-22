@@ -956,7 +956,6 @@ pub(crate) async fn stream_chat_sse(
             executor: skill_executor,
             quality_tracker: p.skill_quality_tracker.clone(),
             quality_tracker_baseline: p.skill_quality_tracker.clone(),
-            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             execution: astra_runtime::turn::agentic_loop::host::SkillExecutionState {
                 discovered: discovered_skills,
                 ..Default::default()

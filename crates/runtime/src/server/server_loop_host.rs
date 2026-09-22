@@ -11985,7 +11985,10 @@ impl ServerAgenticLoopHost {
         if let PreparedExecutionPolicy::Evaluation(frozen) = &self.execution_inputs.policy {
             if operation_id == "request_judgment" {
                 let execution = frozen.admitted.clone();
-                if !request.output_budget_fits_completion_cap(execution.max_completion_tokens) {
+                if execution
+                    .max_completion_tokens
+                    .is_some_and(|cap| max_output_tokens > cap as usize)
+                {
                     return Err(JudgmentClientUnavailable::OutputBudget);
                 }
                 let auxiliary_policy = frozen
@@ -12006,8 +12009,8 @@ impl ServerAgenticLoopHost {
                         max_output_tokens,
                         state,
                         operation_id,
-                        Some(&execution),
                         astra_turn_types::InferencePurpose::Introspection,
+                        Some(&execution),
                         Some(auxiliary_policy),
                     )
                     .map(|client| Box::new(client) as Box<_>)

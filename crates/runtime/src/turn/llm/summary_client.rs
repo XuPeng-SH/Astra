@@ -471,7 +471,6 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         if self.route.provider == "typesafe" {
                             ledger
                                 .execute_nonstream_with_execution_round(
-                                    &self.transport.client,
                                     scope,
                                     call,
                                     bounded_auxiliary_budget(

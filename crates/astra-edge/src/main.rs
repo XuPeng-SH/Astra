@@ -3429,8 +3429,11 @@ mod tests {
                     &request_id,
                     &identity,
                     1,
-                    "bash",
-                    &serde_json::json!({}),
+                    invocation_journal::InvocationPayload {
+                        tool: "bash",
+                        args: &serde_json::json!({}),
+                        allocation: None,
+                    },
                     true,
                 )
                 .await
@@ -3529,6 +3532,8 @@ mod tests {
             materialization_id: "cleanup-materialization".into(),
             reconnect: false,
             invocation_journal_root: Some(state.path().to_owned()),
+            evaluation_config: None,
+            evaluation: None,
         };
         let server = async {
             let (stream, _) = listener.accept().await.unwrap();
@@ -3556,6 +3561,7 @@ mod tests {
                 let request = EdgeServerMessage::ToolRequest {
                     request_id: identity.storage_key(), identity: Box::new(identity), delivery_generation: 1,
                     tool: "bash".into(), args: serde_json::json!({"command": format!("touch started-{i}; sleep 2; touch leaked-{i}")}),
+                    evaluation_allocation: None,
                     runtime_process_authorization: managed.then(|| Box::new(astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext { authorization: "Bearer test-grant".into() })), runtime_process_authorization_required: managed, timeout_secs: 30,
                 };
                 ws.send(Message::Text(
@@ -3590,6 +3596,7 @@ mod tests {
                     delivery_generation: 1,
                     tool: "bash".into(),
                     args: serde_json::json!({"command":"touch should-not-run"}),
+                    evaluation_allocation: None,
                     runtime_process_authorization: None,
                     runtime_process_authorization_required: false,
                     timeout_secs: 30,

@@ -18,7 +18,7 @@ use super::experiment::{
 };
 use super::{
     EvaluationPolicyFingerprintInput, content_fingerprint, evaluation_policy_fingerprint,
-    prompt_context_fingerprint,
+    is_no_skill_revision, prompt_context_fingerprint,
 };
 use astra_core::canonical_json_string;
 use serde::{Deserialize, Serialize};
@@ -650,15 +650,19 @@ pub fn prepare_trial_start(
                     "skill_name must be non-empty and at most {MAX_SKILL_NAME_BYTES} bytes"
                 )));
             }
-            let skill_revision = EvaluationSkillRevision {
-                skill_name,
-                revision_id: revision.revision_id.clone(),
-                content_hash: revision.content_hash.clone(),
-            };
-            skill_revision
-                .validate_shape()
-                .map_err(EvaluationBootstrapError::InvalidInput)?;
-            (None, Some(skill_revision))
+            if is_no_skill_revision(&revision.revision_id, &revision.content_hash) {
+                (None, None)
+            } else {
+                let skill_revision = EvaluationSkillRevision {
+                    skill_name,
+                    revision_id: revision.revision_id.clone(),
+                    content_hash: revision.content_hash.clone(),
+                };
+                skill_revision
+                    .validate_shape()
+                    .map_err(EvaluationBootstrapError::InvalidInput)?;
+                (None, Some(skill_revision))
+            }
         }
         other => {
             return Err(EvaluationBootstrapError::Unsupported(format!(
@@ -771,6 +775,7 @@ mod tests {
         DataIsolation, EvaluationBudget, EvaluationCase, EvaluationTarget, ExperimentSpec,
         FrozenConditions, MemoryIsolation, RevisionRef, TrialOrder,
     };
+    use crate::evaluation::{NO_SKILL_CONTENT_HASH, NO_SKILL_REVISION_ID};
 
     fn fixtures() -> (
         EvaluationExperimentRecord,
@@ -1074,6 +1079,48 @@ mod tests {
             })
             .unwrap()
         );
+    }
+
+    #[test]
+    fn prepares_new_skill_comparison_with_an_explicit_no_skill_baseline() {
+        let mut request = prepared_request(EvaluationTargetKind::Skill);
+        request.target.baseline = super::super::api::EvaluationPrepareRevision {
+            revision_id: NO_SKILL_REVISION_ID.to_string(),
+            content: None,
+        };
+        request.target.candidate = super::super::api::EvaluationPrepareRevision {
+            revision_id: "candidate-revision".to_string(),
+            content: None,
+        };
+        request.target.skill_name = Some("candidate-skill".to_string());
+        let skill = PreparedSkillIdentity {
+            skill_name: "candidate-skill".to_string(),
+            baseline_revision_id: NO_SKILL_REVISION_ID.to_string(),
+            baseline_content_hash: NO_SKILL_CONTENT_HASH.to_string(),
+            candidate_revision_id: "candidate-revision".to_string(),
+            candidate_content_hash: "sha256:candidate".to_string(),
+        };
+
+        let spec = build_prepared_experiment_spec(
+            None,
+            "evx_new_skill",
+            &request,
+            &prepared_config(),
+            Some(&skill),
+            EvaluationJudgmentPolicy::Disabled,
+        )
+        .expect("new Skill comparison should prepare");
+
+        assert_eq!(
+            spec.target.baseline.revision_id,
+            NO_SKILL_REVISION_ID.to_string()
+        );
+        assert_eq!(
+            spec.target.baseline.content_hash,
+            NO_SKILL_CONTENT_HASH.to_string()
+        );
+        assert!(spec.target.baseline.content.is_none());
+        assert!(prepared_request_matches_spec(&request, &spec));
     }
 
     fn frozen_workspace_fixture() -> FrozenWorkspaceExecution {

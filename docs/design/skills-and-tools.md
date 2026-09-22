@@ -96,6 +96,17 @@ Skill discovery should be progressive:
 - deterministic ordering;
 - clear diagnostics for unavailable skill dependencies.
 
+Catalog lifetime follows the execution boundary. The local CLI builds one
+unified registry for the interactive session: filesystem skills are available
+first, and the authenticated server catalog is joined once as an external
+provider or after an explicit refresh. Edge executes the local filesystem
+capability; it does not turn each tool call into a server catalog lookup. Web
+and remote CLI runs use a user-scoped server registry retained by
+the lifecycle service. Its database discovery is single-flight, cached for 60
+seconds, and explicitly refreshable; the database provider also caches its
+metadata snapshot and loaded skill bodies. A normal server turn therefore
+reuses the catalog instead of walking `skills_registry` again.
+
 ## Observability
 
 Track per skill version: invocation and success/failure counts, tool-call
@@ -121,22 +132,27 @@ route. For example, these are complete requests:
 * “帮我优化这个能力。”
 * “把刚才反复做的流程变成可复用能力。”
 
-The system resolves the internal work from that intent:
+The normal chat path uses the same model-facing capability mechanism as every
+other tool:
 
 ```text
-user intent
-  -> classify the target and operation
+user message
+  -> select the standard `skill_creator` tool
+  -> apply capability projection, provider admission, and policy
   -> resolve the relevant conversation, current artifact, and evidence
   -> generate one candidate
   -> compare it with the appropriate baseline through the shared Evaluation
   -> return the candidate, verdict, evidence, cost, and limitations
 ```
 
-Classification is a judgment decision point. When the configured JEV Offering
-is available, it may make the decision quickly and cheaply; when it is
-unavailable, the base path still performs the work with the information it can
-prove. JEV is an enhancement to the decision path, not a prerequisite for
-ordinary authoring and not a source of permission to use tools.
+The tool resolves `create` or `improve` only after a candidate exists and the
+session-owned baseline can be identified. An exact active Skill identity is
+strong evidence for improvement; without that evidence the tool creates a new
+private candidate or reports that the operation is ambiguous. The generic
+runtime may use the configured JEV or an explicitly selected LLM substitute
+for eligible execution judgments, but authoring does not add a special
+classifier. Judgment remains optional, cannot grant permission, and never
+replaces the canonical tool admission boundary.
 
 The first object is an owner-scoped instruction-only Skill, but the entrypoint
 is intentionally named and modeled as authoring intent. Future adapters can
@@ -156,16 +172,22 @@ The user-visible result is small and concrete:
 
 The UI may show progress such as “理解目标”, “生成候选”, and “真实评估”,
 but it does not expose the implementation controls above. The existing
-`/harnesses` and `/evaluations` surfaces remain operator and diagnostic views
-until the intent entrypoint is wired end to end; they are not the normal user
-journey.
+`/harnesses` and `/evaluations` surfaces remain operator and diagnostic views;
+they are not the normal user journey. The standard tool and the Web/CLI
+shortcuts call the same authoring operation. Authoring does not invent a task
+criterion or verifier. When a canonical server-owned replay case is present,
+the shared Evaluation is prepared and Web/CLI follow its frozen trial bindings
+through the normal Run lifecycle and render the resulting report; otherwise
+the result explicitly says that evaluation is unavailable.
 
-The current first adapter returns a reviewable Skill candidate and its source
-evidence. It reports Evaluation as unavailable when the context does not
-contain a replayable case and a server-owned verifier; that state is explicit
-and never becomes a pass. Publishing an immutable Skill revision and running
-the shared Evaluation are the next durable steps for a candidate with enough
-evidence.
+The first adapter uses an explicit no-Skill baseline for creation and binds an
+improvement comparison to the exact active Skill revision in the session. It
+stores the generated candidate as a private draft and never activates it as a
+side effect. When the context does not contain a replayable case and a
+server-owned verifier, the result contains the candidate and an explicit
+unavailable evaluation; that state never becomes a pass. A user can then
+provide or record a suitable replay case before asking for the comparison
+again.
 
 ## Evidence-backed evaluation and Skillify adapter
 

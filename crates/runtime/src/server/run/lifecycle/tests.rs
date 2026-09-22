@@ -17764,6 +17764,21 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         catalog_reads > 0,
         "ordinary requests must load the production catalog"
     );
+    let second_default_state = svc.build_initial_state(
+        "test-user",
+        &default_request,
+        "session-2",
+        "run-2",
+        None,
+        None,
+        None,
+    );
+    assert!(second_default_state.skills.resolver.is_some());
+    assert_eq!(
+        skill_service.list_calls.load(Ordering::SeqCst),
+        catalog_reads,
+        "a warm server catalog must be reused across turns for the same user"
+    );
     let mut evaluation = prepared_test_request("evaluate a prompt without Skills");
     evaluation.evaluation_admission = Some(EvaluationRunAdmission {
         experiment_id: "experiment".into(),

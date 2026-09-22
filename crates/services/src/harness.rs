@@ -11,6 +11,11 @@ use uuid::Uuid;
 
 use astra_core::{ErrorResponse, SharedPool, error_response, internal_error};
 
+use crate::evaluation::api::{
+    EvaluationExperimentPrepareResponse, EvaluationPrepareCase, EvaluationPrepareRevision,
+    EvaluationPrepareTarget,
+};
+use crate::evaluation::{EvaluationTargetKind, NO_SKILL_REVISION_ID};
 use crate::models::parse_pricing_snapshot;
 use crate::personal_skills::{
     CreateUserSkillSource, DatabasePersonalSkillStore, SubmitUserSkillVersion,
@@ -284,9 +289,8 @@ pub struct SkillifyDraftRecord {
     pub approved_item_count: usize,
 }
 
-/// Natural-language authoring input. The current first adapter resolves this
-/// intent to Skillify; the caller does not choose a Harness, model, verifier,
-/// or source projection.
+/// Natural-language authoring input. The caller does not choose a Harness,
+/// model, verifier, or source projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoringIntentRequest {
@@ -298,6 +302,17 @@ pub struct AuthoringEvaluationSummary {
     pub status: String,
     pub reason: String,
     pub experiment_id: Option<String>,
+}
+
+/// Server-resolved input for the shared Evaluation prepare boundary. It is
+/// skipped from the HTTP response because clients submit only the natural
+/// language goal; the runtime handler consumes it after authoring has
+/// materialized the candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthoringEvaluationInput {
+    pub submission_idempotency_key: String,
+    pub target: EvaluationPrepareTarget,
+    pub case: EvaluationPrepareCase,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -327,12 +342,16 @@ pub struct AuthoringInferenceEvidence {
 pub struct AuthoringIntentRecord {
     pub target: String,
     pub operation: String,
-    pub classification_source: String,
+    pub resolution_source: String,
     pub goal: String,
     pub harness_run: HarnessRunRecord,
     pub skill_drafts: Vec<HarnessSkillDraftRecord>,
     pub evaluation: AuthoringEvaluationSummary,
     pub inference: AuthoringInferenceEvidence,
+    #[serde(default)]
+    pub evaluation_plan: Option<EvaluationExperimentPrepareResponse>,
+    #[serde(skip)]
+    pub evaluation_input: Option<AuthoringEvaluationInput>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -418,16 +437,6 @@ pub trait SkillifyAgentExecutor: Send + Sync {
 }
 
 #[async_trait]
-pub trait AuthoringIntentClassifier: Send + Sync {
-    async fn classify(
-        &self,
-        user_id: &str,
-        harness_run_id: &str,
-        goal: &str,
-    ) -> Result<Option<String>, String>;
-}
-
-#[async_trait]
 pub trait HarnessService: Send + Sync {
     async fn list_templates(
         &self,
@@ -449,6 +458,15 @@ pub trait HarnessService: Send + Sync {
         session_id: String,
         request: AuthoringIntentRequest,
     ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    async fn persist_authoring_evaluation(
+        &self,
+        user_id: String,
+        harness_run_id: String,
+        expected_candidate_revision_id: String,
+        evaluation: AuthoringEvaluationSummary,
+        plan: Option<EvaluationExperimentPrepareResponse>,
+    ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn get_run(
         &self,
@@ -520,7 +538,6 @@ pub trait HarnessService: Send + Sync {
 pub struct DatabaseHarnessService {
     pool: SharedPool,
     skillify_agent_executor: Option<Arc<dyn SkillifyAgentExecutor>>,
-    authoring_intent_classifier: Option<Arc<dyn AuthoringIntentClassifier>>,
 }
 
 impl DatabaseHarnessService {
@@ -528,7 +545,6 @@ impl DatabaseHarnessService {
         Self {
             pool,
             skillify_agent_executor: None,
-            authoring_intent_classifier: None,
         }
     }
 
@@ -537,14 +553,6 @@ impl DatabaseHarnessService {
         executor: Arc<dyn SkillifyAgentExecutor>,
     ) -> Self {
         self.skillify_agent_executor = Some(executor);
-        self
-    }
-
-    pub fn with_authoring_intent_classifier(
-        mut self,
-        classifier: Arc<dyn AuthoringIntentClassifier>,
-    ) -> Self {
-        self.authoring_intent_classifier = Some(classifier);
         self
     }
 
@@ -660,6 +668,98 @@ impl DatabaseHarnessService {
             .load_skill_rules(harness_run_id, skill_draft_id)
             .await?;
         Ok(draft)
+    }
+
+    async fn load_skill_drafts_for_run(
+        &self,
+        harness_run_id: &str,
+    ) -> Result<Vec<HarnessSkillDraftRecord>, (StatusCode, Json<ErrorResponse>)> {
+        let rows = sqlx::query(
+            "SELECT skill_draft_id, harness_run_id, candidate_name, description,
+                    target_scope, publish_visibility, content_markdown,
+                    IFNULL(CAST(source_summary_json AS CHAR), '{}') AS source_summary_json,
+                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    status, confidence, created_by_node_id, revision, published_version_id,
+                    CAST(created_at AS CHAR) AS created_at,
+                    CAST(updated_at AS CHAR) AS updated_at
+             FROM harness_skill_drafts
+             WHERE harness_run_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(harness_run_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+
+        let mut drafts = Vec::with_capacity(rows.len());
+        for row in rows {
+            drafts.push(skill_draft_from_row(row)?);
+        }
+        if drafts.is_empty() {
+            return Ok(drafts);
+        }
+
+        let rule_rows = sqlx::query(
+            "SELECT skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement,
+                    rationale, IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                    status, confidence, source_count, created_by_node_id,
+                    CAST(created_at AS CHAR) AS created_at,
+                    CAST(updated_at AS CHAR) AS updated_at
+             FROM harness_skill_rules
+             WHERE harness_run_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(harness_run_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+        let mut rules_by_draft: HashMap<String, Vec<HarnessSkillRuleRecord>> = HashMap::new();
+        for row in rule_rows {
+            let rule = skill_rule_from_row(row)?;
+            rules_by_draft
+                .entry(rule.skill_draft_id.clone())
+                .or_default()
+                .push(rule);
+        }
+
+        let citation_rows = sqlx::query(
+            "SELECT citation_id, harness_run_id, item_id, skill_draft_id, skill_rule_id,
+                    source_id, IFNULL(CAST(source_locator_json AS CHAR), '{}') AS source_locator_json,
+                    source_snapshot_ref, source_content_hash,
+                    IFNULL(CAST(source_metadata_json AS CHAR), '{}') AS source_metadata_json,
+                    artifact_id, quote_hash, evidence_text_preview, relevance_score,
+                    created_by_node_id, CAST(created_at AS CHAR) AS created_at
+             FROM harness_citations
+             WHERE harness_run_id = ? AND skill_rule_id IS NOT NULL
+             ORDER BY created_at ASC",
+        )
+        .bind(harness_run_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+        let mut citations_by_rule: HashMap<String, Vec<HarnessCitationRecord>> = HashMap::new();
+        for row in citation_rows {
+            let citation = citation_from_row(row)?;
+            if let Some(skill_rule_id) = citation.skill_rule_id.clone() {
+                citations_by_rule
+                    .entry(skill_rule_id)
+                    .or_default()
+                    .push(citation);
+            }
+        }
+
+        for draft in &mut drafts {
+            let mut rules = rules_by_draft
+                .remove(&draft.skill_draft_id)
+                .unwrap_or_default();
+            for rule in &mut rules {
+                rule.citations = citations_by_rule
+                    .remove(&rule.skill_rule_id)
+                    .unwrap_or_default();
+            }
+            draft.rules = rules;
+        }
+        Ok(drafts)
     }
 
     async fn load_skill_rules(
@@ -880,7 +980,9 @@ impl DatabaseHarnessService {
              WHERE user_id = ",
         );
         builder.push_bind(user_id);
-        builder.push(" AND content IS NOT NULL AND content != '' AND session_id IN (");
+        builder.push(
+            " AND event_type <> 'evaluation_case' AND content IS NOT NULL AND content != '' AND session_id IN (",
+        );
         let mut separated = builder.separated(", ");
         for session_id in session_ids {
             separated.push_bind(session_id);
@@ -1013,6 +1115,276 @@ impl DatabaseHarnessService {
 }
 
 impl DatabaseHarnessService {
+    async fn load_authoring_evaluation_case(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> HarnessResult<Option<EvaluationPrepareCase>> {
+        if session_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let rows = sqlx::query(
+            "SELECT content FROM agent_events
+             WHERE user_id = ? AND session_id = ? AND event_type = 'evaluation_case'
+               AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.astra_ingestion_source')) = 'server'
+               AND content IS NOT NULL AND content != ''
+             ORDER BY created_at ASC, event_id ASC LIMIT 2",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+        if rows.len() > 1 {
+            return Ok(None);
+        }
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let Ok(content) = row.try_get::<String, _>("content") else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str(&content).ok())
+    }
+
+    async fn materialize_authoring_candidate(
+        &self,
+        user_id: &str,
+        harness_run: &HarnessRunRecord,
+        draft: &HarnessSkillDraftRecord,
+    ) -> HarnessResult<String> {
+        validate_skill_name(&draft.candidate_name)?;
+        let candidate_identity = stable_hash(&format!(
+            "authoring-candidate:v2:{}:{}:{}:{}:{}",
+            harness_run.harness_run_id,
+            draft.skill_draft_id,
+            draft.candidate_name,
+            draft.description,
+            draft.content_markdown,
+        ));
+        let candidate_identity = candidate_identity
+            .strip_prefix("sha256:")
+            .unwrap_or(&candidate_identity);
+        // user_skill_versions.version is VARCHAR(64). Keep the readable
+        // authoring prefix and enough content identity for concurrent retries
+        // to converge without exceeding the product schema.
+        let version = format!(
+            "evaluation.{}",
+            &candidate_identity[..candidate_identity.len().min(48)]
+        );
+        let manifest = json!({
+            "name": draft.candidate_name,
+            "description": draft.description,
+            "version": &version,
+        });
+        let expected_content_hash =
+            crate::personal_skills::skill_md_content_hash(&manifest, &draft.content_markdown);
+        let matches_current_draft = |candidate: &crate::personal_skills::UserSkillVersionRecord| {
+            candidate.status == "draft"
+                && candidate.version == version
+                && candidate.manifest_json == manifest
+                && candidate.content_markdown == draft.content_markdown
+                && candidate.content_hash == expected_content_hash
+                && candidate.content_hash
+                    == crate::personal_skills::skill_md_content_hash(
+                        &candidate.manifest_json,
+                        &candidate.content_markdown,
+                    )
+        };
+
+        let store = DatabasePersonalSkillStore::new(self.pool.clone());
+        if let Some(version_id) = harness_run
+            .output_json
+            .pointer("/authoring/candidate_revision_id")
+            .and_then(Value::as_str)
+            && let Some(version) = store
+                .load_version(user_id, &draft.candidate_name, version_id)
+                .await
+                .map_err(|error| {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+                })?
+            && matches_current_draft(&version)
+        {
+            return Ok(version.version_id);
+        }
+
+        if let Some(version_record) = store
+            .load_version_by_version(user_id, &draft.candidate_name, &version)
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?
+        {
+            if !matches_current_draft(&version_record) {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "authoring candidate version identity conflicts with existing content: {}",
+                        version_record.version_id
+                    ),
+                ));
+            }
+            return Ok(version_record.version_id);
+        }
+
+        store
+            .ensure_source(
+                user_id,
+                CreateUserSkillSource {
+                    skill_name: draft.candidate_name.clone(),
+                    visibility: Some("private".to_string()),
+                },
+            )
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        match store
+            .submit_version(
+                user_id,
+                &draft.candidate_name,
+                SubmitUserSkillVersion {
+                    version: version.clone(),
+                    manifest_json: manifest.clone(),
+                    content_markdown: draft.content_markdown.clone(),
+                    status: Some("draft".to_string()),
+                },
+            )
+            .await
+        {
+            Ok(version_record) => Ok(version_record.version_id),
+            Err(error) => {
+                // A concurrent retry may have won the unique source/version
+                // insert. Re-read the immutable identity before surfacing the
+                // write failure so the durable candidate reference converges.
+                if let Some(version_record) = store
+                    .load_version_by_version(user_id, &draft.candidate_name, &version)
+                    .await
+                    .map_err(|load_error| {
+                        error_response(StatusCode::SERVICE_UNAVAILABLE, load_error.to_string())
+                    })?
+                    && matches_current_draft(&version_record)
+                {
+                    return Ok(version_record.version_id);
+                }
+                Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error.to_string(),
+                ))
+            }
+        }
+    }
+
+    async fn resolve_authoring_evaluation_input(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        operation: &str,
+        harness_run: &HarnessRunRecord,
+        drafts: &[HarnessSkillDraftRecord],
+    ) -> HarnessResult<Option<AuthoringEvaluationInput>> {
+        let Some(case) = self
+            .load_authoring_evaluation_case(user_id, session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if drafts.len() != 1 {
+            return Ok(None);
+        }
+        let draft = &drafts[0];
+        let Some(candidate_revision_id) = harness_run
+            .output_json
+            .pointer("/authoring/candidate_revision_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+        else {
+            return Ok(None);
+        };
+        let (skill_name, baseline) = match operation {
+            "create" => (
+                draft.candidate_name.clone(),
+                EvaluationPrepareRevision {
+                    revision_id: NO_SKILL_REVISION_ID.to_string(),
+                    content: None,
+                },
+            ),
+            "improve" => {
+                let store = DatabasePersonalSkillStore::new(self.pool.clone());
+                let active = store
+                    .load_active_for_session(user_id, session_id)
+                    .await
+                    .map_err(|error| {
+                        error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+                    })?;
+                let matches = active
+                    .iter()
+                    .filter(|skill| skill.skill_name == draft.candidate_name)
+                    .collect::<Vec<_>>();
+                let Some(active) = (matches.len() == 1).then(|| matches[0]) else {
+                    return Ok(None);
+                };
+                (
+                    active.skill_name.clone(),
+                    EvaluationPrepareRevision {
+                        revision_id: active.version_id.clone(),
+                        content: None,
+                    },
+                )
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(AuthoringEvaluationInput {
+            submission_idempotency_key: format!(
+                "authoring-evaluation:v1:{}:{}:{}",
+                harness_run.harness_run_id, draft.skill_draft_id, candidate_revision_id
+            ),
+            target: EvaluationPrepareTarget {
+                kind: EvaluationTargetKind::Skill,
+                baseline,
+                candidate: EvaluationPrepareRevision {
+                    revision_id: candidate_revision_id,
+                    content: None,
+                },
+                skill_name: Some(skill_name),
+            },
+            case,
+        }))
+    }
+
+    async fn resolve_authoring_operation(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        drafts: &[HarnessSkillDraftRecord],
+    ) -> HarnessResult<(String, String)> {
+        if drafts.len() != 1 {
+            return Ok((
+                "create_or_improve".to_string(),
+                "insufficient_candidate_evidence".to_string(),
+            ));
+        }
+
+        if session_id.trim().is_empty() {
+            return Ok(("create".to_string(), "no_session_baseline".to_string()));
+        }
+
+        let store = DatabasePersonalSkillStore::new(self.pool.clone());
+        let active = store
+            .load_active_for_session(user_id, session_id)
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let matching = active
+            .iter()
+            .filter(|skill| skill.skill_name == drafts[0].candidate_name)
+            .count();
+        match matching {
+            0 => Ok(("create".to_string(), "no_matching_active_skill".to_string())),
+            1 => Ok(("improve".to_string(), "active_skill_identity".to_string())),
+            _ => Ok((
+                "create_or_improve".to_string(),
+                "ambiguous_active_skill_identity".to_string(),
+            )),
+        }
+    }
+
     async fn load_authoring_inference_evidence(
         &self,
         user_id: &str,
@@ -1364,23 +1736,6 @@ impl DatabaseHarnessService {
         })
     }
 
-    async fn classify_authoring_operation(
-        &self,
-        user_id: &str,
-        harness_run_id: &str,
-        goal: &str,
-    ) -> (String, String) {
-        let Some(classifier) = self.authoring_intent_classifier.as_ref() else {
-            return ("create_or_improve".to_string(), "base_fallback".to_string());
-        };
-        match classifier.classify(user_id, harness_run_id, goal).await {
-            Ok(Some(operation)) if matches!(operation.as_str(), "create" | "improve") => {
-                (operation, "jev".to_string())
-            }
-            _ => ("create_or_improve".to_string(), "base_fallback".to_string()),
-        }
-    }
-
     async fn create_skillify_run_internal(
         &self,
         user_id: String,
@@ -1459,25 +1814,16 @@ impl DatabaseHarnessService {
             Err(error) => return Err(internal_error(error)),
         }
 
-        // The durable HarnessRun must exist before JEV or Skillify provider I/O.
-        // This keeps judgment accounting inside the same owner-scoped lifecycle.
-        let (topic, authoring_metadata) = if let Some(goal) = authoring_goal {
-            let (operation, classification_source) = self
-                .classify_authoring_operation(&user_id, &harness_run_id, goal)
-                .await;
-            let topic = match operation.as_str() {
-                "create" => {
-                    "Create a new reusable Skill from the user's goal and available context."
-                }
-                "improve" => {
-                    "Improve the existing reusable capability described by the user's goal and available context."
-                }
-                _ => "Resolve the user's authoring goal into one reusable capability.",
-            };
+        // The durable HarnessRun must exist before Skillify provider I/O. The
+        // operation is resolved after the candidate exists, from an exact
+        // session-owned active Skill identity. JEV may advise later, but it is
+        // never a prerequisite for the base authoring path.
+        let (topic, authoring_metadata) = if authoring_goal.is_some() {
+            let topic = "Generate one reusable Skill from the user's goal and available context.";
             let metadata = json!({
                 "target": "skill",
-                "operation": &operation,
-                "classification_source": &classification_source,
+                "operation": "create_or_improve",
+                "resolution_source": "pending_candidate_evidence",
             });
             let updated = sqlx::query(
                 "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
@@ -1785,73 +2131,362 @@ impl HarnessService for DatabaseHarnessService {
                 Some(&goal),
             )
             .await?;
-        let (operation, classification_source) = harness_run
-            .output_json
-            .get("authoring")
-            .and_then(Value::as_object)
-            .map(|authoring| {
-                (
-                    authoring
-                        .get("operation")
-                        .and_then(Value::as_str)
-                        .unwrap_or("create_or_improve")
-                        .to_string(),
-                    authoring
-                        .get("classification_source")
-                        .and_then(Value::as_str)
-                        .unwrap_or("base_fallback")
-                        .to_string(),
-                )
-            })
-            .unwrap_or_else(|| ("create_or_improve".to_string(), "base_fallback".to_string()));
         let skill_drafts = self
-            .list_skill_drafts(user_id.clone(), harness_run.harness_run_id.clone())
+            .load_skill_drafts_for_run(&harness_run.harness_run_id)
+            .await?;
+        let (operation, resolution_source) = self
+            .resolve_authoring_operation(&user_id, &session_id, &skill_drafts)
             .await?;
         let inference = self
             .load_authoring_inference_evidence(&user_id, &harness_run.harness_run_id)
             .await?;
-
-        // A candidate is useful even when the current evidence cannot support
-        // a replayable comparison. Keep that distinction visible instead of
-        // turning generation into a fake Evaluation success.
-        let evaluation = AuthoringEvaluationSummary {
-            status: "unavailable".to_string(),
-            reason: "no replayable task case and server-owned verifier were resolved from the authoring context".to_string(),
-            experiment_id: None,
+        let mut persisted_evaluation = harness_run
+            .output_json
+            .pointer("/authoring/evaluation")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<AuthoringEvaluationSummary>(value).ok());
+        let mut persisted_plan = harness_run
+            .output_json
+            .pointer("/authoring/evaluation_plan")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<EvaluationExperimentPrepareResponse>(value).ok()
+            });
+        let mut resolution_run = harness_run.clone();
+        let previous_candidate_revision_id = harness_run
+            .output_json
+            .pointer("/authoring/candidate_revision_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let candidate_revision_id = if skill_drafts.len() == 1 {
+            let version_id = self
+                .materialize_authoring_candidate(&user_id, &harness_run, &skill_drafts[0])
+                .await?;
+            resolution_run.output_json["authoring"]["candidate_revision_id"] =
+                Value::String(version_id.clone());
+            Some(version_id)
+        } else {
+            None
         };
-        let mut output_json = harness_run.output_json.clone();
+
+        let candidate_changed = previous_candidate_revision_id != candidate_revision_id;
+        if let Some(authoring) = resolution_run
+            .output_json
+            .as_object_mut()
+            .and_then(|output| output.get_mut("authoring"))
+            .and_then(Value::as_object_mut)
+        {
+            authoring.insert(
+                "candidate_revision_id".to_string(),
+                candidate_revision_id
+                    .clone()
+                    .map_or(Value::Null, Value::String),
+            );
+            if candidate_changed {
+                // Evaluation evidence belongs to one immutable candidate.
+                // Clear it in the same conditional write that installs a new
+                // candidate reference so an interrupted retry cannot expose
+                // a report for an older draft.
+                authoring.remove("evaluation");
+                authoring.remove("evaluation_plan");
+            }
+        }
+        if candidate_changed {
+            // Persist the candidate reference before resolving optional
+            // evaluation evidence. A replay-case or provider lookup failure
+            // must leave the private candidate recoverable on retry. The
+            // candidate predicate prevents a concurrent authoring request
+            // from overwriting a newer candidate.
+            let update = if let Some(previous_candidate_revision_id) =
+                previous_candidate_revision_id.as_deref()
+            {
+                sqlx::query(
+                    "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
+                     WHERE user_id = ? AND harness_run_id = ?
+                       AND JSON_UNQUOTE(JSON_EXTRACT(output_json, '$.authoring.candidate_revision_id')) = ?
+                       AND CAST(updated_at AS CHAR) = ?",
+                )
+                .bind(resolution_run.output_json.to_string())
+                .bind(&user_id)
+                .bind(&harness_run.harness_run_id)
+                .bind(previous_candidate_revision_id)
+                .bind(&harness_run.updated_at)
+                .execute(self.pool.get())
+                .await
+            } else {
+                sqlx::query(
+                    "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
+                     WHERE user_id = ? AND harness_run_id = ?
+                       AND (JSON_UNQUOTE(JSON_EXTRACT(output_json, '$.authoring.candidate_revision_id')) IS NULL
+                            OR JSON_UNQUOTE(JSON_EXTRACT(output_json, '$.authoring.candidate_revision_id')) = 'null')
+                       AND CAST(updated_at AS CHAR) = ?",
+                )
+                .bind(resolution_run.output_json.to_string())
+                .bind(&user_id)
+                .bind(&harness_run.harness_run_id)
+                .bind(&harness_run.updated_at)
+                .execute(self.pool.get())
+                .await
+            }
+            .map_err(internal_error)?;
+            if update.rows_affected() != 1 {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "authoring candidate changed while the request was resolving; retry the request",
+                ));
+            }
+        }
+
+        if candidate_changed {
+            persisted_evaluation = None;
+            persisted_plan = None;
+        }
+        let mut expected_updated_at = harness_run.updated_at.clone();
+        if candidate_changed {
+            // The candidate update may have raced a same-candidate Evaluation
+            // persistence. Adopt the current row before constructing the
+            // final authoring snapshot so a prepared plan is never lost just
+            // because this request started from an older read.
+            let current = self
+                .get_run(user_id.clone(), harness_run.harness_run_id.clone())
+                .await?;
+            let current_candidate_revision_id = current
+                .output_json
+                .pointer("/authoring/candidate_revision_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if current_candidate_revision_id != candidate_revision_id {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "authoring candidate changed while the request was resolving; retry the request",
+                ));
+            }
+            expected_updated_at = current.updated_at;
+            persisted_evaluation = current
+                .output_json
+                .pointer("/authoring/evaluation")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            persisted_plan = current
+                .output_json
+                .pointer("/authoring/evaluation_plan")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+        }
+        let persisted_plan = persisted_plan.filter(|plan| {
+            candidate_revision_id
+                .as_deref()
+                .is_some_and(|candidate_id| {
+                    plan.experiment.spec.target.candidate.revision_id == candidate_id
+                })
+        });
+        let evaluation_input = if persisted_plan.is_some() {
+            None
+        } else {
+            match self
+                .resolve_authoring_evaluation_input(
+                    &user_id,
+                    &session_id,
+                    &operation,
+                    &resolution_run,
+                    &skill_drafts,
+                )
+                .await
+            {
+                Ok(input) => input,
+                Err((status, error)) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        status = %status,
+                        error = ?error,
+                        "optional authoring evaluation resolution unavailable"
+                    );
+                    None
+                }
+            }
+        };
+        let evaluation = persisted_evaluation.unwrap_or_else(|| {
+            if evaluation_input.is_some() {
+                AuthoringEvaluationSummary {
+                    status: "ready".to_string(),
+                    reason: "candidate and server-owned replay case are ready for the shared Evaluation".to_string(),
+                    experiment_id: None,
+                }
+            } else {
+                AuthoringEvaluationSummary {
+                    status: "unavailable".to_string(),
+                    reason: "no server-owned replay case and verifier were resolved from the authoring context".to_string(),
+                    experiment_id: None,
+                }
+            }
+        });
+        let mut output_json = resolution_run.output_json.clone();
         output_json["authoring"] = json!({
             "target": "skill",
             "operation": &operation,
-            "classification_source": &classification_source,
+            "resolution_source": &resolution_source,
             "evaluation": &evaluation,
+            "evaluation_plan": persisted_plan,
+            "candidate_revision_id": candidate_revision_id,
             "skill_draft_count": skill_drafts.len(),
             "inference": &inference,
         });
-        sqlx::query(
-            "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
-             WHERE user_id = ? AND harness_run_id = ?",
-        )
-        .bind(output_json.to_string())
-        .bind(&user_id)
-        .bind(&harness_run.harness_run_id)
-        .execute(self.pool.get())
-        .await
+        let update = if let Some(candidate_revision_id) = candidate_revision_id.as_deref() {
+            sqlx::query(
+                "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
+                 WHERE user_id = ? AND harness_run_id = ?
+                   AND JSON_UNQUOTE(JSON_EXTRACT(output_json, '$.authoring.candidate_revision_id')) = ?
+                   AND CAST(updated_at AS CHAR) = ?",
+            )
+            .bind(output_json.to_string())
+            .bind(&user_id)
+            .bind(&harness_run.harness_run_id)
+            .bind(candidate_revision_id)
+            .bind(&expected_updated_at)
+            .execute(self.pool.get())
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
+                 WHERE user_id = ? AND harness_run_id = ?
+                   AND (JSON_UNQUOTE(JSON_EXTRACT(output_json, '$.authoring.candidate_revision_id')) IS NULL
+                        OR JSON_UNQUOTE(JSON_EXTRACT(output_json, '$.authoring.candidate_revision_id')) = 'null')
+                   AND CAST(updated_at AS CHAR) = ?",
+            )
+            .bind(output_json.to_string())
+            .bind(&user_id)
+            .bind(&harness_run.harness_run_id)
+            .bind(&expected_updated_at)
+            .execute(self.pool.get())
+            .await
+        }
         .map_err(internal_error)?;
+        if update.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "authoring candidate changed while the request was resolving; retry the request",
+            ));
+        }
         let harness_run = self
             .get_run(user_id, harness_run.harness_run_id.clone())
             .await?;
+        let durable_candidate_revision_id = harness_run
+            .output_json
+            .pointer("/authoring/candidate_revision_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if durable_candidate_revision_id != candidate_revision_id {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "authoring candidate changed while the result was being read; retry the request",
+            ));
+        }
+        let durable_evaluation = harness_run
+            .output_json
+            .pointer("/authoring/evaluation")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<AuthoringEvaluationSummary>(value).ok())
+            .unwrap_or_else(|| AuthoringEvaluationSummary {
+                status: "unavailable".to_string(),
+                reason: "the durable authoring Evaluation result was missing after persistence"
+                    .to_string(),
+                experiment_id: None,
+            });
+        let durable_plan = harness_run
+            .output_json
+            .pointer("/authoring/evaluation_plan")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<EvaluationExperimentPrepareResponse>(value).ok()
+            });
+        let evaluation_input = if durable_plan.is_some() {
+            None
+        } else {
+            evaluation_input
+        };
 
         Ok(AuthoringIntentRecord {
             target: "skill".to_string(),
             operation,
-            classification_source,
+            resolution_source,
             goal,
             harness_run,
             skill_drafts,
-            evaluation,
+            evaluation: durable_evaluation,
             inference,
+            evaluation_plan: durable_plan,
+            evaluation_input,
         })
+    }
+
+    async fn persist_authoring_evaluation(
+        &self,
+        user_id: String,
+        harness_run_id: String,
+        expected_candidate_revision_id: String,
+        evaluation: AuthoringEvaluationSummary,
+        plan: Option<EvaluationExperimentPrepareResponse>,
+    ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let run = self.ensure_run_owner(&user_id, &harness_run_id).await?;
+        let existing_plan = run
+            .output_json
+            .pointer("/authoring/evaluation_plan")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<EvaluationExperimentPrepareResponse>(value).ok()
+            });
+        if plan.is_none()
+            && existing_plan.as_ref().is_some_and(|plan| {
+                plan.experiment.spec.target.candidate.revision_id == expected_candidate_revision_id
+            })
+        {
+            // A late preparation failure must not erase a prepared result for
+            // the same immutable candidate. Candidate changes invalidate the
+            // plan before this method is reached.
+            return Ok(run);
+        }
+        let expected_updated_at = run.updated_at.clone();
+        let mut output_json = run.output_json;
+        let authoring = output_json
+            .as_object_mut()
+            .and_then(|output| output.get_mut("authoring"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                internal_error("authoring harness output is missing its authoring object")
+            })?;
+        authoring.insert(
+            "evaluation".to_string(),
+            serde_json::to_value(evaluation).map_err(internal_error)?,
+        );
+        match plan {
+            Some(plan) => authoring.insert(
+                "evaluation_plan".to_string(),
+                serde_json::to_value(plan).map_err(internal_error)?,
+            ),
+            None => authoring.remove("evaluation_plan"),
+        };
+        let update = sqlx::query(
+            "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
+             WHERE user_id = ? AND harness_run_id = ?
+               AND JSON_UNQUOTE(JSON_EXTRACT(output_json, '$.authoring.candidate_revision_id')) = ?
+               AND CAST(updated_at AS CHAR) = ?",
+        )
+        .bind(output_json.to_string())
+        .bind(&user_id)
+        .bind(&harness_run_id)
+        .bind(&expected_candidate_revision_id)
+        .bind(&expected_updated_at)
+        .execute(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+        if update.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "authoring candidate changed while Evaluation was being prepared; retry the request",
+            ));
+        }
+        self.get_run(user_id, harness_run_id).await
     }
 
     async fn get_run(
@@ -2040,32 +2675,7 @@ impl HarnessService for DatabaseHarnessService {
         harness_run_id: String,
     ) -> Result<Vec<HarnessSkillDraftRecord>, (StatusCode, Json<ErrorResponse>)> {
         self.ensure_run_owner(&user_id, &harness_run_id).await?;
-        let rows = sqlx::query(
-            "SELECT skill_draft_id, harness_run_id, candidate_name, description,
-                    target_scope, publish_visibility, content_markdown,
-                    IFNULL(CAST(source_summary_json AS CHAR), '{}') AS source_summary_json,
-                    IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
-                    status, confidence, created_by_node_id, revision, published_version_id,
-                    CAST(created_at AS CHAR) AS created_at,
-                    CAST(updated_at AS CHAR) AS updated_at
-             FROM harness_skill_drafts
-             WHERE harness_run_id = ?
-             ORDER BY created_at ASC",
-        )
-        .bind(&harness_run_id)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(internal_error)?;
-
-        let mut drafts = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut draft = skill_draft_from_row(row)?;
-            draft.rules = self
-                .load_skill_rules(&harness_run_id, &draft.skill_draft_id)
-                .await?;
-            drafts.push(draft);
-        }
-        Ok(drafts)
+        self.load_skill_drafts_for_run(&harness_run_id).await
     }
 
     async fn get_skill_draft(
@@ -2635,6 +3245,17 @@ impl HarnessService for UnconfiguredHarnessService {
         _session_id: String,
         _request: AuthoringIntentRequest,
     ) -> Result<AuthoringIntentRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("harness service not configured"))
+    }
+
+    async fn persist_authoring_evaluation(
+        &self,
+        _user_id: String,
+        _harness_run_id: String,
+        _expected_candidate_revision_id: String,
+        _evaluation: AuthoringEvaluationSummary,
+        _plan: Option<EvaluationExperimentPrepareResponse>,
+    ) -> Result<HarnessRunRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("harness service not configured"))
     }
 

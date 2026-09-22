@@ -194,6 +194,37 @@ impl DatabasePersonalSkillStore {
         self.load_source(owner_user_id, &request.skill_name).await
     }
 
+    /// Return an existing source without changing its visibility, or create a
+    /// private source atomically when it does not exist. Authoring candidates
+    /// use this path so generating a draft cannot rewrite an active Skill's
+    /// sharing policy, including under a concurrent first write.
+    pub async fn ensure_source(
+        &self,
+        owner_user_id: &str,
+        request: CreateUserSkillSource,
+    ) -> Result<UserSkillSourceRecord, PersonalSkillError> {
+        let source_id = format!("skill-source-{}", Uuid::new_v4());
+        let visibility = request.visibility.unwrap_or_else(|| "private".to_string());
+        sqlx::query(
+            "INSERT INTO user_skill_sources
+             (source_id, owner_user_id, skill_name, visibility, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'active', NOW(6), NOW(6))
+             ON DUPLICATE KEY UPDATE source_id = source_id",
+        )
+        .bind(&source_id)
+        .bind(owner_user_id)
+        .bind(&request.skill_name)
+        .bind(&visibility)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| PersonalSkillError::Database {
+            operation: "ensure_user_skill_source",
+            entity: request.skill_name.clone(),
+            source,
+        })?;
+        self.load_source(owner_user_id, &request.skill_name).await
+    }
+
     pub async fn submit_version(
         &self,
         owner_user_id: &str,
@@ -338,6 +369,36 @@ impl DatabasePersonalSkillStore {
     ) -> Result<Option<UserSkillVersionRecord>, PersonalSkillError> {
         self.load_version_by_id(owner_user_id, skill_name, version_id)
             .await
+    }
+
+    /// Load one immutable owner-scoped revision by its source version label.
+    /// Authoring retries use this to converge concurrent materialization of the
+    /// same content without relying on a random version id.
+    pub async fn load_version_by_version(
+        &self,
+        owner_user_id: &str,
+        skill_name: &str,
+        version: &str,
+    ) -> Result<Option<UserSkillVersionRecord>, PersonalSkillError> {
+        let row = sqlx::query(
+            "SELECT version_id, source_id, owner_user_id, skill_name, version, manifest_json,
+                    content_markdown, content_hash, normalize_version, token_estimate, status,
+                    CAST(created_at AS CHAR) AS created_at, CAST(updated_at AS CHAR) AS updated_at
+             FROM user_skill_versions
+             WHERE owner_user_id = ? AND skill_name = ? AND version = ?",
+        )
+        .bind(owner_user_id)
+        .bind(skill_name)
+        .bind(version)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| PersonalSkillError::Database {
+            operation: "load_user_skill_version_by_version",
+            entity: format!("{skill_name}@{version}"),
+            source,
+        })?;
+        row.map(|row| version_from_row(row, "load_user_skill_version_by_version", version))
+            .transpose()
     }
 
     /// Activate a version with an explicit compare-and-set expectation.

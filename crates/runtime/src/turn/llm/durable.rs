@@ -3142,7 +3142,6 @@ impl DurableInferenceLedger {
         timeout: std::time::Duration,
     ) -> DurableInferenceCallOutcome {
         self.execute_nonstream_with_request_context(
-            client,
             scope,
             call,
             timeout,
@@ -3153,7 +3152,6 @@ impl DurableInferenceLedger {
 
     pub(crate) async fn execute_nonstream_with_execution_round(
         &self,
-        client: &reqwest::Client,
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
         timeout: std::time::Duration,
@@ -3161,13 +3159,12 @@ impl DurableInferenceLedger {
     ) -> DurableInferenceCallOutcome {
         let mut request_context = astra_services::ModelRequestContextSeed::server_default();
         request_context.execution_round = Some(execution_round);
-        self.execute_nonstream_with_request_context(client, scope, call, timeout, request_context)
+        self.execute_nonstream_with_request_context(scope, call, timeout, request_context)
             .await
     }
 
     async fn execute_nonstream_with_request_context(
         &self,
-        client: &reqwest::Client,
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
         timeout: std::time::Duration,
@@ -3629,10 +3626,6 @@ impl DurableInferenceInvocation {
     /// and foreground recovery admitted a fresh identity.
     pub(crate) fn logical_attempt(&self) -> u32 {
         self.plan.logical_attempt()
-    }
-
-    pub(crate) fn invocation_id(&self) -> &str {
-        self.plan.invocation_id()
     }
 
     pub(crate) fn attempt_observer(&self) -> &dyn ProviderAttemptObserver {

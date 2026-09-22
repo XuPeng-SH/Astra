@@ -192,7 +192,6 @@ pub struct AppState {
     pub(crate) replay_service: Arc<dyn ReplayService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
-    pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
     pub(crate) mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     pub(crate) agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     pub(crate) llm_trusted_domain_service:
@@ -306,7 +305,6 @@ impl AppState {
             replay_service: Arc::new(UnconfiguredReplayService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             skill_service: Arc::new(UnconfiguredSkillService),
-            skill_config_service: Arc::new(UnconfiguredSkillConfigService),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             llm_trusted_domain_service: Arc::new(
@@ -600,14 +598,6 @@ impl AppState {
 
     pub fn with_skill_service(mut self, skill_service: Arc<dyn SkillService>) -> Self {
         self.skill_service = skill_service;
-        self
-    }
-
-    pub fn with_skill_config_service(
-        mut self,
-        skill_config_service: Arc<dyn SkillConfigService>,
-    ) -> Self {
-        self.skill_config_service = skill_config_service;
         self
     }
 

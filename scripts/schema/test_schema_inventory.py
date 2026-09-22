@@ -608,9 +608,6 @@ fn char_literal() { let slash = '/'; }
             "skill_metrics",
             "skill_selection_events",
             "skill_installations",
-            "skill_settings",
-            "skill_resource_bindings",
-            "skill_user_credentials",
             "user_skill_sources",
             "user_skill_versions",
             "agent_agents",
@@ -651,18 +648,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "user's installed/activated state",
             self.tables["skill_installations"]["merge_guidance"],
-        )
-        self.assertIn(
-            "different secrecy and lookup semantics",
-            self.tables["skill_settings"]["merge_guidance"],
-        )
-        self.assertIn(
-            "external resources",
-            self.tables["skill_resource_bindings"]["merge_guidance"],
-        )
-        self.assertIn(
-            "encrypted user secrets",
-            self.tables["skill_user_credentials"]["merge_guidance"],
         )
         self.assertIn(
             "source owns authoring identity",

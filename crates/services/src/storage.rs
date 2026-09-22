@@ -6343,26 +6343,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(pool, "skill_settings",
-        "CREATE TABLE IF NOT EXISTS skill_settings (
-            setting_id    VARCHAR(36) PRIMARY KEY,
-            skill_id      VARCHAR(36),
-            skill_name    VARCHAR(128) NOT NULL,
-            setting_name  VARCHAR(128) NOT NULL,
-            setting_value TEXT,
-            is_secret     SMALLINT NOT NULL DEFAULT 0,
-            scope_type    VARCHAR(32) NOT NULL DEFAULT 'global',
-            scope_id      VARCHAR(36),
-            updated_by    VARCHAR(128),
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_ss_skill_setting_scope (skill_name, setting_name, scope_type, scope_id),
-            INDEX idx_ss_skill (skill_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "runtime_llm_trusted_domains",
         "CREATE TABLE IF NOT EXISTS runtime_llm_trusted_domains (
             domain_id     VARCHAR(36) PRIMARY KEY,
@@ -6376,41 +6356,6 @@ async fn ensure_core_schema_while_leased(
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_rld_host_port (domain_host, domain_port),
             INDEX idx_rld_enabled (is_enabled)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "skill_resource_bindings",
-        "CREATE TABLE IF NOT EXISTS skill_resource_bindings (
-            binding_id    VARCHAR(36) PRIMARY KEY,
-            user_id       VARCHAR(128) NOT NULL,
-            skill_name    VARCHAR(128) NOT NULL,
-            resource_type VARCHAR(64) NOT NULL,
-            resource_key  VARCHAR(128) NOT NULL,
-            binding_name  VARCHAR(128) NOT NULL,
-            binding_value TEXT,
-            is_secret     SMALLINT NOT NULL DEFAULT 0,
-            updated_by    VARCHAR(128),
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_srb_user_skill (user_id, skill_name),
-            INDEX idx_srb_resource (resource_type, resource_key)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "skill_user_credentials",
-        "CREATE TABLE IF NOT EXISTS skill_user_credentials (
-            credential_id   VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(128) NOT NULL,
-            skill_name      VARCHAR(128) NOT NULL,
-            credential_name VARCHAR(128) NOT NULL,
-            value_encrypted TEXT NOT NULL,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_suc_user_skill_cred (user_id, skill_name, credential_name)
         )",
     )
     .execute(&pool)

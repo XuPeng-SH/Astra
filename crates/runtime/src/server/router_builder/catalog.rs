@@ -75,28 +75,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(skills::unpublish_skill_handler),
         )
         .route(
-            "/skills/{skill_name}/config/validate",
-            get(config_admin::skill::validate_config_handler),
-        )
-        .route(
-            "/skills/{skill_name}/config",
-            get(config_admin::skill::get_effective_config_handler),
-        )
-        .route(
-            "/skills/{skill_name}/config/{setting_name}",
-            axum::routing::put(config_admin::skill::set_setting_handler)
-                .delete(config_admin::skill::delete_setting_handler),
-        )
-        .route(
-            "/skills/{skill_name}/resources",
-            get(config_admin::skill::list_resources_handler),
-        )
-        .route(
-            "/skills/{skill_name}/resources/{resource_key}",
-            axum::routing::put(config_admin::skill::bind_resource_handler)
-                .delete(config_admin::skill::unbind_resource_handler),
-        )
-        .route(
             "/marketplace/install",
             post(crate::service_handlers::marketplace::install_skill_handler),
         )
@@ -115,11 +93,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/marketplace/installed",
             get(crate::service_handlers::marketplace::list_installed_handler),
-        )
-        .route(
-            "/marketplace/credentials",
-            post(crate::service_handlers::marketplace::save_credential_handler)
-                .delete(crate::service_handlers::marketplace::delete_credential_handler),
         )
         .route(
             "/marketplace/quality-report",

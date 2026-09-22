@@ -1,8 +1,6 @@
 //! Slash command fallback routing for the interactive session.
 
-use astra_services::{
-    ModelListCursor, ModelListItemResponse, ModelListPageResponse, session_journal,
-};
+use astra_services::{ModelListItemResponse, session_journal};
 use crossterm::style::Stylize;
 use std::{io::IsTerminal, path::PathBuf};
 

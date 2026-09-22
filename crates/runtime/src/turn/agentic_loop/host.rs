@@ -1667,8 +1667,6 @@ pub struct SkillState {
     /// against this baseline so historical outcomes are not re-attributed to
     /// every later turn.
     pub quality_tracker_baseline: crate::skills::quality::SkillQualityTracker,
-    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
     /// into each LLM request without bloating the persistent conversation history.
@@ -1693,7 +1691,6 @@ impl Default for SkillState {
             request_constraints: Default::default(),
             quality_tracker: Default::default(),
             quality_tracker_baseline: Default::default(),
-            improvement_tracker: Default::default(),
             listing_message: None,
             tool_event_hooks: Default::default(),
             session_event_hooks: Default::default(),
@@ -5451,7 +5448,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         telemetry: Default::default(),
         skills: SkillState {
             quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             ..Default::default()
         },
         hooks: Default::default(),
@@ -7303,7 +7299,6 @@ pub(crate) mod tests {
             telemetry: Default::default(),
             skills: SkillState {
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 ..Default::default()
             },
             hooks: Default::default(),
