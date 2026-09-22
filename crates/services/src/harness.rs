@@ -2197,7 +2197,7 @@ impl HarnessService for DatabaseHarnessService {
                 content_markdown: version.content_markdown,
             })
         } else if !session_id.trim().is_empty() {
-            self.validate_session_ownership(&user_id, &[session_id.clone()])
+            self.validate_session_ownership(&user_id, std::slice::from_ref(&session_id))
                 .await?;
             let active = store
                 .load_active_for_session(&user_id, &session_id)
@@ -4196,20 +4196,25 @@ async fn refresh_skill_draft_after_rule_decision(
     decision: &str,
     after: Option<&Value>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let draft_row = sqlx::query(
-        "SELECT content_markdown
+    let edits_body = matches!(decision, "edit" | "reject");
+    let previous = if edits_body {
+        let draft_row = sqlx::query(
+            "SELECT content_markdown
          FROM harness_skill_drafts
          WHERE harness_run_id = ? AND skill_draft_id = ?
          LIMIT 1",
-    )
-    .bind(harness_run_id)
-    .bind(skill_draft_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(internal_error)?;
-    let previous = required_harness_string(&draft_row, "harness_skill_drafts", "content_markdown")?;
+        )
+        .bind(harness_run_id)
+        .bind(skill_draft_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(internal_error)?;
+        required_harness_string(&draft_row, "harness_skill_drafts", "content_markdown")?
+    } else {
+        String::new()
+    };
     let content_markdown =
-        if matches!(decision, "edit" | "reject") {
+        if edits_body {
             after.and_then(|value| value.get("content_markdown")).and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| error_response(StatusCode::BAD_REQUEST,
@@ -4246,10 +4251,11 @@ async fn refresh_skill_draft_after_rule_decision(
     let status = derive_harness_skill_draft_status(&rules);
     sqlx::query(
         "UPDATE harness_skill_drafts
-         SET status = ?, content_markdown = ?, revision = revision + ?, updated_at = NOW(6)
+         SET status = ?, content_markdown = IF(?, ?, content_markdown), revision = revision + ?, updated_at = NOW(6)
          WHERE harness_run_id = ? AND skill_draft_id = ?",
     )
     .bind(status)
+    .bind(edits_body)
     .bind(content_markdown)
     .bind(i32::from(changed))
     .bind(harness_run_id)
