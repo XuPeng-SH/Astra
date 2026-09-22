@@ -3506,14 +3506,14 @@ fn evaluate_one(
                         score: Some(0.0),
                     };
                 }
-                if report.turns_with_feedback == 0 {
+                if report.cache_hit_ratios.is_empty() {
                     return if *optional {
                         CriterionResult {
                             criterion: c.clone(),
                             severity: criterion_severity(c),
                             passed: true,
                             detail:
-                                "pipeline cache ratio skipped (optional + no pipeline feedback turns)"
+                                "pipeline cache ratio skipped (optional + no measured input denominator)"
                                     .into(),
                             full_detail: None,
                             score: None,
@@ -3524,14 +3524,14 @@ fn evaluate_one(
                             severity: criterion_severity(c),
                             passed: false,
                             detail:
-                                "no pipeline feedback turns available — cannot evaluate cache ratio"
+                                "no pipeline cache-ratio observations available — cannot evaluate cache ratio"
                                     .into(),
                             full_detail: None,
                             score: None,
                         }
                     };
                 }
-                let passed = report.turns_with_feedback > 0 && report.avg_cache_hit_ratio >= *min;
+                let passed = report.avg_cache_hit_ratio >= *min;
                 CriterionResult {
                     criterion: c.clone(),
                     severity: criterion_severity(c),
@@ -6531,7 +6531,7 @@ mod tests {
             Some(&sess),
         );
         assert!(!r[0].passed);
-        assert!(r[0].detail.contains("no pipeline feedback turns"));
+        assert!(r[0].detail.contains("no pipeline cache-ratio observations"));
     }
 
     #[test]

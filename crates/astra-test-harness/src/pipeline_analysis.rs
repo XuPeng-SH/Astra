@@ -23,6 +23,10 @@ pub struct PipelineHealthReport {
     pub cache_hit_ratios: Vec<f64>,
     /// Average billable cache-read share across all turns.
     pub avg_cache_hit_ratio: f64,
+    /// Ratios came from raw LLM usage because no feedback frame had a
+    /// measurable input denominator.
+    #[serde(default)]
+    pub cache_ratio_from_raw_usage: bool,
     /// Sum of the runtime's stable provider-prefix estimates for feedback
     /// observations with actual request usage and a `provider-prefix-v1`
     /// identity.
@@ -229,11 +233,10 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                     report.invalid_events = report.invalid_events.saturating_add(1);
                     continue;
                 }
-                let Some(ratio) = frame.cache_hit_ratio() else {
-                    report.invalid_events = report.invalid_events.saturating_add(1);
-                    continue;
-                };
-                feedback_ratios.push(ratio);
+                report.turns_with_feedback = report.turns_with_feedback.saturating_add(1);
+                if let Some(ratio) = frame.cache_hit_ratio() {
+                    feedback_ratios.push(ratio);
+                }
                 if let (Some(eligible), Some(usage)) = (
                     frame.context.estimated_cache_eligible_tokens,
                     frame.request_usage.as_ref(),
@@ -317,12 +320,12 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
         report.alerts.extend(raw_breaks);
     }
 
-    report.cache_hit_ratios = if feedback_ratios.is_empty() {
+    report.cache_ratio_from_raw_usage = feedback_ratios.is_empty() && !raw_usage_ratios.is_empty();
+    report.cache_hit_ratios = if report.cache_ratio_from_raw_usage {
         raw_usage_ratios
     } else {
         feedback_ratios
     };
-    report.turns_with_feedback = report.cache_hit_ratios.len() as u32;
     if !report.cache_hit_ratios.is_empty() {
         report.avg_cache_hit_ratio =
             report.cache_hit_ratios.iter().sum::<f64>() / report.cache_hit_ratios.len() as f64;
@@ -583,18 +586,9 @@ fn raw_llm_response_cache_hit_ratio(event: &crate::session_capture::JournalEvent
         .and_then(|response| response.get("response"))
         .and_then(|response| response.get("usage"))?;
 
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cached_input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let cache_read_tokens = usage.get("cached_input_tokens")?.as_u64()?;
+    let cache_creation_tokens = usage.get("cache_creation_tokens")?.as_u64()?;
     let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
         input_tokens,
         cache_read_tokens,
@@ -740,18 +734,27 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
             ));
         }
         out.push_str("  No pipeline feedback events found.\n");
-        render_execution_summary(report, &mut out);
-        return out;
+        if report.cache_hit_ratios.is_empty() {
+            render_execution_summary(report, &mut out);
+            return out;
+        }
+    } else {
+        out.push_str(&format!(
+            "  Turns with feedback: {}\n",
+            report.turns_with_feedback
+        ));
     }
-
-    out.push_str(&format!(
-        "  Turns with feedback: {}\n",
-        report.turns_with_feedback
-    ));
-    out.push_str(&format!(
-        "  Avg billable cache-read share: {:.1}%\n",
-        report.avg_cache_hit_ratio * 100.0
-    ));
+    if report.cache_ratio_from_raw_usage {
+        out.push_str("  Cache share uses raw LLM usage fallback.\n");
+    }
+    if report.cache_hit_ratios.is_empty() {
+        out.push_str("  Avg billable cache-read share: unknown (no input denominator)\n");
+    } else {
+        out.push_str(&format!(
+            "  Avg billable cache-read share: {:.1}%\n",
+            report.avg_cache_hit_ratio * 100.0
+        ));
+    }
     if let Some(coverage) = report.stable_prefix_cache_coverage {
         out.push_str(&format!(
             "  Stable-prefix cache coverage: {:.1}% ({}/{} tokens, {} provider-prefix-v1 observations)\n",
@@ -1352,6 +1355,57 @@ mod tests {
     }
 
     #[test]
+    fn zero_input_feedback_is_valid_without_a_cache_percentage() {
+        let mut output_only = make_feedback_event(1, 0.0);
+        output_only.raw["metadata"]["runtime_feedback"]["request_usage"]["prompt"] =
+            serde_json::json!(0);
+        output_only.raw["metadata"]["runtime_feedback"]["run_usage"]["prompt"] =
+            serde_json::json!(0);
+        let report = analyze_pipeline_health(&make_capture(vec![
+            output_only,
+            make_feedback_event(2, 0.7),
+        ]));
+        assert_eq!(report.invalid_events, 0);
+        assert_eq!(report.turns_with_feedback, 2);
+        assert_eq!(report.cache_hit_ratios, vec![0.7]);
+
+        let mut output_only = make_feedback_event(3, 0.0);
+        output_only.raw["metadata"]["runtime_feedback"]["request_usage"]["prompt"] =
+            serde_json::json!(0);
+        output_only.raw["metadata"]["runtime_feedback"]["run_usage"]["prompt"] =
+            serde_json::json!(0);
+        let output_capture = make_capture(vec![output_only.clone()]);
+        let only_output_report = analyze_pipeline_health(&output_capture);
+        assert_eq!(only_output_report.turns_with_feedback, 1);
+        assert!(only_output_report.cache_hit_ratios.is_empty());
+        assert!(
+            render_pipeline_health(&only_output_report)
+                .contains("Avg billable cache-read share: unknown")
+        );
+        for optional in [false, true] {
+            let result = crate::criteria::evaluate_deterministic_with_session(
+                &[crate::criteria::Criterion::PipelineAvgCacheHitRatio { min: 0.5, optional }],
+                &crate::runner::RunOutcome::new("m"),
+                Some(&output_capture),
+            );
+            assert_eq!(result[0].passed, optional);
+            assert!(
+                result[0].detail.contains("cache ratio")
+                    || result[0].detail.contains("cache-ratio")
+            );
+        }
+
+        let fallback_report = analyze_pipeline_health(&make_capture(vec![
+            output_only,
+            make_llm_response_event(100, 900, 0),
+        ]));
+        assert_eq!(fallback_report.turns_with_feedback, 1);
+        assert!(fallback_report.cache_ratio_from_raw_usage);
+        assert_eq!(fallback_report.cache_hit_ratios, vec![0.9]);
+        assert!(render_pipeline_health(&fallback_report).contains("raw LLM usage fallback"));
+    }
+
+    #[test]
     fn negative_feedback_pressure_marks_health_evidence_incomplete() {
         let mut event = make_feedback_event(1, 0.5);
         event.raw["metadata"]["runtime_feedback"]["context"]["token_pressure"] =
@@ -1382,11 +1436,24 @@ mod tests {
             make_llm_response_event(172, 10_112, 0),
         ]);
         let report = analyze_pipeline_health(&capture);
-        assert_eq!(report.turns_with_feedback, 3);
+        assert_eq!(report.turns_with_feedback, 0);
         assert_eq!(report.cache_hit_ratios.len(), 3);
+        assert!(render_pipeline_health(&report).contains("raw LLM usage fallback"));
         assert!(report.cache_hit_ratios[0] < 0.01);
         assert!(report.cache_hit_ratios[1] > 0.9);
         assert!(report.avg_cache_hit_ratio > 0.6);
+    }
+
+    #[test]
+    fn raw_usage_missing_cache_bucket_has_no_cache_percentage() {
+        let mut event = make_llm_response_event(100, 0, 0);
+        event.raw["metadata"]["response"]["response"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cached_input_tokens");
+        let report = analyze_pipeline_health(&make_capture(vec![event]));
+        assert!(report.cache_hit_ratios.is_empty());
+        assert!(!report.cache_ratio_from_raw_usage);
     }
 
     #[test]

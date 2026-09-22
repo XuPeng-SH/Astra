@@ -283,6 +283,29 @@ pub(crate) fn format_render_error(reason: &str) -> String {
     format!("{{\n  \"error\": \"SuiteReport JSON render failed: {escaped}\"\n}}")
 }
 
+fn pipeline_health_line(health: &crate::pipeline_analysis::PipelineHealthReport) -> String {
+    let cache_share = if health.cache_hit_ratios.is_empty() {
+        "unknown".to_string()
+    } else {
+        format!("{:.0}%", health.avg_cache_hit_ratio * 100.0)
+    };
+    let source = if health.cache_hit_ratios.is_empty() {
+        "none"
+    } else if health.cache_ratio_from_raw_usage {
+        "raw_llm_usage"
+    } else {
+        "pipeline_feedback"
+    };
+    let stable = health
+        .stable_prefix_cache_coverage
+        .map(|ratio| format!(" stable-prefix={:.0}%", ratio * 100.0))
+        .unwrap_or_default();
+    format!(
+        "    pipeline: turns={} cache-read-share={} source={}{} compactions={}\n",
+        health.turns_with_feedback, cache_share, source, stable, health.compaction_count
+    )
+}
+
 fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let mut s = String::new();
     s.push_str("=== astra-test suite report ===\n");
@@ -434,23 +457,8 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 cap.tools_invoked()
             ));
             let health = crate::pipeline_analysis::analyze_pipeline_health(cap);
-            if health.turns_with_feedback > 0 {
-                if let Some(stable_prefix_coverage) = health.stable_prefix_cache_coverage {
-                    s.push_str(&format!(
-                        "    pipeline: turns={} cache-read-share={:.0}% stable-prefix={:.0}% compactions={}\n",
-                        health.turns_with_feedback,
-                        health.avg_cache_hit_ratio * 100.0,
-                        stable_prefix_coverage * 100.0,
-                        health.compaction_count,
-                    ));
-                } else {
-                    s.push_str(&format!(
-                        "    pipeline: turns={} cache-read-share={:.0}% compactions={}\n",
-                        health.turns_with_feedback,
-                        health.avg_cache_hit_ratio * 100.0,
-                        health.compaction_count,
-                    ));
-                }
+            if health.turns_with_feedback > 0 || !health.cache_hit_ratios.is_empty() {
+                s.push_str(&pipeline_health_line(&health));
                 if health.cascade_detected {
                     s.push_str("    pipeline: ⚠ compaction cascade detected\n");
                 }
@@ -892,6 +900,23 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_summary_preserves_unknown_ratio_and_fallback_source() {
+        let mut health = crate::pipeline_analysis::PipelineHealthReport {
+            turns_with_feedback: 1,
+            ..Default::default()
+        };
+        let output_only = pipeline_health_line(&health);
+        assert!(output_only.contains("cache-read-share=unknown source=none"));
+        assert!(!output_only.contains("cache-read-share=0%"));
+
+        health.cache_hit_ratios = vec![0.9];
+        health.avg_cache_hit_ratio = 0.9;
+        health.cache_ratio_from_raw_usage = true;
+        let fallback = pipeline_health_line(&health);
+        assert!(fallback.contains("cache-read-share=90% source=raw_llm_usage"));
+    }
     use crate::criteria::Criterion;
 
     fn mk_outcome() -> RunOutcome {

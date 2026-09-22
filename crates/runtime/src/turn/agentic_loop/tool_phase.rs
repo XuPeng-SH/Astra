@@ -6092,7 +6092,7 @@ esac
 
         // LiveRuntimeProvider
         assert_eq!(provider.token_pressure(), 0.0);
-        assert_eq!(provider.cache_hit_ratio(), 0.0);
+        assert_eq!(provider.cache_hit_ratio(), None);
         assert_eq!(provider.current_error_rate(), 0.0);
         assert_eq!(provider.budget_remaining(), 10);
         assert_eq!(provider.budget_max(), 10);
