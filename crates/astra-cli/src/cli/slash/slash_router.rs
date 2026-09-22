@@ -681,6 +681,7 @@ mod model_list_json_tests {
             max_completion_tokens: Some(8192),
             architecture: None,
             thinking_capability: Some(astra_services::models::ThinkingCapability::Both),
+            pricing: None,
         }
     }
 

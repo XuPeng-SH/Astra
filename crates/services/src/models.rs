@@ -42,6 +42,82 @@ pub struct PricingData {
     pub cache_write: Option<f64>,
 }
 
+/// Administrator-supplied rates. Unlike legacy usage accounting, every
+/// component needed to publish a price must be explicit at the write boundary.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredPricingData {
+    pub currency: String,
+    pub unit: String,
+    pub prompt: f64,
+    pub completion: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+}
+
+impl ConfiguredPricingData {
+    fn validate(&self) -> Result<(), String> {
+        if self.currency != "USD" || self.unit != "per_token" {
+            return Err("pricing requires currency=USD and unit=per_token".into());
+        }
+        validate_pricing_data(&PricingData {
+            prompt: self.prompt,
+            completion: self.completion,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+        })
+    }
+
+    pub(crate) fn rates(&self) -> PricingData {
+        PricingData {
+            prompt: self.prompt,
+            completion: self.completion,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+        }
+    }
+}
+
+/// Configured catalog rate, not a provider bill or a task-cost estimate.
+/// Missing pricing remains `None`; an explicitly configured zero is valid.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalogPricing {
+    pub currency: String,
+    pub unit: String,
+    pub source: String,
+    pub prompt: f64,
+    pub completion: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    /// Model configuration update, which need not be a price change.
+    pub configuration_updated_at: String,
+}
+
+fn catalog_pricing_from_stored(raw: &str, updated_at: &str) -> Option<ModelCatalogPricing> {
+    let price = configured_pricing_from_stored(raw)?;
+    let updated_at = updated_at.trim();
+    if updated_at.is_empty() {
+        return None;
+    }
+    Some(ModelCatalogPricing {
+        currency: "USD".into(),
+        unit: "per_token".into(),
+        source: "configured".into(),
+        prompt: price.prompt,
+        completion: price.completion,
+        cache_read: price.cache_read,
+        cache_write: price.cache_write,
+        configuration_updated_at: updated_at.into(),
+    })
+}
+
+pub(crate) fn configured_pricing_from_stored(raw: &str) -> Option<ConfiguredPricingData> {
+    let price = serde_json::from_str::<ConfiguredPricingData>(raw).ok()?;
+    price.validate().ok()?;
+    Some(price)
+}
+
 impl PricingData {
     #[must_use]
     pub fn is_valid(&self) -> bool {
@@ -359,7 +435,7 @@ pub struct ModelCreateRequestData {
     pub input_modalities: Vec<String>,
     pub output_modalities: Vec<String>,
     pub supported_parameters: Vec<String>,
-    pub pricing: PricingData,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     pub tags: Vec<String>,
     pub quirks: Option<QuirksData>,
@@ -397,7 +473,7 @@ pub struct ModelUpdateRequestData {
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
     pub supported_parameters: Option<Vec<String>>,
-    pub pricing: Option<PricingData>,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     pub tags: Option<Vec<String>>,
     pub is_active: Option<bool>,
@@ -540,6 +616,7 @@ pub struct ModelListItem {
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
     pub thinking_capability: Option<ThinkingCapability>,
+    pub pricing: Option<ModelCatalogPricing>,
 }
 
 /// Apply purpose eligibility to the complete catalog before pagination,
@@ -2339,7 +2416,7 @@ pub async fn resolve_memory_offerings(
 
 /// Return the index of the cheapest entry by `pricing.completion`.
 ///
-/// * Missing / unparseable pricing and `completion <= 0` are treated as `+infinity`,
+/// * Missing / unproven pricing is treated as `+infinity`,
 ///   so they lose to any priced row.
 /// * Ties on price are broken by ascending `model_name` (so the result is deterministic).
 ///
@@ -2368,10 +2445,8 @@ pub(crate) fn rank_cheapest_index(entries: &[(String, String)]) -> usize {
 }
 
 fn score_completion(pricing_json: &str) -> f64 {
-    serde_json::from_str::<PricingData>(pricing_json)
+    configured_pricing_from_stored(pricing_json)
         .map(|p| p.completion)
-        .ok()
-        .filter(|c| *c > 0.0)
         .unwrap_or(f64::INFINITY)
 }
 
@@ -3004,6 +3079,10 @@ impl DatabaseModelService {
         let cap_str: Option<String> = row.try_get("thinking_capability").map_err(internal_error)?;
         let thinking_capability =
             ThinkingCapability::try_from_db_column(cap_str.as_deref()).map_err(internal_error)?;
+        let pricing_json: String = row.try_get("pricing_json").map_err(internal_error)?;
+        let configuration_updated_at: String = row
+            .try_get("configuration_updated_at")
+            .map_err(internal_error)?;
 
         Ok(ModelListItem {
             offering_id: row.try_get("model_id").map_err(internal_error)?,
@@ -3021,6 +3100,7 @@ impl DatabaseModelService {
                 .map_err(internal_error)?,
             architecture: row.try_get("architecture").map_err(internal_error)?,
             thinking_capability,
+            pricing: catalog_pricing_from_stored(&pricing_json, &configuration_updated_at),
         })
     }
 
@@ -3107,33 +3187,7 @@ impl DatabaseModelService {
 
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
-            let is_active_int: i16 = row.try_get("is_active").map_err(internal_error)?;
-            let name: String = row.try_get("model_name").map_err(internal_error)?;
-            let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
-            let context_window =
-                model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
-            models.push(ModelListItem {
-                offering_id: row.try_get("model_id").map_err(internal_error)?,
-                access_id: "self-hosted".to_string(),
-                access_kind: ModelAccessKind::SelfHosted,
-                access_label: "Self-hosted".to_string(),
-                execution_placement: ModelExecutionPlacement::Server,
-                name,
-                provider: row.try_get("provider").map_err(internal_error)?,
-                description: row.try_get("description").map_err(internal_error)?,
-                is_active: is_active_int != 0,
-                context_window,
-                max_completion_tokens: row
-                    .try_get("max_completion_tokens")
-                    .map_err(internal_error)?,
-                architecture: row.try_get("architecture").map_err(internal_error)?,
-                thinking_capability: {
-                    let cap_str: Option<String> =
-                        row.try_get("thinking_capability").map_err(internal_error)?;
-                    ThinkingCapability::try_from_db_column(cap_str.as_deref())
-                        .map_err(internal_error)?
-                },
-            });
+            models.push(Self::model_list_item_from_row(&row)?);
         }
         if !is_admin && !user_id.is_empty() {
             let user_rows = query(&format!(
@@ -3167,6 +3221,7 @@ impl DatabaseModelService {
                     max_completion_tokens: None,
                     architecture: None,
                     thinking_capability,
+                    pricing: None,
                 });
             }
         }
@@ -3204,7 +3259,8 @@ pub const MODEL_SELECT_COLS: &str = "\
 const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, description, is_active, \
     context_window, max_completion_tokens, architecture, \
-    thinking_capability";
+    thinking_capability, CAST(pricing AS CHAR) AS pricing_json, \
+    CAST(updated_at AS CHAR) AS configuration_updated_at";
 const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name > ?) \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
@@ -3790,8 +3846,11 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         request: ModelCreateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        validate_pricing_data(&request.pricing)
-            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        if let Some(pricing) = request.pricing.as_ref() {
+            pricing
+                .validate()
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
         let context_window = require_create_context_window(request.context_window)?;
 
@@ -3853,7 +3912,13 @@ impl ModelService for DatabaseModelService {
             .unwrap_or_else(|_| r#"["text"]"#.to_string());
         let supported = serde_json::to_string(&request.supported_parameters)
             .unwrap_or_else(|_| "[]".to_string());
-        let pricing = serde_json::to_string(&request.pricing).unwrap_or_else(|_| "{}".to_string());
+        let pricing = request
+            .pricing
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(internal_error)?
+            .unwrap_or_else(|| "{}".to_string());
         let tags = serde_json::to_string(&request.tags).unwrap_or_else(|_| "[]".to_string());
         let quirks = request
             .quirks
@@ -4109,7 +4174,8 @@ impl ModelService for DatabaseModelService {
         request: ModelUpdateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         if let Some(pricing) = request.pricing.as_ref() {
-            validate_pricing_data(pricing)
+            pricing
+                .validate()
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -5209,8 +5275,7 @@ pub struct ModelCreateRequest {
     pub output_modalities: Vec<String>,
     #[serde(default)]
     pub supported_parameters: Vec<String>,
-    #[serde(default)]
-    pub pricing: PricingData,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -5232,7 +5297,7 @@ pub struct ModelUpdateRequest {
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
     pub supported_parameters: Option<Vec<String>>,
-    pub pricing: Option<PricingData>,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     pub tags: Option<Vec<String>>,
     pub is_active: Option<bool>,
@@ -5280,6 +5345,7 @@ pub struct ModelListItemResponse {
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
     pub thinking_capability: Option<ThinkingCapability>,
+    pub pricing: Option<ModelCatalogPricing>,
 }
 
 impl From<ModelRecord> for ModelResponse {
@@ -5323,6 +5389,7 @@ impl From<ModelListItem> for ModelListItemResponse {
             max_completion_tokens: r.max_completion_tokens,
             architecture: r.architecture,
             thinking_capability: r.thinking_capability,
+            pricing: r.pricing,
         }
     }
 }
@@ -5974,7 +6041,123 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }
+    }
+
+    #[test]
+    fn catalog_pricing_preserves_explicit_zero_and_unknown_rates() {
+        let updated_at = "2026-09-23 12:00:00.000000";
+        let priced = catalog_pricing_from_stored(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0.000002,"cache_read":0.0000002}"#,
+            updated_at,
+        )
+        .unwrap();
+        assert_eq!(priced.prompt, 0.0);
+        assert_eq!(priced.completion, 0.000002);
+        assert_eq!(priced.cache_read, Some(0.0000002));
+        assert_eq!(priced.cache_write, None);
+        assert_eq!(priced.currency, "USD");
+        assert_eq!(priced.unit, "per_token");
+        assert_eq!(priced.source, "configured");
+        assert_eq!(priced.configuration_updated_at, updated_at);
+
+        for raw in [
+            "null",
+            "{}",
+            r#"{"prompt":0}"#,
+            r#"{"prompt":0,"completion":0}"#,
+            r#"{"prompt":1,"completion":2}"#,
+            r#"{"currency":"CNY","unit":"per_token","prompt":1,"completion":2}"#,
+            r#"{"currency":"USD","unit":"per_million_tokens","prompt":1,"completion":2}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":"0","completion":1}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":-1,"completion":1}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":1,"completion":2,"cache_read":-1}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":1,"completion":2,"cache_write":"free"}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":1e999,"completion":2}"#,
+        ] {
+            assert!(
+                catalog_pricing_from_stored(raw, updated_at).is_none(),
+                "{raw}"
+            );
+        }
+        assert!(
+            catalog_pricing_from_stored(
+                r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+                " "
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn configured_price_requires_explicit_currency_unit_and_both_rates() {
+        for raw in [
+            r#"{"prompt":0,"completion":0}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":0}"#,
+            r#"{"currency":"CNY","unit":"per_token","prompt":0,"completion":0}"#,
+        ] {
+            match serde_json::from_str::<ConfiguredPricingData>(raw) {
+                Ok(price) => assert!(price.validate().is_err(), "{raw}"),
+                Err(_) => {}
+            }
+        }
+        let price: ConfiguredPricingData = serde_json::from_str(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+        )
+        .unwrap();
+        assert!(price.validate().is_ok());
+        assert_eq!(
+            catalog_pricing_from_stored(&serde_json::to_string(&price).unwrap(), "2026-09-23")
+                .unwrap()
+                .prompt,
+            0.0
+        );
+    }
+
+    #[test]
+    fn model_create_request_keeps_omitted_price_unknown() {
+        let base = serde_json::json!({
+            "name": "priced",
+            "provider": "mock",
+            "api_key": "fixture",
+        });
+        let omitted: ModelCreateRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(omitted.pricing.is_none());
+        let mut partial = base.clone();
+        partial["pricing"] = serde_json::json!({
+            "currency": "USD", "unit": "per_token", "prompt": 0.0
+        });
+        assert!(serde_json::from_value::<ModelCreateRequest>(partial).is_err());
+        let mut explicit = base;
+        explicit["pricing"] = serde_json::json!({
+            "currency": "USD", "unit": "per_token", "prompt": 0.0, "completion": 0.0
+        });
+        assert!(
+            serde_json::from_value::<ModelCreateRequest>(explicit)
+                .unwrap()
+                .pricing
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn catalog_revision_changes_with_configured_price_evidence() {
+        let mut item = test_model_list_item("openai", "flash", "offer-1");
+        let unknown = model_catalog_revision(&[item.clone()]);
+        item.pricing = catalog_pricing_from_stored(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+            "2026-09-23 12:00:00.000000",
+        );
+        let free = model_catalog_revision(&[item.clone()]);
+        assert_ne!(unknown, free);
+        item.pricing.as_mut().unwrap().completion = 0.000002;
+        assert_ne!(free, model_catalog_revision(&[item.clone()]));
+        let changed_rate = model_catalog_revision(&[item.clone()]);
+        item.pricing.as_mut().unwrap().configuration_updated_at = "2026-09-24".into();
+        assert_ne!(changed_rate, model_catalog_revision(&[item]));
     }
 
     #[test]
@@ -6597,7 +6780,9 @@ mod tests {
 
     fn entry(name: &str, completion: Option<f64>) -> (String, String) {
         let json = match completion {
-            Some(c) => format!(r#"{{"completion": {c}}}"#),
+            Some(c) => {
+                format!(r#"{{"currency":"USD","unit":"per_token","prompt":0,"completion":{c}}}"#)
+            }
             None => "{}".to_string(),
         };
         (name.to_string(), json)
@@ -6630,10 +6815,22 @@ mod tests {
     }
 
     #[test]
-    fn rank_cheapest_treats_zero_as_infinity() {
-        // Zero or negative completion is treated as "unpriced" so it loses to any priced row.
+    fn rank_cheapest_never_compares_unproven_or_cny_rates_as_usd() {
+        let entries = vec![
+            ("legacy".into(), r#"{"prompt":0,"completion":0}"#.into()),
+            (
+                "cny".into(),
+                r#"{"currency":"CNY","unit":"per_token","prompt":0,"completion":0}"#.into(),
+            ),
+            entry("verified-usd", Some(0.5)),
+        ];
+        assert_eq!(rank_cheapest_index(&entries), 2);
+    }
+
+    #[test]
+    fn rank_cheapest_accepts_explicit_zero() {
         let entries = vec![entry("zero_priced", Some(0.0)), entry("normal", Some(0.02))];
-        assert_eq!(rank_cheapest_index(&entries), 1);
+        assert_eq!(rank_cheapest_index(&entries), 0);
     }
 
     #[test]
@@ -7155,6 +7352,11 @@ mod tests {
 
     #[test]
     fn model_list_item_to_response_preserves_fields() {
+        let configured_price = catalog_pricing_from_stored(
+            r#"{"currency":"USD","unit":"per_token","prompt":0.000001,"completion":0.000002}"#,
+            "2026-09-23 12:00:00.000000",
+        )
+        .expect("explicit configured USD price");
         let item = ModelListItem {
             offering_id: "m1".into(),
             access_id: "self-hosted".into(),
@@ -7169,6 +7371,7 @@ mod tests {
             max_completion_tokens: Some(16384),
             architecture: Some("transformer".into()),
             thinking_capability: Some(ThinkingCapability::Both),
+            pricing: Some(configured_price),
         };
         let resp = ModelListItemResponse::from(item.clone());
         assert_eq!(resp.offering_id, item.offering_id);
@@ -7177,6 +7380,11 @@ mod tests {
         assert_eq!(resp.name, item.name);
         assert_eq!(resp.context_window, 128000);
         assert_eq!(resp.thinking_capability, Some(ThinkingCapability::Both));
+        assert_eq!(resp.pricing, item.pricing);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["pricing"]["currency"], "USD");
+        assert_eq!(json["pricing"]["cache_read"], Value::Null);
+        assert!(json.get("api_key").is_none());
     }
 
     #[test]
@@ -7195,12 +7403,14 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let resp = ModelListItemResponse::from(item);
         assert!(resp.description.is_none());
         assert!(resp.max_completion_tokens.is_none());
         assert!(resp.architecture.is_none());
         assert!(resp.thinking_capability.is_none());
+        assert_eq!(serde_json::to_value(&resp).unwrap()["pricing"], Value::Null);
     }
 
     #[test]
@@ -7226,6 +7436,7 @@ mod tests {
             max_completion_tokens: Some(8_192),
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         });
 
         let ready = project_model_access(
@@ -7391,6 +7602,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
 
         let error = project_model_access(
@@ -7425,6 +7637,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let alpha = offering("offer-alpha", "Alpha");
         let beta = offering("offer-beta", "Beta");
@@ -7471,6 +7684,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
 
         let projection = project_model_access_page(
@@ -7524,6 +7738,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
 
         let projection = project_model_access_page_with_default_catalog(
@@ -7569,6 +7784,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let alpha = offering("offer-alpha", "Alpha");
         let beta = offering("offer-beta", "Beta");
@@ -7614,6 +7830,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let projection = project_model_access_with_default(
             vec![declared],
@@ -7661,6 +7878,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let invalid_id = "not-a-valid\noffering-id";
         let projection = project_model_access_with_default(
@@ -7711,6 +7929,7 @@ mod tests {
                 max_completion_tokens: None,
                 architecture: None,
                 thinking_capability: None,
+                pricing: None,
             }],
             "2026-07-20T00:00:00Z".into(),
         )
@@ -7969,6 +8188,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: Some(ThinkingCapability::Both),
+            pricing: None,
         };
         let resp = ModelListItemResponse::from(item);
         let v = serde_json::to_value(&resp).expect("serialize ModelListItemResponse");
@@ -8079,11 +8299,11 @@ mod tests {
             ),
             (
                 "qwen-flash".to_string(),
-                r#"{"prompt":0.00000015,"completion":0.0000015}"#.to_string(),
+                r#"{"currency":"USD","unit":"per_token","prompt":0.00000015,"completion":0.0000015}"#.to_string(),
             ),
             (
                 "qwen3-flash".to_string(),
-                r#"{"prompt":0.0000002,"completion":0.000002}"#.to_string(),
+                r#"{"currency":"USD","unit":"per_token","prompt":0.0000002,"completion":0.000002}"#.to_string(),
             ),
         ];
         // selector_rows indices: [1, 2]

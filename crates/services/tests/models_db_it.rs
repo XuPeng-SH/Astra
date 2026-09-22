@@ -2,6 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
+use astra_services::models::ModelUpdateRequestData;
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelAccessKind, ModelOfferingResolutionError,
     ModelService, resolve_active_llm_offering, revalidate_active_llm_offering,
@@ -31,6 +32,98 @@ async fn seed_model(pool: &sqlx::Pool<sqlx::MySql>, model_name: &str) -> String 
     .await
     .expect("seed model");
     model_id
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn configured_catalog_price_matches_full_and_paginated_reads() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let model_name = format!("catalog_price_{}", Uuid::new_v4().simple());
+    let model_id = seed_model(&pool, &model_name).await;
+    sqlx::query("UPDATE infra_llm_models SET pricing = ?, updated_at = ? WHERE model_id = ?")
+        .bind(r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0.000002,"cache_read":0.0000002}"#)
+        .bind("2026-09-23 12:00:00.000000")
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let service = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("catalog-price-db-it-key").unwrap()),
+    )
+    .with_pool(shared_pool);
+    let full = service.list_models(String::new(), true).await.unwrap();
+    let full_item = full
+        .iter()
+        .find(|item| item.offering_id == model_id)
+        .unwrap();
+    let mut cursor = None;
+    let page_item = loop {
+        let page = service
+            .list_models_page(String::new(), true, 16, cursor)
+            .await
+            .unwrap();
+        if let Some(item) = page
+            .items
+            .into_iter()
+            .find(|item| item.offering_id == model_id)
+        {
+            break item;
+        }
+        cursor = page.next_cursor;
+        assert!(
+            cursor.is_some(),
+            "seeded Offering must be present in complete catalog"
+        );
+    };
+    assert_eq!(full_item.pricing, page_item.pricing);
+    let price = page_item.pricing.unwrap();
+    assert_eq!(price.prompt, 0.0);
+    assert_eq!(price.completion, 0.000002);
+    assert_eq!(price.cache_read, Some(0.0000002));
+    assert_eq!(price.cache_write, None);
+    assert_eq!(price.configuration_updated_at, "2026-09-23 12:00:00.000000");
+
+    sqlx::query("UPDATE infra_llm_models SET pricing = ? WHERE model_id = ?")
+        .bind(r#"{"prompt":0,"completion":0}"#)
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    service
+        .update_model(
+            model_name,
+            ModelUpdateRequestData {
+                api_key: None,
+                base_url: None,
+                provider: None,
+                description: Some("unrelated description change".into()),
+                context_window: None,
+                max_completion_tokens: None,
+                input_modalities: None,
+                output_modalities: None,
+                supported_parameters: None,
+                pricing: None,
+                architecture: None,
+                tags: None,
+                is_active: None,
+                quirks: None,
+            },
+        )
+        .await
+        .unwrap();
+    let updated = service.list_models(String::new(), true).await.unwrap();
+    assert!(
+        updated
+            .iter()
+            .find(|item| item.offering_id == model_id)
+            .unwrap()
+            .pricing
+            .is_none()
+    );
 }
 
 #[tokio::test]

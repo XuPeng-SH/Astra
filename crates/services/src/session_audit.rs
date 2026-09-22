@@ -12,7 +12,7 @@ use sqlx::{MySql, Pool, query};
 
 use crate::db_row::RowExt as RuntimePromotionAuditRow;
 use crate::db_row::RowExt as SessionAuditRow;
-use crate::models::PricingData;
+use crate::models::{PricingData, configured_pricing_from_stored};
 use crate::storage::agent_session_exists_for_user;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
@@ -2752,51 +2752,6 @@ fn summarize_session_request_usage(
     summary
 }
 
-fn pricing_json_number(context: &str, field: &str, value: &serde_json::Value) -> AuditResult<f64> {
-    let Some(number) = value.as_f64() else {
-        return Err(audit_decode_error(
-            context,
-            &format!("pricing_json.{field}"),
-            format!("expected number, got {value}"),
-        ));
-    };
-    if number.is_finite() && number >= 0.0 {
-        Ok(number)
-    } else {
-        Err(audit_decode_error(
-            context,
-            &format!("pricing_json.{field}"),
-            format!("expected non-negative finite number, got {number}"),
-        ))
-    }
-}
-
-fn pricing_json_required_number(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-    field: &str,
-) -> AuditResult<f64> {
-    let Some(value) = obj.get(field) else {
-        return Err(audit_decode_error(
-            context,
-            &format!("pricing_json.{field}"),
-            "missing required pricing field",
-        ));
-    };
-    pricing_json_number(context, field, value)
-}
-
-fn pricing_json_optional_number(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-    field: &str,
-) -> AuditResult<Option<f64>> {
-    match obj.get(field) {
-        Some(value) if !value.is_null() => pricing_json_number(context, field, value).map(Some),
-        _ => Ok(None),
-    }
-}
-
 fn active_model_pricing_from_row(
     row: &impl SessionAuditRow,
     wanted: &HashSet<&str>,
@@ -2810,24 +2765,7 @@ fn active_model_pricing_from_row(
         audit_row_optional_string(row, context, "pricing_json")?.ok_or_else(|| {
             audit_decode_error(context, "pricing_json", "expected pricing JSON, got NULL")
         })?;
-    let value: serde_json::Value = serde_json::from_str(&pricing_json)
-        .map_err(|error| audit_decode_error(context, "pricing_json", error))?;
-    let Some(obj) = value.as_object() else {
-        return Err(audit_decode_error(
-            context,
-            "pricing_json",
-            format!("expected JSON object, got {value}"),
-        ));
-    };
-    Ok(Some((
-        model_name,
-        PricingData {
-            prompt: pricing_json_required_number(obj, context, "prompt")?,
-            completion: pricing_json_required_number(obj, context, "completion")?,
-            cache_read: pricing_json_optional_number(obj, context, "cache_read")?,
-            cache_write: pricing_json_optional_number(obj, context, "cache_write")?,
-        },
-    )))
+    Ok(configured_pricing_from_stored(&pricing_json).map(|pricing| (model_name, pricing.rates())))
 }
 
 async fn load_active_model_pricing_map(
@@ -4709,7 +4647,7 @@ mod tests {
                 turn_seq: Some(42),
                 model: Some("gpt-5"),
                 pricing_json: Some(
-                    r#"{"prompt": 0.000002, "completion": 0.000008, "cache_read": 0.0000005}"#,
+                    r#"{"currency":"USD","unit":"per_token","prompt": 0.000002, "completion": 0.000008, "cache_read": 0.0000005}"#,
                 ),
             }
         }
@@ -5862,7 +5800,7 @@ mod tests {
     }
 
     #[test]
-    fn active_model_pricing_row_decode_preserves_values_and_fails_loudly() {
+    fn active_model_pricing_row_only_accepts_explicit_usd_rates() {
         let wanted = HashSet::from(["gpt-5"]);
         let decoded = active_model_pricing_from_row(&FakeSessionAuditRow::complete(), &wanted)
             .expect("pricing row decodes")
@@ -5888,33 +5826,32 @@ mod tests {
             active_model_pricing_from_row(&FakeSessionAuditRow::fail_on("pricing_json"), &wanted),
             "pricing_json",
         );
-        assert_audit_internal_error_mentions(
+        assert!(
             active_model_pricing_from_row(
                 &FakeSessionAuditRow::with_pricing_json(Some("{not-json")),
                 &wanted,
-            ),
-            "pricing_json",
+            )
+            .unwrap()
+            .is_none()
         );
         assert_audit_internal_error_mentions(
             active_model_pricing_from_row(&FakeSessionAuditRow::with_pricing_json(None), &wanted),
             "expected pricing JSON",
         );
-        assert_audit_internal_error_mentions(
-            active_model_pricing_from_row(
-                &FakeSessionAuditRow::with_pricing_json(Some(r#"{"completion": 8.0}"#)),
-                &wanted,
-            ),
-            "pricing_json.prompt",
-        );
-        assert_audit_internal_error_mentions(
-            active_model_pricing_from_row(
-                &FakeSessionAuditRow::with_pricing_json(Some(
-                    r#"{"prompt": 2.0, "completion": -1.0}"#,
-                )),
-                &wanted,
-            ),
-            "non-negative",
-        );
+        for raw in [
+            r#"{"completion": 8.0}"#,
+            r#"{"prompt": 2.0, "completion": -1.0}"#,
+            r#"{"currency":"CNY","unit":"per_token","prompt":0,"completion":0}"#,
+        ] {
+            assert!(
+                active_model_pricing_from_row(
+                    &FakeSessionAuditRow::with_pricing_json(Some(raw)),
+                    &wanted,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
     }
 
     #[test]

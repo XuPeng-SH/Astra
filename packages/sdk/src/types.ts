@@ -1497,11 +1497,23 @@ export type RuntimeTranscriptParams = {
 
 export type RuntimeModelAccessKind =
   | "astra_cloud"
+  | "cloud_byok"
   | "workspace"
   | "this_device"
   | "self_hosted";
 
 export type RuntimeModelExecutionPlacement = "server" | "edge";
+
+export type RuntimeModelCatalogPricing = {
+  currency: "USD";
+  unit: "per_token";
+  source: "configured";
+  prompt: number;
+  completion: number;
+  cache_read: number | null;
+  cache_write: number | null;
+  configuration_updated_at: string;
+};
 
 export type RuntimeModelListItem = {
   offering_id: string;
@@ -1517,6 +1529,7 @@ export type RuntimeModelListItem = {
   max_completion_tokens: number | null;
   architecture: unknown | null;
   thinking_capability: "both" | "effort_only" | "native_only" | "none" | null;
+  pricing: RuntimeModelCatalogPricing | null;
 };
 
 export type RuntimeModelCatalogCursor = {

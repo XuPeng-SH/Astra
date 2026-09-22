@@ -185,6 +185,7 @@ impl ExternalCatalogModel {
             max_completion_tokens: i32_value(&self.limits, "max_completion_tokens"),
             architecture: string_value(&self.metadata, "architecture"),
             thinking_capability: None,
+            pricing: None,
         }
     }
 }
