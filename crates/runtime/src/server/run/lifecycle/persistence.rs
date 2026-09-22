@@ -3153,7 +3153,7 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
             && end - offset < TRANSCRIPT_MEMBERSHIP_ROWS
             && end - offset + 2 < TRANSCRIPT_BATCH_BINDS
         {
-            let item_bytes = items[end].source_event_id.len() + items[end].content.len() + 64;
+            let item_bytes = items[end].source_event_id.len() + 64;
             if end > offset && bytes.saturating_add(item_bytes) > TRANSCRIPT_BATCH_BYTES {
                 break;
             }
