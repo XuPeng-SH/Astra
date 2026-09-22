@@ -7091,6 +7091,7 @@ impl AgenticRunLifecycleService {
             agent_id,
             delegation_chain: Vec::new(),
             current_model: request.model.clone(),
+            current_model_selection: request.model_selection.clone(),
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: workspace.to_path_buf(),
@@ -20560,6 +20561,48 @@ impl ServerSpawnAgentExecutor {
             })
     }
 
+    async fn select_spawn_model_execution(
+        &self,
+        parent: &ServerSpawnRuntimeContext,
+        selection: Option<&ModelSelection>,
+    ) -> Result<astra_services::AdmittedModelExecution, String> {
+        let parent_execution = parent.admitted_model_execution.as_ref();
+        let Some(selection) = selection else {
+            return parent_execution.cloned().ok_or_else(|| {
+                "server dynamic child cannot inherit a missing parent model admission".to_string()
+            });
+        };
+        astra_services::validate_model_offering_id(&selection.offering_id)
+            .map_err(|error| format!("invalid child model selection: {error}"))?;
+        if let Some(parent_execution) = parent_execution
+            && parent_execution.offering_id == selection.offering_id
+        {
+            return Ok(parent_execution.clone());
+        }
+        if let Some(model_service) = self.model_service.as_ref() {
+            return crate::server::model_execution_admission::admit_model_execution(
+                model_service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+                &parent.user_id,
+                selection,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|(_, body)| body.0.detail);
+        }
+        astra_services::revalidate_admitted_model_execution(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &parent.user_id,
+            &selection.offering_id,
+            self.shared_pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
     /// Publish the child as the next possible parent before its loop starts.
     ///
     /// Dynamic agents use the same session-owned spawner at every depth.  A
@@ -20573,6 +20616,7 @@ impl ServerSpawnAgentExecutor {
         parent: &ServerSpawnRuntimeContext,
         config: &SpawnRunConfig,
         request_constraints: RequestConstraints,
+        admitted_model_execution: astra_services::AdmittedModelExecution,
     ) -> Result<(ServerSpawnRuntimeContext, ExecutionOwnerGenerationGuard), String> {
         // A child owns its own local control handles. Parent cancellation is
         // inherited through the token tree, while a child's direct pause or
@@ -20600,7 +20644,7 @@ impl ServerSpawnAgentExecutor {
             session_id: parent.session_id.clone(),
             trace_context: parent.trace_context.clone(),
             forward_headers: parent.forward_headers.clone(),
-            admitted_model_execution: parent.admitted_model_execution.clone(),
+            admitted_model_execution: Some(admitted_model_execution),
             interaction_mode: parent.interaction_mode,
             edge_tools: parent.edge_tools.clone(),
             request_constraints,
@@ -21800,6 +21844,9 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
 
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         let context = self.runtime_context_for_config(&config).await?;
+        let admitted_model_execution = self
+            .select_spawn_model_execution(&context, config.model_selection.as_ref())
+            .await?;
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
             "server dynamic agent lifecycle is no longer available for this session".to_string()
         })?;
@@ -21810,13 +21857,20 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let request_constraints =
             spawn_child_request_constraints(&context.request_constraints, &config);
         let (child_runtime_context, _generation_publication_guard) = self
-            .register_child_runtime_context(&context, &config, request_constraints.clone())
+            .register_child_runtime_context(
+                &context,
+                &config,
+                request_constraints.clone(),
+                admitted_model_execution.clone(),
+            )
             .await?;
 
         let mut profile =
             AgentProfile::new(&config.agent_id, &config.description, AgentTier::System);
         profile.system_prompt = Some(spawn_system_prompt(&config));
-        profile.model_selection = None;
+        profile.model_selection = Some(ModelSelection {
+            offering_id: admitted_model_execution.offering_id.clone(),
+        });
         profile.skill_filter = config.allowed_tools.clone();
         profile.metadata.insert(
             "spawn_agent_type".to_string(),
@@ -21899,7 +21953,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             previous_output: None,
             context: subrun_context,
             forward_headers: context.forward_headers.clone(),
-            admitted_model_execution: context.admitted_model_execution.clone(),
+            admitted_model_execution: Some(admitted_model_execution.clone()),
             interaction_mode: child_runtime_context.interaction_mode,
             request_constraints,
             recursion_depth: config.recursion_depth,
@@ -21922,15 +21976,14 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             harness_sink: context.harness_sink.clone(),
         };
 
-        let executor = self
-            .build_subrun_executor(
-                child_permissions,
-                dynamic_agent_spawner,
-                config.client_tool_delivery_tx.clone(),
-                context.admitted_model_execution.as_ref(),
-                child_runtime_context.edge_tools.clone(),
-            )
-            .with_admitted_execution_deadline(config.execution_deadline);
+        let executor = self.build_subrun_executor(
+            child_permissions,
+            dynamic_agent_spawner,
+            config.client_tool_delivery_tx.clone(),
+            Some(&admitted_model_execution),
+            child_runtime_context.edge_tools.clone(),
+        )
+        .with_admitted_execution_deadline(config.execution_deadline);
         #[cfg(feature = "e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
             executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
@@ -22523,6 +22576,14 @@ impl ServerSubRunExecutor {
                 .or(self.admitted_model_execution.as_ref())
                 .cloned());
         };
+        if let Some(execution) = config
+            .admitted_model_execution
+            .as_ref()
+            .or(self.admitted_model_execution.as_ref())
+            && execution.offering_id == selection.offering_id
+        {
+            return Ok(Some(execution.clone()));
+        }
         let execution = self
             .admit_offering(&config.user_id, &selection.offering_id)
             .await?;
@@ -23964,6 +24025,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     agent_id: config.agent_profile.agent_id.clone(),
                     delegation_chain: config.delegation_chain.clone(),
                     current_model: child_model_name.clone(),
+                    current_model_selection: config.agent_profile.model_selection.clone(),
                     recursion_depth: config.recursion_depth,
                     is_fork_child: config.inherited_prefix.is_some(),
                     working_dir: agent_working_dir,
