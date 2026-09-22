@@ -1090,6 +1090,7 @@ impl DatabaseStateProjectionStore {
                     entity: session_id.to_string(),
                     source,
                 })?;
+            connection.release();
             return Ok(());
         }
         let payload = json!({

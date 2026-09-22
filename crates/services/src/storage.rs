@@ -107,7 +107,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-20-v91";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-22-v91";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -6325,7 +6325,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-
     core_schema_create!(pool, "skill_installations",
         "CREATE TABLE IF NOT EXISTS skill_installations (
             installation_id  VARCHAR(36) PRIMARY KEY,
@@ -6650,6 +6649,7 @@ async fn verify_core_schema_shape(
             &[
                 "delete_requested_at",
                 "provider_creation_hash",
+                "bootstrap_creation_hash",
                 "project_id",
                 "project_retention_policy",
             ][..],
@@ -7665,6 +7665,7 @@ async fn verify_core_schema_shape(
         &["scope_kind", "operation_id"],
     )
     .await?;
+    verify_inference_route_schema_contract(pool, database).await?;
     verify_inference_invocation_schema_contract(pool, database).await?;
     verify_inference_provider_attempt_schema_contract(pool, database).await?;
     verify_inference_canonical_transition_head_schema_contract(pool, database).await?;

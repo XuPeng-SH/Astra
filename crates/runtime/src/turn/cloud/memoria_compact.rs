@@ -2133,9 +2133,20 @@ mod tests {
         ] {
             params.current_tokens = tokens;
             params.tier = tier;
-            let result =
-                compact_with_memoria(&msgs, session, &config, &params, Some(&mock), &CompactConfig { enable_summary: false, ..CompactConfig::default() }, None, &astra_turn_core::cloud_summary::canonical_summary_prompt_templates())
-                    .await;
+            let result = compact_with_memoria(
+                &msgs,
+                session,
+                &config,
+                &params,
+                Some(&mock),
+                &CompactConfig {
+                    enable_summary: false,
+                    ..CompactConfig::default()
+                },
+                None,
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
+            )
+            .await;
             assert_eq!(result.messages.len(), 2);
             assert_eq!(
                 mock.admissions.load(std::sync::atomic::Ordering::Relaxed),

@@ -3153,7 +3153,7 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
             && end - offset < TRANSCRIPT_MEMBERSHIP_ROWS
             && end - offset + 2 < TRANSCRIPT_BATCH_BINDS
         {
-            let item_bytes = items[end].source_event_id.len() + 64;
+            let item_bytes = items[end].source_event_id.len() + items[end].content.len() + 64;
             if end > offset && bytes.saturating_add(item_bytes) > TRANSCRIPT_BATCH_BYTES {
                 break;
             }
@@ -3178,8 +3178,12 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
             membership.push_bind(&item.source_event_id);
         }
         membership.push(
-            ") SELECT MIN(c.input_ordinal) AS input_ordinal
+            ") SELECT c.input_ordinal, first_input.input_ordinal AS first_ordinal,
+                      stored.item_seq, stored.run_id, stored.role, stored.content
              FROM candidates c
+             JOIN (SELECT source_event_id, MIN(input_ordinal) AS input_ordinal
+                   FROM candidates GROUP BY source_event_id) first_input
+               ON first_input.source_event_id = c.source_event_id
              LEFT JOIN session_transcript_items stored
                ON stored.source_event_id = c.source_event_id
               AND stored.user_id = ",
@@ -3187,14 +3191,32 @@ pub(crate) async fn append_session_transcript_items_admitted_in_tx(
         membership.push_bind(user_id);
         membership.push(" AND stored.session_id = ");
         membership.push_bind(session_id);
-        membership.push(
-            " WHERE stored.item_seq IS NULL
-              GROUP BY c.source_event_id ORDER BY input_ordinal ASC",
-        );
-        let ordinals = membership
-            .build_query_scalar::<i64>()
-            .fetch_all(&mut **tx)
-            .await?;
+        membership.push(" ORDER BY c.input_ordinal ASC");
+        let membership_rows = membership.build().fetch_all(&mut **tx).await?;
+        let mut ordinals = Vec::new();
+        for row in membership_rows {
+            let ordinal = row.try_get::<i64, _>("input_ordinal")?;
+            let first = row.try_get::<i64, _>("first_ordinal")?;
+            let item = &chunk[ordinal as usize];
+            let first_item = &chunk[first as usize];
+            let stored = row.try_get::<Option<i64>, _>("item_seq")?.is_some();
+            let same_input = item.run_id == first_item.run_id
+                && item.role == first_item.role
+                && item.content == first_item.content;
+            let same_stored = !stored
+                || (row.try_get::<Option<String>, _>("run_id")? == item.run_id
+                    && row.try_get::<String, _>("role")? == item.role
+                    && row.try_get::<String, _>("content")? == item.content);
+            if !same_input || !same_stored {
+                return Err(sqlx::Error::Protocol(format!(
+                    "transcript source event {} conflicts with persisted content",
+                    item.source_event_id
+                )));
+            }
+            if !stored && ordinal == first {
+                ordinals.push(ordinal);
+            }
+        }
         if !ordinals.is_empty() && next_seq.is_none() {
             next_seq = Some(
                 sqlx::query_scalar::<_, i64>(
@@ -7210,11 +7232,40 @@ mod tests {
         .await
         .expect("read column equality");
 
+        for cross_batch in [false, true] {
+            let mut conflicting = vec![make_item("new-conflict", "original")];
+            if cross_batch {
+                for index in 0..TRANSCRIPT_MEMBERSHIP_ROWS {
+                    conflicting.push(make_item(&format!("rollback-{index}"), "new"));
+                }
+            }
+            conflicting.push(make_item("new-conflict", "changed"));
+            persist_session_transcript_items(&pool, &owner_user_id, &session_id, &conflicting)
+                .await
+                .expect_err("conflicting duplicate must roll back every chunk");
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_transcript_items
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&owner_user_id)
+            .bind(&session_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(count, items.len() as i64 + 1);
+        }
+
         let mut mixed = vec![
-            make_item(&items[0].source_event_id, "conflicting replay"),
+            TranscriptPersistItem {
+                run_id: items[0].run_id.clone(),
+                role: items[0].role,
+                content: items[0].content.clone(),
+                payload: None,
+                source_event_id: items[0].source_event_id.clone(),
+            },
             make_item("within-chunk", "first within"),
-            make_item("WITHIN-CHUNK", "case variant"),
-            make_item("within-chunk", "conflicting duplicate"),
+            make_item("WITHIN-CHUNK", "first within"),
+            make_item("within-chunk", "first within"),
             make_item("across-chunks", "first across"),
             make_item("equal-text-one", "equal text"),
             make_item("equal-text-two", "equal text"),
@@ -7223,8 +7274,8 @@ mod tests {
         for index in 0..filler_count {
             mixed.push(make_item(&format!("filler-{index}"), &"x".repeat(6000)));
         }
-        mixed.push(make_item("ACROSS-CHUNKS", "case variant across"));
-        mixed.push(make_item("across-chunks", "conflicting across"));
+        mixed.push(make_item("ACROSS-CHUNKS", "first across"));
+        mixed.push(make_item("across-chunks", "first across"));
         mixed.push(make_item("last-new", "last"));
         persist_session_transcript_items(&pool, &owner_user_id, &session_id, &mixed)
             .await
@@ -7249,7 +7300,7 @@ mod tests {
         expected.push(("CaseProbe".into(), "probe".into()));
         expected.push(("within-chunk".into(), "first within".into()));
         if case_equivalent == 0 {
-            expected.push(("WITHIN-CHUNK".into(), "case variant".into()));
+            expected.push(("WITHIN-CHUNK".into(), "first within".into()));
         }
         expected.extend([
             ("across-chunks".into(), "first across".into()),
@@ -7260,7 +7311,7 @@ mod tests {
             expected.push((format!("filler-{index}"), "x".repeat(6000)));
         }
         if case_equivalent == 0 {
-            expected.push(("ACROSS-CHUNKS".into(), "case variant across".into()));
+            expected.push(("ACROSS-CHUNKS".into(), "first across".into()));
         }
         expected.push(("last-new".into(), "last".into()));
         assert_eq!(actual.len(), expected.len());
@@ -7283,7 +7334,7 @@ mod tests {
         .await
         .expect("first writer's uncommitted item");
         let overlapping = [
-            make_item("concurrent-shared", "second writer conflict"),
+            make_item("concurrent-shared", "first writer"),
             make_item("concurrent-new", "second writer new"),
         ];
         let mut waiting = Box::pin(persist_session_transcript_items(
