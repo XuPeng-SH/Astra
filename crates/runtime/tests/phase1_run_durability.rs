@@ -1057,8 +1057,8 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     assert_eq!(custody[0]["data"]["user_id"], user_id);
     assert_eq!(custody[0]["data"]["session_id"], session_id);
     assert_eq!(custody[0]["data"]["run_id"], run_id);
-    assert_eq!(custody[0]["data"]["from_generation"], 0);
-    assert_eq!(custody[0]["data"]["to_generation"], 1);
+    assert_eq!(custody[0]["data"]["from_generation"], 1);
+    assert_eq!(custody[0]["data"]["to_generation"], 2);
     let indexes = loaded
         .events
         .iter()

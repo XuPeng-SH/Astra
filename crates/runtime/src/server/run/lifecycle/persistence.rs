@@ -6818,9 +6818,15 @@ mod tests {
         // Exercise the same authoritative resolver used after a lost COMMIT
         // acknowledgement, including its receipt and canonical-evidence checks.
         let request_append = append();
+        // The public entrypoint adds output/accounting receipts before calling
+        // this lower-level resolver. Resolve that complete frozen batch here.
+        let resolution_settlement = CanonicalTerminalSettlement {
+            events: &commit.terminal_events,
+            ..settlement
+        };
         let receipts = DatabaseRunStateStore::new(pool.clone())
             .resolve_atomic_terminal_settlement(
-                atomic_terminal_request(&request_append, settlement),
+                atomic_terminal_request(&request_append, resolution_settlement),
                 None,
             )
             .await
@@ -6834,7 +6840,7 @@ mod tests {
             &pool,
             &append(),
             &state,
-            settlement,
+            resolution_settlement,
             Some(&receipts),
         )
         .await
@@ -6900,7 +6906,7 @@ mod tests {
             &pool,
             &append(),
             &state,
-            settlement,
+            resolution_settlement,
             Some(&receipts),
         )
         .await

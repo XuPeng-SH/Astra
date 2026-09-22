@@ -837,7 +837,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         None,
         &experiment_id,
         &preparation,
-        &execution_fixture::execution_config("test-model", "openai", "authoring"),
+        &execution_fixture::execution_config("test-model", "openai", &input.case.case_id),
         Some(&identity),
         EvaluationJudgmentPolicy::Disabled,
     )
