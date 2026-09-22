@@ -39,11 +39,11 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-amd64
-            features: ""
+            features: astra-cli/release-vendored-openssl
           - os: macos-15
             target: aarch64-apple-darwin
             suffix: darwin-arm64
-            features: ""
+            features: astra-cli/release-vendored-openssl
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -126,6 +126,17 @@ jobs:
               exit 1
             fi
             "${candidate}" --help >/dev/null
+            if [ "$(uname -s)" = Darwin ]; then
+              deps="$(otool -L "${candidate}" | awk 'NR > 1 { print $1 }')"
+              for dep in ${deps}; do
+                case "${dep}" in
+                  *libssl*|*libcrypto*)
+                    echo "${binary} links non-portable OpenSSL: ${dep}" >&2
+                    exit 1
+                    ;;
+                esac
+              done
+            fi
           done
 
       - name: Verify Darwin session execution lease contract
