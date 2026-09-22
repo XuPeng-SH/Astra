@@ -95,6 +95,8 @@ pub(crate) struct SubRunHost {
     pub(crate) journal_identity: Option<SubRunJournalIdentity>,
     /// Per-response completion token limit from the skill manifest.
     pub(crate) max_completion_tokens: Option<u32>,
+    /// Explicit child request cap, retained across retries of round zero only.
+    pub(crate) initial_output_limit: Option<u32>,
     /// Effort level from the skill manifest.
     pub(crate) effort: Option<String>,
     /// Agent type hint from the skill manifest.
@@ -500,6 +502,8 @@ impl AgenticLoopHost for SubRunHost {
 
         let effective_offering_id = self.offering_id.clone();
         let thinking = state.thinking.clone();
+        self.executor
+            .publish_parent_model_reasoning(Some(&self.offering_id), thinking.clone());
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
@@ -584,7 +588,7 @@ impl AgenticLoopHost for SubRunHost {
             state.root_user_query_event_id.as_deref(),
         );
 
-        let server_payload =
+        let mut server_payload =
             crate::cli::chat_stream::server_loop_admission_payload_with_execution_time_budget(
                 &payload,
                 &state.message,
@@ -595,6 +599,12 @@ impl AgenticLoopHost for SubRunHost {
                     }),
             )
             .map_err(str::to_string)?;
+        if let Some(limit) = self
+            .initial_output_limit
+            .filter(|_| state.current_round_index == 0)
+        {
+            server_payload["context"]["max_output_tokens"] = json!(limit);
+        }
         let deadline = self.execution_deadline;
         let admission =
             self.api
@@ -642,7 +652,6 @@ impl AgenticLoopHost for SubRunHost {
             }
             other => astra_core::ClassifiedError::from(other.to_string()),
         })?;
-
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
@@ -1233,6 +1242,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
             max_completion_tokens: max_tokens,
+            initial_output_limit: None,
             effort: effort.map(String::from),
             agent_type: agent_type.map(String::from),
             execution_deadline: None,
@@ -1861,6 +1871,7 @@ mod tests {
                 persistence_blocked: false,
             }),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -1875,6 +1886,44 @@ mod tests {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn subrun_explicit_output_cap_survives_first_round_retry_only() {
+        use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .unwrap();
+        let mut host = bare_subrun_host();
+        host.api = astra_thin_client::ThinClient::new(&mock.base_url, None).unwrap();
+        host.initial_output_limit = Some(32768);
+        host.max_completion_tokens = Some(64000);
+        let mut state = make_test_loop_state();
+        state.message = "Explain this".into();
+        state.thinking = astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+            budget_tokens: 16384,
+        };
+        state.messages = vec![json!({"role":"user", "content":"Explain this"})];
+        for round in [0, 0, 1] {
+            state.current_round_index = round;
+            host.execute_turn(&mut state).await.unwrap();
+        }
+        let requests = mock.received_requests();
+        assert_eq!(requests.len(), 3);
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(
+                request["context"]["thinking"],
+                serde_json::to_value(&state.thinking).unwrap()
+            );
+            assert_eq!(
+                request["context"].get("max_output_tokens").cloned(),
+                (index < 2).then(|| json!(32768))
+            );
+        }
+        assert_eq!(host.max_completion_tokens, Some(64000));
+        assert_eq!(host.initial_output_limit, Some(32768));
     }
 
     fn bare_subrun_host() -> SubRunHost {
@@ -1892,6 +1941,7 @@ mod tests {
             journal: None,
             journal_identity: None,
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -1999,6 +2049,7 @@ mod tests {
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -2033,6 +2084,7 @@ mod tests {
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -2153,6 +2205,7 @@ mod tests {
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -2188,6 +2241,7 @@ mod tests {
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,

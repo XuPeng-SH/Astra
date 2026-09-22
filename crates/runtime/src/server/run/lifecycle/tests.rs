@@ -3864,6 +3864,7 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
     }
 
     let context = crate::orchestration::SpawnContext {
+        parent_model_reasoning: None,
         parent_run_id: "prune-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -3991,6 +3992,7 @@ async fn shutdown_fence_reports_pending_session_child_reconciliation_after_root_
         },
     );
     let context = crate::orchestration::SpawnContext {
+        parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4077,6 +4079,7 @@ async fn shutdown_stays_bounded_while_stalled_child_control_remains_pending() {
         },
     );
     let context = crate::orchestration::SpawnContext {
+        parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4158,6 +4161,7 @@ async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
         "transport": "server_local"
     });
     let context = crate::orchestration::SpawnContext {
+        parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4240,6 +4244,7 @@ async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
     let spawner =
         DynamicAgentSpawner::new(router).with_executor(Arc::new(WaitingLifecycleExecutor));
     let context = crate::orchestration::SpawnContext {
+        parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4780,6 +4785,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
     let permission_context =
         crate::orchestration::PermissionSyncContext::shared(inherited_permissions.clone());
     SpawnRunConfig {
+        max_output_tokens: None,
         run_id: "child-run".to_string(),
         cancellation_binding_id: "test-child-binding".to_string(),
         agent_id: "child@1234".to_string(),
@@ -6784,6 +6790,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
         .await;
     let context = crate::orchestration::SpawnContext {
+        parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -6815,6 +6822,36 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .await
         .expect("inherited Offering is prepared without a catalog lookup");
     assert_eq!(prepared.len(), 2);
+
+    // Omission inherits an exact parent setting instead of silently dropping
+    // it. This fixture has unknown reasoning capability, so admission fails
+    // before any child starts. Explicit model-default opts out of inheritance.
+    let mut inherited_context = context.clone();
+    inherited_context.parent_model_reasoning = Some(
+        astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+            selection: ModelSelection {
+                offering_id: test_admitted_model_execution().offering_id,
+            },
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+        },
+    );
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&inputs, &inherited_context, None)
+            .await
+            .is_err()
+    );
+    let mut explicit_default = inputs.clone();
+    for input in &mut explicit_default {
+        input.reasoning =
+            Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault);
+    }
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&explicit_default, &inherited_context, None)
+            .await
+            .is_ok()
+    );
 
     let model_service = Arc::new(ActiveTestModelService::default());
     let batch_executor = Arc::new(
@@ -6933,6 +6970,48 @@ fn server_spawn_reasoning_validation_is_capability_strict() {
     use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
 
     let mut execution = test_admitted_model_execution();
+    execution.provider = "anthropic".into();
+    execution.thinking_capability = Some(ThinkingCapability::Both);
+    execution.max_completion_tokens = Some(8000);
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 8000
+            }
+        )
+        .is_err()
+    );
+    execution.max_completion_tokens = Some(8001);
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 8000
+            }
+        )
+        .is_ok()
+    );
+    execution.provider = "openai".into();
+    execution.max_completion_tokens = None;
+    let fallback =
+        crate::prompts::capped_output_tokens(&crate::prompts::budget_for_model_with_metadata(
+            Some(&execution.model_name),
+            execution.context_window,
+            None,
+        ));
+    execution.provider = "anthropic".into();
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Enabled {
+                budget_tokens: fallback as u32
+            }
+        )
+        .is_err(),
+        "unknown catalog ceiling still uses the canonical fallback output budget"
+    );
+    execution.provider = "openai".into();
     execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
     execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
     assert!(
@@ -6971,6 +7050,32 @@ fn server_spawn_reasoning_validation_is_capability_strict() {
         )
         .is_err(),
         "unknown capability is not evidence that high is supported"
+    );
+}
+
+#[test]
+fn initial_output_limit_requires_a_positive_typed_integer() {
+    assert_eq!(
+        AgenticRunLifecycleService::initial_output_limit_from_chat_context(&None).unwrap(),
+        None
+    );
+    for value in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("8000"),
+        json!(null),
+        json!(4294967296_u64),
+    ] {
+        let context = Some(Map::from_iter([("max_output_tokens".into(), value)]));
+        assert!(
+            AgenticRunLifecycleService::initial_output_limit_from_chat_context(&context).is_err()
+        );
+    }
+    let context = Some(Map::from_iter([("max_output_tokens".into(), json!(8001))]));
+    assert_eq!(
+        AgenticRunLifecycleService::initial_output_limit_from_chat_context(&context).unwrap(),
+        Some(8001)
     );
 }
 
@@ -11772,6 +11877,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
     .with_run_engine(service.run_engine.clone())
     .with_pool(pool.clone());
     let mut child_config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: child_run_id.clone(),
@@ -12433,6 +12539,7 @@ fn test_executable_subrun_config(
     admitted_model_execution: astra_services::AdmittedModelExecution,
 ) -> SubRunConfig {
     SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: run_id.to_string(),
@@ -13114,6 +13221,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-run".to_string(),
@@ -13225,6 +13333,7 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "generic-child-run".to_string(),
@@ -13322,6 +13431,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-run".to_string(),
@@ -13803,6 +13913,7 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-safe".to_string(),

@@ -983,11 +983,15 @@ fn should_send_provider_no_tool_choice(
 /// Providers without prefix reuse may retain the cheaper no-thinking retry.
 fn primary_thinking_for_attempt(
     state_thinking: &ThinkingConfig,
+    preserve_thinking: bool,
     canonical_work_establishment_pending: bool,
     final_answer_settlement_text_only: bool,
     provider_attempt_boundary: ProviderAttemptBoundary,
     cache_protocol: astra_turn_core::cache_placement::CacheProtocol,
 ) -> ThinkingConfig {
+    if preserve_thinking {
+        return state_thinking.clone();
+    }
     if canonical_work_establishment_pending || provider_attempt_boundary.forces_thinking_off() {
         return ThinkingConfig::Off;
     }
@@ -3896,6 +3900,8 @@ impl ExplainAnalyzeNode {
 }
 
 pub struct ServerAgenticLoopHost {
+    preserve_thinking: bool,
+    initial_output_limit: Option<u32>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     execution_handoff: Option<ExecutionHandoffContext>,
     // ── LLM resolution ──
@@ -5537,6 +5543,8 @@ fn explain_analyze_outcome_for_error(
 
 /// Builder for [`ServerAgenticLoopHost`].
 pub struct ServerAgenticLoopHostBuilder {
+    preserve_thinking: bool,
+    initial_output_limit: Option<u32>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -5611,6 +5619,14 @@ pub struct ServerAgenticLoopHostBuilder {
 }
 
 impl ServerAgenticLoopHostBuilder {
+    pub fn with_preserved_thinking(mut self, preserve: bool) -> Self {
+        self.preserve_thinking = preserve;
+        self
+    }
+    pub fn with_initial_output_limit(mut self, limit: Option<u32>) -> Self {
+        self.initial_output_limit = limit;
+        self
+    }
     pub fn with_model_service(
         mut self,
         service: Option<Arc<dyn astra_services::ModelService>>,
@@ -5626,6 +5642,8 @@ impl ServerAgenticLoopHostBuilder {
     ) -> Self {
         Self {
             model_service: None,
+            preserve_thinking: false,
+            initial_output_limit: None,
             matrixone,
             encryptor,
             shared_pool: None,
@@ -6312,6 +6330,8 @@ impl ServerAgenticLoopHostBuilder {
             shared_pool: self.shared_pool,
             inference_ledger_persistence: self.inference_ledger_persistence,
             model_override: self.model_override,
+            preserve_thinking: self.preserve_thinking,
+            initial_output_limit: self.initial_output_limit,
             admitted_model_execution: self.admitted_model_execution,
             inference_owner_pod_id: self.inference_owner_pod_id,
             resolved_model_name: None,
@@ -19704,6 +19724,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             llm_cfg.max_completion_tokens,
         );
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
+        let requested_output_limit = self.initial_output_limit.filter(|_| state.current_round_index == 0);
+        let max_output_tokens = requested_output_limit
+            .map_or(max_output_tokens, |limit| max_output_tokens.min(limit as usize));
         // Tool annotations are part of the same provider-visible schema
         // surface used by the final budget owner below.
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
@@ -19891,6 +19914,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ProviderAttemptBoundary::new(force_provider_convergence, use_no_tool_choice);
         let primary_thinking = primary_thinking_for_attempt(
             &state.thinking,
+            self.preserve_thinking,
             canonical_work_establishment_pending,
             final_answer_settlement_text_only,
             provider_attempt_boundary,
@@ -19902,13 +19926,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider budget into an arbitrary 4× request; a repeated typed cap
         // settles as an incomplete, resumable result below.
         let mut effective_max_output = max_output_tokens;
+        primary_thinking.validate_output_budget(effective_max_output as u64)
+            .map_err(|message| astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message))?;
         let context_output_limit = final_wire_budget_status
             .model_limit
             .saturating_sub(final_wire_budget_status.estimated_input_tokens)
             .saturating_sub(final_wire_budget_status.reserved_protocol_tokens);
         let output_cap_retry_limit = output_cap_retry_limit(
             max_output_tokens,
-            llm_cfg.max_completion_tokens,
+            requested_output_limit.or(llm_cfg.max_completion_tokens),
             context_output_limit,
         );
         let mut attempt_in_round = 0_u32;
@@ -32231,6 +32257,7 @@ mod tests {
             delegation_chain: Vec::new(),
             current_model: Some("test-model".into()),
             current_model_selection: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: work_dir.to_path_buf(),
@@ -43447,6 +43474,7 @@ mod tests {
             primary_thinking_for_attempt(
                 &adaptive,
                 false,
+                false,
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::OpenAiAutoPrefix,
@@ -43460,6 +43488,7 @@ mod tests {
                     effort: ThinkingEffort::High,
                 },
                 false,
+                false,
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::None,
@@ -43470,6 +43499,7 @@ mod tests {
         assert_eq!(
             primary_thinking_for_attempt(
                 &adaptive,
+                false,
                 true,
                 true,
                 ProviderAttemptBoundary::new(false, false),
@@ -43478,6 +43508,39 @@ mod tests {
             ThinkingConfig::Off,
             "canonical Work establishment remains an explicit convergence boundary"
         );
+    }
+
+    #[test]
+    fn exact_thinking_survives_convergence_and_settlement() {
+        use astra_turn_core::cache_placement::CacheProtocol;
+        use astra_turn_core::thinking_config::ThinkingEffort;
+        for thinking in [
+            ThinkingConfig::Off,
+            ThinkingConfig::Enabled {
+                budget_tokens: 8_000,
+            },
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        ] {
+            for (work, settlement, convergence) in [
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+            ] {
+                assert_eq!(
+                    primary_thinking_for_attempt(
+                        &thinking,
+                        true,
+                        work,
+                        settlement,
+                        ProviderAttemptBoundary::new(convergence, true),
+                        CacheProtocol::None
+                    ),
+                    thinking
+                );
+            }
+        }
     }
 
     #[test]
