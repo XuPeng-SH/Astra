@@ -260,6 +260,13 @@ Usage coverage is independent of request outcome:
 - `unavailable`: usage and measured diagnostic fields are absent. Placeholder
   zeroes in legacy records are not evidence of zero-token billing.
 
+Live runtime and feedback cache-read percentages require a positive observed
+input-token denominator. With no input measurement they display `unknown`, not
+`0%`; an observed positive input with zero cache reads may display `0%`.
+This live snapshot is not a durable session or task-tree usage aggregate.
+It does not establish whether a provider omitted cache buckets; request-ledger
+usage coverage remains authoritative for that distinction.
+
 Accepted events have no provider measurements. Terminal diagnostics with
 unavailable usage store nullable token columns as `NULL`. Aggregate request
 counters still count those attempts; token sums contain only observed usage
