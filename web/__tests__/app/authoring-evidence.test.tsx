@@ -6,7 +6,7 @@ import { createSession, listSessions } from '@/lib/api/sessions';
 import { runPreparedEvaluation, getEvaluationExperiment } from '@/lib/api/evaluations';
 import type { AuthoringIntentRecord } from '@/lib/api/types';
 
-const navigation = vi.hoisted(() => ({ query: 'sessionId=session' }));
+const navigation = vi.hoisted(() => ({ query: 'sessionId=session', defer: false }));
 vi.mock('next/navigation', () => ({ useSearchParams: () => new URLSearchParams(navigation.query) }));
 vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn(), listAuthoringTargets: vi.fn(), loadAuthoringResult: vi.fn(), decideSkillDraft: vi.fn(), publishSkillDraft: vi.fn(), activatePersonalSkill: vi.fn() }));
 vi.mock('@/lib/api/sessions', () => ({ createSession: vi.fn(), listSessions: vi.fn() }));
@@ -29,8 +29,14 @@ const record = {
 } as unknown as AuthoringIntentRecord;
 
 beforeEach(() => {
-  vi.resetAllMocks(); window.localStorage.clear();
-  navigation.query = 'sessionId=session';
+  vi.restoreAllMocks(); vi.resetAllMocks(); window.localStorage.clear();
+  navigation.query = 'sessionId=session'; navigation.defer = false;
+  window.history.replaceState(null, '', '/authoring?sessionId=session');
+  const replaceState = window.history.replaceState.bind(window.history);
+  vi.spyOn(window.history, 'replaceState').mockImplementation((data, unused, url) => {
+    replaceState(data, unused, url);
+    if (!navigation.defer) navigation.query = window.location.search.slice(1);
+  });
   vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000001');
   vi.mocked(listAuthoringTargets).mockResolvedValue([]);
   vi.mocked(getEvaluationExperiment).mockResolvedValue({ experiment: { experiment_id: 'comparison', spec_fingerprint: 'frozen' }, trials: [] } as unknown as Awaited<ReturnType<typeof getEvaluationExperiment>>);
@@ -170,6 +176,7 @@ it('resumes the persisted comparison after a lost response and reload without re
   expect(runPreparedEvaluation).toHaveBeenLastCalledWith(expect.objectContaining({ trials: [binding] }), expect.anything());
   expect(createAuthoringIntent).toHaveBeenCalledTimes(1);
   recovered.unmount();
+  navigation.query = 'sessionId=session';
   render(<AuthoringPage ownerId="another-owner" runtimeKey="runtime" />);
   await waitFor(() => expect(screen.queryByText('正在恢复已保存的结果…')).not.toBeInTheDocument());
   expect(screen.queryByText('Review carefully')).not.toBeInTheDocument();
@@ -302,4 +309,95 @@ it('does not activate a newly created session after the owner leaves the page', 
   view.unmount();
   await act(async () => finish({ session_id: 'new-session', created_at: '' }));
   expect(activatePersonalSkill).not.toHaveBeenCalled();
+});
+
+
+it.each([false, true])('preserves the source and pinned improvement target from a result link (explicit=%s)', async (explicit) => {
+  navigation.query = 'runId=old-run';
+  window.history.replaceState(null, '', '/authoring?runId=old-run');
+  const target = { skill_name: 'review', version_id: 'old-version' };
+  const previous = { ...record, harness_run: { ...record.harness_run, harness_run_id: 'old-run',
+    output_json: { authoring: { baseline: target, request: { goal: 'Improve review', create_new: false,
+      idempotency_key: 'old-key', ...(explicit ? { target_skill: target } : {}) } } } } };
+  const next = { ...previous, harness_run: { ...previous.harness_run, harness_run_id: 'new-run' },
+    skill_drafts: [{ ...record.skill_drafts[0], description: 'New candidate evidence' }] };
+  vi.mocked(loadAuthoringResult).mockImplementation(async (id) => id === 'new-run' ? next : previous);
+  vi.mocked(createAuthoringIntent).mockResolvedValue(next);
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('Review carefully');
+  fireEvent.click(screen.getByRole('button', { name: '另生成一个候选' }));
+  await screen.findByText('New candidate evidence');
+  expect(createAuthoringIntent).toHaveBeenCalledWith(expect.objectContaining({
+    create_new: false, target_skill: target,
+  }), 'session');
+  expect(new URL(window.location.href).searchParams.get('runId')).toBe('new-run');
+  view.unmount();
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('New candidate evidence');
+  expect(loadAuthoringResult).toHaveBeenLastCalledWith('new-run');
+  expect(createAuthoringIntent).toHaveBeenCalledTimes(1);
+});
+
+
+it('keeps evaluation mounted while Next defers the canonical query update', async () => {
+  navigation.defer = true;
+  vi.mocked(createAuthoringIntent).mockResolvedValue({ ...record,
+    evaluation_plan: { experiment: { experiment_id: 'comparison' }, trials: [] } as unknown as NonNullable<AuthoringIntentRecord['evaluation_plan']> });
+  vi.mocked(runPreparedEvaluation).mockReturnValue(new Promise(() => {}));
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Improve review' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  await screen.findByText('正在验证：候选与依据已可查看');
+  const options = vi.mocked(runPreparedEvaluation).mock.calls[0][1];
+  expect(options?.signal?.aborted).toBe(false);
+  navigation.query = window.location.search.slice(1);
+  view.rerender(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  expect(screen.getByText('正在验证：候选与依据已可查看')).toBeInTheDocument();
+  expect(options?.signal?.aborted).toBe(false);
+  expect(loadAuthoringResult).not.toHaveBeenCalled();
+});
+
+it('preserves the original operation identity when validating an auto-targeted candidate', async () => {
+  navigation.query = 'runId=auto-run';
+  const original = record.harness_run.output_json.authoring as { request: { goal: string; idempotency_key: string } };
+  const auto = { ...record, harness_run: { ...record.harness_run, output_json: {
+    authoring: { ...original, baseline: { skill_name: 'review', version_id: 'baseline' } },
+  } } };
+  vi.mocked(loadAuthoringResult).mockResolvedValue(auto);
+  vi.mocked(createAuthoringIntent).mockResolvedValue(auto);
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('Review carefully');
+  fireEvent.change(screen.getByLabelText('验证任务'), { target: { value: 'task' } });
+  fireEvent.change(screen.getByLabelText('预期 JSON 结果'), { target: { value: '{"ok":true}' } });
+  fireEvent.click(screen.getByRole('button', { name: '用这个任务验证' }));
+  await waitFor(() => expect(createAuthoringIntent).toHaveBeenCalledWith({ ...original.request,
+    validation_task: { source_id: 'task', expected_result: { ok: true } },
+  }, 'session'));
+});
+
+
+it('clears the candidate when external navigation removes the result query', async () => {
+  navigation.query = 'runId=old-run';
+  vi.mocked(loadAuthoringResult).mockResolvedValue(record);
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('Review carefully');
+  navigation.query = '';
+  view.rerender(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await waitFor(() => expect(screen.queryByText('正在恢复已保存的结果…')).not.toBeInTheDocument());
+  expect(screen.getByLabelText('Authoring goal')).toHaveValue('');
+  expect(screen.queryByText('Review carefully')).not.toBeInTheDocument();
+});
+
+it('loads the canonical result under the new runtime after generating another candidate', async () => {
+  window.history.replaceState(null, '', '/authoring?runId=old-run');
+  vi.mocked(loadAuthoringResult).mockResolvedValue(record);
+  vi.mocked(createAuthoringIntent).mockResolvedValue({ ...record,
+    harness_run: { ...record.harness_run, harness_run_id: 'new-run' } });
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('Review carefully');
+  fireEvent.click(screen.getByRole('button', { name: '另生成一个候选' }));
+  await waitFor(() => expect(new URL(window.location.href).searchParams.get('runId')).toBe('new-run'));
+  view.rerender(<AuthoringPage ownerId="owner" runtimeKey="other-runtime" />);
+  await waitFor(() => expect(loadAuthoringResult).toHaveBeenLastCalledWith('new-run'));
 });

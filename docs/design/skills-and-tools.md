@@ -214,8 +214,10 @@ the original idempotency key and optional validation task), scoped by authentica
 owner, runtime, and originating session. An interrupted or lost initial response
 is retried only with this saved request; an in-progress response never rotates
 the key. Once a response arrives, the browser replaces the pending request with
-the run reference. Starting a different generation while recovery is pending
-requires explicitly abandoning recovery; this does not cancel the server task.
+the run reference and updates the result URL without interrupting evaluation.
+Generating another candidate retains the saved source session and pinned baseline;
+validation replay retains the original request identity unchanged. Starting a
+different generation while recovery is pending requires explicitly abandoning recovery; this does not cancel the server task.
 If browser storage fails before dispatch, generation does not start.
 The existing run metadata retains the original
 submission request so conversation links can also continue validation. Recovery reads

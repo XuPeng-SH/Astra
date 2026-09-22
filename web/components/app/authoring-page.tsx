@@ -36,11 +36,27 @@ export function AuthoringPage(scope: AuthoringScope) {
   const params = useSearchParams();
   const sessionId = params.get('sessionId');
   const runId = params.get('runId');
-  return <AuthoringSession key={JSON.stringify([scope.ownerId, scope.runtimeKey, sessionId, runId])} {...scope} sessionId={sessionId} runId={runId} />;
+  const scopeKey = JSON.stringify([scope.ownerId, scope.runtimeKey, sessionId]);
+  const [view, setView] = useState({ scopeKey, urlRunId: runId, initialRunId: runId, generation: 0 });
+  const internalRunId = useRef<string | null>(null);
+  if (view.scopeKey !== scopeKey || view.urlRunId !== runId) {
+    setView(view.scopeKey === scopeKey && internalRunId.current !== null && runId === internalRunId.current
+      ? { ...view, urlRunId: runId }
+      : { scopeKey, urlRunId: runId, initialRunId: runId, generation: view.generation + 1 });
+    internalRunId.current = null;
+  }
+  function updateResultUrl(nextRunId: string) {
+    internalRunId.current = nextRunId;
+    const url = new URL(window.location.href);
+    url.searchParams.set('runId', nextRunId);
+    window.history.replaceState(null, '', url);
+  }
+  return <AuthoringSession key={JSON.stringify([scope.ownerId, scope.runtimeKey, sessionId, view.generation])} {...scope} sessionId={sessionId} runId={view.initialRunId} onResult={updateResultUrl} />;
 }
 
-function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringScope & { sessionId: string | null; runId: string | null }) {
+function AuthoringSession({ ownerId, runtimeKey, sessionId, runId, onResult }: AuthoringScope & { sessionId: string | null; runId: string | null; onResult: (runId: string) => void }) {
   const storageKey = `astra:authoring:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(sessionId ?? '')}:${encodeURIComponent(runId ?? '')}`;
+  const recoveryKey = useRef(storageKey);
   const evaluationAbort = useRef<AbortController | null>(null);
   const mounted = useRef(true);
   const [recovering, setRecovering] = useState(true);
@@ -56,7 +72,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
     setTargets([]); setTargetVersion(''); setTargetsError(null);
     setTargetsLoading(Boolean(sessionId));
     if (sessionId) listAuthoringTargets(sessionId).then((items) => {
-      if (!cancelled) setTargets(items);
+      if (!cancelled) setTargets((current) => [...current, ...items.filter((item) => !current.some((entry) => entry.version_id === item.version_id))]);
     }).catch((reason) => {
       if (!cancelled) setTargetsError(reason instanceof Error ? reason.message : '无法读取当前 Skill');
     }).finally(() => { if (!cancelled) setTargetsLoading(false); });
@@ -95,7 +111,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
         const loaded = await loadAuthoringResult(reference);
         if (!active) return;
         setResult(loaded); setGoal(loaded.goal);
-        setSubmittedRequest((loaded.harness_run.output_json.authoring as { request?: AuthoringIntentRequest } | undefined)?.request ?? null);
+        restoreIntent(loaded);
       } catch (reason) { if (active) setError(reason instanceof Error ? reason.message : '无法恢复已有结果'); }
       finally { if (active) setRecovering(false); }
     }
@@ -103,17 +119,38 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
     return () => { active = false; mounted.current = false; evaluationAbort.current?.abort(); };
   }, [storageKey, runId]);
 
+  function restoreIntent(loaded: AuthoringIntentRecord) {
+    const authoring = loaded.harness_run.output_json.authoring as { request?: AuthoringIntentRequest; baseline?: { skill_name: string; version_id: string } } | undefined;
+    const request = authoring?.request;
+    // Auto-selected improvement targets must also remain pinned on continuation.
+    const target = request?.target_skill ?? (authoring?.baseline ? {
+      skill_name: authoring.baseline.skill_name, version_id: authoring.baseline.version_id,
+    } : undefined);
+    setSubmittedRequest(request ?? null); setCreateNew(request?.create_new ?? false);
+    if (target) {
+      setTargets((current) => [target, ...current.filter((entry) => entry.version_id !== target.version_id)]);
+      setTargetVersion(target.version_id);
+    }
+  }
+
   function remember(created: AuthoringIntentRecord) {
     setPending(null);
     setSavedRunId(created.harness_run.harness_run_id);
-    try { window.localStorage.setItem(storageKey, JSON.stringify({ runId: created.harness_run.harness_run_id })); }
+    const nextRunId = created.harness_run.harness_run_id;
+    const nextKey = `astra:authoring:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(sessionId ?? '')}:${encodeURIComponent(nextRunId)}`;
+    try {
+      window.localStorage.setItem(recoveryKey.current, JSON.stringify({ runId: nextRunId }));
+      window.localStorage.setItem(nextKey, JSON.stringify({ runId: nextRunId }));
+    }
     catch { setError('浏览器无法保存恢复引用；请保留候选的审核链接。'); }
+    recoveryKey.current = nextKey;
+    onResult(nextRunId);
   }
 
   async function showAndEvaluate(created: AuthoringIntentRecord) {
     if (!mounted.current) return;
     setResult(created); setProjection(null);
-    setSubmittedRequest((created.harness_run.output_json.authoring as { request?: AuthoringIntentRequest } | undefined)?.request ?? null);
+    restoreIntent(created);
     if (!created.evaluation_plan) return;
     setEvaluating(true);
     const controller = new AbortController();
@@ -163,7 +200,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
     setBusy(true); setError(null);
     try {
       // Persist before dispatch: a missing response must never require a new key.
-      window.localStorage.setItem(storageKey, JSON.stringify({ pending: submission }));
+      window.localStorage.setItem(recoveryKey.current, JSON.stringify({ pending: submission }));
       setPending(submission); setSubmittedRequest(submission.request);
       const created = await createAuthoringIntent(submission.request, submission.sessionId);
       if (!mounted.current) return;
@@ -188,15 +225,17 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
     if (pending) { await generate(pending); return; }
     const trimmed = goal.trim();
     if (!trimmed) { setError('Describe the outcome you want to create or improve.'); return; }
+    const sourceSession = (result?.harness_run.input_json.session_ids as string[] | undefined)?.[0] ?? sessionId ?? undefined;
+    const target = targets.find((entry) => entry.version_id === targetVersion) ?? submittedRequest?.target_skill;
     setResult(null);
     await generate({ request: { goal: trimmed, create_new: createNew, idempotency_key: crypto.randomUUID(),
-      ...(!createNew && targetVersion ? { target_skill: targets.find((target) => target.version_id === targetVersion) } : {}),
-    }, sessionId: sessionId ?? undefined });
+      ...(!createNew && target ? { target_skill: target } : {}),
+    }, sessionId: sourceSession });
   }
 
   function startAnother() {
     // Explicitly abandon recovery; this does not cancel an admitted server run.
-    window.localStorage.removeItem(storageKey);
+    window.localStorage.removeItem(recoveryKey.current);
     setPending(null); setSavedRunId(null); setSubmittedRequest(null); setResult(null); setError(null);
   }
 
