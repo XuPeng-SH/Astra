@@ -5,9 +5,11 @@
 //! error messages so users don't waste time on doomed runs.
 
 use std::path::Path;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::runner::parse_strict_cli_outcome;
@@ -20,6 +22,8 @@ pub enum PreflightError {
     BinaryNotFound,
     #[error("astra binary exists but is not executable")]
     BinaryNotExecutable,
+    #[error("build identity verification failed: {detail}")]
+    BuildIdentity { detail: String },
     #[error("server unreachable: {detail}")]
     ServerUnreachable { detail: String },
     #[error("server is reachable but not ready: {detail}")]
@@ -54,6 +58,7 @@ struct ServerReadiness {
     unavailable_components: Vec<String>,
     interaction_api_major: String,
     build_git_sha: String,
+    build_git_dirty: Option<bool>,
 }
 
 fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
@@ -99,7 +104,145 @@ fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
         unavailable_components,
         interaction_api_major: interaction_api_major.to_string(),
         build_git_sha: build_git_sha.to_string(),
+        build_git_dirty: value
+            .get("build_git_dirty")
+            .and_then(serde_json::Value::as_bool),
     })
+}
+
+fn validate_build_identity(
+    component: &str,
+    expected: &str,
+    actual: Option<&str>,
+    dirty: Option<bool>,
+) -> Result<(), PreflightError> {
+    let invalid = |detail| PreflightError::BuildIdentity { detail };
+    if expected.len() != 40 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid(
+            "ASTRA_EXPECTED_BUILD_GIT_SHA must be a full commit SHA".into(),
+        ));
+    }
+    if actual != Some(expected) || dirty != Some(false) {
+        return Err(invalid(format!(
+            "{component}: expected clean build {expected}, got revision {actual:?}, dirty {dirty:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn check_client_build(astra_bin: &Path, expected: &str) -> Result<(), PreflightError> {
+    let invalid = |detail| PreflightError::BuildIdentity { detail };
+    let (status, stdout, stderr) =
+        capture_readiness_probe(astra_bin, "--build-info-json", None, 4096)
+            .await
+            .map_err(invalid)?;
+    if !status.success() {
+        return Err(invalid(format!(
+            "CLI build identity probe exited {status}: {stderr}"
+        )));
+    }
+    let identity: serde_json::Value = serde_json::from_slice(&stdout)
+        .map_err(|error| invalid(format!("CLI build identity is invalid JSON: {error}")))?;
+    if identity.get("schema").and_then(serde_json::Value::as_str)
+        != Some(astra_core::build_info::BUILD_INFO_SCHEMA)
+    {
+        return Err(invalid("CLI build identity schema is unsupported".into()));
+    }
+    for field in ["target", "profile"] {
+        if identity
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|value| value.trim().is_empty() || value == "unknown")
+        {
+            return Err(invalid(format!("CLI build identity omitted valid {field}")));
+        }
+    }
+    validate_build_identity(
+        "CLI",
+        expected,
+        identity.get("git_sha").and_then(serde_json::Value::as_str),
+        identity
+            .get("git_dirty")
+            .and_then(serde_json::Value::as_bool),
+    )
+}
+
+/// Health and artifact probes must finish before any paid model work. Bound
+/// their retained output while reading, and kill the child when a deadline wins.
+async fn capture_readiness_probe(
+    astra_bin: &Path,
+    argument: &str,
+    profile: Option<&str>,
+    max_bytes: usize,
+) -> Result<(ExitStatus, Vec<u8>, String), String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut child = astra_command(astra_bin, profile)
+            .arg(argument)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("{argument} probe spawn failed: {error}"))?;
+        let mut stdout_reader = child
+            .stdout
+            .take()
+            .expect("piped probe stdout")
+            .take(max_bytes as u64 + 1);
+        let mut stderr_reader = child.stderr.take().expect("piped probe stderr").take(4097);
+        let read_stdout = async {
+            let mut bytes = Vec::new();
+            stdout_reader
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| format!("{argument} stdout read failed: {error}"))?;
+            if bytes.len() > max_bytes {
+                return Err(format!("{argument} stdout exceeds {max_bytes} bytes"));
+            }
+            Ok(bytes)
+        };
+        let read_stderr = async {
+            let mut bytes = Vec::new();
+            stderr_reader
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| format!("{argument} stderr read failed: {error}"))?;
+            if bytes.len() > 4096 {
+                return Err(format!("{argument} stderr exceeds 4096 bytes"));
+            }
+            Ok(bytes)
+        };
+        let (stdout, stderr) = tokio::try_join!(read_stdout, read_stderr)?;
+        let stderr = safe_probe_diagnostic(&String::from_utf8_lossy(&stderr));
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| format!("{argument} probe wait failed: {error}"))?;
+        Ok((status, stdout, stderr))
+    })
+    .await
+    .map_err(|_| format!("{argument} probe timed out"))?
+}
+
+fn safe_probe_diagnostic(stderr: &str) -> String {
+    let (redacted, _) = astra_turn_core::safety_middleware::redact_credentials_in_text(stderr);
+    // The general tool-output redactor intentionally uses length thresholds.
+    // Readiness errors need no secret-bearing line, even for a short password.
+    static SENSITIVE_LINE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let sensitive = SENSITIVE_LINE.get_or_init(|| {
+        regex::Regex::new(r"(?i)password|passwd|secret|token|api.?key|auth|bearer")
+            .expect("probe diagnostic credential labels")
+    });
+    redacted
+        .lines()
+        .map(|line| {
+            if sensitive.is_match(line) {
+                "[credential-bearing diagnostic omitted]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn validate_health_probe(stdout: &[u8], exit_code: Option<i32>) -> Result<ServerReadiness, String> {
@@ -142,6 +285,57 @@ fn validate_successful_model_probe(
     Ok(())
 }
 
+/// Revision verification binds the suite to the preflight routing context.
+/// Case-local overrides are not visible to that probe (including follow-ups,
+/// which inherit these fields), so reject them before any live work.
+pub fn validate_revision_bound_cases(cases: &[crate::case::Case]) -> Result<(), PreflightError> {
+    for case in cases {
+        for key in case.cli_env.keys() {
+            if matches!(
+                key.to_ascii_uppercase().as_str(),
+                "ASTRA_API_URL"
+                    | "ASTRA_CONFIG_SOURCE"
+                    | "ASTRA_PROFILE"
+                    | "ASTRA_CLI_CREDENTIALS_DIR"
+                    | "ASTRA_LOCAL_STATE_ROOT"
+                    | "ASTRA_ACCESS_TOKEN"
+                    | "MOI_AUTH_DIR"
+                    | "HOME"
+                    | "USERPROFILE"
+                    | "HOMEDRIVE"
+                    | "HOMEPATH"
+                    | "XDG_CONFIG_HOME"
+                    | "XDG_STATE_HOME"
+                    | "APPDATA"
+                    | "LOCALAPPDATA"
+                    | "HTTP_PROXY"
+                    | "HTTPS_PROXY"
+                    | "ALL_PROXY"
+                    | "NO_PROXY"
+            ) {
+                return Err(PreflightError::BuildIdentity {
+                    detail: format!(
+                        "case {:?}: cli_env key {key} can change the verified execution target; configure routing before preflight instead",
+                        case.name
+                    ),
+                });
+            }
+        }
+        for argument in &case.extra_cli_args {
+            let flag = argument.split('=').next().unwrap_or(argument);
+            if matches!(flag, "--api-url" | "--profile") {
+                return Err(PreflightError::BuildIdentity {
+                    detail: format!(
+                        "case {:?}: extra_cli_args flag {flag} can change the verified execution target; configure routing before preflight instead",
+                        case.name
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run all pre-flight checks in order. Validates binary, server, and
 /// every model in the matrix (not just the first).
 pub async fn run_preflight(
@@ -153,14 +347,77 @@ pub async fn run_preflight(
     // The server and local dependency scripts both load `.env`; do the same
     // for the harness so an owner-auth probe cannot be skipped merely because
     // the caller did not export the local development variables in its shell.
-    dotenvy::dotenv().ok();
-    // Model probes intentionally run from a disposable directory. Resolve the
-    // executable before changing CWD so a caller-provided `./target/debug/astra`
-    // remains executable during health, registration, retry, and cleanup.
+    if !astra_core::config::explicit_env_config_requested().map_err(|error| {
+        PreflightError::BuildIdentity {
+            detail: error.to_string(),
+        }
+    })? {
+        dotenvy::dotenv().ok();
+    }
+    let expected_build = std::env::var("ASTRA_EXPECTED_BUILD_GIT_SHA")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            _ => Err(PreflightError::BuildIdentity {
+                detail: "ASTRA_EXPECTED_BUILD_GIT_SHA must be valid UTF-8".into(),
+            }),
+        })?;
+    // Execution later uses an explicit legacy profile for owner-scoped
+    // capture. Bind that same route before health, rather than probing a
+    // native MOI login and only switching profiles after paid model work.
+    let credentials = astra_credentials::CredentialStore::new()
+        .load()
+        .map_err(|error| PreflightError::AuthFailed {
+            detail: error.to_string(),
+        })?;
+    let effective_profile = astra_credentials::CredentialStore::resolve_profile_name(
+        requested_profile,
+        credentials.current_profile.as_deref(),
+    );
+    run_preflight_with_build(
+        astra_bin,
+        models,
+        Some(&effective_profile),
+        requested_profile.unwrap_or("harness-auto"),
+        require_memoria,
+        expected_build.as_deref(),
+        astra_core::build_info::current(),
+    )
+    .await
+}
+
+async fn run_preflight_with_build(
+    astra_bin: &Path,
+    models: &[String],
+    requested_profile: Option<&str>,
+    auto_profile: &str,
+    require_memoria: bool,
+    expected_build: Option<&str>,
+    harness: astra_core::build_info::BuildInfo,
+) -> Result<Option<String>, PreflightError> {
+    // Probe workspaces change CWD; resolve the executable once beforehand.
     let astra_bin = canonical_binary_path(astra_bin)?;
-    let readiness = check_server(&astra_bin).await?;
-    if require_memoria {
-        check_memoria_readiness(&readiness).await?;
+    let expected_build = expected_build.map(|value| value.trim().to_ascii_lowercase());
+    if let Some(expected) = expected_build.as_deref() {
+        validate_build_identity(
+            "harness",
+            expected,
+            Some(harness.git_sha),
+            Some(harness.git_dirty),
+        )?;
+        check_client_build(&astra_bin, expected).await?;
+    }
+    check_execution_server(
+        &astra_bin,
+        requested_profile,
+        expected_build.as_deref(),
+        require_memoria,
+    )
+    .await?;
+    if expected_build.is_none() {
+        eprintln!(
+            "[astra-test] preflight: deployment smoke check; build revision equality not verified"
+        );
     }
     // A model probe is a real `astra chat` invocation. Running it from the
     // caller's checkout can therefore acquire that checkout's physical
@@ -180,6 +437,9 @@ pub async fn run_preflight(
             model,
             effective_profile.as_deref(),
             probe_workspace.path(),
+            auto_profile,
+            expected_build.as_deref(),
+            require_memoria,
         )
         .await?;
     }
@@ -207,19 +467,41 @@ fn canonical_binary_path(astra_bin: &Path) -> Result<std::path::PathBuf, Preflig
     Ok(canonical)
 }
 
-async fn check_server(astra_bin: &Path) -> Result<ServerReadiness, PreflightError> {
-    let output = Command::new(astra_bin)
-        .args(["health"])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
-        .output()
-        .await
-        .map_err(|e| PreflightError::ServerUnreachable {
-            detail: format!("failed to spawn: {e}"),
-        })?;
+async fn check_execution_server(
+    astra_bin: &Path,
+    profile: Option<&str>,
+    expected_build: Option<&str>,
+    require_memoria: bool,
+) -> Result<(), PreflightError> {
+    let readiness = check_server(astra_bin, profile).await?;
+    if let Some(expected) = expected_build {
+        validate_build_identity(
+            "Server",
+            expected,
+            Some(&readiness.build_git_sha),
+            readiness.build_git_dirty,
+        )?;
+        eprintln!("[astra-test] preflight: execution Server matches clean build {expected}");
+    }
+    if require_memoria {
+        check_memoria_readiness(&readiness).await?;
+    }
+    Ok(())
+}
 
-    let readiness = validate_health_probe(&output.stdout, output.status.code())
-        .map_err(|detail| PreflightError::ServerUnready { detail })?;
+async fn check_server(
+    astra_bin: &Path,
+    profile: Option<&str>,
+) -> Result<ServerReadiness, PreflightError> {
+    let (status, stdout, stderr) = capture_readiness_probe(astra_bin, "health", profile, 65536)
+        .await
+        .map_err(|detail| PreflightError::ServerUnreachable { detail })?;
+
+    let readiness = validate_health_probe(&stdout, status.code()).map_err(|detail| {
+        PreflightError::ServerUnready {
+            detail: format!("{detail}; stderr: {stderr}"),
+        }
+    })?;
     eprintln!(
         "[astra-test] preflight: Server contract={} build={}",
         readiness.interaction_api_major,
@@ -394,6 +676,9 @@ async fn check_model(
     model: &str,
     profile: Option<&str>,
     probe_workspace: &Path,
+    auto_profile: &str,
+    expected_build: Option<&str>,
+    require_memoria: bool,
 ) -> Result<Option<String>, PreflightError> {
     let mut command = astra_command(astra_bin, profile);
     command.args([
@@ -408,11 +693,7 @@ async fn check_model(
     ]);
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        command
-            .env("NO_PROXY", "localhost,127.0.0.1")
-            .env("no_proxy", "localhost,127.0.0.1")
-            .current_dir(probe_workspace)
-            .output(),
+        command.current_dir(probe_workspace).output(),
     )
     .await;
 
@@ -444,12 +725,29 @@ async fn check_model(
         // Try auto-login in an isolated profile and retry. The CLI owns its
         // credential store; the harness must never parse tokens and write that
         // file through a second implementation.
-        let auto_profile = profile.unwrap_or("harness-auto");
+        if profile != Some(auto_profile) {
+            // Switching auth mode can switch Server. Validate before even
+            // registering an account at the new target.
+            check_execution_server(
+                astra_bin,
+                Some(auto_profile),
+                expected_build,
+                require_memoria,
+            )
+            .await?;
+        }
         eprintln!(
             "[astra-test] preflight: auth failed, attempting auto-register in profile `{auto_profile}`..."
         );
         match try_auto_register(astra_bin, auto_profile, probe_workspace).await {
             Ok(()) => {
+                check_execution_server(
+                    astra_bin,
+                    Some(auto_profile),
+                    expected_build,
+                    require_memoria,
+                )
+                .await?;
                 // Retry the model check after registration.
                 let mut retry_command = astra_command(astra_bin, Some(auto_profile));
                 retry_command.args([
@@ -464,11 +762,7 @@ async fn check_model(
                 ]);
                 let retry = tokio::time::timeout(
                     Duration::from_secs(30),
-                    retry_command
-                        .env("NO_PROXY", "localhost,127.0.0.1")
-                        .env("no_proxy", "localhost,127.0.0.1")
-                        .current_dir(probe_workspace)
-                        .output(),
+                    retry_command.current_dir(probe_workspace).output(),
                 )
                 .await;
                 match retry {
@@ -606,8 +900,6 @@ async fn try_auto_register(
             "--password",
             "harness-auto-pw",
         ])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
         .current_dir(probe_workspace)
         .output()
         .await;
@@ -623,8 +915,6 @@ async fn try_auto_register(
             "--password",
             "harness-auto-pw",
         ])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
         .current_dir(probe_workspace)
         .output()
         .await;
@@ -652,6 +942,522 @@ async fn try_auto_register(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_preflight_resolves_profile_before_health_without_reusing_it_for_auto_auth() {
+        const CHILD: &str = "ASTRA_TEST_PREFLIGHT_PROFILE_CHILD";
+        if let Ok(directory) = std::env::var(CHILD) {
+            let requested = std::env::var("ASTRA_TEST_REQUESTED_PROFILE").ok();
+            let error = super::run_preflight(
+                &std::path::Path::new(&directory).join("astra"),
+                &["test-model".into()],
+                requested.as_deref(),
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, super::PreflightError::AuthFailed { .. }),
+                "{error}"
+            );
+            return;
+        }
+        for (requested, environment, current, expected) in [
+            (
+                Some("requested"),
+                Some("environment"),
+                Some("current"),
+                "requested",
+            ),
+            (None, Some("environment"), Some("current"), "environment"),
+            (None, None, Some("current"), "current"),
+            (None, None, None, "default"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let calls = directory.path().join("calls");
+            std::fs::write(
+                directory.path().join("credentials.json"),
+                serde_json::json!({"current_profile": current, "profiles": {}}).to_string(),
+            )
+            .unwrap();
+            crate::test_support::write_executable_shim(&directory.path().join("astra"), format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+[ "$1" = --profile ] || exit 98
+shift 2
+case "$1" in
+health) printf '%s' '{{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","build_git_dirty":false}}' ;;
+chat) printf '401 Unauthorized' >&2; exit 3 ;;
+admin) exit 1 ;;
+*) exit 99 ;;
+esac
+"#, calls=calls.display(),
+            )).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "preflight::tests::public_preflight_resolves_profile_before_health_without_reusing_it_for_auto_auth", "--test-threads=1"])
+                .env(CHILD, directory.path())
+                .env("ASTRA_CLI_CREDENTIALS_DIR", directory.path())
+                .env("ASTRA_CONFIG_SOURCE", "explicit-env")
+                .env_remove("ASTRA_EXPECTED_BUILD_GIT_SHA")
+                .env_remove("ASTRA_TEST_REQUESTED_PROFILE")
+                .env_remove("ASTRA_PROFILE");
+            if let Some(value) = requested {
+                command.env("ASTRA_TEST_REQUESTED_PROFILE", value);
+            }
+            if let Some(value) = environment {
+                command.env("ASTRA_PROFILE", value);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let log = std::fs::read_to_string(calls).unwrap();
+            assert!(
+                log.starts_with(&format!(
+                    "--profile {expected} health\n--profile {expected} chat "
+                )),
+                "{log}"
+            );
+            let auto = requested.unwrap_or("harness-auto");
+            assert!(
+                log.contains(&format!("--profile {auto} admin register ")),
+                "{log}"
+            );
+        }
+    }
+
+    #[test]
+    fn revision_bound_cases_reject_routing_overrides_without_disclosing_values() {
+        for key in [
+            "ASTRA_API_URL",
+            "ASTRA_CONFIG_SOURCE",
+            "ASTRA_PROFILE",
+            "ASTRA_CLI_CREDENTIALS_DIR",
+            "ASTRA_LOCAL_STATE_ROOT",
+            "ASTRA_ACCESS_TOKEN",
+            "MOI_AUTH_DIR",
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            for value in ["", "private-endpoint-or-credential"] {
+                let mut case =
+                    serde_yaml_ng::from_str::<crate::case::Case>("name: routing\nprompt: hello\n")
+                        .unwrap();
+                case.cli_env.insert(key.into(), value.into());
+                let error = super::validate_revision_bound_cases(&[case])
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(key), "{error}");
+                assert!(!error.contains("private-endpoint-or-credential"), "{error}");
+            }
+        }
+        for flag in ["--api-url", "--profile"] {
+            for args in [
+                vec![flag.to_string(), "private-endpoint-or-credential".into()],
+                vec![format!("{flag}=private-endpoint-or-credential")],
+            ] {
+                let mut case =
+                    serde_yaml_ng::from_str::<crate::case::Case>("name: routing\nprompt: hello\n")
+                        .unwrap();
+                case.extra_cli_args = args;
+                let error = super::validate_revision_bound_cases(&[case])
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(flag), "{error}");
+                assert!(!error.contains("private-endpoint-or-credential"), "{error}");
+            }
+        }
+        let case = serde_yaml_ng::from_str::<crate::case::Case>(
+            "name: tracing\nprompt: hello\ncli_env: {ASTRA_TRACE: verbose, NO_COLOR: '1'}\nextra_cli_args: [--explain]\nsteps:\n  - prompt: continue\n",
+        ).unwrap();
+        super::validate_revision_bound_cases(&[case]).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revision_probe_checks_explicit_execution_profile_not_native_endpoint() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra");
+        let calls = dir.path().join("calls");
+        let identity = serde_json::json!({
+            "schema": astra_core::build_info::BUILD_INFO_SCHEMA,
+            "git_sha": SHA, "git_dirty": false, "target": "test", "profile": "test"
+        });
+        for execution_sha in ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", SHA] {
+            // No explicit profile models native MOI routing to A; local
+            // selects the independent execution endpoint (B in the first run).
+            crate::test_support::write_executable_shim(&bin, format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+if [ "$1" = --build-info-json ]; then
+  [ "$#" -eq 1 ] || exit 98
+  printf '%s' '{identity}'
+  exit 0
+fi
+revision='{SHA}'
+if [ "$1" = --profile ]; then
+  [ "$2" = local ] || exit 97
+  revision='{execution_sha}'
+  shift 2
+fi
+case "$1" in
+health) printf '{{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"%s","build_git_dirty":false}}' "$revision" ;;
+chat) printf '{{}}' ;;
+*) exit 99 ;;
+esac
+"#, calls=calls.display(),
+            )).unwrap();
+            let error = super::run_preflight_with_build(
+                &bin,
+                &["test-model".into()],
+                Some("local"),
+                "local",
+                false,
+                Some(SHA),
+                astra_core::build_info::BuildInfo {
+                    git_sha: SHA,
+                    git_dirty: false,
+                    ..astra_core::build_info::current()
+                },
+            )
+            .await
+            .unwrap_err();
+            let log = std::fs::read_to_string(&calls).unwrap();
+            assert!(
+                log.starts_with("--build-info-json\n--profile local health\n"),
+                "{log}"
+            );
+            if execution_sha != SHA {
+                assert!(
+                    matches!(error, super::PreflightError::BuildIdentity { .. }),
+                    "{error}"
+                );
+                assert!(
+                    !log.contains("chat"),
+                    "mismatch must prevent paid work: {log}"
+                );
+            } else {
+                // Invalid model evidence is intentional: reaching chat on the
+                // verified profile proves routing without live model work.
+                assert!(
+                    matches!(error, super::PreflightError::ModelUnavailable { .. }),
+                    "{error}"
+                );
+                assert!(log.contains("--profile local chat "), "{log}");
+            }
+            std::fs::remove_file(&calls).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_auto_registration_keeps_retry_cleanup_and_returned_profile_bound() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SESSION: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra");
+        let calls = dir.path().join("calls");
+        let registered = dir.path().join("registered");
+        let outcome = serde_json::json!({
+            "trace_id": null, "request_id": null, "run_id": "run-1", "session_id": SESSION,
+            "text": "pong", "final_state": "completed", "interruption_kind": null,
+            "tool_result_class_counts": {}, "prompt_tokens": 0, "fresh_prompt_tokens": 0,
+            "cache": {"hit": false, "read_tokens": 0, "creation_tokens": 0},
+            "completion_tokens": 0, "llm_rounds": 0, "tool_calls_count": 0, "tools_used": [],
+            "persistence_error": null, "exit_code": 0, "success": true, "error_kind": null
+        });
+        crate::test_support::write_executable_shim(&bin, format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+[ "$1" = --profile ] || exit 98
+shift 2
+case "$1" in
+health) printf '%s' '{{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"{SHA}","build_git_dirty":false}}' ;;
+chat)
+  if [ ! -f '{registered}' ]; then printf '401 Unauthorized' >&2; exit 3; fi
+  printf '%s' '{outcome}'
+  ;;
+admin) if [ "$2" = login ]; then touch '{registered}'; fi ;;
+session) printf '%s' '{{"session_id":"{SESSION}","status":"cancelled","execution_settled":true}}' ;;
+*) exit 99 ;;
+esac
+"#, calls=calls.display(), registered=registered.display(),
+        )).unwrap();
+        let profile = super::check_model(
+            &bin,
+            "test-model",
+            Some("user-current"),
+            dir.path(),
+            "harness-auto",
+            Some(SHA),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(profile.as_deref(), Some("harness-auto"));
+        let log = std::fs::read_to_string(calls).unwrap();
+        let lines: Vec<_> = log.lines().collect();
+        assert!(
+            lines[0].starts_with("--profile user-current chat "),
+            "{log}"
+        );
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| line.starts_with("--profile harness-auto ")),
+            "{log}"
+        );
+        assert_eq!(log.matches(" health").count(), 2, "{log}");
+        assert_eq!(log.matches(" chat ").count(), 2, "{log}");
+        assert!(log.contains(&format!("session cancel {SESSION}")), "{log}");
+        assert!(log.contains(&format!("session delete {SESSION}")), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_profile_is_verified_before_registration_and_before_model_retry() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra");
+        let calls = dir.path().join("calls");
+        let registered = dir.path().join("registered");
+        for (fail_after_registration, missing_memoria) in
+            [(false, false), (true, false), (true, true)]
+        {
+            crate::test_support::write_executable_shim(&bin, format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+[ "$1" = --profile ] || exit 98
+profile="$2"
+shift 2
+case "$1" in
+chat) printf '401 Unauthorized' >&2; exit 3 ;;
+health)
+  revision='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  status=healthy
+  memoria=connected
+  if [ '{fail_after_registration}' = true ] && [ ! -f '{registered}' ]; then revision='{SHA}'; fi
+  if [ '{missing_memoria}' = true ]; then revision='{SHA}'; status=degraded; memoria=unavailable; fi
+  printf '{{"status":"%s","database":"connected","memoria":"%s","interaction_api_major":"3","build_git_sha":"%s","build_git_dirty":false}}' "$status" "$memoria" "$revision"
+  ;;
+admin)
+  [ "$profile" = harness-auto ] || exit 97
+  if [ "$2" = login ]; then touch '{registered}'; fi
+  ;;
+*) exit 99 ;;
+esac
+"#, calls=calls.display(), registered=registered.display(),
+            )).unwrap();
+            let error = super::check_model(
+                &bin,
+                "test-model",
+                Some(if missing_memoria {
+                    "harness-auto"
+                } else {
+                    "user-current"
+                }),
+                dir.path(),
+                "harness-auto",
+                Some(SHA),
+                missing_memoria,
+            )
+            .await
+            .unwrap_err();
+            if missing_memoria {
+                assert!(
+                    matches!(error, super::PreflightError::ServerUnready { .. }),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    matches!(error, super::PreflightError::BuildIdentity { .. }),
+                    "{error}"
+                );
+            }
+            let log = std::fs::read_to_string(&calls).unwrap();
+            assert_eq!(
+                log.matches(" chat ").count(),
+                1,
+                "no retry on unverified target: {log}"
+            );
+            assert!(log.contains("--profile harness-auto health"), "{log}");
+            assert_eq!(
+                log.contains(" admin register "),
+                fail_after_registration,
+                "{log}"
+            );
+            assert_eq!(
+                log.matches(" health").count(),
+                if fail_after_registration && !missing_memoria {
+                    2
+                } else {
+                    1
+                },
+                "{log}"
+            );
+            std::fs::remove_file(&calls).unwrap();
+            if registered.exists() {
+                std::fs::remove_file(&registered).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_gate_precedes_health_model_and_auth_probes() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra");
+        let calls = dir.path().join("calls");
+        let identity = serde_json::json!({
+            "schema": astra_core::build_info::BUILD_INFO_SCHEMA,
+            "git_sha": SHA, "git_dirty": false, "target": "test", "profile": "test"
+        })
+        .to_string();
+        let health = serde_json::json!({
+            "status": "healthy", "database": "connected", "memoria": "connected",
+            "interaction_api_major": "3", "build_git_sha": SHA, "build_git_dirty": true
+        })
+        .to_string();
+        for (metadata, expected_calls) in [
+            ("not-json", "--build-info-json\n"),
+            (identity.as_str(), "--build-info-json\nhealth\n"),
+        ] {
+            crate::test_support::write_executable_shim(&bin, format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n--build-info-json) printf '%s' '{}' ;;\nhealth) printf '%s' '{}' ;;\n*) exit 99 ;;\nesac\n",
+                calls.display(), metadata, health,
+            )).unwrap();
+            let harness = astra_core::build_info::BuildInfo {
+                git_sha: SHA,
+                git_dirty: false,
+                ..astra_core::build_info::current()
+            };
+            let error = super::run_preflight_with_build(
+                &bin,
+                &["test-model".into()],
+                None,
+                "harness-auto",
+                false,
+                Some(" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"),
+                harness,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, super::PreflightError::BuildIdentity { .. }),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_to_string(&calls).unwrap(), expected_calls);
+            std::fs::remove_file(&calls).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_probe_preserves_redacted_failure_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra");
+        crate::test_support::write_executable_shim(
+            &bin,
+            "#!/bin/sh\nprintf 'configuration failed\\npassword = hunter2\\napi_key = test-secret-value-123456\\nauth = abc123\\nBearer xyz789\\n' >&2\nexit 2\n",
+        )
+        .unwrap();
+        let error = super::check_server(&bin, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configuration failed"), "{error}");
+        assert!(!error.contains("test-secret-value-123456"), "{error}");
+        assert!(!error.contains("hunter2"), "{error}");
+        assert!(!error.contains("abc123"), "{error}");
+        assert!(!error.contains("xyz789"), "{error}");
+        let error = super::check_client_build(&bin, &"a".repeat(40))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configuration failed"), "{error}");
+        assert!(!error.contains("test-secret-value-123456"), "{error}");
+        assert!(!error.contains("hunter2"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_probe_bounds_both_output_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra");
+        for (script, expected) in [
+            (
+                "#!/bin/sh\nwhile :; do printf '0123456789'; done\n",
+                "stdout exceeds 16 bytes",
+            ),
+            (
+                "#!/bin/sh\nwhile :; do printf '0123456789' >&2; done\n",
+                "stderr exceeds 4096 bytes",
+            ),
+        ] {
+            crate::test_support::write_executable_shim(&bin, script).unwrap();
+            let error = super::capture_readiness_probe(&bin, "health", None, 16)
+                .await
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_probe_timeout_terminates_child_with_open_or_closed_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra");
+        let pid_file = dir.path().join("pid");
+        for output in ["", "printf '{}\\n'; exec 1>&- 2>&-"] {
+            crate::test_support::write_executable_shim(
+                &bin,
+                format!(
+                    "#!/bin/sh\nprintf '%s' $$ > '{}'\n{output}\nexec sleep 30\n",
+                    pid_file.display()
+                ),
+            )
+            .unwrap();
+            let error = super::capture_readiness_probe(&bin, "health", None, 16)
+                .await
+                .unwrap_err();
+            assert!(error.contains("timed out"), "{error}");
+            let pid = std::fs::read_to_string(&pid_file).unwrap();
+            assert!(pid.parse::<u32>().unwrap() > 1);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let alive = tokio::process::Command::new("kill")
+                        .args(["-0", pid.as_str()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await
+                        .unwrap()
+                        .success();
+                    if !alive {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("timed-out child must be killed and reaped");
+        }
+    }
+
     #[test]
     fn shared_server_readiness_contract() {
         let cases: serde_json::Value =
@@ -867,7 +1673,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_unreachable_on_bad_binary() {
-        let result = check_server(Path::new("/nonexistent/astra")).await;
+        let result = check_server(Path::new("/nonexistent/astra"), None).await;
         assert!(matches!(
             result,
             Err(PreflightError::ServerUnreachable { .. })
@@ -882,6 +1688,9 @@ mod tests {
             "gpt-4",
             None,
             probe_workspace.path(),
+            "harness-auto",
+            None,
+            false,
         )
         .await;
         assert!(matches!(
@@ -917,9 +1726,17 @@ mod tests {
         )
         .unwrap();
 
-        let profile = check_model(&bin, "deepseek", Some("isolated-harness"), dir.path())
-            .await
-            .unwrap();
+        let profile = check_model(
+            &bin,
+            "deepseek",
+            Some("isolated-harness"),
+            dir.path(),
+            "isolated-harness",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(profile.as_deref(), Some("isolated-harness"));
         let args = fs::read_to_string(log).unwrap();
         assert!(args.contains("--profile\nisolated-harness\n"), "{args}");
@@ -966,6 +1783,54 @@ mod tests {
         assert!(!stderr_indicates_cli_auth_failure(
             "request failed with status 403 Forbidden"
         ));
+    }
+
+    #[test]
+    fn expected_build_requires_exact_revision_and_explicit_clean_evidence() {
+        let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(validate_build_identity("CLI", expected, Some(expected), Some(false)).is_ok());
+        for (sha, dirty) in [
+            (
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                Some(false),
+            ),
+            (Some(expected), Some(true)),
+            (Some(expected), None),
+            (None, Some(false)),
+        ] {
+            assert!(validate_build_identity("CLI", expected, sha, dirty).is_err());
+        }
+        for invalid in [
+            "",
+            "abcdef",
+            "HEAD",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+        ] {
+            assert!(
+                validate_build_identity("harness", invalid, Some(invalid), Some(false)).is_err()
+            );
+        }
+        for dirty in [
+            serde_json::json!(false),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let health = serde_json::json!({
+                "status": "healthy", "database": "connected", "interaction_api_major": "3",
+                "build_git_sha": expected, "build_git_dirty": dirty,
+            });
+            let readiness = parse_server_readiness(&serde_json::to_vec(&health).unwrap()).unwrap();
+            assert_eq!(
+                validate_build_identity(
+                    "Server",
+                    expected,
+                    Some(&readiness.build_git_sha),
+                    readiness.build_git_dirty
+                )
+                .is_ok(),
+                dirty == false,
+            );
+        }
     }
 
     #[test]

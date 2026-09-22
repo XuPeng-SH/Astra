@@ -52,6 +52,44 @@ code is correct. Branch acceptance requires the deterministic HTTP system
 matrix against the current binary/DB wiring; a deployment smoke additionally
 needs the target Server revision recorded by the release workflow.
 
+For a revision-bound comparison, set `ASTRA_EXPECTED_BUILD_GIT_SHA` to the full
+40-character commit SHA. Before any model probe, preflight requires the harness,
+selected CLI and Server to report that exact revision and an explicitly clean
+build. Missing identity or a dirty/mismatched build fails verification. This
+mode cannot use `--skip-preflight`. `astra-test --build-info-json` prints the
+same side-effect-free artifact identity as Server/CLI; record executable SHA-256
+hashes alongside it. Without the expected revision, the harness remains a
+deployment smoke and does not certify the current branch.
+Revision verification requires the built-in CLI executor and is unavailable in
+dashboard mode. Embedded identity is a build declaration: use the trusted build
+workflow to refresh source metadata, particularly after uncommitted edits;
+this check does not fingerprint runtime configuration or all dependencies.
+Preflight resolves the legacy execution profile before checking health and
+passes that same explicit profile to health, model probes and case execution;
+it does not validate a native MOI endpoint and then execute on a legacy one.
+An automatic switch to the isolated `harness-auto` profile rechecks readiness
+and revision before registration and again before retrying the model probe.
+Artifact-only `--build-info-json` remains independent of profiles/configuration.
+The CLI binary is resolved to an absolute path before constructing any consumer,
+so a case's working directory cannot select a different relative executable.
+All CLI subprocesses inherit the caller's proxy and bypass environment unchanged;
+ThinClient owns loopback bypass and remote endpoint proxy handling.
+In revision-bound mode, selected cases cannot override endpoint/profile,
+credential/settings roots, home directories, access tokens or proxy variables
+through `cli_env`, or routing flags through `extra_cli_args`. These are rejected
+before any live probe; configure shared routing in the harness environment or
+`--profile` instead. Non-routing overrides such as `ASTRA_TRACE` remain allowed.
+Strict mode loads the startup directory's dotenv once (unless the caller already
+selected `ASTRA_CONFIG_SOURCE=explicit-env`), then exports `explicit-env` to the
+whole execution chain. Probe/case working-directory dotenv files cannot supply
+another endpoint, and cases cannot override `ASTRA_CONFIG_SOURCE`. This mode
+also skips local ServerConfig files, including `ASTRA_SERVER_CONFIG`: settings
+needed by local dependency probes must be available in the exported environment.
+It does not change the remote Server's configuration.
+Cases and their setup commands are trusted test inputs: this verification is
+not isolation against scripts or concurrent processes changing CLI settings,
+credentials, binaries or the deployment after preflight.
+
 Invalid machine-event evidence fails the run even when terminal JSON reports
 success. The report retains available terminal text and token diagnostics, but
 clears session/run identities so it cannot certify an unbound journal. Such a

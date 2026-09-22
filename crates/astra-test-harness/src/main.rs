@@ -14,7 +14,7 @@ use astra_test_harness::judger::{
     AstraCliJudger, ExternalCmdJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger,
     warn_if_same_family,
 };
-use astra_test_harness::preflight::run_preflight;
+use astra_test_harness::preflight::{run_preflight, validate_revision_bound_cases};
 use astra_test_harness::report::{Format, render};
 use astra_test_harness::runner::{RunnerConfig, resolve_models, resolve_runner_profile_owner};
 use astra_test_harness::suite::{
@@ -318,9 +318,49 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if astra_core::build_info::write_json_if_requested()
+        .map_err(|error| anyhow::anyhow!("build identity: {error}"))?
+    {
+        return Ok(());
+    }
+    initialize_execution_environment()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+fn initialize_execution_environment() -> Result<()> {
+    use astra_core::config::{
+        ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV, explicit_env_config_requested,
+    };
+    if !explicit_env_config_requested()? {
+        dotenvy::dotenv().ok();
+    }
+    // Validate again: the startup dotenv may itself select a source.
+    explicit_env_config_requested()?;
+    if std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
+        // SAFETY: startup runs before application threads are created. Tests
+        // exercise this only in an isolated subprocess with one selected test.
+        unsafe { std::env::set_var(ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV) };
+    }
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
+    if args.skip_preflight && std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
+        anyhow::bail!("--skip-preflight cannot bypass ASTRA_EXPECTED_BUILD_GIT_SHA verification");
+    }
+    if std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some()
+        && (args.live_dashboard.is_some() || args.executor_cmd.is_some())
+    {
+        anyhow::bail!(
+            "revision verification requires the built-in CLI executor without --live-dashboard"
+        );
+    }
     if !args.no_judger && args.judger_cmd.is_none() {
         astra_test_harness::judger::validate_builtin_judger_timeout(args.judger_timeout)
             .map_err(anyhow::Error::msg)?;
@@ -348,7 +388,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let astra_bin = resolve_astra_bin(args.astra_bin.clone())?;
+    // All consumers must execute the same artifact, even after changing CWD.
+    let astra_bin = std::fs::canonicalize(resolve_astra_bin(args.astra_bin.clone())?)
+        .context("resolve absolute astra binary path")?;
 
     // ── Dashboard-only mode ─────────────────────────────────────────
     // When --live-dashboard is passed without a full CLI run config,
@@ -417,6 +459,10 @@ async fn main() -> Result<()> {
         eprintln!("[astra-test] filter matched {} case(s)", cases.len());
     }
 
+    if std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
+        validate_revision_bound_cases(&cases)?;
+    }
+
     // Apply --force-model: override case-level models
     if let Some(ref forced) = args.force_model {
         for case in &mut cases {
@@ -481,7 +527,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
+                anyhow::bail!("pre-flight check failed: {e}");
             }
         }
     }
@@ -700,6 +746,83 @@ mod tests {
     use astra_test_harness::runner::resolve_runner_profile_owner;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn revision_environment_is_inherited_without_loading_case_dotenv() {
+        const CHILD: &str = "ASTRA_TEST_REVISION_ENV_CHILD";
+        match std::env::var(CHILD).as_deref() {
+            Ok("case") => {
+                // Exercise the actual shared configuration loader used by
+                // CLI AppSettings, not a second implementation of dotenv.
+                let _ = astra_core::AppSettings::from_env();
+                assert!(std::env::var_os("ASTRA_API_URL").is_none());
+                assert!(astra_core::config::explicit_env_config_requested().unwrap());
+                return;
+            }
+            Ok("startup") => {
+                super::initialize_execution_environment().unwrap();
+                assert_eq!(
+                    std::env::var_os("ASTRA_TRACE").is_some(),
+                    std::env::var("ASTRA_TEST_LOAD_STARTUP_DOTENV").unwrap() == "true",
+                );
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::revision_environment_is_inherited_without_loading_case_dotenv",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, "case")
+                    .current_dir(std::env::var_os("ASTRA_TEST_CASE_DIRECTORY").unwrap())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                return;
+            }
+            _ => {}
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let case = directory.path().join("case");
+        fs::create_dir(&case).unwrap();
+        fs::write(
+            directory.path().join(".env"),
+            "ASTRA_TRACE=startup-marker\n",
+        )
+        .unwrap();
+        fs::write(
+            case.join(".env"),
+            "ASTRA_API_URL=http://different-case-server.invalid\n",
+        )
+        .unwrap();
+        for already_explicit in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tests::revision_environment_is_inherited_without_loading_case_dotenv",
+                    "--test-threads=1",
+                ])
+                .current_dir(directory.path())
+                .env(CHILD, "startup")
+                .env("ASTRA_TEST_CASE_DIRECTORY", &case)
+                .env(
+                    "ASTRA_TEST_LOAD_STARTUP_DOTENV",
+                    (!already_explicit).to_string(),
+                )
+                .env(
+                    "ASTRA_EXPECTED_BUILD_GIT_SHA",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .env_remove("ASTRA_TRACE")
+                .env_remove("ASTRA_API_URL")
+                .env_remove("ASTRA_SERVER_CONFIG")
+                .env_remove("ASTRA_CONFIG_SOURCE");
+            if already_explicit {
+                command.env("ASTRA_CONFIG_SOURCE", "explicit-env");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
 
     #[test]
     fn workspace_bin_prefers_only_available_debug_binary() {
