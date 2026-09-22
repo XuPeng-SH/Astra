@@ -9017,6 +9017,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
             &state_session,
             &active_skill_name,
             &active_skill_version.version_id,
+            None,
         )
         .await
         .expect("activate personal skill");
