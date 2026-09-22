@@ -6530,26 +6530,28 @@ mod tests {
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_success_commits_evidence_usage_and_terminal_together() {
         for with_buffer in [false, true] {
-            assert_canonical_terminal_replay(with_buffer, None).await;
+            assert_canonical_terminal_replay(with_buffer, &[]).await;
         }
     }
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_rejects_colliding_evidence_before_settlement() {
-        for event_type in [
-            "user_query",
-            "llm_response",
-            "user_message",
-            "llm_round_completed",
-            "tool_call_started",
-            "tool_call_completed",
-        ] {
-            assert_canonical_terminal_replay(true, Some(event_type)).await;
-        }
+        assert_canonical_terminal_replay(
+            true,
+            &[
+                "user_query",
+                "llm_response",
+                "user_message",
+                "llm_round_completed",
+                "tool_call_started",
+                "tool_call_completed",
+            ],
+        )
+        .await;
     }
 
-    async fn assert_canonical_terminal_replay(with_buffer: bool, collision: Option<&str>) {
+    async fn assert_canonical_terminal_replay(with_buffer: bool, collisions: &[&str]) {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let user_id = Uuid::new_v4().to_string();
@@ -6686,7 +6688,7 @@ mod tests {
             completion_tokens: 17,
             tool_calls: 6,
         };
-        if let Some(event_type) = collision {
+        if !collisions.is_empty() {
             // First capture exact evidence through the ordinary append boundary,
             // where valid siblings remain independent. Inject a hash mismatch
             // without changing identity/content, as with a metadata collision.
@@ -6694,6 +6696,10 @@ mod tests {
                 .persist_core_and_trace_in_transaction(&state)
                 .await
                 .expect("capture evidence before injecting a conflicting hash");
+        }
+        // Reuse the same frozen evidence; every rejected corruption must leave
+        // the run unchanged before restoring it and checking the next event.
+        for &event_type in collisions {
             let event_id: String = sqlx::query_scalar(
                 "SELECT event_id FROM agent_events
                  WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?",
@@ -6764,8 +6770,8 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(terminals, 0);
-            // Restore the fixture; the same state must now commit, replay, and
-            // resolve a lost acknowledgement through the checks below.
+            // Restore this event before the next corruption. Once all variants
+            // reject, the same run must commit, replay, and resolve a lost ack.
             sqlx::query(
                 "UPDATE agent_events SET payload_hash = ? WHERE user_id = ? AND event_id = ?",
             )
