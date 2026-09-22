@@ -3,6 +3,69 @@ use crate::cli::{cli_config::cli_output, session::session_state::SessionState, t
 use astra_runtime::prompts;
 use crossterm::style::Stylize;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedAuthoringRequest {
+    api_origin: String,
+    session_id: String,
+    request: serde_json::Value,
+}
+
+fn save_authoring_request(
+    directory: &std::path::Path,
+    saved: &SavedAuthoringRequest,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let path = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(saved).map_err(|error| error.to_string())?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+async fn resume_authoring_request(
+    path: &std::path::Path,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("Cannot read saved authoring request: {error}"))?;
+    let saved: SavedAuthoringRequest =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if saved
+        .request
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|key| key.trim().is_empty())
+    {
+        return Err("Saved authoring request has no recoverable attempt identity.".into());
+    }
+    if saved.api_origin != api.api_origin() {
+        return Err(
+            "Saved authoring request belongs to a different server; select its original profile."
+                .into(),
+        );
+    }
+    eprintln!("  Resume this attempt: /skill resume {}", path.display());
+    dispatch_authoring_request(&saved, api, token)
+        .await
+        .map_err(|error| {
+            format!(
+                "{error}; resume the same attempt with /skill resume {}",
+                path.display()
+            )
+        })
+}
+
 async fn start_authoring_from_session(
     arg: &str,
     create_new: bool,
@@ -60,12 +123,31 @@ async fn start_authoring_from_session(
             }
         }
     };
-    let body = serde_json::json!({"goal": goal, "create_new": create_new, "target_skill": target});
+    let saved = SavedAuthoringRequest {
+        api_origin: api.api_origin(),
+        session_id: session_id.to_string(),
+        request: serde_json::json!({"goal": goal, "create_new": create_new, "target_skill": target,
+            "idempotency_key": uuid::Uuid::new_v4().to_string()}),
+    };
+    let directory = crate::cli::cli_config::cli_utils::credentials_path()
+        .parent()
+        .ok_or("credentials directory unavailable")?
+        .join("authoring");
+    let path = save_authoring_request(&directory, &saved)?;
+    resume_authoring_request(&path, api, token).await
+}
+
+async fn dispatch_authoring_request(
+    saved: &SavedAuthoringRequest,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<(), String> {
+    let session_id = &saved.session_id;
     let response = api
         .post_bearer_path_json_text(
             token.unwrap_or(""),
             &format!("/harnesses/authoring/{session_id}"),
-            &body,
+            &saved.request,
         )
         .await
         .map_err(|error| format!("Authoring request failed: {error}"))?;
@@ -211,7 +293,12 @@ pub(crate) async fn handle_skill_command(
             eprintln!(
                 "    {}  {}",
                 "/skill create <goal>".magenta(),
-                "Create or improve a capability from this session".dim()
+                "Create a capability from this session".dim()
+            );
+            eprintln!(
+                "    {}  {}",
+                "/skill resume <saved-request-file>".magenta(),
+                "Recover the same generation after interruption".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -1323,6 +1410,9 @@ Follow these steps:
             rollback_skill(sub_arg.trim(), api, token, state).await;
         }
 
+        "resume" => {
+            resume_authoring_request(std::path::Path::new(sub_arg), api, token).await?;
+        }
         "create" | "improve" => {
             start_authoring_from_session(sub_arg, sub == "create", api, token, state).await?;
         }
@@ -2158,7 +2248,7 @@ mod tests {
     mod authoring_tests {
         use super::super::handle_skill_command;
         use crate::cli::session::session_state::SessionState;
-        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         #[tokio::test]
@@ -2167,7 +2257,7 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/harnesses/authoring/session-123"))
                 .and(header("authorization", "Bearer tok"))
-                .and(body_json(serde_json::json!({
+                .and(body_partial_json(serde_json::json!({
                     "goal": "帮我生成一个 review helper", "create_new": true, "target_skill": null
                 })))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2251,7 +2341,7 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/harnesses/authoring/session-123"))
-                .and(body_json(
+                .and(body_partial_json(
                     serde_json::json!({"goal":"Keep examples", "create_new":false,
                     "target_skill":{"skill_name":"review","version_id":"review-v1"}}),
                 ))
@@ -2283,6 +2373,59 @@ mod tests {
             .unwrap_err();
             assert!(selected.contains("Authoring request failed"));
             assert!(state.active_system_skills.is_empty());
+        }
+
+        #[tokio::test]
+        async fn saved_authoring_retries_the_exact_request_after_a_lost_response() {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/authoring/original-session"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(2)
+                .mount(&srv)
+                .await;
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let saved = super::super::SavedAuthoringRequest {
+                api_origin: client.api_origin(),
+                session_id: "original-session".into(),
+                request: serde_json::json!({"goal":"Keep examples", "create_new":false,
+                    "target_skill":{"skill_name":"review", "version_id":"frozen-v1"},
+                    "idempotency_key":uuid::Uuid::new_v4().to_string()}),
+            };
+            let file = super::super::save_authoring_request(directory.path(), &saved).unwrap();
+            for _ in 0..2 {
+                let error = handle_skill_command(
+                    &format!("resume {}", file.display()),
+                    &client,
+                    &mut SessionState::default(),
+                    None,
+                    Some("tok"),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("/skill resume"));
+            }
+            let requests = srv.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].body, requests[1].body);
+            assert_eq!(
+                requests[0].body_json::<serde_json::Value>().unwrap(),
+                saved.request
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let other = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+            let error = super::super::resume_authoring_request(&file, &other, Some("tok"))
+                .await
+                .unwrap_err();
+            assert!(error.contains("different server"));
         }
 
         #[tokio::test]

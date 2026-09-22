@@ -412,3 +412,121 @@ async fn l3_16_s13_seven_version_iteration_append_only_and_structured_switch_bac
         expected_active_version_id: None,
     };
 }
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn activation_capacity_serializes_additions_and_preserves_runnable_replacements() {
+    let pool = setup_pool().await;
+    let store = DatabasePersonalSkillStore::new(pool.clone());
+    let (user_id, prefix) = test_ids();
+    let session_id = format!("session-{}", Uuid::new_v4());
+    insert_session(&pool, &session_id, &user_id).await;
+    let limit = astra_services::personal_skills::MAX_ACTIVE_PERSONAL_SKILLS;
+    let mut versions = Vec::new();
+    for index in 0..=limit {
+        let name = format!("{prefix}-{index}");
+        let version = store
+            .submit_version(&user_id, &name, submit_request("v1", "published"))
+            .await
+            .unwrap();
+        if index < limit - 1 {
+            store
+                .activate_version_with_expected(
+                    &user_id,
+                    &session_id,
+                    &name,
+                    &version.version_id,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        versions.push(version);
+    }
+    let left = &versions[limit - 1];
+    let right = &versions[limit];
+    let (a, b) = tokio::join!(
+        store.activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &left.skill_name,
+            &left.version_id,
+            None
+        ),
+        store.activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &right.skill_name,
+            &right.version_id,
+            None
+        ),
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let rejected = if a.is_err() { left } else { right };
+    let error = a.err().or(b.err()).unwrap();
+    assert!(
+        matches!(error, PersonalSkillError::ActivationLimitReached { .. }),
+        "{error}"
+    );
+    let events_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert!(matches!(
+        store
+            .activate_version_with_expected(
+                &user_id,
+                &session_id,
+                &rejected.skill_name,
+                &rejected.version_id,
+                None
+            )
+            .await,
+        Err(PersonalSkillError::ActivationLimitReached { .. })
+    ));
+    let events_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(
+        events_before, events_after,
+        "rejected activation must not append events"
+    );
+    let before = store
+        .load_active_for_session(&user_id, &session_id)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), limit);
+    let replacement = store
+        .submit_version(
+            &user_id,
+            &versions[0].skill_name,
+            submit_request("v2", "published"),
+        )
+        .await
+        .unwrap();
+    store
+        .activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &replacement.skill_name,
+            &replacement.version_id,
+            Some(&versions[0].version_id),
+        )
+        .await
+        .unwrap();
+    let after = store
+        .load_active_for_session(&user_id, &session_id)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), limit);
+    assert!(
+        after
+            .iter()
+            .any(|active| active.version_id == replacement.version_id)
+    );
+}

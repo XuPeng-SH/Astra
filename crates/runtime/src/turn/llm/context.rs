@@ -3857,7 +3857,7 @@ mod context_cache_contract_tests {
     }
 
     fn external_effect_projection_state() -> crate::turn::agentic_loop::host::AgenticLoopState {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut state = seeded_context_state();
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
                 true,
@@ -4120,8 +4120,14 @@ mod context_cache_contract_tests {
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "gpt-4",
-            context_window: Some(200_000),
-            max_completion_tokens: Some(16_384),
+            context_budget: &crate::prompts::ContextBudget::resolve(
+                Some(200_000),
+                Some(16_384),
+                0.75,
+                6,
+                8_000,
+                crate::prompts::CompactConfig::default(),
+            ),
             cache_capability: None,
             user_content: "change the host file",
             query_source: "test",

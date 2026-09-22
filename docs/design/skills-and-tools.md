@@ -219,6 +219,12 @@ Generating another candidate retains the saved source session and pinned baselin
 validation replay retains the original request identity unchanged. Starting a
 different generation while recovery is pending requires explicitly abandoning recovery; this does not cancel the server task.
 If browser storage fails before dispatch, generation does not start.
+The advanced Harness entry point also retains its exact request/key before dispatch
+and offers explicit recovery after reload. CLI `/skill create` and `/skill improve`
+write a private request file before sending; the printed `/skill resume <file>`
+command replays that request against the original server. The file contains the
+source session and frozen target, never credentials. It remains available after
+success for recovery; starting a new create/improve command is a new attempt.
 The existing run metadata retains the original
 submission request so conversation links can also continue validation. Recovery reads
 authorized run/draft records and refreshes Evaluation bindings before continuing
@@ -320,7 +326,11 @@ writes. Publication does not activate the candidate or alter the pinned baseline
 Explicit use sends the published revision and expected active baseline through
 the existing activation CAS. Conflicts require reading the current version and
 another user action; they never silently overwrite concurrent adoption. Returning
-to the baseline uses the same CAS path.
+to the baseline uses the same CAS path. The current runtime bounds a session to
+64 active personal Skill names. New-name activation enforces that bound under
+the existing session admission lock before writing state or audit events;
+replacing an active version remains allowed at capacity. Rejection leaves the
+previous runnable session unchanged and adds no query to the request hot path.
 
 Database catalog discovery preserves user-owned precedence, then creation order,
 and caches the exact selected record ID. Loading uses that ID so a newer public

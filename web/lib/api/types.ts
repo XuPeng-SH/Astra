@@ -439,6 +439,7 @@ export type HarnessSkillDraft = {
 };
 
 export type SkillifyRunRequest = {
+  idempotency_key?: string;
   session_ids: string[];
   source_files?: Array<{
     file_name: string;

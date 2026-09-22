@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::state_projection::{DatabaseStateProjectionStore, StateProjectionError};
 
+pub const MAX_ACTIVE_PERSONAL_SKILLS: usize = 64;
+
 pub const SKILL_MD_NORMALIZE_VERSION: &str = "skill_md_v1";
 
 #[derive(Debug, Error)]
@@ -60,6 +62,8 @@ pub enum PersonalSkillError {
         session_id: String,
         skill_name: String,
     },
+    #[error("session already has {limit} active personal Skills")]
+    ActivationLimitReached { limit: usize },
     #[error(
         "skill activation changed concurrently: skill={skill_name}, expected={expected:?}, actual={actual:?}"
     )]
@@ -518,6 +522,9 @@ impl DatabasePersonalSkillStore {
                     status,
                 });
             }
+            Err(StateProjectionError::PersonalSkillActivationLimitReached { limit }) => {
+                return Err(PersonalSkillError::ActivationLimitReached { limit });
+            }
             Err(StateProjectionError::PersonalSkillActivationConflict {
                 skill_name,
                 expected,
@@ -561,10 +568,11 @@ impl DatabasePersonalSkillStore {
              WHERE state.user_id = ? AND state.session_id = ?
                AND state.scope = 'session' AND state.category = 'active_skill'
                AND state.status = 'active'
-             ORDER BY state.item_key ASC LIMIT 65",
+             ORDER BY state.item_key ASC LIMIT ?",
         )
         .bind(owner_user_id)
         .bind(session_id)
+        .bind((MAX_ACTIVE_PERSONAL_SKILLS + 1) as u32)
         .fetch_all(self.pool.get())
         .await
         .map_err(|source| PersonalSkillError::Database {
@@ -572,7 +580,7 @@ impl DatabasePersonalSkillStore {
             entity: session_id.to_string(),
             source,
         })?;
-        if rows.len() > 64 {
+        if rows.len() > MAX_ACTIVE_PERSONAL_SKILLS {
             return Err(PersonalSkillError::InvalidActiveProjection {
                 owner_user_id: owner_user_id.to_string(),
                 session_id: session_id.to_string(),

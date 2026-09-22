@@ -38,7 +38,8 @@ fn map_personal_skill_error(error: PersonalSkillError) -> (StatusCode, Json<Erro
         PersonalSkillError::InvalidActiveProjection { .. } => {
             error_response(StatusCode::CONFLICT, error.to_string())
         }
-        PersonalSkillError::ActivationConflict { .. } => {
+        PersonalSkillError::ActivationConflict { .. }
+        | PersonalSkillError::ActivationLimitReached { .. } => {
             error_response(StatusCode::CONFLICT, error.to_string())
         }
         other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),

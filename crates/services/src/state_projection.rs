@@ -96,6 +96,8 @@ pub enum StateProjectionError {
     },
     #[error("personal skill version is not activatable: version={version_id}, status={status}")]
     PersonalSkillVersionNotActivatable { version_id: String, status: String },
+    #[error("session already has {limit} active personal Skills")]
+    PersonalSkillActivationLimitReached { limit: usize },
     #[error(
         "personal skill activation changed concurrently: skill={skill_name}, expected={expected:?}, actual={actual:?}"
     )]
@@ -1092,6 +1094,30 @@ impl DatabaseStateProjectionStore {
                 })?;
             connection.release();
             return Ok(());
+        }
+        // Session write admission above serializes concurrent additions. Replacements
+        // do not consume another slot, and rejected additions write no event or state.
+        if current_active_version.is_none() {
+            let active = sqlx::query(
+                "SELECT item_key FROM session_state_items
+                 WHERE user_id = ? AND session_id = ? AND scope = 'session'
+                   AND category = 'active_skill' AND status = 'active' LIMIT ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(crate::personal_skills::MAX_ACTIVE_PERSONAL_SKILLS as u32)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "check_skill_activation_capacity",
+                entity: session_id.to_string(),
+                source,
+            })?;
+            if active.len() >= crate::personal_skills::MAX_ACTIVE_PERSONAL_SKILLS {
+                return Err(StateProjectionError::PersonalSkillActivationLimitReached {
+                    limit: crate::personal_skills::MAX_ACTIVE_PERSONAL_SKILLS,
+                });
+            }
         }
         let payload = json!({
             "skill_name": skill_name,

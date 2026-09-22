@@ -19,7 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listChats } from '@/lib/api/chats';
 import {
   createSkillifyRun,
@@ -39,6 +39,7 @@ import type {
   HarnessSkillRule,
   HarnessTemplate,
   SkillifyPublishRecord,
+  SkillifyRunRequest,
 } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -102,10 +103,20 @@ function sourceCitationLabel(count: number) {
   return `${count} source citation${count === 1 ? '' : 's'}`;
 }
 
-export function HarnessesPage() {
+export function HarnessesPage({ ownerId, runtimeKey }: { ownerId: string; runtimeKey: string }) {
+  const params = useSearchParams();
+  const storageKey = `astra:harness:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(params.get('runId') ?? '')}`;
+  return <HarnessSession key={storageKey} storageKey={storageKey} />;
+}
+
+function HarnessSession({ storageKey }: { storageKey: string }) {
   const searchParams = useSearchParams();
   const requestedRunId = searchParams.get('runId');
   const requestedDraftId = searchParams.get('draftId');
+  const mounted = useRef(true);
+  const recoveryKey = useRef(storageKey);
+  const [pending, setPending] = useState<SkillifyRunRequest | null>(null);
+  const [recovering, setRecovering] = useState(true);
   const [view, setView] = useState<HarnessView>('catalog');
   const [templates, setTemplates] = useState<HarnessTemplate[]>([]);
   const [nodeCatalog, setNodeCatalog] = useState<HarnessNodeCatalogItem[]>([]);
@@ -160,15 +171,28 @@ export function HarnessesPage() {
   }, [loadInitial]);
 
   useEffect(() => {
-    if (!requestedRunId) return;
     let cancelled = false;
+    mounted.current = true;
+    let recovery: { pending?: SkillifyRunRequest; runId?: string } = {};
+    try {
+      recovery = JSON.parse(window.localStorage.getItem(storageKey) ?? '{}');
+    } catch { /* An explicit authorized result link remains usable without storage. */ }
+    if (recovery.pending) {
+      setPending(recovery.pending); setView('skillify'); setRecovering(false);
+      return () => { mounted.current = false; };
+    }
+    const reference = requestedRunId ?? recovery.runId;
+    if (!reference) {
+      setRecovering(false);
+      return () => { mounted.current = false; };
+    }
     setView('skillify');
     setBusy(true);
     setError(null);
     setRun(null);
     setSkillDrafts([]);
     setPublished([]);
-    void Promise.all([getHarnessRun(requestedRunId), listSkillDrafts(requestedRunId)])
+    void Promise.all([getHarnessRun(reference), listSkillDrafts(reference)])
       .then(([existingRun, drafts]) => {
         if (cancelled) return;
         setRun(existingRun);
@@ -178,9 +202,9 @@ export function HarnessesPage() {
       .catch((reason) => {
         if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load the candidate.');
       })
-      .finally(() => { if (!cancelled) setBusy(false); });
-    return () => { cancelled = true; };
-  }, [requestedRunId, requestedDraftId]);
+      .finally(() => { if (!cancelled) { setBusy(false); setRecovering(false); } });
+    return () => { cancelled = true; mounted.current = false; };
+  }, [requestedRunId, requestedDraftId, storageKey]);
 
   const refreshDrafts = useCallback(async (runId: string) => {
     const drafts = await listSkillDrafts(runId);
@@ -210,27 +234,46 @@ export function HarnessesPage() {
   const startSkillify = useCallback(async () => {
     setError(null);
     setPublished([]);
-    if (selected.length === 0 && sourceFiles.length === 0) {
+    if (!pending && selected.length === 0 && sourceFiles.length === 0) {
       setError('Select at least one session or text file.');
       return;
     }
     setBusy(true);
     try {
-      const created = await createSkillifyRun({
+      const request = pending ?? {
+        idempotency_key: crypto.randomUUID(),
         session_ids: selected,
         source_files: sourceFiles,
         skill_name: skillName.trim() || null,
         topic: topic.trim() || null,
-        target_scope: 'personal',
-      });
+        target_scope: 'personal' as const,
+      };
+      window.localStorage.setItem(recoveryKey.current, JSON.stringify({ pending: request }));
+      setPending(request);
+      const created = await createSkillifyRun(request);
+      if (!mounted.current) return;
       setRun(created);
+      if (created.status === 'running') {
+        setError('原生成任务仍在执行；稍后恢复同一任务以读取结果。');
+        return;
+      }
+      const reference = JSON.stringify({ runId: created.harness_run_id });
+      const nextKey = `${storageKey.slice(0, storageKey.lastIndexOf(':') + 1)}${encodeURIComponent(created.harness_run_id)}`;
+      window.localStorage.setItem(recoveryKey.current, reference);
+      window.localStorage.setItem(nextKey, reference);
+      recoveryKey.current = nextKey;
+      setPending(null);
+      const url = new URL(window.location.href);
+      url.searchParams.set('runId', created.harness_run_id);
+      url.searchParams.delete('draftId');
+      window.history.replaceState(null, '', url);
       await refreshDrafts(created.harness_run_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start Skillify.');
+      if (mounted.current) setError(err instanceof Error ? err.message : 'Failed to start Skillify.');
     } finally {
       setBusy(false);
     }
-  }, [refreshDrafts, selected, skillName, sourceFiles, topic]);
+  }, [refreshDrafts, selected, skillName, sourceFiles, topic, pending, storageKey]);
 
   const decideRule = useCallback(async (
     draft: HarnessSkillDraft,
@@ -411,13 +454,21 @@ export function HarnessesPage() {
           </div>
         ) : null}
 
+        {pending ? <div role="status" className="rounded-card border p-4">
+          已保留原始生成请求。重试会恢复同一次生成，不会使用下面修改后的来源。
+          <Button disabled={busy} onClick={startSkillify}>恢复原生成任务</Button>
+          <Button disabled={busy} onClick={() => {
+            try { window.localStorage.removeItem(recoveryKey.current); setPending(null); }
+            catch { setError('无法清除浏览器恢复记录'); }
+          }}>放弃恢复并新建任务</Button>
+        </div> : null}
         {view === 'catalog' ? (
           <CatalogView templates={templates} onOpenTemplate={openTemplate} onOpenCustom={() => setView('custom')} />
         ) : null}
 
         {view === 'skillify' ? (
           <SkillifyView
-            busy={busy}
+            busy={busy || recovering || !!pending}
             sessions={sessions}
             selected={selected}
             sourceFiles={sourceFiles}
