@@ -354,8 +354,107 @@ pub fn build_comparison_for_plan(
     Ok(report)
 }
 
+// Keep comparisons within a frozen case and repetition; never average away
+// failed trials or silently compare different units.
+fn render_metric_comparisons(
+    report: &ComparisonReport,
+    incomplete_metrics: &BTreeSet<(&str, &str)>,
+    output: &mut String,
+) {
+    let mut pairs = BTreeMap::new();
+    for observation in &report.observations {
+        pairs
+            .entry((&observation.case_id, observation.repetition))
+            .or_insert_with(BTreeMap::new)
+            .insert(&observation.arm, observation);
+    }
+    output.push_str("\n## Measured comparisons\n\nDelta is candidate minus baseline, not a quality verdict. Missing values are not zero. Costs are estimated trial costs, excluding Skill authoring.\n");
+    for ((case_id, repetition), arms) in pairs {
+        let baseline = arms.get(&ComparisonArm::Baseline);
+        let candidate = arms.get(&ComparisonArm::Candidate);
+        output.push_str(&format!(
+            "\n### {} · repetition {repetition}\n\n| Metric (unit) | Baseline | Candidate | Delta |\n| --- | ---: | ---: | ---: |\n",
+            markdown_cell(case_id)
+        ));
+        let status = |trial: Option<&&TrialObservation>| {
+            trial.map_or_else(
+                || "Missing".to_string(),
+                |trial| format!("{:?}", trial.status),
+            )
+        };
+        output.push_str(&format!(
+            "| Trial status | {} | {} | — |\n",
+            status(baseline),
+            status(candidate)
+        ));
+        let metrics: BTreeSet<_> = arms
+            .values()
+            .flat_map(|trial| {
+                trial
+                    .measurements
+                    .iter()
+                    .map(|m| (m.name != "task_success", &m.name, &m.unit))
+            })
+            .collect();
+        for (_, name, unit) in metrics {
+            let [before, after] = [baseline, candidate].map(|trial| {
+                trial.and_then(|trial| {
+                    trial
+                        .measurements
+                        .iter()
+                        .find(|m| &m.name == name && &m.unit == unit)
+                })
+            });
+            let value = |measurement: Option<&Measurement>| {
+                measurement
+                    .filter(|m| m.status == MeasurementStatus::Observed)
+                    .and_then(|m| m.value)
+                    .filter(|value| value.is_finite())
+            };
+            let [before_incomplete, after_incomplete] = [baseline, candidate].map(|trial| {
+                trial.is_some_and(|trial| {
+                    incomplete_metrics.contains(&(trial.trial_id.as_str(), name.as_str()))
+                })
+            });
+            let cell =
+                |measurement: Option<&Measurement>, incomplete: bool| match value(measurement) {
+                    Some(value) if incomplete => format!("{value} (coverage incomplete)"),
+                    Some(value) => value.to_string(),
+                    None => measurement
+                        .map_or_else(|| "Missing".to_string(), |m| format!("{:?}", m.status)),
+                };
+            let delta = match (value(before), value(after)) {
+                (Some(before), Some(after))
+                    if !before_incomplete && !after_incomplete && (after - before).is_finite() =>
+                {
+                    format!("{:+}", after - before)
+                }
+                _ => "—".to_string(),
+            };
+            output.push_str(&format!(
+                "| {} ({}) | {} | {} | {} |\n",
+                markdown_cell(name),
+                markdown_cell(unit),
+                cell(before, before_incomplete),
+                cell(after, after_incomplete),
+                delta
+            ));
+        }
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
 /// Render the same structured report for Markdown or a terminal preview.
-pub fn render_markdown(report: &ComparisonReport) -> String {
+pub fn render_markdown(
+    report: &ComparisonReport,
+    incomplete_metrics: &BTreeSet<(&str, &str)>,
+) -> String {
     let mut output = format!(
         "# Evaluation comparison\n\nBaseline: `{}`  \nCandidate: `{}`  \nCases: {} planned, {} observed (paired: {} cases / {} trial pairs)  \nTrials: {} / {} observed\n\n",
         report.baseline_label,
@@ -383,6 +482,7 @@ pub fn render_markdown(report: &ComparisonReport) -> String {
             output.push_str(&format!("- {item}\n"));
         }
     }
+    render_metric_comparisons(report, incomplete_metrics, &mut output);
     output.push_str("\n## Trials and evidence\n\n");
     for observation in &report.observations {
         output.push_str(&format!(
@@ -398,12 +498,18 @@ pub fn render_markdown(report: &ComparisonReport) -> String {
                 "- measurement `{}`: {:?} {} ({:?})\n",
                 measurement.name, measurement.value, measurement.unit, measurement.status
             ));
+            if let Some(basis) = &measurement.basis {
+                output.push_str(&format!("  - basis: {}\n", markdown_cell(basis)));
+            }
         }
         for item in &observation.evidence {
             output.push_str(&format!(
                 "- evidence `{}` ({:?}, {:?})\n",
                 item.evidence_id, item.kind, item.availability
             ));
+            if let Some(locator) = &item.locator {
+                output.push_str(&format!("  - reference: {}\n", markdown_cell(locator)));
+            }
         }
     }
     output
@@ -461,7 +567,47 @@ mod tests {
         assert_eq!(report.paired_trial_pair_count, 1);
         assert!(report.conclusion.contains("unavailable or unknown"));
         assert_eq!(report.causal_strength, CausalStrength::Unknown);
-        assert!(render_markdown(&report).contains("evidence-case-1"));
+        assert!(render_markdown(&report, &BTreeSet::new()).contains("evidence-case-1"));
+    }
+
+    #[test]
+    fn comparison_table_preserves_pairing_missing_values_and_evidence() {
+        let mut baseline = observation("case|1", ComparisonArm::Baseline, TrialStatus::Completed);
+        baseline.measurements[0].value = Some(120.0);
+        baseline.measurements[0].status = MeasurementStatus::Observed;
+        baseline.measurements[0].basis = Some("provider usage".into());
+        let mut candidate = observation("case|1", ComparisonArm::Candidate, TrialStatus::Failed);
+        candidate.measurements[0].value = Some(80.0);
+        candidate.measurements[0].status = MeasurementStatus::Observed;
+        let mut missing = candidate.clone();
+        missing.repetition = 1;
+        missing.measurements[0].value = None;
+        missing.measurements[0].status = MeasurementStatus::Unavailable;
+        let mut different_unit = candidate.clone();
+        different_unit.repetition = 2;
+        different_unit.measurements[0].unit = "USD".into();
+        let mut baseline_different_unit = baseline.clone();
+        baseline_different_unit.repetition = 2;
+        let report = build_comparison(
+            "old",
+            "new",
+            &[
+                baseline,
+                candidate,
+                missing,
+                baseline_different_unit,
+                different_unit,
+            ],
+        );
+        let rendered = render_markdown(&report, &BTreeSet::new());
+        assert!(rendered.contains("| tokens (tokens) | 120 | 80 | -40 |"));
+        assert!(rendered.contains("| tokens (tokens) | Missing | Unavailable | — |"));
+        assert!(rendered.contains("| tokens (USD) | Missing | 80 | — |"));
+        assert!(rendered.contains("| tokens (tokens) | 120 | Missing | — |"));
+        assert!(rendered.contains("case\\|1 · repetition 0"));
+        assert!(rendered.contains("basis: provider usage"));
+        assert!(rendered.contains("reference: case\\|1"));
+        assert!(rendered.contains("Failed"));
     }
 
     #[test]
@@ -632,7 +778,7 @@ mod tests {
         assert_eq!(report.observed_case_count, 1);
         assert_eq!(report.status_counts.get("completed"), Some(&1));
         assert_eq!(report.status_counts.get("failed"), Some(&1));
-        assert!(render_markdown(&report).contains("baseline"));
+        assert!(render_markdown(&report, &BTreeSet::new()).contains("baseline"));
     }
 
     #[test]

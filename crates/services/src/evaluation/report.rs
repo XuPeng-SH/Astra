@@ -18,7 +18,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 5;
-pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v6";
+pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v7";
 const MAX_REPORT_LABEL_BYTES: usize = 256;
 
 pub fn validate_report_label(name: &str, label: &str) -> Result<(), String> {
@@ -332,68 +332,6 @@ pub fn build_report_artifact(
     }
     let judgment = build_judgment_summary(&experiment.spec, &report.observations)?;
     let observation_refs = observation_refs_by_id.into_values().collect::<Vec<_>>();
-    let mut markdown = render_markdown(&report);
-    markdown.push_str("\n## Task criteria\n\n| Trial | Criterion result |\n| --- | --- |\n");
-    for trial_id in &planned_trial_ids {
-        use super::task_assessment::{TaskAssessmentOutcome, TaskAssessmentUnavailableReason};
-        let result = match assessments
-            .iter()
-            .find(|record| &record.trial_id == trial_id)
-            .map(|record| &record.outcome)
-        {
-            Some(TaskAssessmentOutcome::Pass) => "Pass",
-            Some(TaskAssessmentOutcome::Fail) => "Fail",
-            Some(TaskAssessmentOutcome::Unavailable(
-                TaskAssessmentUnavailableReason::TerminalNotCompleted,
-            )) => "Unavailable: execution did not complete",
-            Some(TaskAssessmentOutcome::Unavailable(
-                TaskAssessmentUnavailableReason::NoTerminalOutput,
-            )) => "Unavailable: no terminal output",
-            Some(TaskAssessmentOutcome::Unavailable(
-                TaskAssessmentUnavailableReason::OutputTooLarge,
-            )) => "Unavailable: output exceeds the frozen verifier limit",
-            Some(TaskAssessmentOutcome::Unavailable(
-                TaskAssessmentUnavailableReason::CodingEvidenceUnavailable,
-            )) => "Unavailable: coding evidence was not durably captured",
-            None => "Not assessed",
-        };
-        markdown.push_str(&format!("| `{trial_id}` | {result} |\n"));
-    }
-    if let Some(judgment) = judgment.as_ref() {
-        markdown.push_str(
-            "\n## Judgment coverage\n\nThe candidate's frozen `skill_auto_route` decision is reported separately from task criteria and run metrics.\n\n",
-        );
-        markdown.push_str(
-            "| Trial | Judgment status | Evidence | Detail |\n| --- | --- | --- | --- |\n",
-        );
-        for trial in &judgment.trials {
-            let status = trial
-                .status
-                .as_ref()
-                .map(|value| format!("{value:?}").to_ascii_lowercase())
-                .unwrap_or_else(|| "missing".to_string());
-            let evidence = if trial.evidence_available {
-                "available"
-            } else {
-                "missing"
-            };
-            let detail = trial
-                .skill_name
-                .as_deref()
-                .or(trial.reason.as_deref())
-                .unwrap_or("");
-            markdown.push_str(&format!(
-                "| `{}` | {} | {} | {} |\n",
-                trial.trial_id, status, evidence, detail
-            ));
-        }
-        if !judgment.missing_trial_ids.is_empty() {
-            markdown.push_str(&format!(
-                "\nMissing judgment outcomes: {}.\n",
-                judgment.missing_trial_ids.join(", ")
-            ));
-        }
-    }
     let mut metric_gaps = Vec::new();
     for trial_id in &planned_trial_ids {
         let observation = report
@@ -454,6 +392,72 @@ pub fn build_report_artifact(
                 expected_unit: unit.into(),
                 reason: reason.into(),
             });
+        }
+    }
+    let incomplete_metrics = metric_gaps
+        .iter()
+        .map(|gap| (gap.trial_id.as_str(), gap.metric.as_str()))
+        .collect();
+    let mut markdown = render_markdown(&report, &incomplete_metrics);
+    markdown.push_str("\n## Task criteria\n\n| Trial | Criterion result |\n| --- | --- |\n");
+    for trial_id in &planned_trial_ids {
+        use super::task_assessment::{TaskAssessmentOutcome, TaskAssessmentUnavailableReason};
+        let result = match assessments
+            .iter()
+            .find(|record| &record.trial_id == trial_id)
+            .map(|record| &record.outcome)
+        {
+            Some(TaskAssessmentOutcome::Pass) => "Pass",
+            Some(TaskAssessmentOutcome::Fail) => "Fail",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::TerminalNotCompleted,
+            )) => "Unavailable: execution did not complete",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::NoTerminalOutput,
+            )) => "Unavailable: no terminal output",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::OutputTooLarge,
+            )) => "Unavailable: output exceeds the frozen verifier limit",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::CodingEvidenceUnavailable,
+            )) => "Unavailable: coding evidence was not durably captured",
+            None => "Not assessed",
+        };
+        markdown.push_str(&format!("| `{trial_id}` | {result} |\n"));
+    }
+    if let Some(judgment) = judgment.as_ref() {
+        markdown.push_str(
+            "\n## Judgment coverage\n\nThe candidate's frozen `skill_auto_route` decision is reported separately from task criteria and run metrics.\n\n",
+        );
+        markdown.push_str(
+            "| Trial | Judgment status | Evidence | Detail |\n| --- | --- | --- | --- |\n",
+        );
+        for trial in &judgment.trials {
+            let status = trial
+                .status
+                .as_ref()
+                .map(|value| format!("{value:?}").to_ascii_lowercase())
+                .unwrap_or_else(|| "missing".to_string());
+            let evidence = if trial.evidence_available {
+                "available"
+            } else {
+                "missing"
+            };
+            let detail = trial
+                .skill_name
+                .as_deref()
+                .or(trial.reason.as_deref())
+                .unwrap_or("");
+            markdown.push_str(&format!(
+                "| `{}` | {} | {} | {} |\n",
+                trial.trial_id, status, evidence, detail
+            ));
+        }
+        if !judgment.missing_trial_ids.is_empty() {
+            markdown.push_str(&format!(
+                "\nMissing judgment outcomes: {}.\n",
+                judgment.missing_trial_ids.join(", ")
+            ));
         }
     }
     markdown.push_str("\n## Metric coverage\n\n");
@@ -751,6 +755,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(gaps.len(), 2);
         assert!(gaps.iter().all(|gap| gap.reason.contains("subtotal")));
+        assert!(artifact.markdown.contains(
+            "| prompt_tokens (tokens) | 0 (coverage incomplete) | 0 (coverage incomplete) | — |"
+        ));
         assert!(artifact.manifest.coverage.evidence_incomplete);
         assert!(
             artifact
@@ -758,6 +765,26 @@ mod tests {
                 .observations
                 .iter()
                 .all(|item| item.measurements[0].value == Some(0.0))
+        );
+
+        observations[0].observation.measurements[0].value = Some(120.0);
+        observations[0].observation.measurements[0].basis =
+            Some("evaluation_inference_evidence.v1".into());
+        observations[1].observation.measurements[0].value = Some(80.0);
+        let partial = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &[],
+            &[],
+            "base",
+            "cand",
+        )
+        .unwrap();
+        assert!(
+            partial
+                .markdown
+                .contains("| prompt_tokens (tokens) | 120 | 80 (coverage incomplete) | — |")
         );
     }
 
@@ -844,6 +871,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(artifact.manifest.assessment_refs.len(), 2);
+        assert!(
+            artifact
+                .markdown
+                .contains("| task_success (boolean) | 0 | 1 | +1 |")
+        );
+        assert!(artifact.markdown.contains("evaluation://assessment/"));
         for (trial, expected) in observations.iter().zip([0.0, 1.0]) {
             let observed = artifact
                 .report

@@ -258,7 +258,19 @@ Reports are derived from persisted trial facts and expose content, behavior,
 and result differences with links to authorized evidence. Measured,
 verified, assessed, inferred, and unavailable facts remain distinct. Missing
 usage or incomplete traces are reported as missing; they are never converted
-to zero. A report can be regenerated without rerunning a trial.
+to zero. A report can be regenerated without rerunning a trial. The shared
+Markdown report includes baseline/candidate metric tables per frozen case and
+repetition, with absolute candidate-minus-baseline deltas only for observed
+values with the same unit and complete metric coverage. Partial usage remains
+labeled as incomplete and receives no delta; missing values remain explicit.
+Per-trial status,
+measurement basis, and evidence locators remain available beneath the tables;
+these references do not imply an automatic causal analysis of the trajectory.
+CLI `/skill create` and `/skill improve` print this report after evaluation,
+instead of the raw report JSON. Standalone Evaluation commands retain their
+structured output. The natural-language `skill_creator` tool still returns a
+prepared candidate and result-page continuation; it does not yet run this
+comparison automatically inside the chat turn.
 
 Private adoption is an explicit compare-and-set against the currently active
 revision. The activation request carries `expected_active_version_id`; `null`

@@ -1,9 +1,5 @@
 use crate::cli::surface::skill_install_status_surface::skill_install_status_surface;
-use crate::cli::{
-    cli_config::{cli_output, cli_utils::print_json_or_raw},
-    session::session_state::SessionState,
-    theme,
-};
+use crate::cli::{cli_config::cli_output, session::session_state::SessionState, theme};
 use astra_runtime::prompts;
 use crossterm::style::Stylize;
 
@@ -109,7 +105,15 @@ async fn start_authoring_from_session(
         )
         .await?;
         eprintln!("  Evaluation report:");
-        print_json_or_raw(&report);
+        let report: astra_services::evaluation::EvaluationReportArtifact =
+            serde_json::from_str(&report)
+                .map_err(|error| format!("Invalid evaluation report: {error}"))?;
+        let width = crossterm::terminal::size()
+            .ok()
+            .map(|(width, _)| width as usize);
+        for line in crate::tui::render_markdown_text_with_width(&report.markdown, width).lines {
+            eprintln!("{line}");
+        }
     }
     eprintln!("  Nothing was activated; publishing/adoption remains an explicit reviewed action.");
     Ok(())
