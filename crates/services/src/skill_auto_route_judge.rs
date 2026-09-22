@@ -175,12 +175,14 @@ pub fn parse_skill_auto_route_response(
     model: &str,
     provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
 ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
-    Ok(parse_skill_auto_route_response_with_status(raw, ctx)?.skill_name)
+    Ok(parse_skill_auto_route_response_with_status(raw, ctx, model, provenance)?.skill_name)
 }
 
 pub fn parse_skill_auto_route_response_with_status(
     raw: &str,
     ctx: &SkillAutoRouteJudgeContext,
+    model: &str,
+    provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
 ) -> Result<SkillAutoRouteParseResult, SkillAutoRouteJudgeError> {
     let request = skill_auto_route_judgment_request(ctx)?;
     let normalized =
@@ -335,6 +337,8 @@ mod tests {
         let uncertain = parse_skill_auto_route_response_with_status(
             r#"{"true":["0"],"uncertain":["1"]}"#,
             &ctx,
+            "chat-fixture",
+            Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         )
         .unwrap();
         assert_eq!(uncertain.status, SkillAutoRouteParseStatus::Uncertain);
