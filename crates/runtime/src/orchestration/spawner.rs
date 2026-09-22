@@ -4801,11 +4801,14 @@ impl DynamicAgentSpawner {
             )
             .map_err(SpawnError::DepthLimitExceeded)?;
         let initial_turns = astra_turn_core::orchestration_spawn_tool::resolve_turn_budget(
-            input.max_turns,
+            input.initial_turns,
             input.complexity.as_deref(),
             agent_def.max_turns,
         );
-        let hard_turn_limit = input.max_turns.map(|turns| turns.max(1));
+        // The model may request an initial checkpoint, but the runtime-owned
+        // renewable budget remains authoritative and is never converted into
+        // a hard execution limit.
+        let hard_turn_limit = None;
         Ok((
             agent_def,
             effective_allowed_tools,

@@ -895,8 +895,6 @@ struct AgentFanoutStartSlot {
     #[serde(default)]
     agent_type: Option<String>,
     #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
     initial_turns: Option<u32>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
@@ -921,8 +919,6 @@ struct AgentFanoutStartSlot {
 struct AgentFanoutDefaults {
     #[serde(default)]
     agent_type: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
     #[serde(default)]
     initial_turns: Option<u32>,
     #[serde(default)]
@@ -987,7 +983,6 @@ const FANOUT_START_FIELDS: &[&str] = &[
 ];
 const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "agent_type",
-    "model",
     "initial_turns",
     "max_output_tokens",
     "complexity",
@@ -1001,7 +996,6 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "description",
     "prompt",
     "agent_type",
-    "model",
     "initial_turns",
     "max_output_tokens",
     "complexity",
@@ -1356,22 +1350,18 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .enumerate()
         .map(|(slot_index, slot)| {
             let slot_id = slot.slot_id.clone();
-            let spawn_args = fanout_slot_spawn_args(
+            let spawn_input = fanout_slot_spawn_input(
                 &input,
                 slot,
                 &group_id,
                 &title,
                 input.target_count,
                 slot_index,
-                tool_call_id.as_deref(),
             );
-            let spawn_input = normalize_agent_spawn_args(&spawn_args)
-                .and_then(|normalized| {
-                    serde_json::from_value::<SpawnAgentInput>(normalized)
-                        .map_err(|error| error.to_string())
-                })
+            spawn_input
+                .validate_fanout_metadata()
                 .map_err(|error| format!("invalid resolved fanout slot {slot_index}: {error}"))?;
-            Ok((slot_index, slot_id, spawn_args, spawn_input))
+            Ok((slot_index, slot_id, spawn_input))
         })
         .collect::<Result<_, String>>()
     {
@@ -1380,7 +1370,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
     };
     let resolved_inputs: Vec<_> = planned_slots
         .iter()
-        .map(|(_, _, _, input)| input.clone())
+        .map(|(_, _, input)| input.clone())
         .collect();
     let spawn_context = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
@@ -1457,15 +1447,17 @@ async fn handle_agent_fanout_start_action_with_deadline(
     let futs: Vec<_> = planned_slots
         .into_iter()
         .zip(preparations)
-        .map(|((slot_index, slot_id, spawn_args, _), preparation)| {
+        .map(|((slot_index, slot_id, spawn_input), preparation)| {
             let capacity_reservation_owner = capacity_reservation_owner.clone();
+            let tool_call_id = tool_call_id.clone();
             Box::pin(async move {
-                let rendered = handle_agent_spawn_action_with_controls(
-                    &spawn_args,
+                let rendered = handle_agent_spawn_input_with_controls(
+                    spawn_input,
                     Some(ctx),
                     SpawnDeadline::Explicit(child_execution_deadline),
                     capacity_reservation_owner.as_deref(),
                     Some(preparation),
+                    tool_call_id,
                 )
                 .await;
                 let rendered_value = parsed_agent_output_or_bounded_error(rendered);
@@ -2290,120 +2282,63 @@ async fn handle_agent_fanout_stop_group_action(
     .to_string()
 }
 
-fn fanout_slot_spawn_args(
+fn fanout_slot_spawn_input(
     input: &AgentFanoutStartInput,
     slot: AgentFanoutStartSlot,
     group_id: &str,
     group_title: &str,
     target_count: usize,
     slot_index: usize,
-    tool_call_id: Option<&str>,
-) -> Value {
-    let mut value = json!({
-        "action": "spawn",
-        "description": slot.description,
-        "prompt": slot.prompt,
-        "fanout_group_id": group_id,
-        "fanout_group_title": group_title,
-        "fanout_target_count": target_count,
-        "fanout_slot_index": slot_index,
-    });
-    let object = value.as_object_mut().expect("object");
+) -> SpawnAgentInput {
     let defaults = input.defaults.as_ref();
-    let initial_turns = slot
-        .initial_turns
-        .or_else(|| defaults.and_then(|defaults| defaults.initial_turns));
-    insert_optional_string(
-        object,
-        "agent_type",
-        slot.agent_type
-            .or_else(|| defaults.and_then(|d| d.agent_type.clone()))
-            .or_else(|| Some("explore".to_string())),
-    );
-    insert_optional_string(
-        object,
-        "model",
-        slot.model
-            .or_else(|| defaults.and_then(|d| d.model.clone())),
-    );
-    insert_optional_u32(object, "initial_turns", initial_turns);
-    insert_optional_u32(
-        object,
-        "max_output_tokens",
-        slot.max_output_tokens
-            .or_else(|| defaults.and_then(|d| d.max_output_tokens)),
-    );
-    insert_optional_string(
-        object,
-        "complexity",
-        slot.complexity
-            .or_else(|| defaults.and_then(|d| d.complexity.clone())),
-    );
-    insert_optional_bool(
-        object,
-        "isolated",
-        slot.isolated.or_else(|| defaults.and_then(|d| d.isolated)),
-    );
-    insert_optional_string(object, "fanout_slot_id", slot.slot_id);
-    if let Some(selection) = slot
-        .model_selection
-        .or_else(|| defaults.and_then(|d| d.model_selection.clone()))
-    {
-        object.insert("model_selection".to_string(), json!(selection));
-    }
-    if let Some(reasoning) = slot
-        .reasoning
-        .or_else(|| defaults.and_then(|d| d.reasoning.clone()))
-    {
-        object.insert("reasoning".to_string(), json!(reasoning));
-    }
-    if let Some(allowed_tools) = slot
-        .allowed_tools
-        .or_else(|| defaults.and_then(|d| d.allowed_tools.clone()))
-    {
-        object.insert("allowed_tools".to_string(), json!(allowed_tools));
-    }
-    if let Some(tool_call_id) = tool_call_id {
-        object.insert(
-            "_tool_call_id".to_string(),
-            Value::String(tool_call_id.to_string()),
-        );
-    }
-    value
-}
+    let trimmed = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let agent_type = slot
+        .agent_type
+        .or_else(|| defaults.and_then(|defaults| defaults.agent_type.clone()))
+        .and_then(|value| trimmed(Some(value)))
+        .unwrap_or_else(|| "explore".to_string());
 
-fn insert_optional_string(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    value: Option<String>,
-) {
-    if let Some(value) = value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        object.insert(key.to_string(), Value::String(value));
+    SpawnAgentInput {
+        description: slot.description,
+        prompt: slot.prompt,
+        agent_type,
+        run_in_background: false,
+        name: None,
+        initial_turns: slot
+            .initial_turns
+            .or_else(|| defaults.and_then(|defaults| defaults.initial_turns)),
+        max_output_tokens: slot
+            .max_output_tokens
+            .or_else(|| defaults.and_then(|defaults| defaults.max_output_tokens)),
+        isolated: slot
+            .isolated
+            .or_else(|| defaults.and_then(|defaults| defaults.isolated))
+            .unwrap_or(false),
+        allowed_tools: slot
+            .allowed_tools
+            .or_else(|| defaults.and_then(|defaults| defaults.allowed_tools.clone())),
+        inherit_prefix: None,
+        complexity: trimmed(
+            slot.complexity
+                .or_else(|| defaults.and_then(|defaults| defaults.complexity.clone())),
+        ),
+        fanout_group_id: Some(group_id.to_string()),
+        fanout_group_title: Some(group_title.to_string()),
+        fanout_target_count: Some(target_count),
+        fanout_slot_index: Some(slot_index),
+        fanout_slot_id: trimmed(slot.slot_id),
+        work_item: None,
+        model_selection: slot
+            .model_selection
+            .or_else(|| defaults.and_then(|defaults| defaults.model_selection.clone())),
+        reasoning: slot
+            .reasoning
+            .or_else(|| defaults.and_then(|defaults| defaults.reasoning.clone())),
     }
-}
-
-fn insert_optional_u32(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<u32>) {
-    if let Some(value) = value {
-        object.insert(key.to_string(), json!(value));
-    }
-}
-
-fn insert_optional_bool(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    value: Option<bool>,
-) {
-    if let Some(value) = value {
-        object.insert(key.to_string(), json!(value));
-    }
-}
-
-fn next_fanout_group_id(ctx: &AgentToolContext) -> String {
-    let id = NEXT_FANOUT_GROUP_ID.fetch_add(1, Ordering::Relaxed);
-    format!("{}-fanout-{id}", ctx.run_id)
 }
 
 async fn find_fanout_group(
@@ -2572,6 +2507,27 @@ async fn handle_agent_spawn_action_with_controls(
         }
     };
 
+    handle_agent_spawn_input_with_controls(
+        input,
+        ctx,
+        deadline_policy,
+        reservation_owner_id,
+        preparation,
+        args.get("_tool_call_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    )
+    .await
+}
+
+async fn handle_agent_spawn_input_with_controls(
+    input: SpawnAgentInput,
+    ctx: Option<&AgentToolContext>,
+    deadline_policy: SpawnDeadline,
+    reservation_owner_id: Option<&str>,
+    preparation: Option<Box<dyn super::spawner::PreparedSpawn>>,
+    spawn_tool_call_id: Option<String>,
+) -> String {
     let ctx = match ctx {
         Some(c) => c,
         None => {
@@ -2660,10 +2616,7 @@ async fn handle_agent_spawn_action_with_controls(
         trace_context: ctx.trace_context.clone(),
         execution_metadata: ctx.execution_metadata.clone(),
         workspace_mutation: ctx.workspace_mutation.get(),
-        spawn_tool_call_id: args
-            .get("_tool_call_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
+        spawn_tool_call_id,
         delegation_chain: child_delegation_chain,
     };
 
@@ -5389,7 +5342,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_slot_spawn_args_carry_group_title_for_ui_projection() {
+    fn fanout_slot_spawn_input_carries_group_title_for_ui_projection() {
         let input = AgentFanoutStartInput {
             _action: Some("start".into()),
             _tool_call_id: None,
@@ -5404,7 +5357,6 @@ mod tests {
             description: "Review storage".into(),
             prompt: "Review storage layer".into(),
             agent_type: None,
-            model: None,
             initial_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -5414,14 +5366,14 @@ mod tests {
             reasoning: None,
         };
 
-        let args = fanout_slot_spawn_args(&input, slot, "review-1", "review fanout", 3, 1, None);
+        let spawn = fanout_slot_spawn_input(&input, slot, "review-1", "review fanout", 3, 1);
 
-        assert_eq!(args["fanout_group_id"], "review-1");
-        assert_eq!(args["fanout_group_title"], "review fanout");
-        assert_eq!(args["fanout_target_count"], 3);
-        assert_eq!(args["fanout_slot_index"], 1);
-        assert_eq!(args["fanout_slot_id"], "storage");
-        assert!(args.get("name").is_none());
+        assert_eq!(spawn.fanout_group_id.as_deref(), Some("review-1"));
+        assert_eq!(spawn.fanout_group_title.as_deref(), Some("review fanout"));
+        assert_eq!(spawn.fanout_target_count, Some(3));
+        assert_eq!(spawn.fanout_slot_index, Some(1));
+        assert_eq!(spawn.fanout_slot_id.as_deref(), Some("storage"));
+        assert!(spawn.name.is_none());
     }
 
     #[test]
@@ -5443,19 +5395,75 @@ mod tests {
         .expect("typed fanout selection");
         let override_input = input.slots.pop().expect("override slot");
         let shared_input = input.slots.pop().expect("shared slot");
-        let shared = fanout_slot_spawn_args(&input, shared_input, "group", "group", 2, 0, None);
-        let override_slot =
-            fanout_slot_spawn_args(&input, override_input, "group", "group", 2, 1, None);
-        assert_eq!(shared["model_selection"]["offering_id"], "shared");
-        assert_eq!(shared["reasoning"]["effort"], "low");
-        assert_eq!(override_slot["model_selection"]["offering_id"], "specific");
-        assert_eq!(override_slot["reasoning"]["mode"], "model_default");
+        let shared = fanout_slot_spawn_input(&input, shared_input, "group", "group", 2, 0);
+        let override_slot = fanout_slot_spawn_input(&input, override_input, "group", "group", 2, 1);
+        assert_eq!(
+            shared
+                .model_selection
+                .as_ref()
+                .map(|value| value.offering_id.as_str()),
+            Some("shared")
+        );
+        assert_eq!(
+            shared.reasoning.as_ref().map(|value| value.config()),
+            Some(astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::Low,
+            })
+        );
+        assert_eq!(
+            override_slot
+                .model_selection
+                .as_ref()
+                .map(|value| value.offering_id.as_str()),
+            Some("specific")
+        );
+        assert_eq!(
+            override_slot.reasoning.as_ref().map(|value| value.config()),
+            Some(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault)
+        );
         assert!(
             serde_json::from_value::<AgentFanoutStartInput>(json!({
                 "action": "start", "target_count": 1,
                 "slots": [{"description": "bad", "prompt": "bad", "model": "unresolved-alias"}]
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn fanout_slot_spawn_input_preserves_agent_type_default_semantics() {
+        let resolved_agent_type = |payload: Value| {
+            let mut input = serde_json::from_value::<AgentFanoutStartInput>(payload)
+                .expect("valid typed fanout");
+            let slot = input.slots.pop().expect("one slot");
+            fanout_slot_spawn_input(&input, slot, "group", "group", 1, 0).agent_type
+        };
+
+        assert_eq!(
+            resolved_agent_type(json!({
+                "target_count": 1,
+                "slots": [{"description": "audit", "prompt": "inspect"}]
+            })),
+            "explore"
+        );
+        assert_eq!(
+            resolved_agent_type(json!({
+                "target_count": 1,
+                "slots": [{
+                    "description": "audit",
+                    "prompt": "inspect",
+                    "agent_type": "  "
+                }]
+            })),
+            "explore"
+        );
+        assert_eq!(
+            resolved_agent_type(json!({
+                "target_count": 1,
+                "defaults": {"agent_type": "  "},
+                "slots": [{"description": "audit", "prompt": "inspect"}]
+            })),
+            "explore"
         );
     }
 
@@ -5482,7 +5490,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_slot_spawn_args_preserve_explicit_deep_review_budget() {
+    fn fanout_slot_spawn_input_preserves_explicit_deep_review_budget() {
         let input = AgentFanoutStartInput {
             _action: Some("start".into()),
             _tool_call_id: None,
@@ -5502,7 +5510,6 @@ mod tests {
             description: "Review correctness".into(),
             prompt: "Review correctness deeply".into(),
             agent_type: None,
-            model: None,
             initial_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -5512,15 +5519,15 @@ mod tests {
             reasoning: None,
         };
 
-        let args = fanout_slot_spawn_args(&input, slot, "review-1", "review fanout", 4, 1, None);
+        let spawn = fanout_slot_spawn_input(&input, slot, "review-1", "review fanout", 4, 1);
 
-        assert_eq!(args["agent_type"], "code-review");
-        assert_eq!(args["complexity"], "deep");
-        assert_eq!(args["initial_turns"], 15);
+        assert_eq!(spawn.agent_type, "code-review");
+        assert_eq!(spawn.complexity.as_deref(), Some("deep"));
+        assert_eq!(spawn.initial_turns, Some(15));
     }
 
     #[test]
-    fn fanout_slot_spawn_args_preserve_explicit_general_purpose_budget() {
+    fn fanout_slot_spawn_input_preserves_explicit_general_purpose_budget() {
         let input = AgentFanoutStartInput {
             _action: Some("start".into()),
             _tool_call_id: None,
@@ -5540,7 +5547,6 @@ mod tests {
             description: "Investigate runtime".into(),
             prompt: "Investigate runtime failures".into(),
             agent_type: None,
-            model: None,
             initial_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -5550,19 +5556,12 @@ mod tests {
             reasoning: None,
         };
 
-        let args = fanout_slot_spawn_args(
-            &input,
-            slot,
-            "investigate-1",
-            "investigation fanout",
-            2,
-            0,
-            None,
-        );
+        let spawn =
+            fanout_slot_spawn_input(&input, slot, "investigate-1", "investigation fanout", 2, 0);
 
-        assert_eq!(args["agent_type"], "general-purpose");
-        assert_eq!(args["complexity"], "light");
-        assert_eq!(args["initial_turns"], 10);
+        assert_eq!(spawn.agent_type, "general-purpose");
+        assert_eq!(spawn.complexity.as_deref(), Some("light"));
+        assert_eq!(spawn.initial_turns, Some(10));
     }
 
     #[test]
@@ -5581,7 +5580,6 @@ mod tests {
             description: "Fetch one source".into(),
             prompt: "Fetch one source and return its URL".into(),
             agent_type: None,
-            model: Some("deepseek-v4-flash".into()),
             initial_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -5591,11 +5589,11 @@ mod tests {
             reasoning: None,
         };
 
-        let args = fanout_slot_spawn_args(&input, slot, "fetch-1", "parallel fetch", 1, 0, None);
+        let spawn = fanout_slot_spawn_input(&input, slot, "fetch-1", "parallel fetch", 1, 0);
 
-        assert_eq!(args["agent_type"], "explore");
+        assert_eq!(spawn.agent_type, "explore");
         assert!(
-            args.get("initial_turns").is_none(),
+            spawn.initial_turns.is_none(),
             "an implicit persona budget must remain a renewable child slice"
         );
     }
@@ -5619,7 +5617,6 @@ mod tests {
             description: "Review correctness".into(),
             prompt: "Review correctness and return evidence".into(),
             agent_type: None,
-            model: None,
             initial_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -5629,17 +5626,16 @@ mod tests {
             reasoning: None,
         };
 
-        let args = fanout_slot_spawn_args(
+        let spawn = fanout_slot_spawn_input(
             &input,
             slot,
             "review-implicit-budget",
             "review fanout",
             3,
             0,
-            None,
         );
 
-        assert!(args.get("initial_turns").is_none());
+        assert!(spawn.initial_turns.is_none());
     }
 
     #[tokio::test]

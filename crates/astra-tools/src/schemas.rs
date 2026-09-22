@@ -2024,7 +2024,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
                                     "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
-                                    "model": {"type": "string"},
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                     "max_output_tokens": {"type": "integer"},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
@@ -2042,7 +2041,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "additionalProperties": false,
                             "properties": {
                                 "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Shared child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
-                                "model": {"type": "string"},
                                 "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                 "max_output_tokens": {"type": "integer"},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
