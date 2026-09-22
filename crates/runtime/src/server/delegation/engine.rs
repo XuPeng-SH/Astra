@@ -870,6 +870,8 @@ pub struct SubRunConfig {
     /// Short-lived execution material inherited from the admitted parent run.
     /// It is sideband state and is never serialized into delegation context.
     pub admitted_model_execution: Option<AdmittedModelExecution>,
+    /// Effective reasoning control frozen for this execution attempt.
+    pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
     /// Effective interaction policy for this exact child invocation. It is
     /// resolved once from the durable parent and carried on the run config so
     /// executors, retries, and descendants cannot invent a new default.
@@ -2413,6 +2415,7 @@ impl DelegationEngine {
             caller_run_id: Some(parent_run_id.to_string()),
             child_provider,
             child_model_id: child_model_id.to_string(),
+            child_thinking: None,
             // Delegate doesn't expose max_output_tokens (agent
             // profile carries max_turns only), so leave None —
             // validate_spawn will skip the thinking-budget clamp
@@ -3383,6 +3386,7 @@ impl DelegationEngine {
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
@@ -3738,6 +3742,7 @@ impl DelegationEngine {
                                 context: ctx,
                                 forward_headers: forward_headers.clone(),
                                 admitted_model_execution: admitted_model_execution.cloned(),
+                                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                                 interaction_mode,
                                 request_constraints: request_constraints.clone(),
                                 recursion_depth: child_recursion_depth,
@@ -3953,6 +3958,7 @@ impl DelegationEngine {
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
@@ -4049,6 +4055,7 @@ impl DelegationEngine {
                             ),
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
+                            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                             interaction_mode,
                             request_constraints: request_constraints.clone(),
                             recursion_depth: child_recursion_depth,
@@ -4265,6 +4272,7 @@ impl DelegationEngine {
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
@@ -4353,6 +4361,7 @@ impl DelegationEngine {
                             ),
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
+                            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                             interaction_mode,
                             request_constraints: request_constraints.clone(),
                             recursion_depth: child_recursion_depth,
@@ -4498,6 +4507,7 @@ impl DelegationEngine {
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
@@ -4757,6 +4767,7 @@ impl DelegationEngine {
                 context: fork_context,
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
@@ -7588,6 +7599,7 @@ mod tests {
             context: HashMap::new(),
             forward_headers: HashMap::new(),
             admitted_model_execution: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             interaction_mode: RequestedTurnInteractionMode::Headless,
             request_constraints: Default::default(),
             recursion_depth: 1,
