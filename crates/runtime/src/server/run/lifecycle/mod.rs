@@ -7845,10 +7845,6 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
-        // The request-derived context starts untrusted. Preserve this proof
-        // only after the selection, resolved identity, and short-lived
-        // execution material have matched at the Server admission boundary.
-        context.model_identity_admitted = true;
         context.work_binding = work_binding.map(ValidatedWorkRuntimeBinding::durable_binding);
         use astra_services::runs::{
             DurableAdmissionSource, ModelAdmissionSource, RuntimeCapabilitySource,
@@ -12694,7 +12690,7 @@ impl AgenticRunLifecycleService {
             return astra_turn_core::thinking_config::ThinkingConfig::from_payload_value(value);
         }
         Ok(model
-            .map(|name| astra_turn_core::thinking_config::resolve_model_thinking(name).1)
+            .map(|name| astra_turn_core::thinking_config::resolve_model_thinking_request(name).1)
             .unwrap_or_default())
     }
     /// Extract edge tools from the request context, or provide empty defaults.
