@@ -609,6 +609,8 @@ impl Default for RunStartContext {
 pub(crate) struct RunGenerationControls {
     pub thinking: ThinkingConfig,
     pub first_output_max_tokens: Option<u32>,
+    /// Whether inference must preserve this effective control against runtime overrides.
+    pub preserve_thinking: bool,
 }
 
 pub(crate) fn durable_run_generation_controls(
@@ -7931,6 +7933,7 @@ mod tests {
                 budget_tokens: 2048,
             },
             first_output_max_tokens: Some(4096),
+            preserve_thinking: true,
         };
         engine
             .start_run_with_context(
@@ -7957,7 +7960,15 @@ mod tests {
         run.events.pop();
 
         run.events[0]["data"]["generation_controls"] = serde_json::json!({
-            "thinking": {"mode": "off"}
+            "thinking": {"mode": "off"},
+            "preserve_thinking": true
+        });
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0] = valid_start.clone();
+
+        run.events[0]["data"]["generation_controls"] = serde_json::json!({
+            "thinking": {"mode": "off"},
+            "first_output_max_tokens": null
         });
         assert!(durable_run_generation_controls(&run).is_err());
         run.events[0] = valid_start;
@@ -7967,7 +7978,8 @@ mod tests {
         assert!(durable_run_generation_controls(&run).is_err());
         run.events[0]["data"]["generation_controls"] = serde_json::json!({
             "thinking": {"mode": "enabled", "budget_tokens": 4096},
-            "first_output_max_tokens": 4096
+            "first_output_max_tokens": 4096,
+            "preserve_thinking": true
         });
         assert!(durable_run_generation_controls(&run).is_err());
 
