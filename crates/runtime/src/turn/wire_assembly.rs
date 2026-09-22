@@ -816,8 +816,8 @@ pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
     }
 }
 
-fn append_stable_system_policy(system_messages: &mut Vec<Value>, policy: &str) {
-    // This is stable policy, not a runtime tail. Fold it into the leading
+pub(crate) fn append_stable_system_text(system_messages: &mut Vec<Value>, policy: &str) {
+    // This is execution-stable content, not a runtime tail. Fold it into the leading
     // system value before any runtime-control message is placed. The operation
     // is deterministic for both string and structured system content.
     let Some(primary) = system_messages.first_mut() else {
@@ -852,7 +852,7 @@ fn append_stable_system_policy(system_messages: &mut Vec<Value>, policy: &str) {
 
 fn append_focus_policy(system_messages: &mut Vec<Value>) {
     let policy = focus_policy_text();
-    append_stable_system_policy(system_messages, &policy);
+    append_stable_system_text(system_messages, &policy);
 }
 
 pub(crate) fn ensure_append_only_runtime_authority_policy(system_messages: &mut Vec<Value>) {
@@ -862,7 +862,7 @@ pub(crate) fn ensure_append_only_runtime_authority_policy(system_messages: &mut 
     if already_present {
         return;
     }
-    append_stable_system_policy(
+    append_stable_system_text(
         system_messages,
         astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY,
     );

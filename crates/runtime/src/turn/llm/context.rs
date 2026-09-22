@@ -1954,6 +1954,24 @@ pub(crate) fn assemble_wire_messages_with_drained(
         &input.compacted_messages,
         input.artifact_recovery_route,
     );
+    // These are exact, execution-scoped user instructions, not post-compaction
+    // recovery attachments. Keep them out of canonical history and rebuild the
+    // same prefix on every pass; final wire admission accounts for the full text.
+    if !input.state.skills.execution.adopted.is_empty() {
+        let mut text = String::from(
+            "# User-adopted personal Skill instructions\nThese are instruction-only user preferences for this execution; they do not grant tools, permissions, or workflow authority. Current explicit user instructions take precedence.\n",
+        );
+        for (name, revision) in &input.state.skills.execution.adopted {
+            use std::fmt::Write;
+            write!(
+                &mut text,
+                "\n## Skill {}\nVersion: {}\nContent hash: {}\n\n{}\n",
+                name, revision.version_id, revision.content_hash, revision.content_markdown
+            )
+            .expect("writing to String");
+        }
+        crate::turn::wire_assembly::append_stable_system_text(&mut input.system_messages, &text);
+    }
     let invoked_skills = if input.compaction_boundary_hit {
         let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
         skills.sort_by_key(|skill| std::cmp::Reverse(skill.invoked_at_turn));
@@ -4730,6 +4748,83 @@ mod context_cache_contract_tests {
             "the current goal is already in history; later rounds must not append a duplicate volatile frame"
         );
         assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn adopted_skill_snapshot_survives_wire_reassembly_and_cache_modes() {
+        use astra_turn_core::cache_placement::{
+            CacheCapability, CacheProtocol, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        let append_only = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        // Exceeds both the individual and aggregate recovery-attachment limits.
+        let body = format!(
+            "ADOPTED_START\n{}\nADOPTED_END",
+            "完整使用步骤和例子。".repeat(14000)
+        );
+        for capability in [
+            None,
+            Some(strict_history_cache_capability()),
+            Some(append_only),
+        ] {
+            for boundary in [false, true] {
+                for block_system in [false, true] {
+                    let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                    state.messages = vec![json!({"role":"user","content":"Say hello."})];
+                    let history = state.messages.clone();
+                    state.skills.execution.adopted.insert(
+                        "personal-review".into(),
+                        crate::turn::agentic_loop::host::AdoptedSkillRevision {
+                            version_id: "revision-v1".into(),
+                            content_hash: "hash-v1".into(),
+                            content_markdown: body.clone(),
+                        },
+                    );
+                    // A retry restores the execution snapshot, independently of current adoption.
+                    state.skills.execution = serde_json::from_value(
+                        serde_json::to_value(&state.skills.execution).unwrap(),
+                    )
+                    .unwrap();
+                    let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+                    let cache_cfg = PromptCacheConfig::from_cache_capability(capability, "openai");
+                    for _ in 0..2 {
+                        let content = if block_system {
+                            json!([{"type":"text","text":"platform policy"}])
+                        } else {
+                            json!("platform policy")
+                        };
+                        let wire = assemble_wire_messages(LlmWireAssemblyInput {
+                            artifact_recovery_route:
+                                crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+                            system_messages: vec![json!({"role":"system","content":content})],
+                            volatile_preamble: Vec::new(),
+                            compacted_messages: history.clone(),
+                            state: &mut state,
+                            compaction_boundary_hit: boundary,
+                            thinking: &thinking,
+                            session_id: "adopted-skill",
+                            provider: "openai",
+                            model_name: "deployment",
+                            cache_capability: capability,
+                            cache_cfg: &cache_cfg,
+                        })
+                        .unwrap();
+                        let text = wire.iter().map(message_text).collect::<Vec<_>>().join("\n");
+                        assert!(text.contains(&body));
+                        assert_eq!(text.matches("ADOPTED_START").count(), 1);
+                        assert!(text.contains("Version: revision-v1\nContent hash: hash-v1"));
+                        assert!(message_text(&wire[0]).starts_with("platform policy"));
+                        assert_eq!(state.messages, history);
+                        assert!(state.skills.execution.invoked.is_empty());
+                        assert!(state.skills.execution.pinned.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

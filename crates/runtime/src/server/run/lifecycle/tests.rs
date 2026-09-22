@@ -1,3 +1,6 @@
+#[path = "personal_skill_delivery_tests.rs"]
+mod personal_skill_delivery_tests;
+
 use super::*;
 
 #[path = "trace_ingestion_tests.rs"]
@@ -400,44 +403,6 @@ fn completed_run_with_closed_empty_ledger_remains_completed() {
         AgenticRunLifecycleService::finalize_run_events(outcome, Vec::new(), &state);
     assert_eq!(status, RunStatus::Completed);
     assert_eq!(error, None);
-}
-
-#[test]
-fn active_personal_skill_is_installed_as_exact_runtime_content() {
-    let svc = test_service();
-    let request = test_request("use the active skill");
-    let mut state =
-        svc.build_initial_state("owner-a", &request, "session-a", "run-a", None, None, None);
-    install_active_personal_skills(
-        &mut state,
-        vec![astra_services::ActivePersonalSkillRecord {
-            skill_name: "review-exact".to_string(),
-            version_id: "version-exact".to_string(),
-            version: "1.0.0".to_string(),
-            content_hash: "sha256:exact".to_string(),
-            content_markdown: "EXACT PERSONAL SKILL CONTENT".to_string(),
-        }],
-    );
-
-    let invoked = state
-        .skills
-        .execution
-        .invoked
-        .get("review-exact")
-        .expect("active personal skill must be in runtime prompt attachments");
-    assert_eq!(invoked.content, "EXACT PERSONAL SKILL CONTENT");
-    assert!(state.skills.execution.pinned.contains("review-exact"));
-    assert_eq!(
-        state
-            .skills
-            .execution
-            .revision_identities
-            .get("review-exact"),
-        Some(&crate::turn::agentic_loop::host::SkillRevisionIdentity {
-            version_id: "version-exact".to_string(),
-            content_hash: "sha256:exact".to_string(),
-        })
-    );
 }
 
 #[test]
@@ -24802,6 +24767,14 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             invoked_at_turn: 7,
             reentry_count: 2,
             execution_topology: None,
+        },
+    );
+    facts.original.skill_execution.adopted.insert(
+        "personal-review".into(),
+        crate::turn::agentic_loop::host::AdoptedSkillRevision {
+            version_id: "original-v1".into(),
+            content_hash: "original-hash".into(),
+            content_markdown: "Original adopted instructions, frozen before retry.".into(),
         },
     );
     let expected_skills = serde_json::to_value(&facts.original.skill_execution).unwrap();

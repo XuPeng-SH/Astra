@@ -332,6 +332,16 @@ the existing session admission lock before writing state or audit events;
 replacing an active version remains allowed at capacity. Rejection leaves the
 previous runnable session unchanged and adds no query to the request hot path.
 
+Each execution freezes the adopted personal Skill bodies and revision identities.
+The shared wire assembler appends these complete instruction-only snapshots to the
+leading system context before provider cache annotation, on ordinary requests as
+well as after compaction. They are not tool invocations and do not suppress workflow
+routing. Checkpoint continuation retains the execution's snapshot; a new execution
+uses the currently adopted revisions. Bodies are not recovery attachments and are
+never truncated to attachment limits. Final wire budget validation either admits
+the complete instructions or fails before provider execution. Adoption grants no
+tools, permissions, or workflow authority.
+
 Database catalog discovery preserves user-owned precedence, then creation order,
 and caches the exact selected record ID. Loading uses that ID so a newer public
 version cannot replace a private override. This adds no per-turn database reads.

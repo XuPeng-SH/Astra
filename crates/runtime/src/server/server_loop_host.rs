@@ -25287,6 +25287,14 @@ mod tests {
                 execution_topology: None,
             },
         );
+        state.skills.execution.adopted.insert(
+            "personal-review".into(),
+            crate::turn::agentic_loop::host::AdoptedSkillRevision {
+                version_id: "frozen-v1".into(),
+                content_hash: "frozen-hash".into(),
+                content_markdown: "USER_ADOPTED_REVIEW_INSTRUCTIONS".into(),
+            },
+        );
         for index in 0..10 {
             state.messages.push(json!({
                 "role": "user",
@@ -25340,6 +25348,14 @@ mod tests {
             "the rebuilt candidate must carry one bounded skill recovery attachment"
         );
         assert!(message_text(skill_attachments[0]).contains("review instructions"));
+        let full_wire = wire.iter().map(message_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            full_wire
+                .matches("USER_ADOPTED_REVIEW_INSTRUCTIONS")
+                .count(),
+            1
+        );
+        assert!(full_wire.contains("Version: frozen-v1\nContent hash: frozen-hash"));
     }
 
     #[test]

@@ -4083,29 +4083,19 @@ fn install_active_personal_skills(
     state: &mut AgenticLoopState,
     active_skills: Vec<astra_services::ActivePersonalSkillRecord>,
 ) {
-    for skill in active_skills {
-        let skill_name = skill.skill_name;
-        let revision_id = skill.version_id;
-        let content_hash = skill.content_hash;
-        state.skills.execution.pinned.insert(skill_name.clone());
-        state.skills.execution.invoked.insert(
-            skill_name.clone(),
-            crate::turn::skill_tool::InvokedSkill {
-                name: skill_name.clone(),
-                content: skill.content_markdown,
-                invoked_at_turn: state.current_session_turn_number(),
-                reentry_count: 0,
-                execution_topology: None,
-            },
-        );
-        state.skills.execution.revision_identities.insert(
-            skill_name,
-            crate::turn::agentic_loop::host::SkillRevisionIdentity {
-                version_id: revision_id,
-                content_hash,
-            },
-        );
-    }
+    state.skills.execution.adopted = active_skills
+        .into_iter()
+        .map(|skill| {
+            (
+                skill.skill_name,
+                crate::turn::agentic_loop::host::AdoptedSkillRevision {
+                    version_id: skill.version_id,
+                    content_hash: skill.content_hash,
+                    content_markdown: skill.content_markdown,
+                },
+            )
+        })
+        .collect();
 }
 
 fn normalize_allowlist_entry(entry: &str, field: &str) -> Result<String, String> {
