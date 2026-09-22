@@ -12,6 +12,8 @@ impl IntrospectReport {
             "schema": "astra-introspect-model-projection-v1",
             "tool": "introspect",
             "snapshot_boundary": "before_current_introspect_execution",
+            "evidence_revision": self.evidence_revision,
+            "covered_facets": self.covered_facets,
             "recovery": "Inspect further only for needed evidence. Another introspect call creates a new snapshot, not the remainder of this one.",
             "observations": [],
             "evidence": [],
@@ -27,6 +29,18 @@ impl IntrospectReport {
                 .as_array_mut()
                 .unwrap()
                 .push(json!("semantic_judgments"));
+        }
+        if self.tool_result_judgments.is_some() {
+            projected["projection_budget"]["omitted_fields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("tool_result_judgments"));
+        }
+        if self.judgment_usage.is_some() {
+            projected["projection_budget"]["omitted_fields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("judgment_usage"));
         }
         self.update_projection_counts(&mut projected);
         assert!(
@@ -63,7 +77,17 @@ impl IntrospectReport {
             .sort_by_key(|observation| std::cmp::Reverse(observation_priority_key(observation)));
         // Give the most important fitting observation priority over the runtime frame.
         let mut frame_attempted = false;
+        let mut usage_attempted = false;
         for observation in observations {
+            if !usage_attempted
+                && !matches!(
+                    observation.severity.as_str(),
+                    "critical" | "error" | "warning"
+                )
+            {
+                self.fit_judgment_usage(&mut projected, max_chars);
+                usage_attempted = true;
+            }
             // Try one complete supporting evidence unit at a time. An oversized
             // first reference must not hide a critical fact supported elsewhere.
             let supports = if observation.evidence_refs.is_empty() {
@@ -108,7 +132,7 @@ impl IntrospectReport {
                     continue;
                 }
                 projected = candidate;
-                if !frame_attempted {
+                if usage_attempted && !frame_attempted {
                     self.fit_field(
                         &mut projected,
                         "runtime_feedback",
@@ -119,6 +143,9 @@ impl IntrospectReport {
                 }
                 break;
             }
+        }
+        if !usage_attempted {
+            self.fit_judgment_usage(&mut projected, max_chars);
         }
         if !frame_attempted {
             self.fit_field(
@@ -139,6 +166,14 @@ impl IntrospectReport {
                 &mut projected,
                 "semantic_judgments",
                 json!(semantics),
+                max_chars,
+            );
+        }
+        if let Some(judgments) = &self.tool_result_judgments {
+            self.fit_field(
+                &mut projected,
+                "tool_result_judgments",
+                json!(judgments),
                 max_chars,
             );
         }
@@ -164,6 +199,11 @@ impl IntrospectReport {
                 projected = candidate;
             }
         }
+        // Source coverage is not automatically model-visible: the final
+        // projection may omit every observation for a facet. Recompute the
+        // marker from retained semantic units so downstream reuse logic never
+        // treats budgeted-away detail as delivered evidence.
+        projected["covered_facets"] = json!(projected_covered_facets(self, &projected));
         projected.to_string()
     }
 
@@ -176,6 +216,37 @@ impl IntrospectReport {
             .retain(|field| field != name);
         if fits(&candidate, max_chars) {
             *projected = candidate;
+        }
+    }
+
+    fn fit_judgment_usage(&self, projected: &mut Value, max_chars: usize) {
+        let Some(usage) = &self.judgment_usage else {
+            return;
+        };
+        // Reuse ledger totals, including their unknown/partial coverage. The
+        // model budget removes detail; it must never recompute aggregate usage
+        // from whichever attempts or groups happen to fit.
+        let mut compact = usage.clone();
+        compact.omitted_attempts = compact
+            .omitted_attempts
+            .saturating_add(compact.attempts.len());
+        compact.attempts.clear();
+        compact.omitted_groups = compact.omitted_groups.saturating_add(compact.groups.len());
+        compact.groups.clear();
+        self.fit_field(projected, "judgment_usage", json!(compact), max_chars);
+        if projected.get("judgment_usage").is_none() {
+            return;
+        }
+        for group in &usage.groups {
+            let mut candidate = compact.clone();
+            candidate.groups.push(group.clone());
+            candidate.omitted_groups = candidate.omitted_groups.saturating_sub(1);
+            let mut with_group = projected.clone();
+            with_group["judgment_usage"] = json!(candidate);
+            if fits(&with_group, max_chars) {
+                compact = candidate;
+                *projected = with_group;
+            }
         }
     }
 
@@ -198,11 +269,164 @@ fn fits(value: &Value, max_chars: usize) -> bool {
     value.to_string().chars().count() <= max_chars
 }
 
+fn projected_covered_facets(report: &IntrospectReport, projected: &Value) -> Vec<String> {
+    let Some(observations) = projected.get("observations").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(evidence) = projected.get("evidence").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    report
+        .covered_facets
+        .iter()
+        .filter(|facet| {
+            let source_for_facet = report
+                .observations
+                .iter()
+                .filter(|observation| observation.facet == **facet)
+                .collect::<Vec<_>>();
+            let retained_for_facet = observations
+                .iter()
+                .filter(|observation| {
+                    observation.get("facet").and_then(Value::as_str) == Some(facet.as_str())
+                })
+                .collect::<Vec<_>>();
+            if source_for_facet.is_empty() || source_for_facet.len() != retained_for_facet.len() {
+                return false;
+            }
+            source_for_facet.iter().all(|source| {
+                let Some(retained) = retained_for_facet.iter().find(|candidate| {
+                    candidate.get("ref_id").and_then(Value::as_str) == Some(source.ref_id.as_str())
+                }) else {
+                    return false;
+                };
+                source.evidence_refs.iter().all(|reference| {
+                    retained
+                        .get("evidence_refs")
+                        .and_then(Value::as_array)
+                        .is_some_and(|references| {
+                            references
+                                .iter()
+                                .any(|candidate| candidate.as_str() == Some(reference.as_str()))
+                        })
+                        && evidence.iter().any(|candidate| {
+                            candidate.get("ref_id").and_then(Value::as_str)
+                                == Some(reference.as_str())
+                        })
+                })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::introspect::{IntrospectRequest, IntrospectSnapshot, build_introspect_report};
     use crate::tool::result::sanitize::INTROSPECT_MODEL_RESULT_CHARS;
+
+    #[test]
+    fn ledger_summary_survives_oversized_evidence_without_recounting_groups() {
+        use crate::introspect::{JudgmentUsageCoverage, JudgmentUsageGroup, JudgmentUsageSnapshot};
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        for evidence in &mut report.evidence {
+            evidence.summary = "large evidence ".repeat(2_000);
+        }
+        report.judgment_usage = Some(JudgmentUsageSnapshot {
+            coverage: JudgmentUsageCoverage::Available,
+            observed_attempts: Some(3),
+            known_input_tokens: Some(1234),
+            known_output_tokens: Some(0),
+            input_complete: false,
+            output_complete: true,
+            omitted_attempts: 3,
+            groups: vec![JudgmentUsageGroup {
+                provider: "typesafe".into(),
+                offering_id: "offering".into(),
+                model: "jev".into(),
+                purpose: "tool_result_rerank".into(),
+                operation: "tool_result_rerank".into(),
+                attempts: 3,
+                known_input_tokens: 1234,
+                known_output_tokens: 0,
+                input_observed: true,
+                output_observed: true,
+                input_complete: false,
+                output_complete: true,
+            }],
+            ..Default::default()
+        });
+        let original = serde_json::to_value(&report).unwrap();
+        let text = report.model_projection(INTROSPECT_MODEL_RESULT_CHARS);
+        let projection: Value = serde_json::from_str(&text).unwrap();
+        let usage = &projection["judgment_usage"];
+        assert_eq!(usage["known_input_tokens"], 1234);
+        assert_eq!(usage["known_output_tokens"], 0);
+        assert_eq!(usage["input_complete"], false);
+        assert_eq!(usage["output_complete"], true);
+        assert_eq!(usage["observed_attempts"], 3);
+        assert_eq!(usage["groups"][0]["operation"], "tool_result_rerank");
+        assert!(
+            !projection["projection_budget"]["omitted_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("judgment_usage"))
+        );
+        assert!(text.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
+        assert_eq!(serde_json::to_value(&report).unwrap(), original);
+    }
+
+    #[test]
+    fn unavailable_usage_and_display_omission_remain_distinct() {
+        use crate::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        report.judgment_usage = Some(JudgmentUsageSnapshot::unavailable(
+            JudgmentUsageCoverage::SourceExcluded,
+        ));
+        let full: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert_eq!(full["judgment_usage"]["coverage"], "source_excluded");
+        assert!(full["judgment_usage"]["known_input_tokens"].is_null());
+        let mut narrow = json!({"projection_budget":{"omitted_fields":["judgment_usage"]}});
+        report.fit_judgment_usage(&mut narrow, 100);
+        assert!(narrow.get("judgment_usage").is_none());
+        assert_eq!(
+            narrow["projection_budget"]["omitted_fields"],
+            json!(["judgment_usage"])
+        );
+    }
+
+    #[test]
+    fn warning_and_auxiliary_totals_precede_large_runtime_frame() {
+        use crate::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        report.observations.truncate(1);
+        report.observations[0].severity = "warning".into();
+        report.observations[0].summary = "Provider evidence is partial".into();
+        report.observations[0].evidence_refs.clear();
+        report.runtime_feedback = Some(crate::introspect::test_runtime_feedback(3, 3, 0));
+        report.judgment_usage = Some(JudgmentUsageSnapshot {
+            coverage: JudgmentUsageCoverage::Available,
+            observed_attempts: Some(1),
+            known_input_tokens: Some(321),
+            known_output_tokens: Some(17),
+            ..Default::default()
+        });
+        let result: Value = serde_json::from_str(&report.model_projection(2400)).unwrap();
+        assert_eq!(result["observations"][0]["severity"], "warning");
+        assert_eq!(result["judgment_usage"]["known_input_tokens"], 321);
+        assert_eq!(result["judgment_usage"]["known_output_tokens"], 17);
+    }
 
     #[test]
     fn projection_prioritizes_critical_evidence_and_preserves_reference_closure() {
@@ -256,6 +480,66 @@ mod tests {
             report.observations.len() - result["observations"].as_array().unwrap().len()
         );
         assert_eq!(serde_json::to_value(&report).unwrap(), before);
+    }
+
+    #[test]
+    fn projection_does_not_claim_coverage_when_all_observations_are_omitted() {
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        report.covered_facets = vec!["overview".into()];
+        report.observations.clear();
+
+        let projected: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert_eq!(projected["covered_facets"], json!([]));
+    }
+
+    #[test]
+    fn projection_does_not_claim_coverage_for_partial_facet_retention() {
+        let mut report = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        let facet = report.observations[0].facet.clone();
+        let mut omitted = report.observations[0].clone();
+        omitted.ref_id = "urn:observation:omitted".into();
+        omitted.summary = "complete detail".into();
+        report.observations.push(omitted);
+        report.covered_facets = vec![facet.clone()];
+
+        let complete: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert_eq!(
+            complete["observations"].as_array().unwrap().len(),
+            report.observations.len()
+        );
+        assert_eq!(complete["covered_facets"], json!([facet.clone()]));
+
+        report.observations[1].summary = "oversized detail ".repeat(2_000);
+        let partial: Value =
+            serde_json::from_str(&report.model_projection(INTROSPECT_MODEL_RESULT_CHARS)).unwrap();
+        assert_eq!(partial["covered_facets"], json!([]));
+        assert_eq!(partial["observations"].as_array().unwrap().len(), 1);
+
+        let mut missing_support = build_introspect_report(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+        );
+        let facet = missing_support.observations[0].facet.clone();
+        let mut extra_evidence = missing_support.evidence[0].clone();
+        extra_evidence.ref_id = "urn:evidence:required-but-omitted".into();
+        missing_support.evidence.push(extra_evidence);
+        missing_support.observations[0]
+            .evidence_refs
+            .push("urn:evidence:required-but-omitted".into());
+        missing_support.covered_facets = vec![facet];
+
+        let missing: Value =
+            serde_json::from_str(&missing_support.model_projection(INTROSPECT_MODEL_RESULT_CHARS))
+                .unwrap();
+        assert_eq!(missing["covered_facets"], json!([]));
     }
 
     #[test]

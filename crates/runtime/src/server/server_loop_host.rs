@@ -72,7 +72,6 @@ use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_config::user_profile::WorkLifecycleIntent;
 use astra_core::SharedPool;
-use astra_services::AdmittedModelExecution;
 use astra_services::multi_agent::EdgeDispatchService;
 #[cfg(test)]
 use astra_services::runs::ExecutionTimeBudget;
@@ -80,6 +79,7 @@ use astra_services::runs::{
     RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
 };
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+use astra_services::{AdmittedModelExecution, SessionArtifactStore};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
@@ -1330,22 +1330,26 @@ fn auxiliary_llm_policy_label() -> &'static str {
     AuxiliaryLlmPolicy::from_env().as_label()
 }
 
-/// Work admission is the semantic lifecycle classifier. The adaptive default
-/// starts one bounded decision beside every eligible unbound primary Auto
-/// turn. `boundary_only` is the explicit lower-latency opt-out that waits for
-/// an effect/topology boundary. A provider `start_work` carrier is a typed
-/// payload; any available decision is settled before canonical admission.
-/// With no configured judge or no usable result, normal typed admission remains.
+/// Work admission is the semantic lifecycle classifier. The capacity-aware
+/// default spends a bounded decision at an existing typed effect/topology
+/// boundary, where the result has an immediate admission consumer. It does
+/// not speculate beside an ordinary unbound primary turn. `always` is the
+/// explicit high-frequency mode for deployments that want that speculation;
+/// `boundary_only` additionally suppresses unrelated optional auxiliaries.
+/// A provider `start_work` carrier is a typed payload; any available decision
+/// is settled before canonical admission. With no configured judge or no
+/// usable result, normal typed admission remains.
 fn should_skip_work_admission_judge(
     admission_boundary: bool,
-    _topology_boundary: bool,
+    topology_boundary: bool,
 ) -> Option<&'static str> {
     match AuxiliaryLlmPolicy::from_env() {
-        AuxiliaryLlmPolicy::BoundaryOnly if admission_boundary => None,
+        AuxiliaryLlmPolicy::BoundaryOnly if admission_boundary || topology_boundary => None,
         AuxiliaryLlmPolicy::BoundaryOnly => Some("ordinary_primary_turn"),
         AuxiliaryLlmPolicy::Disabled => Some("disabled"),
         AuxiliaryLlmPolicy::Always => None,
-        AuxiliaryLlmPolicy::CapacityAware => None,
+        AuxiliaryLlmPolicy::CapacityAware if admission_boundary || topology_boundary => None,
+        AuxiliaryLlmPolicy::CapacityAware => Some("ordinary_primary_turn"),
     }
 }
 
@@ -2165,6 +2169,10 @@ fn classification_response_failure(
 struct ClassificationObservation {
     fact: astra_turn_types::SemanticJudgmentFactV1,
     diagnostic: Option<Value>,
+    /// Actual durable execution returned by the summary adapter for this
+    /// stage. This stays beside the redacted semantic fact; the persisted
+    /// trace only carries the bounded invocation identity.
+    execution: Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
     interrupted: bool,
 }
 
@@ -2185,6 +2193,7 @@ impl ClassificationObservationGuard {
             astra_services::TurnIntentJudgeError,
         >,
         received_failure: Option<astra_turn_types::SemanticJudgmentUnavailableReasonV1>,
+        execution: Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
     ) {
         self.completed = true;
         let diagnostic = match result {
@@ -2211,6 +2220,7 @@ impl ClassificationObservationGuard {
             observations.push(ClassificationObservation {
                 fact,
                 diagnostic,
+                execution,
                 interrupted: false,
             });
         }
@@ -2237,6 +2247,7 @@ impl Drop for ClassificationObservationGuard {
                     },
                 },
                 diagnostic: None,
+                execution: None,
                 interrupted: true,
             });
         }
@@ -2291,6 +2302,33 @@ impl WorkAdmissionTimingBuffer {
                 .as_millis() as u64,
             outcome,
         });
+    }
+}
+
+struct ResolvedJudgmentRoute {
+    config: ResolvedTurnLlmConfig,
+    execution: astra_services::AdmittedModelExecution,
+}
+
+fn tool_result_not_dispatched_reason(
+    reason: JudgmentClientUnavailable,
+) -> astra_turn_types::ToolResultSelectionNotDispatchedReasonV1 {
+    match reason {
+        JudgmentClientUnavailable::NoOffering => {
+            astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::NoOffering
+        }
+        JudgmentClientUnavailable::InvalidRequest => {
+            astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::InvalidRequest
+        }
+        JudgmentClientUnavailable::OutputBudget => {
+            astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::OutputBudget
+        }
+        JudgmentClientUnavailable::RouteUnavailable => {
+            astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::RouteUnavailable
+        }
+        JudgmentClientUnavailable::DurableMaterialUnavailable => {
+            astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::DurableMaterialUnavailable
+        }
     }
 }
 
@@ -2659,6 +2697,7 @@ impl SummaryClientWorkAdmissionJudge {
             completed: false,
         };
         let mut received_failure = None;
+        let mut initial_execution = None;
         let initial = async {
             let response = self
                 .summarize(
@@ -2667,12 +2706,16 @@ impl SummaryClientWorkAdmissionJudge {
                     &astra_services::work_admission_classification_messages(&request),
                 )
                 .await?;
+            // Capture the durable identity before validating or parsing the
+            // response. A malformed/failed structured result can still have
+            // consumed a real provider invocation.
+            initial_execution = response.execution.clone();
             received_failure = classification_response_failure(&response);
             Self::require_completed(&response)?;
             astra_services::parse_work_admission_classification(&request, &response.text)
         }
         .await;
-        initial_observation.complete(&initial, received_failure);
+        initial_observation.complete(&initial, received_failure, initial_execution);
         let classification = match initial {
             Err(error @ astra_services::TurnIntentJudgeError::Uncertain { .. }) => {
                 let Some(clarification) =
@@ -2697,6 +2740,7 @@ impl SummaryClientWorkAdmissionJudge {
                     completed: false,
                 };
                 let mut received_failure = None;
+                let mut clarification_execution = None;
                 let result = async {
                     let clarified = self
                         .summarize(
@@ -2705,6 +2749,7 @@ impl SummaryClientWorkAdmissionJudge {
                             &astra_services::work_admission_classification_messages(&clarification),
                         )
                         .await?;
+                    clarification_execution = clarified.execution.clone();
                     received_failure = classification_response_failure(&clarified);
                     Self::require_completed(&clarified)?;
                     astra_services::parse_work_admission_clarification(
@@ -2714,7 +2759,11 @@ impl SummaryClientWorkAdmissionJudge {
                     )
                 }
                 .await;
-                clarification_observation.complete(&result, received_failure);
+                clarification_observation.complete(
+                    &result,
+                    received_failure,
+                    clarification_execution,
+                );
                 result?
             }
             result => result?,
@@ -3563,8 +3612,12 @@ fn explain_analyze_tool_name(event: &Value) -> &str {
 }
 
 fn bounded_explain_analyze_label(prefix: &str, name: &str) -> String {
+    bounded_explain_analyze_text(&format!("{prefix} {name}"))
+}
+
+fn bounded_explain_analyze_text(value: &str) -> String {
     const MAX_LABEL_BYTES: usize = 160;
-    let mut label = format!("{prefix} {name}");
+    let mut label = value.to_string();
     if label.len() > MAX_LABEL_BYTES {
         let mut boundary = MAX_LABEL_BYTES - '…'.len_utf8();
         while !label.is_char_boundary(boundary) {
@@ -3574,6 +3627,27 @@ fn bounded_explain_analyze_label(prefix: &str, name: &str) -> String {
         label.push('…');
     }
     label
+}
+
+fn bounded_explain_component(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let suffix = "…";
+    let mut boundary = max_bytes.saturating_sub(suffix.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}{}", &value[..boundary], suffix)
+}
+
+fn bounded_explain_judgment_identity(provider: &str, model: &str) -> Option<String> {
+    let provider = bounded_explain_component(provider, 12);
+    let model = bounded_explain_component(model, 28);
+    astra_services::judgment_presentation::provider_model_label(
+        Some(provider.as_str()),
+        Some(model.as_str()),
+    )
 }
 
 #[derive(Clone)]
@@ -3892,6 +3966,14 @@ pub struct ServerAgenticLoopHost {
     /// Final typed result adopted (or rejected) at the Work-admission
     /// settlement boundary. Classification observations remain separate.
     work_admission_explain_admission: Option<astra_turn_types::ExplainAnalyzeAdmissionSettlementV1>,
+    /// Live-only provenance used to enrich Explain nodes. The persisted
+    /// semantic trace remains the bounded observation plus invocation ID;
+    /// this map is drained with the pending observations and cannot cross a
+    /// turn or session.
+    pending_classification_executions: BTreeMap<
+        (String, astra_turn_types::RequestJudgmentStageV1),
+        Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
+    >,
     /// The optional semantic sidecar gets at most one attempt per user turn.
     /// An unavailable classifier is not retried inside the same user turn.
     /// Absence or failure leaves primary typed proposals on normal admission.
@@ -5053,6 +5135,57 @@ impl ToolRouteObserver for ExplainAnalyzeToolRouteObserver {
 /// boundaries while leaving durable inference observation as the sole attempt
 /// authority. Live facts share the ordered host event lane; callers without a
 /// live lane publish the same facts through the ordinary host emitter.
+fn explain_tool_result_application(
+    bindings: &[astra_turn_types::ToolResultProjectionBindingV1],
+) -> Option<String> {
+    use astra_turn_types::{ToolResultProjectionDispositionV1, ToolResultProjectionWireStateV1};
+    if bindings.iter().any(|binding| binding.validate().is_err()) {
+        return Some("tool-result context adoption not confirmed".to_string());
+    }
+    let selected = bindings
+        .iter()
+        .filter(|binding| {
+            binding.decision.disposition == ToolResultProjectionDispositionV1::Selected
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        if bindings
+            .iter()
+            .any(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Unknown)
+        {
+            return Some("tool-result context adoption not confirmed".to_string());
+        }
+        return bindings
+            .iter()
+            .any(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Omitted)
+            .then(|| "tool-result context omitted from request".to_string());
+    }
+    let proposed = selected
+        .iter()
+        .map(|binding| binding.decision.selected_ranges.len())
+        .sum::<usize>();
+    let included = selected
+        .iter()
+        .map(|binding| binding.receipt.actual_ranges.len())
+        .sum::<usize>();
+    let all_included = selected
+        .iter()
+        .all(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Included);
+    if selected
+        .iter()
+        .any(|binding| binding.receipt.state == ToolResultProjectionWireStateV1::Unknown)
+    {
+        return Some("tool-result selection adoption not fully confirmed".to_string());
+    }
+    Some(if all_included && proposed == included {
+        format!("tool-result selection included · {included} chunk(s)")
+    } else if included > 0 {
+        format!("tool-result selection partially included · {included}/{proposed} chunks")
+    } else {
+        "tool-result selection not included".to_string()
+    })
+}
+
 struct ExplainAnalyzeProviderAttemptObserver<'a> {
     inner: &'a dyn crate::turn::llm::client::ProviderAttemptObserver,
     context: Option<ExplainAnalyzeContext>,
@@ -5061,6 +5194,7 @@ struct ExplainAnalyzeProviderAttemptObserver<'a> {
     model_round_index: u32,
     model_name: String,
     wire_model_name: Option<String>,
+    tool_result_application_labels: std::sync::Mutex<HashMap<u32, String>>,
     spans: std::sync::Mutex<HashMap<u32, ExplainAnalyzeProviderAttemptSpan>>,
 }
 
@@ -5082,6 +5216,7 @@ impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
             model_round_index,
             model_name: model_name.into(),
             wire_model_name,
+            tool_result_application_labels: std::sync::Mutex::new(HashMap::new()),
             spans: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -5100,11 +5235,24 @@ impl<'a> ExplainAnalyzeProviderAttemptObserver<'a> {
 impl crate::turn::llm::client::ProviderAttemptObserver
     for ExplainAnalyzeProviderAttemptObserver<'_>
 {
+    fn prepared_tool_result_projections(
+        &self,
+    ) -> Vec<crate::turn::llm::client::PreparedToolResultProjection> {
+        self.inner.prepared_tool_result_projections()
+    }
+
     async fn begin_attempt(
         &self,
         wire: &crate::turn::llm::client::ProviderWireRequestIdentity,
     ) -> Result<u32, astra_core::ClassifiedError> {
-        self.inner.begin_attempt(wire).await
+        let attempt_index = self.inner.begin_attempt(wire).await?;
+        if let Some(label) = explain_tool_result_application(&wire.tool_result_projections) {
+            self.tool_result_application_labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(attempt_index, label);
+        }
+        Ok(attempt_index)
     }
 
     async fn finish_attempt(
@@ -5190,7 +5338,7 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             return;
         };
         let started_at = Instant::now();
-        let model_label = match self
+        let mut model_label = match self
             .wire_model_name
             .as_deref()
             .filter(|wire_model| *wire_model != self.model_name)
@@ -5198,6 +5346,15 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             Some(wire_model) => format!("{} → {}", self.model_name, wire_model),
             None => self.model_name.clone(),
         };
+        if let Some(application) = self
+            .tool_result_application_labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt_index)
+        {
+            model_label.push_str(" · ");
+            model_label.push_str(&application);
+        }
         let node = ExplainAnalyzeNode::new(
             context,
             format!("{parent_node_id}/physical/{attempt_index}"),
@@ -5240,6 +5397,798 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             },
         );
     }
+}
+
+struct PendingToolResultProjection {
+    freeze_key: String,
+    canonical_identity: String,
+    descriptor: astra_services::session_journal::ToolResultArtifactDescriptor,
+    tool_name: String,
+    baseline_body: String,
+    projection: astra_turn_core::tool::result::chunks::ToolResultChunkCandidateProjection,
+    /// Built only when the current admission has an auxiliary offering. A
+    /// pending candidate still carries enough typed evidence to explain a
+    /// deterministic baseline or a not-dispatched outcome without creating a
+    /// provider request that cannot be sent.
+    request: Option<astra_turn_types::JudgmentRequest>,
+    goal_complete: bool,
+    target_sha256: String,
+}
+
+const MAX_TOOL_RESULT_ARTIFACTS_PER_PREPARATION: usize = 32;
+
+impl PendingToolResultProjection {
+    fn has_complete_judgment_evidence(&self) -> bool {
+        self.projection.scan_complete() && self.goal_complete
+    }
+}
+
+fn next_tool_result_selection_subject<'a>(
+    candidate_freeze_keys: &'a [String],
+    candidate_output_budgets: &[usize],
+    frozen_decisions: &BTreeMap<String, astra_turn_types::ToolResultProjectionDecisionV1>,
+    allow_new_judgment: bool,
+    suppressed_operation_ids: &HashSet<String>,
+    max_completion_tokens: Option<u32>,
+) -> Option<&'a str> {
+    allow_new_judgment.then(|| {
+        candidate_freeze_keys
+            .iter()
+            .enumerate()
+            .find(|(index, freeze_key)| {
+                let Some(output_budget) = candidate_output_budgets.get(*index) else {
+                    return false;
+                };
+                !astra_turn_types::output_budget_exceeds_completion_cap(
+                    *output_budget,
+                    max_completion_tokens,
+                ) && !frozen_decisions.contains_key(*freeze_key)
+                    && !suppressed_operation_ids.contains(*freeze_key)
+            })
+            .map(|(_, freeze_key)| freeze_key.as_str())
+    })?
+}
+
+struct ToolResultProjectionPreparation {
+    prepared: Vec<crate::turn::llm::client::PreparedToolResultProjection>,
+    pending: Option<PendingToolResultProjection>,
+}
+
+fn split_canonical_and_provider_budget_messages(
+    canonical_messages: Vec<Value>,
+    provider: &str,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+) -> (Vec<Value>, Vec<Value>) {
+    let provider_budget_messages =
+        crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &canonical_messages,
+            provider,
+            cache_capability,
+        );
+    (canonical_messages, provider_budget_messages)
+}
+
+#[cfg(not(test))]
+fn has_eligible_tool_result_projection_candidate(messages: &[Value]) -> bool {
+    messages.iter().rev().any(|message| {
+        let Some(descriptor) =
+            astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)
+        else {
+            return false;
+        };
+        descriptor.byte_len
+            <= astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES as u64
+            && astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                message,
+            )
+            .is_ok()
+    })
+}
+
+async fn prepare_tool_result_projections(
+    pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    goal: &str,
+    messages: &[Value],
+    allow_new_judgment: bool,
+    suppressed_operation_ids: &HashSet<String>,
+    max_completion_tokens: Option<u32>,
+    cancel_token: Option<Arc<CancellationToken>>,
+) -> Result<ToolResultProjectionPreparation, astra_core::ClassifiedError> {
+    struct SourceCandidate {
+        canonical_identity: String,
+        descriptor: astra_services::session_journal::ToolResultArtifactDescriptor,
+        tool_name: String,
+        baseline_body: String,
+    }
+
+    struct Candidate {
+        freeze_key: String,
+        canonical_identity: String,
+        descriptor: astra_services::session_journal::ToolResultArtifactDescriptor,
+        tool_name: String,
+        baseline_body: String,
+        projection: astra_turn_core::tool::result::chunks::ToolResultChunkCandidateProjection,
+        target_sha256: String,
+        output_token_budget: usize,
+    }
+
+    let empty = || ToolResultProjectionPreparation {
+        prepared: Vec::new(),
+        pending: None,
+    };
+
+    let Some(pool) = pool else {
+        return Ok(empty());
+    };
+    let owner = match astra_services::OwnerScope::user(user_id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!(%error, "tool-result projection owner is invalid; retaining baseline context");
+            return Ok(empty());
+        }
+    };
+    let session_dir = match astra_services::local_session_artifact_store()
+        .session_dir_for_owner(&owner, session_id)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "tool-result projection artifacts unavailable; retaining baseline context");
+            return Ok(empty());
+        }
+    };
+    let mut source_candidates = Vec::new();
+    let mut source_identities = BTreeSet::new();
+    for message in messages.iter().rev() {
+        let Some((canonical_identity, descriptor, tool_name, baseline_body)) = (|| {
+            let canonical_identity = astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(message).ok()?;
+            let descriptor =
+                astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)?;
+            let tool_name = message
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD)?
+                .as_str()?
+                .to_string();
+            let baseline_body = message.get("content")?.as_str()?.to_string();
+            Some((canonical_identity, descriptor, tool_name, baseline_body))
+        })() else {
+            continue;
+        };
+        if descriptor.byte_len
+            > astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_SCAN_BYTES as u64
+            || !source_identities.insert(canonical_identity.clone())
+        {
+            continue;
+        }
+        source_candidates.push(SourceCandidate {
+            canonical_identity,
+            descriptor,
+            tool_name,
+            baseline_body,
+        });
+        if source_candidates.len() == MAX_TOOL_RESULT_ARTIFACTS_PER_PREPARATION {
+            break;
+        }
+    }
+    source_candidates.reverse();
+    let goal_for_worker = goal.to_string();
+    let artifact_session_dir = session_dir.clone();
+    let worker_cancel = cancel_token.clone();
+    let mut preparation_task = tokio::task::spawn_blocking(move || {
+        source_candidates
+            .into_iter()
+            .take_while(|_| {
+                !worker_cancel
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+            })
+            .filter_map(|source| {
+            let projection = astra_turn_core::tool_result_storage::read_verified_tool_result_chunk_candidates(
+                &artifact_session_dir,
+                &source.descriptor,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_SCAN_BYTES,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_CHUNK_BYTES,
+                astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_CHUNKS,
+            )
+            .ok()??;
+            // This hash is needed to look up an already-frozen decision even
+            // when no auxiliary offering is currently available. Do not keep
+            // the full request for every artifact; only the selected pending
+            // candidate below gets a dispatchable request.
+            let target_sha256 = astra_turn_core::tool::result::selection::tool_result_selection_subject_sha256_for_projection(
+                &goal_for_worker,
+                &source.tool_name,
+                &source.descriptor,
+                &projection,
+            ).ok()?;
+            let freeze_key = astra_turn_types::tool_result_projection_freeze_key(
+                &source.descriptor.run_id,
+                &source.descriptor.call_id,
+                &source.descriptor.content_sha256,
+                &source.canonical_identity,
+                &target_sha256,
+            );
+            let output_token_budget =
+                astra_turn_core::tool::result::selection::tool_result_selection_output_token_budget(
+                    &projection,
+                );
+            Some(Candidate {
+                freeze_key,
+                canonical_identity: source.canonical_identity,
+                descriptor: source.descriptor,
+                tool_name: source.tool_name,
+                baseline_body: source.baseline_body,
+                projection,
+                target_sha256,
+                output_token_budget,
+            })
+        })
+        .collect::<Vec<_>>()
+    });
+    let task_result = if let Some(cancel_token) = cancel_token {
+        tokio::select! {
+            result = &mut preparation_task => result,
+            () = cancel_token.cancelled() => {
+                preparation_task.abort();
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "tool-result projection preparation cancelled",
+                ));
+            }
+        }
+    } else {
+        preparation_task.await
+    };
+    let candidates = task_result.map_err(|error| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            format!("tool-result projection preparation task failed: {error}"),
+        )
+    })?;
+    if candidates.is_empty() {
+        return Ok(empty());
+    }
+    let freeze_keys = candidates
+        .iter()
+        .map(|candidate| candidate.freeze_key.clone())
+        .collect::<Vec<_>>();
+    let decisions = match astra_services::load_tool_result_projection_decisions(
+        pool,
+        user_id,
+        session_id,
+        &freeze_keys,
+    )
+    .await
+    {
+        Ok(decisions) => decisions,
+        Err(error) => {
+            tracing::warn!(%error, "frozen tool-result projections unavailable; retaining baseline context");
+            return Ok(empty());
+        }
+    };
+    let candidate_freeze_keys = candidates
+        .iter()
+        .map(|candidate| candidate.freeze_key.clone())
+        .collect::<Vec<_>>();
+    let candidate_output_budgets = candidates
+        .iter()
+        .map(|candidate| candidate.output_token_budget)
+        .collect::<Vec<_>>();
+    let pending_freeze_key = next_tool_result_selection_subject(
+        &candidate_freeze_keys,
+        &candidate_output_budgets,
+        &decisions,
+        allow_new_judgment,
+        suppressed_operation_ids,
+        max_completion_tokens,
+    );
+    let mut prepared = Vec::new();
+    let mut pending = None;
+    let goal_complete =
+        astra_turn_core::tool::result::selection::tool_result_selection_goal_coverage_complete(
+            goal,
+        );
+    for candidate in candidates {
+        let Some(decision) = decisions.get(&candidate.freeze_key).cloned() else {
+            if pending.is_none() && pending_freeze_key == Some(candidate.freeze_key.as_str()) {
+                pending = Some(PendingToolResultProjection {
+                    freeze_key: candidate.freeze_key,
+                    canonical_identity: candidate.canonical_identity,
+                    descriptor: candidate.descriptor,
+                    tool_name: candidate.tool_name,
+                    baseline_body: candidate.baseline_body,
+                    projection: candidate.projection,
+                    request: None,
+                    goal_complete,
+                    target_sha256: candidate.target_sha256,
+                });
+            }
+            continue;
+        };
+        if decision.canonical_message_sha256 != candidate.canonical_identity {
+            continue;
+        }
+        let rendered_body = match decision.disposition {
+                astra_turn_types::ToolResultProjectionDispositionV1::Selected => {
+                    match astra_turn_core::tool::result::selection::recover_frozen_tool_result_selection_projection(
+                        &session_dir,
+                        &candidate.tool_name,
+                        &candidate.descriptor,
+                        &decision,
+                    ) {
+                        Ok(projection) => {
+                            if !tool_result_projection_reduces_current_context(
+                                &candidate.baseline_body,
+                                projection.body(),
+                            ) {
+                                tracing::debug!(
+                                    freeze_key = %candidate.freeze_key,
+                                    selected_bytes = projection.body().len(),
+                                    current_baseline_bytes = candidate.baseline_body.len(),
+                                    selected_tokens = crate::prompts::estimate_str_tokens(projection.body()),
+                                    current_baseline_tokens = crate::prompts::estimate_str_tokens(&candidate.baseline_body),
+                                    "frozen tool-result projection does not reduce the current context budget"
+                                );
+                                if let Ok(projection) = crate::turn::llm::client::PreparedToolResultProjection::not_adopted(decision) {
+                                    prepared.push(projection);
+                                }
+                                continue;
+                            }
+                            projection.body().to_string()
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                freeze_key = %candidate.freeze_key,
+                                %error,
+                                "frozen tool-result projection recovery failed; retaining baseline context"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                astra_turn_types::ToolResultProjectionDispositionV1::Baseline => {
+                    candidate.baseline_body
+                }
+            };
+        if let Ok(projection) =
+            crate::turn::llm::client::PreparedToolResultProjection::new(decision, rendered_body)
+                .map_err(|error| {
+                    tracing::warn!(
+                        freeze_key = %candidate.freeze_key,
+                        %error,
+                        "frozen tool-result projection is inconsistent; retaining baseline context"
+                    );
+                })
+        {
+            prepared.push(projection);
+        }
+    }
+    Ok(ToolResultProjectionPreparation { prepared, pending })
+}
+
+async fn complete_tool_result_projection_preparation(
+    mut preparation: ToolResultProjectionPreparation,
+    client: Option<&dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+    client_unavailable: Option<astra_turn_types::ToolResultSelectionNotDispatchedReasonV1>,
+    observed_outcome: &mut Option<astra_turn_types::ToolResultSelectionOutcomeV1>,
+) -> Result<Vec<crate::turn::llm::client::PreparedToolResultProjection>, astra_core::ClassifiedError>
+{
+    let Some(pending) = preparation.pending.take() else {
+        return Ok(preparation.prepared);
+    };
+    let baseline = |fallback, judgment_invocation_id| {
+        let decision =
+            astra_turn_core::tool::result::selection::baseline_tool_result_projection_decision(
+                &pending.descriptor,
+                &pending.target_sha256,
+                &pending.canonical_identity,
+                judgment_invocation_id,
+                fallback,
+                &pending.baseline_body,
+            )
+            .map_err(|error| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!("invalid baseline tool-result projection: {error}"),
+                )
+            })?;
+        crate::turn::llm::client::PreparedToolResultProjection::new(
+            decision,
+            pending.baseline_body.clone(),
+        )
+    };
+    if !pending.has_complete_judgment_evidence() {
+        let prepared = baseline(
+            astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage,
+            None,
+        )?;
+        *observed_outcome = Some(astra_turn_types::ToolResultSelectionOutcomeV1::Baseline {
+            decision_sha256: prepared.decision.decision_sha256.clone(),
+            fallback: astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage,
+        });
+        preparation.prepared.push(prepared);
+        return Ok(preparation.prepared);
+    }
+    let Some(request) = pending.request.as_ref() else {
+        // A complete candidate without a request means admission did not
+        // produce a dispatchable route (or the typed request could not be
+        // built). Preserve the baseline and the explicit skip reason without
+        // pretending that an auxiliary model ran.
+        *observed_outcome = Some(
+            astra_turn_types::ToolResultSelectionOutcomeV1::NotDispatched {
+                reason: client_unavailable.unwrap_or(
+                    astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::InvalidRequest,
+                ),
+            },
+        );
+        return Ok(preparation.prepared);
+    };
+    let Some(client) = client else {
+        // Capacity can appear later in the same session. Keep the ordinary
+        // baseline for this request without freezing a permanent semantic
+        // decision that would suppress a future judgment.
+        *observed_outcome = client_unavailable
+            .map(|reason| astra_turn_types::ToolResultSelectionOutcomeV1::NotDispatched { reason });
+        return Ok(preparation.prepared);
+    };
+    let response = match client
+        .summarize(
+            astra_turn_types::InferencePurpose::ToolResultRerank,
+            &astra_turn_types::judgment_messages(request),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.kind == astra_core::ErrorKind::Cancelled => {
+            *observed_outcome = Some(
+                astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                    reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::Cancelled,
+                    execution: None,
+                },
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "tool-result judgment unavailable; retaining baseline context");
+            // Transport/provider availability is not a semantic decision and
+            // must not be frozen across later requests.
+            *observed_outcome = Some(
+                astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                    reason:
+                        astra_turn_types::ToolResultSelectionUnavailableReasonV1::ExecutionError,
+                    execution: None,
+                },
+            );
+            return Ok(preparation.prepared);
+        }
+    };
+    let judgment_execution = response.execution.as_ref().map(|execution| {
+        astra_turn_types::ToolResultSelectionExecutionV1 {
+            invocation_id: execution.invocation_id.clone(),
+            model_name: execution.model_name.clone(),
+            provider: execution.provider.clone(),
+        }
+    });
+    if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
+        // No complete semantic conclusion exists. Preserve this request's
+        // baseline without freezing a failure across later healthy routes.
+        *observed_outcome = Some(
+            astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                reason: if response.is_ptl_error {
+                    astra_turn_types::ToolResultSelectionUnavailableReasonV1::ProviderPtlError
+                } else {
+                    astra_turn_types::ToolResultSelectionUnavailableReasonV1::UnexpectedFinish
+                },
+                execution: judgment_execution,
+            },
+        );
+        return Ok(preparation.prepared);
+    }
+    let normalized = match astra_turn_types::normalize_judgment_response(
+        request,
+        &response.text,
+        response
+            .execution
+            .as_ref()
+            .map_or("judgment", |execution| execution.model_name.as_str()),
+    ) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            tracing::warn!(%error, "invalid tool-result judgment; retaining baseline context");
+            *observed_outcome = Some(
+                astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                    reason:
+                        astra_turn_types::ToolResultSelectionUnavailableReasonV1::InvalidResponse,
+                    execution: judgment_execution,
+                },
+            );
+            return Ok(preparation.prepared);
+        }
+    };
+    let Some(judgment_execution) = judgment_execution else {
+        // Every reusable model-derived decision, including NoClearMatch and
+        // ProjectionNotSmaller, must be attributable to a real durable
+        // auxiliary execution.
+        *observed_outcome = Some(
+            astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::MissingExecutionProvenance,
+                execution: None,
+            },
+        );
+        return Ok(preparation.prepared);
+    };
+    let recommendation =
+        match astra_turn_core::tool::result::selection::tool_result_selection_recommendation(
+            &pending.projection,
+            &normalized,
+        ) {
+            Ok(recommendation) => recommendation,
+            Err(error) => {
+                tracing::warn!(%error, "inconsistent tool-result judgment; retaining baseline context");
+                *observed_outcome = Some(
+                    astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                        reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::InvalidResponse,
+                        execution: Some(judgment_execution),
+                    },
+                );
+                return Ok(preparation.prepared);
+            }
+        };
+    let (relevant_chunks, uncertain_chunks, irrelevant_chunks) = recommendation
+        .dispositions()
+        .values()
+        .fold((0_u32, 0_u32, 0_u32), |mut counts, disposition| {
+            match disposition {
+                astra_turn_core::tool::result::selection::ToolResultChunkDisposition::Relevant => {
+                    counts.0 += 1;
+                }
+                astra_turn_core::tool::result::selection::ToolResultChunkDisposition::Uncertain => {
+                    counts.1 += 1;
+                }
+                astra_turn_core::tool::result::selection::ToolResultChunkDisposition::Irrelevant => {
+                    counts.2 += 1;
+                }
+            }
+            counts
+        });
+    if !recommendation.has_clear_match() {
+        let prepared = baseline(
+            astra_turn_types::ToolResultProjectionFallbackV1::NoClearMatch,
+            Some(judgment_execution.invocation_id.clone()),
+        )?;
+        *observed_outcome = Some(astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+            decision_sha256: prepared.decision.decision_sha256.clone(),
+            disposition: astra_turn_types::ToolResultProjectionDispositionV1::Baseline,
+            selected_chunks: 0,
+            relevant_chunks,
+            uncertain_chunks,
+            irrelevant_chunks,
+            fallback: Some(astra_turn_types::ToolResultProjectionFallbackV1::NoClearMatch),
+            execution: judgment_execution,
+        });
+        preparation.prepared.push(prepared);
+        return Ok(preparation.prepared);
+    }
+    let rendered =
+        astra_turn_core::tool::result::selection::render_tool_result_selection_projection(
+            &pending.tool_name,
+            &pending.descriptor,
+            &pending.projection,
+            &recommendation,
+            &pending.baseline_body,
+        )
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("invalid tool-result selection rendering: {error}"),
+            )
+        })?;
+    let Some(rendered) = rendered.filter(|rendered| {
+        tool_result_projection_reduces_current_context(&pending.baseline_body, rendered.body())
+    }) else {
+        let prepared = baseline(
+            astra_turn_types::ToolResultProjectionFallbackV1::ProjectionNotSmaller,
+            Some(judgment_execution.invocation_id.clone()),
+        )?;
+        *observed_outcome = Some(astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+            decision_sha256: prepared.decision.decision_sha256.clone(),
+            disposition: astra_turn_types::ToolResultProjectionDispositionV1::Baseline,
+            selected_chunks: 0,
+            relevant_chunks,
+            uncertain_chunks,
+            irrelevant_chunks,
+            fallback: Some(astra_turn_types::ToolResultProjectionFallbackV1::ProjectionNotSmaller),
+            execution: judgment_execution,
+        });
+        preparation.prepared.push(prepared);
+        return Ok(preparation.prepared);
+    };
+    let decision =
+        astra_turn_core::tool::result::selection::selected_tool_result_projection_decision(
+            &rendered,
+            &pending.target_sha256,
+            &pending.canonical_identity,
+            judgment_execution.invocation_id.clone(),
+        )
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("invalid selected tool-result projection: {error}"),
+            )
+        })?;
+    *observed_outcome = Some(astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+        decision_sha256: decision.decision_sha256.clone(),
+        disposition: astra_turn_types::ToolResultProjectionDispositionV1::Selected,
+        selected_chunks: u32::try_from(decision.selected_ranges.len()).unwrap_or(u32::MAX),
+        relevant_chunks,
+        uncertain_chunks,
+        irrelevant_chunks,
+        fallback: None,
+        execution: judgment_execution,
+    });
+    preparation
+        .prepared
+        .push(crate::turn::llm::client::PreparedToolResultProjection::new(
+            decision,
+            rendered.body().to_string(),
+        )?);
+    Ok(preparation.prepared)
+}
+
+fn record_tool_result_selection_observation(
+    state: &mut AgenticLoopState,
+    expected_session_id: &str,
+    expected_user_id: &str,
+    phase: &str,
+    observation: astra_turn_types::ToolResultSelectionObservationV1,
+) {
+    if observation.validate().is_err()
+        || state.current_session_id.as_deref() != Some(expected_session_id)
+        || state
+            .context_manifest_user_id
+            .as_deref()
+            .is_some_and(|owner| owner != expected_user_id)
+    {
+        return;
+    }
+    let span_id = format!("{}:{phase}", observation.correlation.evaluation_id);
+    if let Ok(trace) =
+        astra_services::tool_result_selection_observation::tool_result_selection_trace(
+            &span_id,
+            &observation,
+            chrono::Utc::now().timestamp_micros().max(0) as u64,
+        )
+    {
+        if phase == "started" {
+            let event = trace
+                .clone()
+                .session_id(Some(expected_session_id))
+                .turn(Some(observation.correlation.turn))
+                .build();
+            match astra_services::session_journal::JournalWriter::for_user(
+                expected_user_id,
+                expected_session_id,
+            )
+            .and_then(|writer| writer.append_bulk_no_sync(std::slice::from_ref(&event)))
+            {
+                Ok(()) => return,
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to persist started tool-result selection observation"
+                ),
+            }
+        }
+        if let Some(buffer) = state.turn_event_buffer.as_mut() {
+            buffer.record_trace_span_v2(trace);
+        }
+    }
+}
+
+fn explain_tool_result_selection(
+    coverage: &astra_turn_types::ToolResultSelectionCoverageV1,
+    outcome: &astra_turn_types::ToolResultSelectionOutcomeV1,
+) -> (String, astra_turn_types::ExplainAnalyzeOutcomeV1) {
+    use astra_turn_types::{
+        ExplainAnalyzeOutcomeV1, ToolResultProjectionDispositionV1, ToolResultProjectionFallbackV1,
+        ToolResultSelectionOutcomeV1,
+    };
+    let (label, explain_outcome) = match outcome {
+        ToolResultSelectionOutcomeV1::Started => (
+            "Tool-result judgment started".into(),
+            ExplainAnalyzeOutcomeV1::Waiting,
+        ),
+        ToolResultSelectionOutcomeV1::Decided {
+            disposition: ToolResultProjectionDispositionV1::Selected,
+            selected_chunks,
+            execution,
+            ..
+        } => (
+            format!(
+                "Tool-result judgment · inclusion shown on model request · selected {selected_chunks}/{} chunks · execution via {}",
+                coverage.candidate_chunks,
+                explain_tool_result_judgment_execution(execution)
+            ),
+            ExplainAnalyzeOutcomeV1::Succeeded,
+        ),
+        ToolResultSelectionOutcomeV1::Decided {
+            fallback: Some(ToolResultProjectionFallbackV1::NoClearMatch),
+            execution,
+            ..
+        } => (
+            format!(
+                "Tool-result judgment · inclusion shown on model request · kept existing tool context · no clear match · execution via {}",
+                explain_tool_result_judgment_execution(execution)
+            ),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::Decided {
+            execution,
+            fallback: Some(ToolResultProjectionFallbackV1::ProjectionNotSmaller),
+            ..
+        } => (
+            format!(
+                "Tool-result judgment · inclusion shown on model request · kept existing tool context · selection not smaller · execution via {}",
+                explain_tool_result_judgment_execution(execution)
+            ),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::Decided { execution, .. } => (
+            format!(
+                "Tool-result judgment · inclusion shown on model request · kept existing tool context · execution via {}",
+                explain_tool_result_judgment_execution(execution)
+            ),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::Baseline { .. } => (
+            "Tool-result selection · kept existing tool context (incomplete evidence)".into(),
+            ExplainAnalyzeOutcomeV1::Fallback,
+        ),
+        ToolResultSelectionOutcomeV1::NotDispatched { reason } => (
+            format!(
+                "Tool-result selection · kept existing tool context (not dispatched: {})",
+                astra_services::tool_result_selection_observation::tool_result_selection_not_dispatched_reason_label(
+                    *reason,
+                )
+            ),
+            ExplainAnalyzeOutcomeV1::Unavailable,
+        ),
+        ToolResultSelectionOutcomeV1::Unavailable { execution, reason } => (
+            execution.as_ref().map_or_else(
+                || {
+                    format!(
+                        "Tool-result judgment · unavailable ({}) · kept existing tool context",
+                        astra_services::tool_result_selection_observation::tool_result_selection_unavailable_reason_label(
+                            *reason,
+                        )
+                    )
+                },
+                |execution| {
+                    format!(
+                        "Tool-result judgment · unavailable ({}) · execution via {} · kept existing tool context",
+                        astra_services::tool_result_selection_observation::tool_result_selection_unavailable_reason_label(
+                            *reason,
+                        ),
+                        explain_tool_result_judgment_execution(execution)
+                    )
+                },
+            ),
+            ExplainAnalyzeOutcomeV1::Unavailable,
+        ),
+    };
+    (bounded_explain_analyze_text(&label), explain_outcome)
+}
+
+fn explain_tool_result_judgment_execution(
+    execution: &astra_turn_types::ToolResultSelectionExecutionV1,
+) -> String {
+    bounded_explain_judgment_identity(&execution.provider, &execution.model_name)
+        .unwrap_or_else(|| "execution identity unavailable".into())
+}
+
+fn tool_result_projection_reduces_current_context(baseline: &str, selected: &str) -> bool {
+    selected.len() < baseline.len()
+        && crate::prompts::estimate_str_tokens(selected)
+            <= crate::prompts::estimate_str_tokens(baseline)
 }
 
 fn explain_analyze_token_usage(
@@ -6104,6 +7053,7 @@ impl ServerAgenticLoopHostBuilder {
             work_admission_classification_correlation: None,
             pending_classification_observations: Vec::new(),
             work_admission_explain_admission: None,
+            pending_classification_executions: BTreeMap::new(),
             work_admission_attempted: false,
             work_admission_unavailable: false,
             work_admission_unavailable_reason: None,
@@ -7980,6 +8930,38 @@ impl ServerAgenticLoopHost {
         })
     }
 
+    /// Keep the live Explain node useful when a real auxiliary execution is
+    /// known, without turning the node label into an implementation dump.
+    /// The invocation identity remains in the semantic trace and physical
+    /// usage ledger; this label is only the user-facing model/provider hint.
+    fn classification_explain_label(
+        fact: &astra_turn_types::SemanticJudgmentFactV1,
+        execution: Option<&astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
+    ) -> String {
+        let stage = match fact.stage {
+            astra_turn_types::RequestJudgmentStageV1::Initial => "initial",
+            astra_turn_types::RequestJudgmentStageV1::Clarification => "clarification",
+        };
+        let presented_result = bounded_explain_component(&fact.result.presentation_label(), 48);
+        let result = match &fact.result {
+            astra_turn_types::RequestJudgmentResultV1::NotDispatched { .. } => {
+                format!("classification was not run · {}", presented_result)
+            }
+            _ => format!("guidance use not recorded · {}", presented_result),
+        };
+        let mut parts = vec!["Classify request".to_owned(), stage.to_owned(), result];
+        if !matches!(
+            &fact.result,
+            astra_turn_types::RequestJudgmentResultV1::NotDispatched { .. }
+        ) && let Some(execution) = execution
+            && let Some(identity) =
+                bounded_explain_judgment_identity(&execution.provider, &execution.model_name)
+        {
+            parts.push(format!("execution via {identity}"));
+        }
+        bounded_explain_analyze_text(&parts.join(" · "))
+    }
+
     async fn reconcile_work_admission_skill_revision(
         &mut self,
         state: &mut AgenticLoopState,
@@ -8011,13 +8993,12 @@ impl ServerAgenticLoopHost {
         skill_revision
     }
 
-    /// Start the built-in Work classifier for a primary turn or for a typed
-    /// executable boundary. The adaptive default starts the primary-turn
-    /// decision when capacity permits; an explicit `boundary_only` policy
-    /// keeps ordinary text on the single-request path. The boundary call is
-    /// always the fallback before a tool/control effect is admitted. Both
-    /// paths share the same bounded typed decision and never inspect prompt
-    /// text.
+    /// Start the built-in Work classifier for a typed executable boundary.
+    /// CapacityAware and BoundaryOnly both keep an ordinary unbound primary
+    /// turn on the single-request path; Always is the explicit speculative
+    /// mode. The boundary call is the fallback before a tool/control effect is
+    /// admitted. All paths share the same bounded typed decision and never
+    /// inspect prompt text.
     async fn start_work_admission_preflight(
         &mut self,
         state: &AgenticLoopState,
@@ -8513,6 +9494,7 @@ impl ServerAgenticLoopHost {
                         result: astra_turn_types::RequestJudgmentResultV1::NotDispatched { reason },
                     },
                 },
+                None,
             );
         }
     }
@@ -8532,12 +9514,20 @@ impl ServerAgenticLoopHost {
                     delivery: astra_turn_types::SemanticJudgmentDeliveryV1::Unresolved,
                 };
             }
+            let execution = observation.execution;
+            let mut correlation = correlation.clone();
+            if let Some(execution) = execution.as_ref() {
+                correlation.invocation = astra_turn_types::SemanticJudgmentInvocationV1::Known {
+                    invocation_id: execution.invocation_id.clone(),
+                };
+            }
             self.queue_classification_observation(
                 astra_turn_types::SemanticJudgmentObservationV1 {
                     schema_version: astra_turn_types::SEMANTIC_JUDGMENT_SCHEMA_VERSION,
-                    correlation: correlation.clone(),
+                    correlation,
                     fact: observation.fact,
                 },
+                execution,
             );
         }
     }
@@ -8545,15 +9535,36 @@ impl ServerAgenticLoopHost {
     fn queue_classification_observation(
         &mut self,
         observation: astra_turn_types::SemanticJudgmentObservationV1,
+        execution: Option<astra_turn_core::cloud_summary::SummaryExecutionProvenance>,
     ) {
         // C3 is bounded, best-effort telemetry. Never retain provider text or
         // let observation pressure alter admission/control state.
         if self.pending_classification_observations.len() < 32 && observation.validate().is_ok() {
+            let key = (
+                observation.correlation.evaluation_span_id.clone(),
+                observation.fact.stage,
+            );
+            match self.pending_classification_executions.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(execution);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get() != &execution {
+                        // The same logical stage must not silently switch
+                        // execution identities. Leave its live label
+                        // unqualified. The persisted invocation identity and
+                        // physical ledger remain the authorities for any
+                        // later conflict/coverage projection.
+                        entry.insert(None);
+                    }
+                }
+            }
             self.pending_classification_observations.push(observation);
         }
     }
 
     fn flush_classification_observations(&mut self, state: &mut AgenticLoopState) {
+        let executions = std::mem::take(&mut self.pending_classification_executions);
         for observation in std::mem::take(&mut self.pending_classification_observations) {
             if state.current_session_id.as_deref() != Some(self.session_id.as_str())
                 || state.current_run_id.as_deref() != Some(observation.correlation.run_id.as_str())
@@ -8578,6 +9589,46 @@ impl ServerAgenticLoopHost {
             };
             if let Some(buffer) = state.turn_event_buffer.as_mut() {
                 buffer.record_trace_span_v2(trace);
+            }
+            let Some(context) = self.explain_analyze_context.clone().filter(|context| {
+                context.run_id == observation.correlation.run_id
+                    && context.turn_id == format!("turn-{}", observation.correlation.turn)
+            }) else {
+                continue;
+            };
+            let now = Instant::now();
+            let execution = executions
+                .get(&(
+                    observation.correlation.evaluation_span_id.clone(),
+                    observation.fact.stage,
+                ))
+                .and_then(Option::as_ref);
+            let node = ExplainAnalyzeNode::new(
+                &context,
+                format!("{}/judgment/{span_id}", context.root_node_id),
+                Some(context.root_node_id.clone()),
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation,
+                Self::classification_explain_label(&observation.fact, execution),
+                now,
+                Some(observation.correlation.round),
+                None,
+            );
+            for (transition, duration, outcome) in [
+                (
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+                    None,
+                    None,
+                ),
+                (
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+                    Some(0),
+                    Some(observation.fact.preparation_outcome()),
+                ),
+            ] {
+                if let Some(event) = context.event(&node, transition, now, duration, outcome, None)
+                {
+                    self.emit_progress_event(event);
+                }
             }
         }
     }
@@ -10550,7 +11601,7 @@ impl ServerAgenticLoopHost {
     async fn judgment_summary_client(
         &mut self,
         state: &AgenticLoopState,
-        operation_id: &'static str,
+        operation_id: &str,
         request: &astra_turn_types::JudgmentRequest,
     ) -> Result<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>, JudgmentClientUnavailable>
     {
@@ -10562,81 +11613,183 @@ impl ServerAgenticLoopHost {
             );
             return Err(JudgmentClientUnavailable::InvalidRequest);
         }
+        self.judgment_summary_client_with_output_budget(
+            state,
+            operation_id,
+            request.output_token_budget(),
+            false,
+        )
+        .await
+    }
+
+    async fn resolve_judgment_route(
+        &self,
+        operation_id: &str,
+    ) -> Result<ResolvedJudgmentRoute, JudgmentClientUnavailable> {
+        let Some(pool) = &self.shared_pool else {
+            tracing::debug!(
+                operation_id,
+                "judgment inference unavailable without an explicit judgment Offering"
+            );
+            return Err(JudgmentClientUnavailable::NoOffering);
+        };
+        let config = astra_services::DatabaseAdminConfigService::new(self.matrixone.clone())
+            .with_pool(pool.clone());
+        let models = astra_services::DatabaseModelService::new(
+            self.matrixone.clone(),
+            self.encryptor.clone(),
+        )
+        .with_pool(pool.clone());
+        let execution = match astra_services::admin_config::resolve_judgment_offering(
+            &config,
+            &models,
+            &self.user_id,
+        )
+        .await
+        {
+            Ok(Some(execution)) => execution,
+            Ok(None) => {
+                tracing::debug!(
+                    operation_id,
+                    "no judgment Offering is configured; the primary typed Work carrier remains the explicit no-classifier path"
+                );
+                return Err(JudgmentClientUnavailable::NoOffering);
+            }
+            Err((status, _)) => {
+                tracing::warn!(operation_id, %status, "configured judgment Offering cannot be admitted");
+                return Err(JudgmentClientUnavailable::RouteUnavailable);
+            }
+        };
+        let route = resolve_llm_model_for_turn(
+            &self.matrixone,
+            &self.encryptor,
+            None,
+            Some(pool.get()),
+            Some(&execution),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(operation_id, %error, "configured judgment route unavailable");
+            JudgmentClientUnavailable::RouteUnavailable
+        })?;
+        Ok(ResolvedJudgmentRoute {
+            config: route,
+            execution,
+        })
+    }
+
+    fn judgment_summary_client_for_route(
+        &self,
+        state: &AgenticLoopState,
+        operation_id: &str,
+        max_output_tokens: usize,
+        route: &ResolvedJudgmentRoute,
+        selection_identity: bool,
+    ) -> Result<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>, JudgmentClientUnavailable>
+    {
+        if route
+            .execution
+            .max_completion_tokens
+            .is_some_and(|cap| max_output_tokens > cap as usize)
+        {
+            tracing::warn!(
+                operation_id,
+                model_name = %route.execution.model_name,
+                configured_max_completion_tokens = ?route.execution.max_completion_tokens,
+                required_output_tokens = max_output_tokens,
+                "judgment route cannot emit a complete typed answer; no provider request dispatched"
+            );
+            return Err(JudgmentClientUnavailable::OutputBudget);
+        }
+        let client = self
+            .durable_summary_client_for_execution(
+                &route.config,
+                max_output_tokens,
+                state,
+                operation_id,
+                Some(&route.execution),
+            )
+            .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable)?;
+        let client = if selection_identity {
+            client.with_selection_identity(operation_id, state.current_round_index)
+        } else {
+            client
+        };
+        Ok(Box::new(client))
+    }
+
+    fn tool_result_selection_admission_input(
+        &self,
+        state: &AgenticLoopState,
+        route: &ResolvedJudgmentRoute,
+        operation_id: &str,
+    ) -> Result<astra_services::InferenceInvocationInput, astra_core::ClassifiedError> {
+        let run_authority = self
+            .inference_run_authority(state)?
+            .map(|authority| authority.admission_authority());
+        let scope = match state
+            .current_run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|run_id| !run_id.is_empty())
+        {
+            Some(run_id) => astra_turn_types::InferenceInvocationScope::Run {
+                session_id: self.session_id.clone(),
+                run_id: run_id.to_string(),
+                turn: state.session_turn,
+                // Selection subject identity is intentionally independent of
+                // provider round. The subject itself is the operation ID.
+                round: 0,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            },
+            None => astra_turn_types::InferenceInvocationScope::Session {
+                session_id: self.session_id.clone(),
+                turn: state.session_turn,
+                round: 0,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            },
+        };
+        Ok(astra_services::InferenceInvocationInput {
+            user_id: self.user_id.clone(),
+            scope,
+            run_authority,
+            offering_id: route.execution.offering_id.clone(),
+            resolved_model_name: route.config.model_name.clone(),
+            upstream_model_name: route
+                .config
+                .wire_model_name
+                .as_deref()
+                .unwrap_or(&route.config.model_name)
+                .to_string(),
+            provider: route.config.provider.clone(),
+            purpose: astra_turn_types::InferencePurpose::ToolResultRerank,
+            execution_placement: route.execution.execution_placement,
+            access_kind: route.execution.access_kind,
+        })
+    }
+
+    async fn judgment_summary_client_with_output_budget(
+        &mut self,
+        state: &AgenticLoopState,
+        operation_id: &str,
+        max_output_tokens: usize,
+        selection_identity: bool,
+    ) -> Result<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>, JudgmentClientUnavailable>
+    {
         #[cfg(test)]
         if let Some(client) = self.test_judgment_clients.pop_front() {
             return Ok(client);
         }
-        let max_output_tokens = request.output_token_budget();
-        if let Some(pool) = &self.shared_pool {
-            let config = astra_services::DatabaseAdminConfigService::new(self.matrixone.clone())
-                .with_pool(pool.clone());
-            let models = astra_services::DatabaseModelService::new(
-                self.matrixone.clone(),
-                self.encryptor.clone(),
-            )
-            .with_pool(pool.clone());
-            match astra_services::admin_config::resolve_judgment_offering(
-                &config,
-                &models,
-                &self.user_id,
-            )
-            .await
-            {
-                Ok(Some(execution)) => {
-                    if !request.output_budget_fits_completion_cap(execution.max_completion_tokens) {
-                        tracing::warn!(
-                            operation_id,
-                            model_name = %execution.model_name,
-                            configured_max_completion_tokens = ?execution.max_completion_tokens,
-                            required_output_tokens = max_output_tokens,
-                            "judgment route cannot emit a complete typed answer; no provider request dispatched"
-                        );
-                        return Err(JudgmentClientUnavailable::OutputBudget);
-                    }
-                    let route = match resolve_llm_model_for_turn(
-                        &self.matrixone,
-                        &self.encryptor,
-                        None,
-                        Some(pool.get()),
-                        Some(&execution),
-                    )
-                    .await
-                    {
-                        Ok(route) => route,
-                        Err(error) => {
-                            tracing::warn!(operation_id, %error, "configured judgment route unavailable");
-                            return Err(JudgmentClientUnavailable::RouteUnavailable);
-                        }
-                    };
-                    return self
-                        .durable_summary_client_for_execution(
-                            &route,
-                            max_output_tokens,
-                            state,
-                            operation_id,
-                            Some(&execution),
-                        )
-                        .map(|client| Box::new(client) as Box<_>)
-                        .ok_or(JudgmentClientUnavailable::DurableMaterialUnavailable);
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        operation_id,
-                        "no judgment Offering is configured; the primary typed Work carrier remains the explicit no-classifier path"
-                    );
-                    return Err(JudgmentClientUnavailable::NoOffering);
-                }
-                Err((status, _)) => {
-                    tracing::warn!(operation_id, %status, "configured judgment Offering cannot be admitted");
-                    return Err(JudgmentClientUnavailable::RouteUnavailable);
-                }
-            }
-        }
-        tracing::debug!(
+        let route = self.resolve_judgment_route(operation_id).await?;
+        self.judgment_summary_client_for_route(
+            state,
             operation_id,
-            "judgment inference unavailable without an explicit judgment Offering"
-        );
-        Err(JudgmentClientUnavailable::NoOffering)
+            max_output_tokens,
+            &route,
+            selection_identity,
+        )
     }
 
     async fn turn_intent_summary_client(
@@ -10679,7 +11832,7 @@ impl ServerAgenticLoopHost {
         config: &ResolvedTurnLlmConfig,
         max_output_tokens: usize,
         state: &AgenticLoopState,
-        operation_id: &'static str,
+        operation_id: &str,
     ) -> Option<RuntimeSummaryClient> {
         self.durable_summary_client_for_execution(
             config,
@@ -10695,7 +11848,7 @@ impl ServerAgenticLoopHost {
         config: &ResolvedTurnLlmConfig,
         max_output_tokens: usize,
         state: &AgenticLoopState,
-        operation_id: &'static str,
+        operation_id: &str,
         execution: Option<&astra_services::AdmittedModelExecution>,
     ) -> Option<RuntimeSummaryClient> {
         let authority = match self.inference_run_authority(state) {
@@ -11616,6 +12769,58 @@ impl ServerAgenticLoopHost {
         );
         self.start_explain_analyze_node(node);
         Some(node_id)
+    }
+
+    fn emit_explain_analyze_tool_result_selection(
+        &mut self,
+        state: &AgenticLoopState,
+        started_at: Instant,
+        coverage: &astra_turn_types::ToolResultSelectionCoverageV1,
+        outcome: &astra_turn_types::ToolResultSelectionOutcomeV1,
+    ) {
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        let finished_at = Instant::now();
+        let (label, explain_outcome) = explain_tool_result_selection(coverage, outcome);
+        let parent_node_id = Self::explain_phase_node(
+            &context,
+            TurnPhaseKind::RequestPreparation,
+            state.current_round_index,
+            0,
+            started_at,
+        )
+        .node_id;
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            format!(
+                "{}/judgment/tool_result/{}",
+                context.root_node_id,
+                context.next_event_id()
+            ),
+            Some(parent_node_id),
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Judgment,
+            label,
+            started_at,
+            Some(state.current_round_index),
+            None,
+        );
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if let Some(event) = context.event(
+            &node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            finished_at,
+            Some(duration_ms),
+            Some(explain_outcome),
+            None,
+        ) {
+            self.emit_progress_event(event);
+        }
     }
 
     fn finish_explain_analyze_context_assembly(
@@ -18162,11 +19367,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             return outcome;
         }
 
-        // Auto starts bounded semantic admission in parallel with the primary
-        // request. CapacityAware is the documented default; BoundaryOnly is
-        // the explicit policy that waits for a typed provider boundary. If no
-        // durable inference material is available, action and completion both
-        // fail closed below.
+        // Auto may start bounded semantic admission in parallel with the
+        // primary request only in the explicit Always policy. The default
+        // waits until a typed provider boundary has an immediate admission
+        // consumer. If no durable inference material is available, action
+        // and completion both fail closed below.
         if self
             .start_work_admission_preflight(state, false, false)
             .await
@@ -19062,7 +20267,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // this exact prefix. A matching WAL transition is bound to provider
         // attempt admission before HTTP is authorized.
         let mut durable_canonical_cursor = state.messages.len();
-        let (mut llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
+        let (llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
             .assemble_llm_messages_with_final_budget(
                 final_system_messages,
                 final_volatile_preamble,
@@ -19112,23 +20317,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_tools = ?final_tools.iter().filter_map(tool_schema_name).collect::<Vec<_>>(),
             "resolved final wire tool surface"
         );
-        // From this boundary onward, budget estimation and planned prompt
-        // diagnostics consume one shared pre-client projection. The client
-        // remains the sole provider-final projector: its immutable prepared
-        // body receipt is attached after durable admission/dispatch below.
-        let pre_client_wire_messages = llm_messages;
-        llm_messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
-            &pre_client_wire_messages,
-            &llm_cfg.provider,
-            llm_cfg.cache_capability,
-        );
+        // Budget estimation and planned-prompt diagnostics consume the same
+        // provider-visible projection. Keep the canonical messages separate:
+        // tool-result selection and the client's projection application both
+        // require their trusted artifact metadata, which the provider
+        // projection deliberately strips at the wire boundary.
+        let (canonical_llm_messages, provider_budget_messages) =
+            split_canonical_and_provider_budget_messages(
+                llm_messages,
+                &llm_cfg.provider,
+                llm_cfg.cache_capability,
+            );
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                 crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
                     trace,
-                    &llm_messages,
+                    &provider_budget_messages,
                     &final_tools,
-                    &pre_client_wire_messages,
+                    &canonical_llm_messages,
                     if self.full_llm_capture {
                         crate::turn::llm::context::WireTraceDetail::Debug
                     } else {
@@ -19137,7 +20343,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                     trace,
-                    &llm_messages,
+                    &provider_budget_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
@@ -19146,7 +20352,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 )
             } else {
                 crate::turn::wire_assembly::wire_budget_status_with_metadata(
-                    &llm_messages,
+                    &provider_budget_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
@@ -19199,7 +20405,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         if let Some(pipeline_session) = state.pipeline_session.as_mut() {
             pipeline_session.replace_pending_planned_wire_prompt_with_cache_capability(
-                &llm_messages,
+                &provider_budget_messages,
                 &final_tools,
                 llm_cfg.cache_capability,
             );
@@ -19273,6 +20479,262 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_reasoning = String::new();
         let mut first_stream_update_turn_ms: Option<u64> = None;
         let mut first_visible_text_turn_ms: Option<u64> = None;
+        // The provider client owns the final metadata-stripping projection.
+        // Preserve canonical artifact identity until optional selection has
+        // been applied and bound to the admitted provider request.
+        let mut llm_messages = canonical_llm_messages;
+        let tool_result_goal = state.runtime_decision_user_intent();
+        #[cfg(not(test))]
+        let tool_result_has_candidate =
+            has_eligible_tool_result_projection_candidate(&llm_messages);
+        #[cfg(not(test))]
+        let tool_result_goal_complete =
+            astra_turn_core::tool::result::selection::tool_result_selection_goal_coverage_complete(
+                &tool_result_goal,
+            );
+        #[cfg(not(test))]
+        let mut tool_result_route = None;
+        #[cfg(test)]
+        let tool_result_route: Option<ResolvedJudgmentRoute> = None;
+        let mut tool_result_client_unavailable = None;
+        #[cfg(not(test))]
+        if tool_result_has_candidate && tool_result_goal_complete {
+            match self
+                .resolve_judgment_route("tool_result_rerank")
+                .await
+            {
+                Ok(route) => tool_result_route = Some(route),
+                Err(reason) => {
+                    if tool_result_client_unavailable.is_none() {
+                        tool_result_client_unavailable =
+                            Some(tool_result_not_dispatched_reason(reason));
+                    }
+                }
+            }
+        }
+        // Existing durable selection subjects are the scheduler's retry gate.
+        // A route change intentionally does not match the old route facts.
+        let mut suppressed_tool_result_operation_ids = HashSet::new();
+        let mut allow_new_tool_result_judgment = true;
+        if let Some(route) = tool_result_route.as_ref() {
+            let admission_input = self
+                .tool_result_selection_admission_input(state, route, "tool_result_rerank");
+            let existing = match admission_input {
+                Ok(input) => match self.shared_pool.as_ref() {
+                    Some(pool) => {
+                        astra_services::load_existing_inference_operation_ids_for_route(
+                            pool, &input,
+                        )
+                        .await
+                    }
+                    None => Err(astra_services::ServiceError::persistence(
+                        "selection admission database unavailable",
+                    )),
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "tool-result selection admission facts unavailable");
+                    Err(astra_services::ServiceError::persistence(
+                        "selection admission authority unavailable",
+                    ))
+                }
+            };
+            match existing {
+                Ok(operation_ids) => {
+                    suppressed_tool_result_operation_ids = operation_ids.into_iter().collect();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "tool-result selection retry gate unavailable; skipping new judgment");
+                    allow_new_tool_result_judgment = false;
+                    tool_result_client_unavailable = Some(
+                        astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::DurableMaterialUnavailable,
+                    );
+                }
+            }
+        }
+        // Optional tool-result selection is prepared before the primary
+        // logical invocation is admitted. The auxiliary request therefore
+        // cannot leave an open primary attempt while it waits, and every
+        // resulting decision is frozen atomically by the subsequent primary
+        // admission. At most one previously unseen artifact is judged here.
+        let mut tool_result_projection_preparation = prepare_tool_result_projections(
+            self.shared_pool.as_ref(),
+            &self.user_id,
+            &self.session_id,
+            &tool_result_goal,
+            &llm_messages,
+            allow_new_tool_result_judgment,
+            &suppressed_tool_result_operation_ids,
+            tool_result_route
+                .as_ref()
+                .and_then(|route| route.execution.max_completion_tokens),
+            self.client_cancel_token.clone(),
+        )
+        .await?;
+        let mut tool_result_judgment_client = None;
+        let tool_result_can_build_request = {
+            #[cfg(test)]
+            {
+                true
+            }
+            #[cfg(not(test))]
+            {
+                tool_result_route.is_some()
+            }
+        };
+        if tool_result_can_build_request
+            && let Some(pending) = tool_result_projection_preparation.pending.as_ref()
+            && pending.has_complete_judgment_evidence()
+        {
+            let request = astra_turn_core::tool::result::selection::build_tool_result_selection_judgment(
+                &tool_result_goal,
+                &pending.tool_name,
+                &pending.descriptor,
+                &pending.projection,
+            );
+            match request {
+                Ok(request) => {
+                    let operation_id = pending.freeze_key.clone();
+                    let output_budget = request.output_token_budget();
+                    let client = if let Some(route) = tool_result_route.as_ref() {
+                        self.judgment_summary_client_for_route(
+                            state,
+                            &operation_id,
+                            output_budget,
+                            route,
+                            true,
+                        )
+                    } else {
+                        #[cfg(test)]
+                        {
+                            self.judgment_summary_client_with_output_budget(
+                                state,
+                                &operation_id,
+                                output_budget,
+                                true,
+                            )
+                            .await
+                        }
+                        #[cfg(not(test))]
+                        {
+                            Err(JudgmentClientUnavailable::NoOffering)
+                        }
+                    };
+                    match client {
+                        Ok(client) => {
+                            if let Some(pending) =
+                                tool_result_projection_preparation.pending.as_mut()
+                            {
+                                pending.request = Some(request);
+                            }
+                            tool_result_judgment_client = Some(client);
+                        }
+                        Err(reason) => {
+                            if tool_result_client_unavailable.is_none() {
+                                tool_result_client_unavailable =
+                                    Some(tool_result_not_dispatched_reason(reason));
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if tool_result_client_unavailable.is_none() {
+                        tool_result_client_unavailable = Some(
+                            astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::InvalidRequest,
+                        );
+                    }
+                }
+            }
+        }
+        let tool_result_evaluation = tool_result_projection_preparation
+            .pending
+            .as_ref()
+            .and_then(|pending| {
+                Some((
+                    astra_turn_types::ToolResultSelectionCorrelationV1 {
+                        run_id: state.current_run_id.clone()?,
+                        turn: state.current_session_turn_number(),
+                        round: state.current_round_index,
+                        owner_generation: state.current_run_owner_generation,
+                        evaluation_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    astra_turn_types::ToolResultSelectionCoverageV1 {
+                        source_bytes: pending.projection.source_bytes(),
+                        scanned_bytes: pending.projection.scanned_bytes(),
+                        candidate_chunks: u32::try_from(pending.projection.candidates().len())
+                            .unwrap_or(u32::MAX),
+                        source_complete: pending.projection.scan_complete(),
+                        goal_complete: pending.goal_complete,
+                    },
+                    pending.freeze_key.clone(),
+                ))
+            });
+        let tool_result_selection_started_at = Instant::now();
+        let tool_result_will_dispatch = tool_result_judgment_client.is_some()
+            && tool_result_projection_preparation
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.request.is_some());
+        if tool_result_will_dispatch
+            && let Some((correlation, coverage, _freeze_key)) = tool_result_evaluation.as_ref()
+        {
+            record_tool_result_selection_observation(
+                state,
+                &self.session_id,
+                &self.user_id,
+                "started",
+                astra_turn_types::ToolResultSelectionObservationV1 {
+                    schema_version:
+                        astra_turn_types::TOOL_RESULT_SELECTION_OBSERVATION_SCHEMA_VERSION,
+                    correlation: correlation.clone(),
+                    coverage: coverage.clone(),
+                    outcome: astra_turn_types::ToolResultSelectionOutcomeV1::Started,
+                },
+            );
+        }
+        let mut tool_result_selection_outcome = None;
+        let prepared_tool_result_projection_result = complete_tool_result_projection_preparation(
+            tool_result_projection_preparation,
+            tool_result_judgment_client.as_deref(),
+            tool_result_client_unavailable,
+            &mut tool_result_selection_outcome,
+        )
+        .await;
+        if prepared_tool_result_projection_result.is_err()
+            && tool_result_selection_outcome.is_none()
+            && tool_result_evaluation.is_some()
+        {
+            tool_result_selection_outcome = Some(
+                astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                    reason:
+                        astra_turn_types::ToolResultSelectionUnavailableReasonV1::ExecutionError,
+                    execution: None,
+                },
+            );
+        }
+        if let (Some((correlation, coverage, _freeze_key)), Some(outcome)) =
+            (tool_result_evaluation, tool_result_selection_outcome)
+        {
+            self.emit_explain_analyze_tool_result_selection(
+                state,
+                tool_result_selection_started_at,
+                &coverage,
+                &outcome,
+            );
+            record_tool_result_selection_observation(
+                state,
+                &self.session_id,
+                &self.user_id,
+                "terminal",
+                astra_turn_types::ToolResultSelectionObservationV1 {
+                    schema_version:
+                        astra_turn_types::TOOL_RESULT_SELECTION_OBSERVATION_SCHEMA_VERSION,
+                    correlation,
+                    coverage,
+                    outcome,
+                },
+            );
+        }
+        let prepared_tool_result_projections = prepared_tool_result_projection_result?;
         // A coordinator's streamed answer prose is provisional while canonical Work
         // has a live binding.  Buffer it until the server has inspected the
         // durable queue below: otherwise a model can visibly claim success,
@@ -19526,7 +20988,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "host advanced to the authoritative recovered inference identity"
                 );
             }
-            // All admission awaits are complete. Sample one second-granular
+            // All admission and optional projection awaits are complete. Sample one second-granular
             // dispatch budget and derive both the model-visible authority and
             // the hard client timeout from it. No await is allowed between
             // this snapshot and provider dispatch.
@@ -19664,6 +21126,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .cloned();
             if let Err(error) = durable_invocation
                 .bind_provider_canonical_transitions(provider_canonical_transitions)
+            {
+                self.complete_request_preparation_phase_with_context(
+                    state,
+                    request_attempt_started_at,
+                    attempt_in_round,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                    attempt_context_metrics.clone(),
+                );
+                durable_invocation.finish_error(&error).await?;
+                return Err(error);
+            }
+            if let Err(error) = durable_invocation
+                .bind_tool_result_projections(prepared_tool_result_projections.clone())
             {
                 self.complete_request_preparation_phase_with_context(
                     state,
@@ -22089,6 +23565,600 @@ fn canonical_edge_dispatch_result(
 mod tests {
     use super::*;
 
+    struct FixedToolResultJudgmentClient {
+        response: astra_turn_core::cloud_summary::SummaryResponse,
+    }
+
+    struct UnexpectedToolResultJudgmentClient;
+
+    struct CancelledToolResultJudgmentClient;
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::cloud_summary::SummaryLlmClient for UnexpectedToolResultJudgmentClient {
+        async fn summarize(
+            &self,
+            _purpose: astra_turn_types::InferencePurpose,
+            _messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            panic!("incomplete evidence must not dispatch a judgment")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::cloud_summary::SummaryLlmClient for CancelledToolResultJudgmentClient {
+        async fn summarize(
+            &self,
+            _purpose: astra_turn_types::InferencePurpose,
+            _messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "test cancellation",
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::cloud_summary::SummaryLlmClient for FixedToolResultJudgmentClient {
+        async fn summarize(
+            &self,
+            purpose: astra_turn_types::InferencePurpose,
+            _messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            assert_eq!(
+                purpose,
+                astra_turn_types::InferencePurpose::ToolResultRerank
+            );
+            Ok(self.response.clone())
+        }
+    }
+
+    fn pending_tool_result_projection_fixture() -> PendingToolResultProjection {
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!("important evidence\n{}", "irrelevant detail\n".repeat(300));
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-selection",
+            "call-selection",
+            "exec",
+            &source,
+        )
+        .unwrap();
+        let projection =
+            astra_turn_core::tool_result_storage::read_verified_tool_result_chunk_candidates(
+                dir.path(),
+                &persisted.descriptor,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_SCAN_BYTES,
+                astra_turn_core::tool::result::chunks::DEFAULT_TOOL_RESULT_CHUNK_BYTES,
+                astra_turn_core::tool::result::chunks::MAX_TOOL_RESULT_CHUNKS,
+            )
+            .unwrap()
+            .unwrap();
+        let request =
+            astra_turn_core::tool::result::selection::build_tool_result_selection_judgment(
+                "find important evidence",
+                "exec",
+                &persisted.descriptor,
+                &projection,
+            )
+            .unwrap();
+        let target_sha256 =
+            astra_turn_core::tool::result::selection::tool_result_selection_target_sha256(
+                "find important evidence",
+                &request,
+            )
+            .unwrap();
+        PendingToolResultProjection {
+            freeze_key: astra_turn_types::tool_result_projection_freeze_key(
+                &persisted.descriptor.run_id,
+                &persisted.descriptor.call_id,
+                &persisted.descriptor.content_sha256,
+                &"c".repeat(64),
+                &target_sha256,
+            ),
+            canonical_identity: "c".repeat(64),
+            descriptor: persisted.descriptor,
+            tool_name: "exec".into(),
+            baseline_body: source,
+            projection,
+            request: Some(request),
+            goal_complete: true,
+            target_sha256,
+        }
+    }
+
+    async fn complete_test_tool_result_projection(
+        pending: PendingToolResultProjection,
+        client: Option<&dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+    ) -> (
+        Vec<crate::turn::llm::client::PreparedToolResultProjection>,
+        Option<astra_turn_types::ToolResultSelectionOutcomeV1>,
+    ) {
+        let mut outcome = None;
+        let prepared = complete_tool_result_projection_preparation(
+            ToolResultProjectionPreparation {
+                prepared: Vec::new(),
+                pending: Some(pending),
+            },
+            client,
+            None,
+            &mut outcome,
+        )
+        .await
+        .unwrap();
+        (prepared, outcome)
+    }
+
+    #[test]
+    fn provider_budget_projection_does_not_consume_selection_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-selection-boundary",
+            "call-selection-boundary",
+            "exec",
+            &"relevant evidence\n".repeat(2_000),
+        )
+        .unwrap();
+        let mut tool_message = json!({
+            "role": "tool",
+            "tool_call_id": "call-selection-boundary",
+            "content": persisted.replacement,
+            (astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD): "exec",
+        });
+        astra_turn_core::tool_result_storage::mark_tool_result_run_id(
+            &mut tool_message,
+            Some("run-selection-boundary"),
+        )
+        .unwrap();
+        astra_turn_core::tool_result_storage::mark_tool_result_artifact_descriptor(
+            &mut tool_message,
+            Some(&persisted.descriptor),
+        )
+        .unwrap();
+        astra_turn_core::tool_result_storage::mark_tool_result_optional_projection(
+            &mut tool_message,
+            true,
+        )
+        .unwrap();
+        let expected_identity =
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                &tool_message,
+            )
+            .unwrap();
+
+        let (canonical, provider_budget) = split_canonical_and_provider_budget_messages(
+            vec![json!({"role": "system", "content": "stable"}), tool_message],
+            "openai",
+            None,
+        );
+
+        assert_eq!(
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                &canonical[1],
+            )
+            .unwrap(),
+            expected_identity,
+            "selection must consume the canonical message with immutable artifact authority",
+        );
+        assert!(
+            astra_turn_core::tool::result::selection::canonical_tool_result_projection_identity(
+                &provider_budget[1],
+            )
+            .is_err(),
+            "provider budget projection must strip internal selection authority",
+        );
+        for field in [
+            astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
+        ] {
+            assert!(provider_budget[1].get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn tool_result_projection_must_reduce_bytes_without_increasing_budget_tokens() {
+        let ascii_baseline = "a".repeat(8_000);
+        let dense_unicode_selection = "界".repeat(1_500);
+        assert!(dense_unicode_selection.len() < ascii_baseline.len());
+        assert!(
+            crate::prompts::estimate_str_tokens(&dense_unicode_selection)
+                > crate::prompts::estimate_str_tokens(&ascii_baseline)
+        );
+        assert!(!tool_result_projection_reduces_current_context(
+            &ascii_baseline,
+            &dense_unicode_selection
+        ));
+        assert!(tool_result_projection_reduces_current_context(
+            &ascii_baseline,
+            &"b".repeat(4_000)
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_tool_result_judgment_selects_exact_chunks_with_actual_invocation() {
+        let pending = pending_tool_result_projection_fixture();
+        let answers = pending
+            .projection
+            .candidates()
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                (
+                    candidate.chunk().id.clone(),
+                    json!({"type": "noul", "noul": if index == 0 { 1.0 } else { 0.0 }}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let client = FixedToolResultJudgmentClient {
+            response: astra_turn_core::cloud_summary::SummaryResponse {
+                text: json!({
+                    "schema_version": 1,
+                    "model": "jev-1.13.0",
+                    "answers": answers,
+                })
+                .to_string(),
+                is_ptl_error: false,
+                finish_reason: Some("stop".into()),
+                usage: serde_json::Map::new(),
+                execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    invocation_id: "invocation-actual".into(),
+                    model_name: "jev-1.13.0".into(),
+                    provider: "typesafe".into(),
+                }),
+            },
+        };
+        let (prepared, outcome) =
+            complete_test_tool_result_projection(pending, Some(&client)).await;
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            prepared[0].decision.disposition,
+            astra_turn_types::ToolResultProjectionDispositionV1::Selected
+        );
+        assert_eq!(
+            prepared[0].decision.judgment_invocation_id.as_deref(),
+            Some("invocation-actual")
+        );
+        assert_eq!(prepared[0].decision.selected_ranges.len(), 1);
+        let (label, explain_outcome) = explain_tool_result_selection(
+            &astra_turn_types::ToolResultSelectionCoverageV1 {
+                source_bytes: 100,
+                scanned_bytes: 100,
+                candidate_chunks: 2,
+                source_complete: true,
+                goal_complete: true,
+            },
+            outcome.as_ref().unwrap(),
+        );
+        assert!(
+            label.contains("execution via Jev · jev-1.13.0")
+                && label.contains("selected 1/2 chunks")
+        );
+        assert!(!label.contains("wire application reported separately"));
+        assert!(label.contains("inclusion shown on model request"));
+        assert_eq!(
+            explain_outcome,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+        );
+        let decision = prepared[0].decision.clone();
+        let application =
+            explain_tool_result_application(&[astra_turn_types::ToolResultProjectionBindingV1 {
+                receipt: astra_turn_types::ToolResultProjectionReceiptV1 {
+                    decision_sha256: decision.decision_sha256.clone(),
+                    provider_wire_sha256: "d".repeat(64),
+                    state: astra_turn_types::ToolResultProjectionWireStateV1::Included,
+                    actual_ranges: decision.selected_ranges.clone(),
+                    actual_body_sha256: Some(decision.rendered_body_sha256.clone()),
+                    reason: None,
+                },
+                decision,
+            }])
+            .unwrap();
+        assert_eq!(application, "tool-result selection included · 1 chunk(s)");
+        let unknown_decision = prepared[0].decision.clone();
+        let unknown_application =
+            explain_tool_result_application(&[astra_turn_types::ToolResultProjectionBindingV1 {
+                receipt: astra_turn_types::ToolResultProjectionReceiptV1 {
+                    decision_sha256: unknown_decision.decision_sha256.clone(),
+                    provider_wire_sha256: "e".repeat(64),
+                    state: astra_turn_types::ToolResultProjectionWireStateV1::Unknown,
+                    actual_ranges: Vec::new(),
+                    actual_body_sha256: None,
+                    reason: Some("wire body could not be proven".into()),
+                },
+                decision: unknown_decision,
+            }])
+            .unwrap();
+        assert_eq!(
+            unknown_application,
+            "tool-result selection adoption not fully confirmed"
+        );
+        assert!(matches!(
+            outcome,
+            Some(astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+                disposition: astra_turn_types::ToolResultProjectionDispositionV1::Selected,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_result_selection_without_judgment_keeps_baseline_without_freezing() {
+        let pending = pending_tool_result_projection_fixture();
+        let mut outcome = None;
+        let prepared = complete_tool_result_projection_preparation(
+            ToolResultProjectionPreparation {
+                prepared: Vec::new(),
+                pending: Some(pending),
+            },
+            None,
+            Some(astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::NoOffering),
+            &mut outcome,
+        )
+        .await
+        .unwrap();
+
+        assert!(prepared.is_empty());
+        assert_eq!(
+            outcome,
+            Some(
+                astra_turn_types::ToolResultSelectionOutcomeV1::NotDispatched {
+                    reason: astra_turn_types::ToolResultSelectionNotDispatchedReasonV1::NoOffering,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn selection_scheduler_skips_admitted_subject_and_gives_next_candidate_a_turn() {
+        let candidates = vec!["subject-a".to_string(), "subject-b".to_string()];
+        let budgets = vec![100, 100];
+        let frozen = BTreeMap::new();
+        let suppressed = HashSet::from(["subject-a".to_string()]);
+
+        assert_eq!(
+            next_tool_result_selection_subject(
+                &candidates,
+                &budgets,
+                &frozen,
+                true,
+                &suppressed,
+                None,
+            ),
+            Some("subject-b")
+        );
+        assert_eq!(
+            next_tool_result_selection_subject(
+                &candidates,
+                &budgets,
+                &frozen,
+                false,
+                &suppressed,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_scheduler_skips_budget_incompatible_candidate() {
+        let candidates = vec!["too-large".to_string(), "fits".to_string()];
+        let budgets = vec![2_000, 100];
+        let frozen = BTreeMap::new();
+        let suppressed = HashSet::new();
+
+        assert_eq!(
+            next_tool_result_selection_subject(
+                &candidates,
+                &budgets,
+                &frozen,
+                true,
+                &suppressed,
+                Some(1_024),
+            ),
+            Some("fits")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_result_judgment_retains_an_unavailable_observation() {
+        let mut outcome = None;
+        let error = complete_tool_result_projection_preparation(
+            ToolResultProjectionPreparation {
+                prepared: Vec::new(),
+                pending: Some(pending_tool_result_projection_fixture()),
+            },
+            Some(&CancelledToolResultJudgmentClient),
+            None,
+            &mut outcome,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert!(matches!(
+            outcome,
+            Some(
+                astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                    reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::Cancelled,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn tool_result_judgment_explain_label_is_bounded_for_catalog_identities() {
+        let (label, outcome) = explain_tool_result_selection(
+            &astra_turn_types::ToolResultSelectionCoverageV1 {
+                source_bytes: 100,
+                scanned_bytes: 100,
+                candidate_chunks: 2,
+                source_complete: true,
+                goal_complete: true,
+            },
+            &astra_turn_types::ToolResultSelectionOutcomeV1::Decided {
+                decision_sha256: "a".repeat(64),
+                disposition: astra_turn_types::ToolResultProjectionDispositionV1::Selected,
+                selected_chunks: 1,
+                relevant_chunks: 1,
+                uncertain_chunks: 0,
+                irrelevant_chunks: 1,
+                fallback: None,
+                execution: astra_turn_types::ToolResultSelectionExecutionV1 {
+                    invocation_id: "invocation".into(),
+                    model_name: "m".repeat(255),
+                    provider: "p".repeat(128),
+                },
+            },
+        );
+        assert!(
+            label.len() <= 160,
+            "label exceeded Explain contract: {label}"
+        );
+        assert!(label.contains("selected"));
+        assert!(label.contains("inclusion shown on model request"));
+        assert_eq!(
+            outcome,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_goal_coverage_freezes_baseline_without_calling_judge() {
+        let mut pending = pending_tool_result_projection_fixture();
+        pending.goal_complete = false;
+        let (prepared, outcome) = complete_test_tool_result_projection(
+            pending,
+            Some(&UnexpectedToolResultJudgmentClient),
+        )
+        .await;
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            prepared[0].decision.fallback,
+            Some(astra_turn_types::ToolResultProjectionFallbackV1::IncompleteCoverage)
+        );
+        assert!(matches!(
+            outcome.as_ref(),
+            Some(astra_turn_types::ToolResultSelectionOutcomeV1::Baseline { .. })
+        ));
+        let (label, explain_outcome) = explain_tool_result_selection(
+            &astra_turn_types::ToolResultSelectionCoverageV1 {
+                source_bytes: 100,
+                scanned_bytes: 100,
+                candidate_chunks: 2,
+                source_complete: true,
+                goal_complete: false,
+            },
+            outcome.as_ref().unwrap(),
+        );
+        assert!(label.contains("existing tool context") && !label.contains("full result"));
+        assert_eq!(
+            explain_outcome,
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Fallback
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_invalid_judgment_keeps_baseline_without_freezing() {
+        for response in [
+            astra_turn_core::cloud_summary::SummaryResponse {
+                text: String::new(),
+                is_ptl_error: true,
+                finish_reason: None,
+                usage: serde_json::Map::new(),
+                execution: None,
+            },
+            astra_turn_core::cloud_summary::SummaryResponse {
+                text: "truncated".into(),
+                is_ptl_error: false,
+                finish_reason: Some("length".into()),
+                usage: serde_json::Map::new(),
+                execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    invocation_id: "invocation-length".into(),
+                    model_name: "judge".into(),
+                    provider: "provider".into(),
+                }),
+            },
+            astra_turn_core::cloud_summary::SummaryResponse {
+                text: "not-json".into(),
+                is_ptl_error: false,
+                finish_reason: Some("stop".into()),
+                usage: serde_json::Map::new(),
+                execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    invocation_id: "invocation-invalid".into(),
+                    model_name: "judge".into(),
+                    provider: "provider".into(),
+                }),
+            },
+        ] {
+            let (prepared, outcome) = complete_test_tool_result_projection(
+                pending_tool_result_projection_fixture(),
+                Some(&FixedToolResultJudgmentClient { response }),
+            )
+            .await;
+            assert!(prepared.is_empty());
+            assert!(matches!(
+                outcome,
+                Some(astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unattributed_model_decisions_are_not_frozen() {
+        for (has_match, tiny_baseline) in [(false, false), (true, true)] {
+            let mut pending = pending_tool_result_projection_fixture();
+            if tiny_baseline {
+                pending.baseline_body = "tiny baseline".into();
+            }
+            let answers = pending
+                .projection
+                .candidates()
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    (
+                        candidate.chunk().id.clone(),
+                        json!({"type": "noul", "noul": if has_match && index == 0 { 1.0 } else { 0.0 }}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let client = FixedToolResultJudgmentClient {
+                response: astra_turn_core::cloud_summary::SummaryResponse {
+                    text: json!({
+                        "schema_version": 1,
+                        "model": "judge",
+                        "answers": answers,
+                    })
+                    .to_string(),
+                    is_ptl_error: false,
+                    finish_reason: Some("stop".into()),
+                    usage: serde_json::Map::new(),
+                    execution: None,
+                },
+            };
+            let (prepared, outcome) =
+                complete_test_tool_result_projection(pending, Some(&client)).await;
+
+            assert!(prepared.is_empty());
+            assert!(matches!(
+                outcome,
+                Some(astra_turn_types::ToolResultSelectionOutcomeV1::Unavailable {
+                    reason: astra_turn_types::ToolResultSelectionUnavailableReasonV1::MissingExecutionProvenance,
+                    ..
+                })
+            ));
+        }
+    }
+
     #[test]
     fn server_manifest_identity_uses_admitted_state_when_result_has_no_ids() {
         let result = HostTurnResult {
@@ -23782,6 +25852,7 @@ mod tests {
                 is_ptl_error: false,
                 finish_reason: Some("stop".to_string()),
                 usage: serde_json::Map::new(),
+                execution: None,
             })
         }
     }
@@ -23863,6 +25934,7 @@ mod tests {
                             is_ptl_error,
                             finish_reason: finish_reason.map(str::to_string),
                             usage: serde_json::Map::new(),
+                            execution: None,
                         },
                     )])),
                 }),
@@ -23891,6 +25963,26 @@ mod tests {
                 output_tokens,
             }
             .to_json_map(),
+            execution: None,
+        }
+    }
+
+    fn summary_response_with_execution(
+        text: &str,
+        invocation_id: &str,
+        model_name: &str,
+        provider: &str,
+    ) -> astra_turn_core::cloud_summary::SummaryResponse {
+        astra_turn_core::cloud_summary::SummaryResponse {
+            text: text.to_string(),
+            is_ptl_error: false,
+            finish_reason: Some("stop".to_string()),
+            usage: serde_json::Map::new(),
+            execution: Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                invocation_id: invocation_id.to_string(),
+                model_name: model_name.to_string(),
+                provider: provider.to_string(),
+            }),
         }
     }
 
@@ -24002,6 +26094,7 @@ mod tests {
                         },
                     },
                     diagnostic: Some(json!({"uncertain_fields":["required"]})),
+                    execution: None,
                     interrupted: false,
                 }),
         );
@@ -24204,14 +26297,14 @@ mod tests {
     #[tokio::test]
     async fn work_judgment_clarification_is_bounded_and_preserves_locks() {
         let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
-        uncertain["answers"]["mutation.may_mutate"]["noul"] = json!(0.37);
+        uncertain["answers"]["required"]["noul"] = json!(0.21);
         for variant in ["success", "uncertain", "conflict", "malformed"] {
             let mut clarified: Value =
                 serde_json::from_str(&classification_response(false)).unwrap();
             let text = match variant {
                 "uncertain" => uncertain.to_string(),
                 "conflict" => {
-                    clarified["answers"]["required"]["noul"] = json!(1.0);
+                    clarified["answers"]["parallel_subruns"]["noul"] = json!(1.0);
                     clarified.to_string()
                 }
                 "malformed" => "{}".into(),
@@ -24254,10 +26347,203 @@ mod tests {
                 serde_json::from_str(requests.lock().unwrap()[1][1]["content"].as_str().unwrap())
                     .unwrap();
             assert_eq!(
-                sent.state["clarification"]["locked_fields"]["required"],
+                sent.state["clarification"]["locked_fields"]["parallel_subruns"],
                 false
             );
+            assert!(
+                sent.state["clarification"]["locked_fields"]
+                    .get("required")
+                    .is_none()
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn request_classification_keeps_stage_local_execution_provenance() {
+        let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
+        uncertain["answers"]["required"]["noul"] = json!(0.21);
+        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
+            responses: std::sync::Mutex::new(
+                [
+                    Ok(summary_response_with_execution(
+                        &uncertain.to_string(),
+                        "invocation-initial",
+                        "deepseek-flash",
+                        "deepseek",
+                    )),
+                    Ok(summary_response_with_execution(
+                        &classification_response(false),
+                        "invocation-clarification",
+                        "fallback-llm",
+                        "openai-compatible",
+                    )),
+                ]
+                .into(),
+            ),
+        }));
+        let planner = SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+
+        assert!(
+            judge
+                .classify_and_plan(&planner, &Default::default())
+                .await
+                .is_ok()
+        );
+        let observations = judge.classification_observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0]
+                .execution
+                .as_ref()
+                .map(|execution| execution.invocation_id.as_str()),
+            Some("invocation-initial")
+        );
+        assert_eq!(
+            observations[1]
+                .execution
+                .as_ref()
+                .map(|execution| execution.invocation_id.as_str()),
+            Some("invocation-clarification")
+        );
+        drop(observations);
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-provenance".into(),
+            "s-provenance".into(),
+        )
+        .build();
+        host.work_admission_classification_correlation =
+            Some(astra_turn_types::SemanticJudgmentCorrelationV1 {
+                run_id: "run-provenance".into(),
+                turn: 1,
+                round: 0,
+                owner_generation: Some(1),
+                evaluation_span_id: "evaluation-provenance".into(),
+                invocation: astra_turn_types::SemanticJudgmentInvocationV1::Unavailable,
+            });
+        host.retain_classification_observations(
+            std::mem::take(&mut *judge.classification_observations.lock().unwrap()),
+            astra_turn_types::SemanticJudgmentUnavailableReasonV1::ExecutionError,
+        );
+        assert_eq!(host.pending_classification_observations.len(), 2);
+        let invocations = host
+            .pending_classification_observations
+            .iter()
+            .map(|observation| match &observation.correlation.invocation {
+                astra_turn_types::SemanticJudgmentInvocationV1::Known { invocation_id } => {
+                    invocation_id.as_str()
+                }
+                astra_turn_types::SemanticJudgmentInvocationV1::Unavailable => "unavailable",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invocations,
+            vec!["invocation-initial", "invocation-clarification"]
+        );
+        let initial_execution = host
+            .pending_classification_executions
+            .get(&(
+                "evaluation-provenance".into(),
+                astra_turn_types::RequestJudgmentStageV1::Initial,
+            ))
+            .and_then(Option::as_ref)
+            .expect("initial execution provenance");
+        assert_eq!(initial_execution.model_name, "deepseek-flash");
+        assert_eq!(initial_execution.provider, "deepseek");
+        let clarification_execution = host
+            .pending_classification_executions
+            .get(&(
+                "evaluation-provenance".into(),
+                astra_turn_types::RequestJudgmentStageV1::Clarification,
+            ))
+            .and_then(Option::as_ref)
+            .expect("clarification execution provenance");
+        assert_eq!(clarification_execution.model_name, "fallback-llm");
+        assert_eq!(clarification_execution.provider, "openai-compatible");
+        let label = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            Some(initial_execution),
+        );
+        assert!(label.contains("guidance use not recorded"), "{label}");
+        assert!(
+            label.contains("execution via deepseek · deepseek-flash"),
+            "{label}"
+        );
+        assert!(!label.contains("model="), "{label}");
+        assert!(!label.contains("provider="), "{label}");
+        assert!(label.len() <= 160, "{} bytes", label.len());
+
+        let jev_label = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            Some(
+                &astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    provider: "typesafe".into(),
+                    model_name: "jev-1.13.0".into(),
+                    invocation_id: "invocation-jev".into(),
+                },
+            ),
+        );
+        assert!(
+            jev_label.contains("execution via Jev · jev-1.13.0"),
+            "{jev_label}"
+        );
+
+        let no_execution = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            None,
+        );
+        assert!(
+            no_execution.contains("guidance use not recorded"),
+            "{no_execution}"
+        );
+        assert!(!no_execution.contains("execution via"), "{no_execution}");
+
+        let long_identity = ServerAgenticLoopHost::classification_explain_label(
+            &host.pending_classification_observations[0].fact,
+            Some(
+                &astra_turn_core::cloud_summary::SummaryExecutionProvenance {
+                    provider: "provider".repeat(32),
+                    model_name: "model".repeat(64),
+                    invocation_id: "invocation-long".into(),
+                },
+            ),
+        );
+        assert!(long_identity.len() <= 160, "{long_identity}");
+        assert!(
+            long_identity.contains("uncertain fields=required"),
+            "{long_identity}"
+        );
+        assert!(long_identity.contains("execution via"), "{long_identity}");
+        assert!(
+            long_identity.contains("guidance use not recorded"),
+            "{long_identity}"
+        );
+
+        let not_dispatched = astra_turn_types::SemanticJudgmentFactV1 {
+            stage: astra_turn_types::RequestJudgmentStageV1::Initial,
+            result: astra_turn_types::RequestJudgmentResultV1::NotDispatched {
+                reason: astra_turn_types::SemanticJudgmentPreDispatchReasonV1::NoOffering,
+            },
+        };
+        let skipped_label =
+            ServerAgenticLoopHost::classification_explain_label(&not_dispatched, None);
+        assert!(
+            skipped_label.contains("classification was not run"),
+            "{skipped_label}"
+        );
+        assert!(
+            !skipped_label.contains("guidance use not recorded"),
+            "{skipped_label}"
+        );
+
+        // A scope mismatch must discard the trace and its live-only
+        // provenance together; neither can survive into a later turn.
+        let mut state = create_test_state();
+        host.flush_classification_observations(&mut state);
+        assert!(host.pending_classification_observations.is_empty());
+        assert!(host.pending_classification_executions.is_empty());
     }
 
     #[tokio::test]
@@ -24479,6 +26765,7 @@ mod tests {
                         result: observed,
                     },
                     diagnostic: None,
+                    execution: None,
                     interrupted: false,
                 });
             host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
@@ -24688,6 +26975,7 @@ mod tests {
                     is_ptl_error: true,
                     finish_reason: Some("stop".into()),
                     usage: Default::default(),
+                    execution: None,
                 })
             } else {
                 Err(astra_core::ClassifiedError::new(
@@ -24735,7 +27023,7 @@ mod tests {
     #[tokio::test]
     async fn request_classification_clarification_failure_retains_initial_abstention() {
         let mut uncertain: Value = serde_json::from_str(&classification_response(false)).unwrap();
-        uncertain["answers"]["mutation.may_mutate"]["noul"] = json!(0.37);
+        uncertain["answers"]["required"]["noul"] = json!(0.21);
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
             responses: std::sync::Mutex::new(
                 [
@@ -45163,6 +47451,11 @@ mod tests {
             Some("system")
         );
         assert_eq!(
+            llm_events[0]["metadata"]["request_projection_authority"].as_str(),
+            Some("planned_pre_client_projection_v1"),
+            "the journal must identify its canonical pre-client request projection"
+        );
+        assert_eq!(
             captured_summary_roles
                 .last()
                 .and_then(|entry| entry["role"].as_str()),
@@ -45195,19 +47488,22 @@ mod tests {
             assert!(!content.contains("Turn-start session execution state"));
             assert!(!content.contains("<system-reminder>"));
         }
-        assert_eq!(
+        assert!(
             captured_request_messages
                 .iter()
                 .filter(|message| message["role"] == "system")
-                .count(),
-            1
+                .count()
+                >= 1,
+            "the canonical journal request must retain at least one system message"
         );
-        assert!(captured_request_messages.iter().any(|message| {
-            message["role"] == "user"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|text| text.starts_with("<astra-runtime-context>\n"))
-        }));
+        assert!(
+            captured_request_messages.iter().any(|message| {
+                message["role"] == "system"
+                    && message[crate::turn::wire_assembly::RUNTIME_SYSTEM_CONTEXT_MARKER].as_bool()
+                        == Some(true)
+            }),
+            "the canonical journal must retain the runtime system context marker"
+        );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),
             Some("success_stop")
@@ -48046,7 +50342,7 @@ mod tests {
 
         #[test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        fn auxiliary_llm_policy_defaults_to_outer_work_admission() {
+        fn auxiliary_llm_policy_defaults_to_boundary_work_admission() {
             let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
             let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
 
@@ -48056,8 +50352,8 @@ mod tests {
             );
             assert_eq!(
                 should_skip_work_admission_judge(false, false),
-                None,
-                "default Auto must start one outer semantic sidecar"
+                Some("ordinary_primary_turn"),
+                "the default must not speculate beside an ordinary primary turn"
             );
             assert_eq!(should_skip_work_admission_judge(true, false), None);
             assert_eq!(should_skip_work_admission_judge(true, true), None);
@@ -48081,19 +50377,20 @@ mod tests {
                 Some("ordinary_primary_turn")
             );
             assert_eq!(should_skip_work_admission_judge(true, false), None);
+            assert_eq!(should_skip_work_admission_judge(false, true), None);
         }
 
         #[test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        fn capacity_aware_starts_outer_work_admission_even_with_provider_quota() {
+        fn capacity_aware_waits_for_a_work_boundary_even_with_provider_quota() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "capacity_aware");
             let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
             let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
             assert_eq!(
                 should_skip_work_admission_judge(false, false),
-                None,
-                "capacity admission must reject explicitly, not silently downgrade Auto"
+                Some("ordinary_primary_turn"),
+                "capacity-aware Work admission must wait for an existing boundary"
             );
             assert_eq!(should_skip_work_admission_judge(true, false), None);
             assert_eq!(
@@ -48101,6 +50398,7 @@ mod tests {
                 None,
                 "fanout remains one of the structural ambiguities the Work judge resolves"
             );
+            assert_eq!(should_skip_work_admission_judge(false, true), None);
 
             let _disabled = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
             assert_eq!(
@@ -48277,7 +50575,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn ordinary_primary_turn_marks_missing_work_admission_unavailable() {
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn ordinary_primary_turn_defers_work_admission_without_a_boundary() {
+            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -48296,10 +50596,10 @@ mod tests {
             );
             assert!(
                 host.pending_work_admission_judge.is_none(),
-                "missing admitted model material cannot create a judge task"
+                "an ordinary primary turn must not create a speculative judge task"
             );
-            assert!(host.work_admission_attempted);
-            assert!(host.work_admission_unavailable);
+            assert!(!host.work_admission_attempted);
+            assert!(!host.work_admission_unavailable);
         }
 
         #[tokio::test]

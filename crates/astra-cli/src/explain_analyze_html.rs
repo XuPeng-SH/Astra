@@ -47,7 +47,8 @@ pub(crate) fn render(
 
     writer.push(&overview_card(&graph, delivery_degraded));
 
-    let mut auxiliary_lines = crate::explain_analyze_report::auxiliary_usage_lines(&graph);
+    let mut auxiliary_lines =
+        crate::explain_analyze_report::auxiliary_usage_lines_with_detail(&graph, verbose);
     auxiliary_lines.extend(crate::explain_analyze_report::auxiliary_details_lines(
         &graph,
     ));
@@ -834,6 +835,7 @@ fn kind_label(kind: ExplainAnalyzeNodeKindV1) -> &'static str {
         ExplainAnalyzeNodeKindV1::Admission => "admission",
         ExplainAnalyzeNodeKindV1::Preparation => "preparation",
         ExplainAnalyzeNodeKindV1::ContextAssembly => "context assembly",
+        ExplainAnalyzeNodeKindV1::Judgment => "judgment",
         ExplainAnalyzeNodeKindV1::ModelRound => "model round",
         ExplainAnalyzeNodeKindV1::ProviderAttempt => "provider attempt",
         ExplainAnalyzeNodeKindV1::ToolBatch => "tool batch",

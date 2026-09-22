@@ -29,6 +29,7 @@ pub mod inference_execution;
 pub mod interaction_contract;
 pub mod introspection;
 pub mod jobs;
+pub mod judgment_presentation;
 pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
@@ -76,6 +77,7 @@ pub mod sync_engine;
 pub mod sync_outbox;
 pub mod team_persistence;
 pub mod tool_invocation_ledger;
+pub mod tool_result_selection_observation;
 pub mod triggers;
 pub mod turn_intent_judge;
 pub mod verification;
@@ -134,9 +136,9 @@ pub use agent_bindings::{
     validate_agent_binding_payload,
 };
 pub use agent_lessons::{
-    Lesson, LessonHint, LessonKind, MIN_LESSON_ACTION_CHARS, MIN_LESSON_ACTION_WORDS, NewLesson,
-    SCRATCHPAD_LOWERCASE_PHRASES, is_action_prompt_worthy, memory_value_to_lesson_hint,
-    sanitize_for_prompt,
+    Lesson, LessonHint, LessonKind, MAX_LESSON_ACTION_CHARS, MIN_LESSON_ACTION_CHARS,
+    MIN_LESSON_ACTION_WORDS, NewLesson, SCRATCHPAD_LOWERCASE_PHRASES, is_action_prompt_worthy,
+    memory_value_to_lesson_hint, sanitize_for_prompt,
 };
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
@@ -207,17 +209,19 @@ pub use harness::{
     SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
 pub use inference_execution::{
-    InferenceCanonicalTransitionReceipt, InferenceInvocationAdmissionResolution,
-    InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
-    InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan, InferenceProviderDeliveryState,
-    InferenceProviderWireIdentity, InferenceRunAdmissionAuthority, InferenceScopeRejection,
-    InferenceSettlementReconcileOutcome, InferenceTerminalStatus, InferenceUsage,
-    InferenceUsageStatus, admit_inference_invocation,
+    AuxiliaryExecutionAttemptFact, InferenceCanonicalTransitionReceipt,
+    InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
+    InferenceInvocationTerminal, InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan,
+    InferenceProviderDeliveryState, InferenceProviderWireIdentity, InferenceRunAdmissionAuthority,
+    InferenceScopeRejection, InferenceSettlementReconcileOutcome, InferenceTerminalStatus,
+    InferenceUsage, InferenceUsageStatus, SessionAuxiliaryUsageCapture, admit_inference_invocation,
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
-    load_inference_canonical_transitions_for_session, next_inference_logical_attempt_pair_base,
+    load_existing_inference_operation_ids_for_route,
+    load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
+    load_tool_result_projection_decisions, next_inference_logical_attempt_pair_base,
     plan_inference_invocation, plan_inference_provider_attempt,
     plan_inference_provider_attempt_with_context, reconcile_inference_settlement,
     reconcile_inference_settlements, renew_inference_invocation_owner,

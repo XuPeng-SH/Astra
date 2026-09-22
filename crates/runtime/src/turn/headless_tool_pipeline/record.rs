@@ -982,6 +982,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             model_tool_result_for_followup(result_presentation, model_result_str, &journal_result)
         };
 
+        // Online feedback must evaluate the exact sanitized projection that
+        // crossed the model boundary. `result_full` may intentionally point
+        // at an out-of-line artifact, so do not make the evaluator recover a
+        // model-visible identity from storage presentation. Generic artifact
+        // replacements are not evidence: the model received only a pointer
+        // and can request a native recovery window if needed.
+        if let Some(record) = self.ctx.tool_call_records.last_mut() {
+            record.runtime_model_result_full = if !is_err
+                && (journal_result.artifact.is_none()
+                    || result_presentation != astra_tools::ModelResultPresentation::Generic)
+            {
+                (!model_result_str.is_empty()).then_some(model_result_str.clone())
+            } else {
+                None
+            };
+        }
+
         let (mut tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
             &execution.id,
             &execution.name,
@@ -999,7 +1016,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 serde_json::Value::Number(self.ctx.llm_round.into()),
             );
             obj.insert(
-                "_tool_name".to_string(),
+                astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD.to_string(),
                 serde_json::Value::String(execution.name.clone()),
             );
             if let Err(error) = astra_turn_core::tool_result_storage::mark_tool_result_run_id(
@@ -1031,6 +1048,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     tool_call_id = %execution.id,
                     error = %error,
                     "tool-result artifact descriptor was not attached"
+                );
+            }
+            if let Err(error) =
+                astra_turn_core::tool_result_storage::mark_tool_result_optional_projection(
+                    &mut tool_msg,
+                    result_presentation == astra_tools::ModelResultPresentation::Generic
+                        && journal_result.artifact.is_some()
+                        && structural_model_projection.is_none(),
+                )
+            {
+                tracing::error!(
+                    run_id = ?self.ctx.current_run_id,
+                    tool_call_id = %execution.id,
+                    error = %error,
+                    "tool-result optional projection eligibility was not attached"
                 );
             }
         }
@@ -1675,7 +1707,17 @@ mod tests {
         assert_eq!(model_result, inline);
         let projected: serde_json::Value = serde_json::from_str(&model_result).unwrap();
         assert_eq!(projected["schema"], "astra-introspect-model-projection-v1");
-        assert_eq!(projected["summary"], report.summary);
+        let summary_shortened = report.summary.chars().count() > 360;
+        let expected_summary = if summary_shortened {
+            format!("{}…", report.summary.chars().take(360).collect::<String>())
+        } else {
+            report.summary.clone()
+        };
+        assert_eq!(projected["summary"], expected_summary);
+        assert_eq!(
+            projected["projection_budget"]["summary_shortened"],
+            summary_shortened
+        );
         assert!(
             !model_result.contains("introspect(artifact="),
             "introspect should use typed facet requests rather than recursively paging its own snapshot"

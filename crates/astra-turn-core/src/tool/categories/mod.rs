@@ -198,6 +198,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("mo_query", RO, MO),
     // ── Agent info / reflection (read-only) ──────────────────────────
     tool("get_agent_info", RO, C),
+    tool("introspect", RO, C),
     tool("reflect", RO, C),
     tool("inspect_work_plan", RO, C.union(OR)),
     tool("inspect_work_criteria", RO, C.union(OR)),
@@ -436,7 +437,7 @@ impl ToolRegistry {
         } else if flags.contains(ToolFlags::ORCHESTRATION)
             || matches!(
                 name,
-                "get_agent_info" | "reflect" | "skill" | "discover_skills"
+                "get_agent_info" | "introspect" | "reflect" | "skill" | "discover_skills"
             )
         {
             ToolDisplayCategory::Utility
@@ -1513,6 +1514,15 @@ mod tests {
     }
 
     #[test]
+    fn classify_introspect_is_read_only_and_parallelizable() {
+        let c = classify_name("introspect");
+        assert_eq!(c.category, ToolCategory::ReadOnly);
+        assert!(c.parallelizable);
+        assert!(c.compactable);
+        assert!(!c.approval_required);
+    }
+
+    #[test]
     fn classify_unknown_tool_fail_closed() {
         let c = classify_name("mcp_unknown_server_tool");
         assert_eq!(c.category, ToolCategory::Mutating);
@@ -2186,6 +2196,7 @@ mod tests {
             "rollback_session_state",
             "reflect",
             "get_agent_info",
+            "introspect",
             "skill",
             "discover_skills",
         ] {

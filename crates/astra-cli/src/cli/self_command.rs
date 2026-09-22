@@ -586,6 +586,7 @@ async fn build_reflect_response(
         data_coverage,
         judgment_usage: None,
         semantic_judgments: None,
+        tool_result_judgments: None,
         view: Some(view),
         summary,
         observations,
@@ -2537,13 +2538,13 @@ mod tests {
             report["summary"]
                 .as_str()
                 .unwrap()
-                .contains("bounded owner-local journal")
+                .contains("local journal")
         );
         assert!(
             report["summary"]
                 .as_str()
                 .unwrap()
-                .contains("counts unavailable, not zero")
+                .contains("does not mean no classification ran")
         );
         assert_eq!(
             report["judgment_usage"]["scope"],
@@ -2688,7 +2689,7 @@ mod tests {
             !unrelated["summary"]
                 .as_str()
                 .unwrap()
-                .contains("Semantic judgments:")
+                .contains("Request classification ·")
         );
         assert!(server.received_requests().await.unwrap().is_empty());
     }

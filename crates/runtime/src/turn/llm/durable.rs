@@ -55,6 +55,10 @@ impl DurableInferenceRunAuthority {
         }
     }
 
+    pub(crate) fn admission_authority(&self) -> astra_services::InferenceRunAdmissionAuthority {
+        self.durable.clone()
+    }
+
     fn local_fence_error(&self, stage: &'static str) -> Option<astra_core::ClassifiedError> {
         if self
             .execution_lease_lost
@@ -113,6 +117,7 @@ impl DurableInferenceRunAuthority {
 
 pub(crate) struct DurableInferenceCallOutcome {
     logical_attempt: u32,
+    invocation_id: Option<String>,
     result: Result<LlmCallResult, astra_core::ClassifiedError>,
 }
 
@@ -120,6 +125,13 @@ impl DurableInferenceCallOutcome {
     #[must_use]
     pub(crate) fn logical_attempt(&self) -> u32 {
         self.logical_attempt
+    }
+
+    /// Actual durable invocation admitted for this call. This can differ from
+    /// the originally requested logical attempt after foreground recovery.
+    #[must_use]
+    pub(crate) fn invocation_id(&self) -> Option<&str> {
+        self.invocation_id.as_deref()
     }
 
     pub(crate) fn into_result(self) -> Result<LlmCallResult, astra_core::ClassifiedError> {
@@ -2750,6 +2762,7 @@ impl DurableInferenceLedger {
             .map_err(|error| service_error("logical attempt cursor", error))
     }
 
+    #[cfg(test)]
     pub(crate) async fn admit(
         &self,
         scope: astra_turn_types::InferenceInvocationScope,
@@ -3127,13 +3140,46 @@ impl DurableInferenceLedger {
         call: LlmCall<'_>,
         timeout: std::time::Duration,
     ) -> DurableInferenceCallOutcome {
+        self.execute_nonstream_with_request_context(
+            client,
+            scope,
+            call,
+            timeout,
+            astra_services::ModelRequestContextSeed::server_default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_nonstream_with_execution_round(
+        &self,
+        client: &reqwest::Client,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        timeout: std::time::Duration,
+        execution_round: u32,
+    ) -> DurableInferenceCallOutcome {
+        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
+        request_context.execution_round = Some(execution_round);
+        self.execute_nonstream_with_request_context(client, scope, call, timeout, request_context)
+            .await
+    }
+
+    async fn execute_nonstream_with_request_context(
+        &self,
+        client: &reqwest::Client,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        timeout: std::time::Duration,
+        request_context: astra_services::ModelRequestContextSeed,
+    ) -> DurableInferenceCallOutcome {
         let invocation = match self
-            .admit(
+            .admit_with_request_context(
                 scope,
                 call.purpose,
                 call.route.model_name,
                 call.route.wire_model_name.unwrap_or(call.route.model_name),
                 call.route.provider,
+                request_context,
             )
             .await
         {
@@ -3141,11 +3187,13 @@ impl DurableInferenceLedger {
             Err(failure) => {
                 return DurableInferenceCallOutcome {
                     logical_attempt: failure.logical_attempt,
+                    invocation_id: None,
                     result: Err(failure.error),
                 };
             }
         };
         let logical_attempt = invocation.logical_attempt();
+        let invocation_id = invocation.invocation_id().to_string();
         let result = async {
             let owner_lease = invocation.owner_lease.clone();
             let attempt_observer = invocation.attempt_observer_arc();
@@ -3215,6 +3263,7 @@ impl DurableInferenceLedger {
         .await;
         DurableInferenceCallOutcome {
             logical_attempt,
+            invocation_id: Some(invocation_id),
             result,
         }
     }
@@ -3230,13 +3279,40 @@ impl DurableInferenceLedger {
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
     ) -> DurableInferenceCallOutcome {
+        self.execute_stream_no_tool_choice_with_request_context(
+            scope,
+            call,
+            astra_services::ModelRequestContextSeed::server_default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_stream_no_tool_choice_with_execution_round(
+        &self,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        execution_round: u32,
+    ) -> DurableInferenceCallOutcome {
+        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
+        request_context.execution_round = Some(execution_round);
+        self.execute_stream_no_tool_choice_with_request_context(scope, call, request_context)
+            .await
+    }
+
+    async fn execute_stream_no_tool_choice_with_request_context(
+        &self,
+        scope: astra_turn_types::InferenceInvocationScope,
+        call: LlmCall<'_>,
+        request_context: astra_services::ModelRequestContextSeed,
+    ) -> DurableInferenceCallOutcome {
         let invocation = match self
-            .admit(
+            .admit_with_request_context(
                 scope,
                 call.purpose,
                 call.route.model_name,
                 call.route.wire_model_name.unwrap_or(call.route.model_name),
                 call.route.provider,
+                request_context,
             )
             .await
         {
@@ -3244,11 +3320,13 @@ impl DurableInferenceLedger {
             Err(failure) => {
                 return DurableInferenceCallOutcome {
                     logical_attempt: failure.logical_attempt,
+                    invocation_id: None,
                     result: Err(failure.error),
                 };
             }
         };
         let logical_attempt = invocation.logical_attempt();
+        let invocation_id = invocation.invocation_id().to_string();
         let result = async {
             let owner_cancel = invocation.owner_lease.cancel.clone();
             let attempt_observer = invocation.attempt_observer_arc();
@@ -3309,6 +3387,7 @@ impl DurableInferenceLedger {
         .await;
         DurableInferenceCallOutcome {
             logical_attempt,
+            invocation_id: Some(invocation_id),
             result,
         }
     }
@@ -3539,6 +3618,10 @@ pub(crate) struct DurableProviderAttemptFact {
 }
 
 impl DurableInferenceInvocation {
+    pub(crate) fn invocation_id(&self) -> &str {
+        self.plan.invocation_id()
+    }
+
     /// Authoritative logical attempt selected by durable admission.
     ///
     /// This can be exactly one greater than the requested attempt when the
@@ -3589,6 +3672,58 @@ impl DurableInferenceInvocation {
             ));
         }
         *bound = transitions;
+        Ok(())
+    }
+
+    /// Bind source-verified optional context projections before provider
+    /// assembly. Retries reuse the same immutable decisions and reconstructed
+    /// bodies while each physical attempt receives its own exact wire receipt.
+    pub(crate) fn bind_tool_result_projections(
+        &self,
+        projections: Vec<crate::turn::llm::client::PreparedToolResultProjection>,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        if self.observer.next_attempt.load(Ordering::Acquire) != 0 {
+            return Err(contract_error(
+                "tool-result projection binding",
+                "provider attempt admission already started",
+            ));
+        }
+        let mut freeze_keys = BTreeSet::new();
+        for projection in &projections {
+            projection.decision.validate().map_err(|error| {
+                contract_error(
+                    "tool-result projection binding",
+                    format!("invalid decision: {error}"),
+                )
+            })?;
+            if !freeze_keys.insert(projection.decision.freeze_key_sha256.as_str()) {
+                return Err(contract_error(
+                    "tool-result projection binding",
+                    "duplicate projection freeze key",
+                ));
+            }
+        }
+        let mut bound = self
+            .observer
+            .tool_result_projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !bound.is_empty()
+            && bound
+                .iter()
+                .map(|value| &value.decision)
+                .collect::<Vec<_>>()
+                != projections
+                    .iter()
+                    .map(|value| &value.decision)
+                    .collect::<Vec<_>>()
+        {
+            return Err(contract_error(
+                "tool-result projection binding",
+                "a different projection set is already bound",
+            ));
+        }
+        *bound = projections;
         Ok(())
     }
 
@@ -3911,6 +4046,8 @@ struct DurableProviderAttemptObserver {
     invocation: astra_services::InferenceInvocationPlan,
     request_context: astra_services::ModelRequestContextSeed,
     canonical_transitions: std::sync::Mutex<Vec<astra_turn_types::ProviderCanonicalTransitionV2>>,
+    tool_result_projections:
+        std::sync::Mutex<Vec<crate::turn::llm::client::PreparedToolResultProjection>>,
     admitted_canonical_transition_id: std::sync::Mutex<Option<String>>,
     next_attempt: AtomicU32,
     dispatch_started: AtomicBool,
@@ -4106,6 +4243,7 @@ impl DurableProviderAttemptObserver {
             invocation,
             request_context,
             canonical_transitions: std::sync::Mutex::new(Vec::new()),
+            tool_result_projections: std::sync::Mutex::new(Vec::new()),
             admitted_canonical_transition_id: std::sync::Mutex::new(None),
             next_attempt: AtomicU32::new(0),
             dispatch_started: AtomicBool::new(false),
@@ -4275,6 +4413,15 @@ impl Drop for DurableProviderAttemptObserver {
 
 #[async_trait]
 impl ProviderAttemptObserver for DurableProviderAttemptObserver {
+    fn prepared_tool_result_projections(
+        &self,
+    ) -> Vec<crate::turn::llm::client::PreparedToolResultProjection> {
+        self.tool_result_projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
@@ -4318,7 +4465,9 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
             self.request_context.clone(),
         )
         .with_canonical_transitions(&canonical_transitions)
-        .map_err(|error| service_error("provider canonical transition", error))?;
+        .map_err(|error| service_error("provider canonical transition", error))?
+        .with_tool_result_projections(wire.tool_result_projections.clone())
+        .map_err(|error| service_error("provider tool-result projections", error))?;
         let request = DurableProviderRequestIdentity {
             request_id: attempt.request_id().to_string(),
             request_hash: wire.provider_wire_hash.clone(),
@@ -6014,6 +6163,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7625,6 +7775,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -7686,6 +7837,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
 
         let admitting_observer = observer.clone();
@@ -7777,6 +7929,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let attempt = observer
             .begin_attempt(&wire)
@@ -7833,6 +7986,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         };
         let mut admission = Box::pin(observer.begin_attempt(&wire));
         tokio::select! {
@@ -7923,6 +8077,7 @@ mod tests {
                 ..Default::default()
             },
             fingerprints: Default::default(),
+            tool_result_projections: Vec::new(),
         }
     }
 

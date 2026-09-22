@@ -40,9 +40,7 @@ impl StandardKernel {
             Box::new(crate::verifiers::DelegationVerifier::default()),
             Box::new(crate::verifiers::ConfidenceVerifier::default()),
             Box::new(crate::verifiers::ProgressVerifier {
-                max_read_only_round_streak: limits.max_read_only_round_streak,
                 max_redundant_read_count: limits.max_redundant_read_count,
-                ..Default::default()
             }),
             Box::new(crate::verifiers::CompletionVerifier),
         ];
@@ -109,7 +107,6 @@ pub struct HarnessLimits {
     pub cache_creation_cost_per_mtok: Option<f64>,
     pub max_tool_calls_per_session: Option<u32>,
     pub sensitive_tools: Vec<String>,
-    pub max_read_only_round_streak: u32,
     pub max_redundant_read_count: u32,
 }
 
@@ -127,22 +124,16 @@ impl Default for HarnessLimits {
             cache_creation_cost_per_mtok: None,
             max_tool_calls_per_session: None,
             sensitive_tools: Vec::new(),
-            max_read_only_round_streak: progress.max_read_only_round_streak,
             max_redundant_read_count: progress.max_redundant_read_count,
         }
     }
 }
 
 impl HarnessLimits {
-    /// SWE-bench runs are offline/headless and should continue until they
-    /// produce a patch, finish, or hit the runner timeout. Disable the
-    /// interactive read-only checkpoint while keeping the other verifiers.
+    /// The benchmark profile shares ordinary observation and enforcement
+    /// semantics. Pattern observations do not pause execution.
     pub fn swebench() -> Self {
-        Self {
-            max_read_only_round_streak: 0,
-            max_redundant_read_count: 0,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 
@@ -311,16 +302,25 @@ mod tests {
 
     #[test]
     fn pause_severity_maps_to_hook_pause() {
+        struct ExplicitPause;
+        impl Verifier for ExplicitPause {
+            fn name(&self) -> &'static str {
+                "explicit_pause"
+            }
+            fn trigger_points(&self) -> &'static [crate::HookPoint] {
+                &[crate::HookPoint::PostTurn]
+            }
+            fn check(&self, _: &DecisionRecord) -> Vec<crate::Violation> {
+                vec![crate::Violation {
+                    severity: Severity::Pause,
+                    verifier: self.name().into(),
+                    message: "explicit checkpoint".into(),
+                    recovery_threshold: None,
+                }]
+            }
+        }
         let sink = InMemorySnapshotSink::arc();
-        let kernel = StandardKernel::new(
-            sink.clone(),
-            vec![Box::new(ProgressVerifier {
-                max_read_only_round_streak: 2,
-                max_redundant_read_count: 10,
-                recovery_read_only_round_streak: 1,
-                min_redundant_reads_for_pause: 2,
-            })],
-        );
+        let kernel = StandardKernel::new(sink.clone(), vec![Box::new(ExplicitPause)]);
 
         let mut record = make_record(HookPoint::PostTurn, 1, 0);
         record.snapshot.final_state = Some("empty".into());
@@ -329,22 +329,43 @@ mod tests {
 
         match kernel.on_record(&record) {
             HookVerdict::Pause { reason, .. } => {
-                assert!(reason.contains("decision checkpoint"));
+                assert!(reason.contains("explicit checkpoint"));
             }
             other => panic!("expected pause verdict, got {other:?}"),
         }
     }
 
     #[test]
-    fn swebench_profile_disables_progress_pause() {
+    fn all_profiles_keep_overlap_observations_nonblocking() {
+        for profile in [HarnessProfile::Default, HarnessProfile::Swebench] {
+            let sink = InMemorySnapshotSink::arc();
+            let kernel = StandardKernel::with_profile(sink.clone(), profile);
+            let mut record = make_record(HookPoint::PostTurn, 1, 0);
+            record.snapshot.final_state = Some("empty".into());
+            record.snapshot.read_only_round_streak = 100;
+            record.snapshot.redundant_read_count = 100;
+
+            assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+        }
+    }
+
+    #[test]
+    fn actual_budget_still_blocks_with_high_read_overlap() {
         let sink = InMemorySnapshotSink::arc();
-        let kernel = StandardKernel::with_profile(sink.clone(), HarnessProfile::Swebench);
-        let mut record = make_record(HookPoint::PostTurn, 1, 0);
-        record.snapshot.final_state = Some("empty".into());
+        let kernel = StandardKernel::configured(
+            sink,
+            HarnessLimits {
+                max_turns: Some(1),
+                ..HarnessLimits::default()
+            },
+        );
+        let mut record = make_record(HookPoint::PostTurn, 2, 100);
         record.snapshot.read_only_round_streak = 100;
         record.snapshot.redundant_read_count = 100;
-
-        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+        match kernel.on_record(&record) {
+            HookVerdict::Block { reason } => assert!(reason.contains("[budget]")),
+            other => panic!("expected budget block, got {other:?}"),
+        }
     }
 
     #[test]
@@ -366,10 +387,7 @@ mod tests {
         let kernel = StandardKernel::new(
             sink.clone(),
             vec![Box::new(ProgressVerifier {
-                max_read_only_round_streak: 10,
                 max_redundant_read_count: 3,
-                recovery_read_only_round_streak: 5,
-                min_redundant_reads_for_pause: 2,
             })],
         );
 
@@ -382,26 +400,20 @@ mod tests {
     }
 
     #[test]
-    fn turn_guard_adapter_blocks_on_stall() {
+    fn turn_guard_adapter_observes_repetition_without_blocking() {
         let sink = InMemorySnapshotSink::arc();
         let kernel = StandardKernel::new(
             sink.clone(),
-            vec![Box::new(TurnGuardVerifierAdapter {
-                warn_threshold: 3,
-                fatal_threshold: 5,
-            })],
+            vec![Box::new(TurnGuardVerifierAdapter { warn_threshold: 3 })],
         );
 
         // No stall
         let record = make_record(HookPoint::PostTurn, 1, 2);
         assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
 
-        // Fatal stall
+        // Repetition alone has no stopping authority.
         let record = make_record(HookPoint::PostTurn, 1, 5);
-        assert!(matches!(
-            kernel.on_record(&record),
-            HookVerdict::Block { .. }
-        ));
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
     }
 
     #[test]
@@ -429,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_verifiers_first_fatal_wins() {
+    fn budget_still_blocks_when_repetition_is_observed() {
         let sink = InMemorySnapshotSink::arc();
         let kernel = StandardKernel::new(
             sink.clone(),
@@ -439,20 +451,30 @@ mod tests {
                     max_tokens: None,
                     max_duration_millis: None,
                 }),
-                Box::new(TurnGuardVerifierAdapter {
-                    warn_threshold: 2,
-                    fatal_threshold: 3,
-                }),
+                Box::new(TurnGuardVerifierAdapter { warn_threshold: 2 }),
             ],
         );
 
-        // Both would fire fatal at PostTurn — first verifier wins
+        // A real budget violation remains fatal alongside repetition evidence.
         let record = make_record(HookPoint::PostTurn, 10, 5);
         match kernel.on_record(&record) {
             HookVerdict::Block { reason } => {
                 assert!(reason.contains("[budget]"));
             }
             _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn configured_profiles_do_not_stop_on_signature_repetition() {
+        for profile in [HarnessProfile::Default, HarnessProfile::Swebench] {
+            let sink = InMemorySnapshotSink::arc();
+            let kernel = StandardKernel::with_profile(sink.clone(), profile);
+            for streak in [3, 5, 6, 100] {
+                let record = make_record(HookPoint::PostTurn, 1, streak);
+                assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+                assert!(sink.latest().is_some());
+            }
         }
     }
 
@@ -570,15 +592,10 @@ mod tests {
             _ => panic!("expected Block verdict"),
         }
 
-        // Exceeds stall threshold → Block
+        // Repetition within budget remains advisory.
         let mut record = make_record(HookPoint::PostTurn, 3, 6);
         record.snapshot.consecutive_same_tool = 6;
-        match kernel.on_record(&record) {
-            HookVerdict::Block { reason } => {
-                assert!(reason.contains("turn_guard"));
-            }
-            _ => panic!("expected Block from stall"),
-        }
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
     }
 
     // ── Critical verifier panic → Block ─────────────────────────────────

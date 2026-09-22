@@ -1499,6 +1499,31 @@ pub async fn lock_agent_session_write_fence<T>(
 where
     T: TransactionConnection,
 {
+    match lock_agent_session_write_fence_state(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Writable => Ok(()),
+        AgentSessionWriteFenceState::PendingDelete
+        | AgentSessionWriteFenceState::CompletedDelete => Err(sqlx::Error::Protocol(
+            "session has a durable deletion fence".into(),
+        )),
+        AgentSessionWriteFenceState::Missing => Err(sqlx::Error::Protocol(
+            "session lifecycle fence disappeared before it could be locked".into(),
+        )),
+    }
+}
+
+/// Lock the durable lifecycle fence and retain the state for callers that
+/// need to distinguish an ordinary writable session from deletion admission.
+/// The insert-and-lock sequence is the same as
+/// [`lock_agent_session_write_fence`]; exposing the typed state keeps callers
+/// from matching storage error strings.
+pub async fn lock_agent_session_write_fence_state<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+) -> Result<AgentSessionWriteFenceState, sqlx::Error>
+where
+    T: TransactionConnection,
+{
     // Session creation/backfill establishes the fence before normal child
     // writes. Fast-path the common case so every manifest/event write does not
     // pay an INSERT IGNORE round trip. If this transaction inserted the fence,
@@ -1524,17 +1549,7 @@ where
         }
         state => state,
     };
-
-    match state {
-        AgentSessionWriteFenceState::Writable => Ok(()),
-        AgentSessionWriteFenceState::PendingDelete
-        | AgentSessionWriteFenceState::CompletedDelete => Err(sqlx::Error::Protocol(
-            "session has a durable deletion fence".into(),
-        )),
-        AgentSessionWriteFenceState::Missing => Err(sqlx::Error::Protocol(
-            "session lifecycle fence disappeared before it could be locked".into(),
-        )),
-    }
+    Ok(state)
 }
 
 pub async fn add_agent_session_event_count_or_create<T>(
@@ -7789,6 +7804,62 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "tool_result_projection_decisions",
+        "CREATE TABLE IF NOT EXISTS tool_result_projection_decisions (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            freeze_key_sha256 CHAR(64) NOT NULL,
+            decision_sha256 CHAR(64) NOT NULL,
+            decision_json LONGTEXT NOT NULL,
+            decision_bytes BIGINT NOT NULL,
+            canonical_message_sha256 CHAR(64) NOT NULL,
+            source_sha256 CHAR(64) NOT NULL,
+            source_bytes BIGINT NOT NULL,
+            rendered_body_sha256 CHAR(64) NOT NULL,
+            rendered_body_bytes BIGINT NOT NULL,
+            producer_run_id VARCHAR(64) NOT NULL,
+            producer_call_id VARCHAR(255) NOT NULL,
+            first_admitted_attempt_id VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, freeze_key_sha256),
+            INDEX idx_tool_result_projection_decisions_attempt
+                (user_id, first_admitted_attempt_id),
+            CONSTRAINT chk_tool_result_projection_decision_bounds
+                CHECK (decision_bytes > 0 AND source_bytes > 0 AND rendered_body_bytes > 0)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "tool_result_projection_receipts",
+        "CREATE TABLE IF NOT EXISTS tool_result_projection_receipts (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            attempt_id VARCHAR(64) NOT NULL,
+            freeze_key_sha256 CHAR(64) NOT NULL,
+            decision_sha256 CHAR(64) NOT NULL,
+            provider_wire_sha256 CHAR(64) NOT NULL,
+            receipt_sha256 CHAR(64) NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_bytes BIGINT NOT NULL,
+            wire_state VARCHAR(32) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, attempt_id, freeze_key_sha256),
+            INDEX idx_tool_result_projection_receipts_session
+                (user_id, session_id, attempt_id),
+            CONSTRAINT chk_tool_result_projection_receipt_bounds
+                CHECK (receipt_bytes > 0),
+            CONSTRAINT chk_tool_result_projection_receipt_state
+                CHECK (wire_state IN ('included', 'partially_included', 'omitted', 'unknown'))
         )",
     )
     .execute(&pool)

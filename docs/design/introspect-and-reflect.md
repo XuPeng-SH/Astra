@@ -38,8 +38,8 @@ uses the same ledger at turn scope. Classification confidence and reflection's
 inferred confidence are distinct; neither proves that a direction was applied
 or that Work was delivered.
 The session view covers the supported judgment operations (request admission,
-skill routing, memory relevance/feedback, verification, and completion-proxy
-turn intent), not every auxiliary model call. Routine hint/summary projections
+skill routing, memory relevance/feedback, tool-result selection, verification,
+and completion-proxy turn intent), not every auxiliary model call. Routine hint/summary projections
 bound group detail and report how many groups were omitted.
 
 Runtime introspection also exposes typed `judgment_usage` in its snapshot and
@@ -74,6 +74,14 @@ retain at most 2/8/16/32 attempts with explicit omitted counts. Identity display
 fields are capped at 128 characters and truncation is reported; these display
 identities are never execution references. Other facets do not load this data.
 
+The bounded model view retains a compact `judgment_usage` ledger summary ahead
+of routine observations. It copies the captured totals and coverage without
+recounting displayed groups, omits individual attempts with explicit counts,
+and adds complete identity groups only while the model budget permits. If the
+summary itself cannot fit, `projection_budget.omitted_fields` names
+`judgment_usage`. Missing auxiliary evidence must not be inferred from the
+separately scoped runtime request/run accounting.
+
 Semantic judgment results are separate from physical usage. The shared
 owner/session-scoped C3 projection exposes captured request classifications,
 closed abstention/conflict/invalid-response reasons and explicit preparation or
@@ -97,6 +105,18 @@ Explain presents these semantic facts as fixed-label preparation milestones.
 Their zero-length intervals mark observation instants, not inference latency;
 measured provider duration and usage retain their existing owners. Labels are
 derived from the typed facts and are never parsed back into semantic state.
+
+Large tool-result selection has a separate shared read projection for
+introspection and reflection. Evaluation traces answer what was evaluated and
+recommended; immutable projection receipts answer what the provider wire
+actually contained. A recommendation without a receipt has unconfirmed
+application. A receipt without a trace is still valid application evidence but
+does not recover the missing evaluation rationale. A `Started` trace without a
+terminal trace is reported as missing terminal evidence, not inferred to be a
+cancellation or interruption. Evaluation capture and application capture have
+independent bounded-coverage states, and conflicting identities are quarantined
+without discarding unrelated facts. Default text is a compact outcome summary;
+hashes, ranges and internal identities remain diagnostic details.
 
 ## Goals
 

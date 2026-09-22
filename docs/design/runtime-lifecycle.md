@@ -79,9 +79,52 @@ Missing progress receipts do not establish a stall: capabilities have different
 evidence coverage. In the absence of an authoritative stop condition, another
 bounded slice is allowed without a separate progress-credit ledger or mandatory
 reflection call. Explicit hard limits, cancellation, workspace quarantine,
-and repetition controls remain authoritative. Historical guard verdicts remain
+and explicit execution limits remain authoritative. Historical guard verdicts remain
 audit and recovery advice, not sticky execution vetoes. Continuation
 does not make unexecuted requests successful or grant them completion evidence.
+Model-facing capacity reminders must not imply that renewal proves progress,
+unfinished work, or authorization for additional scope. The requested outcome
+is not evidence of what actually executed; completion claims must use observed
+results even when they differ from the request.
+
+Repeated tool signatures establish a repeated request pattern, not unchanged
+results or lack of progress. Signature-only advice must preserve legitimate
+verification, pagination, evidence recovery and authorized waiting. It must
+not claim that earlier content remains in context, prescribe workspace edits,
+escalate to task termination because prior advice was repeated, or add a tool
+to retry caution solely because its name recurs. Independent tool-health
+evidence remains available to the existing recovery policy.
+Repeated calls within a batch likewise do not establish reward manipulation
+or low task value. They must not create a separate risk score, retry-cautioned
+tool list, or extra correction pressure without independent outcome evidence.
+Read tools may report overlapping delivery for the same captured content, but
+must not infer current prompt coverage or require stopping from read counts.
+Policy feedback names these observations `read_coverage_overlap` and
+`round_activity`, with coverage/progress review recommendations rather than
+semantic judgments of redundancy or low value. Both observation stages remain
+advisory; persistence of a signal is not proof that the model ignored feedback.
+Policy feedback schema v4 includes current, bounded recovery evidence from
+TurnGuard alongside behavioral observations. One pre-provider policy projection
+owns model-facing signature/operation repetition feedback; post-tool evaluation retains health,
+audit and checkpoint responsibilities without a second prompt producer.
+Recovery snapshots survive same-execution replay and are refreshed at tool
+boundaries, including clearing recovered pressure. They are not reconstructed
+from historical warning events or suppressed by optional semantic judgments.
+Repeated-operation counts use full authoritative argument identities within the
+existing bounded window. They do not prove unchanged results, lack of progress,
+or that a previous observation can be reused. Partial argument previews cannot
+establish this identity; introspect and reflect have no separate reuse rule.
+There are no compatibility aliases or legacy continuation conversions.
+
+The runtime harness follows the same boundary: signature repetition is a
+warning observation, never a Fatal/Block or Pause condition. Actual configured
+budgets, safety invariants and critical-verifier failures retain their existing
+enforcement. Empty tool-call sets do not constitute repeated tool activity.
+Read-only streaks and historical range overlap likewise remain observations,
+not pause or forced-finalization conditions. Overlap does not prove unchanged
+contents or that earlier results remain in context. Explicit debugger pauses
+retain their separate control semantics; benchmark profiles need no exception
+to the observation-only rule.
 
 Progress does not discharge completion obligations. Required validation must
 still apply to the final mutation state; a renewed slice must not be reported
