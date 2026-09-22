@@ -2354,12 +2354,13 @@ mod tests {
                 },
                 &params,
                 Some(&memoria),
-                Some(&CompactConfig {
+                &CompactConfig {
                     enable_summary: true,
                     summary_min_tier: CompactionTier::AggressivePrune,
                     ..Default::default()
-                }),
+                },
                 Some(&summary),
+                &astra_turn_core::cloud_summary::canonical_summary_prompt_templates(),
             )
             .await;
             assert_eq!(
