@@ -10607,7 +10607,10 @@ impl crate::turn::cloud::memoria_compact::MemoriaPort for EvaluationMemorySpy {
         _: Option<&str>,
         _: usize,
         _: bool,
-    ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+    ) -> Result<
+        Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+        astra_memoria::MemoriaOperationError,
+    > {
         self.operations.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
