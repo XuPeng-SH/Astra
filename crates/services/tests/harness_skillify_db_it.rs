@@ -655,7 +655,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
             &owner,
             CreateUserSkillSource {
                 skill_name: "review".into(),
-                visibility: Some("private".into()),
+                visibility: Some("public".into()),
             },
         )
         .await
@@ -715,6 +715,15 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         .await
         .unwrap();
     assert_eq!(result.operation, "improve");
+    assert_eq!(
+        store
+            .load_source(&owner, "review")
+            .await
+            .unwrap()
+            .visibility,
+        "public",
+        "candidate materialization must preserve an existing source's visibility"
+    );
     assert_eq!(
         result.harness_run.output_json["authoring"]["baseline"]["version_id"],
         baseline.version_id

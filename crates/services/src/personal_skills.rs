@@ -209,7 +209,7 @@ impl DatabasePersonalSkillStore {
             "INSERT INTO user_skill_sources
              (source_id, owner_user_id, skill_name, visibility, status, created_at, updated_at)
              VALUES (?, ?, ?, ?, 'active', NOW(6), NOW(6))
-             ON DUPLICATE KEY UPDATE source_id = source_id",
+             ON DUPLICATE KEY UPDATE visibility = visibility",
         )
         .bind(&source_id)
         .bind(owner_user_id)
