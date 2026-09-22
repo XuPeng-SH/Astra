@@ -199,12 +199,25 @@ existing exact-JSON verifier, not an inferred success criterion. Task, verifier,
 and candidate are frozen before Evaluation preparation. The candidate and its
 evidence appear before trial execution completes; the report updates afterward.
 The primary result page also supports explicit private publication and use in
-the originating session. It shows bounded baseline/candidate criterion outcomes
+an explicitly selected Web session, including a new empty Web session when
+there is no originating conversation. Session creation preserves the Web
+hydration metadata; activation pins the published version through the existing
+compare-and-set endpoint before any task is sent. The ordinary Skill picker
+exposes personal sources and published revisions on demand, separately from
+per-turn name selection. It loads versions only for the selected source rather
+than fetching every Skill body. It shows bounded baseline/candidate criterion outcomes
 without presenting them as causal improvement. Generation cost is labeled
 separately from trial cost.
 
-Browser recovery stores only the run reference, scoped by authenticated owner,
-runtime, and originating session. The existing run metadata retains the original
+Before generation dispatch, browser recovery stores the exact request (including
+the original idempotency key and optional validation task), scoped by authenticated
+owner, runtime, and originating session. An interrupted or lost initial response
+is retried only with this saved request; an in-progress response never rotates
+the key. Once a response arrives, the browser replaces the pending request with
+the run reference. Starting a different generation while recovery is pending
+requires explicitly abandoning recovery; this does not cancel the server task.
+If browser storage fails before dispatch, generation does not start.
+The existing run metadata retains the original
 submission request so conversation links can also continue validation. Recovery reads
 authorized run/draft records and refreshes Evaluation bindings before continuing
 the existing comparison; it never regenerates a candidate. A changed draft

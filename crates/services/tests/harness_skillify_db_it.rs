@@ -710,6 +710,8 @@ async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
         )
         .await
         .unwrap();
+    // Model dispatch must not happen again when the original response was lost.
+    *executor.failure.lock().unwrap() = Some("replay dispatched synthesis again".into());
     let replay = service
         .create_authoring_intent(
             owner.clone(),
@@ -723,6 +725,7 @@ async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
         recovered.harness_run.harness_run_id,
         replay.harness_run.harness_run_id
     );
+    *executor.failure.lock().unwrap() = None;
     let fresh = service
         .create_authoring_intent(owner.clone(), String::new(), request(None), None)
         .await

@@ -29,6 +29,8 @@ type AuthoringResult = AuthoringIntentRecord & {
   evaluation_error?: string;
 };
 
+type PendingAuthoring = { request: AuthoringIntentRequest; sessionId?: string };
+
 type AuthoringScope = { ownerId: string; runtimeKey: string };
 export function AuthoringPage(scope: AuthoringScope) {
   const params = useSearchParams();
@@ -42,6 +44,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
   const evaluationAbort = useRef<AbortController | null>(null);
   const mounted = useRef(true);
   const [recovering, setRecovering] = useState(true);
+  const [pending, setPending] = useState<PendingAuthoring | null>(null);
   const [savedRunId, setSavedRunId] = useState<string | null>(null);
   const [projection, setProjection] = useState<EvaluationProjection | null>(null);
   const [targets, setTargets] = useState<Array<NonNullable<AuthoringIntentRequest['target_skill']>>>([]);
@@ -79,7 +82,13 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
     async function recover() {
       try {
         const raw = window.localStorage.getItem(storageKey);
-        const saved = raw ? JSON.parse(raw) as { runId?: string } : {};
+        const saved = raw ? JSON.parse(raw) as { runId?: string; pending?: PendingAuthoring } : {};
+        if (saved.pending) {
+          setPending(saved.pending); setSubmittedRequest(saved.pending.request);
+          setGoal(saved.pending.request.goal); setCreateNew(saved.pending.request.create_new ?? false);
+          setTargetVersion(saved.pending.request.target_skill?.version_id ?? '');
+          return;
+        }
         const reference = runId ?? saved.runId;
         if (typeof reference !== 'string') return;
         setSavedRunId(reference);
@@ -95,6 +104,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
   }, [storageKey, runId]);
 
   function remember(created: AuthoringIntentRecord) {
+    setPending(null);
     setSavedRunId(created.harness_run.harness_run_id);
     try { window.localStorage.setItem(storageKey, JSON.stringify({ runId: created.harness_run.harness_run_id })); }
     catch { setError('浏览器无法保存恢复引用；请保留候选的审核链接。'); }
@@ -125,6 +135,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
   }
 
   async function resume() {
+    if (pending) { await generate(pending); return; }
     if (!savedRunId) return;
     setBusy(true); setError(null);
     try { await showAndEvaluate(await loadAuthoringResult(savedRunId)); }
@@ -148,47 +159,45 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
     finally { setBusy(false); }
   }
 
-  async function validateTask() {
-    if (!submittedRequest || !taskSourceId) return;
-    setBusy(true);
-    setError(null);
+  async function generate(submission: PendingAuthoring) {
+    setBusy(true); setError(null);
     try {
-      const expected = JSON.parse(expectedResult);
-      const created = await createAuthoringIntent({ ...submittedRequest,
-        validation_task: { source_id: taskSourceId, expected_result: expected },
-      }, (result?.harness_run.input_json.session_ids as string[] | undefined)?.[0]);
+      // Persist before dispatch: a missing response must never require a new key.
+      window.localStorage.setItem(storageKey, JSON.stringify({ pending: submission }));
+      setPending(submission); setSubmittedRequest(submission.request);
+      const created = await createAuthoringIntent(submission.request, submission.sessionId);
       if (!mounted.current) return;
       remember(created);
       await showAndEvaluate(created);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '无法准备验证任务');
-    } finally { setBusy(false); }
+      if (mounted.current) setError(reason instanceof Error ? reason.message : '无法完成生成，请恢复原任务。');
+    } finally { if (mounted.current) setBusy(false); }
+  }
+
+  async function validateTask() {
+    if (!submittedRequest || !taskSourceId) return;
+    try {
+      const expected = JSON.parse(expectedResult);
+      await generate({ request: { ...submittedRequest,
+        validation_task: { source_id: taskSourceId, expected_result: expected },
+      }, sessionId: (result?.harness_run.input_json.session_ids as string[] | undefined)?.[0] });
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法准备验证任务'); }
   }
 
   async function submit() {
+    if (pending) { await generate(pending); return; }
     const trimmed = goal.trim();
-    if (!trimmed) {
-      setError('Describe the outcome you want to create or improve.');
-      return;
-    }
-    setBusy(true);
-    setError(null);
+    if (!trimmed) { setError('Describe the outcome you want to create or improve.'); return; }
     setResult(null);
-    try {
-      const request: AuthoringIntentRequest = { goal: trimmed, create_new: createNew, idempotency_key: crypto.randomUUID(),
-        ...(!createNew && targetVersion ? { target_skill: targets.find((target) => target.version_id === targetVersion) } : {}),
-      };
-      setSubmittedRequest(request);
-      const created = await createAuthoringIntent(request, sessionId ?? undefined);
-      if (!mounted.current) return;
-      if (created.skill_drafts.length === 0) throw new Error('本次生成没有产生 Skill 候选，请调整目标后重试。');
-      remember(created);
-      await showAndEvaluate(created);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Failed to start authoring.');
-    } finally {
-      setBusy(false);
-    }
+    await generate({ request: { goal: trimmed, create_new: createNew, idempotency_key: crypto.randomUUID(),
+      ...(!createNew && targetVersion ? { target_skill: targets.find((target) => target.version_id === targetVersion) } : {}),
+    }, sessionId: sessionId ?? undefined });
+  }
+
+  function startAnother() {
+    // Explicitly abandon recovery; this does not cancel an admitted server run.
+    window.localStorage.removeItem(storageKey);
+    setPending(null); setSavedRunId(null); setSubmittedRequest(null); setResult(null); setError(null);
   }
 
   return (
@@ -210,17 +219,17 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
             onChange={(event) => setGoal(event.target.value)}
             placeholder="For example: 帮我把刚才反复做的流程变成一个可复用的 Skill"
             rows={5}
-            disabled={busy}
+            disabled={busy || !!pending}
             aria-label="Authoring goal"
           />
           {sessionId ? <label className="mt-3 flex gap-2 text-xs">
-            <input type="checkbox" checked={createNew} disabled={busy} onChange={(event) => setCreateNew(event.target.checked)} />
+            <input type="checkbox" checked={createNew} disabled={busy || !!pending} onChange={(event) => setCreateNew(event.target.checked)} />
             创建新 Skill；不修改当前会话使用的 Skill
           </label> : null}
           {targetsError ? <p className="mt-2 text-sm text-danger">{targetsError}</p> : null}
           {!createNew && targets.length > 1 ? <label className="mt-3 block text-sm">
             要优化哪个 Skill？
-            <select aria-label="要优化的 Skill" value={targetVersion} disabled={busy}
+            <select aria-label="要优化的 Skill" value={targetVersion} disabled={busy || !!pending}
               onChange={(event) => setTargetVersion(event.target.value)} className="mt-2 w-full border p-2">
               <option value="">请选择</option>
               {targets.map((target) => <option key={target.version_id} value={target.version_id}>{target.skill_name}</option>)}
@@ -233,14 +242,19 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
             <Button
               type="button"
               onClick={() => void submit()}
-              disabled={busy || recovering || !goal.trim() || (!createNew && (targetsLoading || !!targetsError || (targets.length > 1 && !targetVersion)))}
+              disabled={busy || recovering || !goal.trim() || (!pending && !createNew && (targetsLoading || !!targetsError || (targets.length > 1 && !targetVersion)))}
               leadingIcon={busy ? Loader2 : Sparkles}
             >
-              {evaluating ? '正在评估' : busy ? '正在生成' : result ? '另生成一个候选' : '生成结果'}
+              {evaluating ? '正在评估' : busy ? '正在生成' : pending ? '重试原任务' : result ? '另生成一个候选' : '生成结果'}
             </Button>
           </div>
           {recovering ? <p className="mt-3 text-sm">正在恢复已保存的结果…</p> : null}
-          {savedRunId && !evaluating ? <Button variant="ghost" className="mt-3" disabled={busy || recovering} onClick={() => void resume()}>恢复已有结果与评估</Button> : null}
+          {pending ? <div className="mt-3 text-sm">
+            <p>原始提交已保存。重试会恢复同一次生成，不会重新创建或重复计费。</p>
+            <Button variant="ghost" disabled={busy} onClick={startAnother}>放弃恢复并修改目标</Button>
+            <p className="text-xs text-text-muted">放弃恢复不会取消服务端已经开始的任务；再次生成属于新任务。</p>
+          </div> : null}
+          {(savedRunId || pending) && !evaluating ? <Button variant="ghost" className="mt-3" disabled={busy || recovering} onClick={() => void resume()}>恢复已有结果与评估</Button> : null}
           {error ? <p className="mt-3 text-sm text-danger">{error}</p> : null}
         </Card>
 
@@ -328,7 +342,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId }: AuthoringSc
                 </select>
                 {taskSourceId ? <pre className="my-2 max-h-48 overflow-auto whitespace-pre-wrap text-xs">{tasks.find((task) => task.source_id === taskSourceId)?.content}</pre> : null}
                 <Textarea aria-label="预期 JSON 结果" placeholder='预期 JSON 结果，例如 {"ok": true}' value={expectedResult} disabled={busy} onChange={(event) => setExpectedResult(event.target.value)} />
-                <Button className="mt-3" disabled={busy || !submittedRequest || !taskSourceId || !expectedResult.trim()} onClick={() => void validateTask()}>用这个任务验证</Button>
+                <Button className="mt-3" disabled={busy || !!pending || !submittedRequest || !taskSourceId || !expectedResult.trim()} onClick={() => void validateTask()}>用这个任务验证</Button>
               </> : <p className="text-sm">缺少可复用的原始用户任务。请在包含实际任务的会话中生成或优化 Skill；当前候选仍可审阅。</p>}
             </Card> : null}
 

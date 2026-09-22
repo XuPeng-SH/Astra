@@ -53,11 +53,15 @@ function runtimePath(segments: string[], method: HttpMethod) {
 
 async function handle(request: NextRequest, method: HttpMethod, context: RouteContext) {
   const { segments } = await context.params;
-  const path = runtimePath(segments, method);
+  let path = runtimePath(segments, method);
   if (!path) {
     return NextResponse.json({ error: 'evaluation route not found' }, { status: 404 });
   }
 
+  if (path === '/skills/user') {
+    const prefix = request.nextUrl.searchParams.get('prefix');
+    if (prefix) path += `?prefix=${encodeURIComponent(prefix)}`;
+  }
   try {
     const runtime = await requireRuntimeClient({
       auth: 'required',

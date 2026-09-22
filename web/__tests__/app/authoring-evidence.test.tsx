@@ -2,12 +2,14 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { AuthoringPage } from '@/components/app/authoring-page';
 import { SkillUseAction } from '@/components/app/skill-use-action';
 import { createAuthoringIntent, listAuthoringTargets, loadAuthoringResult, decideSkillDraft, publishSkillDraft, activatePersonalSkill } from '@/lib/api/harnesses';
+import { createSession, listSessions } from '@/lib/api/sessions';
 import { runPreparedEvaluation, getEvaluationExperiment } from '@/lib/api/evaluations';
 import type { AuthoringIntentRecord } from '@/lib/api/types';
 
 const navigation = vi.hoisted(() => ({ query: 'sessionId=session' }));
 vi.mock('next/navigation', () => ({ useSearchParams: () => new URLSearchParams(navigation.query) }));
 vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn(), listAuthoringTargets: vi.fn(), loadAuthoringResult: vi.fn(), decideSkillDraft: vi.fn(), publishSkillDraft: vi.fn(), activatePersonalSkill: vi.fn() }));
+vi.mock('@/lib/api/sessions', () => ({ createSession: vi.fn(), listSessions: vi.fn() }));
 vi.mock('@/lib/api/evaluations', () => ({ runPreparedEvaluation: vi.fn(), getEvaluationExperiment: vi.fn() }));
 
 const record = {
@@ -109,7 +111,8 @@ it('does not launch evaluation from an authoring response after the owner change
   expect(runPreparedEvaluation).not.toHaveBeenCalled();
   expect(getEvaluationExperiment).not.toHaveBeenCalled();
   expect(screen.queryByText('Review carefully')).not.toBeInTheDocument();
-  expect(window.localStorage.length).toBe(0);
+  expect(window.localStorage.length).toBe(1);
+  expect(window.localStorage.key(0)).toContain('owner:runtime');
 });
 
 it('reuses the candidate when selecting an original task and explicit expected result', async () => {
@@ -205,4 +208,98 @@ it('does not publish after the owner changes while approval is pending', async (
   view.rerender(<AuthoringPage ownerId="other-owner" runtimeKey="runtime" />);
   await act(async () => approve(record.skill_drafts[0]));
   expect(publishSkillDraft).not.toHaveBeenCalled();
+});
+
+
+it('persists the original submission before dispatch and retries a lost initial response with the same key after reload', async () => {
+  vi.mocked(createAuthoringIntent).mockImplementationOnce(async (request) => {
+    expect(JSON.parse(window.localStorage.getItem(window.localStorage.key(0)!)!).pending.request).toEqual(request);
+    throw new Error('Initial response lost');
+  }).mockRejectedValueOnce(new Error('Original run is still running')).mockResolvedValue(record);
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Create a review skill' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  await screen.findByText('Initial response lost');
+  const original = vi.mocked(createAuthoringIntent).mock.calls[0];
+  view.unmount();
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  const retry = await screen.findByRole('button', { name: '重试原任务' });
+  expect(screen.getByLabelText('Authoring goal')).toBeDisabled();
+  expect(createAuthoringIntent).toHaveBeenCalledTimes(1);
+  fireEvent.click(retry);
+  await screen.findByText('Original run is still running');
+  fireEvent.click(screen.getByRole('button', { name: '恢复已有结果与评估' }));
+  await screen.findByText('Review carefully');
+  expect(vi.mocked(createAuthoringIntent).mock.calls).toEqual([original, original, original]);
+  expect(crypto.randomUUID).toHaveBeenCalledTimes(1);
+});
+
+it('recovers the original request when the page leaves before generation completes', async () => {
+  let finish!: (value: AuthoringIntentRecord) => void;
+  vi.mocked(createAuthoringIntent).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; })).mockResolvedValue(record);
+  const view = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Create a review skill' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  view.unmount();
+  await act(async () => finish(record));
+  expect(runPreparedEvaluation).not.toHaveBeenCalled();
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.click(await screen.findByRole('button', { name: '重试原任务' }));
+  await screen.findByText('Review carefully');
+  expect(vi.mocked(createAuthoringIntent).mock.calls[1]).toEqual(vi.mocked(createAuthoringIntent).mock.calls[0]);
+});
+
+it('does not dispatch generation when the browser cannot retain the recovery request', async () => {
+  const storage = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('Storage full'); });
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Create a review skill' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  await screen.findByText('Storage full');
+  expect(createAuthoringIntent).not.toHaveBeenCalled();
+  storage.mockRestore();
+});
+
+it('uses a standalone published Skill in an explicitly selected session with CAS', async () => {
+  vi.mocked(listSessions).mockResolvedValue({ sessions: [
+    { session_id: 'other', title: 'My task', status: 'active', created_at: '', metadata: { source: 'web_v1', web_chat_id: 'web-other' } },
+    { session_id: 'closed', title: 'Ended task', status: 'ended', created_at: '' },
+  ], next_cursor: null });
+  vi.mocked(activatePersonalSkill).mockResolvedValue({ version_id: 'published', content_hash: 'hash' });
+  render(<SkillUseAction skillName="review" versionId="published" />);
+  expect(listSessions).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: '选择其他会话' }));
+  await screen.findByRole('option', { name: 'My task' });
+  expect(screen.queryByRole('option', { name: 'Ended task' })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('启用 Skill 的会话'), { target: { value: 'other' } });
+  expect(activatePersonalSkill).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: '在此会话使用此版本' }));
+  await screen.findByText(/已启用 review/);
+  expect(activatePersonalSkill).toHaveBeenCalledWith('review', 'other', 'published', null);
+  expect(screen.getByRole('link', { name: '返回会话' })).toHaveAttribute('href', '/chats/web-other');
+});
+
+it('creates an empty session before explicit activation and retries activation in that same session', async () => {
+  vi.mocked(createSession).mockResolvedValue({ session_id: 'new-session', status: 'active', created_at: '' });
+  vi.mocked(activatePersonalSkill).mockRejectedValueOnce(new Error('Activation response lost')).mockResolvedValue({ version_id: 'published', content_hash: 'hash' });
+  render(<SkillUseAction skillName="review" versionId="published" />);
+  fireEvent.click(screen.getByRole('button', { name: '在新会话使用此版本' }));
+  await screen.findByRole('alert');
+  expect(createSession).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole('button', { name: '在此会话使用此版本' }));
+  await screen.findByText(/已启用 review/);
+  expect(createSession).toHaveBeenCalledTimes(1);
+  expect(activatePersonalSkill).toHaveBeenLastCalledWith('review', 'new-session', 'published', null);
+});
+
+it('does not activate a newly created session after the owner leaves the page', async () => {
+  let finish!: (session: Awaited<ReturnType<typeof createSession>>) => void;
+  vi.mocked(createSession).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+  const view = render(<SkillUseAction skillName="review" versionId="published" />);
+  fireEvent.click(screen.getByRole('button', { name: '在新会话使用此版本' }));
+  view.unmount();
+  await act(async () => finish({ session_id: 'new-session', created_at: '' }));
+  expect(activatePersonalSkill).not.toHaveBeenCalled();
 });

@@ -121,8 +121,8 @@ export function listEvaluationModels() {
   return requestJson<EvaluationModelPage>('/api/evaluations/models');
 }
 
-export function listPersonalSkillSources() {
-  return requestJson<PersonalSkillSource[]>('/api/evaluations/skills');
+export function listPersonalSkillSources(prefix = '') {
+  return requestJson<PersonalSkillSource[]>(`/api/evaluations/skills${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`);
 }
 
 export function listPersonalSkillVersions(skillName: string) {
