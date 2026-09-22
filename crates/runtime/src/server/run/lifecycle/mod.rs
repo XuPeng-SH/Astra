@@ -7796,6 +7796,10 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
+        context.generation_controls = Some(
+            Self::root_generation_controls(request)
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?,
+        );
         context.work_binding = work_binding.map(ValidatedWorkRuntimeBinding::durable_binding);
         use astra_services::runs::{
             DurableAdmissionSource, ModelAdmissionSource, RuntimeCapabilitySource,
@@ -8804,11 +8808,10 @@ impl AgenticRunLifecycleService {
         // explicitly supplied thinking, validate it against the already
         // admitted Offering before inference; an absent field preserves the
         // ordinary chat default without inventing an explicit `off` request.
-        let thinking = Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+        let controls = Self::root_generation_controls(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
-        let initial_output_limit =
-            Self::initial_output_limit_from_chat_context(&request.context)
-                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        let thinking = controls.thinking;
+        let initial_output_limit = controls.first_output_max_tokens;
         if let Some(limit) = initial_output_limit {
             thinking
                 .validate_output_budget(u64::from(limit))
@@ -11664,6 +11667,8 @@ impl AgenticRunLifecycleService {
         plan_authoring_active: bool,
         work_runtime_binding: Option<&ValidatedWorkRuntimeBinding>,
     ) -> server_loop_host::ServerAgenticLoopHost {
+        let generation_controls = Self::root_generation_controls(request)
+            .expect("generation controls validated before host construction");
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
             self.encryptor.clone(),
@@ -11671,20 +11676,8 @@ impl AgenticRunLifecycleService {
             session_id.to_string(),
         )
         .with_model(request.model.clone())
-        .with_initial_output_limit(
-            Self::initial_output_limit_from_chat_context(&request.context)
-                .expect("output limit validated before host construction"),
-        )
-        .with_preserved_thinking(
-            request
-                .context
-                .as_ref()
-                .is_some_and(|context| context.contains_key("thinking"))
-                && Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-                    .is_ok_and(|thinking| {
-                        thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
-                    }),
-        )
+        .with_initial_output_limit(generation_controls.first_output_max_tokens)
+        .with_preserved_thinking(generation_controls.preserve_thinking)
         .with_model_service(Some(self.model_service.clone()))
         .with_admitted_execution_deadline(request.admitted_execution_deadline)
         .with_admitted_model_execution(request.admitted_model_execution.clone())
@@ -12462,9 +12455,9 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             harness,
         } = environment;
-        let thinking_config =
-            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-                .expect("thinking configuration was validated during request admission");
+        let thinking_config = Self::root_generation_controls(request)
+            .expect("generation controls validated during request admission")
+            .thinking;
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(request.model.as_deref());
@@ -12643,6 +12636,25 @@ impl AgenticRunLifecycleService {
             canonical_trace_time_bounds: Default::default(),
             harness,
         }
+    }
+
+    fn root_generation_controls(
+        request: &ChatRequestData,
+    ) -> Result<crate::server::run::engine::RunGenerationControls, String> {
+        let thinking =
+            Self::thinking_from_chat_context(&request.context, request.model.as_deref())?;
+        let first_output_max_tokens =
+            Self::initial_output_limit_from_chat_context(&request.context)?;
+        let preserve_thinking = request
+            .context
+            .as_ref()
+            .is_some_and(|context| context.contains_key("thinking"))
+            && thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+        Ok(crate::server::run::engine::RunGenerationControls {
+            thinking,
+            first_output_max_tokens,
+            preserve_thinking,
+        })
     }
 
     fn thinking_from_chat_context(
@@ -22233,6 +22245,8 @@ impl ServerSubRunExecutor {
             let requested_controls = crate::server::run::engine::RunGenerationControls {
                 thinking: config.thinking.clone(),
                 first_output_max_tokens: config.max_output_tokens,
+                preserve_thinking: config.thinking
+                    != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
             };
             if crate::server::run::engine::durable_run_generation_controls(&existing)?
                 != requested_controls
@@ -22376,6 +22390,8 @@ impl ServerSubRunExecutor {
                     generation_controls: Some(crate::server::run::engine::RunGenerationControls {
                         thinking: config.thinking.clone(),
                         first_output_max_tokens: config.max_output_tokens,
+                        preserve_thinking: config.thinking
+                            != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                     }),
                     agent_binding_name: Some(config.agent_profile.name.clone()),
                     provider_run_owner: inherited_provider_run_owner(&config.context)?,
@@ -22418,6 +22434,8 @@ impl ServerSubRunExecutor {
         let requested_controls = crate::server::run::engine::RunGenerationControls {
             thinking: config.thinking.clone(),
             first_output_max_tokens: config.max_output_tokens,
+            preserve_thinking: config.thinking
+                != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         };
         let Some(run_engine) = self.durable_run_engine() else {
             return Ok((inherited_execution.cloned(), requested_controls));
@@ -23422,7 +23440,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .with_model(child_model_name.clone())
         .with_initial_output_limit(generation_controls.first_output_max_tokens)
-        .with_preserved_thinking(generation_controls.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault)
+        .with_preserved_thinking(generation_controls.preserve_thinking)
         .with_model_service(self.model_service.clone())
         .with_admitted_model_execution(admitted_model_execution)
         .with_inference_owner_pod_id(

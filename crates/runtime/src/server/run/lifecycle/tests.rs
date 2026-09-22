@@ -354,6 +354,46 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            crate::server::run::engine::durable_run_generation_controls(&durable).unwrap(),
+            crate::server::run::engine::RunGenerationControls {
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                first_output_max_tokens: None,
+                preserve_thinking: false,
+            }
+        );
+        let mut explicit = request.clone();
+        let explicit_context = explicit.context.get_or_insert_with(serde_json::Map::new);
+        explicit_context.insert("thinking".into(), serde_json::json!({"mode": "off"}));
+        explicit_context.insert("max_output_tokens".into(), serde_json::json!(2048));
+        service
+            .persist_run_start(
+                "explicit-controls-run",
+                "user-1",
+                "explicit-controls-session",
+                &explicit,
+                None,
+                None,
+                None,
+                None,
+                mode,
+            )
+            .await
+            .expect("persist explicit root generation controls");
+        let explicit_run = service
+            .run_engine
+            .load_run("user-1", "explicit-controls-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::server::run::engine::durable_run_generation_controls(&explicit_run).unwrap(),
+            crate::server::run::engine::RunGenerationControls {
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+                first_output_max_tokens: Some(2048),
+                preserve_thinking: true,
+            }
+        );
         let decoded = durable
             .execution_restrictions()
             .unwrap()
@@ -6708,6 +6748,51 @@ fn initial_output_limit_requires_a_positive_typed_integer() {
     );
 }
 
+#[test]
+fn root_generation_controls_preserve_explicitness_and_effective_reasoning() {
+    use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+    let mut request = test_request("snapshot root controls");
+    request.model = None;
+    request.context = None;
+    let omitted = AgenticRunLifecycleService::root_generation_controls(&request).unwrap();
+    assert_eq!(omitted.thinking, ThinkingConfig::Off);
+    assert_eq!(omitted.first_output_max_tokens, None);
+    assert!(!omitted.preserve_thinking);
+
+    for (value, expected) in [
+        (json!({"mode": "off"}), ThinkingConfig::Off),
+        (
+            json!({"mode": "model_default"}),
+            ThinkingConfig::ModelDefault,
+        ),
+        (
+            json!({"mode": "adaptive", "effort": "high"}),
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        ),
+        (
+            json!({"mode": "enabled", "budget_tokens": 2048}),
+            ThinkingConfig::Enabled {
+                budget_tokens: 2048,
+            },
+        ),
+    ] {
+        request.context = Some(Map::from_iter([
+            ("thinking".into(), value),
+            ("max_output_tokens".into(), json!(4096)),
+        ]));
+        let controls = AgenticRunLifecycleService::root_generation_controls(&request).unwrap();
+        assert_eq!(controls.thinking, expected);
+        assert_eq!(controls.first_output_max_tokens, Some(4096));
+        assert_eq!(
+            controls.preserve_thinking,
+            expected != ThinkingConfig::ModelDefault
+        );
+    }
+}
+
 #[tokio::test]
 async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propagates() {
     let executor = ServerSpawnAgentExecutor::new(
@@ -10455,6 +10540,57 @@ fn db_backed_test_service(
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_run_start_generation_controls_survive_a_fresh_reader() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let suffix = Uuid::new_v4();
+    let user_id = format!("generation-controls-owner-{suffix}");
+    let session_id = format!("generation-controls-session-{suffix}");
+    let run_id = format!("generation-controls-run-{suffix}");
+    crate::server::run::insert_active_run_session_fixture(&pool, &user_id, &session_id).await;
+    let controls = crate::server::run::engine::RunGenerationControls {
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+            budget_tokens: 2048,
+        },
+        first_output_max_tokens: Some(4096),
+        preserve_thinking: true,
+    };
+    db_backed_test_service(&pool, "generation-controls-writer")
+        .run_engine
+        .start_run_with_context(
+            &run_id,
+            &user_id,
+            &session_id,
+            crate::server::run::engine::RunStartContext {
+                generation_controls: Some(controls.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist controlled run start");
+
+    let reader = db_backed_test_service(&pool, "generation-controls-reader");
+    let durable = reader
+        .run_engine
+        .load_run(&user_id, &run_id)
+        .await
+        .expect("load persisted run")
+        .expect("run exists");
+    assert_eq!(
+        crate::server::run::engine::durable_run_generation_controls(&durable).unwrap(),
+        controls
+    );
+    assert_eq!(
+        durable
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_started")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
@@ -12865,6 +13001,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         crate::server::run::engine::RunGenerationControls {
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             first_output_max_tokens: None,
+            preserve_thinking: true,
         }
     );
     assert_eq!(

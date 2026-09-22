@@ -2273,6 +2273,7 @@ impl DelegationEngine {
                     generation_controls: Some(crate::server::run::engine::RunGenerationControls {
                         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                         first_output_max_tokens: None,
+                        preserve_thinking: true,
                     }),
                     ..Default::default()
                 },
@@ -9242,6 +9243,7 @@ mod tests {
                 crate::server::run::engine::RunGenerationControls {
                     thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
                     first_output_max_tokens: None,
+                    preserve_thinking: true,
                 }
             );
         }
