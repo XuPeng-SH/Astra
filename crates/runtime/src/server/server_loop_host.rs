@@ -1322,10 +1322,10 @@ pub(crate) fn resolve_optional_auxiliary_call_gate() -> AuxiliaryCallGate {
 pub(crate) fn resolve_work_admission_gate() -> WorkAdmissionGate {
     match AuxiliaryLlmPolicy::from_env() {
         AuxiliaryLlmPolicy::Disabled => WorkAdmissionGate::Disabled,
-        AuxiliaryLlmPolicy::BoundaryOnly => WorkAdmissionGate::BoundaryOnly,
-        AuxiliaryLlmPolicy::Always | AuxiliaryLlmPolicy::CapacityAware => {
-            WorkAdmissionGate::Allowed
+        AuxiliaryLlmPolicy::BoundaryOnly | AuxiliaryLlmPolicy::CapacityAware => {
+            WorkAdmissionGate::BoundaryOnly
         }
+        AuxiliaryLlmPolicy::Always => WorkAdmissionGate::Allowed,
     }
 }
 
@@ -1341,10 +1341,10 @@ pub(crate) fn resolve_work_admission_gate() -> WorkAdmissionGate {
 fn should_skip_work_admission_judge(
     gate: WorkAdmissionGate,
     admission_boundary: bool,
-    _topology_boundary: bool,
+    topology_boundary: bool,
 ) -> Option<&'static str> {
     match gate {
-        WorkAdmissionGate::BoundaryOnly if admission_boundary => None,
+        WorkAdmissionGate::BoundaryOnly if admission_boundary || topology_boundary => None,
         WorkAdmissionGate::BoundaryOnly => Some("ordinary_primary_turn"),
         WorkAdmissionGate::Disabled => Some("disabled"),
         WorkAdmissionGate::Allowed => None,
@@ -51255,8 +51255,8 @@ mod tests {
             );
             assert_eq!(
                 should_skip_work_admission_judge(resolve_work_admission_gate(), false, false),
-                None,
-                "default Auto must start one outer semantic sidecar"
+                Some("ordinary_primary_turn"),
+                "default policy waits for an admission or topology boundary"
             );
             assert_eq!(
                 should_skip_work_admission_judge(resolve_work_admission_gate(), true, false),
@@ -51326,8 +51326,8 @@ mod tests {
             );
             assert_eq!(
                 should_skip_work_admission_judge(resolve_work_admission_gate(), false, false),
-                None,
-                "capacity admission must reject explicitly, not silently downgrade Auto"
+                Some("ordinary_primary_turn"),
+                "provider quota does not create a Work admission boundary"
             );
             assert_eq!(
                 should_skip_work_admission_judge(resolve_work_admission_gate(), true, false),

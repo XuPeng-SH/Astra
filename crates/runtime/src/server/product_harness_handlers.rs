@@ -238,8 +238,35 @@ pub async fn create_skillify_harness_run_handler(
         .map(|run| (StatusCode::CREATED, Json(run)))
 }
 
-/// High-level authoring entrypoint. The session is an authenticated route
-/// boundary; the request body contains only the user's natural-language goal.
+/// List immutable active Skill targets within the authenticated owner's session.
+pub async fn list_authoring_targets_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<
+    Json<Vec<astra_services::harness::AuthoringSkillTarget>>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        error_response(StatusCode::SERVICE_UNAVAILABLE, "database not configured")
+    })?;
+    let active = astra_services::DatabasePersonalSkillStore::new(pool)
+        .load_active_for_session(&user.user_id, &session_id)
+        .await
+        .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(
+        active
+            .into_iter()
+            .map(|skill| astra_services::harness::AuthoringSkillTarget {
+                skill_name: skill.skill_name,
+                version_id: skill.version_id,
+            })
+            .collect(),
+    ))
+}
+
+/// Author a candidate from the user goal and optional pinned Skill target.
 pub async fn create_authoring_intent_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

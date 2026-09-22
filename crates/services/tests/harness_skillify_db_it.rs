@@ -1,4 +1,8 @@
 mod common;
+mod execution_fixture {
+    use astra_services as services;
+    include!("fixtures/evaluation_execution_config.rs");
+}
 
 use std::sync::{Arc, Mutex};
 
@@ -553,6 +557,10 @@ async fn cleanup_skillify_run(
         .bind(event_id)
         .execute(pool)
         .await;
+    let _ = sqlx::query("DELETE FROM session_state_items WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
         .bind(session_id)
         .execute(pool)
@@ -630,7 +638,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
     use astra_services::personal_skills::{
         CreateUserSkillSource, DatabasePersonalSkillStore, SubmitUserSkillVersion,
     };
-    let shared = common::setup_pool().await;
+    let (shared, mut settings) = common::setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let owner = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -665,14 +673,33 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
             &owner,
             "review",
             SubmitUserSkillVersion {
-                version: "1.0.0".into(),
-                manifest_json: json!({"name":"review","version":"1.0.0","description":"Review"}),
+                version: "0.1.0".into(),
+                manifest_json: json!({"name":"review","version":"0.1.0","description":"Review"}),
                 content_markdown: "# Review\n\n## Steps\nPreserve existing examples.".into(),
-                status: Some("draft".into()),
+                status: Some("published".into()),
             },
         )
         .await
         .unwrap();
+    store
+        .activate_version_with_expected(&owner, &session_id, "review", &baseline.version_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .load_active_for_session(&owner, &session_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .load_active_for_session("other-owner", &session_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let executor = Arc::new(CapturingSkillifyExecutor::default());
     *executor.output.lock().unwrap() = Some(SkillifyAgentOutput {
         extractor: "test".into(),
@@ -724,6 +751,22 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         result.harness_run.output_json["authoring"]["baseline"]["version_id"],
         baseline.version_id
     );
+    let tool_output = result.tool_output();
+    assert_eq!(
+        tool_output["harness_run_id"],
+        result.harness_run.harness_run_id
+    );
+    assert_eq!(
+        tool_output["candidates"][0]["skill_draft_id"],
+        result.skill_drafts[0].skill_draft_id
+    );
+    assert_eq!(
+        tool_output["candidates"][0]["review_url"],
+        format!(
+            "/harnesses?runId={}&draftId={}",
+            result.harness_run.harness_run_id, result.skill_drafts[0].skill_draft_id
+        )
+    );
     let captured = executor.request.lock().unwrap().take().unwrap();
     assert_eq!(captured.skill_name.as_deref(), Some("review"));
     assert!(
@@ -762,6 +805,44 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
     let input = selected.evaluation_input.as_ref().unwrap();
     assert_eq!(input.case.message, task_source.content);
     assert_eq!(input.target.baseline.revision_id, baseline.version_id);
+    // Cross the real preparation boundary, not just the authoring DTO.
+    use astra_services::evaluation::{
+        EvaluationJudgmentPolicy, PreparedSkillIdentity, build_prepared_experiment_spec,
+        prepared_experiment_id,
+    };
+    let experiment_id = prepared_experiment_id(&owner, &input.submission_idempotency_key).unwrap();
+    let candidate = store
+        .load_version(&owner, "review", &input.target.candidate.revision_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let preparation = astra_services::evaluation::EvaluationExperimentPrepareRequest {
+        submission_idempotency_key: input.submission_idempotency_key.clone(),
+        target: input.target.clone(),
+        case: input.case.clone(),
+        model_offering_id: "test-model".into(),
+        workspace: None,
+        judgment_model_offering_id: None,
+        max_concurrency: 1,
+        max_wall_time_secs: 30,
+    };
+    let identity = PreparedSkillIdentity {
+        skill_name: "review".into(),
+        baseline_revision_id: baseline.version_id.clone(),
+        baseline_content_hash: baseline.content_hash.clone(),
+        candidate_revision_id: candidate.version_id.clone(),
+        candidate_content_hash: candidate.content_hash.clone(),
+    };
+    let spec = build_prepared_experiment_spec(
+        None,
+        &experiment_id,
+        &preparation,
+        &execution_fixture::execution_config("test-model", "openai", "authoring"),
+        Some(&identity),
+        EvaluationJudgmentPolicy::Disabled,
+    )
+    .unwrap();
+    assert_eq!(spec.target.baseline.revision_id, baseline.version_id);
     validation.validation_task.as_mut().unwrap().expected_result = json!({"ok":false});
     let conflict = service
         .create_authoring_intent(owner.clone(), session_id.clone(), validation)
@@ -777,6 +858,85 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         .await
         .unwrap();
     assert_eq!(resumed.evaluation_input, selected.evaluation_input);
+    let run_id = result.harness_run.harness_run_id.clone();
+    let draft_id = result.skill_drafts[0].skill_draft_id.clone();
+    service
+        .decide_skill_draft(
+            owner.clone(),
+            run_id.clone(),
+            draft_id.clone(),
+            HarnessDecisionRequest {
+                decision: "approve".into(),
+                after_json: None,
+                reason: None,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .unwrap();
+    // Publication must not need a second connection while holding the draft lock.
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 0;
+    let publisher =
+        DatabaseHarnessService::new(astra_core::SharedPool::new(&settings).await.unwrap());
+    let conflict = publisher
+        .publish_skill_draft(
+            owner.clone(),
+            run_id.clone(),
+            draft_id.clone(),
+            astra_services::SkillifyPublishRequest {
+                visibility: Some("private".into()),
+                version: Some("0.1.0".into()),
+                description: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+    assert_eq!(
+        store.list_sources(&owner, None).await.unwrap()[0].visibility,
+        "public",
+        "failed publication must not change the old Skill's visibility"
+    );
+    let publish = || astra_services::SkillifyPublishRequest {
+        visibility: Some("private".into()),
+        version: None,
+        description: None,
+    };
+    let (first, retry) = tokio::join!(
+        service.publish_skill_draft(owner.clone(), run_id.clone(), draft_id.clone(), publish()),
+        service.publish_skill_draft(owner.clone(), run_id.clone(), draft_id.clone(), publish()),
+    );
+    let published = first.unwrap();
+    assert_eq!(
+        published.version_id,
+        retry.unwrap().version_id,
+        "concurrent retries publish one immutable version"
+    );
+    let single_connection_retry = publisher
+        .publish_skill_draft(owner.clone(), run_id.clone(), draft_id.clone(), publish())
+        .await
+        .unwrap();
+    assert_eq!(single_connection_retry.version_id, published.version_id);
+    assert_ne!(published.version_id, baseline.version_id);
+    assert_eq!(
+        store
+            .load_version(&owner, "review", &baseline.version_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .content_markdown,
+        baseline.content_markdown
+    );
+    assert_eq!(
+        store
+            .load_active_for_session(&owner, &session_id)
+            .await
+            .unwrap()[0]
+            .version_id,
+        baseline.version_id,
+        "publishing must not implicitly activate the improvement"
+    );
     cleanup_skillify_run(
         &pool,
         &result.harness_run.harness_run_id,

@@ -28799,7 +28799,7 @@ mod tests {
                     "submission_idempotency_key": "atomic-start",
                     "target": {"kind": "prompt", "baseline": {"revision_id": "base", "content": "base prompt"},
                         "candidate": {"revision_id": "candidate", "content": "candidate prompt"}},
-                    "case": {"case_id": "case", "message": "fixed input", "verifier_id": "verifier", "verifier_version": "1", "holdout": false},
+                    "case": {"case_id": "case", "message": "fixed input", "verifier_config": {"kind":"json_value_equals", "expected":{"ok":true}}, "holdout": false},
                     "model_offering_id": "model", "max_concurrency": 1, "max_wall_time_secs": 30,
                 })).unwrap();
                 let spec = build_prepared_experiment_spec(
@@ -31337,10 +31337,17 @@ mod tests {
             assert_eq!(claim.run.session_id, *session_id);
             assert_eq!(claim.claimed_from_generation, 0);
             assert_eq!(claim.run.run_generation, 1);
-            assert_eq!(claim.run.last_event_idx, 1);
+            assert_eq!(claim.run.last_event_idx, 2);
+            let mut custody = RunRecoveryCustody::for_claim(&claim.run, 0).event();
+            custody["index"] = json!(1);
+            let persisted = store.load_run(&user_id, run_id).await.unwrap().unwrap();
+            assert_eq!(
+                persisted.events.iter().find(|event| event["index"] == 1),
+                Some(&custody)
+            );
             let event_type: String = sqlx::query_scalar(
                 "SELECT event_type FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND event_idx = 1",
+                 WHERE user_id = ? AND run_id = ? AND event_idx = 2",
             )
             .bind(&user_id)
             .bind(run_id)

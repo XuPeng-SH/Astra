@@ -1,11 +1,11 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { AuthoringPage } from '@/components/app/authoring-page';
-import { createAuthoringIntent } from '@/lib/api/harnesses';
+import { createAuthoringIntent, listAuthoringTargets } from '@/lib/api/harnesses';
 import { runPreparedEvaluation } from '@/lib/api/evaluations';
 import type { AuthoringIntentRecord } from '@/lib/api/types';
 
 vi.mock('next/navigation', () => ({ useSearchParams: () => new URLSearchParams('sessionId=session') }));
-vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn() }));
+vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn(), listAuthoringTargets: vi.fn() }));
 vi.mock('@/lib/api/evaluations', () => ({ runPreparedEvaluation: vi.fn() }));
 
 const record = {
@@ -23,11 +23,12 @@ const record = {
   inference: { providers: [], usage_status: 'unavailable', estimated_cost_usd: null },
 } as unknown as AuthoringIntentRecord;
 
-beforeEach(() => vi.resetAllMocks());
+beforeEach(() => { vi.resetAllMocks(); vi.mocked(listAuthoringTargets).mockResolvedValue([]); });
 
 async function submit() {
   render(<AuthoringPage />);
   fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Create a review skill' } });
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成结果' })).toBeEnabled());
   fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
   await screen.findByText('Review carefully');
 }
@@ -58,4 +59,19 @@ it('reuses the candidate when selecting an original task and explicit expected r
   const requests = vi.mocked(createAuthoringIntent).mock.calls;
   expect(requests).toHaveLength(2);
   expect(requests[1][0]).toEqual({ ...requests[0][0], validation_task: { source_id: 'task', expected_result: { ok: true } } });
+});
+
+it('asks for an ambiguous active Skill and sends its frozen identity', async () => {
+  const targets = [{ skill_name: 'review', version_id: 'v-review' }, { skill_name: 'deploy', version_id: 'v-deploy' }];
+  vi.mocked(listAuthoringTargets).mockResolvedValue(targets);
+  vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+  render(<AuthoringPage />);
+  fireEvent.change(screen.getByLabelText('Authoring goal'), { target: { value: 'Improve my skill' } });
+  const selection = await screen.findByLabelText('要优化的 Skill');
+  expect(screen.getByRole('button', { name: '生成结果' })).toBeDisabled();
+  expect(createAuthoringIntent).not.toHaveBeenCalled();
+  fireEvent.change(selection, { target: { value: 'v-review' } });
+  fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
+  await screen.findByText('Review carefully');
+  expect(createAuthoringIntent).toHaveBeenCalledWith(expect.objectContaining({ target_skill: targets[0] }), 'session');
 });

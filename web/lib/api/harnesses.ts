@@ -108,3 +108,7 @@ export function createSkillifyDraft(runId: string, payload: SkillifyDraftRequest
     body: JSON.stringify(payload),
   });
 }
+
+export function listAuthoringTargets(sessionId: string) {
+  return requestJson<Array<NonNullable<AuthoringIntentRequest['target_skill']>>>(`/api/chats/${encodeURIComponent(sessionId)}/authoring`);
+}

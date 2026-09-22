@@ -151,8 +151,21 @@ impl DatabasePersonalSkillStore {
         owner_user_id: &str,
         request: CreateUserSkillSource,
     ) -> Result<UserSkillSourceRecord, PersonalSkillError> {
-        if self
-            .load_source_optional(owner_user_id, &request.skill_name)
+        let mut conn = self
+            .pool
+            .get()
+            .acquire()
+            .await
+            .map_err(|error| db_error("create_source", request.skill_name.clone(), error))?;
+        Self::create_source_on(&mut conn, owner_user_id, request).await
+    }
+
+    pub(crate) async fn create_source_on(
+        conn: &mut sqlx::MySqlConnection,
+        owner_user_id: &str,
+        request: CreateUserSkillSource,
+    ) -> Result<UserSkillSourceRecord, PersonalSkillError> {
+        if Self::load_source_optional_on(&mut *conn, owner_user_id, &request.skill_name)
             .await?
             .is_some()
         {
@@ -164,14 +177,14 @@ impl DatabasePersonalSkillStore {
             .bind(&visibility)
             .bind(owner_user_id)
             .bind(&request.skill_name)
-            .execute(self.pool.get())
+            .execute(&mut *conn)
             .await
             .map_err(|source| PersonalSkillError::Database {
                 operation: "update_user_skill_source",
                 entity: request.skill_name.clone(),
                 source,
             })?;
-            return self.load_source(owner_user_id, &request.skill_name).await;
+            return Self::load_source_on(&mut *conn, owner_user_id, &request.skill_name).await;
         }
         let source_id = format!("skill-source-{}", Uuid::new_v4());
         let visibility = request.visibility.unwrap_or_else(|| "private".to_string());
@@ -184,14 +197,14 @@ impl DatabasePersonalSkillStore {
         .bind(owner_user_id)
         .bind(&request.skill_name)
         .bind(&visibility)
-        .execute(self.pool.get())
+        .execute(&mut *conn)
         .await
         .map_err(|source| PersonalSkillError::Database {
             operation: "create_user_skill_source",
             entity: request.skill_name.clone(),
             source,
         })?;
-        self.load_source(owner_user_id, &request.skill_name).await
+        Self::load_source_on(&mut *conn, owner_user_id, &request.skill_name).await
     }
 
     /// Return an existing source without changing its visibility, or create a
@@ -200,6 +213,20 @@ impl DatabasePersonalSkillStore {
     /// sharing policy, including under a concurrent first write.
     pub async fn ensure_source(
         &self,
+        owner_user_id: &str,
+        request: CreateUserSkillSource,
+    ) -> Result<UserSkillSourceRecord, PersonalSkillError> {
+        let mut conn = self
+            .pool
+            .get()
+            .acquire()
+            .await
+            .map_err(|error| db_error("ensure_source", request.skill_name.clone(), error))?;
+        Self::ensure_source_on(&mut conn, owner_user_id, request).await
+    }
+
+    pub(crate) async fn ensure_source_on(
+        conn: &mut sqlx::MySqlConnection,
         owner_user_id: &str,
         request: CreateUserSkillSource,
     ) -> Result<UserSkillSourceRecord, PersonalSkillError> {
@@ -215,14 +242,14 @@ impl DatabasePersonalSkillStore {
         .bind(owner_user_id)
         .bind(&request.skill_name)
         .bind(&visibility)
-        .execute(self.pool.get())
+        .execute(&mut *conn)
         .await
         .map_err(|source| PersonalSkillError::Database {
             operation: "ensure_user_skill_source",
             entity: request.skill_name.clone(),
             source,
         })?;
-        self.load_source(owner_user_id, &request.skill_name).await
+        Self::load_source_on(&mut *conn, owner_user_id, &request.skill_name).await
     }
 
     pub async fn submit_version(
@@ -231,19 +258,36 @@ impl DatabasePersonalSkillStore {
         skill_name: &str,
         request: SubmitUserSkillVersion,
     ) -> Result<UserSkillVersionRecord, PersonalSkillError> {
-        let source = match self.load_source_optional(owner_user_id, skill_name).await? {
-            Some(source) => source,
-            None => {
-                self.create_source(
-                    owner_user_id,
-                    CreateUserSkillSource {
-                        skill_name: skill_name.to_string(),
-                        visibility: Some("private".to_string()),
-                    },
-                )
-                .await?
-            }
-        };
+        let mut conn = self
+            .pool
+            .get()
+            .acquire()
+            .await
+            .map_err(|error| db_error("submit_version", skill_name, error))?;
+        Self::submit_version_on(&mut conn, owner_user_id, skill_name, request).await
+    }
+
+    pub(crate) async fn submit_version_on(
+        conn: &mut sqlx::MySqlConnection,
+        owner_user_id: &str,
+        skill_name: &str,
+        request: SubmitUserSkillVersion,
+    ) -> Result<UserSkillVersionRecord, PersonalSkillError> {
+        let source =
+            match Self::load_source_optional_on(&mut *conn, owner_user_id, skill_name).await? {
+                Some(source) => source,
+                None => {
+                    Self::create_source_on(
+                        &mut *conn,
+                        owner_user_id,
+                        CreateUserSkillSource {
+                            skill_name: skill_name.to_string(),
+                            visibility: Some("private".to_string()),
+                        },
+                    )
+                    .await?
+                }
+            };
         let status = request.status.unwrap_or_else(|| "draft".to_string());
         validate_version_status(&status)?;
         let canonical = normalize_skill_md(&request.manifest_json, &request.content_markdown);
@@ -275,14 +319,14 @@ impl DatabasePersonalSkillStore {
         .bind(SKILL_MD_NORMALIZE_VERSION)
         .bind(i64::from(token_estimate))
         .bind(&status)
-        .execute(self.pool.get())
+        .execute(&mut *conn)
         .await
         .map_err(|source| PersonalSkillError::Database {
             operation: "submit_user_skill_version",
             entity: format!("{skill_name}@{}", request.version),
             source,
         })?;
-        self.load_version_by_id(owner_user_id, skill_name, &version_id)
+        Self::load_version_by_id_on(&mut *conn, owner_user_id, skill_name, &version_id)
             .await?
             .ok_or_else(|| PersonalSkillError::VersionNotFound {
                 owner_user_id: owner_user_id.to_string(),
@@ -380,6 +424,21 @@ impl DatabasePersonalSkillStore {
         skill_name: &str,
         version: &str,
     ) -> Result<Option<UserSkillVersionRecord>, PersonalSkillError> {
+        let mut conn = self
+            .pool
+            .get()
+            .acquire()
+            .await
+            .map_err(|error| db_error("load_version_by_version", skill_name, error))?;
+        Self::load_version_by_version_on(&mut conn, owner_user_id, skill_name, version).await
+    }
+
+    pub(crate) async fn load_version_by_version_on(
+        conn: &mut sqlx::MySqlConnection,
+        owner_user_id: &str,
+        skill_name: &str,
+        version: &str,
+    ) -> Result<Option<UserSkillVersionRecord>, PersonalSkillError> {
         let row = sqlx::query(
             "SELECT version_id, source_id, owner_user_id, skill_name, version, manifest_json,
                     content_markdown, content_hash, normalize_version, token_estimate, status,
@@ -390,7 +449,7 @@ impl DatabasePersonalSkillStore {
         .bind(owner_user_id)
         .bind(skill_name)
         .bind(version)
-        .fetch_optional(self.pool.get())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|source| PersonalSkillError::Database {
             operation: "load_user_skill_version_by_version",
@@ -609,12 +668,12 @@ impl DatabasePersonalSkillStore {
             .collect()
     }
 
-    async fn load_source(
-        &self,
+    async fn load_source_on(
+        conn: &mut sqlx::MySqlConnection,
         owner_user_id: &str,
         skill_name: &str,
     ) -> Result<UserSkillSourceRecord, PersonalSkillError> {
-        self.load_source_optional(owner_user_id, skill_name)
+        Self::load_source_optional_on(conn, owner_user_id, skill_name)
             .await?
             .ok_or_else(|| PersonalSkillError::Database {
                 operation: "load_user_skill_source",
@@ -623,8 +682,8 @@ impl DatabasePersonalSkillStore {
             })
     }
 
-    async fn load_source_optional(
-        &self,
+    async fn load_source_optional_on(
+        conn: &mut sqlx::MySqlConnection,
         owner_user_id: &str,
         skill_name: &str,
     ) -> Result<Option<UserSkillSourceRecord>, PersonalSkillError> {
@@ -635,7 +694,7 @@ impl DatabasePersonalSkillStore {
         )
         .bind(owner_user_id)
         .bind(skill_name)
-        .fetch_optional(self.pool.get())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|source| PersonalSkillError::Database {
             operation: "load_user_skill_source",
@@ -652,6 +711,21 @@ impl DatabasePersonalSkillStore {
         skill_name: &str,
         version_id: &str,
     ) -> Result<Option<UserSkillVersionRecord>, PersonalSkillError> {
+        let mut conn = self
+            .pool
+            .get()
+            .acquire()
+            .await
+            .map_err(|error| db_error("load_version_by_id", skill_name, error))?;
+        Self::load_version_by_id_on(&mut conn, owner_user_id, skill_name, version_id).await
+    }
+
+    async fn load_version_by_id_on(
+        conn: &mut sqlx::MySqlConnection,
+        owner_user_id: &str,
+        skill_name: &str,
+        version_id: &str,
+    ) -> Result<Option<UserSkillVersionRecord>, PersonalSkillError> {
         let row = sqlx::query(
             "SELECT version_id, source_id, owner_user_id, skill_name, version, manifest_json,
                     content_markdown, content_hash, normalize_version, token_estimate, status,
@@ -662,7 +736,7 @@ impl DatabasePersonalSkillStore {
         .bind(owner_user_id)
         .bind(skill_name)
         .bind(version_id)
-        .fetch_optional(self.pool.get())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|source| PersonalSkillError::Database {
             operation: "load_user_skill_version",

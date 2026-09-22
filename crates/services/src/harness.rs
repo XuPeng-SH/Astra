@@ -378,6 +378,29 @@ pub struct AuthoringIntentRecord {
     pub evaluation_input: Option<AuthoringEvaluationInput>,
 }
 
+impl AuthoringIntentRecord {
+    /// The shared conversational continuation contract for Server and CLI.
+    pub fn tool_output(&self) -> Value {
+        json!({
+            "status": "candidate_ready", "target": self.target, "operation": self.operation,
+            "harness_run_id": self.harness_run.harness_run_id,
+            "candidates": self.skill_drafts.iter().map(|draft| json!({
+                "skill_draft_id": draft.skill_draft_id,
+                "review_url": format!("/harnesses?runId={}&draftId={}", self.harness_run.harness_run_id, draft.skill_draft_id),
+                "name": draft.candidate_name, "description": draft.description,
+                "content_markdown": draft.content_markdown, "status": draft.status,
+            })).collect::<Vec<_>>(),
+            "evaluation": self.evaluation,
+            "evidence": {
+                "inference_complete": self.inference.complete,
+                "usage_status": self.inference.usage_status,
+                "estimated_cost_usd": self.inference.estimated_cost_usd,
+            },
+            "next_step": "The candidate is private and inactive. Follow its review_url to review evidence and publish this exact candidate.",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillifyPublishRequest {
     pub visibility: Option<String>,
@@ -1375,8 +1398,15 @@ impl DatabaseHarnessService {
         };
         Ok(Some(AuthoringEvaluationInput {
             submission_idempotency_key: format!(
-                "authoring-evaluation:v1:{}:{}:{}",
-                harness_run.harness_run_id, draft.skill_draft_id, candidate_revision_id
+                "authoring-evaluation:v1:{}",
+                stable_hash(
+                    &json!([
+                        harness_run.harness_run_id,
+                        draft.skill_draft_id,
+                        candidate_revision_id
+                    ])
+                    .to_string()
+                )
             ),
             target: EvaluationPrepareTarget {
                 kind: EvaluationTargetKind::Skill,
@@ -3217,10 +3247,11 @@ impl HarnessService for DatabaseHarnessService {
                 "only skillify harness drafts can be published as skills",
             ));
         }
+        let mut tx = self.pool.get().begin().await.map_err(internal_error)?;
         let draft = self
-            .load_skill_draft(&harness_run_id, &skill_draft_id)
+            .load_skill_draft_locked(&mut tx, &harness_run_id, &skill_draft_id)
             .await?;
-        if !harness_skill_draft_is_publishable(&draft.status) {
+        if draft.status != "published" && !harness_skill_draft_is_publishable(&draft.status) {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 "skill draft must be approved before publishing",
@@ -3252,7 +3283,12 @@ impl HarnessService for DatabaseHarnessService {
             .unwrap_or_else(|| draft.publish_visibility.clone());
         validate_publish_visibility(&visibility)?;
         validate_skill_name(&draft.candidate_name)?;
-        let version = request.version.unwrap_or_else(|| "0.1.0".to_string());
+        // One reviewed draft owns one default publication identity. Different
+        // improvements never compete for a fixed 0.1.0 label; retries converge.
+        let version = request.version.unwrap_or_else(|| {
+            let identity = stable_hash(&skill_draft_id);
+            format!("0.1.0+{}", &identity[7..55])
+        });
         let description = request
             .description
             .unwrap_or_else(|| draft.description.clone());
@@ -3261,19 +3297,34 @@ impl HarnessService for DatabaseHarnessService {
             "description": description,
             "version": version
         });
-        let store = DatabasePersonalSkillStore::new(self.pool.clone());
-        store
-            .create_source(
-                &user_id,
-                CreateUserSkillSource {
-                    skill_name: draft.candidate_name.clone(),
-                    visibility: Some(visibility.clone()),
-                },
-            )
-            .await
-            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let version_record = store
-            .submit_version(
+        let existing = DatabasePersonalSkillStore::load_version_by_version_on(
+            &mut tx,
+            &user_id,
+            &draft.candidate_name,
+            &version,
+        )
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let version_record = if let Some(existing) = existing {
+            if existing.status != "published"
+                || existing.manifest_json != manifest
+                || existing.content_markdown != draft.content_markdown
+            {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "publication version already belongs to different content",
+                ));
+            }
+            existing
+        } else {
+            if draft.published_version_id.is_some() {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "this draft has already been published with another version",
+                ));
+            }
+            DatabasePersonalSkillStore::submit_version_on(
+                &mut tx,
                 &user_id,
                 &draft.candidate_name,
                 SubmitUserSkillVersion {
@@ -3284,22 +3335,44 @@ impl HarnessService for DatabaseHarnessService {
                 },
             )
             .await
-            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
 
-        let mut tx = self.pool.get().begin().await.map_err(internal_error)?;
-        sqlx::query(
-            "UPDATE harness_skill_drafts
-             SET status = 'published', published_version_id = ?, publish_visibility = ?, updated_at = NOW(6)
-             WHERE harness_run_id = ? AND skill_draft_id = ?",
-        )
-        .bind(&version_record.version_id)
-        .bind(&visibility)
-        .bind(&harness_run_id)
-        .bind(&skill_draft_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal_error)?;
-        update_skillify_draft_counts(&mut tx, &harness_run_id).await?;
+        if draft
+            .published_version_id
+            .as_ref()
+            .is_some_and(|id| id != &version_record.version_id)
+        {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "this draft has already been published with another version",
+            ));
+        }
+        if draft.status != "published" || draft.publish_visibility != visibility {
+            DatabasePersonalSkillStore::create_source_on(
+                &mut tx,
+                &user_id,
+                CreateUserSkillSource {
+                    skill_name: draft.candidate_name.clone(),
+                    visibility: Some(visibility.clone()),
+                },
+            )
+            .await
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            sqlx::query(
+                "UPDATE harness_skill_drafts
+                 SET status = 'published', published_version_id = ?, publish_visibility = ?, updated_at = NOW(6)
+                 WHERE harness_run_id = ? AND skill_draft_id = ?",
+            )
+            .bind(&version_record.version_id)
+            .bind(&visibility)
+            .bind(&harness_run_id)
+            .bind(&skill_draft_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            update_skillify_draft_counts(&mut tx, &harness_run_id).await?;
+        }
         tx.commit().await.map_err(internal_error)?;
 
         Ok(SkillifyPublishRecord {

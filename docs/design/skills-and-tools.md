@@ -148,6 +148,8 @@ user message
 The tool fixes `create` or `improve` before generation. `target_skill` pins an
 owner-scoped Skill name and immutable version; otherwise a single active session
 Skill supplies the target. Multiple active Skills require a target selection.
+The authenticated authoring GET lists active names and version IDs for that
+session; Web offers a target selector when more than one is active.
 `create_new` explicitly requests a new Skill. The old version's complete body is
 an input to generation, and an improvement must retain its name. The same frozen
 version is the Evaluation baseline; a model-generated name never chooses it. The generic
@@ -250,7 +252,17 @@ Authoring requests may carry an `idempotency_key` to replay one attempt. Each ne
 user submission uses a new key; omitting it creates a fresh attempt. Replaying a
 running or failed attempt returns a conflict, rather than claiming a candidate is
 ready. The authoring result links directly to the persisted candidate's existing
-review and publication flow. Publication remains an explicit user action.
+review and publication flow. The standard tool returns the same persisted run
+and draft IDs and review URL in both CLI and Server. Evaluation submission keys
+hash the frozen run, draft, and candidate identity to remain within the shared
+preparation boundary's length limit.
+
+Publication remains an explicit user action. Without an explicit version, each
+draft receives a distinct immutable version derived from its ID. Retrying the
+same publication returns that version, including concurrent retries; conflicting
+content cannot replace a published version. Version, visibility, and draft linkage
+commit on one transaction connection; identical retries perform no publication
+writes. Publication does not activate the candidate or alter the pinned baseline.
 
 Database catalog discovery preserves user-owned precedence, then creation order,
 and caches the exact selected record ID. Loading uses that ID so a newer public

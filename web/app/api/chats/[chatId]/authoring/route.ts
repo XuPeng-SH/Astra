@@ -25,3 +25,14 @@ export async function POST(
     );
   }
 }
+
+export async function GET(_request: NextRequest, context: { params: Promise<{ chatId: string }> }) {
+  try {
+    const runtime = await requireRuntimeClient({ auth: 'required', operation: 'list authoring targets' });
+    const { chatId } = await context.params;
+    return NextResponse.json(await runtime.get(`/harnesses/authoring/${encodeURIComponent(chatId)}`));
+  } catch (error) {
+    return NextResponse.json({ error: runtimeErrorDetail(error, 'Failed to load authoring targets.') },
+      { status: error instanceof RuntimeClientError ? (error.status ?? 502) : 502 });
+  }
+}

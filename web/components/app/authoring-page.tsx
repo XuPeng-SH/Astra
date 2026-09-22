@@ -2,8 +2,8 @@
 
 import { AlertTriangle, CheckCircle2, Loader2, Sparkles } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
-import { useState } from 'react';
-import { createAuthoringIntent } from '@/lib/api/harnesses';
+import { useEffect, useState } from 'react';
+import { createAuthoringIntent, listAuthoringTargets } from '@/lib/api/harnesses';
 import { runPreparedEvaluation, type EvaluationReport } from '@/lib/api/evaluations';
 import type { AuthoringIntentRecord, AuthoringIntentRequest } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
@@ -31,6 +31,21 @@ type AuthoringResult = AuthoringIntentRecord & {
 export function AuthoringPage() {
   const searchParams = useSearchParams();
   const sessionId = searchParams.get('sessionId');
+  const [targets, setTargets] = useState<Array<NonNullable<AuthoringIntentRequest['target_skill']>>>([]);
+  const [targetVersion, setTargetVersion] = useState('');
+  const [targetsLoading, setTargetsLoading] = useState(Boolean(sessionId));
+  const [targetsError, setTargetsError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setTargets([]); setTargetVersion(''); setTargetsError(null);
+    setTargetsLoading(Boolean(sessionId));
+    if (sessionId) listAuthoringTargets(sessionId).then((items) => {
+      if (!cancelled) setTargets(items);
+    }).catch((reason) => {
+      if (!cancelled) setTargetsError(reason instanceof Error ? reason.message : '无法读取当前 Skill');
+    }).finally(() => { if (!cancelled) setTargetsLoading(false); });
+    return () => { cancelled = true; };
+  }, [sessionId]);
   const [goal, setGoal] = useState('');
   const [result, setResult] = useState<AuthoringResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -85,7 +100,9 @@ export function AuthoringPage() {
     setError(null);
     setResult(null);
     try {
-      const request = { goal: trimmed, create_new: createNew, idempotency_key: crypto.randomUUID() };
+      const request: AuthoringIntentRequest = { goal: trimmed, create_new: createNew, idempotency_key: crypto.randomUUID(),
+        ...(!createNew && targetVersion ? { target_skill: targets.find((target) => target.version_id === targetVersion) } : {}),
+      };
       setSubmittedRequest(request);
       const created = await createAuthoringIntent(request, sessionId ?? undefined);
       if (created.skill_drafts.length === 0) throw new Error('本次生成没有产生 Skill 候选，请调整目标后重试。');
@@ -123,6 +140,15 @@ export function AuthoringPage() {
             <input type="checkbox" checked={createNew} disabled={busy} onChange={(event) => setCreateNew(event.target.checked)} />
             创建新 Skill；不修改当前会话使用的 Skill
           </label> : null}
+          {targetsError ? <p className="mt-2 text-sm text-danger">{targetsError}</p> : null}
+          {!createNew && targets.length > 1 ? <label className="mt-3 block text-sm">
+            要优化哪个 Skill？
+            <select aria-label="要优化的 Skill" value={targetVersion} disabled={busy}
+              onChange={(event) => setTargetVersion(event.target.value)} className="mt-2 w-full border p-2">
+              <option value="">请选择</option>
+              {targets.map((target) => <option key={target.version_id} value={target.version_id}>{target.skill_name}</option>)}
+            </select>
+          </label> : null}
           <div className="mt-4 flex items-center justify-between gap-3">
             <p className="text-xs text-text-muted">
               不需要选择 Harness、模型、验证器或上下文来源。
@@ -130,7 +156,7 @@ export function AuthoringPage() {
             <Button
               type="button"
               onClick={() => void submit()}
-              disabled={busy || !goal.trim()}
+              disabled={busy || !goal.trim() || (!createNew && (targetsLoading || !!targetsError || (targets.length > 1 && !targetVersion)))}
               leadingIcon={busy ? Loader2 : Sparkles}
             >
               {evaluating ? '正在评估' : busy ? '正在生成' : '生成结果'}

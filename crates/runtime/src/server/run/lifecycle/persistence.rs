@@ -6782,7 +6782,6 @@ mod tests {
                 .expect("commit canonical terminal settlement");
         let committed_count = assert_session_event_count(&db, &user_id, &session_id).await;
         assert!(committed_count > 0);
-        assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
         if let Some(execution_started_at) = execution_started_at {
             let timestamps = sqlx::query(
@@ -6841,7 +6840,7 @@ mod tests {
         .await
         .expect("delayed lost-ack resolution retains the original capture")
         .expect("commit must remain authoritative");
-        assert_eq!(resolved.committed_events, terminal_events);
+        assert_eq!(resolved.committed_events, commit.terminal_events);
         assert_eq!(
             assert_session_event_count(&db, &user_id, &session_id).await,
             committed_count
@@ -6874,6 +6873,22 @@ mod tests {
         assert_eq!(accounting["data"]["tool_call_count"], 6);
         let output_receipt = &commit.terminal_events[0];
         assert_eq!(output_receipt["event_type"], "run_output_recorded");
+        assert_eq!(commit.terminal_events.len(), 4);
+        assert_eq!(output_receipt["data"]["owner_user_id"], user_id);
+        assert_eq!(output_receipt["data"]["session_id"], session_id);
+        assert_eq!(output_receipt["data"]["run_id"], run_id);
+        assert_eq!(
+            output_receipt["data"]["source_event_id"],
+            json!(commit.terminal_assistant_source_event_id)
+        );
+        assert_eq!(
+            output_receipt["data"]["content_hash"],
+            astra_services::evaluation::content_fingerprint("atomically committed answer")
+        );
+        assert_eq!(
+            output_receipt["data"]["content_bytes"],
+            "atomically committed answer".len()
+        );
         assert_eq!(
             replay.terminal_assistant_source_event_id,
             commit.terminal_assistant_source_event_id

@@ -341,7 +341,6 @@ export function HarnessesPage() {
     try {
       const record = await publishSkillDraft(run.harness_run_id, draft.skill_draft_id, {
         visibility,
-        version: '0.1.0',
       });
       setPublished((current) => [...current, record]);
       await refreshDrafts(run.harness_run_id);

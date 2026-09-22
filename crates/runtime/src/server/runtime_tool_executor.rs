@@ -1219,32 +1219,7 @@ impl RuntimeToolExecutor {
                 ));
             }
         };
-        let candidates = record
-            .skill_drafts
-            .iter()
-            .map(|draft| {
-                json!({
-                    "name": draft.candidate_name,
-                    "description": draft.description,
-                    "content_markdown": draft.content_markdown,
-                    "status": draft.status,
-                })
-            })
-            .collect::<Vec<_>>();
-        let output = json!({
-            "status": "candidate_ready",
-            "target": record.target,
-            "operation": record.operation,
-            "candidates": candidates,
-            "evaluation": record.evaluation,
-            "evidence": {
-                "inference_complete": record.inference.complete,
-                "usage_status": record.inference.usage_status,
-                "estimated_cost_usd": record.inference.estimated_cost_usd,
-            },
-            "next_step": "The candidate is private and inactive. Review the candidate and evaluation evidence before publishing it.",
-        });
-        astra_tools::ToolResult::text(output.to_string())
+        astra_tools::ToolResult::text(record.tool_output().to_string())
     }
 
     /// Configure semantic read reuse from exact provider capabilities.
