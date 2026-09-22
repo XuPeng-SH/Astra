@@ -275,6 +275,7 @@ impl DatabaseModelService {
                         .then_some(model.max_output_tokens),
                     architecture: None,
                     thinking_capability: None,
+                    pricing: None,
                 });
             }
             if page.next_page_token.is_empty() {

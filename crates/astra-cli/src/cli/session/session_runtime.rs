@@ -2377,6 +2377,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }
     }
 

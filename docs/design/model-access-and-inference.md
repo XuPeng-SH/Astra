@@ -111,6 +111,17 @@ complete effective catalog, not from the current page. Only the first page
 may carry `default_offering_id`; continuation pages carry `null` and clients
 must preserve the first-page server decision.
 
+Catalog entries expose `pricing` only when the deployment configuration has
+explicit `currency=USD`, `unit=per_token`, and valid input and output rates.
+An explicit zero is a rate; unannotated legacy prices, missing or malformed
+rates, other currencies, personal BYOK, Genesis, and device Offerings
+report `null`, not a fabricated free price. Optional cache rates stay nullable.
+Administrators must explicitly reconfigure legacy prices before they can be
+shown or used by future cost routing; the system never infers their currency.
+`configuration_updated_at` dates the whole model configuration, not a provider
+price verification or a bill. This projection uses the existing catalog query
+and does not replace execution-time admission or physical-usage accounting.
+
 Both endpoints accept `purpose=chat|typed_judgment`, defaulting to `chat`.
 Only `/models` additionally accepts `purpose=all` for registry inspection;
 `/model-access?purpose=all` returns `400 model_catalog_purpose_invalid`, since

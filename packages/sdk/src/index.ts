@@ -122,6 +122,7 @@ export type {
   RuntimeTranscriptParams,
   RuntimeModelAccessKind,
   RuntimeModelExecutionPlacement,
+  RuntimeModelCatalogPricing,
   RuntimeModelListItem,
   RuntimeModelCatalogCursor,
   RuntimeModelListPageResponse,
