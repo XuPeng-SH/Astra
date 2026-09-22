@@ -5797,15 +5797,15 @@ impl AgenticRunLifecycleService {
                         reservation,
                     } => (lease, reservation),
                     astra_services::AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        active_lease_expires_at_unix_ms,
                         ..
                     } => {
                         if let Ok(distributed_permit) = distributed_result {
                             let _ = distributed_permit.release().await;
                         }
-                        return Err(error_response_coded(
-                            StatusCode::CONFLICT,
-                            "another controller owns this canonical session branch",
-                            "session_writer_conflict",
+                        return Err(session_writer_conflict_response(
+                            session_id,
+                            active_lease_expires_at_unix_ms,
                         ));
                     }
                     astra_services::AcquireWriterAndReserveTurnOutcome::ReservationConflict {

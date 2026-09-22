@@ -470,6 +470,10 @@ pub(crate) struct PartialTurnData {
     /// The local client can no longer settle or observe an admitted durable
     /// run, so that exact owner must receive an explicit cancellation request.
     pub remote_cancel_required: bool,
+    /// An edge callback acknowledgement failed and this client detached.
+    /// The sentence in `TurnFailure::error` states that fact only. The outer
+    /// lifecycle owner adds whether the server run is still active.
+    pub callback_client_detached: bool,
     /// Exact durable owner: a callback-producer child when callback delivery
     /// failed, otherwise the immutable physical SSE root.
     pub remote_cancel_run_id: Option<String>,
@@ -482,6 +486,46 @@ pub(crate) struct PartialTurnData {
     /// JSON surfaces preserve a typed, resumable terminal instead of dropping
     /// the entire envelope when the loop returns `TurnFailure`.
     pub interruption: Option<serde_json::Value>,
+}
+
+fn session_cancel_and_resume_commands(session_id: Option<&str>) -> (String, String) {
+    match session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(session_id) => (
+            format!("`astra session cancel {session_id}`"),
+            format!("`astra --resume {session_id}`"),
+        ),
+        None => (
+            "`astra session cancel <session_id>`".to_string(),
+            "`astra --resume <session_id>`".to_string(),
+        ),
+    }
+}
+
+/// Session cancellation settles the Session to `cancelled`. The same interactive
+/// process keeps its current session id and does not resume, so a later turn
+/// cannot be admitted until the user resumes the Session back to `active`.
+pub(crate) fn session_stop_then_resume(session_id: Option<&str>) -> String {
+    let (cancel_command, resume_command) = session_cancel_and_resume_commands(session_id);
+    format!(
+        "Wait for it to finish, or stop it with {cancel_command}, then run {resume_command} before sending another message."
+    )
+}
+
+/// Interactive detach did not request server cancellation.
+pub(crate) fn interactive_detach_recovery(session_id: Option<&str>) -> String {
+    format!(
+        "The server run was not cancelled. {}",
+        session_stop_then_resume(session_id)
+    )
+}
+
+/// Headless DELETE was attempted, but its settlement was not observed.
+/// The run may already be cancelled server-side.
+pub(crate) fn headless_unconfirmed_cancel_notice(session_id: Option<&str>) -> String {
+    format!(
+        "Exact server run cancellation could not be confirmed; the run may still be active. {}",
+        session_stop_then_resume(session_id)
+    )
 }
 
 pub(crate) fn unsettled_physical_owner_run_id(
