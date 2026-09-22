@@ -4857,7 +4857,7 @@ impl ToolExecutor {
         args: &Value,
         source_is_error: &mut Option<bool>,
     ) -> String {
-        let Some(goal) = args
+        let Some(_) = args
             .get("goal")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -4888,11 +4888,7 @@ impl ToolExecutor {
             }
         };
         let response = api
-            .post_bearer_path_json_text(
-                &token,
-                &format!("/harnesses/authoring/{session_id}"),
-                &json!({"goal": goal}),
-            )
+            .post_bearer_path_json_text(&token, &format!("/harnesses/authoring/{session_id}"), args)
             .await;
         match response {
             Ok(body) => {

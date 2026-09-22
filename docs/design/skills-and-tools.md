@@ -145,10 +145,12 @@ user message
   -> return the candidate, verdict, evidence, cost, and limitations
 ```
 
-The tool resolves `create` or `improve` only after a candidate exists and the
-session-owned baseline can be identified. An exact active Skill identity is
-strong evidence for improvement; without that evidence the tool creates a new
-private candidate or reports that the operation is ambiguous. The generic
+The tool fixes `create` or `improve` before generation. `target_skill` pins an
+owner-scoped Skill name and immutable version; otherwise a single active session
+Skill supplies the target. Multiple active Skills require a target selection.
+`create_new` explicitly requests a new Skill. The old version's complete body is
+an input to generation, and an improvement must retain its name. The same frozen
+version is the Evaluation baseline; a model-generated name never chooses it. The generic
 runtime may use the configured JEV or an explicitly selected LLM substitute
 for eligible execution judgments, but authoring does not add a special
 classifier. Judgment remains optional, cannot grant permission, and never
@@ -186,8 +188,11 @@ stores the generated candidate as a private draft and never activates it as a
 side effect. When the context does not contain a replayable case and a
 server-owned verifier, the result contains the candidate and an explicit
 unavailable evaluation; that state never becomes a pass. A user can then
-provide or record a suitable replay case before asking for the comparison
-again.
+select an original task from the frozen conversation sources and supply an
+expected JSON result in the authoring page. This bounded verification uses the
+existing exact-JSON verifier, not an inferred success criterion. Task, verifier,
+and candidate are frozen before Evaluation preparation. The candidate and its
+evidence appear before trial execution completes; the report updates afterward.
 
 ## Evidence-backed evaluation and Skillify adapter
 
@@ -250,3 +255,19 @@ review and publication flow. Publication remains an explicit user action.
 Database catalog discovery preserves user-owned precedence, then creation order,
 and caches the exact selected record ID. Loading uses that ID so a newer public
 version cannot replace a private override. This adds no per-turn database reads.
+
+Skillify citations must be exact, nonempty excerpts of their referenced frozen
+source. The server locates the excerpt and persists UTF-8 byte offsets; a model's
+locator is not authoritative. An absent excerpt rejects the generated output.
+The authoring and review pages share rule evidence, including the original source
+and its kind. User goals and statements support requirements, not claims of
+execution success. Model confidence is not a verification result.
+
+Approving a rule or draft changes review state without rewriting its body.
+Editing or rejecting a rule requires the reviewed full Markdown; the UI shows
+old and new content explicitly. Body changes increment the draft revision and
+mark previous Evaluation as applying to earlier content. They also invalidate
+the current candidate reference, preventing late preparation from attaching an
+old report to the edited draft. Review counter updates preserve frozen baseline,
+case, and Evaluation metadata. These writes occur only on explicit authoring or
+review actions, never on the agent execution hot path.

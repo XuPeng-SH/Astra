@@ -686,6 +686,13 @@ fn skill_creator_schema() -> Value {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
+                    "create_new": { "type": "boolean", "description": "True when the user requests a new Skill rather than improving an existing one." },
+                    "target_skill": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": { "skill_name": { "type": "string" }, "version_id": { "type": "string" } },
+                        "required": ["skill_name", "version_id"],
+                        "description": "Exact existing Skill version to improve. Resolve from authorized context; ask the user when multiple targets are plausible."
+                    },
                     "goal": {
                         "type": "string",
                         "minLength": 1,

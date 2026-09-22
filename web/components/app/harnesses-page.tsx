@@ -35,7 +35,6 @@ import type {
   ChatSummary,
   HarnessNodeCatalogItem,
   HarnessRun,
-  HarnessCitation,
   HarnessSkillDraft,
   HarnessSkillRule,
   HarnessTemplate,
@@ -46,6 +45,7 @@ import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { PageHeader } from '@/components/ui/page-header';
 import { Textarea } from '@/components/ui/textarea';
+import { RuleEvidence, SkillContentComparison, frozenSkillSources } from '@/components/app/skill-evidence';
 import { cn } from '@/lib/utils/cn';
 
 type HarnessView = 'catalog' | 'skillify' | 'custom';
@@ -57,6 +57,8 @@ type SkillifySourceFileInput = {
 type RuleEditState = {
   statement: string;
   rationale: string;
+  content_markdown: string;
+  decision: 'edit' | 'reject';
 };
 
 function statusClass(status: string) {
@@ -93,22 +95,6 @@ function defaultCustomWorkflow() {
     '4. Hold uncertain items in human review.',
     '5. Emit audited artifacts with citations and decisions.',
   ].join('\n');
-}
-
-function stringFromUnknown(value: unknown) {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
-}
-
-function citationSourceLabel(citation: HarnessCitation) {
-  const locator = citation.source_locator_json ?? {};
-  return (
-    stringFromUnknown(locator.title) ??
-    stringFromUnknown(locator.file_name) ??
-    stringFromUnknown(locator.session_id) ??
-    stringFromUnknown(locator.source_id) ??
-    citation.source_id ??
-    'Unknown source'
-  );
 }
 
 function sourceCitationLabel(count: number) {
@@ -286,8 +272,8 @@ export function HarnessesPage() {
     setError(null);
     try {
       const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
-        decision: 'edit',
-        after_json: { statement, rationale },
+        decision: edit.decision,
+        after_json: { statement, rationale, content_markdown: edit.content_markdown },
         reason: 'Edited rule from Skillify review UI.',
       });
       setSkillDrafts((current) => current.map((entry) => (entry.skill_draft_id === updated.skill_draft_id ? updated : entry)));
@@ -633,6 +619,7 @@ function SkillifyView({
   const [ruleEdits, setRuleEdits] = useState<Record<string, RuleEditState>>({});
   const activeDraftKey = activeDraft?.skill_draft_id ?? null;
   const isEditingDraft = activeDraftKey !== null && editingDraftId === activeDraftKey;
+  const evaluatedRevision = (run?.output_json?.authoring as { evaluated_draft_revision?: number } | undefined)?.evaluated_draft_revision;
   const readyDrafts = skillDrafts.filter((draft) => draft.status === 'ready_to_publish');
 
   useEffect(() => {
@@ -660,21 +647,23 @@ function SkillifyView({
     }
   }, [activeDraft, draftMarkdown, onEditDraft]);
 
-  const startRuleEdit = useCallback((rule: HarnessSkillRule) => {
+  const startRuleEdit = useCallback((rule: HarnessSkillRule, decision: 'edit' | 'reject' = 'edit') => {
     setRuleEdits((current) => ({
       ...current,
       [rule.skill_rule_id]: {
         statement: rule.statement,
         rationale: rule.rationale,
+        content_markdown: activeDraft?.content_markdown ?? '',
+        decision,
       },
     }));
-  }, []);
+  }, [activeDraft]);
 
-  const updateRuleEdit = useCallback((ruleId: string, field: keyof RuleEditState, value: string) => {
+  const updateRuleEdit = useCallback((ruleId: string, field: 'statement' | 'rationale' | 'content_markdown', value: string) => {
     setRuleEdits((current) => ({
       ...current,
       [ruleId]: {
-        ...(current[ruleId] ?? { statement: '', rationale: '' }),
+        ...(current[ruleId] ?? { statement: '', rationale: '', content_markdown: '', decision: 'edit' as const }),
         [field]: value,
       },
     }));
@@ -902,11 +891,14 @@ function SkillifyView({
                 </div>
               ) : null}
 	              {isEditingDraft ? (
+                <>
 	                <Textarea
 	                  value={draftMarkdown}
 	                  onChange={(event) => setDraftMarkdown(event.target.value)}
 	                  className="mt-4 min-h-[620px] font-mono text-xs"
 	                />
+                  <SkillContentComparison before={activeDraft?.content_markdown ?? ''} after={draftMarkdown} />
+                </>
 	              ) : (
 	                <pre className="mt-4 max-h-[620px] overflow-auto whitespace-pre-wrap rounded-control border border-border bg-bg p-4 text-xs text-text-secondary">
 	                  {activeDraft?.content_markdown ?? ''}
@@ -939,7 +931,9 @@ function SkillifyView({
                       </Button>
                     </div>
                   </div>
-	                  <div className="mt-3 space-y-3">
+	                  {evaluatedRevision !== undefined && activeDraft.revision !== evaluatedRevision ?
+                    <p className="my-3 text-sm text-warning">正文已修改。先前评估仅适用于生成时的版本，不代表当前发布内容。</p> : null}
+                  <div className="mt-3 space-y-3">
 	                    {activeDraft.rules.map((rule) => {
 	                      const ruleEdit = ruleEdits[rule.skill_rule_id];
 	                      return (
@@ -951,11 +945,7 @@ function SkillifyView({
 	                          <span className="rounded-full border border-border bg-surface px-2 py-0.5 text-xs text-text-secondary">
 	                            {rule.rule_type}
 	                          </span>
-                          {rule.confidence !== null ? (
-                            <span className="text-xs text-text-muted">
-                              confidence {Math.round(rule.confidence * 100)}%
-                            </span>
-	                            ) : null}
+
 	                          </div>
 	                          {ruleEdit ? (
 	                            <div className="mt-3 space-y-2">
@@ -971,6 +961,10 @@ function SkillifyView({
 	                                className="min-h-20 text-xs"
 	                                aria-label="Rule rationale"
 	                              />
+                              <p className="text-xs text-warning">请同时审阅完整正文；系统不会根据规则重写其他内容。</p>
+                              <Textarea aria-label="Revised skill content" value={ruleEdit.content_markdown}
+                                onChange={(event) => updateRuleEdit(rule.skill_rule_id, 'content_markdown', event.target.value)} rows={10} />
+                              <SkillContentComparison before={activeDraft.content_markdown} after={ruleEdit.content_markdown} />
 	                            </div>
 	                          ) : (
 	                            <>
@@ -984,21 +978,7 @@ function SkillifyView({
 	                            </div>
                           {rule.citations.length ? (
                             <div className="space-y-2">
-                              {rule.citations.map((citation) => (
-                                <div
-                                  key={citation.citation_id}
-                                  className="rounded-control border border-border bg-surface px-2.5 py-2"
-                                >
-                                  <div className="text-xs font-medium text-text-secondary">
-                                    {citationSourceLabel(citation)}
-                                  </div>
-                                  {citation.evidence_text_preview ? (
-                                    <p className="mt-1 text-xs leading-relaxed text-text-muted">
-                                      {citation.evidence_text_preview}
-                                    </p>
-                                  ) : null}
-                                </div>
-                              ))}
+                              <RuleEvidence citations={rule.citations} sources={run ? frozenSkillSources(run) : []} />
                             </div>
 	                          ) : (
 	                            <p className="text-xs text-text-muted">No citation details returned.</p>
@@ -1039,7 +1019,7 @@ function SkillifyView({
 	                                size="sm"
 	                                variant="ghost"
 	                                leadingIcon={X}
-	                                onClick={() => onDecideRule(activeDraft, rule, 'reject')}
+	                                onClick={() => startRuleEdit(rule, 'reject')}
 	                                disabled={busy || rule.status === 'rejected' || activeDraft.status === 'published'}
 	                              >
 	                                Reject

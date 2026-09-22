@@ -5,10 +5,11 @@ import { useSearchParams } from 'next/navigation';
 import { useState } from 'react';
 import { createAuthoringIntent } from '@/lib/api/harnesses';
 import { runPreparedEvaluation, type EvaluationReport } from '@/lib/api/evaluations';
-import type { AuthoringIntentRecord } from '@/lib/api/types';
+import type { AuthoringIntentRecord, AuthoringIntentRequest } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { PageHeader } from '@/components/ui/page-header';
+import { SkillEvidence, SkillContentComparison, frozenSkillSources } from '@/components/app/skill-evidence';
 import { Textarea } from '@/components/ui/textarea';
 
 function countDraftCitations(draft: AuthoringIntentRecord['skill_drafts'][number]) {
@@ -35,6 +36,45 @@ export function AuthoringPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [submittedRequest, setSubmittedRequest] = useState<AuthoringIntentRequest | null>(null);
+  const [evaluating, setEvaluating] = useState(false);
+  const [createNew, setCreateNew] = useState(false);
+  const [taskSourceId, setTaskSourceId] = useState('');
+  const [expectedResult, setExpectedResult] = useState('');
+  const sources = result ? frozenSkillSources(result.harness_run) : [];
+  const tasks = sources.filter((source) => source.event_type === 'user_query');
+  const baseline = result?.harness_run.output_json?.authoring as { baseline?: { content_markdown?: string; version_id?: string } } | undefined;
+
+  async function showAndEvaluate(created: AuthoringIntentRecord) {
+    // Deliver the candidate and its evidence immediately, before replay settles.
+    setResult(created);
+    if (!created.evaluation_plan) return;
+    setEvaluating(true);
+    try {
+      const report = await runPreparedEvaluation(created.evaluation_plan, {
+        waitSecs: Math.max(300, created.evaluation_plan.trials.length * 300 + 60),
+      });
+      setResult({ ...created, evaluation_report: report });
+    } catch (reason) {
+      setResult({ ...created, evaluation_error: reason instanceof Error ? reason.message : 'Evaluation did not settle.' });
+    } finally { setEvaluating(false); }
+  }
+
+  async function validateTask() {
+    if (!submittedRequest || !taskSourceId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const expected = JSON.parse(expectedResult);
+      const created = await createAuthoringIntent({ ...submittedRequest,
+        validation_task: { source_id: taskSourceId, expected_result: expected },
+      }, sessionId ?? undefined);
+      await showAndEvaluate(created);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法准备验证任务');
+    } finally { setBusy(false); }
+  }
+
   async function submit() {
     const trimmed = goal.trim();
     if (!trimmed) {
@@ -45,25 +85,11 @@ export function AuthoringPage() {
     setError(null);
     setResult(null);
     try {
-      const created = await createAuthoringIntent({ goal: trimmed, idempotency_key: crypto.randomUUID() }, sessionId ?? undefined);
-      if (created.skill_drafts.length === 0) {
-        throw new Error("本次生成没有产生 Skill 候选，请调整目标后重试。");
-      }
-      if (!created.evaluation_plan) {
-        setResult(created);
-        return;
-      }
-      try {
-        const report = await runPreparedEvaluation(created.evaluation_plan, {
-          waitSecs: Math.max(300, created.evaluation_plan.trials.length * 300 + 60),
-        });
-        setResult({ ...created, evaluation_report: report });
-      } catch (reason) {
-        setResult({
-          ...created,
-          evaluation_error: reason instanceof Error ? reason.message : 'Evaluation did not settle.',
-        });
-      }
+      const request = { goal: trimmed, create_new: createNew, idempotency_key: crypto.randomUUID() };
+      setSubmittedRequest(request);
+      const created = await createAuthoringIntent(request, sessionId ?? undefined);
+      if (created.skill_drafts.length === 0) throw new Error('本次生成没有产生 Skill 候选，请调整目标后重试。');
+      await showAndEvaluate(created);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Failed to start authoring.');
     } finally {
@@ -93,6 +119,10 @@ export function AuthoringPage() {
             disabled={busy}
             aria-label="Authoring goal"
           />
+          {sessionId ? <label className="mt-3 flex gap-2 text-xs">
+            <input type="checkbox" checked={createNew} disabled={busy} onChange={(event) => setCreateNew(event.target.checked)} />
+            创建新 Skill；不修改当前会话使用的 Skill
+          </label> : null}
           <div className="mt-4 flex items-center justify-between gap-3">
             <p className="text-xs text-text-muted">
               不需要选择 Harness、模型、验证器或上下文来源。
@@ -103,7 +133,7 @@ export function AuthoringPage() {
               disabled={busy || !goal.trim()}
               leadingIcon={busy ? Loader2 : Sparkles}
             >
-              {busy ? '正在生成' : '生成结果'}
+              {evaluating ? '正在评估' : busy ? '正在生成' : '生成结果'}
             </Button>
           </div>
           {error ? <p className="mt-3 text-sm text-danger">{error}</p> : null}
@@ -119,7 +149,7 @@ export function AuthoringPage() {
                   <AlertTriangle className="mt-0.5 size-5 text-warning" />
                 )}
                 <div>
-                  <h2 className="text-base font-semibold text-text">评估结果</h2>
+                  <h2 className="text-base font-semibold text-text">{evaluating ? '正在验证：候选与依据已可查看' : '评估结果'}</h2>
                   {result.evaluation_report ? (
                     <>
                       <p className="mt-1 text-sm leading-6 text-text-secondary">
@@ -144,7 +174,7 @@ export function AuthoringPage() {
                       {result.evaluation_error
                         ? '候选已生成，但真实评估尚未完成。'
                         : result.evaluation.status === 'unavailable'
-                          ? '候选已生成，但当前上下文没有可复放的真实案例。'
+                          ? '候选已生成，评估暂不可用；具体缺失条件见下方详情。'
                           : result.evaluation.status === 'prepared'
                             ? '候选已生成，真实评估已准备并等待运行。'
                             : '候选已生成，当前证据还不足以证明真实任务改进。'}
@@ -176,6 +206,20 @@ export function AuthoringPage() {
               </div>
             </Card>
 
+            {!result.evaluation_plan ? <Card className="p-5">
+              <h3 className="font-medium">用已有任务验证</h3>
+              <p className="my-2 text-xs text-text-muted">生成依据不等于效果证明。选择原始任务，并明确预期结果；目前此入口支持完整 JSON 结果的精确比较。无法给出判定条件时，不会宣称验证通过。</p>
+              {tasks.length ? <>
+                <select aria-label="验证任务" value={taskSourceId} disabled={busy} onChange={(event) => setTaskSourceId(event.target.value)} className="w-full border p-2">
+                  <option value="">选择原始任务</option>
+                  {tasks.map((task) => <option key={task.source_id} value={task.source_id}>{task.content.slice(0, 120)}</option>)}
+                </select>
+                {taskSourceId ? <pre className="my-2 max-h-48 overflow-auto whitespace-pre-wrap text-xs">{tasks.find((task) => task.source_id === taskSourceId)?.content}</pre> : null}
+                <Textarea aria-label="预期 JSON 结果" placeholder='预期 JSON 结果，例如 {"ok": true}' value={expectedResult} disabled={busy} onChange={(event) => setExpectedResult(event.target.value)} />
+                <Button className="mt-3" disabled={busy || !taskSourceId || !expectedResult.trim()} onClick={() => void validateTask()}>用这个任务验证</Button>
+              </> : <p className="text-sm">缺少可复用的原始用户任务。请在包含实际任务的会话中生成或优化 Skill；当前候选仍可审阅。</p>}
+            </Card> : null}
+
             {result.skill_drafts.map((draft) => (
               <Card key={draft.skill_draft_id} className="p-5 sm:p-6">
                 <div className="flex items-start justify-between gap-4">
@@ -190,6 +234,8 @@ export function AuthoringPage() {
                     私有候选
                   </span>
                 </div>
+                {baseline?.baseline?.content_markdown ? <SkillContentComparison before={baseline.baseline.content_markdown} after={draft.content_markdown} /> : null}
+                <SkillEvidence rules={draft.rules} sources={sources} />
                 <pre className="mt-4 max-h-[520px] overflow-auto whitespace-pre-wrap rounded-control border border-border bg-surface-muted p-4 text-xs leading-5 text-text-secondary">
                   {draft.content_markdown}
                 </pre>

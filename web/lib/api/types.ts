@@ -394,6 +394,7 @@ export type HarnessCitation = {
   skill_rule_id: string | null;
   source_id: string | null;
   source_locator_json: Record<string, unknown>;
+  source_metadata_json?: Record<string, unknown>;
   artifact_id: string | null;
   quote_hash: string | null;
   evidence_text_preview: string | null;
@@ -451,6 +452,9 @@ export type SkillifyRunRequest = {
 
 export type AuthoringIntentRequest = {
   goal: string;
+  create_new?: boolean;
+  target_skill?: { skill_name: string; version_id: string };
+  validation_task?: { source_id: string; expected_result: unknown };
   idempotency_key?: string;
 };
 

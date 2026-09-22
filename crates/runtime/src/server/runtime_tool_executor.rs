@@ -58,7 +58,7 @@ pub trait SkillCreatorToolService: Send + Sync {
         &self,
         user_id: &str,
         session_id: &str,
-        goal: &str,
+        request: astra_services::AuthoringIntentRequest,
     ) -> Result<astra_services::AuthoringIntentRecord, String>;
 }
 
@@ -1160,7 +1160,7 @@ impl RuntimeToolExecutor {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return astra_tools::cancelled_tool_result("skill_creator", false);
         }
-        let Some(goal) = args
+        let Some(_) = args
             .get("goal")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -1179,13 +1179,21 @@ impl RuntimeToolExecutor {
         let service = Arc::clone(service);
         let user_id = self.user_id.clone();
         let session_id = self.session_id.clone();
-        let goal = goal.to_string();
+        let request =
+            match serde_json::from_value::<astra_services::AuthoringIntentRequest>(args.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(format!(
+                        "invalid authoring request: {error}"
+                    ));
+                }
+            };
         // Keep the application operation alive after transport cancellation so
         // its durable HarnessRun can reach a terminal state. The transport may
         // stop waiting, but dropping the in-flight provider future here would
         // leave a running authoring record behind.
         let mut operation =
-            tokio::spawn(async move { service.create_skill(&user_id, &session_id, &goal).await });
+            tokio::spawn(async move { service.create_skill(&user_id, &session_id, request).await });
         let joined = if let Some(cancel_token) = cancel_token {
             tokio::select! {
                 biased;

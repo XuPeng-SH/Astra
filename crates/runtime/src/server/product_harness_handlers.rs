@@ -26,16 +26,13 @@ impl crate::server::runtime_tool_executor::SkillCreatorToolService
         &self,
         user_id: &str,
         session_id: &str,
-        goal: &str,
+        request: astra_services::AuthoringIntentRequest,
     ) -> Result<astra_services::AuthoringIntentRecord, String> {
         run_authoring_intent(
             &self.state,
             user_id.to_string(),
             session_id.to_string(),
-            astra_services::AuthoringIntentRequest {
-                idempotency_key: None,
-                goal: goal.to_string(),
-            },
+            request,
         )
         .await
         .map_err(|(_, body)| body.0.detail)

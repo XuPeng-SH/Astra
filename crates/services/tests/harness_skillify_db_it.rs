@@ -236,7 +236,7 @@ async fn database_skillify_citations_point_to_review_items() {
             description: "Citation Skill".to_string(),
             target_scope: "personal".to_string(),
             publish_visibility: "private".to_string(),
-            content_markdown: "# Citation Skill\n\n- Cite event-level evidence.".to_string(),
+            content_markdown: "# Citation Skill\n\n## When to use\nFor reviews.\n\n- Cite event-level evidence.\n\n## Example\nPreserve this example.".to_string(),
             source_summary_json: json!({"source_count": 1}),
             confidence: Some(0.9),
             rules: vec![SkillifyAgentRule {
@@ -248,7 +248,7 @@ async fn database_skillify_citations_point_to_review_items() {
                 citations: vec![SkillifyAgentCitation {
                     source_id: event_id.clone(),
                     source_excerpt: "cite the event-level source".to_string(),
-                    source_locator_json: json!({"event_id": event_id}),
+                    source_locator_json: json!({"event_id": "forged", "start_byte": 999}),
                 }],
             }],
         }],
@@ -292,6 +292,7 @@ async fn database_skillify_citations_point_to_review_items() {
         Some(rule.skill_rule_id.as_str())
     );
     assert_eq!(citation.item_id, items[0].item_id);
+    assert_eq!(citation.source_locator_json["event_id"], event_id);
     assert_ne!(citation.item_id, rule.skill_rule_id);
     assert_eq!(
         items[0]
@@ -324,6 +325,21 @@ async fn database_skillify_citations_point_to_review_items() {
     let approved_rule = &drafts_after_item_decision[0].rules[0];
     assert_eq!(approved_rule.status, "approved");
     assert_eq!(drafts_after_item_decision[0].status, "ready_to_publish");
+    assert_eq!(
+        drafts_after_item_decision[0].content_markdown, drafts[0].content_markdown,
+        "approving a rule must preserve full generated text"
+    );
+    assert_eq!(drafts_after_item_decision[0].revision, drafts[0].revision);
+    assert_eq!(
+        citation.source_locator_json["validation"],
+        "exact_source_match"
+    );
+    let start = citation.source_locator_json["start_byte"].as_u64().unwrap() as usize;
+    let end = citation.source_locator_json["end_byte"].as_u64().unwrap() as usize;
+    assert_eq!(
+        &"Always cite the event-level source."[start..end],
+        citation.evidence_text_preview.as_deref().unwrap()
+    );
 
     let draft_after_rule_decision = service
         .decide_skill_rule(
@@ -343,11 +359,53 @@ async fn database_skillify_citations_point_to_review_items() {
     assert_eq!(draft_after_rule_decision.rules[0].status, "needs_revision");
     assert_eq!(draft_after_rule_decision.status, "pending_rule_review");
 
+    let revised_body = format!(
+        "{}\n\n## Additional constraint\nKeep examples.",
+        draft_after_rule_decision.content_markdown
+    );
+    sqlx::query("UPDATE harness_runs SET output_json = JSON_SET(output_json, '$.authoring', CAST(? AS JSON)) WHERE harness_run_id = ?")
+        .bind(json!({"evaluation": {"status": "prepared"}, "candidate_revision_id": "before-review", "baseline": {"version_id":"old-version"}}).to_string())
+        .bind(&run.harness_run_id).execute(&pool).await.unwrap();
+    let edited = service.decide_skill_rule(user_id.clone(), run.harness_run_id.clone(),
+        draft_after_rule_decision.skill_draft_id.clone(), approved_rule.skill_rule_id.clone(),
+        HarnessDecisionRequest { decision: "edit".into(), after_json: Some(json!({
+            "statement": "Cite sources and keep examples.", "content_markdown": &revised_body,
+        })), reason: None, idempotency_key: None }).await.unwrap();
+    assert_eq!(edited.content_markdown, revised_body);
+    assert_eq!(edited.revision, drafts[0].revision + 1);
+    let updated_run = service
+        .get_run(user_id.clone(), run.harness_run_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        updated_run.output_json["authoring"]["evaluation"]["status"],
+        "stale"
+    );
+    assert_eq!(
+        updated_run.output_json["authoring"]["baseline"]["version_id"],
+        "old-version"
+    );
+    assert!(updated_run.output_json["authoring"]["candidate_revision_id"].is_null());
+    let late = service
+        .persist_authoring_evaluation(
+            user_id.clone(),
+            run.harness_run_id.clone(),
+            "before-review".into(),
+            astra_services::AuthoringEvaluationSummary {
+                status: "prepared".into(),
+                reason: "Late preparation".into(),
+                experiment_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(late.0, StatusCode::CONFLICT);
     let items_after_rule_decision = service
         .list_run_items(user_id.clone(), run.harness_run_id.clone())
         .await
         .expect("list items after rule decision");
-    assert_eq!(items_after_rule_decision[0].status, "needs_revision");
+    assert_eq!(items_after_rule_decision[0].status, "approved");
 
     sqlx::query("UPDATE harness_items SET locator_json = 'not-json' WHERE item_id = ?")
         .bind(&items[0].item_id)
@@ -513,6 +571,9 @@ async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
     let service =
         DatabaseHarnessService::new(shared_pool).with_skillify_agent_executor(executor.clone());
     let request = |key: Option<&str>| astra_services::AuthoringIntentRequest {
+        create_new: false,
+        target_skill: None,
+        validation_task: None,
         goal: "Create a concise review skill".into(),
         idempotency_key: key.map(str::to_string),
     };
@@ -559,4 +620,170 @@ async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
         .execute(&pool)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_retry() {
+    use astra_services::harness::AuthoringSkillTarget;
+    use astra_services::personal_skills::{
+        CreateUserSkillSource, DatabasePersonalSkillStore, SubmitUserSkillVersion,
+    };
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let owner = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title) VALUES (?, ?, 'authoring task')",
+    )
+    .bind(&session_id)
+    .bind(&owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let payload = json!({"event_id": &event_id, "session_id": &session_id, "user_id": &owner,
+        "event_type":"user_query", "content":"Return {\"ok\":true} as JSON."});
+    sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'user_query', ?, ?, ?)")
+        .bind(&event_id).bind(&session_id).bind(&owner).bind(payload["content"].as_str().unwrap())
+        .bind(agent_event_fixture_payload_hash(payload.clone())).bind(Uuid::new_v4().to_string())
+        .execute(&pool).await.unwrap();
+    let store = DatabasePersonalSkillStore::new(shared.clone());
+    store
+        .ensure_source(
+            &owner,
+            CreateUserSkillSource {
+                skill_name: "review".into(),
+                visibility: Some("private".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let baseline = store
+        .submit_version(
+            &owner,
+            "review",
+            SubmitUserSkillVersion {
+                version: "1.0.0".into(),
+                manifest_json: json!({"name":"review","version":"1.0.0","description":"Review"}),
+                content_markdown: "# Review\n\n## Steps\nPreserve existing examples.".into(),
+                status: Some("draft".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let executor = Arc::new(CapturingSkillifyExecutor::default());
+    *executor.output.lock().unwrap() = Some(SkillifyAgentOutput {
+        extractor: "test".into(),
+        subagent_strategy: json!({}),
+        drafts: vec![SkillifyAgentDraft {
+            candidate_name: "review".into(),
+            description: "Improved review".into(),
+            target_scope: "personal".into(),
+            publish_visibility: "private".into(),
+            content_markdown: format!("{}\nUse citations.", baseline.content_markdown),
+            source_summary_json: json!({}),
+            confidence: None,
+            rules: vec![SkillifyAgentRule {
+                rule_type: "workflow".into(),
+                statement: "Preserve existing examples.".into(),
+                rationale: "Keep the old capability.".into(),
+                confidence: None,
+                citations: vec![SkillifyAgentCitation {
+                    source_id: format!("skill-version:{}", baseline.version_id),
+                    source_excerpt: "Preserve existing examples.".into(),
+                    source_locator_json: json!({}),
+                }],
+            }],
+        }],
+    });
+    let service =
+        DatabaseHarnessService::new(shared).with_skillify_agent_executor(executor.clone());
+    let request = astra_services::AuthoringIntentRequest {
+        goal: "Improve review with citations".into(),
+        create_new: false,
+        target_skill: Some(AuthoringSkillTarget {
+            skill_name: "review".into(),
+            version_id: baseline.version_id.clone(),
+        }),
+        validation_task: None,
+        idempotency_key: Some("frozen-attempt".into()),
+    };
+    let result = service
+        .create_authoring_intent(owner.clone(), session_id.clone(), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.operation, "improve");
+    assert_eq!(
+        result.harness_run.output_json["authoring"]["baseline"]["version_id"],
+        baseline.version_id
+    );
+    let captured = executor.request.lock().unwrap().take().unwrap();
+    assert_eq!(captured.skill_name.as_deref(), Some("review"));
+    assert!(
+        captured
+            .source_packets
+            .iter()
+            .any(|source| source.event_type == "skill_baseline"
+                && source.content == baseline.content_markdown)
+    );
+    let replay = service
+        .create_authoring_intent(owner.clone(), session_id.clone(), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        result.harness_run.harness_run_id,
+        replay.harness_run.harness_run_id
+    );
+    assert!(
+        executor.request.lock().unwrap().is_none(),
+        "retry must not regenerate"
+    );
+    let task_source = captured
+        .source_packets
+        .iter()
+        .find(|source| source.event_type == "user_query")
+        .unwrap();
+    let mut validation = request.clone();
+    validation.validation_task = Some(astra_services::harness::AuthoringValidationTask {
+        source_id: task_source.source_id.clone(),
+        expected_result: json!({"ok":true}),
+    });
+    let selected = service
+        .create_authoring_intent(owner.clone(), session_id.clone(), validation.clone())
+        .await
+        .unwrap();
+    let input = selected.evaluation_input.as_ref().unwrap();
+    assert_eq!(input.case.message, task_source.content);
+    assert_eq!(input.target.baseline.revision_id, baseline.version_id);
+    validation.validation_task.as_mut().unwrap().expected_result = json!({"ok":false});
+    let conflict = service
+        .create_authoring_intent(owner.clone(), session_id.clone(), validation)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.0,
+        StatusCode::CONFLICT,
+        "task identity must freeze before a plan exists"
+    );
+    let resumed = service
+        .create_authoring_intent(owner.clone(), session_id.clone(), request)
+        .await
+        .unwrap();
+    assert_eq!(resumed.evaluation_input, selected.evaluation_input);
+    cleanup_skillify_run(
+        &pool,
+        &result.harness_run.harness_run_id,
+        &event_id,
+        &session_id,
+    )
+    .await;
+    for table in ["user_skill_versions", "user_skill_sources"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE owner_user_id = ?"))
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }
