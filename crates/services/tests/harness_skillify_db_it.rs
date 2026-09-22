@@ -716,11 +716,7 @@ async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_ret
         .unwrap();
     assert_eq!(result.operation, "improve");
     assert_eq!(
-        store
-            .load_source(&owner, "review")
-            .await
-            .unwrap()
-            .visibility,
+        store.list_sources(&owner, Some("review")).await.unwrap()[0].visibility,
         "public",
         "candidate materialization must preserve an existing source's visibility"
     );
