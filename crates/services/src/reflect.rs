@@ -1634,6 +1634,38 @@ pub(crate) fn generate_recommendations(
     recs
 }
 
+fn mark_model_request_usage_unavailable(
+    summary: &mut String,
+    coverage: &mut ObservationDataCoverage,
+) {
+    summary.insert_str(
+        0,
+        "Model-request usage unavailable; this does not establish zero requests. ",
+    );
+    coverage.overall = "partial".into();
+    coverage.providers.insert(
+        "model_request_context".into(),
+        astra_core::ObservationProviderCoverage {
+            status: "missing".into(),
+            freshness_ms: None,
+            reason: Some("source_unavailable".into()),
+        },
+    );
+    coverage.warnings.push(
+        "Model-request usage is unavailable; absence of records does not establish zero requests."
+            .into(),
+    );
+}
+
+fn summarize_model_request_result<E>(
+    result: Result<Vec<ModelRequestContextRecord>, E>,
+) -> (Option<ModelRequestSummary>, bool) {
+    match result {
+        Ok(records) => (ModelRequestSummary::from_records(&records), false),
+        Err(_) => (None, true),
+    }
+}
+
 // ── Database implementation ──────────────────────────────────────────────────
 
 pub struct DatabaseReflectService {
@@ -1851,17 +1883,16 @@ impl ReflectService for DatabaseReflectService {
         // source for prompt-cache accounting. Read a bounded session window
         // only for an explicit reflection request; this keeps the hot turn
         // path untouched while making cache misses explainable to the user.
-        let model_request_summary = if let Some(shared_pool) = self.pool.as_ref() {
-            match crate::model_request_context::list_model_request_context_events(
-                shared_pool,
-                user_id,
-                session_id,
-                500,
-            )
-            .await
-            {
-                Ok(records) => ModelRequestSummary::from_records(&records),
-                Err(error) => {
+        let (model_request_summary, model_request_unavailable) =
+            if let Some(shared_pool) = self.pool.as_ref() {
+                let result = crate::model_request_context::list_model_request_context_events(
+                    shared_pool,
+                    user_id,
+                    session_id,
+                    500,
+                )
+                .await;
+                if let Err(error) = &result {
                     tracing::warn!(
                         target: "astra_services::reflect",
                         user_id = %user_id,
@@ -1869,12 +1900,11 @@ impl ReflectService for DatabaseReflectService {
                         error = %error,
                         "model request context unavailable during reflection"
                     );
-                    None
                 }
-            }
-        } else {
-            None
-        };
+                summarize_model_request_result(result)
+            } else {
+                (None, true)
+            };
 
         let include_semantic_execution = matches!(
             request.depth,
@@ -2215,6 +2245,9 @@ impl ReflectService for DatabaseReflectService {
             &budget_result,
         );
         let mut view = request.view(overview.total_events, overview.total_decisions);
+        if model_request_unavailable {
+            mark_model_request_usage_unavailable(&mut summary, &mut view.data_coverage);
+        }
         if let Some(semantics) = &semantic_judgments {
             view.data_coverage.providers.insert(
                 "semantic_judgment_trace".into(),
@@ -4480,6 +4513,22 @@ mod tests {
         );
         let mut parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
+        let mut unavailable = report.clone();
+        unavailable.depth = "hint".into();
+        unavailable.summary = "long preceding summary ".repeat(50);
+        let view = unavailable.view.as_mut().unwrap();
+        view.depth = "hint".into();
+        mark_model_request_usage_unavailable(&mut unavailable.summary, &mut view.data_coverage);
+        unavailable.data_coverage = view.data_coverage.clone();
+        let projected_unavailable = unavailable.project_lightweight();
+        assert!(projected_unavailable.summary.starts_with(
+            "Model-request usage unavailable; this does not establish zero requests."
+        ));
+        assert_eq!(projected_unavailable.data_coverage.overall, "partial");
+        assert_eq!(
+            projected_unavailable.data_coverage,
+            projected_unavailable.view.unwrap().data_coverage
+        );
         // Old reports omit the new optional field; new unavailable captures
         // carry unknown counts rather than inventing zero semantic calls.
         assert!(parsed.semantic_judgments.is_none());
@@ -4497,6 +4546,35 @@ mod tests {
             serde_json::from_value::<ReflectReport>(value).unwrap(),
             projected
         );
+    }
+
+    #[test]
+    fn model_request_read_failure_is_not_an_empty_usage_window() {
+        let (summary, unavailable) = summarize_model_request_result::<&str>(Err("read failed"));
+        assert!(summary.is_none());
+        assert!(unavailable);
+
+        let mut coverage = ObservationDataCoverage {
+            overall: "fresh".into(),
+            source: "server_db".into(),
+            events: 1,
+            decisions: 0,
+            providers: Default::default(),
+            warnings: vec![],
+        };
+        let mut report_summary = "long preceding summary ".repeat(50);
+        mark_model_request_usage_unavailable(&mut report_summary, &mut coverage);
+        assert!(report_summary.starts_with("Model-request usage unavailable"));
+        assert_eq!(coverage.overall, "partial");
+        let provider = &coverage.providers["model_request_context"];
+        assert_eq!(provider.status, "missing");
+        assert_eq!(provider.reason.as_deref(), Some("source_unavailable"));
+        assert!(coverage.warnings[0].contains("does not establish zero requests"));
+
+        let (empty_summary, empty_unavailable) =
+            summarize_model_request_result::<&str>(Ok(Vec::new()));
+        assert!(empty_summary.is_none());
+        assert!(!empty_unavailable);
     }
 
     #[test]
