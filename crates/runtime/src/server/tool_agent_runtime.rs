@@ -13,7 +13,14 @@ pub(crate) async fn execute_agent_tool(
     agent_tool_context: Option<&AgentToolContext>,
     args: &Value,
     tool_call_id: Option<&str>,
+    delegation_model_admission: Option<&astra_turn_types::DelegationModelAdmission>,
 ) -> astra_tools::ToolResult {
+    let scoped_context = agent_tool_context.map(|context| {
+        let mut context = context.clone();
+        context.delegation_model_admission = delegation_model_admission.cloned();
+        context
+    });
+    let agent_tool_context = scoped_context.as_ref();
     let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(
@@ -68,7 +75,14 @@ pub(crate) async fn execute_agent_fanout_tool(
     agent_tool_context: Option<&AgentToolContext>,
     args: &Value,
     tool_call_id: Option<&str>,
+    delegation_model_admission: Option<&astra_turn_types::DelegationModelAdmission>,
 ) -> astra_tools::ToolResult {
+    let scoped_context = agent_tool_context.map(|context| {
+        let mut context = context.clone();
+        context.delegation_model_admission = delegation_model_admission.cloned();
+        context
+    });
+    let agent_tool_context = scoped_context.as_ref();
     let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(

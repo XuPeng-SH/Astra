@@ -413,6 +413,7 @@ fn build_memory_judgment(
     };
     JudgmentRequest {
         schema_version: 1,
+        explicit_answer_ids: Vec::new(),
         state: serde_json::json!({
             "policy": policy,
             "user_message": truncate(user_message, message_chars),

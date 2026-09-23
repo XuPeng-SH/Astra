@@ -557,6 +557,7 @@ mod tests {
     ) -> CompletionRequest {
         let judgment = astra_turn_types::JudgmentRequest {
             schema_version: 1,
+            explicit_answer_ids: Vec::new(),
             state: json!({"evidence":"bounded"}),
             questions: [(
                 "evidence".to_string(),
@@ -1293,6 +1294,7 @@ mod tests {
         for (index, mode) in ["exact", "partial", "missing"].into_iter().enumerate() {
             let judgment = JudgmentRequest {
                 schema_version: 1,
+                explicit_answer_ids: Vec::new(),
                 state: json!({"usage":mode}),
                 questions: [(
                     "evidence".into(),

@@ -956,7 +956,13 @@ impl CliSpawnAgentExecutor {
 
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &token)
-            .with_memory_attribution_id(config.run_id.clone());
+            .with_memory_attribution_id(config.run_id.clone())
+            .require_delegation_admission(matches!(
+                &config.delegated_model_requirements,
+                astra_turn_types::DelegationIntentRequirements::Requirements { .. }
+                    | astra_turn_types::DelegationIntentRequirements::Unresolved { .. }
+                    | astra_turn_types::DelegationIntentRequirements::Unavailable { .. }
+            ));
         executor.set_cli_local_provider_schemas(all_schemas.clone());
         if let Some(ref cmds) = self.bg_task_commands {
             executor = executor.with_bg_task_commands(cmds.clone());
@@ -1142,6 +1148,7 @@ impl CliSpawnAgentExecutor {
         let max_turns = agentic_turn_budget.initial_turns;
 
         let child_thinking = config.thinking.clone();
+        let child_model_requirements = config.delegated_model_requirements.clone();
         let runtime_manifest = runtime_manifest_for_model(
             "cli_spawn_subrun",
             "cli_spawn_subrun",
@@ -1205,6 +1212,10 @@ impl CliSpawnAgentExecutor {
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
+                request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints {
+                    delegated_model_requirements: child_model_requirements,
+                    ..Default::default()
+                },
                 resolver: self.skill_resolver.clone(),
                 quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
@@ -1707,6 +1718,7 @@ mod tests {
             parent_run_id: "parent-run".into(),
             parent_agent_id: "parent-agent".into(),
             resolved_model_name: Some("parent-model".into()),
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
@@ -1740,6 +1752,7 @@ mod tests {
             task: "reply".into(),
             system_prompt_addendum: String::new(),
             model_selection,
+            delegated_model_requirements: Default::default(),
             fanout_slot: slot,
             thinking,
             max_output_tokens: None,

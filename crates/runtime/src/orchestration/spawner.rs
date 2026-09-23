@@ -822,6 +822,9 @@ pub(crate) fn agent_status_to_progress_event(
 /// Context provided by the parent agent when spawning a child.
 #[derive(Debug, Clone)]
 pub struct SpawnContext {
+    /// Frozen user-authored model instruction for this exact parent tool call.
+    /// It is transient execution authority, never a child prompt field.
+    pub delegation_model_admission: Option<astra_turn_types::DelegationModelAdmission>,
     pub parent_model_reasoning:
         Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
     /// The parent's run ID.
@@ -862,6 +865,116 @@ pub struct SpawnContext {
     /// `AgenticLoopState` inherits this so subsequent delegations
     /// from the child can detect cycles like A→B→C→A.
     pub delegation_chain: Vec<String>,
+}
+
+/// Apply a frozen user instruction before model admission or capacity
+/// reservation. The same rule is checked again by `prepare_static_spawn`, so
+/// prepared and direct spawn paths cannot silently drop the constraint.
+pub(crate) fn apply_delegation_model_admission(
+    input: &mut SpawnAgentInput,
+    admission: &astra_turn_types::DelegationModelAdmission,
+    parent_run_id: &str,
+    tool_call_id: Option<&str>,
+) -> Result<(), SpawnError> {
+    use astra_turn_types::{
+        DelegationModelAdmissionOutcome, DelegationReasoningEffort, DelegationReasoningRequirement,
+    };
+    let invalid =
+        |reason: &str| SpawnError::InvalidInput(format!("delegation model admission: {reason}"));
+    if admission.source.run_id != parent_run_id
+        || tool_call_id != Some(admission.invocation_id.as_str())
+    {
+        return Err(invalid("source invocation changed"));
+    }
+    let target_count = input.fanout_target_count.unwrap_or(1);
+    let slot_index = input.fanout_slot_index.unwrap_or(0);
+    if target_count == 0 || target_count > 16 || slot_index >= target_count {
+        return Err(invalid("invalid target slot"));
+    }
+    let slot = match &admission.outcome {
+        DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { slot_count } => {
+            if *slot_count as usize != target_count {
+                return Err(invalid("slot count changed"));
+            }
+            return Ok(());
+        }
+        DelegationModelAdmissionOutcome::Constrained { slots } => {
+            if slots.len() != target_count {
+                return Err(invalid("slot count changed"));
+            }
+            slots
+                .get(slot_index)
+                .ok_or_else(|| invalid("slot missing"))?
+        }
+    };
+    if slot.slot_index as usize != slot_index {
+        return Err(invalid("slot identity changed"));
+    }
+    if slot.model_selection.is_some() != slot.model_strength.is_some()
+        || slot.reasoning.is_some() != slot.reasoning_strength.is_some()
+    {
+        return Err(invalid("requirement strength changed"));
+    }
+    if let Some(required) = &slot.model_selection {
+        let hard =
+            slot.model_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard);
+        if input
+            .model_selection
+            .as_ref()
+            .is_some_and(|selected| hard && selected != required)
+        {
+            return Err(invalid("tool model conflicts with user requirement"));
+        }
+        if input.model_selection.is_none() {
+            input.model_selection = Some(required.clone());
+        }
+    }
+    if let Some(required) = &slot.reasoning {
+        let hard =
+            slot.reasoning_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard);
+        let required = match required {
+            DelegationReasoningRequirement::ModelDefault => {
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault
+            }
+            DelegationReasoningRequirement::Off => {
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off
+            }
+            DelegationReasoningRequirement::Budget { tokens } => {
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Enabled {
+                    budget_tokens: *tokens,
+                }
+            }
+            DelegationReasoningRequirement::Effort { effort } => {
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
+                    effort: match effort {
+                        DelegationReasoningEffort::Low => {
+                            astra_turn_core::thinking_config::ThinkingEffort::Low
+                        }
+                        DelegationReasoningEffort::Medium => {
+                            astra_turn_core::thinking_config::ThinkingEffort::Medium
+                        }
+                        DelegationReasoningEffort::High => {
+                            astra_turn_core::thinking_config::ThinkingEffort::High
+                        }
+                        DelegationReasoningEffort::Max => {
+                            astra_turn_core::thinking_config::ThinkingEffort::Max
+                        }
+                    },
+                }
+            }
+        };
+        if input
+            .reasoning
+            .as_ref()
+            .is_some_and(|selected| hard && selected != &required)
+        {
+            return Err(invalid("tool reasoning conflicts with user requirement"));
+        }
+        if input.reasoning.is_none() {
+            input.reasoning = Some(required);
+        }
+    }
+    Ok(())
 }
 
 // ─── Agent Status ───────────────────────────────────────────────────────────
@@ -981,6 +1094,9 @@ pub struct SpawnRunConfig {
     /// Exact authorized Offering requested for this child. `None` means
     /// inherit the parent's admitted Offering.
     pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// Frozen projection of human model requirements for this child's own
+    /// future delegations. This is not inferred from the child task prompt.
+    pub delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
     /// Fixed fanout slot this execution consumes, when launched as a batch.
     pub fanout_slot: Option<AgentFanoutSlotIdentity>,
     /// Effective reasoning control, including an explicit target-model default.
@@ -3633,6 +3749,22 @@ impl DynamicAgentSpawner {
         ),
         SpawnError,
     > {
+        if let Some(admission) = context.delegation_model_admission.as_ref() {
+            let mut checked = input.clone();
+            apply_delegation_model_admission(
+                &mut checked,
+                admission,
+                &context.parent_run_id,
+                context.spawn_tool_call_id.as_deref(),
+            )?;
+            if checked.model_selection != input.model_selection
+                || checked.reasoning != input.reasoning
+            {
+                return Err(SpawnError::InvalidInput(
+                    "delegation model requirement was not applied before spawn".into(),
+                ));
+            }
+        }
         if context.parent_is_fork_child && input.inherit_prefix.is_some() {
             return Err(SpawnError::NestedForkInheritanceRejected);
         }
@@ -4449,6 +4581,16 @@ impl DynamicAgentSpawner {
             task: input.prompt.clone(),
             system_prompt_addendum: coordination_addendum,
             model_selection: input.model_selection.clone(),
+            delegated_model_requirements: context
+                .delegation_model_admission
+                .as_ref()
+                .and_then(|admission| {
+                    admission
+                        .child_requirements
+                        .get(input.fanout_slot_index.unwrap_or(0))
+                })
+                .cloned()
+                .unwrap_or_default(),
             fanout_slot: fanout_slot.clone(),
             thinking,
             model,
@@ -7431,6 +7573,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -7466,6 +7609,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -7514,6 +7658,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -7604,6 +7749,7 @@ mod tests {
             ..Default::default()
         };
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -7711,6 +7857,7 @@ mod tests {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(factory.clone() as Arc<dyn SpawnAgentExecutor>);
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -7769,6 +7916,7 @@ mod tests {
         );
 
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -7825,6 +7973,7 @@ mod tests {
             .await
             .unwrap();
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -8754,6 +8903,7 @@ mod tests {
         let spawner = DynamicAgentSpawner::new(router.clone())
             .with_executor(Arc::new(ImmediateSuccessExecutor));
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -8821,6 +8971,7 @@ mod tests {
         let executor = Arc::new(CapturingDepthExecutor::new());
         let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(executor.clone());
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -8892,6 +9043,7 @@ mod tests {
             },
         ));
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -8932,6 +9084,7 @@ mod tests {
     async fn test_spawn_rejects_when_recursion_depth_limit_reached() {
         let spawner = DynamicAgentSpawner::new(mock_router());
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -8972,6 +9125,7 @@ mod tests {
             },
         ));
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -9090,6 +9244,7 @@ mod tests {
             },
         ));
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -9134,6 +9289,7 @@ mod tests {
         ));
         let mut progress = spawner.subscribe_progress();
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
@@ -10726,6 +10882,7 @@ mod tests {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
@@ -10758,6 +10915,7 @@ mod tests {
     #[test]
     fn test_spawn_context_empty_skills_default() {
         let context = SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "run-1".to_string(),
             parent_agent_id: "agent-1".to_string(),
@@ -10839,6 +10997,7 @@ mod tests {
 
     fn make_bg_context() -> SpawnContext {
         SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
@@ -10876,6 +11035,115 @@ mod tests {
             run_in_background: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn frozen_delegation_requirement_applies_omission_and_rejects_conflicts() {
+        use astra_turn_types::{
+            DelegationModelAdmission, DelegationModelAdmissionOutcome,
+            DelegationModelInstructionSource, DelegationModelSlotConstraint,
+            DelegationReasoningEffort, DelegationReasoningRequirement, ModelSelection,
+        };
+        let admission = DelegationModelAdmission {
+            source: DelegationModelInstructionSource {
+                user_id: "user".into(),
+                session_id: "session".into(),
+                run_id: "parent-run".into(),
+                turn_chain_id: "chain".into(),
+                owner_generation: 1,
+                control_epoch: 2,
+                applied_intent_id: None,
+                session_turn: 1,
+                user_intent_digest: "sha256:intent".into(),
+            },
+            invocation_id: "call".into(),
+            arguments_digest: "sha256:args".into(),
+            child_requirements: vec![Default::default()],
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![DelegationModelSlotConstraint {
+                    slot_index: 0,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offering-b".into(),
+                    }),
+                    model_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
+                    reasoning: Some(DelegationReasoningRequirement::Effort {
+                        effort: DelegationReasoningEffort::High,
+                    }),
+                    reasoning_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
+                    task_scope_quote: None,
+                }],
+            },
+        };
+        let mut omitted = make_sync_input();
+        apply_delegation_model_admission(&mut omitted, &admission, "parent-run", Some("call"))
+            .unwrap();
+        assert_eq!(
+            omitted.model_selection.as_ref().unwrap().offering_id,
+            "offering-b"
+        );
+        assert_eq!(
+            omitted.reasoning,
+            Some(
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
+                    effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                }
+            )
+        );
+        let mut conflict = make_sync_input();
+        conflict.model_selection = Some(ModelSelection {
+            offering_id: "offering-a".into(),
+        });
+        assert!(
+            apply_delegation_model_admission(&mut conflict, &admission, "parent-run", Some("call"))
+                .is_err()
+        );
+        let mut default_admission = admission.clone();
+        let DelegationModelAdmissionOutcome::Constrained { slots } = &mut default_admission.outcome
+        else {
+            unreachable!()
+        };
+        slots[0].model_strength = Some(astra_turn_types::DelegationRequirementStrength::Default);
+        slots[0].reasoning_strength =
+            Some(astra_turn_types::DelegationRequirementStrength::Default);
+        let mut overridden = make_sync_input();
+        overridden.model_selection = Some(ModelSelection {
+            offering_id: "offering-a".into(),
+        });
+        overridden.reasoning =
+            Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault);
+        apply_delegation_model_admission(
+            &mut overridden,
+            &default_admission,
+            "parent-run",
+            Some("call"),
+        )
+        .unwrap();
+        assert_eq!(
+            overridden.model_selection.as_ref().unwrap().offering_id,
+            "offering-a"
+        );
+        assert_eq!(
+            overridden.reasoning,
+            Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault)
+        );
+        assert!(
+            apply_delegation_model_admission(
+                &mut make_sync_input(),
+                &admission,
+                "other-run",
+                Some("call")
+            )
+            .is_err()
+        );
+        assert!(
+            apply_delegation_model_admission(
+                &mut make_sync_input(),
+                &admission,
+                "parent-run",
+                None
+            )
+            .is_err()
+        );
     }
 
     fn completed_test_state(index: usize) -> SpawnedAgentState {
@@ -14617,6 +14885,7 @@ mod tests {
 
     fn parent_context(run_id: &str) -> SpawnContext {
         SpawnContext {
+            delegation_model_admission: None,
             parent_model_reasoning: Some(
                 astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
                     selection: astra_turn_types::ModelSelection {

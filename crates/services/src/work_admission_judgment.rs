@@ -25,11 +25,13 @@ pub struct WorkAdmissionClassification {
     pub mutation_completion_scope: MutationCompletionScope,
     pub execution_topology: WorkExecutionTopology,
     pub required_capabilities: Vec<WorkAdmissionCapability>,
+    /// Presence only; never authorizes or resolves a delegated model.
+    pub delegation_model_requirement: WorkAdmissionTruth,
 }
 
 /// Threshold decisions are not execution authority. Discrete model answers retain
 /// their provenance instead of being presented as calibrated probabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkAdmissionTruth {
     Yes,
@@ -72,6 +74,7 @@ const SCOPES: &[&str] = &["workspace", "external", "mixed", "unknown"];
 const DOMAINS: &[&str] = &[
     "none", "github", "git", "code", "memory", "web", "system", "database",
 ];
+const DELEGATION_MODEL_REQUIREMENT_ID: &str = "delegation.model_requirement";
 
 #[must_use]
 pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> JudgmentRequest {
@@ -134,8 +137,13 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
         "capability.web".into(),
         "Web access required; local paths alone do not count.".into(),
     );
+    add(
+        DELEGATION_MODEL_REQUIREMENT_ID.into(),
+        "User explicitly requires a model or reasoning setting for a delegated task. Quotes, mentions, and primary-only settings do not count; unclear scope means uncertain.".into(),
+    );
     JudgmentRequest {
         schema_version: 1,
+        explicit_answer_ids: vec![DELEGATION_MODEL_REQUIREMENT_ID.into()],
         state: json!({
             "policy": format!("{RULES} {MUTATION_TARGET_SCOPE_POLICY}"),
             "context": serde_json::from_str::<Value>(&build_work_admission_prompt(ctx)).expect("typed context"),
@@ -182,7 +190,9 @@ fn decode_evidence(
     TurnIntentJudgeError,
 > {
     let canonical = work_admission_classification_request(&TurnIntentJudgeContext::default());
-    if request.questions != canonical.questions {
+    if request.questions != canonical.questions
+        || request.explicit_answer_ids != canonical.explicit_answer_ids
+    {
         return Err(malformed(raw, "noncanonical classification questions"));
     }
     let normalized = normalize_judgment_response(request, raw, model, provenance)
@@ -335,6 +345,7 @@ fn validate_necessary_evidence(
     // afresh; optional evidence is not silently promoted into authority.
     let locked_fields = necessary
         .into_iter()
+        .chain(std::iter::once(DELEGATION_MODEL_REQUIREMENT_ID.into()))
         .filter_map(|id| match truth(&id) {
             Yes => Some((id, true)),
             No => Some((id, false)),
@@ -431,6 +442,7 @@ pub fn parse_work_admission_classification(
             WorkExecutionTopology::Primary
         },
         required_capabilities,
+        delegation_model_requirement: evidence[DELEGATION_MODEL_REQUIREMENT_ID].truth,
     })
 }
 
@@ -488,13 +500,42 @@ mod tests {
     use super::*;
     use astra_turn_types::{JudgmentAnswer, JudgmentResponse};
 
+    // Most older fixtures exercise Work facts, not delegation. Give them an
+    // explicit negative answer without weakening the production wire parser.
+    fn without_delegation_requirement(raw: &str) -> String {
+        let Ok(mut payload) = serde_json::from_str::<Value>(raw) else {
+            return raw.into();
+        };
+        let Some(object) = payload.as_object_mut() else {
+            return raw.into();
+        };
+        if !object.contains_key("true") || !object.contains_key("uncertain") {
+            return raw.into();
+        }
+        let already_answered = ["true", "false", "uncertain"].into_iter().any(|key| {
+            object
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id == DELEGATION_MODEL_REQUIREMENT_ID))
+        });
+        if !already_answered {
+            object
+                .entry("false")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .expect("fixture false list")
+                .push(json!(DELEGATION_MODEL_REQUIREMENT_ID));
+        }
+        payload.to_string()
+    }
+
     fn parse_chat(
         request: &JudgmentRequest,
         raw: &str,
     ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
         super::parse_work_admission_classification(
             request,
-            raw,
+            &without_delegation_requirement(raw),
             "chat-fixture",
             Some(JudgmentResponseProvenance::DiscreteDecision),
         )
@@ -507,11 +548,74 @@ mod tests {
     ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
         super::parse_work_admission_clarification(
             request,
-            raw,
+            &without_delegation_requirement(raw),
             diagnostics,
             "chat-fixture",
             Some(JudgmentResponseProvenance::DiscreteDecision),
         )
+    }
+
+    #[test]
+    fn delegation_presence_requires_explicit_answer_and_survives_clarification() {
+        let request = work_admission_classification_request(&Default::default());
+        let missing = r#"{"true":["mutation.read_only"],"uncertain":[]}"#;
+        assert!(
+            super::parse_work_admission_classification(
+                &request,
+                missing,
+                "chat-fixture",
+                Some(JudgmentResponseProvenance::DiscreteDecision),
+            )
+            .is_err()
+        );
+        for (list, expected) in [
+            ("true", WorkAdmissionTruth::Yes),
+            ("false", WorkAdmissionTruth::No),
+            ("uncertain", WorkAdmissionTruth::Uncertain),
+        ] {
+            let mut answer = json!({
+                "true": ["mutation.read_only"],
+                "false": [],
+                "uncertain": [],
+            });
+            answer[list]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(DELEGATION_MODEL_REQUIREMENT_ID));
+            let classified = super::parse_work_admission_classification(
+                &request,
+                &answer.to_string(),
+                "chat-fixture",
+                Some(JudgmentResponseProvenance::DiscreteDecision),
+            )
+            .unwrap();
+            assert_eq!(classified.delegation_model_requirement, expected);
+        }
+        let mut downgraded_request = request.clone();
+        downgraded_request.explicit_answer_ids.clear();
+        assert!(parse_chat(&downgraded_request, missing).is_err());
+
+        let error = parse_chat(
+            &request,
+            r#"{"true":["mutation.read_only","delegation.model_requirement"],"uncertain":["required"]}"#,
+        )
+        .unwrap_err();
+        let TurnIntentJudgeError::Uncertain { diagnostics } = error else {
+            panic!("required should request clarification");
+        };
+        let clarified = work_admission_clarification_request(
+            &request,
+            &TurnIntentJudgeError::Uncertain {
+                diagnostics: diagnostics.clone(),
+            },
+        )
+        .unwrap();
+        assert!(clarify_chat(
+            &clarified,
+            r#"{"true":["mutation.read_only"],"false":["delegation.model_requirement"],"uncertain":[]}"#,
+            &diagnostics,
+        )
+        .is_err());
     }
 
     fn response(request: &JudgmentRequest, yes: &[&str]) -> JudgmentResponse {
@@ -588,7 +692,7 @@ mod tests {
         assert!(request_bytes <= baseline_bytes + 1_280);
         assert!(messages_bytes <= baseline_messages_bytes + 1_280);
         assert!(
-            request_bytes < 12_000,
+            request_bytes < 13_000,
             "typed request: {request_bytes} bytes"
         );
         assert!(
@@ -1012,7 +1116,7 @@ mod tests {
         for (provenance, raw) in [
             (
                 JudgmentResponseProvenance::DiscreteDecision,
-                r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":[]}"#.to_string(),
+                r#"{"true":["mutation.read_only","parallel_subruns"],"false":["delegation.model_requirement"],"uncertain":[]}"#.to_string(),
             ),
             (
                 JudgmentResponseProvenance::ProviderProbability,

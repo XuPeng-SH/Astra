@@ -447,6 +447,7 @@ pub fn build_tool_result_selection_judgment(
         schema_version: 1,
         state,
         questions,
+        explicit_answer_ids: Vec::new(),
     })
 }
 

@@ -2258,6 +2258,7 @@ impl DelegationEngine {
         agent_id: &str,
         retry_of: Option<&str>,
         interaction_mode: RequestedTurnInteractionMode,
+        request_constraints: &RequestConstraints,
     ) -> Result<RunExecutionAuthority, String> {
         self.run_engine
             .start_run_ext_with_context(
@@ -2275,6 +2276,9 @@ impl DelegationEngine {
                         first_output_max_tokens: None,
                         preserve_thinking: true,
                     }),
+                    delegated_model_requirements: Some(
+                        request_constraints.delegated_model_requirements.clone(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -2695,6 +2699,7 @@ impl DelegationEngine {
                             &retry_config.agent_profile.agent_id,
                             Some(&original_run_id),
                             retry_config.interaction_mode,
+                            &retry_config.request_constraints,
                         )
                         .await
                     {
@@ -3263,6 +3268,7 @@ impl DelegationEngine {
                     agent_id,
                     None,
                     interaction_mode,
+                    request_constraints,
                 )
                 .await?;
             owner_generations.insert(sub_run_id.clone(), execution_authority.owner_generation);
@@ -3852,6 +3858,7 @@ impl DelegationEngine {
                     agent_id,
                     None,
                     interaction_mode,
+                    request_constraints,
                 )
                 .await?;
 
@@ -4177,6 +4184,7 @@ impl DelegationEngine {
                     producer_id,
                     None,
                     interaction_mode,
+                    request_constraints,
                 )
                 .await?;
             self.tracker
@@ -4426,6 +4434,7 @@ impl DelegationEngine {
                     reviewer_id,
                     None,
                     interaction_mode,
+                    request_constraints,
                 )
                 .await?;
             self.tracker
@@ -4667,6 +4676,7 @@ impl DelegationEngine {
                     agent_id,
                     None,
                     interaction_mode,
+                    request_constraints,
                 )
                 .await?;
             self.tracker
@@ -5418,6 +5428,60 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
 
         (Arc::new(RwLock::new(reg)), engine, tracker)
+    }
+
+    #[tokio::test]
+    async fn prestarted_child_persists_nonempty_descendant_requirements() {
+        use astra_turn_types::{
+            DelegationIntentRequirement, DelegationIntentRequirements,
+            DelegationRequirementPropagation, DelegationRequirementStrength,
+            DelegationUserRequirementSource, ModelSelection,
+        };
+        let (registry, run_engine, tracker) = setup();
+        run_engine
+            .start_run("parent", "user", "session")
+            .await
+            .unwrap();
+        let mut constraints = RequestConstraints::default();
+        constraints.delegated_model_requirements = DelegationIntentRequirements::Requirements {
+            source: DelegationUserRequirementSource {
+                user_id: "user".into(),
+                session_id: "session".into(),
+                session_turn: 1,
+                applied_intent_id: None,
+                user_intent_digest: "intent-digest".into(),
+            },
+            requirements: vec![DelegationIntentRequirement {
+                requirement_id: "all-reviewers".into(),
+                model_selection: Some(ModelSelection {
+                    offering_id: "review-offering".into(),
+                }),
+                reasoning: None,
+                task_scope_quote: None,
+                propagation: DelegationRequirementPropagation::Descendants,
+                strength: DelegationRequirementStrength::Hard,
+            }],
+        };
+        let delegation = DelegationEngine::new(registry, run_engine.clone(), tracker);
+        delegation
+            .start_delegated_run(
+                "child",
+                "user",
+                "session",
+                "parent",
+                "delegation",
+                "reviewer",
+                None,
+                RequestedTurnInteractionMode::Auto,
+                &constraints,
+            )
+            .await
+            .unwrap();
+        let child = run_engine.load_run("user", "child").await.unwrap().unwrap();
+        assert_eq!(
+            crate::server::run::engine::durable_run_delegated_model_requirements(&child).unwrap(),
+            Some(constraints.delegated_model_requirements)
+        );
     }
 
     #[tokio::test]

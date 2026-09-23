@@ -461,6 +461,9 @@ pub struct RunStartContext {
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     /// Immutable effective controls for an executable child run.
     pub(crate) generation_controls: Option<RunGenerationControls>,
+    /// Frozen human model requirements for a child run's future delegations.
+    /// Root runs assess their user turn later, so they may omit this field.
+    pub(crate) delegated_model_requirements: Option<astra_turn_types::DelegationIntentRequirements>,
     /// Trusted process-local proof that the complete model identity was
     /// produced from admitted execution material for this run. This is not a
     /// durable provenance label and is never reconstructed from request data.
@@ -504,6 +507,7 @@ impl Default for RunStartContext {
             model_selection: None,
             resolved_model_selection: None,
             generation_controls: None,
+            delegated_model_requirements: None,
             model_identity_admitted: false,
             runtime_profile: None,
             provider_request_fingerprint: None,
@@ -561,6 +565,31 @@ pub(crate) fn durable_run_generation_controls(
         }
     }
     Ok(controls)
+}
+
+pub(crate) fn durable_run_delegated_model_requirements(
+    run: &DurableRunRecord,
+) -> Result<Option<astra_turn_types::DelegationIntentRequirements>, String> {
+    let mut started = run
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "run_started");
+    let event = started
+        .next()
+        .ok_or_else(|| "durable run has no start event".to_string())?;
+    if started.next().is_some() {
+        return Err("durable run has conflicting start events".into());
+    }
+    event
+        .pointer("/data/delegated_model_requirements")
+        .map(|value| {
+            let requirements: astra_turn_types::DelegationIntentRequirements =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid durable model requirements: {error}"))?;
+            requirements.validate().map_err(str::to_string)?;
+            Ok(requirements)
+        })
+        .transpose()
 }
 
 fn durable_model_identity(
@@ -895,6 +924,7 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
             if key != "execution_restrictions"
                 && key != "admission_source"
                 && key != "generation_controls"
+                && key != "delegated_model_requirements"
             {
                 data.entry(key.clone()).or_insert_with(|| value.clone());
             }
@@ -916,6 +946,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         data.insert(
             "generation_controls".into(),
             serde_json::to_value(controls).expect("typed generation controls serialize"),
+        );
+    }
+    if let Some(requirements) = context.delegated_model_requirements.as_ref() {
+        data.insert(
+            "delegated_model_requirements".into(),
+            serde_json::to_value(requirements).expect("typed model requirements serialize"),
         );
     }
     if let Some(fingerprint) = context.provider_request_fingerprint.as_ref() {

@@ -7031,6 +7031,7 @@ impl AgenticRunLifecycleService {
             .unwrap_or_else(|| "root-agent".to_string());
         let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
+            delegation_model_admission: None,
             run_id: run_id.to_string(),
             agent_id,
             delegation_chain: Vec::new(),
@@ -12251,6 +12252,7 @@ impl AgenticRunLifecycleService {
             run_id,
             workspace_override,
             edge_context,
+            &request_constraints,
         )?;
         let environment = self.assemble_loop_environment(
             user_id,
@@ -12289,6 +12291,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         workspace_override: Option<&std::path::Path>,
         edge_context: &EdgeContext,
+        request_constraints: &RequestConstraints,
     ) -> Result<LoopExecutionFacts, (StatusCode, Json<ErrorResponse>)> {
         use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
         use astra_turn_core::stop_hooks_yaml::{
@@ -12383,6 +12386,9 @@ impl AgenticRunLifecycleService {
                 turn_guard: TurnGuard::with_profile(task_profile),
                 message: prompt_user_message.clone(),
                 user_intent: prompt_user_intent,
+                delegated_model_requirements: request_constraints
+                    .delegated_model_requirements
+                    .clone(),
                 turn_intent: None,
                 task_profile,
                 session_turn: 0,
@@ -12447,6 +12453,9 @@ impl AgenticRunLifecycleService {
     ) -> AgenticLoopState {
         use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
         use astra_text_utils::semantic_dedup::SemanticDedup;
+        let mut request_constraints = request_constraints;
+        request_constraints.delegated_model_requirements =
+            facts.original.delegated_model_requirements.clone();
         let LoopEnvironment {
             skill_registry,
             skill_resolver,
@@ -21099,7 +21108,7 @@ impl ServerSpawnAgentExecutor {
 fn spawn_child_request_constraints(
     parent: &RequestConstraints,
     config: &SpawnRunConfig,
-) -> RequestConstraints {
+) -> Result<RequestConstraints, &'static str> {
     let child_allowed = if config.allowed_tools.iter().any(|tool| tool == "*") {
         if config.read_only {
             // `read_only` here describes workspace mutation, not a ban on
@@ -21152,12 +21161,15 @@ fn spawn_child_request_constraints(
         allowed_tools.insert("settle_work_item".to_string());
     }
 
-    RequestConstraints::new(
+    let mut constraints = RequestConstraints::new(
         allowed_tools,
         parent.enabled_tools.clone(),
         parent.allowed_skills.clone(),
         parent.allowed_skill_sources.clone(),
-    )
+    );
+    config.delegated_model_requirements.validate()?;
+    constraints.delegated_model_requirements = config.delegated_model_requirements.clone();
+    Ok(constraints)
 }
 
 fn delegated_edge_tool_schema_names(constraints: &RequestConstraints) -> Vec<String> {
@@ -21536,6 +21548,7 @@ struct ServerPreparedSpawn {
     requested_selection: Option<ModelSelection>,
     thinking: astra_turn_core::thinking_config::ThinkingConfig,
     slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
+    delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
 }
 
 #[async_trait]
@@ -21547,6 +21560,7 @@ impl PreparedSpawn for ServerPreparedSpawn {
             .map(|address| address.run_id.as_str());
         if parent_run_id != Some(self.parent.parent_run_id.as_str())
             || config.fanout_slot != self.slot
+            || config.delegated_model_requirements != self.delegated_model_requirements
             || config.thinking != self.thinking
             || config.max_output_tokens != self.max_output_tokens
             || match (&self.requested_selection, &config.model_selection) {
@@ -21634,6 +21648,17 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
         for input in inputs {
             let slot = input.fanout_slot_identity()?;
+            let delegated_model_requirements = match context.delegation_model_admission.as_ref() {
+                Some(admission) => admission
+                    .child_requirements
+                    .get(input.fanout_slot_index.unwrap_or(0))
+                    .cloned()
+                    .ok_or_else(|| "prepared child requirement slot is missing".to_string())?,
+                None => Default::default(),
+            };
+            delegated_model_requirements
+                .validate()
+                .map_err(str::to_string)?;
             let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
                 input.reasoning.as_ref(),
                 input.model_selection.as_ref(),
@@ -21675,6 +21700,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 requested_selection: input.model_selection.clone(),
                 thinking,
                 slot,
+                delegated_model_requirements,
             }));
         }
         Ok(prepared)
@@ -21741,7 +21767,8 @@ impl ServerSpawnAgentExecutor {
         // keep alive the supervisor that owns that same future.
         let dynamic_agent_spawner = dynamic_agent_spawner.task_handle();
         let request_constraints =
-            spawn_child_request_constraints(&context.request_constraints, &config);
+            spawn_child_request_constraints(&context.request_constraints, &config)
+                .map_err(str::to_string)?;
         let (child_runtime_context, _generation_publication_guard) = self
             .register_child_runtime_context(
                 &context,
@@ -22253,6 +22280,16 @@ impl ServerSubRunExecutor {
             {
                 return Err("durable sub-run retry changed its generation controls".into());
             }
+            if crate::server::run::engine::durable_run_delegated_model_requirements(&existing)?
+                != Some(
+                    config
+                        .request_constraints
+                        .delegated_model_requirements
+                        .clone(),
+                )
+            {
+                return Err("durable sub-run retry changed inherited model requirements".into());
+            }
             if existing.session_id != config.session_id
                 || existing.parent_run_id.as_deref() != Some(config.parent_run_id.as_str())
             {
@@ -22393,6 +22430,12 @@ impl ServerSubRunExecutor {
                         preserve_thinking: config.thinking
                             != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                     }),
+                    delegated_model_requirements: Some(
+                        config
+                            .request_constraints
+                            .delegated_model_requirements
+                            .clone(),
+                    ),
                     agent_binding_name: Some(config.agent_profile.name.clone()),
                     provider_run_owner: inherited_provider_run_owner(&config.context)?,
                     model_identity_admitted: execution.is_some(),
@@ -22449,6 +22492,16 @@ impl ServerSubRunExecutor {
         let durable_controls = crate::server::run::engine::durable_run_generation_controls(&run)?;
         if durable_controls != requested_controls {
             return Err("durable sub-run generation controls changed before execution".into());
+        }
+        if crate::server::run::engine::durable_run_delegated_model_requirements(&run)?
+            != Some(
+                config
+                    .request_constraints
+                    .delegated_model_requirements
+                    .clone(),
+            )
+        {
+            return Err("durable sub-run model requirements changed before execution".into());
         }
         let offering_id = run.model_offering_id.as_deref().ok_or_else(|| {
             "durable sub-run is missing its admitted Offering identity".to_string()
@@ -23929,6 +23982,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     crate::orchestration::WorkspaceMutationAuthority::default();
                 workspace_mutation.set(inherited_workspace_mutation);
                 executor.set_agent_tool_context(AgentToolContext {
+                    delegation_model_admission: None,
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),
                     delegation_chain: config.delegation_chain.clone(),

@@ -76,6 +76,7 @@ pub fn skill_auto_route_judgment_request(
         .collect::<Vec<_>>();
     Ok(JudgmentRequest {
         schema_version: 1,
+        explicit_answer_ids: Vec::new(),
         state: json!({"policy":ROUTING_POLICY, "query":ctx.query, "catalog":catalog}),
         questions: ctx
             .visible_skills

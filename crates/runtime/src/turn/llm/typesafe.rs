@@ -41,6 +41,7 @@ pub(super) fn response(
         .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let judgment_request = JudgmentRequest {
         schema_version: 1,
+        explicit_answer_ids: Vec::new(),
         state: request
             .get("state")
             .cloned()
@@ -135,6 +136,7 @@ mod tests {
         vec![
             json!({"role":"user", "content": serde_json::to_string(&JudgmentRequest {
             schema_version: 1, state: json!({"lesson":"example"}),
+            explicit_answer_ids: Vec::new(),
             questions: [("0".into(), astra_turn_types::JudgmentQuestion::Noul { instructions: "Is this useful?".into(), criteria: None })].into(),
         }).unwrap()}),
         ]

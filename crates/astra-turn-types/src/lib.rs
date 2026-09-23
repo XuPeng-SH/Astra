@@ -22,6 +22,7 @@ pub use completion_settlement::deserialize_required_option;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
+mod delegation_model_admission;
 mod explain_analyze;
 mod memory_selection;
 pub use memory_selection::*;
@@ -77,6 +78,13 @@ pub use context_identity::{
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
+pub use delegation_model_admission::{
+    DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
+    DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
+    DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
+    DelegationRequirementPropagation, DelegationRequirementStrength,
+    DelegationUserRequirementSource,
+};
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
     ExplainAnalyzeAdmissionSettlementReasonV1, ExplainAnalyzeAdmissionSettlementStatusV1,

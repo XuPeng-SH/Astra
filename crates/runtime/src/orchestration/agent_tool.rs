@@ -409,6 +409,9 @@ fn is_timeout_fanout_finish_reason(reason: &str) -> bool {
 /// Context for executing `agent` tool lifecycle actions.
 #[derive(Clone)]
 pub struct AgentToolContext {
+    /// Invocation-local frozen user model requirement, installed only by the
+    /// trusted tool metadata path. Shared lifecycle contexts keep this empty.
+    pub delegation_model_admission: Option<astra_turn_types::DelegationModelAdmission>,
     /// Current agent's run ID.
     pub run_id: String,
     /// Current agent's ID.
@@ -1140,95 +1143,75 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
         .await
 }
 
-async fn handle_agent_fanout_start_action_with_deadline(
-    args: &Value,
-    ctx: Option<&AgentToolContext>,
-    settlement_timeout: Duration,
-) -> String {
-    if let Err(e) = validate_agent_fanout_start_shape(args) {
-        return render_agent_tool_error(None, &format!("Invalid input: {e}"));
-    }
-    let input: AgentFanoutStartInput = match serde_json::from_value(args.clone()) {
-        Ok(input) => input,
-        Err(e) => {
-            return render_agent_tool_error(
-                None,
-                &format!("Invalid input for agent_fanout.start: {e}. {FANOUT_START_SHAPE}"),
-            );
+// Preserve the handler's historical error precedence: shape/count errors
+// precede runtime binding, while task validation errors follow it.
+enum FanoutStartInputError {
+    Shape(String),
+    Task(String),
+}
+
+impl FanoutStartInputError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Shape(message) | Self::Task(message) => message,
         }
-    };
+    }
+}
+
+fn validated_agent_fanout_start_input(
+    args: &Value,
+) -> Result<AgentFanoutStartInput, FanoutStartInputError> {
+    use FanoutStartInputError::{Shape, Task};
+
+    validate_agent_fanout_start_shape(args).map_err(|e| Shape(format!("Invalid input: {e}")))?;
+    let mut input: AgentFanoutStartInput = serde_json::from_value(args.clone()).map_err(|e| {
+        Shape(format!(
+            "Invalid input for agent_fanout.start: {e}. {FANOUT_START_SHAPE}"
+        ))
+    })?;
     if input.target_count == 0 {
-        return render_agent_tool_error(None, "Invalid input: target_count must be >= 1");
+        return Err(Shape("Invalid input: target_count must be >= 1".into()));
     }
     if input.target_count > MAX_FANOUT_TARGET_COUNT {
-        return render_agent_tool_error(
-            None,
-            &format!(
-                "Invalid input: target_count {} exceeds maximum of {}",
-                input.target_count, MAX_FANOUT_TARGET_COUNT
-            ),
-        );
+        return Err(Shape(format!(
+            "Invalid input: target_count {} exceeds maximum of {}",
+            input.target_count, MAX_FANOUT_TARGET_COUNT
+        )));
     }
     if input.slots.len() != input.target_count {
-        return render_agent_tool_error(
-            None,
-            &format!(
-                "Invalid input: target_count {} requires exactly {} slots, got {}",
-                input.target_count,
-                input.target_count,
-                input.slots.len()
-            ),
-        );
+        return Err(Shape(format!(
+            "Invalid input: target_count {} requires exactly {} slots, got {}",
+            input.target_count,
+            input.target_count,
+            input.slots.len()
+        )));
     }
-    let ctx = match ctx {
-        Some(c) => c,
-        None => {
-            return render_agent_runtime_binding_error("agent_fanout", "start");
-        }
-    };
-    if !ctx.spawner.has_executor() {
-        return render_agent_runtime_binding_error("agent_fanout", "start");
-    }
-    let mut input = input;
     for (slot_index, slot) in input.slots.iter().enumerate() {
         let description_chars = slot.description.chars().count() as u64;
         if description_chars
             > astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
         {
-            return render_agent_tool_error(
-                None,
-                &format!(
-                    "Invalid input: slots[{slot_index}].description has {description_chars} characters; maximum is {}",
-                    astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
-                ),
-            );
+            return Err(Task(format!(
+                "Invalid input: slots[{slot_index}].description has {description_chars} characters; maximum is {}",
+                astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
+            )));
         }
         let prompt_chars = slot.prompt.chars().count() as u64;
         if prompt_chars > astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS {
-            return render_agent_tool_error(
-                None,
-                &format!(
-                    "Invalid input: slots[{slot_index}].prompt has {prompt_chars} characters; maximum is {}. Keep the brief concise and never embed file contents, diffs, or prior tool output.",
-                    astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS
-                ),
-            );
+            return Err(Task(format!(
+                "Invalid input: slots[{slot_index}].prompt has {prompt_chars} characters; maximum is {}. Keep the brief concise and never embed file contents, diffs, or prior tool output.",
+                astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS
+            )));
         }
     }
 
-    let group_id = match input.group_id.as_deref().map(str::trim) {
-        Some("") => {
-            return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
+    if let Some(group_id) = input.group_id.as_mut() {
+        let trimmed = group_id.trim();
+        if trimmed.is_empty() {
+            return Err(Task("Invalid input: group_id must be non-empty".into()));
         }
-        Some(group_id) => group_id.to_string(),
-        None => next_fanout_group_id(ctx),
-    };
-    let title = input
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .unwrap_or(&group_id)
-        .to_string();
+        *group_id = trimmed.to_string();
+    }
 
     // Validate all slots before spawning any.
     let mut seen_slot_ids = HashSet::new();
@@ -1236,38 +1219,66 @@ async fn handle_agent_fanout_start_action_with_deadline(
         if let Some(slot_id) = slot.slot_id.as_mut() {
             let trimmed = slot_id.trim();
             if trimmed.is_empty() {
-                return render_agent_tool_error(
-                    None,
-                    &format!("Invalid input: slots[{slot_index}].id must be non-empty"),
-                );
+                return Err(Task(format!(
+                    "Invalid input: slots[{slot_index}].id must be non-empty"
+                )));
             }
             if trimmed.len() != slot_id.len() {
                 *slot_id = trimmed.to_string();
             }
             let slot_id = slot_id.clone();
             if !seen_slot_ids.insert(slot_id.clone()) {
-                return render_agent_tool_error(
-                    None,
-                    &format!(
-                        "Invalid input: slots[{slot_index}].id '{}' is duplicated",
-                        slot_id
-                    ),
-                );
+                return Err(Task(format!(
+                    "Invalid input: slots[{slot_index}].id '{}' is duplicated",
+                    slot_id
+                )));
             }
         }
         if slot.description.trim().is_empty() {
-            return render_agent_tool_error(
-                None,
-                &format!("Invalid input: slots[{slot_index}].description must be non-empty"),
-            );
+            return Err(Task(format!(
+                "Invalid input: slots[{slot_index}].description must be non-empty"
+            )));
         }
         if slot.prompt.trim().is_empty() {
-            return render_agent_tool_error(
-                None,
-                &format!("Invalid input: slots[{slot_index}].prompt must be non-empty"),
-            );
+            return Err(Task(format!(
+                "Invalid input: slots[{slot_index}].prompt must be non-empty"
+            )));
         }
     }
+    Ok(input)
+}
+
+async fn handle_agent_fanout_start_action_with_deadline(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+    settlement_timeout: Duration,
+) -> String {
+    let validated = validated_agent_fanout_start_input(args);
+    if let Err(FanoutStartInputError::Shape(message)) = &validated {
+        return render_agent_tool_error(None, message);
+    }
+    let ctx = match ctx {
+        Some(c) => c,
+        None => return render_agent_runtime_binding_error("agent_fanout", "start"),
+    };
+    if !ctx.spawner.has_executor() {
+        return render_agent_runtime_binding_error("agent_fanout", "start");
+    }
+    let mut input = match validated {
+        Ok(input) => input,
+        Err(error) => return render_agent_tool_error(None, error.message()),
+    };
+    let group_id = input
+        .group_id
+        .clone()
+        .unwrap_or_else(|| next_fanout_group_id(ctx));
+    let title = input
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&group_id)
+        .to_string();
     let requested_optional_tools = input
         .slots
         .iter()
@@ -1329,7 +1340,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .to_string();
     }
     let tool_call_id = input._tool_call_id.clone();
-    let planned_slots: Vec<_> = match std::mem::take(&mut input.slots)
+    let mut planned_slots: Vec<_> = match std::mem::take(&mut input.slots)
         .into_iter()
         .enumerate()
         .map(|(slot_index, slot)| {
@@ -1352,11 +1363,24 @@ async fn handle_agent_fanout_start_action_with_deadline(
         Ok(planned) => planned,
         Err(error) => return render_agent_tool_error(None, &error),
     };
+    if let Some(admission) = ctx.delegation_model_admission.as_ref() {
+        for (_, _, spawn_input) in &mut planned_slots {
+            if let Err(error) = super::spawner::apply_delegation_model_admission(
+                spawn_input,
+                admission,
+                &ctx.run_id,
+                tool_call_id.as_deref(),
+            ) {
+                return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
+            }
+        }
+    }
     let resolved_inputs: Vec<_> = planned_slots
         .iter()
         .map(|(_, _, input)| input.clone())
         .collect();
     let spawn_context = SpawnContext {
+        delegation_model_admission: ctx.delegation_model_admission.clone(),
         parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
@@ -2412,7 +2436,7 @@ async fn handle_agent_spawn_action_with_capacity_reservation(
 }
 
 async fn handle_agent_spawn_input_with_capacity_reservation(
-    input: SpawnAgentInput,
+    mut input: SpawnAgentInput,
     ctx: Option<&AgentToolContext>,
     reservation_owner_id: Option<&str>,
     preparation: Option<Box<dyn super::spawner::PreparedSpawn>>,
@@ -2424,6 +2448,17 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
             return render_agent_runtime_binding_error("agent", "spawn");
         }
     };
+
+    if let Some(admission) = ctx.delegation_model_admission.as_ref() {
+        if let Err(error) = super::spawner::apply_delegation_model_admission(
+            &mut input,
+            admission,
+            &ctx.run_id,
+            spawn_tool_call_id.as_deref(),
+        ) {
+            return render_agent_tool_error(None, &error.to_string());
+        }
+    }
 
     let unavailable = unavailable_requested_tools(
         input.allowed_tools.as_deref().unwrap_or_default(),
@@ -2480,6 +2515,7 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
     let mut input = input;
     input.model_selection = model_selection;
     let spawn_ctx = SpawnContext {
+        delegation_model_admission: ctx.delegation_model_admission.clone(),
         parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
@@ -2694,6 +2730,38 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
     }
 
     Ok(patched_args)
+}
+
+/// Project task text from the same validated tool shapes used by execution.
+/// Display labels are context for the interpreter, never user authority.
+pub(crate) fn canonical_delegation_slot_briefs(
+    tool_name: &str,
+    args: &Value,
+) -> Result<Vec<astra_services::delegation_model_requirement::DelegationSlotBrief>, String> {
+    use astra_services::delegation_model_requirement::DelegationSlotBrief;
+    match (tool_name, args.get("action").and_then(Value::as_str)) {
+        ("agent", Some("spawn")) => {
+            let input: SpawnAgentInput = serde_json::from_value(normalize_agent_spawn_args(args)?)
+                .map_err(|error| error.to_string())?;
+            Ok(vec![DelegationSlotBrief {
+                description: input.description,
+                prompt: input.prompt,
+            }])
+        }
+        ("agent_fanout", Some("start")) => {
+            let input = validated_agent_fanout_start_input(args)
+                .map_err(|error| error.message().to_string())?;
+            Ok(input
+                .slots
+                .into_iter()
+                .map(|slot| DelegationSlotBrief {
+                    description: slot.description,
+                    prompt: slot.prompt,
+                })
+                .collect())
+        }
+        _ => Err("not a delegated spawn invocation".into()),
+    }
 }
 
 /// Handle `agent(action='get_result')`.
@@ -3597,6 +3665,7 @@ mod tests {
         current_model: Option<&str>,
     ) -> AgentToolContext {
         AgentToolContext {
+            delegation_model_admission: None,
             parent_model_reasoning: None,
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
@@ -4045,6 +4114,74 @@ mod tests {
         assert_eq!(groups[0].parent_run_id.as_deref(), Some("run-parent"));
         assert_eq!(groups[0].slots[0].slot_id.as_deref(), Some("storage"));
         assert_eq!(groups[0].slots[1].slot_id.as_deref(), Some("ui"));
+    }
+
+    #[tokio::test]
+    async fn fanout_model_conflict_rejects_before_group_or_child_reservation() {
+        use astra_turn_types::{
+            DelegationModelAdmission, DelegationModelAdmissionOutcome,
+            DelegationModelInstructionSource, DelegationModelSlotConstraint, ModelSelection,
+        };
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner.clone(), Some("parent-model"));
+        ctx.delegation_model_admission = Some(DelegationModelAdmission {
+            source: DelegationModelInstructionSource {
+                user_id: "user".into(),
+                session_id: "session".into(),
+                run_id: ctx.run_id.clone(),
+                turn_chain_id: "chain".into(),
+                owner_generation: 1,
+                control_epoch: 2,
+                applied_intent_id: None,
+                session_turn: 1,
+                user_intent_digest: "sha256:intent".into(),
+            },
+            invocation_id: "fanout-call".into(),
+            arguments_digest: "sha256:args".into(),
+            child_requirements: vec![Default::default(); 2],
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![
+                    DelegationModelSlotConstraint {
+                        slot_index: 0,
+                        model_selection: Some(ModelSelection {
+                            offering_id: "required".into(),
+                        }),
+                        model_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
+                        reasoning: None,
+                        reasoning_strength: None,
+                        task_scope_quote: None,
+                    },
+                    DelegationModelSlotConstraint {
+                        slot_index: 1,
+                        model_selection: None,
+                        model_strength: None,
+                        reasoning: None,
+                        reasoning_strength: None,
+                        task_scope_quote: None,
+                    },
+                ],
+            },
+        });
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "_tool_call_id": "fanout-call",
+                "group_id": "model-conflict",
+                "target_count": 2,
+                "slots": [
+                    {"id": "review", "description": "Review", "prompt": "Review the diff",
+                     "model_selection": {"offering_id": "wrong"}},
+                    {"id": "survey", "description": "Survey", "prompt": "Survey the code"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert!(result.contains("tool model conflicts"), "{result}");
+        assert_eq!(executor.spawn_count(), 0);
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert!(spawner.list_fanout_groups().await.is_empty());
     }
 
     #[tokio::test]
@@ -4974,6 +5111,92 @@ mod tests {
         assert!(result.contains("id must be non-empty"), "{result}");
         assert!(spawner.list_fanout_groups().await.is_empty());
         assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[tokio::test]
+    async fn fanout_validated_input_rejections_match_task_projection_and_handler() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("parent-model"));
+        let valid = json!({
+            "action": "start", "group_id": "group", "target_count": 2,
+            "slots": [
+                {"id": "one", "description": "Review", "prompt": "Review code"},
+                {"id": "two", "description": "Test", "prompt": "Test code"}
+            ]
+        });
+        let cases = [
+            ("/target_count", json!(0)),
+            ("/target_count", json!(MAX_FANOUT_TARGET_COUNT + 1)),
+            ("/target_count", json!(1)),
+            ("/group_id", json!("  ")),
+            ("/slots/0/id", json!("  ")),
+            ("/slots/1/id", json!(" one ")),
+            ("/slots/0/description", json!("  ")),
+            ("/slots/0/prompt", json!("  ")),
+            (
+                "/slots/0/description",
+                json!("x".repeat(
+                    astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
+                        as usize
+                        + 1
+                )),
+            ),
+            (
+                "/slots/0/prompt",
+                json!("x".repeat(
+                    astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS as usize
+                        + 1
+                )),
+            ),
+        ];
+        for (pointer, value) in cases {
+            let mut args = valid.clone();
+            *args.pointer_mut(pointer).unwrap() = value;
+            let error = canonical_delegation_slot_briefs("agent_fanout", &args).unwrap_err();
+            assert_eq!(
+                handle_agent_fanout_start_action_with_deadline(&args, Some(&ctx), Duration::ZERO,)
+                    .await,
+                render_agent_tool_error(None, &error),
+                "validation drift for {pointer}",
+            );
+        }
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.take_captured_model(), None);
+
+        let mut invalid_task = valid.clone();
+        invalid_task["slots"][0]["prompt"] = json!("");
+        assert_eq!(
+            handle_agent_fanout_start_action_with_deadline(&invalid_task, None, Duration::ZERO)
+                .await,
+            render_agent_runtime_binding_error("agent_fanout", "start"),
+        );
+        invalid_task["target_count"] = json!(0);
+        assert_eq!(
+            handle_agent_fanout_start_action_with_deadline(&invalid_task, None, Duration::ZERO)
+                .await,
+            render_agent_tool_error(None, "Invalid input: target_count must be >= 1"),
+        );
+    }
+
+    #[test]
+    fn fanout_validated_input_preserves_task_text_and_normalizes_ids() {
+        let description = "界".repeat(
+            astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS as usize,
+        );
+        let prompt = "界"
+            .repeat(astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS as usize);
+        let args = json!({
+            "action": "start", "group_id": " group ", "target_count": 1,
+            "slots": [{"id": " slot ", "description": description, "prompt": prompt}]
+        });
+        let input = validated_agent_fanout_start_input(&args)
+            .unwrap_or_else(|error| panic!("{}", error.message()));
+        assert_eq!(input.group_id.as_deref(), Some("group"));
+        assert_eq!(input.slots[0].slot_id.as_deref(), Some("slot"));
+        let briefs = canonical_delegation_slot_briefs("agent_fanout", &args).unwrap();
+        assert_eq!(briefs[0].description, description);
+        assert_eq!(briefs[0].prompt, prompt);
     }
 
     #[tokio::test]

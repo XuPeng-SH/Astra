@@ -2191,11 +2191,16 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .map(|call| call.logical_target_call().clone())
         .collect::<Vec<_>>();
     let mut admitted_tool_call_control = super::host::AdmittedToolCallControl::Continue;
+    let mut delegation_model_admissions = std::collections::HashMap::new();
     if !admitted_logical_calls.is_empty() {
         let delivered = host
             .handle_admitted_tool_invocations(state, &admitted_tool_calls)
             .await;
         admitted_tool_call_control = delivered.control;
+        delegation_model_admissions = delivered.delegation_model_admissions;
+        if let Some(usage) = delivered.auxiliary_usage {
+            state.settle_admitted_auxiliary_usage(usage);
+        }
         record_trusted_client_pipeline_skills(state, &admitted_logical_calls, &delivered.results);
         turn_result.edge_tool_round.extend(delivered.results);
     }
@@ -2445,6 +2450,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     }
                 },
             ),
+            delegation_model_admissions: Some(&delegation_model_admissions),
             physical_tool_calls,
             logical_tool_calls: all_tool_calls,
             deferred_activations_by_call_id: &deferred_activations_by_call_id,

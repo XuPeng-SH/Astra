@@ -6097,9 +6097,8 @@ mod tests {
             r#"{"currency":"USD","unit":"per_token","prompt":0}"#,
             r#"{"currency":"CNY","unit":"per_token","prompt":0,"completion":0}"#,
         ] {
-            match serde_json::from_str::<ConfiguredPricingData>(raw) {
-                Ok(price) => assert!(price.validate().is_err(), "{raw}"),
-                Err(_) => {}
+            if let Ok(price) = serde_json::from_str::<ConfiguredPricingData>(raw) {
+                assert!(price.validate().is_err(), "{raw}");
             }
         }
         let price: ConfiguredPricingData = serde_json::from_str(

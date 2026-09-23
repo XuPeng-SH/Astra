@@ -456,6 +456,36 @@ pub enum AdmittedToolCallControl {
 pub struct AdmittedToolCallOutcome {
     pub results: Vec<EdgeToolExecResult>,
     pub control: AdmittedToolCallControl,
+    /// Transient, trusted constraints for exact logical calls in this round.
+    /// Neither model-authored arguments nor a shared executor map owns them.
+    pub delegation_model_admissions:
+        std::collections::HashMap<String, PreparedDelegationModelAdmission>,
+    pub auxiliary_usage: Option<AdmittedAuxiliaryUsage>,
+}
+
+/// One invocation's trusted model admission and transient ledger preparation.
+/// The latter is never persisted or exposed to the model; the ledger remains
+/// authoritative if another worker wins the same identity before dispatch.
+#[derive(Clone, Debug)]
+pub struct PreparedDelegationModelAdmission {
+    pub admission: astra_turn_types::DelegationModelAdmission,
+    pub(crate) preparation:
+        Option<crate::server::tool_invocation_runtime::InvocationPreparationProbe>,
+}
+
+impl std::ops::Deref for PreparedDelegationModelAdmission {
+    type Target = astra_turn_types::DelegationModelAdmission;
+
+    fn deref(&self) -> &Self::Target {
+        &self.admission
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdmittedAuxiliaryUsage {
+    pub usage: crate::turn::token_usage::TokenUsage,
+    pub attempts: u32,
+    pub provider_reported: u32,
 }
 
 impl From<Vec<EdgeToolExecResult>> for AdmittedToolCallOutcome {
@@ -463,6 +493,8 @@ impl From<Vec<EdgeToolExecResult>> for AdmittedToolCallOutcome {
         Self {
             results,
             control: AdmittedToolCallControl::Continue,
+            delegation_model_admissions: std::collections::HashMap::new(),
+            auxiliary_usage: None,
         }
     }
 }
@@ -700,7 +732,7 @@ pub trait AgenticLoopHost: Send {
     /// attached through dispatch.
     async fn handle_admitted_tool_invocations(
         &mut self,
-        state: &AgenticLoopState,
+        state: &mut AgenticLoopState,
         invocations: &[astra_turn_core::tool::deferred_activation::CanonicalToolInvocation],
     ) -> AdmittedToolCallOutcome {
         let tool_calls = invocations
@@ -1538,6 +1570,9 @@ pub(crate) fn introspect_estimated_input_tokens(state: &AgenticLoopState) -> u64
 ///   `skill` / `discover_skills` tool schemas.
 #[derive(Clone, Debug, Default)]
 pub struct RequestConstraints {
+    /// Authenticated human model requirements, not child-prompt text. This
+    /// must be explicitly assessed before delegation can treat it as empty.
+    pub delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
     /// When set, only this subset of non-skill tools may execute for the request.
     ///
     /// This does not restrict the `skill` or `discover_skills` tool schemas;
@@ -1557,11 +1592,11 @@ pub struct RequestConstraints {
 }
 
 impl RequestConstraints {
-    /// Construct with all three lanes set explicitly.
+    /// Construct with the four external tool/skill lanes set explicitly.
     ///
-    /// Every field is required so adding a new constraint axis is a hard
-    /// compile error at every call site, not a silent default. Callers that
-    /// don't have a specific lane should pass `None`.
+    /// Callers that don't have a specific external lane pass `None`. The
+    /// authenticated model-requirement lane starts `Unassessed` and is set by
+    /// turn admission, never by an external tool payload.
     pub fn new(
         allowed_tools: Option<HashSet<String>>,
         enabled_tools: Option<HashSet<String>>,
@@ -1569,6 +1604,7 @@ impl RequestConstraints {
         allowed_skill_sources: Option<HashSet<crate::skills::manifest::SkillSourceKind>>,
     ) -> Self {
         Self {
+            delegated_model_requirements: Default::default(),
             allowed_tools,
             enabled_tools,
             allowed_skills,
@@ -1603,8 +1639,9 @@ pub struct SkillState {
     /// Optional skill executor for fork-context skills. When set, skills with
     /// `execution_context: Fork` are executed via this executor (sub-agent loop).
     pub executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
-    /// Request-scoped tool/skill constraints supplied by the external caller.
-    /// Nested runs inherit these constraints unchanged.
+    /// Request-scoped constraints supplied by the external caller and the
+    /// authenticated turn. Tool/skill lanes narrow for children; admitted
+    /// model requirements project by their explicit propagation scope.
     pub request_constraints: RequestConstraints,
     /// Per-skill quality metrics accumulated during the session.
     /// Used to boost high-performing skills in selection priority.
@@ -2367,6 +2404,7 @@ pub(crate) struct OriginalLoopExecutionFacts {
     pub turn_guard: TurnGuard,
     pub message: String,
     pub user_intent: String,
+    pub delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub turn_intent: Option<astra_config::user_profile::TurnIntent>,
     pub task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
@@ -2431,6 +2469,11 @@ impl OriginalLoopExecutionFacts {
             turn_guard: state.turn_guard.clone(),
             message: state.message.clone(),
             user_intent: state.user_intent.clone(),
+            delegated_model_requirements: state
+                .skills
+                .request_constraints
+                .delegated_model_requirements
+                .clone(),
             turn_intent: state.turn_intent.clone(),
             task_profile: state.task_profile,
             session_turn: state.session_turn,
@@ -4305,6 +4348,23 @@ impl AgenticLoopState {
             self.user_intent.as_str()
         };
         input.trim().to_string()
+    }
+
+    pub(crate) fn settle_admitted_auxiliary_usage(&mut self, delta: AdmittedAuxiliaryUsage) {
+        for attempt in 0..delta.attempts {
+            self.record_local_usage_coverage(attempt < delta.provider_reported);
+        }
+        self.total_prompt = self.total_prompt.saturating_add(delta.usage.input_tokens);
+        self.total_cache_read = self
+            .total_cache_read
+            .saturating_add(delta.usage.cached_input_tokens);
+        self.total_cache_creation = self
+            .total_cache_creation
+            .saturating_add(delta.usage.cache_creation_tokens);
+        self.total_completion = self
+            .total_completion
+            .saturating_add(delta.usage.output_tokens);
+        self.has_any_usage |= delta.provider_reported > 0;
     }
 
     pub fn push_volatile(&mut self, kind: VolatileKind, content: impl Into<String>) {

@@ -387,6 +387,9 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub current_turn_chain_id: Option<&'a str>,
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
+    pub delegation_model_admissions: Option<
+        &'a HashMap<String, crate::turn::agentic_loop::host::PreparedDelegationModelAdmission>,
+    >,
     pub task_resolution_authority:
         Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     pub tool_calls: &'a [Value],
@@ -1065,6 +1068,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let run_id = self.ctx.current_run_id;
         let turn_chain_id = self.ctx.current_turn_chain_id;
         let durable_dispatch_admission = self.ctx.durable_dispatch_admission;
+        let delegation_model_admissions = self.ctx.delegation_model_admissions;
         let task_resolution_authority = self.ctx.task_resolution_authority;
         let session_turn = self.ctx.session_turn;
         let edge_round_present = !self.ctx.edge_tool_round.is_empty();
@@ -1102,6 +1106,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     ]));
                     return crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Continue;
                 };
+                let delegation_model_admission =
+                    delegation_model_admissions.and_then(|admissions| admissions.get(&exec.id));
                 execute_tool_pure(
                     exec,
                     server_executor,
@@ -1111,6 +1117,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     run_id,
                     turn_chain_id,
                     durable_dispatch_admission,
+                    delegation_model_admission,
                     task_resolution_authority,
                     provider_policy.as_ref(),
                     permission_grant.as_ref(),
@@ -1490,6 +1497,7 @@ mod tests {
                     current_turn_chain_id: has_runtime_executor
                         .then_some(self.turn_chain_id.as_str()),
                     durable_dispatch_admission: None,
+                    delegation_model_admissions: None,
                     task_resolution_authority: None,
                     tool_calls: &self.tool_calls,
                     deferred_activations_by_call_id: &self.deferred_activations_by_call_id,

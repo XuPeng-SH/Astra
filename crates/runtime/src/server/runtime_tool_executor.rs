@@ -741,6 +741,12 @@ impl WorkEstablishmentInvocation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DelegationPreparationError {
+    LedgerUnavailable,
+    FrozenConflict,
+}
+
 pub struct RuntimeToolExecutor {
     // ── Identity ──────────────────────────────────────────────────────────────
     /// Workspace root for this session.
@@ -3333,6 +3339,9 @@ impl RuntimeToolExecutor {
         durable_dispatch_admission: Option<
             crate::server::tool_invocation_runtime::DurableDispatchAdmission,
         >,
+        delegation_model_admission: Option<
+            &crate::turn::agentic_loop::host::PreparedDelegationModelAdmission,
+        >,
         task_resolution_authority: Option<
             &astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority,
         >,
@@ -3365,6 +3374,8 @@ impl RuntimeToolExecutor {
         );
         request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
         request.policy.permission_grant = permission_grant.cloned();
+        request.policy.delegation_model_admission =
+            delegation_model_admission.map(|prepared| prepared.admission.clone());
         request.policy.task_resolution_authority = task_resolution_authority
             .and_then(|authority| authority.for_call(invocation_id))
             .cloned();
@@ -3376,8 +3387,142 @@ impl RuntimeToolExecutor {
             request,
             self.cancel_token.clone(),
             durable_dispatch_admission,
+            delegation_model_admission.and_then(|prepared| prepared.preparation.clone()),
         ))
         .await
+    }
+
+    pub(crate) fn frozen_delegation_admission_from_record(
+        &self,
+        record: &astra_turn_types::ToolInvocationRecord,
+        run_id: &str,
+        turn_chain_id: &str,
+        invocation_id: &str,
+        arguments_digest: &str,
+    ) -> Result<astra_turn_types::DelegationModelAdmission, DelegationPreparationError> {
+        use DelegationPreparationError::FrozenConflict;
+        if record.fingerprint.canonical_arguments_hash != arguments_digest {
+            return Err(FrozenConflict);
+        }
+        let frozen =
+            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(
+                &record.decision,
+            )
+            .map_err(|_| FrozenConflict)?;
+        let admission = frozen.delegation_model_admission.ok_or(FrozenConflict)?;
+        if admission.invocation_id == invocation_id
+            && admission.arguments_digest == arguments_digest
+            && admission.source.user_id == self.user_id
+            && admission.source.session_id == self.session_id
+            && admission.source.run_id == run_id
+            && admission.source.turn_chain_id == turn_chain_id
+        {
+            Ok(admission)
+        } else {
+            Err(FrozenConflict)
+        }
+    }
+
+    /// A failed semantic check must not replace an already frozen invocation.
+    /// This cold recovery path runs only after a hot-only probe missed and the
+    /// new-call judgment failed; normal admission performs no extra lookup.
+    pub(crate) async fn recover_delegation_after_failed_judgment(
+        &self,
+        run_id: &str,
+        turn_chain_id: &str,
+        invocation_id: &str,
+        name: &str,
+        args: &Value,
+        arguments_digest: &str,
+    ) -> Result<
+        Option<(
+            astra_turn_types::DelegationModelAdmission,
+            astra_turn_types::ToolInvocationRecord,
+        )>,
+        DelegationPreparationError,
+    > {
+        use DelegationPreparationError::{FrozenConflict, LedgerUnavailable};
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            &self.user_id,
+            &self.session_id,
+            run_id,
+            turn_chain_id,
+            invocation_id,
+        )
+        .map_err(|_| FrozenConflict)?;
+        let record = self
+            .invocation_ledger
+            .as_ref()
+            .ok_or(LedgerUnavailable)?
+            .get(&identity)
+            .await
+            .map_err(|_| LedgerUnavailable)?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let fingerprint = self.delegation_fingerprint(name, args, &record.decision.decision_id)?;
+        if !record.fingerprint.same_tool_and_arguments(&fingerprint) {
+            return Err(FrozenConflict);
+        }
+        let admission = self.frozen_delegation_admission_from_record(
+            &record,
+            run_id,
+            turn_chain_id,
+            invocation_id,
+            arguments_digest,
+        )?;
+        Ok(Some((admission, record)))
+    }
+
+    /// Perform the ledger's ordinary first lookup before an optional
+    /// semantic model/scope judgment. A miss is not a reservation; the later
+    /// transactional insert and reread still choose the frozen winner.
+    pub(crate) async fn probe_delegation_preparation(
+        &self,
+        run_id: &str,
+        turn_chain_id: &str,
+        invocation_id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Result<
+        crate::server::tool_invocation_runtime::InvocationPreparationProbe,
+        DelegationPreparationError,
+    > {
+        use DelegationPreparationError::{FrozenConflict, LedgerUnavailable};
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            &self.user_id,
+            &self.session_id,
+            run_id,
+            turn_chain_id,
+            invocation_id,
+        )
+        .map_err(|_| FrozenConflict)?;
+        let fingerprint = self.delegation_fingerprint(name, args, "preparation-only")?;
+        self.invocation_ledger.as_ref().ok_or(LedgerUnavailable)?
+            .probe_for_prepare(&identity, &fingerprint).await
+            .map_err(|error| match error {
+                crate::server::tool_invocation_runtime::RuntimeInvocationLedgerError::InvalidRecord(_) => FrozenConflict,
+                crate::server::tool_invocation_runtime::RuntimeInvocationLedgerError::Database(ref store)
+                    if matches!(store.as_ref(), astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::IdentityConflict { .. }) => FrozenConflict,
+                _ => LedgerUnavailable,
+            })
+    }
+
+    fn delegation_fingerprint(
+        &self,
+        name: &str,
+        args: &Value,
+        decision_id: &str,
+    ) -> Result<astra_turn_types::ToolInvocationFingerprint, DelegationPreparationError> {
+        let contract = self
+            .tool_execution_service
+            .tool_registry()
+            .tool_contract_version(name)
+            .ok_or(DelegationPreparationError::FrozenConflict)?;
+        let tool = astra_turn_types::DurableToolReference::built_in(name, contract)
+            .map_err(|_| DelegationPreparationError::FrozenConflict)?;
+        astra_turn_types::ToolInvocationFingerprint::new(tool, args, decision_id)
+            .map_err(|_| DelegationPreparationError::FrozenConflict)
     }
 
     async fn execute_request_with_metadata(
@@ -3396,9 +3541,13 @@ impl RuntimeToolExecutor {
         let effective_cancel_token = cancel_token
             .map(|token| Arc::new(token.clone()))
             .or_else(|| self.cancel_token.clone());
-        let deferred =
-            Box::pin(self.execute_request_before_governance(request, effective_cancel_token, None))
-                .await;
+        let deferred = Box::pin(self.execute_request_before_governance(
+            request,
+            effective_cancel_token,
+            None,
+            None,
+        ))
+        .await;
         let governed = govern_runtime_tool_result(deferred.result, false);
         self.finish_governed_tool_result(governed, deferred.pending)
             .await
@@ -3411,6 +3560,9 @@ impl RuntimeToolExecutor {
         cancel_token: Option<Arc<CancellationToken>>,
         durable_dispatch_admission: Option<
             crate::server::tool_invocation_runtime::DurableDispatchAdmission,
+        >,
+        delegation_preparation: Option<
+            crate::server::tool_invocation_runtime::InvocationPreparationProbe,
         >,
     ) -> GovernableRuntimeToolResult {
         // Never trust a caller-constructed or replayed request carrier. Only
@@ -3446,53 +3598,42 @@ impl RuntimeToolExecutor {
             return GovernableRuntimeToolResult::schema_preflight_rejected(result);
         }
 
+        if matches!(
+            (
+                request.tool_name.as_str(),
+                request
+                    .args
+                    .get("action")
+                    .and_then(serde_json::Value::as_str),
+            ),
+            ("agent", Some("spawn")) | ("agent_fanout", Some("start"))
+        ) && let Err(error) = crate::orchestration::agent_tool::canonical_delegation_slot_briefs(
+            &request.tool_name,
+            &request.args,
+        ) {
+            return GovernableRuntimeToolResult::completed(
+                tool_invocation_decision_rejected_result(format!(
+                    "invalid delegated task before admission: {error}"
+                )),
+            );
+        }
+
+        if (request.policy.delegation_model_admission.is_some() || delegation_preparation.is_some())
+            && (request.policy.permission_grant.is_none() || durable_dispatch_admission.is_none())
+        {
+            return GovernableRuntimeToolResult::completed(
+                tool_invocation_decision_rejected_result(
+                    "delegation model admission requires governed durable dispatch".to_string(),
+                ),
+            );
+        }
+
         request.policy.admission_snapshot = Some(
             self.tool_execution_service
                 .invocation_admission_snapshot(&request)
                 .await,
         );
         let durable_invocation = if request.policy.permission_grant.is_some() {
-            let route = self.tool_execution_service.routing_decision(&request);
-            let decision = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
-                &request,
-                route,
-                self.tool_execution_service.tool_registry(),
-            ) {
-                Ok(decision) => decision,
-                Err(error) => {
-                    return GovernableRuntimeToolResult::completed(
-                        tool_invocation_decision_rejected_result(error.to_string()),
-                    );
-                }
-            };
-            let fingerprint = match decision.fingerprint(&request.args) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
-                        serde_json::json!({
-                            "status": "failed",
-                            "error": error.to_string(),
-                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
-                            "retryable": false,
-                        })
-                        .to_string(),
-                    ));
-                }
-            };
-            let durable_decision = match decision.durable() {
-                Ok(decision) => decision,
-                Err(error) => {
-                    return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
-                        serde_json::json!({
-                            "status": "failed",
-                            "error": error.to_string(),
-                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
-                            "retryable": false,
-                        })
-                        .to_string(),
-                    ));
-                }
-            };
             let identity = match astra_turn_types::ToolInvocationIdentity::new(
                 &request.user_id,
                 &request.session_id,
@@ -3521,14 +3662,111 @@ impl RuntimeToolExecutor {
                     ),
                 );
             };
-            let frozen_decision = match ledger
-                .prepare_for_execution(&identity, &fingerprint, &durable_decision, |decision| {
-                    crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(decision)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                })
-                .await
+            let validate = |decision: &astra_turn_types::ToolInvocationDecision| {
+                crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(decision)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            };
+            let preparation = if let Some(
+                crate::server::tool_invocation_runtime::InvocationPreparationProbe::Existing(
+                    record,
+                ),
+            ) = delegation_preparation.as_ref()
             {
+                let fingerprint = match self.delegation_fingerprint(
+                    &request.tool_name,
+                    &request.args,
+                    &record.decision.decision_id,
+                ) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(_) => {
+                        return GovernableRuntimeToolResult::completed(
+                            tool_invocation_decision_rejected_result(
+                                "delegation replay has no matching tool contract".to_string(),
+                            ),
+                        );
+                    }
+                };
+                ledger
+                    .prepare_for_execution_with_probe(
+                        &identity,
+                        &fingerprint,
+                        delegation_preparation.expect("existing probe"),
+                        None,
+                        validate,
+                    )
+                    .await
+            } else {
+                let route = self.tool_execution_service.routing_decision(&request);
+                let decision = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                route,
+                self.tool_execution_service.tool_registry(),
+            ) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return GovernableRuntimeToolResult::completed(
+                        tool_invocation_decision_rejected_result(error.to_string()),
+                    );
+                }
+            };
+                let fingerprint = match decision.fingerprint(&request.args) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        return GovernableRuntimeToolResult::completed(
+                            astra_tools::ToolResult::error(
+                                serde_json::json!({
+                                    "status": "failed",
+                                    "error": error.to_string(),
+                                    "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                                    "retryable": false,
+                                })
+                                .to_string(),
+                            ),
+                        );
+                    }
+                };
+                let durable_decision = match decision.durable() {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        return GovernableRuntimeToolResult::completed(
+                            astra_tools::ToolResult::error(
+                                serde_json::json!({
+                                    "status": "failed",
+                                    "error": error.to_string(),
+                                    "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                                    "retryable": false,
+                                })
+                                .to_string(),
+                            ),
+                        );
+                    }
+                };
+                match delegation_preparation {
+                    Some(probe) => {
+                        ledger
+                            .prepare_for_execution_with_probe(
+                                &identity,
+                                &fingerprint,
+                                probe,
+                                Some(&durable_decision),
+                                validate,
+                            )
+                            .await
+                    }
+                    None => {
+                        ledger
+                            .prepare_for_execution(
+                                &identity,
+                                &fingerprint,
+                                &durable_decision,
+                                validate,
+                            )
+                            .await
+                    }
+                }
+            };
+            let frozen_decision = match preparation {
                 Ok(crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Prepared {
                     decision,
                 }) => decision,
@@ -3569,6 +3807,19 @@ impl RuntimeToolExecutor {
                     );
                 }
             };
+            if let Err(error) = frozen.validate_frozen_delegation(
+                &request,
+                durable_dispatch_admission.as_ref().map(|admission| {
+                    (
+                        admission.expected_control_epoch,
+                        admission.expected_owner_generation,
+                    )
+                }),
+            ) {
+                return GovernableRuntimeToolResult::completed(
+                    tool_invocation_decision_rejected_result(error.to_string()),
+                );
+            }
             frozen.apply_to_request(&mut request);
             let semantic_read_preparation = self
                 .prepare_semantic_read(&frozen, &identity, &request.args)
@@ -4383,6 +4634,7 @@ impl RuntimeToolExecutor {
                                 },
                             ),
                             expected_control_epoch: request.policy.expected_control_epoch,
+                            delegation_model_admission: request.policy.delegation_model_admission.as_ref(),
                             task_resolution_authority: request.policy.task_resolution_authority.as_ref(),
                         },
                         cancel_token,
@@ -5289,6 +5541,7 @@ mod tests {
                 &json!({"city": 42}),
                 None,
                 Some(&grant),
+                None,
                 None,
                 None,
             )
@@ -8134,6 +8387,170 @@ esac
         (exec, dir)
     }
 
+    #[tokio::test]
+    async fn frozen_delegation_record_checks_exact_invocation_and_arguments() {
+        use astra_turn_types::{
+            DelegationModelAdmission, DelegationModelAdmissionOutcome,
+            DelegationModelInstructionSource,
+        };
+
+        let (mut exec, dir) = test_executor();
+        exec.enable_durable_invocations();
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "call",
+        )
+        .unwrap();
+        let binding = crate::server::tool_execution_binding::ExecutionBindingState::server_sandbox(
+            dir.path(),
+        );
+        let args = json!({"action": "spawn", "description": "Review", "prompt": "Review code"});
+        let mut request = binding.tool_execution_request_for_invocation(&identity, "agent", &args);
+        request.policy.admission_snapshot = Some(Default::default());
+        let admission = DelegationModelAdmission {
+            source: DelegationModelInstructionSource {
+                user_id: identity.user_id.clone(),
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                owner_generation: 1,
+                control_epoch: 2,
+                applied_intent_id: None,
+                session_turn: 1,
+                user_intent_digest: "digest".into(),
+            },
+            invocation_id: identity.invocation_id.clone(),
+            arguments_digest: astra_turn_types::canonical_public_arguments_hash(&args),
+            child_requirements: vec![Default::default()],
+            outcome: DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { slot_count: 1 },
+        };
+        request.policy.delegation_model_admission = Some(admission.clone());
+        let snapshot =
+            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                crate::server::tool_route_selection::ToolExecutionRouteKind::ServerLocal,
+                &astra_runtime_env::ToolRegistry::builtins(),
+            )
+            .unwrap();
+        let decision = snapshot.durable().unwrap();
+        let fingerprint = snapshot.fingerprint(&args).unwrap();
+        exec.invocation_ledger
+            .as_ref()
+            .unwrap()
+            .prepare_for_execution(&identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+
+        let record = exec
+            .invocation_ledger
+            .as_ref()
+            .unwrap()
+            .get(&identity)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exec.frozen_delegation_admission_from_record(
+                &record,
+                "run",
+                "chain",
+                "call",
+                &admission.arguments_digest,
+            ),
+            Ok(admission.clone())
+        );
+        assert_eq!(
+            exec.frozen_delegation_admission_from_record(&record, "run", "chain", "call", "wrong"),
+            Err(DelegationPreparationError::FrozenConflict)
+        );
+        let recovered = exec
+            .recover_delegation_after_failed_judgment(
+                "run",
+                "chain",
+                "call",
+                "agent",
+                &args,
+                &admission.arguments_digest,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered, Some((admission.clone(), record)));
+        assert!(matches!(
+            exec.recover_delegation_after_failed_judgment(
+                "run",
+                "chain",
+                "call",
+                "agent",
+                &json!({"action": "spawn"}),
+                &admission.arguments_digest,
+            )
+            .await,
+            Err(DelegationPreparationError::FrozenConflict)
+        ));
+        assert_eq!(
+            exec.recover_delegation_after_failed_judgment(
+                "run",
+                "chain",
+                "new-call",
+                "agent",
+                &args,
+                &admission.arguments_digest,
+            )
+            .await,
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_fanout_is_rejected_before_durable_prepare() {
+        let (mut exec, _dir) = test_executor();
+        exec.enable_durable_invocations();
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "invalid-fanout",
+        )
+        .unwrap();
+        let args = json!({
+            "action": "start",
+            "target_count": 2,
+            "slots": [
+                {"id": "duplicate", "description": "First", "prompt": "First task"},
+                {"id": "duplicate", "description": "Second", "prompt": "Second task"}
+            ]
+        });
+        let mut request =
+            exec.tool_execution_request_for_invocation(&identity, "agent_fanout", &args, None);
+        request.policy.permission_grant = Some(
+            crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+                source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+                reason: None,
+                updates_hash: None,
+            },
+        );
+        let outcome = exec
+            .execute_request_before_governance(request, None, None, None)
+            .await;
+        assert!(outcome.result.is_error);
+        assert!(outcome.result.output.contains("duplicated"));
+        let record = exec
+            .invocation_ledger
+            .as_ref()
+            .unwrap()
+            .get(&identity)
+            .await
+            .unwrap();
+        assert!(
+            record.is_none(),
+            "invalid input must not leave a Prepared row"
+        );
+    }
+
     #[test]
     fn task_resolution_edge_terminal_status_preserves_execution_and_incomplete_evidence() {
         use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
@@ -8851,6 +9268,7 @@ esac
             std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         let spawner = std::sync::Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         AgentToolContext {
+            delegation_model_admission: None,
             run_id: "test-run".into(),
             agent_id: "test-agent".into(),
             delegation_chain: Vec::new(),
@@ -9217,6 +9635,39 @@ esac
             .await;
         assert_eq!(replay.output, first.output);
         assert_eq!(replay.metadata.as_ref().unwrap()["invocation_replay"], true);
+
+        let fanout_args = json!({
+            "action": "start",
+            "target_count": 1,
+            "slots": [{"id": "one", "description": "Check", "prompt": "Check the result"}]
+        });
+        let fanout = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "fanout-call",
+                "agent_fanout",
+                &fanout_args,
+                None,
+                Some(&grant),
+            )
+            .await;
+        let fanout_replay = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "fanout-call",
+                "agent_fanout",
+                &fanout_args,
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert_eq!(fanout_replay.output, fanout.output);
+        assert_eq!(
+            fanout_replay.metadata.as_ref().unwrap()["invocation_replay"],
+            true
+        );
 
         let second = exec
             .execute_invocation_with_metadata(

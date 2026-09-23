@@ -52,6 +52,7 @@ pub fn accepted_request_judgment_result(
         mutation_completion_scope: decision.mutation_completion_scope(),
         execution_topology: decision.execution_topology(),
         required_capabilities: decision.required_capabilities().to_vec(),
+        delegation_model_requirement: crate::work_admission_judgment::WorkAdmissionTruth::Uncertain,
     };
     request_judgment_result(&Ok(classification))
 }
@@ -1872,7 +1873,7 @@ mod tests {
             crate::work_admission_classification_request(&crate::TurnIntentJudgeContext::default());
         request_judgment_result(&crate::parse_work_admission_classification(
             &request,
-            r#"{"true":["mutation.read_only"],"uncertain":[]}"#,
+            r#"{"true":["mutation.read_only"],"false":["delegation.model_requirement"],"uncertain":[]}"#,
             "chat-fixture",
             Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         ))
@@ -1883,7 +1884,7 @@ mod tests {
             crate::work_admission_classification_request(&crate::TurnIntentJudgeContext::default());
         request_judgment_result(&crate::parse_work_admission_classification(
             &request,
-            r#"{"true":["mutation.read_only"],"uncertain":["required"]}"#,
+            r#"{"true":["mutation.read_only"],"false":["delegation.model_requirement"],"uncertain":["required"]}"#,
             "chat-fixture",
             Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         ))
@@ -2064,7 +2065,7 @@ mod tests {
             crate::work_admission_classification_request(&crate::TurnIntentJudgeContext::default());
         let mut result = crate::parse_work_admission_classification(
             &request,
-            r#"{"true":["mutation.read_only"],"uncertain":["required"]}"#,
+            r#"{"true":["mutation.read_only"],"false":["delegation.model_requirement"],"uncertain":["required"]}"#,
             "chat-fixture",
             Some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision),
         );

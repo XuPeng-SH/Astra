@@ -1743,6 +1743,7 @@ mod tests {
                     },
                 ),
                 None,
+                None,
             )
             .await;
         assert!(
@@ -1784,6 +1785,7 @@ mod tests {
                         expected_execution_binding_generation: None,
                     },
                 ),
+                None,
                 None,
             )
             .await;

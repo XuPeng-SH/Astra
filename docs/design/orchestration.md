@@ -58,6 +58,12 @@ resolver. Unsupported inherited controls fail admission just like unsupported
 explicit controls. Fixed token budgets remain exact and must fit the output
 limit; they are not translated into effort levels. This resolution is in-memory
 and requires no parent-run lookup or additional persistence.
+User-authored delegation requirements retain their default or hard strength in
+the frozen invocation. An explicit slot choice may override a default but not a
+hard requirement; applicable hard requirements are resolved before defaults,
+independent of extraction order. A CLI child without a trusted task binder
+rejects new nested delegation when it inherits unresolved or constrained
+descendant requirements rather than silently dropping them.
 `max_output_tokens` is a ceiling for the first child model round, including its
 retries. CLI carries it as validated `context.max_output_tokens`; internal
 delegation carries the same typed cap. Catalog output limits remain separate.
