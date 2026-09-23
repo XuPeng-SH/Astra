@@ -14,7 +14,13 @@ astra-test --suite crates/astra-test-harness/cases/subagent_model_selection \
 
 For revision-bound evidence set `ASTRA_EXPECTED_BUILD_GIT_SHA` to the full
 candidate commit SHA and follow the harness preflight instructions in
-`crates/astra-test-harness/README.md`. Save the report and structured journal,
-including actual child model/Offering and provider usage; a passing prompt
-alone is not proof of model identity or cost. The invalid final-slot case must
-show zero `agent_spawned` events, not just a failed terminal answer.
+`crates/astra-test-harness/README.md`. The valid case asserts exactly two
+spawn events, one per fanout slot, and checks that both expose the prepared
+`deepseek-v4-flash` selection identity in the journal. It also checks that the
+prepared child run IDs are distinct and match the IDs returned by that fanout
+call. This is admission/preparation evidence, not proof of the provider's
+actual request.
+Save the report and structured journal with provider usage for cost analysis.
+A passing prompt alone is not proof of provider model identity or cost. The
+invalid final-slot case must show zero `agent_spawned` events, not just a
+failed terminal answer.

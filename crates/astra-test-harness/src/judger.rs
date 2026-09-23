@@ -781,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn rubric_wire_uses_named_string_ids_and_rejects_numeric_or_false_shapes() {
+    fn rubric_wire_uses_named_string_ids_and_rejects_numeric_or_duplicate_shapes() {
         let request = build_judger_request("criterion", &dummy_outcome());
         assert!(
             request
