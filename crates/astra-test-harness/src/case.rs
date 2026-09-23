@@ -793,6 +793,33 @@ criteria:
     }
 
     #[test]
+    fn bundled_subagent_model_selection_cases_forbid_reflect_reads() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
+        let cases = Case::load_dir(&dir).expect("subagent model cases must parse");
+
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "flash_fanout_invalid_final_slot",
+                "flash_fanout_model_default"
+            ]
+        );
+        assert!(cases.iter().all(|case| case.debug_log));
+        assert!(
+            cases
+                .iter()
+                .all(|case| case.criteria.iter().any(|criterion| matches!(
+                    criterion,
+                    crate::criteria::Criterion::JournalToolCallCount { name, min: 0, max: 0, .. }
+                        if name == "reflect"
+                )))
+        );
+    }
+
+    #[test]
     fn memory_tool_ban_treats_any_call_as_a_hard_failure() {
         use crate::criteria::{Criterion, CriterionSeverity, evaluate_deterministic};
         use crate::runner::RunOutcome;

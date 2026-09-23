@@ -18,9 +18,14 @@ candidate commit SHA and follow the harness preflight instructions in
 spawn events, one per fanout slot, and checks that both expose the prepared
 `deepseek-v4-flash` selection identity in the journal. It also checks that the
 prepared child run IDs are distinct and match the IDs returned by that fanout
-call. This is admission/preparation evidence, not proof of the provider's
-actual request.
-Save the report and structured journal with provider usage for cost analysis.
-A passing prompt alone is not proof of provider model identity or cost. The
-invalid final-slot case must show zero `agent_spawned` events, not just a
-failed terminal answer.
+call. The invalid final-slot case must show zero `agent_spawned` events, not
+just a failed terminal answer.
+
+These cases deliberately do not call `reflect` or add model-request-ledger
+reads. They provide real-provider execution and child-result evidence, plus
+the prepared selection identity; they do not independently assert the final
+provider request identity for each child. If that attribution is needed,
+perform an explicit Reflect audit separately and report its database reads,
+extra model turn, latency, and cost outside these measurements. Save the report
+and structured journal for cost analysis, and report missing usage as unknown
+rather than inferring cost from a passing answer.
