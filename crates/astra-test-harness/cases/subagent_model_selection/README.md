@@ -28,4 +28,19 @@ provider request identity for each child. If that attribution is needed,
 perform an explicit Reflect audit separately and report its database reads,
 extra model turn, latency, and cost outside these measurements. Save the report
 and structured journal for cost analysis, and report missing usage as unknown
-rather than inferring cost from a passing answer.
+rather than inferring cost from a passing answer. To keep the complete harness
+summary and per-case artifacts after the command exits, run:
+
+```sh
+run_dir="$(mktemp -d "${TMPDIR:-/tmp}/astra-subagent-selection.XXXXXX")"
+printf 'Harness artifacts: %s\n' "$run_dir"
+astra-test --suite crates/astra-test-harness/cases/subagent_model_selection \
+  --models deepseek-v4-flash --no-judger --parallel 1 --runs 3 \
+  --artifacts-dir "$run_dir/cases" \
+  --report-file "$run_dir/report.json" \
+  --eval-file "$run_dir/eval.json"
+```
+
+The report and case artifacts may contain prompts and model responses. Keep the
+directory local, inspect it before sharing, and do not commit it. These output
+flags write local files; they do not add database reads or writes.
