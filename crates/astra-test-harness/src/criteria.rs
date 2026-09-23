@@ -22,6 +22,32 @@ use crate::session_capture::SessionCapture;
 
 mod work_replacement;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventJsonMatch {
+    /// Missing fields do not match, even when `equals` is JSON null.
+    pub path: String,
+    pub equals: serde_json::Value,
+    /// Require every matching event to carry a distinct, non-empty string at
+    /// this pointer (for example, a child `run_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_by: Option<String>,
+    /// Require the unique event IDs to equal IDs in a successful tool result
+    /// from the events' parent run (for example, returned fanout child runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ids_match: Option<SessionEventResultIdMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventResultIdMatch {
+    pub tool_name: String,
+    /// Event pointer for the parent run that owns the matching tool call.
+    pub event_parent_run_id_path: String,
+    pub result_array_path: String,
+    pub item_id_path: String,
+}
+
 /// One declarative success check. Serialized into YAML cases as
 /// `type: <variant>` discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,7 +130,8 @@ pub enum Criterion {
     },
 
     /// Passes when the session journal contains at least `min`
-    /// events with `type == event_type`. Requires session capture.
+    /// events with `type == event_type`, optionally matching one exact
+    /// JSON pointer/value pair. Requires session capture.
     /// Use for structural checks ("at least one subagent_spawned
     /// event appears").
     ///
@@ -122,6 +149,9 @@ pub enum Criterion {
         /// Optional upper bound; `min: 0, max: 0` proves absence.
         #[serde(default)]
         max: Option<u32>,
+        /// Optional exact JSON-pointer predicate against the complete event.
+        #[serde(default)]
+        json_match: Option<SessionEventJsonMatch>,
         /// When true, skip-pass when session is unavailable. Use
         /// sparingly — only for cases that are meaningful even
         /// without the journal check.
@@ -1275,6 +1305,79 @@ fn validate_text_json_dag(
     Ok((node_ids.len(), unique_edges.len()))
 }
 
+fn session_event_ids_match_tool_result(
+    session: &SessionCapture,
+    events: &[&crate::session_capture::JournalEvent],
+    event_id_path: &str,
+    link: &SessionEventResultIdMatch,
+) -> bool {
+    let event_ids = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .raw
+                .pointer(event_id_path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if event_ids.len() != events.len() {
+        return false;
+    }
+
+    let parent_run_ids = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .raw
+                .pointer(&link.event_parent_run_id_path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if parent_run_ids.len() != 1
+        || events.iter().any(|event| {
+            event
+                .raw
+                .pointer(&link.event_parent_run_id_path)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|run_id| run_id.trim().is_empty())
+        })
+    {
+        return false;
+    }
+    let parent_run_id = parent_run_ids.iter().next().copied();
+
+    session.journal_tool_calls().into_iter().any(|call| {
+        if call.name != link.tool_name
+            || call.ok != Some(true)
+            || call.run_id.as_deref() != parent_run_id
+        {
+            return false;
+        }
+        let Some(items) = call
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer(&link.result_array_path))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        let result_ids = items
+            .iter()
+            .map(|item| {
+                item.pointer(&link.item_id_path)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .collect::<Option<std::collections::HashSet<_>>>();
+        result_ids
+            .is_some_and(|result_ids| result_ids.len() == items.len() && result_ids == event_ids)
+    })
+}
+
 fn evaluate_one(
     c: &Criterion,
     outcome: &RunOutcome,
@@ -1647,6 +1750,7 @@ fn evaluate_one(
             event_type,
             min,
             max,
+            json_match,
             optional,
         } => {
             let Some(sess) = session else {
@@ -1676,14 +1780,73 @@ fn evaluate_one(
                     score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
-            let n = sess.count_events(event_type);
-            let pass = n as u32 >= *min && max.is_none_or(|max| n as u32 <= max);
+            let matching_events = sess
+                .events
+                .iter()
+                .filter(|event| event.event_type == *event_type)
+                .filter(|event| {
+                    json_match.as_ref().is_none_or(|predicate| {
+                        event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let n = matching_events.len();
+            let unique_count = json_match
+                .as_ref()
+                .and_then(|predicate| predicate.unique_by.as_ref())
+                .map(|path| {
+                    matching_events
+                        .iter()
+                        .filter_map(|event| {
+                            event.raw.pointer(path).and_then(serde_json::Value::as_str)
+                        })
+                        .filter(|value| !value.trim().is_empty())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                });
+            let result_ids_match = match json_match
+                .as_ref()
+                .and_then(|predicate| predicate.result_ids_match.as_ref())
+            {
+                None => true,
+                Some(link) => json_match
+                    .as_ref()
+                    .and_then(|predicate| predicate.unique_by.as_deref())
+                    .is_some_and(|id_path| {
+                        session_event_ids_match_tool_result(sess, &matching_events, id_path, link)
+                    }),
+            };
+            let pass = n as u32 >= *min
+                && max.is_none_or(|max| n as u32 <= max)
+                && unique_count.is_none_or(|unique_count| unique_count == n)
+                && result_ids_match;
+            let predicate = json_match.as_ref().map_or_else(String::new, |predicate| {
+                let unique_by = predicate
+                    .unique_by
+                    .as_ref()
+                    .map_or_else(String::new, |path| {
+                        format!(
+                            ", unique_by={path} distinct={}",
+                            unique_count.unwrap_or_default()
+                        )
+                    });
+                let id_link = predicate
+                    .result_ids_match
+                    .as_ref()
+                    .map_or_else(String::new, |_| {
+                        format!(", result_ids_match={result_ids_match}")
+                    });
+                format!(
+                    ", {}={}{}{}",
+                    predicate.path, predicate.equals, unique_by, id_link
+                )
+            });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
                 detail: format!(
-                    "session events type={event_type} count={n} (expected {min}..={})",
+                    "session events type={event_type}{predicate} count={n} (expected {min}..={})",
                     max.map_or("unbounded".to_string(), |max| max.to_string())
                 ),
                 full_detail: None,
@@ -4490,8 +4653,40 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             min,
             max,
             event_type,
+            json_match,
             ..
         } => {
+            if let Some(predicate) = json_match {
+                validate_json_pointer("SessionEventCount.json_match.path", &predicate.path)?;
+                if let Some(path) = predicate.unique_by.as_ref() {
+                    validate_json_pointer("SessionEventCount.json_match.unique_by", path)?;
+                }
+                if let Some(link) = predicate.result_ids_match.as_ref() {
+                    if predicate.unique_by.is_none() {
+                        return Err(
+                            "SessionEventCount.result_ids_match requires json_match.unique_by"
+                                .into(),
+                        );
+                    }
+                    if link.tool_name.trim().is_empty() {
+                        return Err(
+                            "SessionEventCount.result_ids_match.tool_name must not be empty".into(),
+                        );
+                    }
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.event_parent_run_id_path",
+                        &link.event_parent_run_id_path,
+                    )?;
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.result_array_path",
+                        &link.result_array_path,
+                    )?;
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.item_id_path",
+                        &link.item_id_path,
+                    )?;
+                }
+            }
             if *min == 0 && max.is_none() {
                 return Err(format!(
                     "SessionEventCount with min=0 requires max for event_type={event_type:?}"
@@ -5342,6 +5537,7 @@ mod tests {
                 event_type: "llm_round".into(),
                 min: 2,
                 max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5349,6 +5545,259 @@ mod tests {
         );
         assert!(r[0].passed);
         assert_eq!(r[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn session_event_count_can_match_model_identity_in_spawn_metadata() {
+        fn spawn_event(
+            run_id: &str,
+            parent_run_id: &str,
+            group_id: &str,
+            slot_index: usize,
+            model_name: &str,
+        ) -> serde_json::Value {
+            let fanout_slot = serde_json::json!({
+                "group_id": group_id,
+                "target_count": 2,
+                "slot_index": slot_index,
+                "slot_id": run_id
+            });
+            let mut event =
+                astra_services::session_journal::JournalEvent::agent_spawned_with_fanout(
+                    Some("s"),
+                    run_id,
+                    run_id,
+                    parent_run_id,
+                    "explore",
+                    "fixture child",
+                    None,
+                    false,
+                    Some(&fanout_slot),
+                    None,
+                )
+                .with_producer_scope(Some(run_id));
+            event.metadata.as_mut().expect("spawn metadata")["model_configuration"] = serde_json::json!({
+                "prepared_selection": {"model_name": model_name}
+            });
+            serde_json::to_value(event).expect("serialize real journal event")
+        }
+
+        fn fanout_turn(parent_run_id: &str, child_ids: &[&str]) -> serde_json::Value {
+            let results = child_ids
+                .iter()
+                .map(|run_id| serde_json::json!({"run_id": run_id}))
+                .collect::<Vec<_>>();
+            let call = astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("reused-call-id".into()),
+                name: "agent_fanout".into(),
+                ok: true,
+                args_full: Some(r#"{"action":"start"}"#.into()),
+                result_full: Some(
+                    serde_json::json!({
+                        "group_id": "flash-model-selection-test",
+                        "results": results
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            };
+            let event = astra_services::session_journal::JournalEvent::turn(
+                Some("s"),
+                1,
+                None,
+                "fixture",
+                "done",
+                1,
+                0,
+                0,
+                1,
+            )
+            .with_producer_scope(Some(parent_run_id))
+            .with_tool_calls(vec![call]);
+            serde_json::to_value(event).expect("serialize real journal tool record")
+        }
+
+        fn model_spawn_events() -> Vec<(&'static str, serde_json::Value)> {
+            vec![
+                (
+                    "agent_spawned",
+                    spawn_event(
+                        "child-1",
+                        "parent-1",
+                        "flash-model-selection-test",
+                        0,
+                        "deepseek-v4-flash",
+                    ),
+                ),
+                (
+                    "agent_spawned",
+                    spawn_event(
+                        "child-2",
+                        "parent-1",
+                        "flash-model-selection-test",
+                        1,
+                        "deepseek-v4-flash",
+                    ),
+                ),
+                (
+                    "agent_spawned",
+                    spawn_event("child-3", "parent-2", "another-group", 0, "another-model"),
+                ),
+            ]
+        }
+
+        let mut events = model_spawn_events();
+        events.push(("turn", fanout_turn("parent-1", &["child-1", "child-2"])));
+        let session = mk_session(&events);
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_spawned".into(),
+            min: 2,
+            max: Some(2),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/metadata/model_configuration/prepared_selection/model_name".into(),
+                equals: serde_json::json!("deepseek-v4-flash"),
+                unique_by: Some("/metadata/run_id".into()),
+                result_ids_match: Some(SessionEventResultIdMatch {
+                    tool_name: "agent_fanout".into(),
+                    event_parent_run_id_path: "/metadata/parent_run_id".into(),
+                    result_array_path: "/results".into(),
+                    item_id_path: "/run_id".into(),
+                }),
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("valid event JSON predicate");
+        let results = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(results[0].passed, "{}", results[0].detail);
+        assert!(results[0].detail.contains("count=2"));
+
+        let mut uniqueness_only = criterion.clone();
+        if let Criterion::SessionEventCount {
+            json_match: Some(predicate),
+            ..
+        } = &mut uniqueness_only
+        {
+            predicate.result_ids_match = None;
+        }
+        let duplicate_run_ids = mk_session(&[
+            (
+                "agent_spawned",
+                spawn_event(
+                    "same-child",
+                    "parent-1",
+                    "flash-model-selection-test",
+                    0,
+                    "deepseek-v4-flash",
+                ),
+            ),
+            (
+                "agent_spawned",
+                spawn_event(
+                    "same-child",
+                    "parent-1",
+                    "flash-model-selection-test",
+                    1,
+                    "deepseek-v4-flash",
+                ),
+            ),
+        ]);
+        let duplicate = evaluate_deterministic_with_session(
+            std::slice::from_ref(&uniqueness_only),
+            &outcome_with_tools(&[]),
+            Some(&duplicate_run_ids),
+        );
+        assert!(!duplicate[0].passed, "duplicate child run IDs must fail");
+
+        let mut mismatched_events = model_spawn_events();
+        mismatched_events.push((
+            "turn",
+            fanout_turn("parent-1", &["child-1", "unrelated-child"]),
+        ));
+        let mismatched_result = mk_session(&mismatched_events);
+        let mismatched = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&mismatched_result),
+        );
+        assert!(
+            !mismatched[0].passed,
+            "spawn IDs must match returned children"
+        );
+
+        let mut wrong_parent_events = model_spawn_events();
+        wrong_parent_events.push((
+            "turn",
+            fanout_turn("parent-1", &["unrelated-child-1", "unrelated-child-2"]),
+        ));
+        wrong_parent_events.push(("turn", fanout_turn("parent-2", &["child-1", "child-2"])));
+        let wrong_parent = mk_session(&wrong_parent_events);
+        let wrong_parent_result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&wrong_parent),
+        );
+        assert!(
+            !wrong_parent_result[0].passed,
+            "a different run reusing a tool call ID cannot authorize the match"
+        );
+
+        let mut missing_parent_identity = session.clone();
+        let child = missing_parent_identity
+            .events
+            .iter_mut()
+            .find(|event| {
+                event.event_type == "agent_spawned"
+                    && event
+                        .raw
+                        .pointer("/metadata/run_id")
+                        .and_then(|id| id.as_str())
+                        == Some("child-2")
+            })
+            .expect("second fixture spawn event");
+        child.raw["metadata"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("parent_run_id");
+        let missing_parent = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&missing_parent_identity),
+        );
+        assert!(
+            !missing_parent[0].passed,
+            "every matched event must carry its parent run identity"
+        );
+    }
+
+    #[test]
+    fn session_event_json_match_preserves_yaml_null() {
+        let parsed: Criterion = serde_yaml_ng::from_str(
+            "type: session_event_count\nevent_type: agent_spawned\nmin: 1\njson_match:\n  path: /metadata/model\n  equals: null\n",
+        )
+        .expect("YAML preserves explicit null in the nested matcher");
+        let Criterion::SessionEventCount {
+            json_match: Some(predicate),
+            ..
+        } = &parsed
+        else {
+            panic!("expected a session event matcher");
+        };
+        assert!(predicate.equals.is_null());
+        validate_criterion(&parsed).expect("parsed null predicate is valid");
+        let session = mk_session(&[(
+            "agent_spawned",
+            serde_json::json!({"metadata": {"model": null}}),
+        )]);
+        let evaluated = evaluate_deterministic_with_session(
+            std::slice::from_ref(&parsed),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(evaluated[0].passed, "{}", evaluated[0].detail);
     }
 
     #[test]
@@ -5362,6 +5811,7 @@ mod tests {
                 event_type: "llm_round".into(),
                 min: 2,
                 max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5379,6 +5829,7 @@ mod tests {
                 event_type: "llm_round".into(),
                 min: 2,
                 max: None,
+                json_match: None,
                 optional: true,
             }],
             &out,
@@ -7623,6 +8074,7 @@ mod tests {
             event_type: "llm_round".into(),
             min: 0,
             max: None,
+            json_match: None,
             optional: false,
         })
         .expect_err("min=0 is trivially-true — should reject");
@@ -7636,6 +8088,7 @@ mod tests {
             event_type: "agent_spawned".into(),
             min: 0,
             max: Some(0),
+            json_match: None,
             optional: false,
         };
         validate_criterion(&criterion).expect("bounded absence check");

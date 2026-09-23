@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn rubric_wire_uses_named_string_ids_and_rejects_numeric_or_false_shapes() {
+    fn rubric_wire_uses_named_string_ids_and_rejects_numeric_or_duplicate_shapes() {
         let request = build_judger_request("criterion", &dummy_outcome());
         assert!(
             request
@@ -777,7 +777,7 @@ mod tests {
         for raw in [
             r#"{"true":[0],"uncertain":[]}"#,
             r#"{"true":["0"],"uncertain":[]}"#,
-            r#"{"true":["rubric_fully_yes"],"uncertain":[],"false":["rubric_no"]}"#,
+            r#"{"true":["rubric_fully_yes"],"uncertain":[],"false":["rubric_fully_yes"]}"#,
         ] {
             assert!(
                 astra_turn_types::normalize_judgment_response(
