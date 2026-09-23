@@ -196,7 +196,7 @@ pub struct SkillAutoRouteJudgeContext<'a> {
     pub visible_skills: &'a [crate::turn::skill_tool::SkillToolInfo],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RejectedToolCall {
     pub(crate) invocation: astra_turn_core::tool::deferred_activation::CanonicalToolInvocation,
     pub(crate) result: String,
@@ -455,6 +455,8 @@ pub enum AdmittedToolCallControl {
 #[derive(Clone, Debug, Default)]
 pub struct AdmittedToolCallOutcome {
     pub results: Vec<EdgeToolExecResult>,
+    /// Server-owned preflight failures rejoin canonical admission rejections.
+    pub pre_execution_rejections: Vec<RejectedToolCall>,
     pub control: AdmittedToolCallControl,
     /// Transient, trusted constraints for exact logical calls in this round.
     /// Neither model-authored arguments nor a shared executor map owns them.
@@ -492,6 +494,7 @@ impl From<Vec<EdgeToolExecResult>> for AdmittedToolCallOutcome {
     fn from(results: Vec<EdgeToolExecResult>) -> Self {
         Self {
             results,
+            pre_execution_rejections: Vec::new(),
             control: AdmittedToolCallControl::Continue,
             delegation_model_admissions: std::collections::HashMap::new(),
             auxiliary_usage: None,

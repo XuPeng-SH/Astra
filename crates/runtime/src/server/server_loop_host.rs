@@ -2657,6 +2657,18 @@ fn delegation_intent_source_from_state(state: &AgenticLoopState) -> Option<Deleg
     delegation_intent_source_from_text(state, &authoritative_delegation_user_text(state)?)
 }
 
+fn delegation_judgment_operation_id(stage: &str, identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // Inference operation IDs are limited to 64 characters. Hash the stage
+    // together with its stable identity so intent and scope judgments cannot
+    // collide while retaining the full 256-bit identity for replay.
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{stage}:{identity}").as_bytes())
+    )
+}
+
 fn inherited_delegation_source_from_state(
     state: &AgenticLoopState,
     origin: &astra_turn_types::DelegationUserRequirementSource,
@@ -7944,13 +7956,13 @@ impl ServerAgenticLoopHost {
                 Some(Ok(None)) | None => blocked.push(call.call.clone()),
             }
         }
-        let mut results = self.edge_action_blocked_results(&blocked, error_kind, reason);
-        results.extend(self.edge_action_blocked_results(
+        let mut results = self.server_preflight_blocked_results(&blocked, error_kind, reason);
+        results.extend(self.server_preflight_blocked_results(
             &unavailable,
             "delegation_preparation_unavailable",
             "The frozen delegation decision could not be read; no child was started.",
         ));
-        results.extend(self.edge_action_blocked_results(
+        results.extend(self.server_preflight_blocked_results(
             &conflicts,
             "delegation_preparation_conflict",
             "The frozen delegation decision conflicts with this invocation; no child was started.",
@@ -8039,7 +8051,7 @@ impl ServerAgenticLoopHost {
             Ok(messages) => messages,
             Err(_) => return unresolved("The user model requirement exceeds the bounded interpretation contract."),
         };
-        let operation_id = format!("delegation_intent_{}", source.user_intent_digest);
+        let operation_id = delegation_judgment_operation_id("intent", &source.user_intent_digest);
         let Some(response) = self
             .call_delegation_judgment(
                 state,
@@ -8195,11 +8207,9 @@ impl ServerAgenticLoopHost {
                 .map(|item| format!("{}:{}", item.id, item.arguments_digest))
                 .collect::<Vec<_>>()
                 .join("|");
-            let operation_id = format!(
-                "delegation_scope_{:x}",
-                sha2::Sha256::digest(
-                    format!("{}|{identity}", source.user_intent_digest).as_bytes()
-                )
+            let operation_id = delegation_judgment_operation_id(
+                "scope",
+                &format!("{}|{identity}", source.user_intent_digest),
             );
             let response = self
                 .call_delegation_judgment(
@@ -15838,6 +15848,25 @@ impl ServerAgenticLoopHost {
         error_kind: &str,
         reason: &str,
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        self.blocked_action_results(tool_calls, error_kind, reason, true)
+    }
+
+    fn server_preflight_blocked_results(
+        &mut self,
+        tool_calls: &[Value],
+        error_kind: &str,
+        reason: &str,
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        self.blocked_action_results(tool_calls, error_kind, reason, false)
+    }
+
+    fn blocked_action_results(
+        &mut self,
+        tool_calls: &[Value],
+        error_kind: &str,
+        reason: &str,
+        emit_edge_terminal: bool,
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
         use astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event;
         use astra_turn_core::sse_stream_host::EdgeToolExecResult;
         use astra_turn_core::stream_events::build_tool_call_end_event;
@@ -15861,10 +15890,12 @@ impl ServerAgenticLoopHost {
                     "advisory": {"executed": false},
                     "output": reason,
                 });
-                self.emit_progress_event(Value::Object(build_tool_call_end_event(
-                    &request_id,
-                    result,
-                )));
+                if emit_edge_terminal {
+                    self.emit_progress_event(Value::Object(build_tool_call_end_event(
+                        &request_id,
+                        result,
+                    )));
+                }
                 let mut fields =
                     self.edge_result_fields_with_runtime(&request_id, &tool_name, &args, None);
                 fields.insert(
@@ -19466,12 +19497,12 @@ impl ServerAgenticLoopHost {
                 Err(_) => probe_blocked.push(item.call),
             }
         }
-        let mut blocked = self.edge_action_blocked_results(
+        let mut blocked = self.server_preflight_blocked_results(
             &probe_blocked,
             "delegation_preparation_unavailable",
             "The frozen delegation decision could not be prepared; no child was started.",
         );
-        blocked.extend(self.edge_action_blocked_results(
+        blocked.extend(self.server_preflight_blocked_results(
             &invalid_shape_calls,
             "invalid_delegation_model_scope",
             "The delegated task shape is invalid; no new child was started.",
@@ -23751,6 +23782,34 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .iter()
             .map(|result| result.request_id.as_str())
             .collect::<std::collections::HashSet<_>>();
+        let pre_execution_rejections = invocations
+            .iter()
+            .filter_map(|invocation| {
+                let result = blocked.iter().find(|result| {
+                    Some(result.request_id.as_str()) == invocation.provider_call_id()
+                })?;
+                let fields = result.tool_result_fields.as_ref();
+                let error_kind = fields
+                    .and_then(|fields| fields.get("error_kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("delegation_preflight_unavailable");
+                let retryable = fields
+                    .and_then(|fields| fields.get("retryable"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Some(crate::turn::agentic_loop::host::RejectedToolCall {
+                    invocation: invocation.clone(),
+                    result: json!({
+                        "status": "failed",
+                        "error_kind": error_kind,
+                        "retryable": retryable,
+                        "advisory": {"executed": false},
+                        "error": result.output,
+                    })
+                    .to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
         let executable = tool_calls
             .iter()
             .filter(|call| {
@@ -23762,7 +23821,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .cloned()
             .collect::<Vec<_>>();
         let mut result = self.handle_admitted_tool_calls(state, &executable).await;
-        result.results.extend(blocked);
+        result
+            .pre_execution_rejections
+            .extend(pre_execution_rejections);
         result.delegation_model_admissions = admissions;
         let auxiliary = std::mem::take(&mut self.work_admission_usage);
         if auxiliary.attempts > 0 {
@@ -41197,6 +41258,21 @@ mod tests {
         assert!(delegation_intent_source_from_state(&state).is_none());
     }
 
+    #[test]
+    fn delegation_judgment_ids_fit_durable_inference_identity_and_separate_stages() {
+        let digest = "a".repeat(64);
+        let intent = delegation_judgment_operation_id("intent", &digest);
+        let scope = delegation_judgment_operation_id("scope", &digest);
+        assert_eq!(intent.len(), 64);
+        assert_eq!(scope.len(), 64);
+        assert_ne!(intent, scope);
+        assert_eq!(intent, delegation_judgment_operation_id("intent", &digest));
+        assert_ne!(
+            intent,
+            delegation_judgment_operation_id("intent", &"b".repeat(64))
+        );
+    }
+
     #[tokio::test]
     async fn superseded_work_judgment_cannot_install_model_requirement() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -41445,6 +41521,25 @@ mod tests {
         let (stale, blocked) = host.admitted_delegation_models(&mut state, &[call]).await;
         assert!(stale.is_empty());
         assert_eq!(blocked.len(), 1);
+
+        let rejected_call =
+            astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(json!({
+                "id": "nested-blocked-call",
+                "type": "function",
+                "function": {"name": "agent", "arguments": r#"{"action":"spawn","description":"Review","prompt":"Review the diff"}"#}
+            }));
+        let delivered = host
+            .handle_admitted_tool_invocations(&mut state, &[rejected_call])
+            .await;
+        assert!(
+            delivered.results.is_empty(),
+            "server preflight is not an edge callback"
+        );
+        assert_eq!(delivered.pre_execution_rejections.len(), 1);
+        let rejection: Value =
+            serde_json::from_str(&delivered.pre_execution_rejections[0].result).unwrap();
+        assert_eq!(rejection["error_kind"], "delegation_model_scope_unresolved");
+        assert_eq!(rejection["advisory"]["executed"], false);
     }
 
     #[test]
