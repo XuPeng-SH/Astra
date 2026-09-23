@@ -22464,6 +22464,7 @@ impl ServerSubRunExecutor {
         &self,
         config: &SubRunConfig,
         selected_execution: Option<&astra_services::AdmittedModelExecution>,
+        durable_run: Option<&astra_services::runs::DurableRunRecord>,
     ) -> Result<
         (
             Option<astra_services::AdmittedModelExecution>,
@@ -22480,20 +22481,17 @@ impl ServerSubRunExecutor {
             preserve_thinking: config.thinking
                 != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         };
-        let Some(run_engine) = self.durable_run_engine() else {
+        let Some(run) = durable_run else {
+            if self.durable_run_engine().is_some() {
+                return Err("durable sub-run disappeared before model materialization".into());
+            }
             return Ok((inherited_execution.cloned(), requested_controls));
         };
-        let run = run_engine
-            .load_run(&config.user_id, &config.run_id)
-            .await?
-            .ok_or_else(|| {
-                "durable sub-run disappeared before model materialization".to_string()
-            })?;
-        let durable_controls = crate::server::run::engine::durable_run_generation_controls(&run)?;
+        let durable_controls = crate::server::run::engine::durable_run_generation_controls(run)?;
         if durable_controls != requested_controls {
             return Err("durable sub-run generation controls changed before execution".into());
         }
-        if crate::server::run::engine::durable_run_delegated_model_requirements(&run)?
+        if crate::server::run::engine::durable_run_delegated_model_requirements(run)?
             != Some(
                 config
                     .request_constraints
@@ -23361,15 +23359,26 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let mut durable_terminal_committed = false;
         let mut atomic_terminal_attempted = false;
         let execution = AssertUnwindSafe(async {
-            let durable_work_binding = match self.durable_run_engine() {
-            Some(engine) => engine
-                .load_run(&config.user_id, &config.run_id)
-                .await?
-                .and_then(|run| run.work_binding),
-            None => None,
+            let durable_run = match self.durable_run_engine() {
+                Some(engine) => Some(
+                    engine
+                        .load_run(&config.user_id, &config.run_id)
+                        .await?
+                        .ok_or_else(|| {
+                            "durable sub-run disappeared before model materialization".to_string()
+                        })?,
+                ),
+                None => None,
             };
+            let durable_work_binding = durable_run
+                .as_ref()
+                .and_then(|run| run.work_binding.clone());
         let (admitted_model_execution, generation_controls) = self
-            .materialize_durable_subrun_execution(&config, selected_execution.as_ref())
+            .materialize_durable_subrun_execution(
+                &config,
+                selected_execution.as_ref(),
+                durable_run.as_ref(),
+            )
             .await?;
         let child_model_name = admitted_model_execution
             .as_ref()

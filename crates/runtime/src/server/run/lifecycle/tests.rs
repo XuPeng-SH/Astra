@@ -13017,6 +13017,32 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         child.events[0]["data"]["interaction_mode"], "auto",
         "child durable start must record the effective interaction policy"
     );
+    let (materialized, controls) = executor
+        .materialize_durable_subrun_execution(
+            &config,
+            config.admitted_model_execution.as_ref(),
+            Some(&child),
+        )
+        .await
+        .expect("the shared durable row must supply execution controls");
+    assert_eq!(
+        materialized
+            .as_ref()
+            .map(|execution| execution.offering_id.as_str()),
+        child.model_offering_id.as_deref()
+    );
+    assert_eq!(controls.thinking, config.thinking);
+    assert!(
+        executor
+            .materialize_durable_subrun_execution(
+                &config,
+                config.admitted_model_execution.as_ref(),
+                None,
+            )
+            .await
+            .expect_err("a missing durable row cannot become inherited execution material")
+            .contains("disappeared before model materialization")
+    );
 
     config.interaction_mode = RequestedTurnInteractionMode::Headless;
     let policy_error = executor
@@ -13072,6 +13098,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
             .materialize_durable_subrun_execution(
                 &config,
                 config.admitted_model_execution.as_ref(),
+                Some(&child),
             )
             .await
             .is_err(),
