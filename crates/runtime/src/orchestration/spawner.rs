@@ -935,7 +935,9 @@ pub(crate) fn apply_delegation_model_admission(
                 .as_ref()
                 .is_some_and(|selected| selected != required)
             {
-                return Err(invalid("tool model conflicts with user requirement"));
+                return Err(invalid(
+                    "tool model conflicts with hard user requirement; omit requested_model_policy instead of guessing an Offering ID so runtime can apply the resolved selection",
+                ));
             }
         }
         if input.requested_model_policy.is_none() {
@@ -11390,10 +11392,13 @@ mod tests {
         conflict.resolved_model_selection = Some(ModelSelection {
             offering_id: "offering-a".into(),
         });
-        assert!(
+        let conflict_error =
             apply_delegation_model_admission(&mut conflict, &admission, "parent-run", Some("call"))
-                .is_err()
-        );
+                .unwrap_err()
+                .to_string();
+        assert!(conflict_error.contains("hard user requirement"));
+        assert!(conflict_error.contains("omit requested_model_policy"));
+        assert!(conflict_error.contains("resolved selection"));
         let mut default_admission = admission.clone();
         let DelegationModelAdmissionOutcome::Constrained { slots } = &mut default_admission.outcome
         else {

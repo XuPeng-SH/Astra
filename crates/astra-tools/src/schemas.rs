@@ -1295,7 +1295,7 @@ macro_rules! heap_schema_vec {
 
 fn requested_model_policy_schema() -> Value {
     json!({
-        "description": "Requested model behavior, distinct from the resolved Offering. Omission follows normal inheritance. Explicit inherit overrides lower-priority defaults. Auto is represented but currently rejected before admission because automatic routing is not enabled.",
+        "description": "Requested model behavior, distinct from the resolved Offering. Omission applies any trusted user model requirement before ordinary parent inheritance. A fixed selection requires an exact authorized Offering ID; never guess one from a display name. If the user names a model but no exact Offering ID is available, omit this field so runtime can apply the trusted requirement. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto is currently unavailable.",
         "oneOf": [
             {
                 "type": "object",
@@ -1890,11 +1890,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground fan-in by default; no background arg); get_result needs the returned agent_id of explicitly backgrounded work; run_chain needs name+description+steps.\n\n\
          Multi-agent and local fixed-chain operations. Actions: spawn, get_result, run_chain, send_message. `run_chain` is a local executor pipeline, not a durable task list. If the user asks for task/Work tracking and `start_work` is visible, call `start_work` directly instead of using `agent`.\n\n\
          ## Required fields per action\n\
-         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `max_turns`, `max_output_tokens`, `complexity`, `isolated`, `allowed_tools`, `name`, `inherit_prefix`.)\n\
+         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `requested_model_policy`, `reasoning`, `max_turns`, `max_output_tokens`, `complexity`, `isolated`, `allowed_tools`, `name`, `inherit_prefix`.)\n\
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued`, then the receiver emits an applied acknowledgement at its next model boundary.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Later `get_result` calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
+         Model choice uses `requested_model_policy`, not a `model` field. Never derive an Offering ID from a display name; when the user names a model but no exact authorized Offering ID is available, omit the policy and let runtime apply the trusted requirement.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
@@ -2608,6 +2609,26 @@ mod tests {
             props.get("run_in_background").is_none(),
             "foreground/background is a user control; the model must not choose scheduling policy"
         );
+    }
+
+    #[test]
+    fn agent_model_policy_describes_canonical_selection_and_human_name_handling() {
+        let schemas = all_tool_schemas();
+        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+        let description = agent["function"]["description"]
+            .as_str()
+            .expect("agent description");
+        assert!(description.contains("`requested_model_policy`, `reasoning`"));
+        assert!(!description.contains("Optional: `agent_type`, `model`"));
+        let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties.get("model").is_none());
+        let policy_description = properties["requested_model_policy"]["description"]
+            .as_str()
+            .expect("requested model policy description");
+        assert!(policy_description.contains("exact authorized Offering ID"));
+        assert!(policy_description.contains("never guess one from a display name"));
+        assert!(policy_description.contains("omit this field"));
+        assert!(policy_description.contains("cannot override a hard user requirement"));
     }
 
     #[cfg(unix)]
