@@ -1010,6 +1010,9 @@ pub struct ChatRequestData {
     pub expected_model_name: Option<String>,
     pub model_selection_mode: ModelSelectionMode,
     pub model_selection: Option<ModelSelection>,
+    /// Caller intent before resolving to the admitted Offering. This is
+    /// durable run provenance, not model execution authority.
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     /// Short-lived execution material for the admitted Offering.
     /// This value is never client supplied, serialized, persisted, or logged.
@@ -1101,6 +1104,7 @@ impl std::fmt::Debug for ChatRequestData {
             .field("expected_model_name", &self.expected_model_name)
             .field("model_selection_mode", &self.model_selection_mode)
             .field("model_selection", &self.model_selection)
+            .field("requested_model_policy", &self.requested_model_policy)
             .field("resolved_model_selection", &self.resolved_model_selection)
             .field(
                 "admitted_model_execution_present",
@@ -38510,6 +38514,7 @@ mod tests {
             expected_model_name: None,
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
             model_selection: None,
+            requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
                 offering_id: "offer-gpt-4".to_string(),
@@ -38716,6 +38721,7 @@ mod tests {
             model_selection: Some(ModelSelection {
                 offering_id: "offer-gpt-4".to_string(),
             }),
+            requested_model_policy: None,
             resolved_model_selection: Some(ResolvedModelSelection {
                 offering_id: "offer-gpt-4".to_string(),
                 model_name: "gpt-4".to_string(),
@@ -38835,6 +38841,7 @@ mod tests {
                     expected_model_name: None,
                     model_selection_mode: ModelSelectionMode::ExplicitOffering,
                     model_selection: None,
+                    requested_model_policy: None,
                     resolved_model_selection: None,
                     admitted_model_execution: None,
                     capability_descriptors: None,

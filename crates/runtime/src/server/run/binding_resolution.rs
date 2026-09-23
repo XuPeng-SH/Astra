@@ -241,6 +241,7 @@ pub(crate) fn run_start_context_from_request(
         agent_binding_name: resolved_primary_binding.map(|binding| binding.binding_name.clone()),
         agent_binding_schema_version: resolved_primary_binding
             .map(|binding| binding.binding_schema_version.clone()),
+        requested_model_policy: request.requested_model_policy.clone(),
         model_selection: request.model_selection.clone(),
         resolved_model_selection: request.resolved_model_selection.clone(),
         generation_controls: None,
@@ -557,6 +558,7 @@ mod tests {
             expected_model_name: None,
             model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
             model_selection: None,
+            requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: None,
             capability_descriptors: None,
@@ -603,6 +605,19 @@ mod tests {
         assert_eq!(
             context.runtime_profile,
             Some(astra_services::runs::RuntimeProfileRequest::AgentBindingRegistry)
+        );
+    }
+
+    #[test]
+    fn run_start_context_preserves_requested_model_policy() {
+        let mut request = test_request("child task");
+        request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Inherit);
+
+        let context = run_start_context_from_request(&request, None, None);
+
+        assert_eq!(
+            context.requested_model_policy,
+            request.requested_model_policy
         );
     }
 

@@ -1,0 +1,57 @@
+name: flash_fanout_auto_unavailable
+description: |
+  Live fail-closed check: an explicit Auto request remains distinct from the
+  parent's fixed model and is rejected before any fanout child is started.
+prompt: |
+  Call agent_fanout.start exactly once with target_count 2 and group_id
+  flash-auto-unavailable-test. Both slots are explore. Slot 0 asks for the
+  exact reply FLASH-NO-CHILD-ONE and inherits the parent setting. Slot 1 has id
+  auto, asks for FLASH-NO-CHILD-TWO, and sets requested_model_policy to
+  {"mode":"auto","strategy":"balanced"}. Do not retry, replace, or start
+  separate agents. Report that automatic routing is unavailable and that no
+  child ran. Do not call Reflect or another diagnostic tool.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/requested_model_policy/mode
+    equals: auto
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/requested_model_policy/strategy
+    equals: balanced
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /status
+    equals: failed
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /error
+    equals: fanout slot auto: automatic model routing is not available yet
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

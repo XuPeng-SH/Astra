@@ -21,6 +21,11 @@ prepared child run IDs are distinct and match the IDs returned by that fanout
 call. The invalid final-slot case must show zero `agent_spawned` events, not
 just a failed terminal answer.
 
+`flash_fanout_auto_unavailable` exercises the current fail-closed boundary:
+the typed Auto request must appear in the tool arguments, return an explicit
+unavailable error, and produce zero child start/termination events. It does
+not claim Auto routing works; that remains a separate product workstream.
+
 These cases deliberately do not call `reflect` or add model-request-ledger
 reads. They provide real-provider execution and child-result evidence, plus
 the prepared selection identity; they do not independently assert the final

@@ -4841,7 +4841,8 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         description: "Test child task".to_string(),
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
-        model_selection: None,
+        requested_model_policy: None,
+        resolved_model_selection: None,
         delegated_model_requirements: Default::default(),
         fanout_slot: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
@@ -6927,15 +6928,16 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
     for input in &mut heterogeneous {
         input.fanout_target_count = Some(3);
     }
-    heterogeneous[0].model_selection = Some(ModelSelection {
-        offering_id: "model-b".into(),
-    });
-    heterogeneous[1].model_selection = Some(ModelSelection {
-        offering_id: "model-c".into(),
-    });
-    heterogeneous[2].model_selection = Some(ModelSelection {
-        offering_id: "model-b".into(),
-    });
+    for (input, offering_id) in heterogeneous
+        .iter_mut()
+        .zip(["model-b", "model-c", "model-b"])
+    {
+        input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: ModelSelection {
+                offering_id: offering_id.into(),
+            },
+        });
+    }
     let prepared = Arc::clone(&batch_executor)
         .prepare_batch(&heterogeneous, &context, None)
         .await
@@ -6945,8 +6947,10 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         model_service.batch_requests.lock().unwrap().as_slice(),
         &[vec!["model-b".to_string(), "model-c".to_string()]]
     );
-    heterogeneous[2].model_selection = Some(ModelSelection {
-        offering_id: "invalid".into(),
+    heterogeneous[2].requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selection: ModelSelection {
+            offering_id: "invalid".into(),
+        },
     });
     assert!(
         Arc::clone(&batch_executor)
@@ -6983,9 +6987,12 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
 
     let mut invalid_offering = unsupported;
     invalid_offering[1].reasoning = None;
-    invalid_offering[1].model_selection = Some(astra_turn_types::ModelSelection {
-        offering_id: String::new(),
-    });
+    invalid_offering[1].requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: astra_turn_types::ModelSelection {
+                offering_id: String::new(),
+            },
+        });
     assert!(
         Arc::clone(&executor)
             .prepare_batch(&invalid_offering, &context, None)
@@ -11861,6 +11868,7 @@ fn test_request(message: &str) -> ChatRequestData {
         model_selection: Some(ModelSelection {
             offering_id: "model-test-model".to_string(),
         }),
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,
@@ -12108,6 +12116,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
         prepared_model: None,
+        requested_model_policy: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -12771,6 +12780,7 @@ fn test_executable_subrun_config(
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(admitted_model_execution),
         prepared_model: None,
+        requested_model_policy: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::new(Some(HashSet::new()), None, None, None),
@@ -12790,6 +12800,69 @@ fn test_executable_subrun_config(
         #[cfg(feature = "harness")]
         harness_sink: None,
     }
+}
+
+#[tokio::test]
+async fn durable_subrun_model_policy_conflict_is_rejected_before_activation() {
+    let admitted = astra_services::AdmittedModelExecution::from_endpoint(
+        "model-test-model".to_string(),
+        "test-model".to_string(),
+        "openai".to_string(),
+        "http://127.0.0.1:1/chat/completions".to_string(),
+        "Bearer test".to_string(),
+        None,
+        128_000,
+    );
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    run_engine
+        .start_run("authority-parent-run", "user-1", "session-1")
+        .await
+        .expect("durable parent");
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone());
+
+    let mut original = test_executable_subrun_config("policy-replay", admitted.clone());
+    original.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selection: ModelSelection {
+            offering_id: "model-test-model".to_string(),
+        },
+    });
+    let authority = executor
+        .ensure_durable_subrun_started(&original, original.admitted_model_execution.as_ref())
+        .await
+        .expect("create original durable child")
+        .expect("durable execution authority");
+    let before = run_engine
+        .load_run("user-1", "policy-replay")
+        .await
+        .expect("read original child")
+        .expect("original durable child");
+
+    let mut conflicting_retry = test_executable_subrun_config("policy-replay", admitted);
+    conflicting_retry.execution_owner_generation = Some(authority.owner_generation);
+    conflicting_retry.requested_model_policy = None;
+    let error = executor
+        .ensure_durable_subrun_started(
+            &conflicting_retry,
+            conflicting_retry.admitted_model_execution.as_ref(),
+        )
+        .await
+        .expect_err("same-generation retry cannot rewrite its original model request");
+    assert!(
+        error.contains("changed its requested model policy"),
+        "{error}"
+    );
+
+    let after = run_engine
+        .load_run("user-1", "policy-replay")
+        .await
+        .expect("read child after rejected replay")
+        .expect("original child remains present");
+    assert_eq!(after, before, "rejected replay must not mutate the run");
 }
 
 #[test]
@@ -13454,6 +13527,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
         prepared_model: None,
+        requested_model_policy: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Auto,
         request_constraints: RequestConstraints::default(),
@@ -13674,6 +13748,7 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
         prepared_model: None,
+        requested_model_policy: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -13773,6 +13848,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
         prepared_model: None,
+        requested_model_policy: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -14256,6 +14332,7 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
         prepared_model: None,
+        requested_model_policy: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -15799,6 +15876,40 @@ async fn prepare_chat_request_rejects_preflight_model_identity_drift() {
     assert_eq!(
         error.1.0.error_code.as_deref(),
         Some("model_identity_changed")
+    );
+}
+
+#[tokio::test]
+async fn prepare_chat_request_rejects_unavailable_or_conflicting_model_policy_before_admission() {
+    let service = test_service();
+    let mut automatic = test_request("delegate this task");
+    automatic.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Auto {
+        strategy: astra_turn_types::AutoModelStrategy::Balanced,
+    });
+    let error = service
+        .prepare_chat_request("u1", automatic)
+        .await
+        .expect_err("unsupported automatic routing must fail before Offering admission");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_routing_unavailable")
+    );
+
+    let mut mismatched_fixed = test_request("delegate this task");
+    mismatched_fixed.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selection: ModelSelection {
+            offering_id: "other-offering".to_string(),
+        },
+    });
+    let error = service
+        .prepare_chat_request("u1", mismatched_fixed)
+        .await
+        .expect_err("requested and admitted Offering identities must agree");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_selection_invalid")
     );
 }
 
@@ -18733,6 +18844,21 @@ fn provider_task_ref_fingerprint_tracks_semantic_routing_but_not_credential_rota
         .expect("valid provider identity")
         .expect("provider identity");
 
+    request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selection: astra_turn_types::ModelSelection {
+            offering_id: "selected-offering".to_string(),
+        },
+    });
+    let changed_model_policy = svc
+        .provider_idempotency_identity("user-1", &request)
+        .expect("valid provider identity")
+        .expect("provider identity");
+    assert_ne!(
+        original.request_fingerprint(),
+        changed_model_policy.request_fingerprint()
+    );
+
+    request.requested_model_policy = None;
     request
         .forward_headers
         .insert("authorization".to_string(), "Bearer token-two".to_string());
@@ -18882,6 +19008,17 @@ async fn provider_task_ref_rejects_a_changed_request() {
         .expect("seed provider run");
 
     request.message = "changed request".to_string();
+    let error = err(svc.stream_chat("user-1".to_string(), request.clone()).await);
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("provider_task_ref_request_mismatch")
+    );
+
+    request.message = "original request".to_string();
+    request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Auto {
+        strategy: astra_turn_types::AutoModelStrategy::Balanced,
+    });
     let error = err(svc.stream_chat("user-1".to_string(), request).await);
     assert_eq!(error.0, StatusCode::CONFLICT);
     assert_eq!(
@@ -23232,6 +23369,7 @@ fn extract_edge_tools_from_context() {
         expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: None,
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,
@@ -23322,6 +23460,7 @@ fn extract_edge_profile_from_context() {
         expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: None,
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,

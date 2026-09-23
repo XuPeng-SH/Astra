@@ -1571,6 +1571,11 @@ fn chat_request_into_data_maps_all_fields() {
         model_selection: Some(astra_turn_types::ModelSelection {
             offering_id: "offer-gpt-4".into(),
         }),
+        requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: astra_turn_types::ModelSelection {
+                offering_id: "offer-gpt-4".into(),
+            },
+        }),
         expected_model_name: Some("gpt-4".into()),
         resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
             offering_id: "offer-gpt-4".into(),
@@ -1652,6 +1657,14 @@ fn chat_request_into_data_maps_all_fields() {
             .as_ref()
             .map(|selection| selection.offering_id.as_str()),
         Some("offer-gpt-4")
+    );
+    assert_eq!(
+        data.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: astra_turn_types::ModelSelection {
+                offering_id: "offer-gpt-4".into(),
+            },
+        })
     );
     assert_eq!(
         data.resolved_model_selection.as_ref().map(|selection| (
@@ -1759,6 +1772,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         work_binding: None,
         agent_id: None,
         model_selection: None,
+        requested_model_policy: None,
         expected_model_name: None,
         resolved_model_selection: None,
         capability_descriptors: None,

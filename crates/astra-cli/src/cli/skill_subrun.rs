@@ -81,6 +81,7 @@ pub(crate) struct SubRunHost {
     pub(crate) token: String,
     pub(crate) model: Option<String>,
     pub(crate) offering_id: String,
+    pub(crate) requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     pub(crate) project_root: PathBuf,
     pub(crate) executor: std::sync::Arc<edge_tools::ToolExecutor>,
     pub(crate) all_schemas: Vec<Value>,
@@ -546,6 +547,11 @@ impl AgenticLoopHost for SubRunHost {
             git_branch: None,
             thinking: thinking.clone(),
         });
+
+        if let Some(policy) = self.requested_model_policy.as_ref() {
+            payload["requested_model_policy"] = serde_json::to_value(policy)
+                .map_err(|error| format!("serialize requested model policy: {error}"))?;
+        }
 
         attach_runtime_volatile_injections(&mut payload, &runtime_volatile_injections);
 
@@ -1247,6 +1253,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             token: self.token.clone(),
             model: effective_model.clone(),
             offering_id: model_selection.offering_id,
+            requested_model_policy: None,
             project_root: self.project_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -1867,6 +1874,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1944,6 +1952,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -2054,6 +2063,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -2089,6 +2099,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -2210,6 +2221,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -2246,6 +2258,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),

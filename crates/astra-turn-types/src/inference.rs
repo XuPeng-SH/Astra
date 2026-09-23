@@ -40,6 +40,62 @@ pub struct ModelSelection {
     pub offering_id: String,
 }
 
+/// The user's requested model behavior before it is resolved to an Offering.
+///
+/// This is intentionally distinct from [`ModelSelection`]: `inherit` and
+/// `auto` can resolve to the same Offering as a fixed request while retaining
+/// different semantics for nested delegation, retries, and explanation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RequestedModelPolicy {
+    Inherit,
+    Fixed { selection: ModelSelection },
+    Auto { strategy: AutoModelStrategy },
+}
+
+/// The optimization objective for a requested automatic model choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoModelStrategy {
+    CostPriority,
+    Balanced,
+}
+
+/// Resolve the model policy when automatic routing is not installed.
+///
+/// `None` on the request means ordinary inheritance, just like an explicit
+/// `inherit`; callers retain the original optional policy separately for
+/// precedence and durable provenance.
+pub fn resolve_requested_model_selection(
+    requested: Option<&RequestedModelPolicy>,
+    inherited: Option<&ModelSelection>,
+) -> Result<Option<ModelSelection>, RequestedModelPolicyError> {
+    match requested {
+        None | Some(RequestedModelPolicy::Inherit) => Ok(inherited.cloned()),
+        Some(RequestedModelPolicy::Fixed { selection }) => Ok(Some(selection.clone())),
+        Some(RequestedModelPolicy::Auto { .. }) => {
+            Err(RequestedModelPolicyError::AutomaticRoutingUnavailable)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestedModelPolicyError {
+    AutomaticRoutingUnavailable,
+}
+
+impl std::fmt::Display for RequestedModelPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AutomaticRoutingUnavailable => {
+                f.write_str("automatic model routing is not available yet")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RequestedModelPolicyError {}
+
 /// Durable owner and causal coordinates for one logical model invocation.
 ///
 /// Auxiliary work such as memory extraction can belong to a session without
@@ -445,6 +501,43 @@ mod tests {
                 "gateway": "provider-gateway"
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn requested_policy_remains_distinct_from_its_resolved_offering() {
+        let inherited = ModelSelection {
+            offering_id: "offer-parent".to_string(),
+        };
+        assert_eq!(
+            resolve_requested_model_selection(
+                Some(&RequestedModelPolicy::Inherit),
+                Some(&inherited)
+            )
+            .unwrap(),
+            Some(inherited.clone())
+        );
+        assert_eq!(
+            resolve_requested_model_selection(
+                Some(&RequestedModelPolicy::Fixed {
+                    selection: ModelSelection {
+                        offering_id: "offer-child".to_string(),
+                    },
+                }),
+                Some(&inherited),
+            )
+            .unwrap()
+            .map(|selection| selection.offering_id),
+            Some("offer-child".to_string())
+        );
+        assert_eq!(
+            resolve_requested_model_selection(
+                Some(&RequestedModelPolicy::Auto {
+                    strategy: AutoModelStrategy::Balanced,
+                }),
+                Some(&inherited),
+            ),
+            Err(RequestedModelPolicyError::AutomaticRoutingUnavailable)
         );
     }
 }

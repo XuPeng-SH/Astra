@@ -1161,6 +1161,12 @@ pub(crate) fn apply_delegation_model_admission(
     };
     let invalid =
         |reason: &str| SpawnError::InvalidInput(format!("delegation model admission: {reason}"));
+    if matches!(
+        input.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+    ) {
+        return Err(invalid("automatic model routing is not available yet"));
+    }
     if admission.source.run_id != parent_run_id
         || tool_call_id != Some(admission.invocation_id.as_str())
     {
@@ -1198,15 +1204,25 @@ pub(crate) fn apply_delegation_model_admission(
     if let Some(required) = &slot.model_selection {
         let hard =
             slot.model_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard);
-        if input
-            .model_selection
-            .as_ref()
-            .is_some_and(|selected| hard && selected != required)
-        {
-            return Err(invalid("tool model conflicts with user requirement"));
+        if hard && input.requested_model_policy.is_some() {
+            if input.resolved_model_selection.is_none() {
+                return Err(invalid(
+                    "requested model policy could not be resolved against the parent",
+                ));
+            }
+            if input
+                .resolved_model_selection
+                .as_ref()
+                .is_some_and(|selected| selected != required)
+            {
+                return Err(invalid("tool model conflicts with user requirement"));
+            }
         }
-        if input.model_selection.is_none() {
-            input.model_selection = Some(required.clone());
+        if input.requested_model_policy.is_none() {
+            input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selection: required.clone(),
+            });
+            input.resolved_model_selection = Some(required.clone());
         }
     }
     if let Some(required) = &slot.reasoning {
@@ -1371,9 +1387,11 @@ pub struct SpawnRunConfig {
     pub task: String,
     /// System prompt addendum from agent type definition.
     pub system_prompt_addendum: String,
-    /// Exact authorized Offering requested for this child. `None` means
-    /// inherit the parent's admitted Offering.
-    pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// User-requested behavior, preserved independently from resolution.
+    /// `None` denotes omission; explicit inheritance remains distinguishable.
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
+    /// Exact Offering resolved by trusted preparation and sent to admission.
+    pub resolved_model_selection: Option<astra_turn_types::ModelSelection>,
     /// Frozen projection of human model requirements for this child's own
     /// future delegations. This is not inferred from the child task prompt.
     pub delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
@@ -1448,6 +1466,20 @@ pub struct SpawnRunConfig {
     /// Exact canonical WorkItem revision requested for this child. The server
     /// validates it against the parent's durable Work binding before insert.
     pub work_item: Option<astra_turn_core::orchestration_spawn_tool::WorkItemExecutionSpec>,
+}
+
+impl SpawnRunConfig {
+    pub fn validate_requested_model_policy(&self) -> Result<(), String> {
+        let Some(policy) = self.requested_model_policy.as_ref() else {
+            return Ok(());
+        };
+        let requested = astra_turn_types::resolve_requested_model_selection(Some(policy), None)
+            .map_err(|error| error.to_string())?;
+        if requested.is_some() && requested != self.resolved_model_selection {
+            return Err("resolved Offering does not match the requested fixed model policy".into());
+        }
+        Ok(())
+    }
 }
 
 /// Durable acknowledgement returned by a spawned-run cancellation owner.
@@ -1528,7 +1560,8 @@ impl std::fmt::Debug for SpawnRunConfig {
             .field("description", &self.description)
             .field("task", &self.task)
             .field("model", &self.model)
-            .field("model_selection", &self.model_selection)
+            .field("requested_model_policy", &self.requested_model_policy)
+            .field("resolved_model_selection", &self.resolved_model_selection)
             .field("thinking", &self.thinking)
             .field("initial_turns", &self.initial_turns)
             .field("hard_turn_limit", &self.hard_turn_limit)
@@ -1634,16 +1667,30 @@ pub trait SpawnAgentExecutor: Send + Sync {
         self: Arc<Self>,
         inputs: &[SpawnAgentInput],
         _context: &SpawnContext,
-        _parent_selection: Option<&astra_turn_types::ModelSelection>,
+        parent_selection: Option<&astra_turn_types::ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String>
     where
         Self: 'static,
     {
-        if inputs
-            .iter()
-            .any(|input| input.model_selection.is_some() || input.reasoning.is_some())
+        let has_unsupported_selection = inputs.iter().any(|input| {
+            matches!(
+                input.requested_model_policy,
+                Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+            )
+        });
+        if has_unsupported_selection
+            || inputs
+                .iter()
+                .any(|input| input.reasoning.is_some() || input.max_output_tokens.is_some())
         {
             return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".to_string());
+        }
+        for input in inputs {
+            astra_turn_types::resolve_requested_model_selection(
+                input.requested_model_policy.as_ref(),
+                parent_selection,
+            )
+            .map_err(|error| error.to_string())?;
         }
         Ok(inputs
             .iter()
@@ -3036,7 +3083,7 @@ impl DynamicAgentSpawner {
                 ));
             }
         }
-        let (mut groups, evicted_agent_ids) = self
+        let (mut groups, evicted_agent_ids, _) = self
             .get_or_validate_fanout_group(
                 identity,
                 cancellation
@@ -3049,6 +3096,7 @@ impl DynamicAgentSpawner {
                 } else {
                     FanoutAdmission::Recovery
                 },
+                None,
             )
             .await?;
         let mut index = self.fanout_agent_index.write().await;
@@ -3745,8 +3793,10 @@ impl DynamicAgentSpawner {
             created_by_tool_use_id,
             parent_run_id,
             None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn declare_fanout_group_with_owner(
@@ -3757,19 +3807,36 @@ impl DynamicAgentSpawner {
         created_by_tool_use_id: Option<&str>,
         parent_run_id: &str,
         owner: Option<(&str, &str)>,
-    ) -> Result<(), SpawnError> {
+        start_request_fingerprint: Option<&str>,
+    ) -> Result<bool, SpawnError> {
         let _activity = self.begin_lifecycle_activity();
         let identity = AgentFanoutSlotIdentity::new(group_id, target_count, 0, None)
             .map_err(SpawnError::InvalidInput)?;
-        let (mut groups, evicted_agent_ids) = self
+        let (mut groups, evicted_agent_ids, is_new) = self
             .get_or_validate_fanout_group(
                 &identity,
                 Some(title),
                 created_by_tool_use_id,
                 parent_run_id,
                 FanoutAdmission::Live,
+                start_request_fingerprint,
             )
             .await?;
+        if let Some(candidate) = start_request_fingerprint {
+            let group = groups.get_mut(group_id).ok_or_else(|| {
+                SpawnError::Race(format!("fanout group '{group_id}' disappeared"))
+            })?;
+            match (is_new, group.start_request_fingerprint.as_deref()) {
+                (true, None) => group.start_request_fingerprint = Some(candidate.to_string()),
+                (false, Some(existing)) if existing == candidate => {}
+                _ => {
+                    return Err(SpawnError::InvalidInput(
+                        "fanout start replay changed or lacks its original request configuration"
+                            .into(),
+                    ));
+                }
+            }
+        }
         let mut index = self.fanout_agent_index.write().await;
         for evicted_agent_id in &evicted_agent_ids {
             index.remove(evicted_agent_id);
@@ -3791,7 +3858,7 @@ impl DynamicAgentSpawner {
                 session_id: session_id.to_string(),
             });
         }
-        Ok(())
+        Ok(is_new)
     }
 
     pub async fn fanout_group_for_agent(
@@ -3982,8 +4049,9 @@ impl DynamicAgentSpawner {
         promoted
     }
 
-    /// Helper to get or create a fanout group and validate it's not terminal.
-    /// Returns the group entry and any evicted agent IDs.
+    /// Helper to get or create a fanout group and validate its owner. An exact
+    /// request replay may inspect a terminal group but cannot add slots.
+    /// Returns the group entry, evicted agent IDs, and whether it was created.
     async fn get_or_validate_fanout_group(
         &self,
         identity: &AgentFanoutSlotIdentity,
@@ -3991,10 +4059,12 @@ impl DynamicAgentSpawner {
         created_by_tool_use_id: Option<&str>,
         parent_run_id: &str,
         admission: FanoutAdmission,
+        replay_fingerprint: Option<&str>,
     ) -> Result<
         (
             tokio::sync::RwLockWriteGuard<'_, HashMap<String, AgentFanoutGroupProjection>>,
             Vec<String>,
+            bool,
         ),
         SpawnError,
     > {
@@ -4033,6 +4103,18 @@ impl DynamicAgentSpawner {
             }
         }
         let is_new = !groups.contains_key(&identity.group_id);
+        let allow_terminal_replay = replay_fingerprint.is_some_and(|candidate| {
+            groups
+                .get(&identity.group_id)
+                .and_then(|group| group.start_request_fingerprint.as_deref())
+                .or_else(|| {
+                    astra_core::sync_poison::recover_mutex_lock(&parent.state)
+                        .retired_group
+                        .as_ref()
+                        .and_then(|group| group.start_request_fingerprint.as_deref())
+                })
+                == Some(candidate)
+        });
         if is_new {
             if let Some(existing) = groups
                 .values()
@@ -4099,7 +4181,7 @@ impl DynamicAgentSpawner {
         // LLM must create a new group_id for retries rather than
         // appending to a settled group, which would corrupt the
         // fixed-size accounting.
-        if matches!(admission, FanoutAdmission::Live)
+        if matches!(admission, FanoutAdmission::Live) && !allow_terminal_replay
             && matches!(
                 group.status,
                 AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
@@ -4132,7 +4214,7 @@ impl DynamicAgentSpawner {
                 _admission: parent,
                 durable: None,
             });
-        Ok((groups, evicted_agent_ids))
+        Ok((groups, evicted_agent_ids, is_new))
     }
 
     async fn record_fanout_spawn_accepted(
@@ -4147,13 +4229,14 @@ impl DynamicAgentSpawner {
         parent_run_id: &str,
         execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Result<(), SpawnError> {
-        let (mut groups, evicted_agent_ids) = self
+        let (mut groups, evicted_agent_ids, _) = self
             .get_or_validate_fanout_group(
                 identity,
                 group_title,
                 created_by_tool_use_id,
                 parent_run_id,
                 FanoutAdmission::Live,
+                None,
             )
             .await?;
         // Acquire the index lock while still holding `groups` to close the
@@ -4260,13 +4343,14 @@ impl DynamicAgentSpawner {
                 )));
             }
         }
-        let (mut groups, evicted_agent_ids) = self
+        let (mut groups, evicted_agent_ids, _) = self
             .get_or_validate_fanout_group(
                 identity,
                 group_title,
                 created_by_tool_use_id,
                 parent_run_id,
                 FanoutAdmission::Live,
+                None,
             )
             .await?;
         // Keep group and reverse-index updates atomic with respect to eviction.
@@ -4932,7 +5016,8 @@ impl DynamicAgentSpawner {
                 &context.parent_run_id,
                 context.spawn_tool_call_id.as_deref(),
             )?;
-            if checked.model_selection != input.model_selection
+            if checked.requested_model_policy != input.requested_model_policy
+                || checked.resolved_model_selection != input.resolved_model_selection
                 || checked.reasoning != input.reasoning
             {
                 return Err(SpawnError::InvalidInput(
@@ -4951,7 +5036,7 @@ impl DynamicAgentSpawner {
         if let astra_turn_core::thinking_config::ThinkingConfig::Enabled { budget_tokens } =
             astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
                 input.reasoning.as_ref(),
-                input.model_selection.as_ref(),
+                input.resolved_model_selection.as_ref(),
                 context.parent_model_reasoning.as_ref(),
             )
             && (budget_tokens < 1024
@@ -5333,7 +5418,7 @@ impl DynamicAgentSpawner {
         let model = context.resolved_model_name.clone();
         let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
             input.reasoning.as_ref(),
-            input.model_selection.as_ref(),
+            input.resolved_model_selection.as_ref(),
             context.parent_model_reasoning.as_ref(),
         );
         // 3b. Resolve fork-prefix inheritance before any side effects
@@ -5783,9 +5868,13 @@ impl DynamicAgentSpawner {
         });
         // This may be inherited from the parent; it is a launch request, not
         // necessarily an explicit user choice or a provider-accepted route.
-        if let Some(selection) = input.model_selection.as_ref() {
+        if let Some(selection) = input.resolved_model_selection.as_ref() {
             model_configuration["requested_offering_id"] =
                 serde_json::Value::String(selection.offering_id.clone());
+        }
+        if let Some(policy) = input.requested_model_policy.as_ref() {
+            model_configuration["requested_model_policy"] = serde_json::to_value(policy)
+                .expect("requested model policy has a closed serialization");
         }
         if let Some(identity) = preparation
             .as_ref()
@@ -5883,7 +5972,15 @@ impl DynamicAgentSpawner {
             description: input.description.clone(),
             task: input.prompt.clone(),
             system_prompt_addendum: coordination_addendum,
-            model_selection: input.model_selection.clone(),
+            resolved_model_selection: input.resolved_model_selection.clone().or_else(|| {
+                preparation
+                    .as_ref()
+                    .and_then(|prepared| prepared.model_identity())
+                    .map(|identity| astra_turn_types::ModelSelection {
+                        offering_id: identity.offering_id,
+                    })
+            }),
+            requested_model_policy: input.requested_model_policy.clone(),
             delegated_model_requirements: context
                 .delegation_model_admission
                 .as_ref()
@@ -5924,6 +6021,9 @@ impl DynamicAgentSpawner {
             delegation_chain: context.delegation_chain.clone(),
             work_item: input.work_item.clone(),
         };
+        run_config
+            .validate_requested_model_policy()
+            .map_err(SpawnError::InvalidInput)?;
 
         // Emit agent_spawned journal event for unified timeline.
         if let Some(sid) = self.current_session_id() {
@@ -12457,9 +12557,13 @@ mod tests {
         }));
 
         let mut input = make_bg_input();
-        input.model_selection = Some(astra_turn_types::ModelSelection {
+        let selection = astra_turn_types::ModelSelection {
             offering_id: "offer-child".into(),
+        };
+        input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: selection.clone(),
         });
+        input.resolved_model_selection = Some(selection);
         input.reasoning = Some(
             astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
                 effort: astra_turn_core::thinking_config::ThinkingEffort::High,
@@ -12544,9 +12648,13 @@ mod tests {
                 error: None,
             }));
         let mut input = make_bg_input();
-        input.model_selection = Some(astra_turn_types::ModelSelection {
+        let selection = astra_turn_types::ModelSelection {
             offering_id: "offer-reviewed".into(),
+        };
+        input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: selection.clone(),
         });
+        input.resolved_model_selection = Some(selection);
         let result = spawner
             .spawn_prepared_with_capacity_reservation(
                 input,
@@ -14476,8 +14584,12 @@ mod tests {
         apply_delegation_model_admission(&mut omitted, &admission, "parent-run", Some("call"))
             .unwrap();
         assert_eq!(
-            omitted.model_selection.as_ref().unwrap().offering_id,
-            "offering-b"
+            omitted.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selection: ModelSelection {
+                    offering_id: "offering-b".into(),
+                },
+            })
         );
         assert_eq!(
             omitted.reasoning,
@@ -14487,8 +14599,45 @@ mod tests {
                 }
             )
         );
+        let mut omitted_with_parent_snapshot = make_sync_input();
+        omitted_with_parent_snapshot.resolved_model_selection = Some(ModelSelection {
+            offering_id: "offering-a".into(),
+        });
+        apply_delegation_model_admission(
+            &mut omitted_with_parent_snapshot,
+            &admission,
+            "parent-run",
+            Some("call"),
+        )
+        .expect("an omitted policy permits the trusted hard requirement to override inheritance");
+        assert_eq!(
+            omitted_with_parent_snapshot.resolved_model_selection,
+            Some(ModelSelection {
+                offering_id: "offering-b".into(),
+            })
+        );
+        let mut explicit_inherit_conflict = make_sync_input();
+        explicit_inherit_conflict.requested_model_policy =
+            Some(astra_turn_types::RequestedModelPolicy::Inherit);
+        explicit_inherit_conflict.resolved_model_selection = Some(ModelSelection {
+            offering_id: "offering-a".into(),
+        });
+        assert!(
+            apply_delegation_model_admission(
+                &mut explicit_inherit_conflict,
+                &admission,
+                "parent-run",
+                Some("call"),
+            )
+            .is_err()
+        );
         let mut conflict = make_sync_input();
-        conflict.model_selection = Some(ModelSelection {
+        conflict.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: ModelSelection {
+                offering_id: "offering-a".into(),
+            },
+        });
+        conflict.resolved_model_selection = Some(ModelSelection {
             offering_id: "offering-a".into(),
         });
         assert!(
@@ -14504,7 +14653,12 @@ mod tests {
         slots[0].reasoning_strength =
             Some(astra_turn_types::DelegationRequirementStrength::Default);
         let mut overridden = make_sync_input();
-        overridden.model_selection = Some(ModelSelection {
+        overridden.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selection: ModelSelection {
+                offering_id: "offering-a".into(),
+            },
+        });
+        overridden.resolved_model_selection = Some(ModelSelection {
             offering_id: "offering-a".into(),
         });
         overridden.reasoning =
@@ -14517,7 +14671,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            overridden.model_selection.as_ref().unwrap().offering_id,
+            overridden
+                .resolved_model_selection
+                .as_ref()
+                .unwrap()
+                .offering_id,
             "offering-a"
         );
         assert_eq!(
@@ -14793,6 +14951,7 @@ mod tests {
                     None,
                     &parent_run_id,
                     Some(("user", "session")),
+                    None,
                 )
                 .await
                 .expect("terminal history can be evicted");
@@ -14854,7 +15013,8 @@ mod tests {
                     None,
                     None,
                     "owner-0",
-                    FanoutAdmission::Recovery
+                    FanoutAdmission::Recovery,
+                    None,
                 )
                 .await
                 .is_err()
@@ -15277,7 +15437,14 @@ mod tests {
                 .unwrap();
             let owner = reservation.owner_id().unwrap().to_string();
             spawner
-                .declare_fanout_group(&group_id, "owned group", 1, None, &context.parent_run_id)
+                .declare_fanout_group(
+                    &group_id,
+                    "owned group",
+                    1,
+                    None,
+                    &context.parent_run_id,
+                    None,
+                )
                 .await
                 .unwrap();
             let mut input = make_bg_input();
@@ -15382,7 +15549,14 @@ mod tests {
         rejected.await.unwrap();
 
         spawner
-            .declare_fanout_group(group_id, "rightful group", 1, None, &context.parent_run_id)
+            .declare_fanout_group(
+                group_id,
+                "rightful group",
+                1,
+                None,
+                &context.parent_run_id,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -15464,13 +15638,87 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fanout_group_declaration_atomically_binds_replay_identity() {
+        let spawner = Arc::new(DynamicAgentSpawner::new(mock_router()));
+        let first_spawner = Arc::clone(&spawner);
+        let second_spawner = Arc::clone(&spawner);
+        let first = tokio::spawn(async move {
+            first_spawner
+                .declare_fanout_group(
+                    "request-bound",
+                    "Request bound",
+                    1,
+                    Some("tool-call"),
+                    "parent",
+                    Some("fingerprint-a"),
+                )
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_spawner
+                .declare_fanout_group(
+                    "request-bound",
+                    "Request bound",
+                    1,
+                    Some("tool-call"),
+                    "parent",
+                    Some("fingerprint-a"),
+                )
+                .await
+        });
+        let (first, second) = (
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        );
+        assert_ne!(
+            first, second,
+            "exactly one declaration owns first admission"
+        );
+
+        spawner
+            .fanout_groups
+            .write()
+            .await
+            .get_mut("request-bound")
+            .unwrap()
+            .status = AgentFanoutStatus::Finished;
+        let terminal_replay = spawner
+            .declare_fanout_group(
+                "request-bound",
+                "Request bound",
+                1,
+                Some("tool-call"),
+                "parent",
+                Some("fingerprint-a"),
+            )
+            .await
+            .expect("an exact replay must attach after the original group settles");
+        assert!(!terminal_replay, "a replay must never own another launch");
+
+        let conflict = spawner
+            .declare_fanout_group(
+                "request-bound",
+                "Request bound",
+                1,
+                Some("tool-call"),
+                "parent",
+                Some("fingerprint-b"),
+            )
+            .await;
+        assert!(
+            conflict.is_err(),
+            "changed request must not reuse the group"
+        );
+    }
+
     #[tokio::test]
     async fn direct_spawn_is_blocked_only_for_parent_run_that_declared_fanout() {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
 
         spawner
-            .declare_fanout_group("fanout-a", "fanout A", 2, Some("call-a"), "parent-a")
+            .declare_fanout_group("fanout-a", "fanout A", 2, Some("call-a"), "parent-a", None)
             .await
             .expect("declaring a fanout group should succeed");
 
@@ -15483,7 +15731,7 @@ mod tests {
         assert!(message.contains("fanout-a"), "{message}");
 
         let cross_parent_reuse = spawner
-            .declare_fanout_group("fanout-a", "fanout A", 2, Some("call-b"), "parent-b")
+            .declare_fanout_group("fanout-a", "fanout A", 2, Some("call-b"), "parent-b", None)
             .await;
         let err = cross_parent_reuse.expect_err("group ids must not be reused across parent runs");
         let message = err.to_string();
@@ -17441,6 +17689,7 @@ mod tests {
                 1,
                 None,
                 "root",
+                None,
             )
             .await
             .expect("declare fixed fanout group");
