@@ -12,8 +12,9 @@ use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::Ste
 use astra_runtime::{
     orchestration::{
         CancellationOrigin, InheritedPermissions, PermissionSummary, PreparedSpawn,
-        SpawnAgentExecutor, SpawnAgentInput, SpawnContext, SpawnRunConfig, SpawnRunResult,
-        project_subrun_status_to_spawn, spawn_completion_status_from_finish_reason,
+        PreparedSpawnModelIdentity, SpawnAgentExecutor, SpawnAgentInput, SpawnContext,
+        SpawnRunConfig, SpawnRunResult, project_subrun_status_to_spawn,
+        spawn_completion_status_from_finish_reason,
     },
     semantic_dedup::SemanticDedup,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
@@ -798,6 +799,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     max_output_tokens: input.max_output_tokens,
                     slot: input.fanout_slot_identity()?,
                     model,
+                    admission_validated: has_override,
                 }) as Box<dyn PreparedSpawn>)
             })
             .collect()
@@ -816,10 +818,23 @@ struct CliPreparedSpawn {
     max_output_tokens: Option<u32>,
     slot: Option<AgentFanoutSlotIdentity>,
     model: crate::cli::session::session_runtime::ServerModelSelection,
+    admission_validated: bool,
 }
 
 #[async_trait]
 impl PreparedSpawn for CliPreparedSpawn {
+    fn model_identity(&self) -> Option<PreparedSpawnModelIdentity> {
+        Some(PreparedSpawnModelIdentity {
+            offering_id: self.model.offering_id.clone(),
+            model_name: self.model.name.clone(),
+            provenance: if self.admission_validated {
+                "admission_validated"
+            } else {
+                "catalog_resolved"
+            },
+        })
+    }
+
     async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         if config
             .parent_address
@@ -1990,6 +2005,18 @@ mod tests {
             .await
             .expect("both slots admitted before launch");
         assert_eq!(prepared.len(), 2);
+        assert_eq!(
+            prepared[0].model_identity().unwrap().offering_id,
+            "offer-flash"
+        );
+        assert_eq!(
+            prepared[1].model_identity().unwrap().offering_id,
+            "offer-glm"
+        );
+        assert_eq!(
+            prepared[1].model_identity().unwrap().provenance,
+            "admission_validated"
+        );
         for (prepared, input) in prepared.into_iter().zip(&inputs) {
             let result = prepared
                 .execute(prepared_cli_test_config(
@@ -2339,12 +2366,13 @@ mod tests {
             prompt: "review".into(),
             ..Default::default()
         }];
-        assert!(
-            Arc::clone(&executor)
-                .prepare_batch(&inputs, &context, None)
-                .await
-                .is_ok()
-        );
+        let prepared = Arc::clone(&executor)
+            .prepare_batch(&inputs, &context, None)
+            .await
+            .unwrap();
+        let identity = prepared[0].model_identity().unwrap();
+        assert_eq!(identity.offering_id, "default-offer");
+        assert_eq!(identity.provenance, "catalog_resolved");
         server.verify().await;
         let mixed = [
             SpawnAgentInput {

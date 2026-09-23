@@ -21553,6 +21553,14 @@ struct ServerPreparedSpawn {
 
 #[async_trait]
 impl PreparedSpawn for ServerPreparedSpawn {
+    fn model_identity(&self) -> Option<crate::orchestration::PreparedSpawnModelIdentity> {
+        Some(crate::orchestration::PreparedSpawnModelIdentity {
+            offering_id: self.execution.offering_id.clone(),
+            model_name: self.execution.model_name.clone(),
+            provenance: "admission_validated",
+        })
+    }
+
     async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         let parent_run_id = config
             .parent_address

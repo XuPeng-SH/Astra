@@ -1305,7 +1305,20 @@ pub struct SpawnRunResult {
 /// CLI layer implements this to run the agentic loop.
 #[async_trait]
 pub trait PreparedSpawn: Send {
+    /// Credential-free selection evidence available before child execution.
+    /// Absence must not be interpreted as admission or provider acceptance.
+    fn model_identity(&self) -> Option<PreparedSpawnModelIdentity> {
+        None
+    }
+
     async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSpawnModelIdentity {
+    pub offering_id: String,
+    pub model_name: String,
+    pub provenance: &'static str,
 }
 
 struct DeferredPreparedSpawn<T: SpawnAgentExecutor + ?Sized> {
@@ -3555,7 +3568,11 @@ impl DynamicAgentSpawner {
         }
     }
 
-    async fn emit_agent_spawned_trace(&self, state: &SpawnedAgentState) {
+    async fn emit_agent_spawned_trace(
+        &self,
+        state: &SpawnedAgentState,
+        model_configuration: &serde_json::Value,
+    ) {
         let Some(trace) = state.trace_context.as_ref() else {
             return;
         };
@@ -3579,6 +3596,7 @@ impl DynamicAgentSpawner {
             "status": "spawned",
             "spawn_tool_call_id": &state.spawn_tool_call_id,
             "run_in_background": state.run_in_background,
+            "model_configuration": model_configuration,
             "fanout_slot": state.fanout_slot.as_ref().map(|slot| serde_json::json!({
                 "group_id": &slot.group_id,
                 "target_count": slot.target_count,
@@ -4494,7 +4512,27 @@ impl DynamicAgentSpawner {
             cleanup_agent_worktree(worktree_path.as_ref(), &agent_id);
             return Err(error);
         }
-        self.emit_agent_spawned_trace(&spawned_state_for_trace)
+        let mut model_configuration = serde_json::json!({
+            "thinking": thinking,
+            "first_output_max_tokens": input.max_output_tokens,
+        });
+        // This may be inherited from the parent; it is a launch request, not
+        // necessarily an explicit user choice or a provider-accepted route.
+        if let Some(selection) = input.model_selection.as_ref() {
+            model_configuration["requested_offering_id"] =
+                serde_json::Value::String(selection.offering_id.clone());
+        }
+        if let Some(identity) = preparation
+            .as_ref()
+            .and_then(|prepared| prepared.model_identity())
+        {
+            model_configuration["prepared_selection"] = serde_json::json!({
+                "offering_id": identity.offering_id,
+                "model_name": identity.model_name,
+                "provenance": identity.provenance,
+            });
+        }
+        self.emit_agent_spawned_trace(&spawned_state_for_trace, &model_configuration)
             .await;
         self.publish_background_agent(&spawned_state_for_trace);
 
@@ -4626,7 +4664,7 @@ impl DynamicAgentSpawner {
             let fanout_slot = fanout_slot
                 .as_ref()
                 .and_then(|slot| serde_json::to_value(slot).ok());
-            let evt = astra_services::session_journal::JournalEvent::agent_spawned_with_fanout(
+            let mut evt = astra_services::session_journal::JournalEvent::agent_spawned_with_fanout(
                 Some(&sid),
                 &agent_id,
                 &run_id,
@@ -4638,6 +4676,16 @@ impl DynamicAgentSpawner {
                 fanout_slot.as_ref(),
                 run_config.execution_metadata.as_ref(),
             );
+            if let Some(metadata) = evt
+                .metadata
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                metadata.insert(
+                    "model_configuration".to_string(),
+                    model_configuration.clone(),
+                );
+            }
             let writer = match context.trace_context.as_ref() {
                 Some(trace) => {
                     astra_services::session_journal::JournalWriter::for_user(&trace.user_id, &sid)
@@ -8088,6 +8136,26 @@ mod tests {
         error: Option<&'static str>,
     }
 
+    struct IdentityPreparedSpawn;
+
+    #[async_trait]
+    impl PreparedSpawn for IdentityPreparedSpawn {
+        fn model_identity(&self) -> Option<PreparedSpawnModelIdentity> {
+            Some(PreparedSpawnModelIdentity {
+                offering_id: "offer-reviewed".into(),
+                model_name: "same-display-name".into(),
+                provenance: "admission_validated",
+            })
+        }
+
+        async fn execute(
+            self: Box<Self>,
+            _config: SpawnRunConfig,
+        ) -> Result<SpawnRunResult, String> {
+            Err("injected failure before provider inference".into())
+        }
+    }
+
     struct CapturingDepthExecutor {
         captured_depth: std::sync::Mutex<Option<u8>>,
         captured_workspace_mutation:
@@ -9185,7 +9253,16 @@ mod tests {
             "transport": "edge_ws"
         }));
 
-        let launched = spawner.spawn(make_bg_input(), &context).await.unwrap();
+        let mut input = make_bg_input();
+        input.model_selection = Some(astra_turn_types::ModelSelection {
+            offering_id: "offer-child".into(),
+        });
+        input.reasoning = Some(
+            astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+            },
+        );
+        let launched = spawner.spawn(input, &context).await.unwrap();
         let agent_id = match launched {
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
             other => panic!("expected launched output, got {other:?}"),
@@ -9231,6 +9308,81 @@ mod tests {
             "{journal}"
         );
         assert!(journal.contains("\"transport\":\"edge_ws\""), "{journal}");
+        let spawned = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["type"] == "agent_spawned")
+            .unwrap();
+        assert_eq!(
+            spawned["metadata"]["model_configuration"]["requested_offering_id"],
+            "offer-child"
+        );
+        assert_eq!(
+            spawned["metadata"]["model_configuration"]["thinking"],
+            serde_json::json!({"mode":"adaptive","effort":"high"})
+        );
+        assert!(
+            spawned["metadata"]["model_configuration"]
+                .get("prepared_selection")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_spawn_journal_records_identity_without_claiming_provider_use() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_session("prepared-model-snapshot".to_string())
+            .with_executor(Arc::new(ImmediateStatusExecutor {
+                status: "completed",
+                finish_reason: "normal",
+                output: None,
+                error: None,
+            }));
+        let mut input = make_bg_input();
+        input.model_selection = Some(astra_turn_types::ModelSelection {
+            offering_id: "offer-reviewed".into(),
+        });
+        let result = spawner
+            .spawn_prepared_with_capacity_reservation(
+                input,
+                &make_bg_context(),
+                None,
+                Some(Box::new(IdentityPreparedSpawn)),
+            )
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched child, got {other:?}"),
+        };
+        let status = spawner
+            .wait_for_agent(&agent_id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(status, AgentStatus::Failed { .. }));
+        let journal = std::fs::read_to_string(astra_services::session_journal::journal_file_path(
+            "prepared-model-snapshot",
+        ))
+        .unwrap();
+        let spawned = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["type"] == "agent_spawned")
+            .collect::<Vec<_>>();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(
+            spawned[0]["metadata"]["model_configuration"]["prepared_selection"],
+            serde_json::json!({
+                "offering_id": "offer-reviewed", "model_name": "same-display-name", "provenance": "admission_validated"
+            })
+        );
+        assert!(
+            spawned[0]["metadata"]["model_configuration"]
+                .get("provider_accepted")
+                .is_none()
+        );
     }
 
     #[tokio::test]
