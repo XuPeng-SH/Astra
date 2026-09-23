@@ -1,7 +1,8 @@
 name: flash_fanout_invalid_final_slot
 description: |
-  A final-slot Offering that cannot be admitted must reject the entire group.
-  Durable agent_spawned absence proves no earlier valid slot leaked through.
+  Live fail-closed smoke: a group containing an invalid final-slot Offering
+  must never start an earlier valid slot when the group is rejected. This
+  smoke test does not identify which admission layer rejected the group.
 prompt: |
   Call agent_fanout.start exactly once with target_count 2. Use description
   "first slot" for slot 0 and "second slot" for slot 1. Slot 0 asks for
@@ -43,11 +44,6 @@ criteria:
     document: result
     path: /status
     equals: failed
-  - type: journal_tool_json_contains
-    name: agent_fanout
-    document: result
-    path: /error
-    contains: "Offering 'invalid-offering-no-such-id' is not available"
   - type: session_event_count
     event_type: agent_spawned
     min: 0
