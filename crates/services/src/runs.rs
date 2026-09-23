@@ -24723,6 +24723,79 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(transport) = data.get("transport").cloned() {
                     obj.insert("transport".to_string(), transport);
                 }
+                // Expose admitted initial controls, not private runtime context or
+                // a claim about which controls the provider ultimately consumed.
+                if let Some(offering_id) = data
+                    .get("model_selection")
+                    .and_then(|selection| selection.get("offering_id"))
+                    .filter(|value| value.is_string())
+                {
+                    obj.insert(
+                        "model_selection".to_string(),
+                        serde_json::json!({"offering_id": offering_id}),
+                    );
+                }
+                if let Some(selection) = data.get("resolved_model_selection") {
+                    if let (Some(offering_id), Some(model_name)) = (
+                        selection
+                            .get("offering_id")
+                            .filter(|value| value.is_string()),
+                        selection
+                            .get("model_name")
+                            .filter(|value| value.is_string()),
+                    ) {
+                        obj.insert(
+                            "resolved_model_selection".to_string(),
+                            serde_json::json!({
+                                "offering_id": offering_id,
+                                "model_name": model_name,
+                            }),
+                        );
+                    }
+                }
+                if let Some(controls) = data.get("generation_controls") {
+                    if let (
+                        Some(thinking),
+                        Some(first_output_max_tokens),
+                        Some(preserve_thinking),
+                    ) = (
+                        controls.get("thinking"),
+                        controls.get("first_output_max_tokens").filter(|value| {
+                            value.is_null()
+                                || value
+                                    .as_u64()
+                                    .is_some_and(|limit| limit > 0 && u32::try_from(limit).is_ok())
+                        }),
+                        controls
+                            .get("preserve_thinking")
+                            .filter(|value| value.is_boolean()),
+                    ) {
+                        let mode = thinking.get("mode").and_then(serde_json::Value::as_str);
+                        let projected_thinking = match mode {
+                            Some("off" | "model_default") => mode.map(|mode| serde_json::json!({"mode": mode})),
+                            Some("enabled") => thinking.get("budget_tokens")
+                                .filter(|value| value.as_u64().is_some_and(|budget| {
+                                    budget >= 1024 && u32::try_from(budget).is_ok()
+                                }))
+                                .map(|budget| serde_json::json!({"mode": "enabled", "budget_tokens": budget})),
+                            Some("adaptive") => thinking.get("effort")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|effort| matches!(*effort, "low" | "medium" | "high" | "max"))
+                                .map(|effort| serde_json::json!({"mode": "adaptive", "effort": effort})),
+                            _ => None,
+                        };
+                        if let Some(thinking) = projected_thinking {
+                            obj.insert(
+                                "generation_controls".to_string(),
+                                serde_json::json!({
+                                    "thinking": thinking,
+                                    "first_output_max_tokens": first_output_max_tokens,
+                                    "preserve_thinking": preserve_thinking,
+                                }),
+                            );
+                        }
+                    }
+                }
             }
             out
         }
@@ -36542,6 +36615,112 @@ mod tests {
         assert!(!rendered.contains("__astra_connection_tokens"));
         assert!(!rendered.contains("provider-api-secret"));
         assert!(rendered.contains("admitted_model_execution_present: true"));
+    }
+
+    #[test]
+    fn run_started_projection_exposes_only_admitted_model_controls() {
+        let event = serde_json::json!({
+            "event_type": "run_started",
+            "data": {
+                "run_id": "child-1",
+                "model_selection": {"offering_id": "offer-child", "private": "do-not-project"},
+                "resolved_model_selection": {
+                    "offering_id": "offer-child", "model_name": "child-model", "credential": "do-not-project"
+                },
+                "generation_controls": {
+                    "thinking": {"mode": "adaptive", "effort": "high", "private": "do-not-project"},
+                    "first_output_max_tokens": null,
+                    "preserve_thinking": true,
+                    "private": "do-not-project"
+                },
+                "admission_source": {"private": "do-not-project"}
+            }
+        });
+        let projected = super::transform_run_event_for_client(event);
+        assert_eq!(projected["run_id"], "child-1");
+        assert_eq!(
+            projected["model_selection"],
+            serde_json::json!({"offering_id": "offer-child"})
+        );
+        assert_eq!(
+            projected["resolved_model_selection"],
+            serde_json::json!({
+                "offering_id": "offer-child", "model_name": "child-model"
+            })
+        );
+        assert_eq!(
+            projected["generation_controls"],
+            serde_json::json!({
+                "thinking": {"mode": "adaptive", "effort": "high"},
+                "first_output_max_tokens": null, "preserve_thinking": true
+            })
+        );
+        assert!(projected.get("admission_source").is_none());
+
+        let missing = super::transform_run_event_for_client(serde_json::json!({
+            "event_type": "run_started", "data": {"run_id": "parent-1"}
+        }));
+        assert!(missing.get("model_selection").is_none());
+        assert!(missing.get("generation_controls").is_none());
+
+        for invalid in [
+            serde_json::json!({"credential": "do-not-project"}),
+            serde_json::json!("secret"),
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            let projected = super::transform_run_event_for_client(serde_json::json!({
+                "event_type": "run_started",
+                "data": {"generation_controls": {
+                    "thinking": {"mode": "off"},
+                    "first_output_max_tokens": invalid,
+                    "preserve_thinking": false
+                }}
+            }));
+            assert!(projected.get("generation_controls").is_none());
+        }
+        for (thinking, cap) in [
+            (serde_json::json!({"mode": "off"}), serde_json::json!(1024)),
+            (
+                serde_json::json!({"mode": "model_default"}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({"mode": "enabled", "budget_tokens": 1024}),
+                serde_json::json!(2048),
+            ),
+        ] {
+            let projected = super::transform_run_event_for_client(serde_json::json!({
+                "event_type": "run_started",
+                "data": {"generation_controls": {
+                    "thinking": thinking,
+                    "first_output_max_tokens": cap,
+                    "preserve_thinking": true
+                }}
+            }));
+            assert_eq!(projected["generation_controls"]["thinking"], thinking);
+            assert_eq!(
+                projected["generation_controls"]["first_output_max_tokens"],
+                cap
+            );
+        }
+        for invalid_budget in [
+            serde_json::json!(1023),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+            serde_json::json!({"credential": "do-not-project"}),
+            serde_json::json!("secret"),
+        ] {
+            let projected = super::transform_run_event_for_client(serde_json::json!({
+                "event_type": "run_started",
+                "data": {"generation_controls": {
+                    "thinking": {"mode": "enabled", "budget_tokens": invalid_budget},
+                    "first_output_max_tokens": 2048,
+                    "preserve_thinking": true
+                }}
+            }));
+            assert!(projected.get("generation_controls").is_none());
+        }
     }
 
     #[test]
