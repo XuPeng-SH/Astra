@@ -3961,6 +3961,7 @@ pub(super) async fn post_work_branch_turn_handler(
         expected_model_name: None,
         model_selection_mode: ModelSelectionMode::ServerDefault,
         model_selection: None,
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,

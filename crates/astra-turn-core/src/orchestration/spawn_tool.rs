@@ -1,7 +1,7 @@
 //! Spawn agent tool schema and types.
 
 use super::fanout_group::AgentFanoutSlotIdentity;
-use astra_turn_types::ModelSelection;
+use astra_turn_types::{ModelSelection, RequestedModelPolicy};
 use serde::{Deserialize, Serialize};
 
 /// Child reasoning intent, kept independent from model identity.
@@ -231,16 +231,23 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     pub work_item: Option<WorkItemExecutionSpec>,
 
-    /// Exact authorized Offering selected for this child. When absent, the
-    /// child inherits the parent's admitted Offering. Display names and model
-    /// aliases are not execution identities.
-    #[serde(default)]
-    pub model_selection: Option<ModelSelection>,
-
     /// Optional reasoning override. Omission inherits the effective parent
     /// setting only for the same Offering; model_default explicitly opts out.
     #[serde(default)]
     pub reasoning: Option<ReasoningSelection>,
+
+    /// User-requested model behavior. Omission follows the normal inherited
+    /// path; explicit `inherit` overrides lower-priority defaults. Auto is
+    /// represented so the request is not confused with a resolved Offering,
+    /// but execution rejects it until the shared router is available.
+    #[serde(default)]
+    pub requested_model_policy: Option<RequestedModelPolicy>,
+
+    /// Concrete Offering resolved by trusted orchestration after applying the
+    /// requested policy and parent snapshot. This is never accepted from tool
+    /// JSON and is deliberately omitted from the public schema.
+    #[serde(skip)]
+    pub resolved_model_selection: Option<ModelSelection>,
 }
 
 impl SpawnAgentInput {
@@ -336,8 +343,9 @@ impl Default for SpawnAgentInput {
             fanout_slot_index: None,
             fanout_slot_id: None,
             work_item: None,
-            model_selection: None,
             reasoning: None,
+            requested_model_policy: None,
+            resolved_model_selection: None,
         }
     }
 }
@@ -570,17 +578,50 @@ mod tests {
     }
 
     #[test]
-    fn spawn_accepts_an_exact_offering_for_admitted_routing() {
-        let json = r#"{"description":"Test","prompt":"Do the thing","model_selection":{"offering_id":"offer-gpt-4o"}}"#;
+    fn spawn_accepts_a_fixed_offering_policy() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"fixed","selection":{"offering_id":"offer-gpt-4o"}}}"#;
         let input = serde_json::from_str::<SpawnAgentInput>(json)
-            .expect("an explicit child model override is part of the typed spawn contract");
+            .expect("a fixed model policy is part of the typed spawn contract");
         assert_eq!(
-            input
-                .model_selection
-                .as_ref()
-                .map(|selection| selection.offering_id.as_str()),
-            Some("offer-gpt-4o")
+            input.requested_model_policy,
+            Some(RequestedModelPolicy::Fixed {
+                selection: ModelSelection {
+                    offering_id: "offer-gpt-4o".to_string(),
+                }
+            })
         );
+        assert!(input.resolved_model_selection.is_none());
+    }
+
+    #[test]
+    fn spawn_preserves_explicit_inherit_and_auto_requests() {
+        let inherited = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"inherit"}}"#,
+        )
+        .expect("explicit inherit is a real override");
+        assert_eq!(
+            inherited.requested_model_policy,
+            Some(RequestedModelPolicy::Inherit)
+        );
+        let automatic = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"auto","strategy":"cost_priority"}}"#,
+        )
+        .expect("Auto policy remains explicit even while routing is unavailable");
+        assert_eq!(
+            automatic.requested_model_policy,
+            Some(RequestedModelPolicy::Auto {
+                strategy: astra_turn_types::AutoModelStrategy::CostPriority,
+            })
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_the_previous_untyped_selection_key() {
+        let error = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"Test","prompt":"Do the thing","model_selection":{"offering_id":"offer-gpt-4o"}}"#,
+        )
+        .expect_err("the model request uses one typed policy field");
+        assert!(error.to_string().contains("model_selection"), "{error}");
     }
 
     #[test]
@@ -595,17 +636,47 @@ mod tests {
     }
 
     #[test]
-    fn spawn_parses_reasoning_independently_from_model_identity() {
+    fn spawn_parses_reasoning_independently_from_model_policy() {
         let input: SpawnAgentInput = serde_json::from_str(
-            r#"{"description":"Review","prompt":"Check it","model_selection":{"offering_id":"offer-b"},"reasoning":{"mode":"adaptive","effort":"high"}}"#,
+            r#"{"description":"Review","prompt":"Check it","requested_model_policy":{"mode":"fixed","selection":{"offering_id":"offer-b"}},"reasoning":{"mode":"adaptive","effort":"high"}}"#,
         )
-        .expect("typed reasoning selection");
+        .expect("typed reasoning and model policy");
+        assert_eq!(
+            input.requested_model_policy,
+            Some(RequestedModelPolicy::Fixed {
+                selection: ModelSelection {
+                    offering_id: "offer-b".to_string(),
+                },
+            })
+        );
 
         assert_eq!(
             input.reasoning.map(|selection| selection.config()),
             Some(crate::thinking_config::ThinkingConfig::Adaptive {
                 effort: crate::thinking_config::ThinkingEffort::High,
             })
+        );
+    }
+
+    #[test]
+    fn resolved_selection_is_never_accepted_from_tool_json() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","resolved_model_selection":{"offering_id":"forged"}}"#;
+        let error = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("resolved Offering identity is runtime-owned");
+        assert!(error.to_string().contains("resolved_model_selection"));
+    }
+
+    #[test]
+    fn auto_policy_does_not_silently_fall_back_to_the_parent_offering() {
+        let policy = RequestedModelPolicy::Auto {
+            strategy: astra_turn_types::AutoModelStrategy::CostPriority,
+        };
+        let parent = ModelSelection {
+            offering_id: "offer-parent".into(),
+        };
+        assert_eq!(
+            astra_turn_types::resolve_requested_model_selection(Some(&policy), Some(&parent)),
+            Err(astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable)
         );
     }
 

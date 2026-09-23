@@ -457,6 +457,9 @@ pub struct RunStartContext {
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
+    /// Original sub-run selection intent, separate from the admitted model
+    /// identity below. `Some(inherit)` must remain distinct from omission.
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     /// Immutable effective controls for an executable child run.
@@ -504,6 +507,7 @@ impl Default for RunStartContext {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
+            requested_model_policy: None,
             model_selection: None,
             resolved_model_selection: None,
             generation_controls: None,
@@ -565,6 +569,30 @@ pub(crate) fn durable_run_generation_controls(
         }
     }
     Ok(controls)
+}
+
+pub(crate) fn durable_run_requested_model_policy(
+    run: &DurableRunRecord,
+) -> Result<Option<astra_turn_types::RequestedModelPolicy>, String> {
+    let mut started = run
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "run_started");
+    let event = started
+        .next()
+        .ok_or_else(|| "durable run has no start event".to_string())?;
+    if started.next().is_some() {
+        return Err("durable run has conflicting start events".into());
+    }
+    let value = event
+        .pointer("/data/requested_model_policy")
+        .ok_or_else(|| "durable run is missing requested model policy".to_string())?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| format!("durable run has invalid requested model policy: {error}"))
 }
 
 pub(crate) fn durable_run_delegated_model_requirements(
@@ -912,6 +940,14 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     data.insert(
         "interaction_mode".to_string(),
         serde_json::Value::String(requested_mode_label(context.interaction_mode).to_string()),
+    );
+    data.insert(
+        "requested_model_policy".to_string(),
+        context
+            .requested_model_policy
+            .as_ref()
+            .map(|policy| serde_json::to_value(policy).expect("requested model policy serializes"))
+            .unwrap_or(serde_json::Value::Null),
     );
     if let Some(interactive_client) = context.interactive_client {
         data.insert(
@@ -7225,6 +7261,45 @@ mod tests {
         assert!(durable_run_generation_controls(&run).is_err());
     }
 
+    #[tokio::test]
+    async fn requested_model_policy_round_trips_and_missing_snapshot_fails_closed() {
+        let engine = test_engine();
+        let policy = astra_turn_types::RequestedModelPolicy::Auto {
+            strategy: astra_turn_types::AutoModelStrategy::Balanced,
+        };
+        engine
+            .start_run_with_context(
+                "policy-run",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    requested_model_policy: Some(policy.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut run = engine
+            .load_run("user-1", "policy-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable_run_requested_model_policy(&run).unwrap(),
+            Some(policy)
+        );
+
+        let valid_start = run.events[0].clone();
+        run.events[0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("requested_model_policy");
+        assert!(durable_run_requested_model_policy(&run).is_err());
+        run.events[0] = valid_start.clone();
+        run.events.push(valid_start);
+        assert!(durable_run_requested_model_policy(&run).is_err());
+    }
+
     #[test]
     fn execution_metadata_cannot_forge_generation_controls() {
         let event = run_started_event_data(&RunStartContext {
@@ -7913,6 +7988,7 @@ mod tests {
             expected_model_name: None,
             model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
             model_selection: None,
+            requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: None,
             capability_descriptors: None,

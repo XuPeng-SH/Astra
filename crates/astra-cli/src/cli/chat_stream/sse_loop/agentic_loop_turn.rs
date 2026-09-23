@@ -640,6 +640,7 @@ fn server_loop_admission_payload_with_execution_time_budget(
         "enabled_tools",
         "plan_subtask_id",
         "is_plan_subtask",
+        "requested_model_policy",
     ] {
         if let Some(value) = source.get(field) {
             request.insert(field.to_string(), value.clone());
@@ -2042,6 +2043,10 @@ mod tests {
     fn server_loop_admission_carries_typed_time_budget_outside_prompt_context() {
         let prepared = json!({
             "model_selection": {"offering_id": "generic-offering"},
+            "requested_model_policy": {
+                "mode": "fixed",
+                "selection": {"offering_id": "selected-offering"}
+            },
             "edge_executor_id": "edge-1",
             "capabilities": [],
             "edge_profile": {
@@ -2062,6 +2067,11 @@ mod tests {
         .expect("typed time budget admission");
 
         assert_eq!(admitted["execution_time_budget"]["remaining_seconds"], 37);
+        assert_eq!(
+            admitted["requested_model_policy"]["selection"]["offering_id"],
+            "selected-offering"
+        );
+        assert!(admitted["context"].get("requested_model_policy").is_none());
         assert_eq!(admitted["runtime_system_prompt"], "stable runtime prompt");
         assert!(
             admitted["context"]["edge_profile"]

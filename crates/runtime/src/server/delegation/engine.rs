@@ -1206,6 +1206,8 @@ pub struct SubRunConfig {
     pub admitted_model_execution: Option<AdmittedModelExecution>,
     /// Exact child route prepared before the durable run was created.
     pub prepared_model: Option<PreparedSubRunModel>,
+    /// Original requested policy, separate from the resolved Offering.
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     /// Effective reasoning control frozen for this execution attempt.
     pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
     /// Effective interaction policy for this exact child invocation. It is
@@ -1317,6 +1319,7 @@ impl std::fmt::Debug for SubRunConfig {
                 &self.admitted_model_execution.is_some(),
             )
             .field("prepared_model", &self.prepared_model.is_some())
+            .field("requested_model_policy", &self.requested_model_policy)
             .field("interaction_mode", &self.interaction_mode)
             .field("request_constraints", &self.request_constraints)
             .field("recursion_depth", &self.recursion_depth)
@@ -4409,6 +4412,7 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: prepared_model.clone(),
+                requested_model_policy: None,
                 thinking: thinking.clone(),
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
@@ -4845,6 +4849,7 @@ impl DelegationEngine {
                                 forward_headers: forward_headers.clone(),
                                 admitted_model_execution: admitted_model_execution.cloned(),
                                 prepared_model: None,
+                                requested_model_policy: None,
                                 thinking: thinking.clone(),
                                 interaction_mode,
                                 request_constraints: request_constraints.clone(),
@@ -5163,6 +5168,7 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: prepared_model.clone(),
+                requested_model_policy: None,
                 thinking: thinking.clone(),
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
@@ -5262,6 +5268,7 @@ impl DelegationEngine {
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
                             prepared_model: None,
+                            requested_model_policy: None,
                             thinking: thinking.clone(),
                             interaction_mode,
                             request_constraints: request_constraints.clone(),
@@ -5614,6 +5621,7 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: producer_model.clone(),
+                requested_model_policy: None,
                 thinking: producer_thinking.clone(),
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
@@ -5711,6 +5719,7 @@ impl DelegationEngine {
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
                             prepared_model: None,
+                            requested_model_policy: None,
                             thinking: producer_thinking.clone(),
                             interaction_mode,
                             request_constraints: request_constraints.clone(),
@@ -5956,6 +5965,7 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: reviewer_model.clone(),
+                requested_model_policy: None,
                 thinking: reviewer_thinking.clone(),
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
@@ -6322,6 +6332,7 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model,
+                requested_model_policy: None,
                 thinking: thinking.clone(),
                 interaction_mode,
                 request_constraints: request_constraints.clone(),
@@ -10305,6 +10316,7 @@ mod tests {
             forward_headers: HashMap::new(),
             admitted_model_execution: None,
             prepared_model: None,
+            requested_model_policy: None,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             interaction_mode: RequestedTurnInteractionMode::Headless,
             request_constraints: Default::default(),

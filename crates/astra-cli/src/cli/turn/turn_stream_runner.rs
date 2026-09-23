@@ -530,6 +530,7 @@ mod tests {
                 3,
                 Some("tool-fanout"),
                 "prior-root-run",
+                None,
             )
             .await
             .unwrap();

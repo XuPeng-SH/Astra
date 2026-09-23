@@ -671,25 +671,50 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 .as_ref()
                 .map(|parent| &parent.selection)
         });
-        let thinking: Vec<_> = inputs
+        let resolved_selections: Vec<_> = inputs
             .iter()
             .map(|input| {
+                let selection = astra_turn_types::resolve_requested_model_selection(
+                    input.requested_model_policy.as_ref(),
+                    parent_selection,
+                )
+                .map_err(|error| error.to_string())?;
+                if input
+                    .resolved_model_selection
+                    .as_ref()
+                    .is_some_and(|prepared| Some(prepared) != selection.as_ref())
+                {
+                    return Err(
+                        "resolved child Offering does not match its requested model policy".into(),
+                    );
+                }
+                Ok(selection)
+            })
+            .collect::<Result<_, String>>()?;
+        let thinking: Vec<_> = inputs
+            .iter()
+            .zip(&resolved_selections)
+            .map(|(input, selection)| {
                 resolve_child_thinking(
                     input.reasoning.as_ref(),
-                    input.model_selection.as_ref().or(parent_selection),
+                    selection.as_ref().or(parent_selection),
                     context.parent_model_reasoning.as_ref(),
                 )
             })
             .collect();
-        let has_override = inputs.iter().any(|input| {
-            input.model_selection.as_ref().is_some_and(|selection| {
-                parent_selection.is_none_or(|parent| selection.offering_id != parent.offering_id)
-            }) || input.reasoning.is_some()
-                || input.max_output_tokens.is_some()
-        });
+        let has_override = inputs
+            .iter()
+            .zip(&resolved_selections)
+            .any(|(input, selection)| {
+                selection.as_ref().is_some_and(|selection| {
+                    parent_selection
+                        .is_none_or(|parent| selection.offering_id != parent.offering_id)
+                }) || input.reasoning.is_some()
+                    || input.max_output_tokens.is_some()
+            });
         if has_override
             && parent_selection.is_none()
-            && inputs.iter().any(|input| input.model_selection.is_none())
+            && resolved_selections.iter().any(Option::is_none)
         {
             return Err("a fanout with per-slot overrides requires an exact parent Offering for inherited slots".to_string());
         }
@@ -721,10 +746,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             let request = ModelAdmissionRequestV1 {
                 slots: inputs
                     .iter()
+                    .zip(&resolved_selections)
                     .zip(&thinking)
-                    .map(|(input, thinking)| {
-                        let offering_id = input
-                            .model_selection
+                    .map(|((input, selection), thinking)| {
+                        let offering_id = selection
                             .as_ref()
                             .map(|selection| selection.offering_id.as_str())
                             .or_else(|| {
@@ -772,14 +797,16 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             .iter()
             .zip(selections)
             .zip(thinking)
-            .map(|((input, model), thinking)| {
+            .zip(resolved_selections)
+            .map(|(((input, model), thinking), _requested_selection)| {
+                let resolved_selection = Some(astra_turn_types::ModelSelection {
+                    offering_id: model.offering_id.clone(),
+                });
                 Ok(Box::new(CliPreparedSpawn {
                     executor: Arc::clone(&self),
                     parent_run_id: context.parent_run_id.clone(),
-                    requested_selection: input
-                        .model_selection
-                        .clone()
-                        .or_else(|| parent_selection.cloned()),
+                    requested_model_policy: input.requested_model_policy.clone(),
+                    resolved_selection,
                     reasoning: thinking,
                     max_output_tokens: input.max_output_tokens,
                     slot: input.fanout_slot_identity()?,
@@ -798,7 +825,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 struct CliPreparedSpawn {
     executor: Arc<CliSpawnAgentExecutor>,
     parent_run_id: String,
-    requested_selection: Option<astra_turn_types::ModelSelection>,
+    requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
+    resolved_selection: Option<astra_turn_types::ModelSelection>,
     reasoning: astra_turn_core::thinking_config::ThinkingConfig,
     max_output_tokens: Option<u32>,
     slot: Option<AgentFanoutSlotIdentity>,
@@ -823,7 +851,8 @@ impl PreparedSpawn for CliPreparedSpawn {
             .map(|address| address.run_id.as_str())
             != Some(self.parent_run_id.as_str())
             || config.fanout_slot != self.slot
-            || config.model_selection != self.requested_selection
+            || config.requested_model_policy != self.requested_model_policy
+            || config.resolved_model_selection != self.resolved_selection
             || config.thinking != self.reasoning
             || config.max_output_tokens != self.max_output_tokens
         {
@@ -844,6 +873,7 @@ impl CliSpawnAgentExecutor {
         config: SpawnRunConfig,
         prepared_model: Option<crate::cli::session::session_runtime::ServerModelSelection>,
     ) -> Result<SpawnRunResult, String> {
+        config.validate_requested_model_policy()?;
         if let Some(limit) = config.max_output_tokens {
             config.thinking.validate_output_budget(u64::from(limit))?;
         }
@@ -933,7 +963,7 @@ impl CliSpawnAgentExecutor {
         let inherited_model = self.resolve_effective_model(config.model.as_deref());
         let model_selection = if let Some(prepared_model) = prepared_model {
             prepared_model
-        } else if let Some(selection) = config.model_selection.as_ref() {
+        } else if let Some(selection) = config.resolved_model_selection.as_ref() {
             if let Some(model_name) = config
                 .model
                 .as_deref()
@@ -1012,6 +1042,7 @@ impl CliSpawnAgentExecutor {
             token: token.clone(),
             model: effective_model.clone(),
             offering_id: model_selection.offering_id,
+            requested_model_policy: config.requested_model_policy.clone(),
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -1775,7 +1806,8 @@ mod tests {
             description: "test slot".into(),
             task: "reply".into(),
             system_prompt_addendum: String::new(),
-            model_selection,
+            requested_model_policy: None,
+            resolved_model_selection: model_selection,
             delegated_model_requirements: Default::default(),
             fanout_slot: slot,
             thinking,
@@ -1805,6 +1837,20 @@ mod tests {
             delegation_chain: Vec::new(),
             work_item: None,
         }
+    }
+
+    fn prepared_cli_test_config_for_input(
+        input: &SpawnAgentInput,
+        model_selection: Option<astra_turn_types::ModelSelection>,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    ) -> SpawnRunConfig {
+        let mut config = prepared_cli_test_config(
+            input.fanout_slot_identity().expect("valid test slot"),
+            model_selection,
+            thinking,
+        );
+        config.requested_model_policy = input.requested_model_policy.clone();
+        config
     }
 
     fn test_executor(base_url: &str) -> CliSpawnAgentExecutor {
@@ -1951,9 +1997,12 @@ mod tests {
         let revoked_executor = Arc::new(test_executor(&revoked_server.uri()));
         unsupported[1].reasoning = None;
         unsupported[1].max_output_tokens = None;
-        unsupported[1].model_selection = Some(astra_turn_types::ModelSelection {
-            offering_id: "offer-revoked".into(),
-        });
+        unsupported[1].requested_model_policy =
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: "offer-revoked".into(),
+                },
+            });
         let revoked_error = match Arc::clone(&revoked_executor)
             .prepare_batch(&unsupported, &context, Some(&parent))
             .await
@@ -1996,8 +2045,10 @@ mod tests {
             SpawnAgentInput {
                 description: "glm review".into(),
                 prompt: "review".into(),
-                model_selection: Some(astra_turn_types::ModelSelection {
-                    offering_id: "offer-glm".into(),
+                requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                    selection: astra_turn_types::ModelSelection {
+                        offering_id: "offer-glm".into(),
+                    },
                 }),
                 reasoning: Some(
                     astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
@@ -2032,12 +2083,13 @@ mod tests {
         );
         for (prepared, input) in prepared.into_iter().zip(&inputs) {
             let result = prepared
-                .execute(prepared_cli_test_config(
-                    input.fanout_slot_identity().unwrap(),
-                    input
-                        .model_selection
-                        .clone()
-                        .or_else(|| Some(parent.clone())),
+                .execute(prepared_cli_test_config_for_input(
+                    input,
+                    astra_turn_types::resolve_requested_model_selection(
+                        input.requested_model_policy.as_ref(),
+                        Some(&parent),
+                    )
+                    .unwrap(),
                     input
                         .reasoning
                         .as_ref()
@@ -2052,7 +2104,10 @@ mod tests {
             );
         }
         let mut explicit_inputs = inputs.clone();
-        explicit_inputs[0].model_selection = Some(parent.clone());
+        explicit_inputs[0].requested_model_policy =
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selection: parent.clone(),
+            });
         let explicit = Arc::clone(&executor)
             .prepare_batch(&explicit_inputs, &context, None)
             .await
@@ -2207,7 +2262,8 @@ mod tests {
             .map(|(index, (model_selection, reasoning))| SpawnAgentInput {
                 description: format!("slot {index}"),
                 prompt: "review".into(),
-                model_selection,
+                requested_model_policy: model_selection
+                    .map(|selection| astra_turn_types::RequestedModelPolicy::Fixed { selection }),
                 reasoning,
                 fanout_group_id: Some("reasoning".into()),
                 fanout_target_count: Some(4),
@@ -2221,12 +2277,20 @@ mod tests {
                 ThinkingConfig::ModelDefault,
                 ThinkingConfig::ModelDefault,
             ];
-            let slots: Vec<_> = inputs.iter().zip(&effective).map(|(input, thinking)| json!({
-                "offering_id": input.model_selection.as_ref().unwrap_or(&parent).offering_id,
-                "reasoning": ReasoningSelection::from(thinking.clone()),
-                "model_name": "admitted-model",
-                "context_window": 128000,
-            })).collect();
+            let slots: Vec<_> = inputs
+                .iter()
+                .zip(&effective)
+                .map(|(input, thinking)| {
+                    json!({
+                        "offering_id": astra_turn_types::resolve_requested_model_selection(
+                            input.requested_model_policy.as_ref(), Some(&parent)
+                        ).unwrap().unwrap().offering_id,
+                        "reasoning": ReasoningSelection::from(thinking.clone()),
+                        "model_name": "admitted-model",
+                        "context_window": 128000,
+                    })
+                })
+                .collect();
             Mock::given(method("POST"))
                 .and(path("/model-access/admit"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({"slots": slots})))
@@ -2250,12 +2314,13 @@ mod tests {
                     serde_json::to_value(ReasoningSelection::from(thinking.clone())).unwrap()
                 );
                 let error = prepared
-                    .execute(prepared_cli_test_config(
-                        input.fanout_slot_identity().unwrap(),
-                        input
-                            .model_selection
-                            .clone()
-                            .or_else(|| Some(parent.clone())),
+                    .execute(prepared_cli_test_config_for_input(
+                        input,
+                        astra_turn_types::resolve_requested_model_selection(
+                            input.requested_model_policy.as_ref(),
+                            Some(&parent),
+                        )
+                        .unwrap(),
                         thinking,
                     ))
                     .await
@@ -2399,8 +2464,10 @@ mod tests {
             SpawnAgentInput {
                 description: "explicit".into(),
                 prompt: "reply".into(),
-                model_selection: Some(astra_turn_types::ModelSelection {
-                    offering_id: "explicit-offer".into(),
+                requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                    selection: astra_turn_types::ModelSelection {
+                        offering_id: "explicit-offer".into(),
+                    },
                 }),
                 fanout_group_id: Some("mixed".into()),
                 fanout_target_count: Some(2),

@@ -9916,6 +9916,32 @@ impl AgenticRunLifecycleService {
             ));
         }
         Self::validate_effective_user_input(&request)?;
+        match request.requested_model_policy.as_ref() {
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. }) => {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
+                        .to_string(),
+                    "model_routing_unavailable",
+                ));
+            }
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selection: requested,
+            }) if request
+                .model_selection
+                .as_ref()
+                .is_none_or(|selected| selected != requested) =>
+            {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "requested fixed model does not match the admitted Offering selection",
+                    "model_selection_invalid",
+                ));
+            }
+            None
+            | Some(astra_turn_types::RequestedModelPolicy::Inherit)
+            | Some(astra_turn_types::RequestedModelPolicy::Fixed { .. }) => {}
+        }
         if let Some(expected_model_name) = request.expected_model_name.as_deref() {
             exact_runtime_string(
                 "expected_model_name",
@@ -10432,7 +10458,7 @@ impl AgenticRunLifecycleService {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
-        let request_identity = json!({
+        let mut request_identity = json!({
             "version": 1,
             "message": request.message,
             "user_intent": request.user_intent,
@@ -10479,6 +10505,14 @@ impl AgenticRunLifecycleService {
             "interaction_mode": request.interaction_mode,
             "interactive_client": request.interactive_client,
         });
+        // Preserve the existing fingerprint for ordinary requests while
+        // binding explicit delegation policy to provider-task retries. A
+        // changed policy must not attach to a run admitted under another one
+        // or bypass Auto's fail-closed preparation check.
+        if let Some(policy) = request.requested_model_policy.as_ref() {
+            request_identity["requested_model_policy"] = serde_json::to_value(policy)
+                .expect("requested model policy must remain JSON serializable");
+        }
         let request_fingerprint = format!(
             "{:x}",
             Sha256::digest(astra_core::canonical_json_string(&request_identity).as_bytes())
@@ -21614,7 +21648,8 @@ struct ServerPreparedSpawn {
     executor: Arc<ServerSpawnAgentExecutor>,
     parent: ServerSpawnRuntimeContext,
     execution: astra_services::AdmittedModelExecution,
-    requested_selection: Option<ModelSelection>,
+    requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
+    resolved_selection: Option<ModelSelection>,
     thinking: astra_turn_core::thinking_config::ThinkingConfig,
     slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
     delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
@@ -21638,13 +21673,10 @@ impl PreparedSpawn for ServerPreparedSpawn {
         if parent_run_id != Some(self.parent.parent_run_id.as_str())
             || config.fanout_slot != self.slot
             || config.delegated_model_requirements != self.delegated_model_requirements
+            || config.requested_model_policy != self.requested_model_policy
             || config.thinking != self.thinking
             || config.max_output_tokens != self.max_output_tokens
-            || match (&self.requested_selection, &config.model_selection) {
-                (Some(expected), actual) => actual != &Some(expected.clone()),
-                (None, Some(actual)) => actual.offering_id != self.execution.offering_id,
-                (None, None) => false,
-            }
+            || config.resolved_model_selection != self.resolved_selection
         {
             return Err("prepared child execution does not match its admitted parent, slot, Offering, or reasoning".to_string());
         }
@@ -21670,10 +21702,27 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             .runtime_context_for_parent_run(&context.parent_run_id)
             .await?;
         let inherited = parent.admitted_model_execution.as_ref();
+        let inherited_selection = inherited.map(|execution| ModelSelection {
+            offering_id: execution.offering_id.clone(),
+        });
         let mut requested = Vec::new();
         for input in inputs {
             input.fanout_slot_identity()?;
-            match input.model_selection.as_ref() {
+            let selection = astra_turn_types::resolve_requested_model_selection(
+                input.requested_model_policy.as_ref(),
+                inherited_selection.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+            if input
+                .resolved_model_selection
+                .as_ref()
+                .is_some_and(|prepared| Some(prepared) != selection.as_ref())
+            {
+                return Err(
+                    "resolved child Offering does not match its requested model policy".into(),
+                );
+            }
+            match selection.as_ref() {
                 Some(selection) => {
                     astra_services::validate_model_offering_id(&selection.offering_id)
                         .map_err(|error| format!("invalid child model selection: {error}"))?;
@@ -21716,12 +21765,26 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             delegated_model_requirements
                 .validate()
                 .map_err(str::to_string)?;
+            let requested_selection = astra_turn_types::resolve_requested_model_selection(
+                input.requested_model_policy.as_ref(),
+                inherited_selection.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+            if input
+                .resolved_model_selection
+                .as_ref()
+                .is_some_and(|prepared| Some(prepared) != requested_selection.as_ref())
+            {
+                return Err(
+                    "resolved child Offering changed after model-policy preparation".into(),
+                );
+            }
             let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
                 input.reasoning.as_ref(),
-                input.model_selection.as_ref(),
+                requested_selection.as_ref(),
                 context.parent_model_reasoning.as_ref(),
             );
-            let execution = match input.model_selection.as_ref() {
+            let execution = match requested_selection.as_ref() {
                 Some(selection)
                     if inherited
                         .is_none_or(|parent| parent.offering_id != selection.offering_id) =>
@@ -21749,12 +21812,16 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             if let Some(limit) = input.max_output_tokens {
                 thinking.validate_output_budget(u64::from(limit))?;
             }
+            let resolved_selection = ModelSelection {
+                offering_id: execution.offering_id.clone(),
+            };
             prepared.push(Box::new(ServerPreparedSpawn {
                 max_output_tokens: input.max_output_tokens,
                 executor: Arc::clone(&self),
                 parent: parent.clone(),
                 execution,
-                requested_selection: input.model_selection.clone(),
+                requested_model_policy: input.requested_model_policy.clone(),
+                resolved_selection: Some(resolved_selection),
                 thinking,
                 slot,
                 delegated_model_requirements,
@@ -21800,9 +21867,14 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     }
 
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        config.validate_requested_model_policy()?;
         let context = self.runtime_context_for_config(&config).await?;
         let admitted_model_execution = self
-            .prepare_spawn_model(&context, config.model_selection.as_ref(), &config.thinking)
+            .prepare_spawn_model(
+                &context,
+                config.resolved_model_selection.as_ref(),
+                &config.thinking,
+            )
             .await?;
         self.execute_with_admitted_model(config, context, admitted_model_execution)
             .await
@@ -21926,6 +21998,7 @@ impl ServerSpawnAgentExecutor {
             forward_headers: context.forward_headers.clone(),
             admitted_model_execution: Some(admitted_model_execution.clone()),
             prepared_model: None,
+            requested_model_policy: config.requested_model_policy.clone(),
             thinking: config.thinking.clone(),
             interaction_mode: child_runtime_context.interaction_mode,
             request_constraints,
@@ -22327,6 +22400,11 @@ impl ServerSubRunExecutor {
                 .ok_or_else(|| "durable sub-run parent has no ancestor root".to_string())?
         };
         if let Some(existing) = existing {
+            if crate::server::run::engine::durable_run_requested_model_policy(&existing)?
+                != config.requested_model_policy
+            {
+                return Err("durable sub-run retry changed its requested model policy".into());
+            }
             let requested_controls = crate::server::run::engine::RunGenerationControls {
                 thinking: config.thinking.clone(),
                 first_output_max_tokens: config.max_output_tokens,
@@ -22482,6 +22560,7 @@ impl ServerSubRunExecutor {
                 None,
                 crate::server::run::engine::RunStartContext {
                     interaction_mode: config.interaction_mode,
+                    requested_model_policy: config.requested_model_policy.clone(),
                     generation_controls: Some(crate::server::run::engine::RunGenerationControls {
                         thinking: config.thinking.clone(),
                         first_output_max_tokens: config.max_output_tokens,

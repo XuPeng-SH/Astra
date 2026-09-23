@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
@@ -896,7 +897,7 @@ struct AgentFanoutStartSlot {
     #[serde(default)]
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
-    model_selection: Option<astra_turn_types::ModelSelection>,
+    requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     #[serde(default)]
     reasoning: Option<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
 }
@@ -921,7 +922,7 @@ struct AgentFanoutDefaults {
     #[serde(default)]
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
-    model_selection: Option<astra_turn_types::ModelSelection>,
+    requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     #[serde(default)]
     reasoning: Option<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
 }
@@ -979,7 +980,7 @@ const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "complexity",
     "isolated",
     "allowed_tools",
-    "model_selection",
+    "requested_model_policy",
     "reasoning",
 ];
 const FANOUT_SLOT_FIELDS: &[&str] = &[
@@ -992,7 +993,7 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "complexity",
     "isolated",
     "allowed_tools",
-    "model_selection",
+    "requested_model_policy",
     "reasoning",
 ];
 const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
@@ -1005,7 +1006,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent Offering unless an exact model_selection is set in a slot or defaults; reasoning is a separate control. A boundary without atomic model admission rejects these overrides before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent setting unless `requested_model_policy` selects a fixed Offering; explicit `inherit` overrides lower-priority defaults. Auto policies are currently rejected before admission because routing is not enabled. Reasoning is a separate control. A boundary without atomic model admission rejects fixed-Offering overrides before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1268,6 +1269,14 @@ async fn handle_agent_fanout_start_action_with_deadline(
         Ok(input) => input,
         Err(error) => return render_agent_tool_error(None, error.message()),
     };
+    let mut request_identity = args.clone();
+    if let Some(object) = request_identity.as_object_mut() {
+        object.remove("_tool_call_id");
+    }
+    let start_request_fingerprint = format!(
+        "{:x}",
+        Sha256::digest(astra_core::canonical_json_string(&request_identity).as_bytes())
+    );
     let group_id = input
         .group_id
         .clone()
@@ -1297,48 +1306,6 @@ async fn handle_agent_fanout_start_action_with_deadline(
     if !unavailable.is_empty() {
         return render_unavailable_delegation_capabilities(&unavailable);
     }
-    if let Some(existing) = ctx.spawner.fanout_group_for_parent_run(&ctx.run_id).await {
-        let same_start = existing.group_id == group_id
-            || input._tool_call_id.as_deref().is_some_and(|tool_call_id| {
-                existing.created_by_tool_use_id.as_deref() == Some(tool_call_id)
-            });
-        if !same_start {
-            return json!({
-                "status": "failed",
-                "error_kind": "fanout_group_already_started",
-                "retryable": false,
-                "executed": false,
-                "group_id": existing.group_id,
-                "target_count": existing.target_count,
-                "allowed_actions": ["get_results", "stop_slot", "stop_group"],
-                "error": format!(
-                    "Parent run '{}' already owns one fixed fanout group. A second start cannot replace or extend it; inspect the existing group with get_results.",
-                    ctx.run_id
-                ),
-            })
-            .to_string();
-        }
-        if existing.is_terminal() {
-            return render_agent_fanout_results(
-                ctx,
-                &existing.group_id,
-                input._tool_call_id,
-                FanoutResultReadOptions::default(),
-                true,
-            )
-            .await;
-        }
-        return json!({
-            "status": "started",
-            "group_id": existing.group_id,
-            "title": existing.title,
-            "target_count": existing.target_count,
-            "fanout": fanout_group_to_json(&existing),
-            "idempotent_replay": true,
-            "instruction": "This fanout start was already accepted. Observe the existing group with agent_fanout.get_results; no replacement agents were launched."
-        })
-        .to_string();
-    }
     let tool_call_id = input._tool_call_id.clone();
     let mut planned_slots: Vec<_> = match std::mem::take(&mut input.slots)
         .into_iter()
@@ -1363,6 +1330,25 @@ async fn handle_agent_fanout_start_action_with_deadline(
         Ok(planned) => planned,
         Err(error) => return render_agent_tool_error(None, &error),
     };
+    let inherited_selection = ctx
+        .parent_model_reasoning
+        .as_ref()
+        .map(|parent| &parent.selection)
+        .or(ctx.current_model_selection.as_ref());
+    for (_, slot_id, spawn_input) in &mut planned_slots {
+        match astra_turn_types::resolve_requested_model_selection(
+            spawn_input.requested_model_policy.as_ref(),
+            inherited_selection,
+        ) {
+            Ok(selection) => spawn_input.resolved_model_selection = selection,
+            Err(error) => {
+                return render_agent_tool_error(
+                    None,
+                    &format!("fanout slot {}: {error}", slot_id.as_deref().unwrap_or("?")),
+                );
+            }
+        }
+    }
     if let Some(admission) = ctx.delegation_model_admission.as_ref() {
         for (_, _, spawn_input) in &mut planned_slots {
             if let Err(error) = super::spawner::apply_delegation_model_admission(
@@ -1374,6 +1360,60 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
             }
         }
+    }
+    if let Some(existing) = ctx.spawner.fanout_group_for_parent_run(&ctx.run_id).await {
+        let same_start = existing.group_id == group_id
+            || input._tool_call_id.as_deref().is_some_and(|tool_call_id| {
+                existing.created_by_tool_use_id.as_deref() == Some(tool_call_id)
+            });
+        if !same_start {
+            return json!({
+                "status": "failed",
+                "error_kind": "fanout_group_already_started",
+                "retryable": false,
+                "executed": false,
+                "group_id": existing.group_id,
+                "target_count": existing.target_count,
+                "allowed_actions": ["get_results", "stop_slot", "stop_group"],
+                "error": format!(
+                    "Parent run '{}' already owns one fixed fanout group. A second start cannot replace or extend it; inspect the existing group with get_results.",
+                    ctx.run_id
+                ),
+            })
+            .to_string();
+        }
+        if existing.start_request_fingerprint.as_deref() != Some(start_request_fingerprint.as_str())
+        {
+            return json!({
+                "status": "failed",
+                "error_kind": "fanout_group_replay_conflict",
+                "retryable": false,
+                "executed": false,
+                "group_id": existing.group_id,
+                "error": "This fanout identity was already used with a different request configuration. Inspect the existing group instead of replaying changed input.",
+            })
+            .to_string();
+        }
+        if existing.is_terminal() {
+            return render_agent_fanout_results(
+                ctx,
+                &existing.group_id,
+                input._tool_call_id,
+                FanoutResultReadOptions::default(),
+                true,
+            )
+            .await;
+        }
+        return json!({
+            "status": "started",
+            "group_id": existing.group_id,
+            "title": existing.title,
+            "target_count": existing.target_count,
+            "fanout": fanout_group_to_json(&existing),
+            "idempotent_replay": true,
+            "instruction": "This fanout start was already accepted. Observe the existing group with agent_fanout.get_results; no replacement agents were launched."
+        })
+        .to_string();
     }
     let resolved_inputs: Vec<_> = planned_slots
         .iter()
@@ -1435,7 +1475,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
             return render_agent_tool_error(None, &format!("fanout admission failed: {error}"));
         }
     };
-    if let Err(error) = ctx
+    let declared_new = match ctx
         .spawner
         .declare_fanout_group(
             &group_id,
@@ -1443,10 +1483,40 @@ async fn handle_agent_fanout_start_action_with_deadline(
             input.target_count,
             tool_call_id.as_deref(),
             &ctx.run_id,
+            Some(&start_request_fingerprint),
         )
         .await
     {
-        return render_agent_tool_error(None, &error.to_string());
+        Ok(declared_new) => declared_new,
+        Err(error) => return render_agent_tool_error(None, &error.to_string()),
+    };
+    if !declared_new {
+        let Some(existing) = ctx.spawner.fanout_group(&group_id).await else {
+            return render_agent_tool_error(
+                None,
+                "fanout group disappeared after idempotent declaration",
+            );
+        };
+        if existing.is_terminal() {
+            return render_agent_fanout_results(
+                ctx,
+                &existing.group_id,
+                input._tool_call_id,
+                FanoutResultReadOptions::default(),
+                true,
+            )
+            .await;
+        }
+        return json!({
+            "status": "started",
+            "group_id": existing.group_id,
+            "title": existing.title,
+            "target_count": existing.target_count,
+            "fanout": fanout_group_to_json(&existing),
+            "idempotent_replay": true,
+            "instruction": "This fanout start was already accepted. Observe the existing group with agent_fanout.get_results; no replacement agents were launched."
+        })
+        .to_string();
     }
 
     // Spawn all slots concurrently — no head-of-line blocking.
@@ -2283,12 +2353,13 @@ fn fanout_slot_spawn_input(
         fanout_slot_index: Some(slot_index),
         fanout_slot_id: trimmed(slot.slot_id),
         work_item: None,
-        model_selection: slot
-            .model_selection
-            .or_else(|| defaults.and_then(|d| d.model_selection.clone())),
+        requested_model_policy: slot
+            .requested_model_policy
+            .or_else(|| defaults.and_then(|d| d.requested_model_policy.clone())),
         reasoning: slot
             .reasoning
             .or_else(|| defaults.and_then(|d| d.reasoning.clone())),
+        resolved_model_selection: None,
     }
 }
 
@@ -2449,6 +2520,19 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
         }
     };
 
+    let inherited_selection = ctx
+        .parent_model_reasoning
+        .as_ref()
+        .map(|parent| &parent.selection)
+        .or(ctx.current_model_selection.as_ref());
+    match astra_turn_types::resolve_requested_model_selection(
+        input.requested_model_policy.as_ref(),
+        inherited_selection,
+    ) {
+        Ok(selection) => input.resolved_model_selection = selection,
+        Err(error) => return render_agent_tool_error(None, &error.to_string()),
+    }
+
     if let Some(admission) = ctx.delegation_model_admission.as_ref() {
         if let Err(error) = super::spawner::apply_delegation_model_admission(
             &mut input,
@@ -2459,7 +2543,6 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
             return render_agent_tool_error(None, &error.to_string());
         }
     }
-
     let unavailable = unavailable_requested_tools(
         input.allowed_tools.as_deref().unwrap_or_default(),
         ctx.enabled_tools.as_ref(),
@@ -2500,20 +2583,14 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
             .await;
     }
 
-    // An explicit Offering can resolve to a different provider/model than the
-    // parent. Until admission returns that exact identity, prefix inheritance
-    // must not guess from the parent's display model.
-    let model_selection = input
-        .model_selection
-        .clone()
-        .or_else(|| ctx.current_model_selection.clone());
+    // The resolved Offering is runtime-owned; keep the user's optional policy
+    // unchanged for durable provenance and nested delegation.
+    let model_selection = input.resolved_model_selection.clone();
     let resolved_model_name = model_selection
         .as_ref()
         .zip(ctx.current_model_selection.as_ref())
         .filter(|(selected, current)| selected.offering_id == current.offering_id)
         .and_then(|_| ctx.current_model.clone());
-    let mut input = input;
-    input.model_selection = model_selection;
     let spawn_ctx = SpawnContext {
         delegation_model_admission: ctx.delegation_model_admission.clone(),
         parent_model_reasoning: ctx.parent_model_reasoning.clone(),
@@ -3248,7 +3325,8 @@ mod tests {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
-            *self.captured_model_selection.lock().unwrap() = config.model_selection.clone();
+            *self.captured_model_selection.lock().unwrap() =
+                config.resolved_model_selection.clone();
             *self.captured_thinking.lock().unwrap() = Some(config.thinking.clone());
             *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
             *self.captured_max_turns.lock().unwrap() = Some(config.initial_turns);
@@ -3791,7 +3869,10 @@ mod tests {
             "description": "Cross-model review",
             "prompt": "Review the latest commit",
             "agent_type": "general-purpose",
-            "model_selection": {"offering_id": "offer-deepseek-flash"}
+            "requested_model_policy": {
+                "mode": "fixed",
+                "selection": {"offering_id": "offer-deepseek-flash"}
+            }
         });
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
@@ -3871,7 +3952,10 @@ mod tests {
             });
             let mut args = json!({"description":"inspect", "prompt":"inspect"});
             if let Some(selection) = selection {
-                args["model_selection"] = json!({"offering_id":selection});
+                args["requested_model_policy"] = json!({
+                    "mode": "fixed",
+                    "selection": {"offering_id":selection}
+                });
             }
             if let Some(reasoning) = reasoning {
                 args["reasoning"] = reasoning;
@@ -4317,6 +4401,65 @@ mod tests {
         let replay: Value = serde_json::from_str(&replay).unwrap();
         assert_eq!(replay["group_id"], "review-first");
         assert_eq!(spawner.list_fanout_groups().await.len(), 1);
+        let original_agent_id = spawner.list_fanout_groups().await[0].slots[0]
+            .agent_id
+            .clone();
+
+        let changed_policy_replay = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "_tool_call_id": "call-first",
+                "group_id": "review-first",
+                "target_count": 1,
+                "slots": [{
+                    "id": "correctness",
+                    "description": "Review correctness",
+                    "prompt": "Review correctness.",
+                    "requested_model_policy": {
+                        "mode": "fixed",
+                        "selection": {"offering_id": "different-offering"}
+                    }
+                }]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let changed_policy_replay: Value = serde_json::from_str(&changed_policy_replay).unwrap();
+        assert_eq!(changed_policy_replay["status"], "failed");
+        assert_eq!(
+            changed_policy_replay["error_kind"],
+            "fanout_group_replay_conflict"
+        );
+
+        let auto_replay = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "_tool_call_id": "call-first",
+                "group_id": "review-first",
+                "target_count": 1,
+                "slots": [{
+                    "id": "correctness",
+                    "description": "Review correctness",
+                    "prompt": "Review correctness.",
+                    "requested_model_policy": {
+                        "mode": "auto",
+                        "strategy": "balanced"
+                    }
+                }]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let auto_replay: Value = serde_json::from_str(&auto_replay).unwrap();
+        assert_eq!(auto_replay["status"], "failed");
+        assert!(
+            auto_replay["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("automatic model routing is not available")),
+            "unsupported Auto must fail before idempotent replay: {auto_replay}"
+        );
+        let unchanged_group = spawner.list_fanout_groups().await.pop().unwrap();
+        assert_eq!(unchanged_group.slots[0].agent_id, original_agent_id);
 
         let second = handle_agent_fanout_tool(
             &json!({
@@ -5247,7 +5390,7 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
-            model_selection: None,
+            requested_model_policy: None,
             reasoning: None,
         };
 
@@ -5267,13 +5410,17 @@ mod tests {
             "action": "start",
             "target_count": 2,
             "defaults": {
-                "model_selection": {"offering_id": "shared"},
+                "requested_model_policy": {
+                    "mode": "fixed", "selection": {"offering_id": "shared"}
+                },
                 "reasoning": {"mode": "adaptive", "effort": "low"}
             },
             "slots": [
                 {"description": "shared", "prompt": "one"},
                 {"description": "override", "prompt": "two",
-                 "model_selection": {"offering_id": "specific"},
+                 "requested_model_policy": {
+                    "mode": "fixed", "selection": {"offering_id": "specific"}
+                 },
                  "reasoning": {"mode": "model_default"}}
             ]
         }))
@@ -5283,11 +5430,12 @@ mod tests {
         let shared = fanout_slot_spawn_input(&input, shared_input, "group", "group", 2, 0);
         let override_slot = fanout_slot_spawn_input(&input, override_input, "group", "group", 2, 1);
         assert_eq!(
-            shared
-                .model_selection
-                .as_ref()
-                .map(|value| value.offering_id.as_str()),
-            Some("shared")
+            shared.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: "shared".into()
+                }
+            })
         );
         assert_eq!(
             shared.reasoning.as_ref().map(|value| value.config()),
@@ -5296,11 +5444,12 @@ mod tests {
             })
         );
         assert_eq!(
-            override_slot
-                .model_selection
-                .as_ref()
-                .map(|value| value.offering_id.as_str()),
-            Some("specific")
+            override_slot.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: "specific".into()
+                }
+            })
         );
         assert_eq!(
             override_slot.reasoning.as_ref().map(|value| value.config()),
@@ -5312,6 +5461,32 @@ mod tests {
                 "slots": [{"description": "bad", "prompt": "bad", "model": "unresolved-alias"}]
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_fanout_inherit_overrides_the_shared_model_policy() {
+        let mut input: AgentFanoutStartInput = serde_json::from_value(json!({
+            "action": "start",
+            "target_count": 1,
+            "defaults": {
+                "requested_model_policy": {
+                    "mode": "fixed",
+                    "selection": {"offering_id": "offer-shared"}
+                }
+            },
+            "slots": [{
+                "description": "follow parent",
+                "prompt": "inspect",
+                "requested_model_policy": {"mode": "inherit"}
+            }]
+        }))
+        .expect("fanout model policy");
+        let slot = input.slots.pop().expect("one slot");
+        let spawn = fanout_slot_spawn_input(&input, slot, "group", "group", 1, 0);
+        assert_eq!(
+            spawn.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Inherit)
         );
     }
 
@@ -5363,7 +5538,9 @@ mod tests {
                 "slots": [
                     {"description": "one", "prompt": "one"},
                     {"description": "two", "prompt": "two",
-                     "model_selection": {"offering_id": "specific"}}
+                     "requested_model_policy": {
+                        "mode": "fixed", "selection": {"offering_id": "specific"}
+                     }}
                 ]
             }),
             Some(&ctx),
@@ -5400,7 +5577,7 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
-            model_selection: None,
+            requested_model_policy: None,
             reasoning: None,
         };
 
@@ -5437,7 +5614,7 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
-            model_selection: None,
+            requested_model_policy: None,
             reasoning: None,
         };
 
@@ -5470,7 +5647,7 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
-            model_selection: None,
+            requested_model_policy: None,
             reasoning: None,
         };
 
@@ -5507,7 +5684,7 @@ mod tests {
             complexity: None,
             isolated: None,
             allowed_tools: None,
-            model_selection: None,
+            requested_model_policy: None,
             reasoning: None,
         };
 

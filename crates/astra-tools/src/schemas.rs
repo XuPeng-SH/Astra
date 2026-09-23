@@ -1293,12 +1293,40 @@ macro_rules! heap_schema_vec {
     }};
 }
 
-fn fanout_model_selection_schema() -> Value {
+fn requested_model_policy_schema() -> Value {
     json!({
-        "type": "object",
-        "properties": {"offering_id": {"type": "string", "minLength": 1, "maxLength": 64}},
-        "required": ["offering_id"],
-        "additionalProperties": false
+        "description": "Requested model behavior, distinct from the resolved Offering. Omission follows normal inheritance. Explicit inherit overrides lower-priority defaults. Auto is represented but currently rejected before admission because automatic routing is not enabled.",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"mode": {"const": "inherit"}},
+                "required": ["mode"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "mode": {"const": "fixed"},
+                    "selection": {
+                        "type": "object",
+                        "properties": {"offering_id": {"type": "string", "minLength": 1, "maxLength": 64}},
+                        "required": ["offering_id"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["mode", "selection"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "mode": {"const": "auto"},
+                    "strategy": {"type": "string", "enum": ["cost_priority", "balanced"]}
+                },
+                "required": ["mode", "strategy"],
+                "additionalProperties": false
+            }
+        ]
     })
 }
 
@@ -1925,13 +1953,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
                         "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
-                        "model_selection": {
-                            "type": "object",
-                            "description": "Exact active Offering for this child. Omit to inherit the parent's admitted execution.",
-                            "properties": {"offering_id": {"type": "string", "minLength": 1, "maxLength": 64}},
-                            "required": ["offering_id"],
-                            "additionalProperties": false
-                        },
+                        "requested_model_policy": requested_model_policy_schema(),
                         "reasoning": fanout_reasoning_schema(),
                         "name": {"type": "string", "description": "Action label when accepted by the selected action."},
                         "input": {"type": "object", "description": "Optional run_chain template input."},
@@ -1975,7 +1997,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["to", "message"]
                     },
                     "x-astra-per-action-allowed": {
-                        "spawn": ["action", "description", "prompt", "agent_type", "model_selection", "reasoning", "name", "max_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
+                        "spawn": ["action", "description", "prompt", "agent_type", "requested_model_policy", "reasoning", "name", "max_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
                         "get_result": ["action", "agent_id"],
                         "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
                         "send_message": ["action", "to", "message", "message_type", "request_id"]
@@ -2024,7 +2046,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean"},
                                     "allowed_tools": {"type": "array", "items": {"type": "string"}},
-                                    "model_selection": fanout_model_selection_schema(),
+                                    "requested_model_policy": requested_model_policy_schema(),
                                     "reasoning": fanout_reasoning_schema()
                                 },
                                 "required": ["description", "prompt"]
@@ -2041,7 +2063,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean"},
                                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
-                                "model_selection": fanout_model_selection_schema(),
+                                "requested_model_policy": requested_model_policy_schema(),
                                 "reasoning": fanout_reasoning_schema()
                             }
                         },
@@ -2680,16 +2702,22 @@ mod tests {
         );
         assert!(slot_props.get("slot_id").is_none());
         assert_eq!(
-            slot_props["model_selection"]["required"],
-            json!(["offering_id"])
+            slot_props["requested_model_policy"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
         );
         assert_eq!(
             slot_props["reasoning"]["oneOf"].as_array().unwrap().len(),
             4
         );
         assert_eq!(
-            params["properties"]["defaults"]["properties"]["model_selection"]["required"],
-            json!(["offering_id"])
+            params["properties"]["defaults"]["properties"]["requested_model_policy"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
         );
         assert!(params["properties"]["defaults"]["properties"]["reasoning"].is_object());
         assert_eq!(
