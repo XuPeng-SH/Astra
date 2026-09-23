@@ -12244,6 +12244,12 @@ impl ServerAgenticLoopHost {
             astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
         )
         .map_err(|(_, body)| body.0.detail)?;
+        if !admitted.has_same_execution_identity(&execution) {
+            return Err(
+                "selected model Offering changed provider/model identity during revalidation; select the updated Offering to continue"
+                    .to_string(),
+            );
+        }
         self.admitted_model_execution = Some(execution);
         self.clear_resolved_llm_config();
         Ok(())
@@ -48565,14 +48571,28 @@ mod tests {
         assert_eq!(second.api_key, "rotated-secret");
         assert_eq!(second.base_url, "https://provider-b.example/v1");
 
+        sqlx::query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
+            .bind(r#"{"wire_model_name":"different-upstream-model"}"#)
+            .bind(&offering_id)
+            .execute(pool)
+            .await
+            .expect("change the selected Offering's upstream model");
+        let drift_result = host.resolve_llm_config_for_state(&state).await;
+
+        sqlx::query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
+            .bind("{}")
+            .bind(&offering_id)
+            .execute(pool)
+            .await
+            .expect("restore the selected upstream model");
+        let restored_result = host.resolve_llm_config_for_state(&state).await;
+
         sqlx::query("UPDATE infra_llm_models SET is_active = 0 WHERE model_id = ?")
             .bind(&offering_id)
             .execute(pool)
             .await
             .expect("disable catalog Offering");
-        host.resolve_llm_config_for_state(&state)
-            .await
-            .expect_err("revoked Offering must block the next provider request");
+        let inactive_result = host.resolve_llm_config_for_state(&state).await;
 
         sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
             .bind(&offering_id)
@@ -48580,6 +48600,15 @@ mod tests {
             .await
             .expect("clean catalog Offering");
         astra_services::models::invalidate_active_llm_model_resolution_cache();
+
+        let drift =
+            drift_result.expect_err("same Offering must not silently switch upstream models");
+        assert!(drift.contains("changed provider/model identity"), "{drift}");
+        let restored = restored_result.expect("restored selected model remains executable");
+        assert_eq!(restored.api_key, "rotated-secret");
+        let inactive =
+            inactive_result.expect_err("revoked Offering must block the next provider request");
+        assert!(inactive.contains("is disabled"), "{inactive}");
     }
 
     #[tokio::test]

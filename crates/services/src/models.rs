@@ -865,6 +865,27 @@ pub struct AdmittedModelExecution {
 }
 
 impl AdmittedModelExecution {
+    /// Whether refreshed admission still refers to the same selected model.
+    ///
+    /// Credentials, endpoint URLs, and capability metadata may legitimately
+    /// rotate while an Offering remains selected. The provider and effective
+    /// upstream model name may not: changing either would silently replace the
+    /// model the caller authorized for this execution.
+    #[must_use]
+    pub fn has_same_execution_identity(&self, other: &Self) -> bool {
+        self.offering_id == other.offering_id
+            && self.access_kind == other.access_kind
+            && self.execution_placement == other.execution_placement
+            && self.provider == other.provider
+            && self.upstream_model_name() == other.upstream_model_name()
+    }
+
+    /// Name sent in the provider request's `model` field.
+    #[must_use]
+    pub fn upstream_model_name(&self) -> &str {
+        self.wire_model_name.as_deref().unwrap_or(&self.model_name)
+    }
+
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
@@ -6512,6 +6533,37 @@ mod tests {
         .expect("admitted execution");
 
         assert_eq!(execution.fixed_temperature, Some(0.6));
+    }
+
+    #[test]
+    fn admitted_execution_identity_allows_material_rotation_but_not_model_drift() {
+        let mut model = sample_resolved_active_model("selected-alias");
+        model.wire_model_name = Some("upstream-model-a".to_string());
+        let selected = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: "selected-offering".to_string(),
+            model,
+        })
+        .expect("admitted execution");
+
+        let refreshed_material = AdmittedModelExecution {
+            api_key: "rotated-secret".to_string(),
+            base_url: "https://rotated-endpoint.example/v1".to_string(),
+            context_window: Some(256_000),
+            ..selected.clone()
+        };
+        assert!(selected.has_same_execution_identity(&refreshed_material));
+
+        let changed_upstream = AdmittedModelExecution {
+            wire_model_name: Some("upstream-model-b".to_string()),
+            ..selected.clone()
+        };
+        assert!(!selected.has_same_execution_identity(&changed_upstream));
+
+        let changed_provider = AdmittedModelExecution {
+            provider: "anthropic".to_string(),
+            ..selected.clone()
+        };
+        assert!(!selected.has_same_execution_identity(&changed_provider));
     }
 
     #[test]
