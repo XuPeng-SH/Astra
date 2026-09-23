@@ -52,6 +52,7 @@ pub fn accepted_request_judgment_result(
         mutation_completion_scope: decision.mutation_completion_scope(),
         execution_topology: decision.execution_topology(),
         required_capabilities: decision.required_capabilities().to_vec(),
+        delegation_model_requirement: crate::work_admission_judgment::WorkAdmissionTruth::Uncertain,
     };
     request_judgment_result(&Ok(classification))
 }

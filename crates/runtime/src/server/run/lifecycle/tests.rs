@@ -3905,6 +3905,7 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
     }
 
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "prune-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
@@ -4033,6 +4034,7 @@ async fn shutdown_fence_reports_pending_session_child_reconciliation_after_root_
         },
     );
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
@@ -4120,6 +4122,7 @@ async fn shutdown_stays_bounded_while_stalled_child_control_remains_pending() {
         },
     );
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
@@ -4202,6 +4205,7 @@ async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
         "transport": "server_local"
     });
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
@@ -4285,6 +4289,7 @@ async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
     let spawner =
         DynamicAgentSpawner::new(router).with_executor(Arc::new(WaitingLifecycleExecutor));
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
@@ -4837,6 +4842,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
         model_selection: None,
+        delegated_model_requirements: Default::default(),
         fanout_slot: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         model: None,
@@ -6728,7 +6734,8 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
         "root-agent",
     ));
     let root = executor.runtime_context_for_config(&child).await.unwrap();
-    let child_constraints = spawn_child_request_constraints(&root.request_constraints, &child);
+    let child_constraints =
+        spawn_child_request_constraints(&root.request_constraints, &child).unwrap();
     executor
         .register_child_runtime_context(
             &root,
@@ -6831,6 +6838,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
         .await;
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
@@ -7190,7 +7198,7 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         .register_child_runtime_context(
             &parent,
             &child,
-            spawn_child_request_constraints(&parent.request_constraints, &child),
+            spawn_child_request_constraints(&parent.request_constraints, &child).unwrap(),
             parent
                 .admitted_model_execution
                 .clone()
@@ -7222,7 +7230,7 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         .register_child_runtime_context(
             &parent,
             &sibling,
-            spawn_child_request_constraints(&parent.request_constraints, &sibling),
+            spawn_child_request_constraints(&parent.request_constraints, &sibling).unwrap(),
             parent
                 .admitted_model_execution
                 .clone()
@@ -8087,7 +8095,7 @@ fn spawn_child_constraints_intersect_parent_and_agent_allowlists() {
     );
     let config = test_spawn_run_config(vec!["bash", "read_file"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
 
     assert_eq!(
         constraints.allowed_tools.unwrap(),
@@ -8154,7 +8162,7 @@ fn spawn_child_constraints_preserve_parent_when_child_allows_all() {
     );
     let config = test_spawn_run_config(vec!["*"], false);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
 
     assert_eq!(
         constraints.allowed_tools.unwrap(),
@@ -8176,7 +8184,7 @@ fn assigned_work_child_keeps_only_its_execution_tools_and_mandatory_settlement()
         },
     );
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
     assert_eq!(
         constraints.allowed_tools.unwrap(),
         ["settle_work_item", "web_fetch"]
@@ -8191,7 +8199,7 @@ fn spawn_child_constraints_read_only_wildcard_gets_read_only_tools() {
     let parent = RequestConstraints::default();
     let config = test_spawn_run_config(vec!["*"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
     let allowed = constraints.allowed_tools.as_ref().unwrap();
 
     assert!(allowed.contains("read_file"));
@@ -8213,7 +8221,7 @@ fn spawn_child_constraints_read_only_wildcard_keeps_only_enabled_network_reads()
     );
     let config = test_spawn_run_config(vec!["*"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
     let allowed = constraints.allowed_tools.as_ref().unwrap();
 
     assert!(allowed.contains("web_fetch"));
@@ -8226,7 +8234,7 @@ fn spawn_child_constraints_read_only_wildcard_respects_explicit_network_disable(
     let parent = RequestConstraints::new(None, Some(HashSet::new()), None, None);
     let config = test_spawn_run_config(vec!["*"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
     let allowed = constraints.allowed_tools.as_ref().unwrap();
 
     assert!(!allowed.contains("web_fetch"));
@@ -23217,6 +23225,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             "same-run",
             None,
             &edge,
+            &constraints,
         )
         .unwrap();
     let messages = vec![
@@ -23226,6 +23235,16 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     facts.messages = messages.clone();
     facts.original.message = "original task".to_string();
     facts.original.user_intent = "original structured intent".to_string();
+    facts.original.delegated_model_requirements =
+        astra_turn_types::DelegationIntentRequirements::Unconstrained {
+            source: astra_turn_types::DelegationUserRequirementSource {
+                user_id: "test-user".into(),
+                session_id: "same-session".into(),
+                session_turn: 7,
+                applied_intent_id: None,
+                user_intent_digest: "original-digest".into(),
+            },
+        };
     facts.original.session_turn = 7;
     facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
     facts.original.root_user_query_event_id = Some("original-query".to_string());
@@ -23343,6 +23362,21 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(state.messages, messages);
     assert_eq!(state.message, "original task");
     assert_eq!(state.user_intent, "original structured intent");
+    assert_eq!(
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements,
+        astra_turn_types::DelegationIntentRequirements::Unconstrained {
+            source: astra_turn_types::DelegationUserRequirementSource {
+                user_id: "test-user".into(),
+                session_id: "same-session".into(),
+                session_turn: 7,
+                applied_intent_id: None,
+                user_intent_digest: "original-digest".into(),
+            },
+        }
+    );
     assert_eq!(state.session_turn, 7);
     assert_eq!(
         state.canonical_turn_chain_id.as_deref(),
@@ -23439,7 +23473,15 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
     let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
     let constraints = RequestConstraints::default();
     let mut facts = svc
-        .prepare_initial_execution_facts("user", &request, "session", "run", None, &edge)
+        .prepare_initial_execution_facts(
+            "user",
+            &request,
+            "session",
+            "run",
+            None,
+            &edge,
+            &constraints,
+        )
         .unwrap();
     facts.hooks.workspace_root_hint = Some("/app".into());
     facts.original.canonical_turn_chain_id = Some("chain".into());

@@ -212,6 +212,7 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
+        delegated_model_requirements: None,
         interaction_mode: super::engine::effective_requested_interaction_mode(
             request.interaction_mode,
             request.interactive_client,

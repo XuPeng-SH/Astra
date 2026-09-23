@@ -26,11 +26,13 @@ pub struct WorkAdmissionClassification {
     pub mutation_completion_scope: MutationCompletionScope,
     pub execution_topology: WorkExecutionTopology,
     pub required_capabilities: Vec<WorkAdmissionCapability>,
+    /// Presence only; never authorizes or resolves a delegated model.
+    pub delegation_model_requirement: WorkAdmissionTruth,
 }
 
 /// Threshold decisions are not execution authority. Discrete model answers retain
 /// their provenance instead of being presented as calibrated probabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkAdmissionTruth {
     Yes,
@@ -74,6 +76,7 @@ const SCOPES: &[&str] = &["workspace", "external", "mixed", "unknown"];
 const DOMAINS: &[&str] = &[
     "none", "github", "git", "code", "memory", "web", "system", "database",
 ];
+const DELEGATION_MODEL_REQUIREMENT_ID: &str = "delegation.model_requirement";
 
 #[must_use]
 pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> JudgmentRequest {
@@ -135,6 +138,10 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
     add(
         "capability.web".into(),
         "Web access required; local paths alone do not count.".into(),
+    );
+    add(
+        DELEGATION_MODEL_REQUIREMENT_ID.into(),
+        "User explicitly requires a model or reasoning setting for a delegated task. Quotes, mentions, and primary-only settings do not count; unclear scope means uncertain.".into(),
     );
     JudgmentRequest {
         schema_version: JUDGMENT_SCHEMA_VERSION,
@@ -204,7 +211,7 @@ fn decode_evidence(
     TurnIntentJudgeError,
 > {
     let canonical = work_admission_classification_request(&TurnIntentJudgeContext::default());
-    if request.questions != canonical.questions {
+    if request.schema_version != canonical.schema_version || request.questions != canonical.questions {
         return Err(malformed(raw, "noncanonical classification questions"));
     }
     let normalized = normalize_judgment_response(request, raw, model, provenance)
@@ -361,6 +368,7 @@ fn validate_necessary_evidence(
     // afresh; optional evidence is not silently promoted into authority.
     let locked_fields = necessary
         .into_iter()
+        .chain(std::iter::once(DELEGATION_MODEL_REQUIREMENT_ID.into()))
         .filter_map(|id| match truth(&id) {
             Yes => Some((id, true)),
             No => Some((id, false)),
@@ -457,6 +465,7 @@ pub fn parse_work_admission_classification(
             WorkExecutionTopology::Primary
         },
         required_capabilities,
+        delegation_model_requirement: evidence[DELEGATION_MODEL_REQUIREMENT_ID].truth,
     })
 }
 
@@ -684,7 +693,7 @@ mod tests {
         assert!(request_bytes <= baseline_bytes + 1_280);
         assert!(messages_bytes <= baseline_messages_bytes + 1_280);
         assert!(
-            request_bytes < 12_000,
+            request_bytes < 13_000,
             "typed request: {request_bytes} bytes"
         );
         assert!(
