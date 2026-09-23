@@ -554,6 +554,7 @@ mod tests {
             full_llm_capture: false,
             agent_id: None,
             model: None,
+            expected_model_name: None,
             model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
             model_selection: None,
             resolved_model_selection: None,

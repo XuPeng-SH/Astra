@@ -1228,7 +1228,7 @@ failure.
 
 Clients obtain one Server projection containing Model Access, effective Offerings, default selection, typed statuses/actions, and a catalog revision.
 
-Chat submits only the user selection:
+Normal chat clients submit only the user selection:
 
 ```json
 {
@@ -1239,6 +1239,12 @@ Chat submits only the user selection:
   }
 }
 ```
+
+A locally orchestrated CLI child run may also send `expected_model_name` after
+batch preflight. It is only an expected-value assertion: Server freshly admits
+the selected Offering and returns `model_identity_changed` if its resolved name
+drifted. The field never authorizes a route or replaces Offering admission.
+Ordinary clients omit it.
 
 Normal run requests never contain:
 
