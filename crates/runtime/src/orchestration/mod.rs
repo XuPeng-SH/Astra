@@ -69,7 +69,7 @@ pub use spawner::{
     DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
     FANOUT_GROUP_CANCELLED_EVENT_TYPE, FanoutGroupCancellation, FanoutParentAdmission,
     InheritedChildPrefix, PermissionSummary, PreparedSpawn, ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext,
-    SpawnError, SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult,
+    PreparedSpawnModelIdentity, SpawnError, SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult,
     SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState,
     WaitForAgentOutcome, project_subrun_status_to_spawn,
     spawn_completion_status_from_finish_reason,

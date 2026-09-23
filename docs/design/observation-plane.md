@@ -222,6 +222,17 @@ failed_at
 
 ## Model request attribution and usage
 
+For local CLI child runs, the existing `agent_spawned` journal and Trace event
+carry a credential-free `model_configuration` snapshot: effective thinking and
+first-output cap at spawn, the requested Offering when known, and a prepared
+Offering/model identity when available. `catalog_resolved` means directory
+resolution only; `admission_validated` means batch admission passed before
+launch. The requested Offering may be inherited, not explicitly chosen by the
+user. These are spawn-time configuration facts, never proof that a provider
+accepted the request or consumed a particular reasoning level. Actual request
+and usage attribution remains with inference evidence; absent evidence is
+unknown, not zero.
+
 The inference ledger stores content-free accepted/terminal request diagnostics
 in `model_request_context_events`. These records complement `agent_events` and
 are exposed through the existing owner-scoped request queries and session
