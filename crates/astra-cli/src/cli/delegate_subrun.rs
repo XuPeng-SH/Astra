@@ -361,9 +361,12 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             } else {
                 let index = slots.len();
                 slots.push(astra_server_types::ModelAdmissionSlotV1 {
-                    offering_id: offering_id.to_string(),
+                    selector: astra_turn_types::ModelSelector::OfferingId {
+                        offering_id: offering_id.to_string(),
+                    },
                     max_output_tokens: request.max_output_tokens,
                     reasoning,
+                    inherited_reasoning: None,
                 });
                 distinct.insert(key, index);
                 index
@@ -380,6 +383,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 astra_server_types::ModelAdmissionRequestV1 { slots },
             )
             .await?
+            .into_iter()
+            .map(|admitted| admitted.model)
+            .collect::<Vec<_>>()
         };
         requests
             .iter()

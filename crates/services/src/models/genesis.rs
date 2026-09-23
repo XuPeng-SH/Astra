@@ -324,6 +324,10 @@ impl DatabaseModelService {
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
         Ok(AdmittedModelExecution {
             offering_id: item.offering_id.clone(),
+            source_identity: Some(crate::models::ResolvedModelSourceIdentity {
+                provider: "openai".into(),
+                access_label: ModelAccessKind::AstraCloud.source_label().to_string(),
+            }),
             access_kind: ModelAccessKind::AstraCloud,
             execution_placement: ModelExecutionPlacement::Server,
             model_name: item.name.clone(),

@@ -2760,6 +2760,7 @@ impl DelegationEngine {
                         astra_services::runs::ResolvedModelSelection {
                             offering_id: prepared.offering_id.clone(),
                             model_name: prepared.model_name.clone(),
+                            source_identity: None,
                         }
                     }),
                     ..Default::default()
@@ -7083,6 +7084,7 @@ mod tests {
                     resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
                         offering_id: offering_id.to_string(),
                         model_name: format!("resolved-{offering_id}"),
+                        source_identity: None,
                     }),
                     generation_controls: Some(RunGenerationControls {
                         thinking: ThinkingConfig::ModelDefault,
@@ -12120,6 +12122,7 @@ mod tests {
                     resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
                         offering_id: "offer-parent".into(),
                         model_name: "parent-model".into(),
+                        source_identity: None,
                     }),
                     generation_controls: Some(crate::server::run::engine::RunGenerationControls {
                         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,

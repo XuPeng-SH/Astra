@@ -722,7 +722,11 @@ impl std::fmt::Debug for RuntimeMcpBindingRequest {
 pub struct ResolvedModelSelection {
     pub offering_id: String,
     pub model_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<crate::models::ResolvedModelSourceIdentity>,
 }
+
+pub use crate::models::ResolvedModelSourceIdentity;
 
 pub const RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION: &str = "astra-semantic-read-mcp-v1";
 
@@ -38518,6 +38522,7 @@ mod tests {
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
                 offering_id: "offer-gpt-4".to_string(),
+                source_identity: None,
                 access_kind: crate::ModelAccessKind::SelfHosted,
                 execution_placement: crate::ModelExecutionPlacement::Server,
                 model_name: "gpt-4".to_string(),
@@ -38725,6 +38730,7 @@ mod tests {
             resolved_model_selection: Some(ResolvedModelSelection {
                 offering_id: "offer-gpt-4".to_string(),
                 model_name: "gpt-4".to_string(),
+                source_identity: None,
             }),
             admitted_model_execution: None,
             capability_descriptors: None,

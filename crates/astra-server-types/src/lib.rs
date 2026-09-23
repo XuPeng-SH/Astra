@@ -46,7 +46,8 @@ pub use edge_ws_protocol::{
     EDGE_TOOL_TIMEOUT_SECS, EdgeClientMessage, EdgeServerMessage, MAX_EDGE_TOOL_TIMEOUT_SECS,
 };
 pub use model_admission::{
-    ModelAdmissionRequestV1, ModelAdmissionResponseV1, ModelAdmissionResultV1, ModelAdmissionSlotV1,
+    ModelAdmissionReasoningInheritanceV1, ModelAdmissionRequestV1, ModelAdmissionResponseV1,
+    ModelAdmissionResultV1, ModelAdmissionSlotV1,
 };
 pub use session_run_tree::{
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,

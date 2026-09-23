@@ -1572,7 +1572,7 @@ fn chat_request_into_data_maps_all_fields() {
             offering_id: "offer-gpt-4".into(),
         }),
         requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: astra_turn_types::ModelSelection {
+            selector: astra_turn_types::ModelSelector::OfferingId {
                 offering_id: "offer-gpt-4".into(),
             },
         }),
@@ -1580,6 +1580,7 @@ fn chat_request_into_data_maps_all_fields() {
         resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
             offering_id: "offer-gpt-4".into(),
             model_name: "gpt-4".into(),
+            source_identity: None,
         }),
         capability_descriptors: None,
         agent_bindings: Vec::new(),
@@ -1661,7 +1662,7 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(
         data.requested_model_policy,
         Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: astra_turn_types::ModelSelection {
+            selector: astra_turn_types::ModelSelector::OfferingId {
                 offering_id: "offer-gpt-4".into(),
             },
         })

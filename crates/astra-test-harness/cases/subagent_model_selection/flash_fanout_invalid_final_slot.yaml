@@ -8,7 +8,7 @@ prompt: |
   "first slot" for slot 0 and "second slot" for slot 1. Slot 0 asks for
   the exact reply FLASH-VALID-SLOT and inherits your model. Slot 1 asks for
   FLASH-INVALID-SLOT and explicitly sets requested_model_policy to
-  {"mode":"fixed","selection":{"offering_id":"invalid-offering-no-such-id"}}.
+  {"mode":"fixed","selector":{"kind":"offering_id","offering_id":"invalid-offering-no-such-id"}}.
   Both slots are explore.
   Do not retry, replace, or launch separate agents. Report the admission
   failure without claiming either slot ran. Do not call Reflect or any other
@@ -39,7 +39,7 @@ criteria:
   - type: journal_tool_json
     name: agent_fanout
     document: arguments
-    path: /slots/1/requested_model_policy/selection/offering_id
+    path: /slots/1/requested_model_policy/selector/offering_id
     equals: invalid-offering-no-such-id
   - type: journal_tool_json
     name: agent_fanout

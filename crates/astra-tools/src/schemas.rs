@@ -1295,7 +1295,7 @@ macro_rules! heap_schema_vec {
 
 fn requested_model_policy_schema() -> Value {
     json!({
-        "description": "Requested model behavior, distinct from the resolved Offering. Omission applies any trusted user model requirement before ordinary parent inheritance. A fixed selection requires an exact authorized Offering ID; never guess one from a display name. If the user names a model but no exact Offering ID is available, omit this field so runtime can apply the trusted requirement. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto is currently unavailable.",
+        "description": "Requested model behavior, distinct from the resolved Offering. Omission applies any trusted user model requirement before ordinary parent inheritance. A fixed selector may use an exact Offering ID or an exact configured model name, optionally qualified by its exact provider/access source; never put a display name in offering_id and never guess an Offering ID. A configured name must resolve to exactly one authorized active Chat model or admission fails before any child starts. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto is currently unavailable.",
         "oneOf": [
             {
                 "type": "object",
@@ -1307,14 +1307,31 @@ fn requested_model_policy_schema() -> Value {
                 "type": "object",
                 "properties": {
                     "mode": {"const": "fixed"},
-                    "selection": {
-                        "type": "object",
-                        "properties": {"offering_id": {"type": "string", "minLength": 1, "maxLength": 64}},
-                        "required": ["offering_id"],
-                        "additionalProperties": false
+                    "selector": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "offering_id"},
+                                    "offering_id": {"type": "string", "minLength": 1, "maxLength": 64}
+                                },
+                                "required": ["kind", "offering_id"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "configured_name"},
+                                    "model_name": {"type": "string", "minLength": 1, "maxLength": 256},
+                                    "source": {"type": "string", "minLength": 1, "maxLength": 128}
+                                },
+                                "required": ["kind", "model_name"],
+                                "additionalProperties": false
+                            }
+                        ]
                     }
                 },
-                "required": ["mode", "selection"],
+                "required": ["mode", "selector"],
                 "additionalProperties": false
             },
             {
@@ -1895,7 +1912,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued`, then the receiver emits an applied acknowledgement at its next model boundary.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Later `get_result` calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
-         Model choice uses `requested_model_policy`, not a `model` field. Never derive an Offering ID from a display name; when the user names a model but no exact authorized Offering ID is available, omit the policy and let runtime apply the trusted requirement.\n\n\
+         Model choice uses `requested_model_policy`, not a `model` field. A fixed selector can use an exact configured model name (and optional exact source) without an Offering ID; never disguise that name as an Offering ID. Runtime resolves it to one authorized Offering before child admission.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
