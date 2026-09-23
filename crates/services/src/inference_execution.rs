@@ -8392,7 +8392,7 @@ fn projected_cache_read_share(
         .then(|| usage.input.cache_read_tokens as f64 / total as f64)
 }
 
-fn projected_auxiliary_usage(
+pub(crate) fn projected_auxiliary_usage(
     protocol: &str,
     status: &str,
     counts: [i64; 4],

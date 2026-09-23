@@ -271,6 +271,15 @@ Usage coverage is independent of request outcome:
 - `unavailable`: usage and measured diagnostic fields are absent. Placeholder
   zeroes in legacy records are not evidence of zero-token billing.
 
+Session Audit request usage reads retained physical provider attempts for the
+authenticated owner and session. It counts failures, cancellation and unknown
+delivery as attempts; each token lane reports a known sum and the number of
+attempts that observed that lane. A missing lane is unknown, not zero. This
+snapshot is not proof that retained records cover the session's lifetime.
+Historical cost remains unavailable until the execution ledger captures an
+Offering-specific price basis at request time; current catalog prices or a
+display model name cannot price historical requests reliably.
+
 Live runtime and feedback cache-read percentages require a positive observed
 input-token denominator. With no input measurement they display `unknown`, not
 `0%`; an observed positive input with zero cache reads may display `0%`.
