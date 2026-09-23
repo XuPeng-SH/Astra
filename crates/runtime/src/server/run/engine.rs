@@ -1605,22 +1605,71 @@ impl RunEngine {
         retry_of: Option<&str>,
         context: RunStartContext,
     ) -> Result<RunExecutionAuthority, String> {
-        let record = self
-            .build_run_start_record(
-                run_id,
-                user_id,
-                session_id,
-                parent_run_id,
-                delegation_id,
-                agent_id,
-                retry_of,
-                context,
-            )
-            .await?;
+        self.start_run_ext_with_context_with_deadline(
+            run_id,
+            user_id,
+            session_id,
+            parent_run_id,
+            delegation_id,
+            agent_id,
+            retry_of,
+            context,
+            None,
+        )
+        .await
+    }
+
+    /// Start a durable run within the caller's execution deadline. If the
+    /// database deadline races commit acknowledgement, the store must prove the
+    /// exact durable receipt before returning execution authority. Repairable
+    /// projection work is best-effort and shares the same deadline.
+    pub(crate) async fn start_run_ext_with_context_with_deadline(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: Option<&str>,
+        delegation_id: Option<&str>,
+        agent_id: Option<&str>,
+        retry_of: Option<&str>,
+        context: RunStartContext,
+        execution_deadline: Option<tokio::time::Instant>,
+    ) -> Result<RunExecutionAuthority, String> {
+        let build_record = self.build_run_start_record(
+            run_id,
+            user_id,
+            session_id,
+            parent_run_id,
+            delegation_id,
+            agent_id,
+            retry_of,
+            context,
+        );
+        let record = match execution_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, build_record)
+                .await
+                .map_err(|_| "sub-run deadline expired before durable admission".to_string())??,
+            None => build_record.await?,
+        };
+        if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err("sub-run deadline expired before durable admission".to_string());
+        }
         let owner_generation = record.run_generation;
-        self.store.insert_run(record).await?;
-        self.project_delegation_run_if_needed(user_id, run_id, None)
-            .await?;
+        match execution_deadline {
+            Some(deadline) => {
+                self.store
+                    .insert_run_with_deadline(record, deadline)
+                    .await?;
+            }
+            None => self.store.insert_run(record).await?,
+        }
+        self.project_delegation_run_best_effort_with_deadline(
+            user_id,
+            run_id,
+            "run create",
+            execution_deadline,
+        )
+        .await;
         Ok(RunExecutionAuthority { owner_generation })
     }
 
@@ -1642,8 +1691,8 @@ impl RunEngine {
             .claim_run_start(record, requested_session_id)
             .await?;
         if matches!(claim, DurableRunStartClaim::Started { .. }) {
-            self.project_delegation_run_if_needed(user_id, run_id, None)
-                .await?;
+            self.project_delegation_run_best_effort(user_id, run_id, "run claim")
+                .await;
         }
         Ok(claim)
     }
@@ -2694,6 +2743,60 @@ impl RunEngine {
             .map_err(|error| {
                 format!("state projection update failed for delegated run {run_id}: {error}")
             })
+    }
+
+    async fn project_delegation_run_best_effort(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        operation: &str,
+    ) {
+        self.project_delegation_run_best_effort_with_deadline(user_id, run_id, operation, None)
+            .await;
+    }
+
+    async fn project_delegation_run_best_effort_with_deadline(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        operation: &str,
+        execution_deadline: Option<tokio::time::Instant>,
+    ) {
+        if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            tracing::warn!(
+                user_id,
+                run_id,
+                operation,
+                "durable run admitted but delegation projection skipped after execution deadline"
+            );
+            return;
+        }
+        let projection = self.project_delegation_run_if_needed(user_id, run_id, None);
+        let projection_result = if let Some(deadline) = execution_deadline {
+            match tokio::time::timeout_at(deadline, projection).await {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        operation,
+                        "durable run admitted but delegation projection exceeded execution deadline"
+                    );
+                    return;
+                }
+            }
+        } else {
+            Some(projection.await)
+        };
+        if let Some(Err(error)) = projection_result {
+            tracing::warn!(
+                user_id,
+                run_id,
+                operation,
+                error = %error,
+                "durable run admitted but delegation projection refresh failed"
+            );
+        }
     }
 
     /// Persist token/tool usage counters.
@@ -7807,6 +7910,7 @@ mod tests {
             full_llm_capture: false,
             agent_id: None,
             model: None,
+            expected_model_name: None,
             model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
             model_selection: None,
             resolved_model_selection: None,

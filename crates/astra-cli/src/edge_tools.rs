@@ -1708,6 +1708,7 @@ impl ToolExecutor {
     pub(crate) fn publish_parent_model_reasoning(
         &self,
         offering_id: Option<&str>,
+        resolved_model_name: Option<&str>,
         thinking: astra_turn_core::thinking_config::ThinkingConfig,
     ) {
         *self.parent_model_reasoning.lock_recover() = offering_id.map(|offering_id| {
@@ -1715,6 +1716,7 @@ impl ToolExecutor {
                 selection: astra_turn_types::ModelSelection {
                     offering_id: offering_id.to_string(),
                 },
+                resolved_model_name: resolved_model_name.map(str::to_string),
                 thinking,
             }
         });
@@ -6379,12 +6381,17 @@ mod tests {
             .with_spawn_context(fanout_test_context(test_spawner()));
         executor.publish_parent_model_reasoning(
             Some("offer-a"),
+            Some("model-a"),
             ThinkingConfig::Enabled {
                 budget_tokens: 8192,
             },
         );
         let admitted = executor.spawn_context_for_admission().unwrap();
-        executor.publish_parent_model_reasoning(Some("offer-b"), ThinkingConfig::Off);
+        executor.publish_parent_model_reasoning(
+            Some("offer-b"),
+            Some("model-b"),
+            ThinkingConfig::Off,
+        );
         let updated = executor.spawn_context_for_admission().unwrap();
         let admitted = admitted.parent_model_reasoning.unwrap();
         assert_eq!(admitted.selection.offering_id, "offer-a");
@@ -6397,7 +6404,7 @@ mod tests {
         let updated = updated.parent_model_reasoning.unwrap();
         assert_eq!(updated.selection.offering_id, "offer-b");
         assert_eq!(updated.thinking, ThinkingConfig::Off);
-        executor.publish_parent_model_reasoning(None, ThinkingConfig::Off);
+        executor.publish_parent_model_reasoning(None, None, ThinkingConfig::Off);
         assert!(
             executor
                 .spawn_context_for_admission()

@@ -1357,6 +1357,10 @@ pub struct ChatRequest {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// Expected resolved name from preflighted CLI sub-runs. Used only to
+    /// reject identity drift after fresh server-side admission.
+    #[serde(default)]
+    pub expected_model_name: Option<String>,
     #[serde(default)]
     pub resolved_model_selection: Option<astra_services::runs::ResolvedModelSelection>,
     #[serde(default)]
@@ -2576,6 +2580,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         full_llm_capture: false,
         agent_id: request.agent_id,
         model: None,
+        expected_model_name: request.expected_model_name,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: request.model_selection,
         resolved_model_selection: request.resolved_model_selection,

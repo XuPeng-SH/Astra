@@ -980,6 +980,10 @@ pub struct ChatRequestData {
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
+    /// Optional exact-name assertion for a client-prepared child Offering.
+    /// This is not execution authority; the Server freshly admits the
+    /// Offering and rejects the request if the resolved name has drifted.
+    pub expected_model_name: Option<String>,
     pub model_selection_mode: ModelSelectionMode,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
@@ -1070,6 +1074,7 @@ impl std::fmt::Debug for ChatRequestData {
             .field("run_start_idempotency", &self.run_start_idempotency)
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
+            .field("expected_model_name", &self.expected_model_name)
             .field("model_selection_mode", &self.model_selection_mode)
             .field("model_selection", &self.model_selection)
             .field("resolved_model_selection", &self.resolved_model_selection)
@@ -4706,6 +4711,22 @@ pub trait RunStateStore: Send + Sync {
 
     /// Insert a new run record.
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String>;
+
+    /// Insert a run without allowing durable admission to exceed the caller's
+    /// execution deadline. Implementations with an authoritative store should
+    /// reconcile a timed-out commit before returning success; an unknown
+    /// outcome must remain an error so callers never dispatch the child.
+    async fn insert_run_with_deadline(
+        &self,
+        record: DurableRunRecord,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        tokio::time::timeout_at(deadline, self.insert_run(record))
+            .await
+            .map_err(|_| {
+                String::from("durable run admission exceeded its deadline; outcome is unknown")
+            })?
+    }
 
     /// Atomically insert a caller-selected run identity or return the session
     /// already bound to that identity.
@@ -10226,6 +10247,7 @@ const FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(
 // Orphan recovery is a retrying background worker. Keep each attempt short so
 // one contended run cannot starve the rest of the recovery scan.
 const BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const RUN_START_TIMEOUT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_CONTROL_LOCK_WAIT_TIMEOUT_SECS: i64 = 3;
 
 #[derive(Clone, Copy)]
@@ -12317,12 +12339,16 @@ impl DatabaseRunStateStore {
     ) -> DbStoreResult<Option<DurableRunRecord>> {
         let sql =
             format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_run_metadata_for_user", run_id, source))?;
         let row = sqlx::query(&sql)
             .bind(user_id)
             .bind(run_id)
-            .fetch_optional(self.pool.get())
+            .fetch_optional(connection.connection_mut())
             .await
             .map_err(|source| db_error("load_run_metadata_for_user", run_id, source))?;
+        connection.release();
         row.map(run_record_from_row).transpose()
     }
 
@@ -13190,6 +13216,42 @@ fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
     Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
 }
 
+fn durable_run_start_receipt_matches(
+    expected: &DurableRunRecord,
+    actual: &DurableRunRecord,
+) -> bool {
+    expected.run_id == actual.run_id
+        && expected.user_id == actual.user_id
+        && expected.session_id == actual.session_id
+        && expected.run_generation == actual.run_generation
+        && expected.parent_run_id == actual.parent_run_id
+        && expected.root_run_id.as_deref().unwrap_or(&expected.run_id)
+            == actual.root_run_id.as_deref().unwrap_or(&actual.run_id)
+        && expected
+            .ancestor_path
+            .as_deref()
+            .unwrap_or(&expected.run_id)
+            == actual.ancestor_path.as_deref().unwrap_or(&actual.run_id)
+        && expected.depth == actual.depth
+        && expected.delegation_id == actual.delegation_id
+        && expected.agent_id == actual.agent_id
+        && expected.retry_of == actual.retry_of
+        && expected
+            .retry_scope
+            .as_deref()
+            .unwrap_or(DEFAULT_RETRY_SCOPE)
+            == actual.retry_scope.as_deref().unwrap_or(DEFAULT_RETRY_SCOPE)
+        && expected.last_event_idx <= actual.last_event_idx
+        && expected.agent_binding_id == actual.agent_binding_id
+        && expected.agent_binding_name == actual.agent_binding_name
+        && expected.agent_binding_schema_version == actual.agent_binding_schema_version
+        && expected.model_offering_id == actual.model_offering_id
+        && expected.resolved_model_name == actual.resolved_model_name
+        && expected.runtime_profile == actual.runtime_profile
+        && expected.start_request_fingerprint == actual.start_request_fingerprint
+        && expected.work_binding == actual.work_binding
+}
+
 impl DatabaseRunStateStore {
     async fn existing_run_start_claim(
         &self,
@@ -13314,9 +13376,250 @@ impl DatabaseRunStateStore {
 
     async fn insert_run_record(
         &self,
+        record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String> {
+        self.insert_run_record_with_deadline(record, claim_existing, requested_session_id, None)
+            .await
+    }
+
+    async fn insert_run_record_with_deadline(
+        &self,
         mut record: DurableRunRecord,
         claim_existing: bool,
         requested_session_id: Option<&str>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<DurableRunStartClaim, String> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err("durable run admission deadline expired before the insert began".into());
+        }
+        let initial_event_rows = self.prepare_initial_run_event_rows(&mut record)?;
+        let receipt_record = deadline.map(|_| record.clone());
+        let transaction = self.insert_run_record_transaction(
+            record,
+            claim_existing,
+            requested_session_id,
+            &initial_event_rows,
+        );
+        let claim = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, transaction).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let expected = receipt_record
+                        .as_ref()
+                        .expect("deadline-bound run insertion keeps its receipt identity");
+                    let owner_generation = self
+                        .reconcile_run_start_receipt(expected, &initial_event_rows)
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "durable run admission deadline expired; commit outcome is unknown: {error}"
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            "durable run admission deadline expired; exact commit receipt was not established and no child was dispatched".to_string()
+                        })?;
+                    tracing::warn!(
+                        user_id = %expected.user_id,
+                        session_id = %expected.session_id,
+                        run_id = %expected.run_id,
+                        "reconciled timed-out run-start commit from exact durable receipts"
+                    );
+                    DurableRunStartClaim::Started { owner_generation }
+                }
+            },
+            None => transaction.await?,
+        };
+
+        if matches!(claim, DurableRunStartClaim::Started { .. }) {
+            let receipt = initial_event_rows
+                .first()
+                .expect("run insertion always has at least one receipt event");
+            let projection = self.sync_projection_for_user(
+                &receipt.user_id,
+                &receipt.session_id,
+                &receipt.run_id,
+            );
+            let projection_result = match deadline {
+                Some(deadline) if tokio::time::Instant::now() >= deadline => None,
+                Some(deadline) => tokio::time::timeout_at(deadline, projection).await.ok(),
+                None => Some(projection.await),
+            };
+            if let Some(Err(error)) = projection_result {
+                tracing::warn!(
+                    user_id = %receipt.user_id,
+                    run_id = %receipt.run_id,
+                    error = %error,
+                    "run create committed but projection refresh failed or exceeded its deadline"
+                );
+            } else if projection_result.is_none() {
+                tracing::warn!(
+                    user_id = %receipt.user_id,
+                    run_id = %receipt.run_id,
+                    "run create committed but projection refresh was skipped at its deadline"
+                );
+            }
+        }
+        Ok(claim)
+    }
+
+    fn prepare_initial_run_event_rows(
+        &self,
+        record: &mut DurableRunRecord,
+    ) -> Result<Vec<RunEventInsertRow>, String> {
+        let mut events = std::mem::take(&mut record.events);
+        if events.is_empty() {
+            events.push(run_created_receipt_event(
+                &record.run_id,
+                &record.session_id,
+            ));
+        }
+        let rows = events
+            .iter()
+            .enumerate()
+            .map(|(event_idx, event)| {
+                build_run_event_insert_row(
+                    &record.user_id,
+                    &record.run_id,
+                    &record.session_id,
+                    record.agent_id.as_deref(),
+                    event_idx as i64,
+                    &self.owner_pod_id,
+                    event,
+                )
+            })
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        record.last_event_idx = rows.last().map_or(-1, |event| event.event_idx);
+        Ok(rows)
+    }
+
+    async fn reconcile_run_start_receipt(
+        &self,
+        expected: &DurableRunRecord,
+        initial_event_rows: &[RunEventInsertRow],
+    ) -> Result<Option<u64>, String> {
+        let receipt_deadline = tokio::time::Instant::now() + RUN_START_TIMEOUT_RECEIPT_TIMEOUT;
+        tokio::time::timeout_at(receipt_deadline, async {
+            for attempt in 0..2 {
+                if let Some(owner_generation) = self
+                    .read_run_start_receipt(expected, initial_event_rows)
+                    .await?
+                {
+                    return Ok(Some(owner_generation));
+                }
+                if attempt == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|_| "bounded run-start receipt check timed out".to_string())?
+    }
+
+    async fn read_run_start_receipt(
+        &self,
+        expected: &DurableRunRecord,
+        expected_events: &[RunEventInsertRow],
+    ) -> Result<Option<u64>, String> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_acquire",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        for expected_event in expected_events {
+            let actual = sqlx::query(
+                "SELECT run_id, event_idx, event_hash FROM agent_run_events
+                 WHERE user_id = ? AND id = ? LIMIT 1",
+            )
+            .bind(&expected_event.user_id)
+            .bind(&expected_event.id)
+            .fetch_optional(connection.connection_mut())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            let Some(actual) = actual else {
+                connection.release();
+                return Ok(None);
+            };
+            let run_id: String = actual.try_get("run_id").map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            let event_idx: i64 = actual.try_get("event_idx").map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            let event_hash: String = actual.try_get("event_hash").map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            if run_id != expected_event.run_id
+                || event_idx != expected_event.event_idx
+                || event_hash != expected_event.event_hash
+            {
+                connection.release();
+                return Ok(None);
+            }
+        }
+        let sql =
+            format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&expected.user_id)
+            .bind(&expected.run_id)
+            .fetch_optional(connection.connection_mut())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_metadata",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        connection.release();
+        let Some(actual) = row
+            .map(run_record_from_row)
+            .transpose()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(durable_run_start_receipt_matches(expected, &actual).then_some(actual.run_generation))
+    }
+
+    async fn insert_run_record_transaction(
+        &self,
+        mut record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+        initial_event_rows: &[RunEventInsertRow],
     ) -> Result<DurableRunStartClaim, String> {
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
@@ -13347,33 +13650,6 @@ impl DatabaseRunStateStore {
             .unwrap_or(DEFAULT_RETRY_SCOPE)
             .to_string();
         validate_retry_scope(&record.run_id, &retry_scope).map_err(|e| e.to_string())?;
-
-        let mut events = std::mem::take(&mut record.events);
-        if events.is_empty() {
-            events.push(run_created_receipt_event(
-                &record.run_id,
-                &record.session_id,
-            ));
-        }
-        let initial_event_rows = events
-            .iter()
-            .enumerate()
-            .map(|(event_idx, event)| {
-                build_run_event_insert_row(
-                    &record.user_id,
-                    &record.run_id,
-                    &record.session_id,
-                    record.agent_id.as_deref(),
-                    event_idx as i64,
-                    &self.owner_pod_id,
-                    event,
-                )
-            })
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
-        record.last_event_idx = initial_event_rows
-            .last()
-            .map_or(-1, |event| event.event_idx);
 
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
@@ -13530,7 +13806,7 @@ impl DatabaseRunStateStore {
         Self::insert_run_event_rows_tx(
             &mut tx,
             &record.run_id,
-            &initial_event_rows,
+            initial_event_rows,
             "insert_initial_run_events",
         )
         .await?;
@@ -13559,23 +13835,11 @@ impl DatabaseRunStateStore {
             }
         };
         if let Some(commit_error) = commit_error {
-            let exact_events = self
-                .exact_run_event_rows_are_durable(
-                    &initial_event_rows,
-                    "reconcile_run_create_commit",
-                )
+            let exact_owner_generation = self
+                .reconcile_run_start_receipt(&record, initial_event_rows)
                 .await
                 .map_err(|error| format!("{commit_error}; {error}"))?;
-            let exact_run = self
-                .load_run_metadata_for_user(&record.user_id, &record.run_id)
-                .await
-                .map_err(|error| format!("{commit_error}; {error}"))?
-                .is_some_and(|durable| {
-                    durable.session_id == record.session_id
-                        && durable.run_generation == record.run_generation
-                        && durable.last_event_idx >= record.last_event_idx
-                });
-            if !exact_events || !exact_run {
+            if exact_owner_generation != Some(record.run_generation) {
                 return Err(format!(
                     "{commit_error}; run create acknowledgement remains ambiguous"
                 ));
@@ -13585,17 +13849,6 @@ impl DatabaseRunStateStore {
                 session_id = %record.session_id,
                 run_id = %record.run_id,
                 "recovered exact run create commit acknowledgement"
-            );
-        }
-        if let Err(error) = self
-            .sync_projection_for_user(&record.user_id, &record.session_id, &record.run_id)
-            .await
-        {
-            tracing::warn!(
-                user_id = %record.user_id,
-                run_id = %record.run_id,
-                error = %error,
-                "run create committed but projection refresh failed"
             );
         }
         Ok(DurableRunStartClaim::Started {
@@ -14647,6 +14900,16 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
         self.insert_run_record(record, false, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn insert_run_with_deadline(
+        &self,
+        record: DurableRunRecord,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        self.insert_run_record_with_deadline(record, false, None, Some(deadline))
             .await
             .map(|_| ())
     }
@@ -21999,6 +22262,9 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         retry_count: u32,
     ) -> Result<bool, String> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("update_retry_count_prepare", run_id, source).to_string())?;
         let result = sqlx::query(
             "UPDATE agent_runs
              SET retry_count = ?, updated_at = NOW(6)
@@ -22008,9 +22274,10 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(user_id)
         .bind(expected_session_id)
         .bind(run_id)
-        .execute(self.pool.get())
+        .execute(connection.connection_mut())
         .await
         .map_err(|source| db_error("update_retry_count", run_id, source).to_string())?;
+        connection.release();
         Ok(result.rows_affected() > 0)
     }
 }
@@ -24735,30 +25002,26 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                         serde_json::json!({"offering_id": offering_id}),
                     );
                 }
-                if let Some(selection) = data.get("resolved_model_selection") {
-                    if let (Some(offering_id), Some(model_name)) = (
+                if let Some(selection) = data.get("resolved_model_selection")
+                    && let (Some(offering_id), Some(model_name)) = (
                         selection
                             .get("offering_id")
                             .filter(|value| value.is_string()),
                         selection
                             .get("model_name")
                             .filter(|value| value.is_string()),
-                    ) {
-                        obj.insert(
-                            "resolved_model_selection".to_string(),
-                            serde_json::json!({
-                                "offering_id": offering_id,
-                                "model_name": model_name,
-                            }),
-                        );
-                    }
+                    )
+                {
+                    obj.insert(
+                        "resolved_model_selection".to_string(),
+                        serde_json::json!({
+                            "offering_id": offering_id,
+                            "model_name": model_name,
+                        }),
+                    );
                 }
-                if let Some(controls) = data.get("generation_controls") {
-                    if let (
-                        Some(thinking),
-                        Some(first_output_max_tokens),
-                        Some(preserve_thinking),
-                    ) = (
+                if let Some(controls) = data.get("generation_controls")
+                    && let (Some(thinking), Some(first_output_max_tokens), Some(preserve_thinking)) = (
                         controls.get("thinking"),
                         controls.get("first_output_max_tokens").filter(|value| {
                             value.is_null()
@@ -24769,31 +25032,41 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                         controls
                             .get("preserve_thinking")
                             .filter(|value| value.is_boolean()),
-                    ) {
-                        let mode = thinking.get("mode").and_then(serde_json::Value::as_str);
-                        let projected_thinking = match mode {
-                            Some("off" | "model_default") => mode.map(|mode| serde_json::json!({"mode": mode})),
-                            Some("enabled") => thinking.get("budget_tokens")
-                                .filter(|value| value.as_u64().is_some_and(|budget| {
-                                    budget >= 1024 && u32::try_from(budget).is_ok()
-                                }))
-                                .map(|budget| serde_json::json!({"mode": "enabled", "budget_tokens": budget})),
-                            Some("adaptive") => thinking.get("effort")
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|effort| matches!(*effort, "low" | "medium" | "high" | "max"))
-                                .map(|effort| serde_json::json!({"mode": "adaptive", "effort": effort})),
-                            _ => None,
-                        };
-                        if let Some(thinking) = projected_thinking {
-                            obj.insert(
-                                "generation_controls".to_string(),
-                                serde_json::json!({
-                                    "thinking": thinking,
-                                    "first_output_max_tokens": first_output_max_tokens,
-                                    "preserve_thinking": preserve_thinking,
-                                }),
-                            );
+                    )
+                {
+                    let mode = thinking.get("mode").and_then(serde_json::Value::as_str);
+                    let projected_thinking = match mode {
+                        Some("off" | "model_default") => {
+                            mode.map(|mode| serde_json::json!({"mode": mode}))
                         }
+                        Some("enabled") => thinking
+                            .get("budget_tokens")
+                            .filter(|value| {
+                                value
+                                    .as_u64()
+                                    .is_some_and(|budget| budget >= 1024 && u32::try_from(budget).is_ok())
+                            })
+                            .map(|budget| {
+                                serde_json::json!({"mode": "enabled", "budget_tokens": budget})
+                            }),
+                        Some("adaptive") => thinking
+                            .get("effort")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|effort| matches!(*effort, "low" | "medium" | "high" | "max"))
+                            .map(|effort| {
+                                serde_json::json!({"mode": "adaptive", "effort": effort})
+                            }),
+                        _ => None,
+                    };
+                    if let Some(thinking) = projected_thinking {
+                        obj.insert(
+                            "generation_controls".to_string(),
+                            serde_json::json!({
+                                "thinking": thinking,
+                                "first_output_max_tokens": first_output_max_tokens,
+                                "preserve_thinking": preserve_thinking,
+                            }),
+                        );
                     }
                 }
             }
@@ -26016,6 +26289,33 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[test]
+    fn timed_out_run_start_receipt_requires_exact_durable_identity() {
+        let expected = durable_run_record("run-start-receipt");
+        let mut committed = expected.clone();
+        committed.last_event_idx = 0;
+        committed.owner_pod_id = Some("current-owner".into());
+        committed.owner_lease_expires_at = Some("later".into());
+        committed.updated_at = "later".into();
+
+        assert!(durable_run_start_receipt_matches(&expected, &committed));
+
+        let mut wrong_owner = committed.clone();
+        wrong_owner.user_id = "another-user".into();
+        assert!(!durable_run_start_receipt_matches(&expected, &wrong_owner));
+
+        let mut wrong_model = committed.clone();
+        wrong_model.resolved_model_name = Some("different-model".into());
+        assert!(!durable_run_start_receipt_matches(&expected, &wrong_model));
+
+        let mut missing_event = committed;
+        missing_event.last_event_idx = expected.last_event_idx - 1;
+        assert!(!durable_run_start_receipt_matches(
+            &expected,
+            &missing_event
+        ));
     }
 
     #[test]
@@ -36548,6 +36848,7 @@ mod tests {
             run_start_idempotency: None,
             agent_id: None,
             model: None,
+            expected_model_name: None,
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
             model_selection: None,
             resolved_model_selection: None,
@@ -36751,6 +37052,7 @@ mod tests {
             run_start_idempotency: None,
             agent_id: None,
             model: Some("gpt-4".to_string()),
+            expected_model_name: None,
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
             model_selection: Some(ModelSelection {
                 offering_id: "offer-gpt-4".to_string(),
@@ -36871,6 +37173,7 @@ mod tests {
                     run_start_idempotency: None,
                     agent_id: None,
                     model: None,
+                    expected_model_name: None,
                     model_selection_mode: ModelSelectionMode::ExplicitOffering,
                     model_selection: None,
                     resolved_model_selection: None,

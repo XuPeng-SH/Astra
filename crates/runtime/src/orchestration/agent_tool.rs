@@ -3864,6 +3864,7 @@ mod tests {
             let mut ctx = test_spawn_context(test_spawner(executor.clone()), Some("parent-model"));
             ctx.parent_model_reasoning = Some(ParentModelReasoning {
                 selection: ctx.current_model_selection.clone().unwrap(),
+                resolved_model_name: Some("parent-model".into()),
                 thinking: ThinkingConfig::Adaptive {
                     effort: ThinkingEffort::High,
                 },

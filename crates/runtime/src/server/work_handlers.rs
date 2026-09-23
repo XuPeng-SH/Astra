@@ -3958,6 +3958,7 @@ pub(super) async fn post_work_branch_turn_handler(
         full_llm_capture: false,
         agent_id: None,
         model: None,
+        expected_model_name: None,
         model_selection_mode: ModelSelectionMode::ServerDefault,
         model_selection: None,
         resolved_model_selection: None,

@@ -15043,6 +15043,7 @@ mod tests {
                     selection: astra_turn_types::ModelSelection {
                         offering_id: "captured-parent-offering".into(),
                     },
+                    resolved_model_name: Some(TEST_CHILD_MODEL.to_string()),
                     thinking: astra_turn_core::thinking_config::ThinkingConfig::Enabled {
                         budget_tokens: 8000,
                     },

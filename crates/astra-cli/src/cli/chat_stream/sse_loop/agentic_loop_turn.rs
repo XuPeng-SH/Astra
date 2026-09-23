@@ -725,6 +725,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         round_index: ctx.round_index,
         offering_id: ctx.offering_id,
+        expected_model_name: None,
         interaction_mode: Some(ctx.interaction_mode.label()),
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
@@ -1364,7 +1365,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     }
 
     ctx.executor
-        .publish_parent_model_reasoning(ctx.offering_id, thinking_config);
+        .publish_parent_model_reasoning(ctx.offering_id, ctx.model, thinking_config);
     PreparedChatTurnPayload {
         payload,
         context_window_estimate: astra_turn_types::ContextWindowUsage::estimated(

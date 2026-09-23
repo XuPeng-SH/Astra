@@ -6510,6 +6510,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
             selection: ModelSelection {
                 offering_id: test_admitted_model_execution().offering_id,
             },
+            resolved_model_name: Some(test_admitted_model_execution().model_name),
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         },
     );
@@ -6620,6 +6621,76 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
             .await
             .is_err(),
         "an invalid final-slot Offering must reject the whole batch"
+    );
+}
+
+#[tokio::test]
+async fn server_subrun_batch_admits_distinct_offerings_once_and_reuses_parent() {
+    use crate::server::delegation::engine::{SubRunExecutor, SubRunModelRequest};
+    use astra_turn_core::thinking_config::ThinkingConfig;
+
+    let parent_execution = test_admitted_model_execution();
+    let parent_selection = astra_turn_types::ModelSelection {
+        offering_id: parent_execution.offering_id.clone(),
+    };
+    let model_service = Arc::new(ActiveTestModelService::default());
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_model_service(Some(model_service.clone()))
+    .with_admitted_model_execution(Some(parent_execution.clone()));
+
+    let request = |offering_id: Option<&str>| SubRunModelRequest {
+        user_id: "user-a".to_string(),
+        selection: offering_id.map(|offering_id| astra_turn_types::ModelSelection {
+            offering_id: offering_id.to_string(),
+        }),
+        parent_model_reasoning: Some(
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: parent_selection.clone(),
+                resolved_model_name: Some(parent_execution.model_name.clone()),
+                thinking: ThinkingConfig::ModelDefault,
+            },
+        ),
+        inherited_execution: Some(parent_execution.clone()),
+        thinking: ThinkingConfig::ModelDefault,
+        max_output_tokens: None,
+    };
+    let requests = vec![
+        request(Some("model-b")),
+        request(Some("model-c")),
+        request(Some("model-b")),
+        request(None),
+    ];
+
+    let prepared = executor
+        .prepare_model_batch(&requests)
+        .await
+        .expect("selected child Offerings are pre-admitted as one batch");
+
+    assert_eq!(prepared.len(), requests.len());
+    assert_eq!(
+        model_service.batch_requests.lock().unwrap().as_slice(),
+        &[vec!["model-b".to_string(), "model-c".to_string()]],
+        "duplicate children share one admission and inheritance performs no lookup"
+    );
+    let identities = prepared
+        .iter()
+        .map(|prepared| {
+            let prepared = prepared.as_ref().expect("each slot has an exact Offering");
+            (prepared.offering_id.as_str(), prepared.model_name.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        [
+            ("model-b", "model-b"),
+            ("model-c", "model-c"),
+            ("model-b", "model-b"),
+            ("model-test-model", "test-model"),
+        ]
     );
 }
 
@@ -11378,6 +11449,7 @@ fn test_request(message: &str) -> ChatRequestData {
         full_llm_capture: false,
         agent_id: None,
         model: Some("test-model".to_string()),
+        expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: Some(ModelSelection {
             offering_id: "model-test-model".to_string(),
@@ -11628,6 +11700,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        prepared_model: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -12290,6 +12363,7 @@ fn test_executable_subrun_config(
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(admitted_model_execution),
+        prepared_model: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::new(Some(HashSet::new()), None, None, None),
@@ -12972,6 +13046,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
+        prepared_model: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Auto,
         request_constraints: RequestConstraints::default(),
@@ -13084,6 +13159,46 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         1
     );
 
+    // ModelDefault is a real delegated execution setting, not the same as
+    // explicit Off. Its durable preservation bit must match the executor's
+    // retry/materialization validation without introducing a compatibility
+    // fallback.
+    config.run_id = "model-default-child-run".to_string();
+    config.execution_owner_generation = None;
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+    let default_authority = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect("ModelDefault child admission")
+        .expect("durable ModelDefault child authority");
+    config.execution_owner_generation = Some(default_authority.owner_generation);
+    let default_child = run_engine
+        .load_run("user-1", "model-default-child-run")
+        .await
+        .expect("load ModelDefault child")
+        .expect("durable ModelDefault child");
+    let default_controls =
+        crate::server::run::engine::durable_run_generation_controls(&default_child).unwrap();
+    assert_eq!(
+        default_controls,
+        crate::server::run::engine::RunGenerationControls {
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+            first_output_max_tokens: None,
+            preserve_thinking: false,
+        }
+    );
+    executor
+        .materialize_durable_subrun_execution(
+            &config,
+            config.admitted_model_execution.as_ref(),
+            Some(&default_child),
+        )
+        .await
+        .expect("ModelDefault durable controls pass executor validation");
+    config.run_id = "child-run".to_string();
+    config.execution_owner_generation = Some(authority.owner_generation);
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+
     config.admitted_model_execution = Some(AdmittedModelExecution::from_endpoint(
         "model-other".to_string(),
         "other-model".to_string(),
@@ -13151,6 +13266,7 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        prepared_model: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -13249,6 +13365,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        prepared_model: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -13731,6 +13848,7 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
+        prepared_model: None,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
@@ -15248,6 +15366,32 @@ async fn server_default_model_mode_uses_existing_model_access_default() {
             .as_ref()
             .map(|execution| execution.offering_id.as_str()),
         Some("model-test-model")
+    );
+}
+
+#[tokio::test]
+async fn prepare_chat_request_rejects_preflight_model_identity_drift() {
+    let service = test_service();
+    let mut matching = test_request("child work");
+    matching.model = None;
+    matching.expected_model_name = Some("test-model".into());
+    let prepared = service
+        .prepare_chat_request("u1", matching)
+        .await
+        .expect("exact preflight identity survives fresh admission");
+    assert_eq!(prepared.model.as_deref(), Some("test-model"));
+
+    let mut drifted = test_request("child work");
+    drifted.model = None;
+    drifted.expected_model_name = Some("old-configured-model".into());
+    let error = service
+        .prepare_chat_request("u1", drifted)
+        .await
+        .expect_err("a changed Offering resolution must not silently execute");
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_identity_changed")
     );
 }
 
@@ -22548,6 +22692,7 @@ fn extract_edge_tools_from_context() {
         full_llm_capture: false,
         agent_id: None,
         model: None,
+        expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: None,
         resolved_model_selection: None,
@@ -22637,6 +22782,7 @@ fn extract_edge_profile_from_context() {
         full_llm_capture: false,
         agent_id: None,
         model: None,
+        expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: None,
         resolved_model_selection: None,

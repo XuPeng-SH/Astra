@@ -1571,6 +1571,7 @@ fn chat_request_into_data_maps_all_fields() {
         model_selection: Some(astra_turn_types::ModelSelection {
             offering_id: "offer-gpt-4".into(),
         }),
+        expected_model_name: Some("gpt-4".into()),
         resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
             offering_id: "offer-gpt-4".into(),
             model_name: "gpt-4".into(),
@@ -1645,6 +1646,7 @@ fn chat_request_into_data_maps_all_fields() {
         data.model.is_none(),
         "wire conversion must not resolve routes"
     );
+    assert_eq!(data.expected_model_name.as_deref(), Some("gpt-4"));
     assert_eq!(
         data.model_selection
             .as_ref()
@@ -1757,6 +1759,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         work_binding: None,
         agent_id: None,
         model_selection: None,
+        expected_model_name: None,
         resolved_model_selection: None,
         capability_descriptors: None,
         agent_bindings: Vec::new(),

@@ -396,6 +396,13 @@ fn attach_runtime_volatile_injections(
 
 #[async_trait]
 impl AgenticLoopHost for SubRunHost {
+    fn parent_model_reasoning_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.executor.parent_model_reasoning_snapshot()
+    }
+
     fn deferred_tool_contract_schemas(&self) -> &[Value] {
         &self.all_schemas
     }
@@ -495,8 +502,11 @@ impl AgenticLoopHost for SubRunHost {
 
         let effective_offering_id = self.offering_id.clone();
         let thinking = state.thinking.clone();
-        self.executor
-            .publish_parent_model_reasoning(Some(&self.offering_id), thinking.clone());
+        self.executor.publish_parent_model_reasoning(
+            Some(&self.offering_id),
+            self.model.as_deref(),
+            thinking.clone(),
+        );
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
@@ -519,6 +529,7 @@ impl AgenticLoopHost for SubRunHost {
             inference_purpose: state.inference_purpose,
             round_index: state.current_round_index,
             offering_id: Some(effective_offering_id.as_str()),
+            expected_model_name: self.model.as_deref(),
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,

@@ -46,6 +46,7 @@ async fn execute_delegation(
     source_agent_id: &str,
     forward_headers: &std::collections::HashMap<String, String>,
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
+    parent_model_reasoning: Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
     engine
@@ -55,6 +56,7 @@ async fn execute_delegation(
             None,
             forward_headers.clone(),
             admitted_model_execution.cloned(),
+            parent_model_reasoning,
             live_event_sink,
         )
         .await
@@ -155,6 +157,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             )
             .await;
         }
+        let parent_model_reasoning = host.parent_model_reasoning_snapshot(state);
         partition_and_execute_delegations(
             tool_calls,
             engine,
@@ -165,6 +168,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             state.hooks.workspace_root_hint.as_deref(),
             &state.hooks.forward_headers,
             state.hooks.admitted_model_execution.as_ref(),
+            parent_model_reasoning.as_ref(),
             &state.skills.request_constraints,
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
@@ -808,6 +812,9 @@ pub(crate) async fn partition_and_execute_delegations(
     workspace_hint: Option<&str>,
     forward_headers: &std::collections::HashMap<String, String>,
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
+    parent_model_reasoning: Option<
+        &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
+    >,
     request_constraints: &RequestConstraints,
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
@@ -882,6 +889,7 @@ pub(crate) async fn partition_and_execute_delegations(
                         source_agent_id,
                         forward_headers,
                         admitted_model_execution,
+                        parent_model_reasoning.cloned(),
                         live_event_sink.clone(),
                     )
                     .await
@@ -2008,6 +2016,7 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
             None,
+            None,
             &RequestConstraints::default(),
             None,
             &[],
@@ -2047,6 +2056,7 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
             None,
+            None,
             &RequestConstraints::default(),
             None,
             &[],
@@ -2076,6 +2086,7 @@ mod tests {
             "main",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,
@@ -2111,6 +2122,7 @@ mod tests {
             "main",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,
@@ -2148,6 +2160,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,

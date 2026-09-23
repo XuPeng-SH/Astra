@@ -996,6 +996,13 @@ fn append_permission_mode_change_audit(
 
 #[async_trait]
 impl AgenticLoopHost for CliServerAdmissionHost<'_> {
+    fn parent_model_reasoning_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.executor.parent_model_reasoning_snapshot()
+    }
+
     fn is_pre_admission_rejection(&self) -> bool {
         is_pre_admission_rejection(
             self.last_error_code.as_deref(),

@@ -19711,6 +19711,21 @@ impl ServerAgenticLoopHost {
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn parent_model_reasoning_snapshot(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.admitted_model_execution.as_ref().map(|execution| {
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: execution.offering_id.clone(),
+                },
+                resolved_model_name: Some(execution.model_name.clone()),
+                thinking: state.thinking.clone(),
+            }
+        })
+    }
+
     fn apply_permission_mode(
         &mut self,
         mode: astra_turn_types::PermissionMode,

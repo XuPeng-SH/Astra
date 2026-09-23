@@ -2191,6 +2191,7 @@ mod tests {
             let context = SpawnContext {
                 parent_model_reasoning: Some(ParentModelReasoning {
                     selection: parent.clone(),
+                    resolved_model_name: Some("parent-model".into()),
                     thinking: inherited.clone(),
                 }),
                 ..cli_fanout_test_context()
@@ -2284,6 +2285,7 @@ mod tests {
         let context = SpawnContext {
             parent_model_reasoning: Some(ParentModelReasoning {
                 selection: parent.clone(),
+                resolved_model_name: Some("parent-model".into()),
                 thinking: ThinkingConfig::Enabled {
                     budget_tokens: 4096,
                 },

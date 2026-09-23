@@ -54,6 +54,10 @@ impl From<crate::thinking_config::ThinkingConfig> for ReasoningSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentModelReasoning {
     pub selection: ModelSelection,
+    /// Exact model name resolved when this parent run was admitted. This is
+    /// an identity assertion for same-Offering inheritance, not authority to
+    /// execute; every child still passes fresh model admission.
+    pub resolved_model_name: Option<String>,
     pub thinking: crate::thinking_config::ThinkingConfig,
 }
 
@@ -653,6 +657,7 @@ mod tests {
         ] {
             let parent = ParentModelReasoning {
                 selection: selection.clone(),
+                resolved_model_name: Some("parent-model".to_string()),
                 thinking: thinking.clone(),
             };
             assert_eq!(resolve_child_thinking(None, None, Some(&parent)), thinking);

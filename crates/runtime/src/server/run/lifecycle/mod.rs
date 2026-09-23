@@ -7040,6 +7040,7 @@ impl AgenticRunLifecycleService {
             parent_model_reasoning: request.model_selection.clone().map(|selection| {
                 astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
                     selection,
+                    resolved_model_name: request.model.clone(),
                     thinking: Self::thinking_from_chat_context(
                         &request.context,
                         request.model.as_deref(),
@@ -9915,6 +9916,13 @@ impl AgenticRunLifecycleService {
             ));
         }
         Self::validate_effective_user_input(&request)?;
+        if let Some(expected_model_name) = request.expected_model_name.as_deref() {
+            exact_runtime_string(
+                "expected_model_name",
+                expected_model_name,
+                "model_identity_invalid",
+            )?;
+        }
         if request.admitted_execution_deadline.is_none() {
             let now_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -9955,11 +9963,12 @@ impl AgenticRunLifecycleService {
                 || request.model_selection.is_some()
                 || request.resolved_model_selection.is_some()
                 || request.admitted_model_execution.is_some()
+                || request.expected_model_name.is_some()
                 || request.model.is_some()
             {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
-                    "Server-default model selection cannot be combined with explicit or provider runtime model state",
+                    "Server-default model selection cannot be combined with explicit or expected model identity",
                     "model_selection_invalid",
                 ));
             }
@@ -10042,6 +10051,7 @@ impl AgenticRunLifecycleService {
                 )
                 .await?,
             );
+            validate_expected_model_name(&request, &resolved.model_name)?;
             request.model = Some(resolved.model_name.clone());
             return Ok(request);
         }
@@ -10062,6 +10072,7 @@ impl AgenticRunLifecycleService {
             None,
         )
         .await?;
+        validate_expected_model_name(&request, &admitted.model_name)?;
         let resolved = ResolvedModelSelection {
             offering_id: admitted.offering_id.clone(),
             model_name: admitted.model_name.clone(),
@@ -13501,6 +13512,24 @@ fn exact_runtime_string(
                 "{field} must be a non-empty exact string without leading/trailing whitespace or control characters"
             ),
             code,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_model_name(
+    request: &ChatRequestData,
+    resolved_model_name: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if request
+        .expected_model_name
+        .as_deref()
+        .is_some_and(|expected| expected != resolved_model_name)
+    {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "The selected Offering resolved to a different model after child preflight; retry delegation to prepare the current identity",
+            "model_identity_changed",
         ));
     }
     Ok(())
@@ -21540,6 +21569,46 @@ impl DurableSubrunControlAuthority {
     }
 }
 
+async fn admit_model_offering_batch(
+    model_service: Option<&Arc<dyn ModelService>>,
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    user_id: &str,
+    shared_pool: Option<&SharedPool>,
+    offering_ids: &[String],
+) -> Result<Vec<AdmittedModelExecution>, String> {
+    if offering_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let executions = if let Some(model_service) = model_service {
+        model_service
+            .admit_model_offerings(user_id.to_string(), offering_ids.to_vec())
+            .await
+            .map_err(|(_, body)| body.0.detail)?
+    } else {
+        astra_services::revalidate_admitted_model_executions(
+            matrixone,
+            encryptor,
+            user_id,
+            offering_ids,
+            shared_pool.map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    };
+    if executions.len() != offering_ids.len()
+        || executions
+            .iter()
+            .zip(offering_ids)
+            .any(|(execution, requested)| execution.offering_id != *requested)
+    {
+        return Err(
+            "batch model admission returned an incomplete or mismatched Offering set".into(),
+        );
+    }
+    Ok(executions)
+}
+
 struct ServerPreparedSpawn {
     max_output_tokens: Option<u32>,
     executor: Arc<ServerSpawnAgentExecutor>,
@@ -21623,35 +21692,15 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 None => {}
             }
         }
-        let executions = if requested.is_empty() {
-            Vec::new()
-        } else if let Some(model_service) = self.model_service.as_ref() {
-            model_service
-                .admit_model_offerings(parent.user_id.clone(), requested.clone())
-                .await
-                .map_err(|(_, body)| body.0.detail)?
-        } else {
-            astra_services::revalidate_admitted_model_executions(
-                &self.matrixone,
-                self.encryptor.as_ref(),
-                &parent.user_id,
-                &requested,
-                self.shared_pool.as_ref().map(SharedPool::get),
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        };
-        if executions.len() != requested.len()
-            || executions
-                .iter()
-                .zip(&requested)
-                .any(|(execution, requested)| execution.offering_id != *requested)
-        {
-            return Err(
-                "batch model admission returned an incomplete or mismatched Offering set"
-                    .to_string(),
-            );
-        }
+        let executions = admit_model_offering_batch(
+            self.model_service.as_ref(),
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &parent.user_id,
+            self.shared_pool.as_ref(),
+            &requested,
+        )
+        .await?;
         let admitted: HashMap<_, _> = requested.into_iter().zip(executions).collect();
         let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
         for input in inputs {
@@ -21876,6 +21925,7 @@ impl ServerSpawnAgentExecutor {
             context: subrun_context,
             forward_headers: context.forward_headers.clone(),
             admitted_model_execution: Some(admitted_model_execution.clone()),
+            prepared_model: None,
             thinking: config.thinking.clone(),
             interaction_mode: child_runtime_context.interaction_mode,
             request_constraints,
@@ -22539,6 +22589,25 @@ impl ServerSubRunExecutor {
         &self,
         config: &SubRunConfig,
     ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
+        if let Some(prepared) = config.prepared_model.as_ref() {
+            if config
+                .agent_profile
+                .model_selection
+                .as_ref()
+                .is_some_and(|selection| selection.offering_id != prepared.offering_id)
+            {
+                return Err("prepared sub-run Offering changed before execution".into());
+            }
+            let execution = prepared.admitted_execution.as_ref().ok_or_else(|| {
+                "server sub-run is missing its pre-admitted model execution".to_string()
+            })?;
+            if execution.offering_id != prepared.offering_id
+                || execution.model_name != prepared.model_name
+            {
+                return Err("prepared sub-run model material changed before execution".into());
+            }
+            return Ok(Some(execution.clone()));
+        }
         let Some(selection) = config.agent_profile.model_selection.as_ref() else {
             return Ok(config
                 .admitted_model_execution
@@ -23215,6 +23284,121 @@ async fn settle_subrun_activation_cancellation(
 impl SubRunExecutor for ServerSubRunExecutor {
     fn owns_durable_run_lifecycle(&self) -> bool {
         true
+    }
+
+    async fn prepare_model_batch(
+        &self,
+        requests: &[crate::server::delegation::engine::SubRunModelRequest],
+    ) -> Result<Vec<Option<crate::server::delegation::engine::PreparedSubRunModel>>, String> {
+        use crate::server::delegation::engine::PreparedSubRunModel;
+
+        let Some(user_id) = requests.first().map(|request| request.user_id.as_str()) else {
+            return Ok(Vec::new());
+        };
+        if requests.iter().any(|request| request.user_id != user_id) {
+            return Err("one sub-run model batch cannot span multiple owners".into());
+        }
+
+        let inherited = self.admitted_model_execution.as_ref();
+        let mut requested = Vec::new();
+        for request in requests {
+            let offering_id = request
+                .selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str())
+                .or_else(|| {
+                    request
+                        .parent_model_reasoning
+                        .as_ref()
+                        .map(|parent| &parent.selection)
+                        .map(|selection| selection.offering_id.as_str())
+                })
+                .or_else(|| {
+                    request
+                        .inherited_execution
+                        .as_ref()
+                        .or(inherited)
+                        .map(|execution| execution.offering_id.as_str())
+                });
+            let Some(offering_id) = offering_id else {
+                continue;
+            };
+            astra_services::validate_model_offering_id(offering_id)
+                .map_err(|error| format!("invalid child model selection: {error}"))?;
+            let parent_execution = request.inherited_execution.as_ref().or(inherited);
+            if parent_execution.is_none_or(|execution| execution.offering_id != offering_id)
+                && !requested
+                    .iter()
+                    .any(|requested_id| requested_id == offering_id)
+            {
+                requested.push(offering_id.to_string());
+            }
+        }
+
+        let admitted = admit_model_offering_batch(
+            self.model_service.as_ref(),
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            user_id,
+            self.shared_pool.as_ref(),
+            &requested,
+        )
+        .await?;
+        let admitted_by_id: HashMap<_, _> = requested.into_iter().zip(admitted).collect();
+
+        requests
+            .iter()
+            .map(|request| {
+                let offering_id = request
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.offering_id.as_str())
+                    .or_else(|| {
+                        request
+                            .parent_model_reasoning
+                            .as_ref()
+                            .map(|parent| &parent.selection)
+                            .map(|selection| selection.offering_id.as_str())
+                    })
+                    .or_else(|| {
+                        request
+                            .inherited_execution
+                            .as_ref()
+                            .or(inherited)
+                            .map(|execution| execution.offering_id.as_str())
+                    });
+                let Some(offering_id) = offering_id else {
+                    return Ok(None);
+                };
+                let execution = request
+                    .inherited_execution
+                    .as_ref()
+                    .or(inherited)
+                    .filter(|execution| execution.offering_id == offering_id)
+                    .cloned()
+                    .or_else(|| admitted_by_id.get(offering_id).cloned())
+                    .ok_or_else(|| {
+                        "batch model admission lost a selected child Offering".to_string()
+                    })?;
+                astra_services::models::validate_model_execution_purpose(
+                    &execution,
+                    astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+                )
+                .map_err(|(_, body)| body.0.detail)?;
+                crate::server::model_execution_admission::validate_reasoning_control(
+                    &execution,
+                    &request.thinking,
+                )?;
+                if let Some(limit) = request.max_output_tokens {
+                    request.thinking.validate_output_budget(u64::from(limit))?;
+                }
+                Ok(Some(PreparedSubRunModel {
+                    offering_id: execution.offering_id.clone(),
+                    model_name: execution.model_name.clone(),
+                    admitted_execution: Some(execution),
+                }))
+            })
+            .collect()
     }
 
     async fn execute(
@@ -24008,6 +24192,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     parent_model_reasoning: config.agent_profile.model_selection.clone().map(|selection| {
                         astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
                             selection,
+                            resolved_model_name: child_model_name.clone(),
                             thinking: config.thinking.clone(),
                         }
                     }),

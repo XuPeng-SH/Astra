@@ -531,6 +531,28 @@ pub trait AgenticLoopHost: Send {
         astra_services::ModelRequestTopology::ServerOnly
     }
 
+    /// Snapshot the exact model identity and effective reasoning setting for
+    /// children created during this turn. Hosts with a provider boundary own
+    /// this identity; it must not be reconstructed from a display-name alias.
+    fn parent_model_reasoning_snapshot(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        state
+            .hooks
+            .admitted_model_execution
+            .as_ref()
+            .map(
+                |execution| astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                    selection: astra_turn_types::ModelSelection {
+                        offering_id: execution.offering_id.clone(),
+                    },
+                    resolved_model_name: Some(execution.model_name.clone()),
+                    thinking: state.thinking.clone(),
+                },
+            )
+    }
+
     /// Project one already-validated runtime feedback frame to live clients.
     ///
     /// The durable journal and PipelineSession remain the authority. This
