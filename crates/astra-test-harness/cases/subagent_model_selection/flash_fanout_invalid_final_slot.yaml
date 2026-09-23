@@ -10,7 +10,8 @@ prompt: |
   FLASH-INVALID-SLOT and explicitly sets model_selection to
   {"offering_id":"invalid-offering-no-such-id"}. Both slots are explore.
   Do not retry, replace, or launch separate agents. Report the admission
-  failure without claiming either slot ran.
+  failure without claiming either slot ran. Do not call Reflect or any other
+  diagnostic tool.
 debug_log: true
 capability: delegation
 timeout_seconds: 180
@@ -50,5 +51,9 @@ criteria:
     max: 0
   - type: session_event_count
     event_type: agent_terminated
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
     min: 0
     max: 0

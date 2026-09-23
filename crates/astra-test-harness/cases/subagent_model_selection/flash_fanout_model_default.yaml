@@ -9,7 +9,8 @@ prompt: |
   Set defaults.reasoning to {"mode":"model_default"}. Give both slots
   agent_type "explore". Ask slot 0 to reply exactly FLASH-SLOT-ALPHA and
   slot 1 to reply exactly FLASH-SLOT-BETA. Do not retry or replace slots.
-  Wait for the group result, then report both exact replies and 2/2.
+  Wait for the group result, then report both exact replies and 2/2. Do not
+  call Reflect or any other diagnostic tool.
 debug_log: true
 capability: delegation
 timeout_seconds: 240
@@ -103,3 +104,9 @@ criteria:
     needle: FLASH-SLOT-ALPHA
   - type: text_contains
     needle: FLASH-SLOT-BETA
+  # Keep the latency/cost case focused on fanout; Reflect would add a
+  # diagnostic model turn and persisted-session database reads.
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0
