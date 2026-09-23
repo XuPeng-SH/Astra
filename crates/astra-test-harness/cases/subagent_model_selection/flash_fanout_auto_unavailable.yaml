@@ -42,7 +42,7 @@ criteria:
     name: agent_fanout
     document: result
     path: /error
-    equals: fanout slot auto: automatic model routing is not available yet
+    equals: "fanout slot auto: automatic model routing is not available yet"
   - type: session_event_count
     event_type: agent_spawned
     min: 0
