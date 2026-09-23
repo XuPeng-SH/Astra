@@ -2,7 +2,7 @@
 //!
 //! Runs spawned agents using the same agentic loop infrastructure as delegation.
 
-use astra_server_types::{ModelAdmissionRequestV1, ModelAdmissionResponseV1, ModelAdmissionSlotV1};
+use astra_server_types::{ModelAdmissionRequestV1, ModelAdmissionSlotV1};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -661,7 +661,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         use astra_turn_core::orchestration_spawn_tool::{
             ReasoningSelection, resolve_child_thinking,
         };
-        use astra_turn_core::thinking_config::ThinkingConfig;
 
         for input in inputs {
             input.fanout_slot_identity()?;
@@ -683,40 +682,42 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             })
             .collect();
         let has_override = inputs.iter().any(|input| {
-            input.model_selection.is_some()
-                || input.reasoning.is_some()
+            input.model_selection.as_ref().is_some_and(|selection| {
+                parent_selection.is_none_or(|parent| selection.offering_id != parent.offering_id)
+            }) || input.reasoning.is_some()
                 || input.max_output_tokens.is_some()
-        }) || thinking
-            .iter()
-            .any(|thinking| *thinking != ThinkingConfig::ModelDefault);
+        });
         if has_override
             && parent_selection.is_none()
             && inputs.iter().any(|input| input.model_selection.is_none())
         {
             return Err("a fanout with per-slot overrides requires an exact parent Offering for inherited slots".to_string());
         }
-        let token = self.resolve_token_async().await?;
-        let selections = if !has_override {
-            // Keep the inherited-only path at its existing single catalog
-            // lookup. It does not need a new preflight request.
-            let model = if let Some(parent_selection) = parent_selection {
-                crate::cli::session::session_runtime::resolve_server_offering_selection(
-                    &self.api,
-                    &token,
-                    &parent_selection.offering_id,
-                )
-                .await?
-            } else {
-                let inherited_model = self.resolve_effective_model(None);
-                crate::cli::skill_subrun::resolve_subrun_model_selection(
-                    &self.api,
-                    &token,
-                    inherited_model.as_deref(),
-                )
-                .await?
-            };
-            vec![model; inputs.len()]
+        // Reuse the exact parent execution snapshot for ordinary inherited
+        // fanout. The parent already used this Offering, and Server rechecks
+        // authorization at every child provider request; another catalog scan
+        // or admission query here would add DB work without granting authority.
+        // New Offerings and explicit per-slot constraints still use one
+        // all-or-error batch admission before any child starts.
+        let parent_model_snapshot = parent_selection
+            .zip(context.resolved_model_name.as_deref())
+            .filter(|(_, name)| !name.trim().is_empty());
+        let batch_admission =
+            has_override || (parent_selection.is_some() && parent_model_snapshot.is_none());
+        let needs_token = batch_admission || parent_selection.is_none();
+        let token = if needs_token {
+            Some(self.resolve_token_async().await?)
         } else {
+            None
+        };
+        let model_provenance = if batch_admission {
+            "admission_validated"
+        } else if parent_selection.is_some() {
+            "inherited_parent_context"
+        } else {
+            "catalog_resolved"
+        };
+        let selections = if batch_admission {
             let request = ModelAdmissionRequestV1 {
                 slots: inputs
                     .iter()
@@ -732,8 +733,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                             .ok_or_else(|| {
                                 "child has no admitted parent or default Offering".to_string()
                             })?;
-                        astra_services::validate_model_offering_id(offering_id)
-                            .map_err(|error| error.to_string())?;
                         let reasoning = ReasoningSelection::from(thinking.clone());
                         Ok(ModelAdmissionSlotV1 {
                             offering_id: offering_id.to_string(),
@@ -744,44 +743,30 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     })
                     .collect::<Result<Vec<_>, String>>()?,
             };
-            let body = serde_json::to_value(&request).map_err(|error| error.to_string())?;
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.api.post_bearer_path_json_text(
-                    &token,
-                    astra_thin_client::paths::MODEL_ACCESS_ADMIT,
-                    &body,
-                ),
+            crate::cli::session::session_runtime::admit_server_model_slots(
+                &self.api,
+                token.as_deref().expect("batch admission requires token"),
+                request,
             )
-            .await
-            .map_err(|_| "model admission timed out before child launch".to_string())?
-            .map_err(|error| error.to_string())?;
-            let response: ModelAdmissionResponseV1 = serde_json::from_str(&response)
-                .map_err(|error| format!("invalid model admission response: {error}"))?;
-            if response.slots.len() != request.slots.len() {
-                return Err("model admission response has incomplete slot coverage".to_string());
-            }
-            request
-                .slots
-                .iter()
-                .zip(response.slots)
-                .map(|(requested, admitted)| {
-                    if admitted.offering_id != requested.offering_id
-                        || admitted.max_output_tokens != requested.max_output_tokens
-                        || admitted.reasoning != requested.reasoning
-                        || admitted.model_name.trim().is_empty()
-                        || admitted.context_window == Some(0)
-                    {
-                        return Err("model admission response does not match the requested slot"
-                            .to_string());
-                    }
-                    Ok(crate::cli::session::session_runtime::ServerModelSelection {
-                        name: admitted.model_name,
-                        context_window: admitted.context_window,
-                        offering_id: admitted.offering_id,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?
+            .await?
+        } else if let Some((selection, model_name)) = parent_model_snapshot {
+            vec![
+                crate::cli::session::session_runtime::ServerModelSelection {
+                    name: model_name.to_string(),
+                    context_window: None,
+                    offering_id: selection.offering_id.clone(),
+                };
+                inputs.len()
+            ]
+        } else {
+            let inherited_model_name = self.resolve_effective_model(None);
+            let model = crate::cli::skill_subrun::resolve_subrun_model_selection(
+                &self.api,
+                token.as_deref().expect("default resolution requires token"),
+                inherited_model_name.as_deref(),
+            )
+            .await?;
+            vec![model; inputs.len()]
         };
         inputs
             .iter()
@@ -799,7 +784,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     max_output_tokens: input.max_output_tokens,
                     slot: input.fanout_slot_identity()?,
                     model,
-                    admission_validated: has_override,
+                    model_provenance,
                 }) as Box<dyn PreparedSpawn>)
             })
             .collect()
@@ -818,7 +803,7 @@ struct CliPreparedSpawn {
     max_output_tokens: Option<u32>,
     slot: Option<AgentFanoutSlotIdentity>,
     model: crate::cli::session::session_runtime::ServerModelSelection,
-    admission_validated: bool,
+    model_provenance: &'static str,
 }
 
 #[async_trait]
@@ -827,11 +812,7 @@ impl PreparedSpawn for CliPreparedSpawn {
         Some(PreparedSpawnModelIdentity {
             offering_id: self.model.offering_id.clone(),
             model_name: self.model.name.clone(),
-            provenance: if self.admission_validated {
-                "admission_validated"
-            } else {
-                "catalog_resolved"
-            },
+            provenance: self.model_provenance,
         })
     }
 
@@ -953,12 +934,40 @@ impl CliSpawnAgentExecutor {
         let model_selection = if let Some(prepared_model) = prepared_model {
             prepared_model
         } else if let Some(selection) = config.model_selection.as_ref() {
-            crate::cli::session::session_runtime::resolve_server_offering_selection(
-                &self.api,
-                &token,
-                &selection.offering_id,
-            )
-            .await?
+            if let Some(model_name) = config
+                .model
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                // The spawner only supplies this resolved name when the
+                // selected Offering is the parent's already-admitted one.
+                // Reuse that request-local projection; each child provider
+                // request still revalidates authorization on Server.
+                crate::cli::session::session_runtime::ServerModelSelection {
+                    name: model_name.to_string(),
+                    context_window: None,
+                    offering_id: selection.offering_id.clone(),
+                }
+            } else {
+                let reasoning = astra_turn_core::orchestration_spawn_tool::ReasoningSelection::from(
+                    config.thinking.clone(),
+                );
+                let request = ModelAdmissionRequestV1 {
+                    slots: vec![ModelAdmissionSlotV1 {
+                        offering_id: selection.offering_id.clone(),
+                        max_output_tokens: config.max_output_tokens,
+                        reasoning: serde_json::to_value(reasoning)
+                            .map_err(|error| error.to_string())?,
+                    }],
+                };
+                crate::cli::session::session_runtime::admit_server_model_slots(
+                    &self.api, &token, request,
+                )
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "model admission returned no selected Offering".to_string())?
+            }
         } else {
             crate::cli::skill_subrun::resolve_subrun_model_selection(
                 &self.api,
@@ -1827,21 +1836,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_fanout_resolves_inherited_offering_once_before_spawning() {
+    async fn cli_fanout_reuses_inherited_offering_without_model_access_io() {
         let server = MockServer::start().await;
-        let offering = test_offering("offer-parent", "parent-model");
-        Mock::given(method("GET"))
-            .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "items": [offering],
-                "next_cursor": null,
-                "limit": 50,
-                "total": 1,
-                "catalog_revision": "sha256:cli-batch-test"
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
         let executor = Arc::new(test_executor(&server.uri()));
         let context = cli_fanout_test_context();
         let inputs = (0..2)
@@ -1860,9 +1856,21 @@ mod tests {
         let prepared = Arc::clone(&executor)
             .prepare_batch(&inputs, &context, Some(&parent))
             .await
-            .expect("one exact catalog resolution for the group");
+            .expect("reuse the parent's exact Offering and resolved model name");
         assert_eq!(prepared.len(), 2);
         server.verify().await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "inherited admission uses no HTTP/DB lookup"
+        );
+        assert!(prepared.iter().all(|spawn| {
+            spawn.model_identity().is_some_and(|identity| {
+                identity.offering_id == "offer-parent"
+                    && identity.model_name == "parent-model"
+                    && identity.provenance == "inherited_parent_context"
+            })
+        }));
 
         let wrong_slot = prepared_cli_test_config(
             inputs[0].fanout_slot_identity().unwrap(),
@@ -1896,13 +1904,15 @@ mod tests {
         let mut unsupported = inputs;
         unsupported[1].reasoning =
             Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off);
+        let unsupported_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/model-access/admit"))
             .respond_with(ResponseTemplate::new(400).set_body_string("reasoning unsupported"))
             .expect(1)
-            .mount(&server)
+            .mount(&unsupported_server)
             .await;
-        let error = match Arc::clone(&executor)
+        let unsupported_executor = Arc::new(test_executor(&unsupported_server.uri()));
+        let error = match Arc::clone(&unsupported_executor)
             .prepare_batch(&unsupported, &context, Some(&parent))
             .await
         {
@@ -1910,48 +1920,51 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("reasoning unsupported"), "{error}");
-        server.verify().await;
+        unsupported_server.verify().await;
 
         let unavailable_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/models"))
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
             .respond_with(ResponseTemplate::new(503))
             .expect(1)
             .mount(&unavailable_server)
             .await;
         let unavailable_executor = Arc::new(test_executor(&unavailable_server.uri()));
         unsupported[1].reasoning = None;
+        unsupported[1].max_output_tokens = Some(64);
         assert!(
             Arc::clone(&unavailable_executor)
                 .prepare_batch(&unsupported, &context, Some(&parent))
                 .await
                 .is_err(),
-            "a failed catalog lookup must reject the group before child creation"
+            "failed batch admission must reject the group before child creation"
         );
         unavailable_server.verify().await;
 
         let revoked_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "items": [],
-                "next_cursor": null,
-                "limit": 50,
-                "total": 0,
-                "catalog_revision": "sha256:revoked-parent"
-            })))
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Offering is not active"))
             .expect(1)
             .mount(&revoked_server)
             .await;
         let revoked_executor = Arc::new(test_executor(&revoked_server.uri()));
+        unsupported[1].reasoning = None;
+        unsupported[1].max_output_tokens = None;
+        unsupported[1].model_selection = Some(astra_turn_types::ModelSelection {
+            offering_id: "offer-revoked".into(),
+        });
         let revoked_error = match Arc::clone(&revoked_executor)
             .prepare_batch(&unsupported, &context, Some(&parent))
             .await
         {
-            Ok(_) => panic!("revoked parent Offering must reject the entire batch"),
+            Ok(_) => panic!("revoked explicit Offering must reject the entire batch"),
             Err(error) => error,
         };
-        assert!(revoked_error.contains("not active"), "{revoked_error}");
+        assert!(
+            revoked_error.contains("Offering is not active"),
+            "{revoked_error}"
+        );
         revoked_server.verify().await;
     }
 
@@ -2721,6 +2734,37 @@ mod tests {
         assert!(
             err.contains("token provider task failed"),
             "join errors must be surfaced, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_single_spawn_reuses_parent_offering_and_sends_exact_identity() {
+        let mock =
+            crate::cli::mock_llm::MockLlmServer::start(crate::cli::mock_llm::MockScenario::Fail)
+                .await
+                .expect("mock Server");
+        let executor = test_executor(&mock.base_url);
+        let offering = astra_turn_types::ModelSelection {
+            offering_id: "offer-parent".into(),
+        };
+        let mut config = prepared_cli_test_config(
+            None,
+            Some(offering),
+            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+        );
+        config.model = Some("parent-model".into());
+        config.hard_turn_limit = Some(1);
+
+        let _ = executor.execute(config).await;
+        let requests = mock.received_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the child reaches its first model request"
+        );
+        assert_eq!(
+            requests[0]["model_selection"]["offering_id"], "offer-parent",
+            "Server must receive the exact parent Offering and perform fresh authorization"
         );
     }
 
