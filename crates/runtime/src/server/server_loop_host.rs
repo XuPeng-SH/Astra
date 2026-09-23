@@ -14897,7 +14897,13 @@ impl ServerAgenticLoopHost {
 
     fn edge_executor_offline_blocks_tool(&self, tool_name: &str) -> bool {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        if self
+        // A client may advertise the schema of a builtin that is executed by
+        // the server (including deferred agent tools). Its declaration must
+        // not turn an offline workspace into an edge result for that tool.
+        if matches!(
+            tool_execution_class(tool_name, &registry),
+            ToolExecutionClass::Unknown | ToolExecutionClass::RuntimeExecutor
+        ) && self
             .edge_provider_tool_schema_digests
             .contains_key(tool_name)
             && matches!(
@@ -35293,6 +35299,52 @@ mod tests {
             1,
             "offline edge blocking must close the exact call exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn offline_client_declaration_cannot_turn_server_agent_tool_into_edge_result() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "client workspace",
+                "/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "client",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Offline,
+            ),
+        )
+        .build();
+        host.edge_provider_tool_schema_digests
+            .insert("agent_fanout".to_string(), "client digest".to_string());
+        host.edge_provider_tool_schema_digests
+            .insert("agent".to_string(), "client digest".to_string());
+        host.edge_provider_tool_schema_digests
+            .insert("custom_edge_tool".to_string(), "client digest".to_string());
+        for server_tool in ["agent", "agent_fanout"] {
+            assert!(!host.edge_executor_offline_blocks_tool(server_tool));
+        }
+        assert!(host.edge_executor_offline_blocks_tool("custom_edge_tool"));
+        let results = host
+            .offline_edge_results_for_tool_calls(&[json!({
+                "id": "call-fanout",
+                "type": "function",
+                "function": {"name": "agent_fanout", "arguments": "{}"}
+            })])
+            .expect("well-formed provider call");
+        assert!(
+            results.is_empty(),
+            "server-owned fanout must not acquire an edge terminal"
+        );
+        assert!(host.edge_executor_offline_blocks_tool("bash"));
     }
 
     #[test]
