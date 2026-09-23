@@ -12,7 +12,6 @@ use sqlx::{MySql, Pool, query};
 
 use crate::db_row::RowExt as RuntimePromotionAuditRow;
 use crate::db_row::RowExt as SessionAuditRow;
-use crate::models::{PricingData, configured_pricing_from_stored};
 use crate::storage::agent_session_exists_for_user;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
@@ -2451,28 +2450,53 @@ pub struct SessionAuditSummary {
     pub ended_at: Option<String>,
 }
 
-/// The producer scope represented by [`SessionRequestUsageSummary`].
+/// The retained physical-attempt scope represented by [`SessionRequestUsageSummary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRequestUsageScope {
-    /// All root and delegated model requests persisted for this session.
+    /// All retained physical attempts for this owner and session at query time.
     #[default]
     SessionAllRuns,
 }
 
-/// Provider-reported request-token lanes for a session audit.
-///
-/// These values are summed from canonical per-request usage records. They do
-/// not use context-window occupancy or cumulative UI counters, so cache reads
-/// stay visible instead of being folded into generic input tokens.
+/// Known token sum and the number of physical attempts that reported the lane.
+/// `None` means no observation; `Some(0)` is a provider-observed zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ObservedTokenLane {
+    pub known_tokens: Option<u64>,
+    pub observed_attempts: u64,
+}
+
+impl ObservedTokenLane {
+    fn observe(&mut self, value: Option<u64>) -> AuditResult<()> {
+        if let Some(value) = value {
+            self.known_tokens = Some(
+                self.known_tokens
+                    .unwrap_or(0)
+                    .checked_add(value)
+                    .ok_or_else(|| internal_error("session request token sum overflow"))?,
+            );
+            self.observed_attempts = self
+                .observed_attempts
+                .checked_add(1)
+                .ok_or_else(|| internal_error("session request observation count overflow"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Retained physical provider-attempt usage, not transcript or lifetime totals.
+/// Compare each lane's `observed_attempts` with `request_count` before using
+/// `known_tokens` as a complete total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionRequestUsageSummary {
     pub scope: SessionRequestUsageScope,
-    pub request_count: u32,
-    pub fresh_input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub output_tokens: u64,
+    pub request_count: u64,
+    pub nonterminal_attempt_count: u64,
+    pub fresh_input_tokens: ObservedTokenLane,
+    pub cache_read_tokens: ObservedTokenLane,
+    pub cache_creation_tokens: ObservedTokenLane,
+    pub output_tokens: ObservedTokenLane,
 }
 
 /// Brief tool-call info within a turn.
@@ -2588,10 +2612,14 @@ pub struct TurnDetail {
 pub struct SessionCostSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub per_model_cost_usd: BTreeMap<String, f64>,
-    pub priced_turn_count: u32,
-    pub unpriced_turn_count: u32,
+    pub unavailable_reason: SessionCostUnavailableReason,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCostUnavailableReason {
+    #[default]
+    HistoricalPricingNotCaptured,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2684,155 +2712,83 @@ fn parse_turn_token_usage(raw: &str, context: &str) -> AuditResult<ParsedTurnTok
     })
 }
 
-#[derive(Debug, Clone)]
-struct TurnCostSample {
-    model: String,
-    usage: ParsedTurnTokenUsage,
-}
-
-fn priced_turn_cost(usage: ParsedTurnTokenUsage, pricing: &PricingData) -> Option<f64> {
-    pricing.estimated_cost_usd(
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cached_input_tokens,
-        usage.cache_creation_tokens,
-    )
-}
-
-fn summarize_session_cost(
-    turns: impl IntoIterator<Item = TurnCostSample>,
-    pricing_by_model: &HashMap<String, PricingData>,
-) -> SessionCostSummary {
-    let mut total_cost_usd = 0.0;
-    let mut per_model_cost_usd = BTreeMap::new();
-    let mut priced_turn_count = 0_u32;
-    let mut unpriced_turn_count = 0_u32;
-
-    for turn in turns {
-        let Some(pricing) = pricing_by_model.get(&turn.model) else {
-            unpriced_turn_count = unpriced_turn_count.saturating_add(1);
-            continue;
-        };
-        if let Some(cost_usd) = priced_turn_cost(turn.usage, pricing) {
-            total_cost_usd += cost_usd;
-            *per_model_cost_usd.entry(turn.model).or_insert(0.0) += cost_usd;
-            priced_turn_count = priced_turn_count.saturating_add(1);
-        } else {
-            unpriced_turn_count = unpriced_turn_count.saturating_add(1);
-        }
-    }
-
-    SessionCostSummary {
-        estimated_cost_usd: (priced_turn_count > 0).then_some(total_cost_usd),
-        per_model_cost_usd,
-        priced_turn_count,
-        unpriced_turn_count,
-    }
+#[derive(Clone, Debug)]
+struct SessionAttemptUsageRow {
+    status: String,
+    protocol: String,
+    usage_status: String,
+    counts: [i64; 4],
 }
 
 fn summarize_session_request_usage(
-    turns: impl IntoIterator<Item = TurnCostSample>,
-) -> SessionRequestUsageSummary {
+    attempts: impl IntoIterator<Item = SessionAttemptUsageRow>,
+) -> AuditResult<SessionRequestUsageSummary> {
     let mut summary = SessionRequestUsageSummary::default();
-    for turn in turns {
-        summary.request_count = summary.request_count.saturating_add(1);
-        summary.fresh_input_tokens = summary
-            .fresh_input_tokens
-            .saturating_add(turn.usage.input_tokens);
-        summary.cache_read_tokens = summary
-            .cache_read_tokens
-            .saturating_add(turn.usage.cached_input_tokens);
-        summary.cache_creation_tokens = summary
-            .cache_creation_tokens
-            .saturating_add(turn.usage.cache_creation_tokens);
-        summary.output_tokens = summary
-            .output_tokens
-            .saturating_add(turn.usage.output_tokens);
-    }
-    summary
-}
-
-fn active_model_pricing_from_row(
-    row: &impl SessionAuditRow,
-    wanted: &HashSet<&str>,
-) -> AuditResult<Option<(String, PricingData)>> {
-    let context = "active_model_pricing_row";
-    let model_name = audit_row_string(row, context, "model_name")?;
-    if !wanted.contains(model_name.as_str()) {
-        return Ok(None);
-    }
-    let pricing_json =
-        audit_row_optional_string(row, context, "pricing_json")?.ok_or_else(|| {
-            audit_decode_error(context, "pricing_json", "expected pricing JSON, got NULL")
-        })?;
-    Ok(configured_pricing_from_stored(&pricing_json).map(|pricing| (model_name, pricing.rates())))
-}
-
-async fn load_active_model_pricing_map(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    models: &[String],
-) -> AuditResult<HashMap<String, PricingData>> {
-    if models.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let wanted: HashSet<&str> = models.iter().map(String::as_str).collect();
-    let rows = query(
-        "SELECT model_name, CAST(pricing AS CHAR) AS pricing_json \
-         FROM infra_llm_models WHERE is_active = 1",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(internal_error)?;
-
-    let mut pricing_by_model = HashMap::new();
-    for row in rows {
-        if let Some((model_name, pricing)) = active_model_pricing_from_row(&row, &wanted)? {
-            pricing_by_model.insert(model_name, pricing);
+    for attempt in attempts {
+        summary.request_count = summary
+            .request_count
+            .checked_add(1)
+            .ok_or_else(|| internal_error("session request count overflow"))?;
+        if attempt.status == "started" {
+            summary.nonterminal_attempt_count = summary
+                .nonterminal_attempt_count
+                .checked_add(1)
+                .ok_or_else(|| internal_error("session nonterminal attempt count overflow"))?;
+            continue;
+        }
+        let usage = crate::inference_execution::projected_auxiliary_usage(
+            &attempt.protocol,
+            &attempt.usage_status,
+            attempt.counts,
+        )
+        .map_err(internal_error)?;
+        if let Some(usage) = usage {
+            summary
+                .fresh_input_tokens
+                .observe(usage.fresh_input_tokens)?;
+            summary.output_tokens.observe(usage.output_tokens)?;
+            summary.cache_read_tokens.observe(usage.cache_read_tokens)?;
+            summary
+                .cache_creation_tokens
+                .observe(usage.cache_creation_tokens)?;
         }
     }
-    Ok(pricing_by_model)
+    Ok(summary)
 }
 
-fn session_turn_cost_sample_from_row(row: &impl SessionAuditRow) -> AuditResult<TurnCostSample> {
-    let context = "session_turn_cost_sample_row";
-    let model = audit_row_string(row, context, "llm_model_used")?;
-    if model.trim().is_empty() {
-        return Err(audit_decode_error(
-            context,
-            "llm_model_used",
-            "expected non-empty model",
-        ));
-    }
-    let token_usage = audit_row_string(row, context, "token_usage")?;
-    Ok(TurnCostSample {
-        model,
-        usage: parse_turn_token_usage(&token_usage, context)?,
-    })
-}
-
-async fn load_session_turn_cost_samples(
+async fn load_session_request_usage(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
     session_id: &str,
-) -> AuditResult<Vec<TurnCostSample>> {
+) -> AuditResult<SessionRequestUsageSummary> {
     let rows = query(
-        "SELECT llm_model_used, CAST(token_usage AS CHAR) AS token_usage \
-         FROM agent_events \
-         WHERE session_id = ? AND user_id = ? \
-           AND event_type IN ('user_query', 'llm_response') \
-           AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-           AND token_usage IS NOT NULL \
-         ORDER BY created_at ASC",
+        "SELECT status, provider_protocol, usage_status, input_tokens, output_tokens, \
+                cache_read_tokens, cache_creation_tokens \
+         FROM inference_provider_attempts WHERE user_id = ? AND session_id = ?",
     )
-    .bind(session_id)
     .bind(user_id)
+    .bind(session_id)
     .fetch_all(pool)
     .await
     .map_err(internal_error)?;
-
-    rows.into_iter()
-        .map(|row| session_turn_cost_sample_from_row(&row))
-        .collect()
+    let attempts = rows
+        .into_iter()
+        .map(|row| {
+            let context = "session_attempt_usage";
+            Ok(SessionAttemptUsageRow {
+                status: audit_row_string(&row, context, "status")?,
+                protocol: audit_row_string(&row, context, "provider_protocol")?,
+                usage_status: audit_row_string(&row, context, "usage_status")?,
+                counts: [
+                    audit_row_i64(&row, context, "input_tokens")?,
+                    audit_row_i64(&row, context, "output_tokens")?,
+                    audit_row_i64(&row, context, "cache_read_tokens")?,
+                    audit_row_i64(&row, context, "cache_creation_tokens")?,
+                ],
+            })
+        })
+        .collect::<AuditResult<Vec<_>>>()?;
+    summarize_session_request_usage(attempts)
 }
 
 /// A child event (tool call or error) linked to a turn via parent_event_id.
@@ -3454,10 +3410,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
         merge_session_durable_metrics(&mut metrics, durable_metrics);
         let duration_secs =
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
-        let turn_costs = load_session_turn_cost_samples(&pool, user_id, session_id).await?;
-        let pricing_by_model = load_active_model_pricing_map(&pool, &metrics.models_used).await?;
-        let request_usage = summarize_session_request_usage(turn_costs.iter().cloned());
-        let cost = summarize_session_cost(turn_costs, &pricing_by_model);
+        let request_usage = load_session_request_usage(&pool, user_id, session_id).await?;
+        // The ledger has physical usage but no historical price snapshot.
+        // Current model-name prices must not rewrite historical spending.
+        let cost = SessionCostSummary::default();
 
         Ok(SessionAuditSummary {
             session_id: session_id.to_string(),
@@ -4599,7 +4555,6 @@ mod tests {
         token_usage: Option<&'static str>,
         turn_seq: Option<i64>,
         model: Option<&'static str>,
-        pricing_json: Option<&'static str>,
     }
 
     impl FakeRuntimePromotionRow {
@@ -4646,9 +4601,6 @@ mod tests {
                 ),
                 turn_seq: Some(42),
                 model: Some("gpt-5"),
-                pricing_json: Some(
-                    r#"{"currency":"USD","unit":"per_token","prompt": 0.000002, "completion": 0.000008, "cache_read": 0.0000005}"#,
-                ),
             }
         }
 
@@ -4694,23 +4646,9 @@ mod tests {
             }
         }
 
-        fn with_token_usage(token_usage: &'static str) -> Self {
-            Self {
-                token_usage: Some(token_usage),
-                ..Self::complete()
-            }
-        }
-
         fn without_turn_seq() -> Self {
             Self {
                 turn_seq: None,
-                ..Self::complete()
-            }
-        }
-
-        fn with_pricing_json(pricing_json: Option<&'static str>) -> Self {
-            Self {
-                pricing_json,
                 ..Self::complete()
             }
         }
@@ -4773,7 +4711,6 @@ mod tests {
                 "model" => self.model.map(str::to_string),
                 "token_usage" => self.token_usage.map(str::to_string),
                 "llm_model_used" => self.model.map(str::to_string),
-                "pricing_json" => self.pricing_json.map(str::to_string),
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -5800,222 +5737,86 @@ mod tests {
     }
 
     #[test]
-    fn active_model_pricing_row_only_accepts_explicit_usd_rates() {
-        let wanted = HashSet::from(["gpt-5"]);
-        let decoded = active_model_pricing_from_row(&FakeSessionAuditRow::complete(), &wanted)
-            .expect("pricing row decodes")
-            .expect("wanted model is retained");
-        assert_eq!(decoded.0, "gpt-5");
-        assert_eq!(decoded.1.prompt, 0.000_002);
-        assert_eq!(decoded.1.completion, 0.000_008);
-        assert_eq!(decoded.1.cache_read, Some(0.000_000_5));
-        assert_eq!(decoded.1.cache_write, None);
-
-        let not_wanted = HashSet::from(["glm-5.2"]);
-        assert!(
-            active_model_pricing_from_row(&FakeSessionAuditRow::complete(), &not_wanted)
-                .expect("unwanted pricing row still decodes its routing key")
-                .is_none()
+    fn session_request_usage_counts_physical_attempts_and_preserves_unknown_lanes() {
+        let attempt =
+            |status: &str, protocol: &str, usage_status: &str, counts| SessionAttemptUsageRow {
+                status: status.into(),
+                protocol: protocol.into(),
+                usage_status: usage_status.into(),
+                counts,
+            };
+        let summary = summarize_session_request_usage([
+            attempt(
+                "succeeded",
+                "openai_compatible",
+                "provider_exact",
+                [100, 20, 80, 0],
+            ),
+            attempt(
+                "failed",
+                "openai_compatible",
+                "provider_partial",
+                [30, 0, 0, 0],
+            ),
+            attempt(
+                "cancelled",
+                "typesafe_systemone",
+                "provider_exact",
+                [50, 10, 0, 0],
+            ),
+            attempt(
+                "delivery_unknown",
+                "openai_compatible",
+                "unavailable",
+                [0, 0, 0, 0],
+            ),
+            attempt("started", "openai_compatible", "unavailable", [0, 0, 0, 0]),
+        ])
+        .unwrap();
+        assert_eq!(summary.request_count, 5);
+        assert_eq!(summary.nonterminal_attempt_count, 1);
+        assert_eq!(
+            summary.fresh_input_tokens,
+            ObservedTokenLane {
+                known_tokens: Some(180),
+                observed_attempts: 3
+            }
         );
-
-        assert_audit_internal_error_mentions(
-            active_model_pricing_from_row(&FakeSessionAuditRow::fail_on("model_name"), &wanted),
-            "model_name",
+        assert_eq!(
+            summary.output_tokens,
+            ObservedTokenLane {
+                known_tokens: Some(30),
+                observed_attempts: 2
+            }
         );
-        assert_audit_internal_error_mentions(
-            active_model_pricing_from_row(&FakeSessionAuditRow::fail_on("pricing_json"), &wanted),
-            "pricing_json",
+        assert_eq!(
+            summary.cache_read_tokens,
+            ObservedTokenLane {
+                known_tokens: Some(80),
+                observed_attempts: 1
+            }
         );
-        assert!(
-            active_model_pricing_from_row(
-                &FakeSessionAuditRow::with_pricing_json(Some("{not-json")),
-                &wanted,
-            )
-            .unwrap()
-            .is_none()
+        assert_eq!(
+            summary.cache_creation_tokens,
+            ObservedTokenLane {
+                known_tokens: Some(0),
+                observed_attempts: 1
+            }
         );
-        assert_audit_internal_error_mentions(
-            active_model_pricing_from_row(&FakeSessionAuditRow::with_pricing_json(None), &wanted),
-            "expected pricing JSON",
-        );
-        for raw in [
-            r#"{"completion": 8.0}"#,
-            r#"{"prompt": 2.0, "completion": -1.0}"#,
-            r#"{"currency":"CNY","unit":"per_token","prompt":0,"completion":0}"#,
-        ] {
-            assert!(
-                active_model_pricing_from_row(
-                    &FakeSessionAuditRow::with_pricing_json(Some(raw)),
-                    &wanted,
-                )
-                .unwrap()
-                .is_none()
-            );
-        }
+        let empty = summarize_session_request_usage([]).unwrap();
+        assert_eq!(empty.request_count, 0);
+        assert_eq!(empty.fresh_input_tokens.known_tokens, None);
+        assert_eq!(SessionCostSummary::default().estimated_cost_usd, None);
     }
 
     #[test]
-    fn session_turn_cost_sample_row_decode_preserves_values_and_fails_loudly() {
-        let sample = session_turn_cost_sample_from_row(&FakeSessionAuditRow::complete())
-            .expect("cost sample row decodes");
-        assert_eq!(sample.model, "gpt-5");
-        assert_eq!(sample.usage.input_tokens, 10);
-        assert_eq!(sample.usage.cached_input_tokens, 2);
-        assert_eq!(sample.usage.output_tokens, 5);
-        assert_eq!(sample.usage.total_tokens, 17);
-
-        assert_audit_internal_error_mentions(
-            session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("llm_model_used")),
-            "llm_model_used",
-        );
-        assert_audit_internal_error_mentions(
-            session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_model("")),
-            "expected non-empty model",
-        );
-        assert_audit_internal_error_mentions(
-            session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("token_usage")),
-            "token_usage",
-        );
-        assert_audit_internal_error_mentions(
-            session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_token_usage("{not-json")),
-            "token_usage",
-        );
-        assert_audit_internal_error_mentions(
-            session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_token_usage(
-                r#"{"input_tokens": -1}"#,
-            )),
-            "non-negative token count",
-        );
-    }
-
-    #[test]
-    fn summarize_session_cost_aggregates_priced_turns_and_flags_unpriced_ones() {
-        let turns = vec![
-            TurnCostSample {
-                model: "claude".into(),
-                usage: ParsedTurnTokenUsage {
-                    input_tokens: 1_000_000,
-                    cached_input_tokens: 0,
-                    cache_creation_tokens: 0,
-                    output_tokens: 500_000,
-                    total_tokens: 1_500_000,
-                },
-            },
-            TurnCostSample {
-                model: "unknown".into(),
-                usage: ParsedTurnTokenUsage {
-                    input_tokens: 100,
-                    cached_input_tokens: 0,
-                    cache_creation_tokens: 0,
-                    output_tokens: 50,
-                    total_tokens: 150,
-                },
-            },
-        ];
-        let pricing_by_model = HashMap::from([(
-            "claude".to_string(),
-            PricingData {
-                prompt: 0.000_002,
-                completion: 0.000_008,
-                cache_read: None,
-                cache_write: None,
-            },
-        )]);
-
-        let summary = summarize_session_cost(turns, &pricing_by_model);
-        assert_eq!(summary.priced_turn_count, 1);
-        assert_eq!(summary.unpriced_turn_count, 1);
-        assert_eq!(summary.estimated_cost_usd, Some(6.0));
-        assert_eq!(summary.per_model_cost_usd.get("claude"), Some(&6.0));
-    }
-
-    #[test]
-    fn session_request_usage_keeps_fresh_and_cache_lanes_distinct() {
-        let usage = summarize_session_request_usage([
-            TurnCostSample {
-                model: "parent".into(),
-                usage: ParsedTurnTokenUsage {
-                    input_tokens: 120,
-                    cached_input_tokens: 480,
-                    cache_creation_tokens: 20,
-                    output_tokens: 30,
-                    total_tokens: 650,
-                },
-            },
-            TurnCostSample {
-                model: "child".into(),
-                usage: ParsedTurnTokenUsage {
-                    input_tokens: 40,
-                    cached_input_tokens: 160,
-                    cache_creation_tokens: 0,
-                    output_tokens: 10,
-                    total_tokens: 210,
-                },
-            },
-        ]);
-
-        assert_eq!(usage.scope, SessionRequestUsageScope::SessionAllRuns);
-        assert_eq!(usage.request_count, 2);
-        assert_eq!(usage.fresh_input_tokens, 160);
-        assert_eq!(usage.cache_read_tokens, 640);
-        assert_eq!(usage.cache_creation_tokens, 20);
-        assert_eq!(usage.output_tokens, 40);
-    }
-
-    #[test]
-    fn summarize_session_cost_marks_missing_cache_rate_as_unpriced() {
-        let turns = vec![TurnCostSample {
-            model: "claude".into(),
-            usage: ParsedTurnTokenUsage {
-                input_tokens: 100,
-                cached_input_tokens: 10,
-                cache_creation_tokens: 0,
-                output_tokens: 20,
-                total_tokens: 130,
-            },
-        }];
-        let pricing_by_model = HashMap::from([(
-            "claude".to_string(),
-            PricingData {
-                prompt: 0.000_002,
-                completion: 0.000_008,
-                cache_read: None,
-                cache_write: None,
-            },
-        )]);
-
-        let summary = summarize_session_cost(turns, &pricing_by_model);
-        assert_eq!(summary.priced_turn_count, 0);
-        assert_eq!(summary.unpriced_turn_count, 1);
-        assert_eq!(summary.estimated_cost_usd, None);
-        assert!(summary.per_model_cost_usd.is_empty());
-    }
-
-    #[test]
-    fn summarize_session_cost_marks_invalid_required_rate_as_unpriced() {
-        let turns = vec![TurnCostSample {
-            model: "claude".into(),
-            usage: ParsedTurnTokenUsage {
-                input_tokens: 100,
-                output_tokens: 20,
-                total_tokens: 120,
-                ..ParsedTurnTokenUsage::default()
-            },
-        }];
-        let pricing_by_model = HashMap::from([(
-            "claude".to_string(),
-            PricingData {
-                prompt: f64::NAN,
-                completion: 8.0,
-                cache_read: None,
-                cache_write: None,
-            },
-        )]);
-
-        let summary = summarize_session_cost(turns, &pricing_by_model);
-        assert_eq!(summary.priced_turn_count, 0);
-        assert_eq!(summary.unpriced_turn_count, 1);
-        assert_eq!(summary.estimated_cost_usd, None);
+    fn session_request_usage_rejects_overflow() {
+        let mut lane = ObservedTokenLane {
+            known_tokens: Some(u64::MAX),
+            observed_attempts: 1,
+        };
+        assert!(lane.observe(Some(1)).is_err());
+        assert_eq!(lane.known_tokens, Some(u64::MAX));
     }
 
     #[test]
@@ -6116,10 +5917,23 @@ mod tests {
             request_usage: SessionRequestUsageSummary {
                 scope: SessionRequestUsageScope::SessionAllRuns,
                 request_count: 12,
-                fresh_input_tokens: 5000,
-                cache_read_tokens: 4200,
-                cache_creation_tokens: 100,
-                output_tokens: 3000,
+                nonterminal_attempt_count: 0,
+                fresh_input_tokens: ObservedTokenLane {
+                    known_tokens: Some(5000),
+                    observed_attempts: 12,
+                },
+                cache_read_tokens: ObservedTokenLane {
+                    known_tokens: Some(4200),
+                    observed_attempts: 12,
+                },
+                cache_creation_tokens: ObservedTokenLane {
+                    known_tokens: Some(100),
+                    observed_attempts: 12,
+                },
+                output_tokens: ObservedTokenLane {
+                    known_tokens: Some(3000),
+                    observed_attempts: 12,
+                },
             },
             tool_calls_total: 25,
             tool_calls_failed: 2,
@@ -6142,7 +5956,7 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"turn_count\":10"));
         assert!(json.contains("\"tokens_in\":5000"));
-        assert!(json.contains("\"cache_read_tokens\":4200"));
+        assert!(json.contains("\"known_tokens\":4200"));
     }
 
     // ── Cross-session type tests ─────────────────────────────────────────────

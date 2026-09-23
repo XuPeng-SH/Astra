@@ -67,15 +67,6 @@ impl ConfiguredPricingData {
             cache_write: self.cache_write,
         })
     }
-
-    pub(crate) fn rates(&self) -> PricingData {
-        PricingData {
-            prompt: self.prompt,
-            completion: self.completion,
-            cache_read: self.cache_read,
-            cache_write: self.cache_write,
-        }
-    }
 }
 
 /// Configured catalog rate, not a provider bill or a task-cost estimate.
