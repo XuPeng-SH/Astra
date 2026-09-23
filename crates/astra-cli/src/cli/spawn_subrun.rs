@@ -671,50 +671,81 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 .as_ref()
                 .map(|parent| &parent.selection)
         });
-        let resolved_selections: Vec<_> = inputs
+        let requested_selectors: Vec<_> = inputs
             .iter()
             .map(|input| {
-                let selection = astra_turn_types::resolve_requested_model_selection(
+                let selector = astra_turn_types::resolve_requested_model_selector(
                     input.requested_model_policy.as_ref(),
                     parent_selection,
                 )
                 .map_err(|error| error.to_string())?;
-                if input
-                    .resolved_model_selection
-                    .as_ref()
-                    .is_some_and(|prepared| Some(prepared) != selection.as_ref())
+                if let (
+                    Some(prepared),
+                    Some(astra_turn_types::ModelSelector::OfferingId { offering_id }),
+                ) = (input.resolved_model_selection.as_ref(), selector.as_ref())
+                    && prepared.offering_id != *offering_id
                 {
                     return Err(
                         "resolved child Offering does not match its requested model policy".into(),
                     );
                 }
-                Ok(selection)
+                Ok(selector)
             })
             .collect::<Result<_, String>>()?;
-        let thinking: Vec<_> = inputs
+        let resolved_selections: Vec<_> = requested_selectors
             .iter()
+            .map(|selector| match selector.as_ref() {
+                Some(astra_turn_types::ModelSelector::OfferingId { offering_id }) => {
+                    Some(astra_turn_types::ModelSelection {
+                        offering_id: offering_id.clone(),
+                    })
+                }
+                Some(astra_turn_types::ModelSelector::ConfiguredName { .. }) => None,
+                None => None,
+            })
+            .collect();
+        let mut thinking: Vec<_> = inputs
+            .iter()
+            .zip(&requested_selectors)
             .zip(&resolved_selections)
-            .map(|(input, selection)| {
+            .map(|((input, selector), selection)| {
+                let configured_name = matches!(
+                    selector,
+                    Some(astra_turn_types::ModelSelector::ConfiguredName { .. })
+                );
                 resolve_child_thinking(
                     input.reasoning.as_ref(),
-                    selection.as_ref().or(parent_selection),
-                    context.parent_model_reasoning.as_ref(),
+                    selection
+                        .as_ref()
+                        .or_else(|| (!configured_name).then_some(parent_selection).flatten()),
+                    (!configured_name)
+                        .then_some(context.parent_model_reasoning.as_ref())
+                        .flatten(),
                 )
             })
             .collect();
         let has_override = inputs
             .iter()
+            .zip(&requested_selectors)
             .zip(&resolved_selections)
-            .any(|(input, selection)| {
-                selection.as_ref().is_some_and(|selection| {
-                    parent_selection
-                        .is_none_or(|parent| selection.offering_id != parent.offering_id)
-                }) || input.reasoning.is_some()
+            .any(|((input, selector), selection)| {
+                selector.as_ref().is_some_and(|selector| match selector {
+                    astra_turn_types::ModelSelector::ConfiguredName { .. } => true,
+                    astra_turn_types::ModelSelector::OfferingId { offering_id } => {
+                        parent_selection.is_none_or(|parent| offering_id != &parent.offering_id)
+                    }
+                }) || (selector.is_none() && selection.is_some() && parent_selection.is_none())
+                    || input.reasoning.is_some()
                     || input.max_output_tokens.is_some()
             });
         if has_override
             && parent_selection.is_none()
-            && resolved_selections.iter().any(Option::is_none)
+            && inputs.iter().any(|input| {
+                matches!(
+                    input.requested_model_policy,
+                    None | Some(astra_turn_types::RequestedModelPolicy::Inherit)
+                )
+            })
         {
             return Err("a fanout with per-slot overrides requires an exact parent Offering for inherited slots".to_string());
         }
@@ -746,34 +777,98 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             let request = ModelAdmissionRequestV1 {
                 slots: inputs
                     .iter()
-                    .zip(&resolved_selections)
+                    .zip(&requested_selectors)
                     .zip(&thinking)
-                    .map(|((input, selection), thinking)| {
-                        let offering_id = selection
-                            .as_ref()
-                            .map(|selection| selection.offering_id.as_str())
+                    .map(|((input, selector), thinking)| {
+                        let selector = selector
+                            .clone()
                             .or_else(|| {
-                                parent_selection.map(|selection| selection.offering_id.as_str())
+                                parent_selection.map(|selection| {
+                                    astra_turn_types::ModelSelector::OfferingId {
+                                        offering_id: selection.offering_id.clone(),
+                                    }
+                                })
                             })
                             .ok_or_else(|| {
                                 "child has no admitted parent or default Offering".to_string()
                             })?;
                         let reasoning = ReasoningSelection::from(thinking.clone());
+                        let inherited_reasoning = if input.reasoning.is_none()
+                            && matches!(
+                                selector,
+                                astra_turn_types::ModelSelector::ConfiguredName { .. }
+                            ) {
+                            context
+                                .parent_model_reasoning
+                                .as_ref()
+                                .map(|parent| {
+                                    Ok::<_, String>(
+                                        astra_server_types::ModelAdmissionReasoningInheritanceV1 {
+                                            offering_id: parent.selection.offering_id.clone(),
+                                            reasoning: serde_json::to_value(
+                                                ReasoningSelection::from(parent.thinking.clone()),
+                                            )
+                                            .map_err(|error| error.to_string())?,
+                                        },
+                                    )
+                                })
+                                .transpose()?
+                        } else {
+                            None
+                        };
                         Ok(ModelAdmissionSlotV1 {
-                            offering_id: offering_id.to_string(),
+                            selector,
                             max_output_tokens: input.max_output_tokens,
                             reasoning: serde_json::to_value(reasoning)
                                 .map_err(|error| error.to_string())?,
+                            inherited_reasoning,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?,
             };
-            crate::cli::session::session_runtime::admit_server_model_slots(
+            let admitted = crate::cli::session::session_runtime::admit_server_model_slots(
                 &self.api,
                 token.as_deref().expect("batch admission requires token"),
                 request,
             )
-            .await?
+            .await?;
+            if admitted.len() != inputs.len() {
+                return Err("batch model admission returned an incomplete Offering set".into());
+            }
+            for (index, ((selector, model), input)) in requested_selectors
+                .iter()
+                .zip(&admitted)
+                .zip(inputs)
+                .enumerate()
+            {
+                match selector {
+                    Some(astra_turn_types::ModelSelector::OfferingId { offering_id })
+                        if model.model.offering_id != *offering_id =>
+                    {
+                        return Err("batch model admission returned a mismatched Offering".into());
+                    }
+                    Some(astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name, ..
+                    }) if !model.model.name.eq_ignore_ascii_case(model_name) => {
+                        return Err(
+                            "batch model admission returned a mismatched configured name".into(),
+                        );
+                    }
+                    _ => {}
+                }
+                if input
+                    .resolved_model_selection
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.offering_id != model.model.offering_id)
+                {
+                    return Err("resolved child Offering changed during batch admission".into());
+                }
+                thinking[index] = model.thinking.clone();
+            }
+            admitted
+                .into_iter()
+                .map(|admitted| admitted.model)
+                .collect()
         } else if let Some((selection, model_name)) = parent_model_snapshot {
             vec![
                 crate::cli::session::session_runtime::ServerModelSelection {
@@ -797,8 +892,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             .iter()
             .zip(selections)
             .zip(thinking)
-            .zip(resolved_selections)
-            .map(|(((input, model), thinking), _requested_selection)| {
+            .map(|((input, model), thinking)| {
                 let resolved_selection = Some(astra_turn_types::ModelSelection {
                     offering_id: model.offering_id.clone(),
                 });
@@ -820,6 +914,30 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         self.execute_with_model_selection(config, None).await
     }
+}
+
+fn validate_prepared_child_model_policy(
+    policy: Option<&astra_turn_types::RequestedModelPolicy>,
+    resolved_selection: Option<&astra_turn_types::ModelSelection>,
+    prepared_model: Option<&crate::cli::session::session_runtime::ServerModelSelection>,
+) -> Result<(), String> {
+    let Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName { model_name, .. },
+    }) = policy
+    else {
+        return Ok(());
+    };
+    let resolved_selection = resolved_selection
+        .ok_or_else(|| "configured model name has no trusted resolved Offering".to_string())?;
+    let prepared_model = prepared_model.ok_or_else(|| {
+        "configured model name requires a matching Server-prepared child model".to_string()
+    })?;
+    if prepared_model.offering_id != resolved_selection.offering_id
+        || !prepared_model.name.eq_ignore_ascii_case(model_name)
+    {
+        return Err("prepared child model does not match its configured-name selector".into());
+    }
+    Ok(())
 }
 
 struct CliPreparedSpawn {
@@ -874,6 +992,11 @@ impl CliSpawnAgentExecutor {
         prepared_model: Option<crate::cli::session::session_runtime::ServerModelSelection>,
     ) -> Result<SpawnRunResult, String> {
         config.validate_requested_model_policy()?;
+        validate_prepared_child_model_policy(
+            config.requested_model_policy.as_ref(),
+            config.resolved_model_selection.as_ref(),
+            prepared_model.as_ref(),
+        )?;
         if let Some(limit) = config.max_output_tokens {
             config.thinking.validate_output_budget(u64::from(limit))?;
         }
@@ -984,10 +1107,13 @@ impl CliSpawnAgentExecutor {
                 );
                 let request = ModelAdmissionRequestV1 {
                     slots: vec![ModelAdmissionSlotV1 {
-                        offering_id: selection.offering_id.clone(),
+                        selector: astra_turn_types::ModelSelector::OfferingId {
+                            offering_id: selection.offering_id.clone(),
+                        },
                         max_output_tokens: config.max_output_tokens,
                         reasoning: serde_json::to_value(reasoning)
                             .map_err(|error| error.to_string())?,
+                        inherited_reasoning: None,
                     }],
                 };
                 crate::cli::session::session_runtime::admit_server_model_slots(
@@ -996,6 +1122,7 @@ impl CliSpawnAgentExecutor {
                 .await?
                 .into_iter()
                 .next()
+                .map(|admitted| admitted.model)
                 .ok_or_else(|| "model admission returned no selected Offering".to_string())?
             }
         } else {
@@ -1745,7 +1872,7 @@ mod tests {
     use super::{
         CliSpawnAgentExecutor, TokenProvider, agent_live_stream_event_sink, build_child_messages,
         build_child_system_prompt, cancelled_loop_origin, classified_error_cancellation_origin,
-        emit_agent_transcript_committed,
+        emit_agent_transcript_committed, validate_prepared_child_model_policy,
     };
     use crate::lock_recovery::LockRecovery;
     use astra_runtime::orchestration::{
@@ -1767,6 +1894,71 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::cli::chat_stream::StreamEvent;
+
+    #[test]
+    fn configured_name_intent_is_preserved_after_matching_server_preparation() {
+        let policy = astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "GLM-5.2".into(),
+                source: Some("typesafe".into()),
+            },
+        };
+        let resolved = astra_turn_types::ModelSelection {
+            offering_id: "offer-glm".into(),
+        };
+        let prepared = crate::cli::session::session_runtime::ServerModelSelection {
+            name: "glm-5.2".into(),
+            context_window: Some(128_000),
+            offering_id: "offer-glm".into(),
+        };
+        validate_prepared_child_model_policy(Some(&policy), Some(&resolved), Some(&prepared))
+            .expect("prepared model must match configured identity");
+        assert_eq!(
+            policy,
+            astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::ConfiguredName {
+                    model_name: "GLM-5.2".into(),
+                    source: Some("typesafe".into()),
+                },
+            },
+            "validation must not rewrite the original selector or source"
+        );
+        assert!(
+            validate_prepared_child_model_policy(Some(&policy), Some(&resolved), None).is_err()
+        );
+        assert!(
+            validate_prepared_child_model_policy(Some(&policy), None, Some(&prepared)).is_err()
+        );
+
+        let wrong_offering = crate::cli::session::session_runtime::ServerModelSelection {
+            offering_id: "offer-other".into(),
+            ..prepared.clone()
+        };
+        assert!(
+            validate_prepared_child_model_policy(
+                Some(&policy),
+                Some(&resolved),
+                Some(&wrong_offering),
+            )
+            .is_err()
+        );
+        let wrong_name = crate::cli::session::session_runtime::ServerModelSelection {
+            name: "other-model".into(),
+            ..prepared
+        };
+        assert!(
+            validate_prepared_child_model_policy(Some(&policy), Some(&resolved), Some(&wrong_name),)
+                .is_err()
+        );
+
+        let exact_id = astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: "offer-fixed".into(),
+            },
+        };
+        validate_prepared_child_model_policy(Some(&exact_id), None, None)
+            .expect("Offering identity needs no configured-name projection");
+    }
 
     fn cli_fanout_test_context() -> SpawnContext {
         SpawnContext {
@@ -1999,7 +2191,7 @@ mod tests {
         unsupported[1].max_output_tokens = None;
         unsupported[1].requested_model_policy =
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                selection: astra_turn_types::ModelSelection {
+                selector: astra_turn_types::ModelSelector::OfferingId {
                     offering_id: "offer-revoked".into(),
                 },
             });
@@ -2046,8 +2238,9 @@ mod tests {
                 description: "glm review".into(),
                 prompt: "review".into(),
                 requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                    selection: astra_turn_types::ModelSelection {
-                        offering_id: "offer-glm".into(),
+                    selector: astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name: "glm-5.2".into(),
+                        source: None,
                     },
                 }),
                 reasoning: Some(
@@ -2082,14 +2275,21 @@ mod tests {
             "admission_validated"
         );
         for (prepared, input) in prepared.into_iter().zip(&inputs) {
+            let admitted_selection =
+                prepared
+                    .model_identity()
+                    .map(|identity| astra_turn_types::ModelSelection {
+                        offering_id: identity.offering_id,
+                    });
+            let requested_selection = astra_turn_types::resolve_requested_model_selection(
+                input.requested_model_policy.as_ref(),
+                Some(&parent),
+            )
+            .unwrap_or(admitted_selection);
             let result = prepared
                 .execute(prepared_cli_test_config_for_input(
                     input,
-                    astra_turn_types::resolve_requested_model_selection(
-                        input.requested_model_policy.as_ref(),
-                        Some(&parent),
-                    )
-                    .unwrap(),
+                    requested_selection,
                     input
                         .reasoning
                         .as_ref()
@@ -2106,7 +2306,9 @@ mod tests {
         let mut explicit_inputs = inputs.clone();
         explicit_inputs[0].requested_model_policy =
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                selection: parent.clone(),
+                selector: astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: parent.offering_id.clone(),
+                },
             });
         let explicit = Arc::clone(&executor)
             .prepare_batch(&explicit_inputs, &context, None)
@@ -2121,8 +2323,8 @@ mod tests {
             "one admission POST per group; no catalog GET or child request"
         );
         assert_eq!(
-            requests[0].body_json::<Value>().unwrap()["slots"][1]["offering_id"],
-            "offer-glm"
+            requests[0].body_json::<Value>().unwrap()["slots"][1]["selector"],
+            json!({"kind":"configured_name","model_name":"glm-5.2"})
         );
 
         let mismatch_server = MockServer::start().await;
@@ -2138,9 +2340,16 @@ mod tests {
             .mount(&mismatch_server)
             .await;
         let mismatch_executor = Arc::new(test_executor(&mismatch_server.uri()));
+        let mut mismatched_inputs = inputs.clone();
+        mismatched_inputs[1].requested_model_policy =
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: "offer-glm".into(),
+                },
+            });
         assert!(
             Arc::clone(&mismatch_executor)
-                .prepare_batch(&inputs, &context, Some(&parent))
+                .prepare_batch(&mismatched_inputs, &context, Some(&parent))
                 .await
                 .is_err()
         );
@@ -2164,6 +2373,98 @@ mod tests {
             failure_server.verify().await;
             assert_eq!(failure_server.received_requests().await.unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn configured_name_inherits_parent_reasoning_through_one_batch_admission() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "slots": [{
+                    "offering_id":"offer-glm",
+                    "reasoning":{"mode":"adaptive","effort":"high"},
+                    "model_name":"glm-5.2",
+                    "context_window":128000
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let executor = Arc::new(test_executor(&server.uri()));
+        let mut context = cli_fanout_test_context();
+        context.parent_model_reasoning = Some(
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: "offer-glm".into(),
+                },
+                resolved_model_name: Some("glm-5.2".into()),
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+                    effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                },
+            },
+        );
+        let input = SpawnAgentInput {
+            description: "named inherited child".into(),
+            prompt: "reply".into(),
+            requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::ConfiguredName {
+                    model_name: "glm-5.2".into(),
+                    source: None,
+                },
+            }),
+            fanout_group_id: Some("group".into()),
+            fanout_target_count: Some(1),
+            fanout_slot_index: Some(0),
+            ..Default::default()
+        };
+        let prepared = Arc::clone(&executor)
+            .prepare_batch(std::slice::from_ref(&input), &context, None)
+            .await
+            .expect("configured name is admitted before launch");
+        assert_eq!(prepared.len(), 1);
+        let identity = prepared[0].model_identity().expect("prepared identity");
+        assert_eq!(identity.offering_id, "offer-glm");
+        assert_eq!(identity.model_name, "glm-5.2");
+        let result = prepared
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute(prepared_cli_test_config_for_input(
+                &input,
+                Some(astra_turn_types::ModelSelection {
+                    offering_id: "offer-glm".into(),
+                }),
+                astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+                    effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                },
+            ))
+            .await
+            .expect_err("trusted binding reaches the deliberate test turn-limit guard");
+        assert!(
+            result.contains("hard_turn_limit must be positive"),
+            "{result}"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "name resolution and admission are one call"
+        );
+        let body = requests[0].body_json::<Value>().unwrap();
+        assert_eq!(
+            body["slots"][0]["selector"],
+            json!({"kind":"configured_name","model_name":"glm-5.2"})
+        );
+        assert_eq!(
+            body["slots"][0]["inherited_reasoning"],
+            json!({
+                "offering_id":"offer-glm",
+                "reasoning":{"mode":"adaptive","effort":"high"}
+            })
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -2262,8 +2563,13 @@ mod tests {
             .map(|(index, (model_selection, reasoning))| SpawnAgentInput {
                 description: format!("slot {index}"),
                 prompt: "review".into(),
-                requested_model_policy: model_selection
-                    .map(|selection| astra_turn_types::RequestedModelPolicy::Fixed { selection }),
+                requested_model_policy: model_selection.map(|selection| {
+                    astra_turn_types::RequestedModelPolicy::Fixed {
+                        selector: astra_turn_types::ModelSelector::OfferingId {
+                            offering_id: selection.offering_id,
+                        },
+                    }
+                }),
                 reasoning,
                 fanout_group_id: Some("reasoning".into()),
                 fanout_target_count: Some(4),
@@ -2465,7 +2771,7 @@ mod tests {
                 description: "explicit".into(),
                 prompt: "reply".into(),
                 requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                    selection: astra_turn_types::ModelSelection {
+                    selector: astra_turn_types::ModelSelector::OfferingId {
                         offering_id: "explicit-offer".into(),
                     },
                 }),

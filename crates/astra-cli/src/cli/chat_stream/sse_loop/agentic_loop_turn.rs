@@ -2045,7 +2045,7 @@ mod tests {
             "model_selection": {"offering_id": "generic-offering"},
             "requested_model_policy": {
                 "mode": "fixed",
-                "selection": {"offering_id": "selected-offering"}
+                "selector": {"kind": "offering_id", "offering_id": "selected-offering"}
             },
             "edge_executor_id": "edge-1",
             "capabilities": [],
@@ -2068,7 +2068,7 @@ mod tests {
 
         assert_eq!(admitted["execution_time_budget"]["remaining_seconds"], 37);
         assert_eq!(
-            admitted["requested_model_policy"]["selection"]["offering_id"],
+            admitted["requested_model_policy"]["selector"]["offering_id"],
             "selected-offering"
         );
         assert!(admitted["context"].get("requested_model_policy").is_none());

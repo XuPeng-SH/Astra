@@ -646,7 +646,7 @@ mod tests {
     fn shipped_subagent_model_cases_parse_with_strict_criteria() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
         let cases = Case::load_dir(&dir).expect("shipped DeepSeek Flash cases");
-        assert_eq!(cases.len(), 2);
+        assert_eq!(cases.len(), 4);
         assert!(cases.iter().all(|case| !case.criteria.is_empty()));
     }
 
@@ -803,8 +803,10 @@ criteria:
                 .map(|case| case.name.as_str())
                 .collect::<Vec<_>>(),
             [
+                "flash_fanout_auto_unavailable",
                 "flash_fanout_invalid_final_slot",
-                "flash_fanout_model_default"
+                "flash_fanout_model_default",
+                "flash_spawn_configured_name_glm"
             ]
         );
         assert!(cases.iter().all(|case| case.debug_log));

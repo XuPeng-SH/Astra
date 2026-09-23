@@ -666,6 +666,7 @@ fn inherit_parent_run_identity(
                     context.resolved_model_selection = Some(ResolvedModelSelection {
                         offering_id: offering_id.to_string(),
                         model_name: model_name.to_string(),
+                        source_identity: None,
                     });
                     Ok(())
                 }
@@ -7376,6 +7377,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7410,6 +7412,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-b".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7441,6 +7444,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     provider_run_owner: Some(astra_services::runs::ProviderRunOwner {
                         provider_id: "moi".to_string(),
@@ -7499,6 +7503,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-parent".to_string(),
                         model_name: "parent-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7523,6 +7528,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-child".to_string(),
                         model_name: "child-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7554,6 +7560,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-parent".to_string(),
                         model_name: "parent-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7578,6 +7585,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-child-b".to_string(),
                         model_name: "child-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7609,6 +7617,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-parent".to_string(),
                         model_name: "parent-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7632,6 +7641,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-child".to_string(),
                         model_name: "child-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7872,6 +7882,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7895,6 +7906,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-unadmitted".to_string(),
                         model_name: "other-provider-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },

@@ -300,6 +300,7 @@ mod tests {
             Self {
                 admitted: AdmittedModelExecution {
                     offering_id: "judge-offering".into(),
+                    source_identity: None,
                     access_kind: ModelAccessKind::SelfHosted,
                     execution_placement: ModelExecutionPlacement::Server,
                     model_name: "judge-model".into(),

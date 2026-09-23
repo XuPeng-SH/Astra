@@ -9926,15 +9926,27 @@ impl AgenticRunLifecycleService {
                 ));
             }
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                selection: requested,
+                selector:
+                    astra_turn_types::ModelSelector::OfferingId {
+                        offering_id: requested,
+                    },
             }) if request
                 .model_selection
                 .as_ref()
-                .is_none_or(|selected| selected != requested) =>
+                .is_none_or(|selected| selected.offering_id != *requested) =>
             {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
                     "requested fixed model does not match the admitted Offering selection",
+                    "model_selection_invalid",
+                ));
+            }
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::ConfiguredName { .. },
+            }) if request.model_selection.is_none() => {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "configured model names require a matching admitted Offering selection",
                     "model_selection_invalid",
                 ));
             }
@@ -10023,6 +10035,7 @@ impl AgenticRunLifecycleService {
             let resolved = ResolvedModelSelection {
                 offering_id: admitted.offering_id.clone(),
                 model_name: admitted.model_name.clone(),
+                source_identity: admitted_source_identity(&admitted),
             };
             request.model_selection = Some(selection);
             request.model = Some(resolved.model_name.clone());
@@ -10065,19 +10078,23 @@ impl AgenticRunLifecycleService {
                     "provider_runtime_context_required",
                 )
             })?;
-            request.admitted_model_execution = Some(
-                crate::server::model_execution_admission::admit_model_execution(
-                    &self.model_service,
-                    astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
-                    user_id,
-                    selection,
-                    Some(resolved),
-                    Some(gateway),
-                    request.runtime_auth.as_ref(),
-                )
-                .await?,
-            );
+            let admitted = crate::server::model_execution_admission::admit_model_execution(
+                &self.model_service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+                user_id,
+                selection,
+                Some(resolved),
+                Some(gateway),
+                request.runtime_auth.as_ref(),
+            )
+            .await?;
             validate_expected_model_name(&request, &resolved.model_name)?;
+            validate_requested_configured_model_name(
+                &request,
+                &resolved.model_name,
+                resolved.source_identity.as_ref(),
+            )?;
+            request.admitted_model_execution = Some(admitted);
             request.model = Some(resolved.model_name.clone());
             return Ok(request);
         }
@@ -10099,9 +10116,16 @@ impl AgenticRunLifecycleService {
         )
         .await?;
         validate_expected_model_name(&request, &admitted.model_name)?;
+        let source_identity = admitted_source_identity(&admitted);
+        validate_requested_configured_model_name(
+            &request,
+            &admitted.model_name,
+            source_identity.as_ref(),
+        )?;
         let resolved = ResolvedModelSelection {
             offering_id: admitted.offering_id.clone(),
             model_name: admitted.model_name.clone(),
+            source_identity,
         };
         request.model = Some(resolved.model_name.clone());
         request.resolved_model_selection = Some(resolved);
@@ -13567,6 +13591,47 @@ fn validate_expected_model_name(
         ));
     }
     Ok(())
+}
+
+fn validate_requested_configured_model_name(
+    request: &ChatRequestData,
+    resolved_model_name: &str,
+    source_identity: Option<&astra_services::runs::ResolvedModelSourceIdentity>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName { model_name, source },
+    }) = request.requested_model_policy.as_ref()
+    else {
+        return Ok(());
+    };
+    let name_matches = model_name.eq_ignore_ascii_case(resolved_model_name);
+    let source_matches = source.as_deref().is_none_or(|source| {
+        source_identity.is_some_and(|identity| {
+            source.eq_ignore_ascii_case(&identity.provider)
+                || source.eq_ignore_ascii_case(&identity.access_label)
+        })
+    });
+    if !name_matches || !source_matches {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "The selected Offering no longer matches the configured child model selector; retry delegation to prepare the current identity",
+            "model_identity_changed",
+        ));
+    }
+    Ok(())
+}
+
+fn admitted_source_identity(
+    admitted: &astra_services::AdmittedModelExecution,
+) -> Option<astra_services::runs::ResolvedModelSourceIdentity> {
+    admitted.source_identity.clone().or_else(|| {
+        (admitted.execution_placement == astra_services::ModelExecutionPlacement::Server).then(
+            || astra_services::runs::ResolvedModelSourceIdentity {
+                provider: admitted.provider.clone(),
+                access_label: admitted.access_kind.source_label().to_string(),
+            },
+        )
+    })
 }
 
 fn exact_runtime_id(
@@ -21705,55 +21770,161 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let inherited_selection = inherited.map(|execution| ModelSelection {
             offering_id: execution.offering_id.clone(),
         });
-        let mut requested = Vec::new();
+        let mut slot_selectors = Vec::with_capacity(inputs.len());
+        let mut initial_selections = Vec::with_capacity(inputs.len());
+        let mut selectors_to_admit = Vec::new();
         for input in inputs {
             input.fanout_slot_identity()?;
-            let selection = astra_turn_types::resolve_requested_model_selection(
+            let selector = astra_turn_types::resolve_requested_model_selector(
                 input.requested_model_policy.as_ref(),
                 inherited_selection.as_ref(),
             )
             .map_err(|error| error.to_string())?;
-            if input
-                .resolved_model_selection
-                .as_ref()
-                .is_some_and(|prepared| Some(prepared) != selection.as_ref())
+            let selection = match selector.as_ref() {
+                Some(astra_turn_types::ModelSelector::OfferingId { offering_id }) => {
+                    astra_services::validate_model_offering_id(offering_id)
+                        .map_err(|error| format!("invalid child model selection: {error}"))?;
+                    Some(ModelSelection {
+                        offering_id: offering_id.clone(),
+                    })
+                }
+                Some(astra_turn_types::ModelSelector::ConfiguredName { .. }) => None,
+                None => inherited_selection.clone(),
+            };
+            if let (Some(prepared), Some(selection)) =
+                (input.resolved_model_selection.as_ref(), selection.as_ref())
+                && prepared != selection
             {
                 return Err(
                     "resolved child Offering does not match its requested model policy".into(),
                 );
             }
-            match selection.as_ref() {
-                Some(selection) => {
-                    astra_services::validate_model_offering_id(&selection.offering_id)
-                        .map_err(|error| format!("invalid child model selection: {error}"))?;
-                    if inherited.is_none_or(|parent| parent.offering_id != selection.offering_id)
-                        && !requested.contains(&selection.offering_id)
-                    {
-                        requested.push(selection.offering_id.clone());
-                    }
+            if selector.is_none() && selection.is_none() {
+                return Err(
+                    "server dynamic child cannot inherit a missing parent model admission"
+                        .to_string(),
+                );
+            }
+            let requires_admission = match selector.as_ref() {
+                Some(astra_turn_types::ModelSelector::ConfiguredName { .. }) => true,
+                Some(astra_turn_types::ModelSelector::OfferingId { offering_id }) => {
+                    inherited.is_none_or(|parent| parent.offering_id != *offering_id)
                 }
-                None if inherited.is_none() => {
+                None => input
+                    .resolved_model_selection
+                    .as_ref()
+                    .zip(inherited_selection.as_ref())
+                    .is_some_and(|(requested, parent)| requested != parent),
+            };
+            if requires_admission {
+                let selector = selector
+                    .clone()
+                    .or_else(|| {
+                        input.resolved_model_selection.as_ref().map(|selection| {
+                            astra_turn_types::ModelSelector::OfferingId {
+                                offering_id: selection.offering_id.clone(),
+                            }
+                        })
+                    })
+                    .ok_or_else(|| "child model selection is missing".to_string())?;
+                if !selectors_to_admit.contains(&selector) {
+                    selectors_to_admit.push(selector);
+                }
+            }
+            slot_selectors.push(selector);
+            initial_selections.push(selection);
+        }
+        let admitted_executions = if selectors_to_admit.is_empty() {
+            Vec::new()
+        } else if let Some(model_service) = self.model_service.as_ref() {
+            model_service
+                .admit_model_selectors(parent.user_id.clone(), selectors_to_admit.clone())
+                .await
+                .map_err(|(_, body)| body.0.detail)?
+        } else if selectors_to_admit
+            .iter()
+            .all(|selector| matches!(selector, astra_turn_types::ModelSelector::OfferingId { .. }))
+        {
+            let offering_ids = selectors_to_admit
+                .iter()
+                .map(|selector| match selector {
+                    astra_turn_types::ModelSelector::OfferingId { offering_id } => {
+                        offering_id.clone()
+                    }
+                    astra_turn_types::ModelSelector::ConfiguredName { .. } => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            admit_model_offering_batch(
+                None,
+                &self.matrixone,
+                self.encryptor.as_ref(),
+                &parent.user_id,
+                self.shared_pool.as_ref(),
+                &offering_ids,
+            )
+            .await?
+        } else {
+            return Err(
+                "configured model names require the authenticated model catalog service".into(),
+            );
+        };
+        if admitted_executions.len() != selectors_to_admit.len() {
+            return Err("batch model admission returned an incomplete Offering set".into());
+        }
+        let admitted_by_selector: Vec<_> = selectors_to_admit
+            .into_iter()
+            .zip(admitted_executions)
+            .collect();
+        let mut admitted_by_id = HashMap::new();
+        for (_, execution) in &admitted_by_selector {
+            admitted_by_id
+                .entry(execution.offering_id.clone())
+                .or_insert_with(|| execution.clone());
+        }
+        let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let slot = input.fanout_slot_identity()?;
+            let selector = slot_selectors[index].as_ref();
+            let mut requested_selection = initial_selections[index].clone();
+            let selected_execution = selector
+                .and_then(|selector| {
+                    admitted_by_selector
+                        .iter()
+                        .find(|(admitted_selector, _)| admitted_selector == selector)
+                        .map(|(_, execution)| execution)
+                })
+                .cloned();
+            if let Some(execution) = selected_execution.as_ref() {
+                let selected = ModelSelection {
+                    offering_id: execution.offering_id.clone(),
+                };
+                if input
+                    .resolved_model_selection
+                    .as_ref()
+                    .is_some_and(|prepared| prepared != &selected)
+                {
                     return Err(
-                        "server dynamic child cannot inherit a missing parent model admission"
-                            .to_string(),
+                        "resolved child Offering changed after model-policy preparation".into(),
                     );
                 }
-                None => {}
+                requested_selection = Some(selected);
             }
-        }
-        let executions = admit_model_offering_batch(
-            self.model_service.as_ref(),
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &parent.user_id,
-            self.shared_pool.as_ref(),
-            &requested,
-        )
-        .await?;
-        let admitted: HashMap<_, _> = requested.into_iter().zip(executions).collect();
-        let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let slot = input.fanout_slot_identity()?;
+            if requested_selection.is_none() {
+                return Err(
+                    "configured model selector did not resolve to an admitted Offering".into(),
+                );
+            }
+            if let Some(admission) = context.delegation_model_admission.as_ref() {
+                let mut checked = input.clone();
+                checked.resolved_model_selection = requested_selection.clone();
+                crate::orchestration::spawner::apply_delegation_model_admission(
+                    &mut checked,
+                    admission,
+                    &context.parent_run_id,
+                    context.spawn_tool_call_id.as_deref(),
+                )
+                .map_err(|error| error.to_string())?;
+            }
             let delegated_model_requirements = match context.delegation_model_admission.as_ref() {
                 Some(admission) => admission
                     .child_requirements
@@ -21765,41 +21936,30 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             delegated_model_requirements
                 .validate()
                 .map_err(str::to_string)?;
-            let requested_selection = astra_turn_types::resolve_requested_model_selection(
-                input.requested_model_policy.as_ref(),
-                inherited_selection.as_ref(),
-            )
-            .map_err(|error| error.to_string())?;
-            if input
-                .resolved_model_selection
-                .as_ref()
-                .is_some_and(|prepared| Some(prepared) != requested_selection.as_ref())
-            {
-                return Err(
-                    "resolved child Offering changed after model-policy preparation".into(),
-                );
-            }
             let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
                 input.reasoning.as_ref(),
                 requested_selection.as_ref(),
                 context.parent_model_reasoning.as_ref(),
             );
-            let execution = match requested_selection.as_ref() {
-                Some(selection)
-                    if inherited
-                        .is_none_or(|parent| parent.offering_id != selection.offering_id) =>
-                {
-                    admitted
-                        .get(&selection.offering_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            "batch model admission lost a selected Offering".to_string()
-                        })?
-                }
-                _ => inherited.cloned().ok_or_else(|| {
+            let execution = if let Some(execution) = selected_execution {
+                execution
+            } else if inherited.is_some_and(|parent| {
+                requested_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.offering_id == parent.offering_id)
+            }) {
+                inherited.cloned().ok_or_else(|| {
                     "server dynamic child cannot inherit a missing parent model admission"
                         .to_string()
-                })?,
+                })?
+            } else {
+                let selection = requested_selection
+                    .as_ref()
+                    .ok_or_else(|| "child model selection is missing".to_string())?;
+                admitted_by_id
+                    .get(&selection.offering_id)
+                    .cloned()
+                    .ok_or_else(|| "batch model admission lost a selected Offering".to_string())?
             };
             astra_services::models::validate_model_execution_purpose(
                 &execution,
@@ -22582,6 +22742,7 @@ impl ServerSubRunExecutor {
                     resolved_model_selection: execution.map(|execution| ResolvedModelSelection {
                         offering_id: execution.offering_id.clone(),
                         model_name: execution.model_name.clone(),
+                        source_identity: admitted_source_identity(execution),
                     }),
                     work_binding,
                     validated_work_item_assignment: config.work_item.is_some(),

@@ -1006,7 +1006,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent setting unless `requested_model_policy` selects a fixed Offering; explicit `inherit` overrides lower-priority defaults. Auto policies are currently rejected before admission because routing is not enabled. Reasoning is a separate control. A boundary without atomic model admission rejects fixed-Offering overrides before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent setting unless `requested_model_policy` selects a fixed model by exact Offering ID or exact configured name; explicit `inherit` overrides lower-priority defaults. Auto policies are currently rejected before admission because routing is not enabled. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1336,11 +1336,28 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .map(|parent| &parent.selection)
         .or(ctx.current_model_selection.as_ref());
     for (_, slot_id, spawn_input) in &mut planned_slots {
-        match astra_turn_types::resolve_requested_model_selection(
+        match astra_turn_types::resolve_requested_model_selector(
             spawn_input.requested_model_policy.as_ref(),
             inherited_selection,
         ) {
-            Ok(selection) => spawn_input.resolved_model_selection = selection,
+            Ok(Some(astra_turn_types::ModelSelector::OfferingId { offering_id })) => {
+                let selection = astra_turn_types::ModelSelection { offering_id };
+                if spawn_input
+                    .resolved_model_selection
+                    .as_ref()
+                    .is_some_and(|prepared| prepared != &selection)
+                {
+                    return render_agent_tool_error(
+                        None,
+                        "resolved child Offering conflicts with its selector",
+                    );
+                }
+                spawn_input.resolved_model_selection = Some(selection);
+            }
+            Ok(Some(astra_turn_types::ModelSelector::ConfiguredName { .. })) => {
+                spawn_input.resolved_model_selection = None;
+            }
+            Ok(None) => spawn_input.resolved_model_selection = None,
             Err(error) => {
                 return render_agent_tool_error(
                     None,
@@ -1415,7 +1432,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         })
         .to_string();
     }
-    let resolved_inputs: Vec<_> = planned_slots
+    let mut resolved_inputs: Vec<_> = planned_slots
         .iter()
         .map(|(_, _, input)| input.clone())
         .collect();
@@ -1475,6 +1492,54 @@ async fn handle_agent_fanout_start_action_with_deadline(
             return render_agent_tool_error(None, &format!("fanout admission failed: {error}"));
         }
     };
+    for (index, preparation) in preparations.iter().enumerate() {
+        let prepared_selection =
+            preparation
+                .model_identity()
+                .map(|identity| astra_turn_types::ModelSelection {
+                    offering_id: identity.offering_id,
+                });
+        if resolved_inputs[index]
+            .resolved_model_selection
+            .as_ref()
+            .zip(prepared_selection.as_ref())
+            .is_some_and(|(requested, prepared)| requested != prepared)
+        {
+            return render_agent_tool_error(
+                None,
+                "fanout admission resolved an Offering that conflicts with the requested selection",
+            );
+        }
+        if matches!(
+            resolved_inputs[index].requested_model_policy.as_ref(),
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
+            })
+        ) && prepared_selection.is_none()
+        {
+            return render_agent_tool_error(
+                None,
+                "configured model name was not resolved by trusted batch admission",
+            );
+        }
+        if let Some(selection) = prepared_selection {
+            resolved_inputs[index].resolved_model_selection = Some(selection.clone());
+            planned_slots[index].2.resolved_model_selection = Some(selection);
+        }
+        if let Some(admission) = ctx.delegation_model_admission.as_ref()
+            && let Err(error) = super::spawner::apply_delegation_model_admission(
+                &mut resolved_inputs[index],
+                admission,
+                &ctx.run_id,
+                tool_call_id.as_deref(),
+            )
+        {
+            return render_agent_tool_error(
+                None,
+                &format!("fanout model requirement failed: {error}"),
+            );
+        }
+    }
     let declared_new = match ctx
         .spawner
         .declare_fanout_group(
@@ -2510,7 +2575,7 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
     mut input: SpawnAgentInput,
     ctx: Option<&AgentToolContext>,
     reservation_owner_id: Option<&str>,
-    preparation: Option<Box<dyn super::spawner::PreparedSpawn>>,
+    mut preparation: Option<Box<dyn super::spawner::PreparedSpawn>>,
     spawn_tool_call_id: Option<String>,
 ) -> String {
     let ctx = match ctx {
@@ -2525,11 +2590,28 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
         .as_ref()
         .map(|parent| &parent.selection)
         .or(ctx.current_model_selection.as_ref());
-    match astra_turn_types::resolve_requested_model_selection(
+    match astra_turn_types::resolve_requested_model_selector(
         input.requested_model_policy.as_ref(),
         inherited_selection,
     ) {
-        Ok(selection) => input.resolved_model_selection = selection,
+        Ok(Some(astra_turn_types::ModelSelector::OfferingId { offering_id })) => {
+            let selection = astra_turn_types::ModelSelection { offering_id };
+            if input
+                .resolved_model_selection
+                .as_ref()
+                .is_some_and(|prepared| prepared != &selection)
+            {
+                return render_agent_tool_error(
+                    None,
+                    "resolved child Offering conflicts with its selector",
+                );
+            }
+            input.resolved_model_selection = Some(selection);
+        }
+        Ok(Some(astra_turn_types::ModelSelector::ConfiguredName { .. })) => {
+            input.resolved_model_selection = None;
+        }
+        Ok(None) => input.resolved_model_selection = None,
         Err(error) => return render_agent_tool_error(None, &error.to_string()),
     }
 
@@ -2568,21 +2650,6 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
     let mut child_delegation_chain = ctx.delegation_chain.clone();
     child_delegation_chain.push(ctx.agent_id.clone());
 
-    // CLI parents have a turn-scoped execution run_id but a stable root
-    // mailbox. Record that relationship before the child is registered so
-    // terminal/checkpoint messages never target an address that disappears
-    // with the spawning turn. Server/child contexts normally resolve to the
-    // same run_id and therefore need no alias.
-    let mailbox_router = ctx.spawner.mailbox_router();
-    if let Some(parent_mailbox) = mailbox_router
-        .registered_address_for_agent(&ctx.agent_id)
-        .await
-    {
-        mailbox_router
-            .record_parent_delivery_alias(&ctx.run_id, &parent_mailbox)
-            .await;
-    }
-
     // The resolved Offering is runtime-owned; keep the user's optional policy
     // unchanged for durable provenance and nested delegation.
     let model_selection = input.resolved_model_selection.clone();
@@ -2610,6 +2677,90 @@ async fn handle_agent_spawn_input_with_capacity_reservation(
         spawn_tool_call_id,
         delegation_chain: child_delegation_chain,
     };
+
+    if preparation.is_none() {
+        if let Err(error) = ctx
+            .spawner
+            .validate_spawn_inputs(std::slice::from_ref(&input), &spawn_ctx)
+        {
+            return render_agent_tool_error(None, &format!("spawn preflight failed: {error}"));
+        }
+        preparation = match ctx
+            .spawner
+            .prepare_spawn_batch(
+                std::slice::from_ref(&input),
+                &spawn_ctx,
+                ctx.current_model_selection.as_ref(),
+            )
+            .await
+        {
+            Ok(mut preparations) if preparations.len() == 1 => preparations.pop(),
+            Ok(_) => {
+                return render_agent_tool_error(
+                    None,
+                    "spawn admission returned an incomplete preparation",
+                );
+            }
+            Err(error) => {
+                return render_agent_tool_error(None, &format!("spawn admission failed: {error}"));
+            }
+        };
+    }
+    let prepared_selection = preparation
+        .as_ref()
+        .and_then(|prepared| prepared.model_identity())
+        .map(|identity| astra_turn_types::ModelSelection {
+            offering_id: identity.offering_id,
+        });
+    if input
+        .resolved_model_selection
+        .as_ref()
+        .zip(prepared_selection.as_ref())
+        .is_some_and(|(requested, prepared)| requested != prepared)
+    {
+        return render_agent_tool_error(
+            None,
+            "spawn admission resolved an Offering that conflicts with the requested selection",
+        );
+    }
+    if matches!(
+        input.requested_model_policy.as_ref(),
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
+        })
+    ) && prepared_selection.is_none()
+    {
+        return render_agent_tool_error(
+            None,
+            "configured model name was not resolved by trusted admission",
+        );
+    }
+    if let Some(selection) = prepared_selection {
+        input.resolved_model_selection = Some(selection);
+    }
+    if let Some(admission) = ctx.delegation_model_admission.as_ref()
+        && let Err(error) = super::spawner::apply_delegation_model_admission(
+            &mut input,
+            admission,
+            &ctx.run_id,
+            spawn_ctx.spawn_tool_call_id.as_deref(),
+        )
+    {
+        return render_agent_tool_error(None, &format!("spawn model requirement failed: {error}"));
+    }
+
+    // CLI parents have a turn-scoped execution run_id but a stable root
+    // mailbox. Record that relationship only after model preflight succeeds,
+    // so a rejected selection leaves no mailbox state behind.
+    let mailbox_router = ctx.spawner.mailbox_router();
+    if let Some(parent_mailbox) = mailbox_router
+        .registered_address_for_agent(&ctx.agent_id)
+        .await
+    {
+        mailbox_router
+            .record_parent_delivery_alias(&ctx.run_id, &parent_mailbox)
+            .await;
+    }
 
     // Allocate the outer async state before constructing the dynamically sized
     // spawn supervisor future. This keeps its first construction and poll off
@@ -3322,6 +3473,29 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for CapturingModelExecutor {
+        async fn prepare_batch(
+            self: Arc<Self>,
+            inputs: &[SpawnAgentInput],
+            _context: &SpawnContext,
+            parent_selection: Option<&astra_turn_types::ModelSelection>,
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+            for input in inputs {
+                astra_turn_types::resolve_requested_model_selection(
+                    input.requested_model_policy.as_ref(),
+                    parent_selection,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(inputs
+                .iter()
+                .map(|_| {
+                    Box::new(CapturingPrepared {
+                        executor: Arc::clone(&self),
+                    }) as Box<dyn crate::orchestration::PreparedSpawn>
+                })
+                .collect())
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
@@ -3348,6 +3522,20 @@ mod tests {
                 permission_requests_approved: 0,
                 tools_blocked: 0,
             })
+        }
+    }
+
+    struct CapturingPrepared {
+        executor: Arc<CapturingModelExecutor>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::orchestration::PreparedSpawn for CapturingPrepared {
+        async fn execute(
+            self: Box<Self>,
+            config: SpawnRunConfig,
+        ) -> Result<SpawnRunResult, String> {
+            self.executor.execute(config).await
         }
     }
 
@@ -3871,7 +4059,7 @@ mod tests {
             "agent_type": "general-purpose",
             "requested_model_policy": {
                 "mode": "fixed",
-                "selection": {"offering_id": "offer-deepseek-flash"}
+                "selector": {"kind": "offering_id", "offering_id": "offer-deepseek-flash"}
             }
         });
 
@@ -3954,7 +4142,7 @@ mod tests {
             if let Some(selection) = selection {
                 args["requested_model_policy"] = json!({
                     "mode": "fixed",
-                    "selection": {"offering_id":selection}
+                    "selector": {"kind":"offering_id", "offering_id":selection}
                 });
             }
             if let Some(reasoning) = reasoning {
@@ -4417,7 +4605,7 @@ mod tests {
                     "prompt": "Review correctness.",
                     "requested_model_policy": {
                         "mode": "fixed",
-                        "selection": {"offering_id": "different-offering"}
+                        "selector": {"kind": "offering_id", "offering_id": "different-offering"}
                     }
                 }]
             }),
@@ -5411,7 +5599,7 @@ mod tests {
             "target_count": 2,
             "defaults": {
                 "requested_model_policy": {
-                    "mode": "fixed", "selection": {"offering_id": "shared"}
+                    "mode": "fixed", "selector": {"kind":"offering_id", "offering_id": "shared"}
                 },
                 "reasoning": {"mode": "adaptive", "effort": "low"}
             },
@@ -5419,7 +5607,7 @@ mod tests {
                 {"description": "shared", "prompt": "one"},
                 {"description": "override", "prompt": "two",
                  "requested_model_policy": {
-                    "mode": "fixed", "selection": {"offering_id": "specific"}
+                    "mode": "fixed", "selector": {"kind":"offering_id", "offering_id": "specific"}
                  },
                  "reasoning": {"mode": "model_default"}}
             ]
@@ -5432,7 +5620,7 @@ mod tests {
         assert_eq!(
             shared.requested_model_policy,
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                selection: astra_turn_types::ModelSelection {
+                selector: astra_turn_types::ModelSelector::OfferingId {
                     offering_id: "shared".into()
                 }
             })
@@ -5446,7 +5634,7 @@ mod tests {
         assert_eq!(
             override_slot.requested_model_policy,
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                selection: astra_turn_types::ModelSelection {
+                selector: astra_turn_types::ModelSelector::OfferingId {
                     offering_id: "specific".into()
                 }
             })
@@ -5472,7 +5660,7 @@ mod tests {
             "defaults": {
                 "requested_model_policy": {
                     "mode": "fixed",
-                    "selection": {"offering_id": "offer-shared"}
+                    "selector": {"kind": "offering_id", "offering_id": "offer-shared"}
                 }
             },
             "slots": [{
@@ -5539,7 +5727,7 @@ mod tests {
                     {"description": "one", "prompt": "one"},
                     {"description": "two", "prompt": "two",
                      "requested_model_policy": {
-                        "mode": "fixed", "selection": {"offering_id": "specific"}
+                        "mode": "fixed", "selector": {"kind": "offering_id", "offering_id": "specific"}
                      }}
                 ]
             }),

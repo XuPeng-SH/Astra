@@ -32,10 +32,24 @@ pub struct SessionEventJsonMatch {
     /// this pointer (for example, a child `run_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_by: Option<String>,
+    /// Require the matched event's top-level `run_id` to equal an identity
+    /// carried by at least one event of this type. This links provider step
+    /// events to their durable `agent_spawned` child-run record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_run_as: Option<SessionEventRunIdMatch>,
     /// Require the unique event IDs to equal IDs in a successful tool result
     /// from the events' parent run (for example, returned fanout child runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_ids_match: Option<SessionEventResultIdMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventRunIdMatch {
+    pub event_type: String,
+    /// JSON pointer to the related event's run ID (for example,
+    /// `/metadata/run_id` on `agent_spawned`).
+    pub run_id_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,9 +143,10 @@ pub enum Criterion {
         successor_path: String,
     },
 
-    /// Passes when the session journal contains at least `min`
+    /// Passes when session capture contains at least `min`
     /// events with `type == event_type`, optionally matching one exact
-    /// JSON pointer/value pair. Requires session capture.
+    /// JSON pointer/value pair or linking a step-event `run_id` to a related
+    /// lifecycle event. Requires session capture.
     /// Use for structural checks ("at least one subagent_spawned
     /// event appears").
     ///
@@ -1789,6 +1804,31 @@ fn evaluate_one(
                         event.raw.pointer(&predicate.path) == Some(&predicate.equals)
                     })
                 })
+                .filter(|event| {
+                    let Some(link) = json_match
+                        .as_ref()
+                        .and_then(|predicate| predicate.same_run_as.as_ref())
+                    else {
+                        return true;
+                    };
+                    let Some(run_id) = event.raw.get("run_id").and_then(serde_json::Value::as_str)
+                    else {
+                        return false;
+                    };
+                    if run_id.trim().is_empty() {
+                        return false;
+                    }
+                    sess.events.iter().any(|related| {
+                        related.event_type == link.event_type
+                            && related
+                                .raw
+                                .pointer(&link.run_id_path)
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|related_id| {
+                                    !related_id.trim().is_empty() && related_id == run_id
+                                })
+                    })
+                })
                 .collect::<Vec<_>>();
             let n = matching_events.len();
             let unique_count = json_match
@@ -1836,9 +1876,15 @@ fn evaluate_one(
                     .map_or_else(String::new, |_| {
                         format!(", result_ids_match={result_ids_match}")
                     });
+                let run_link = predicate
+                    .same_run_as
+                    .as_ref()
+                    .map_or_else(String::new, |link| {
+                        format!(", same_run_as={}", link.event_type)
+                    });
                 format!(
-                    ", {}={}{}{}",
-                    predicate.path, predicate.equals, unique_by, id_link
+                    ", {}={}{}{}{}",
+                    predicate.path, predicate.equals, unique_by, id_link, run_link
                 )
             });
             CriterionResult {
@@ -4661,6 +4707,17 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                 if let Some(path) = predicate.unique_by.as_ref() {
                     validate_json_pointer("SessionEventCount.json_match.unique_by", path)?;
                 }
+                if let Some(link) = predicate.same_run_as.as_ref() {
+                    if link.event_type.trim().is_empty() {
+                        return Err(
+                            "SessionEventCount.same_run_as.event_type must not be empty".into()
+                        );
+                    }
+                    validate_json_pointer(
+                        "SessionEventCount.same_run_as.run_id_path",
+                        &link.run_id_path,
+                    )?;
+                }
                 if let Some(link) = predicate.result_ids_match.as_ref() {
                     if predicate.unique_by.is_none() {
                         return Err(
@@ -5657,6 +5714,7 @@ mod tests {
                 path: "/metadata/model_configuration/prepared_selection/model_name".into(),
                 equals: serde_json::json!("deepseek-v4-flash"),
                 unique_by: Some("/metadata/run_id".into()),
+                same_run_as: None,
                 result_ids_match: Some(SessionEventResultIdMatch {
                     tool_name: "agent_fanout".into(),
                     event_parent_run_id_path: "/metadata/parent_run_id".into(),
@@ -5798,6 +5856,79 @@ mod tests {
             Some(&session),
         );
         assert!(evaluated[0].passed, "{}", evaluated[0].detail);
+    }
+
+    #[test]
+    fn session_event_count_can_bind_completed_model_call_to_spawned_child_run() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "LlmRoundCompleted".into(),
+            min: 1,
+            max: None,
+            json_match: Some(SessionEventJsonMatch {
+                path: "/payload/model".into(),
+                equals: serde_json::json!("glm-5.2"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                }),
+                result_ids_match: None,
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("related run identity path is valid");
+
+        let linked = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {"run_id": "child-run"}}),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "child-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "parent-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "other-child",
+                    "payload": {"model": "other-model"}
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&linked),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        assert!(result[0].detail.contains("count=1"));
+
+        let unlinked = mk_session(&[(
+            "LlmRoundCompleted",
+            serde_json::json!({
+                "run_id": "parent-run",
+                "payload": {"model": "glm-5.2"}
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&unlinked),
+        );
+        assert!(
+            !result[0].passed,
+            "a parent call must not satisfy child evidence"
+        );
     }
 
     #[test]

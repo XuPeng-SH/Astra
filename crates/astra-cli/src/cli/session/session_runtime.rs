@@ -325,6 +325,12 @@ pub(crate) struct ServerModelSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmittedServerModel {
+    pub model: ServerModelSelection,
+    pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServerDefaultModel {
     Selected(ServerModelSelection),
     NoModels,
@@ -804,20 +810,19 @@ pub(crate) fn resolve_server_model_selection_from_catalog(
     ))
 }
 
-/// Resolve exact Offering IDs through the bounded admission endpoint. This is
-/// for execution choices already known by ID; callers needing discovery should
-/// use the catalog path instead.
+/// Resolve and admit a bounded batch of Offering IDs or exact configured-name
+/// selectors. Discovery and authorization stay on Server so a fanout does not
+/// need a catalog GET followed by a separate admission request.
 pub(crate) async fn admit_server_model_slots(
     api: &astra_thin_client::ThinClient,
     token: &str,
     request: astra_server_types::ModelAdmissionRequestV1,
-) -> Result<Vec<ServerModelSelection>, String> {
+) -> Result<Vec<AdmittedServerModel>, String> {
     if request.slots.is_empty() {
         return Ok(Vec::new());
     }
     for slot in &request.slots {
-        astra_services::validate_model_offering_id(&slot.offering_id)
-            .map_err(|error| error.to_string())?;
+        slot.selector.validate().map_err(str::to_string)?;
     }
     let body = serde_json::to_value(&request).map_err(|error| error.to_string())?;
     let response = tokio::time::timeout(
@@ -837,9 +842,23 @@ pub(crate) async fn admit_server_model_slots(
         .iter()
         .zip(response.slots)
         .map(|(requested, admitted)| {
-            if admitted.offering_id != requested.offering_id
+            let selector_matches = match &requested.selector {
+                astra_turn_types::ModelSelector::OfferingId { offering_id } => {
+                    admitted.offering_id == *offering_id
+                }
+                astra_turn_types::ModelSelector::ConfiguredName { model_name, .. } => {
+                    admitted.model_name.eq_ignore_ascii_case(model_name)
+                }
+            };
+            let expected_reasoning = requested
+                .inherited_reasoning
+                .as_ref()
+                .filter(|inherited| inherited.offering_id == admitted.offering_id)
+                .map(|inherited| &inherited.reasoning)
+                .unwrap_or(&requested.reasoning);
+            if !selector_matches
                 || admitted.max_output_tokens != requested.max_output_tokens
-                || admitted.reasoning != requested.reasoning
+                || &admitted.reasoning != expected_reasoning
                 || admitted.model_name.trim().is_empty()
                 || admitted.context_window == Some(0)
             {
@@ -847,10 +866,18 @@ pub(crate) async fn admit_server_model_slots(
                     "model admission response does not match the requested slot".to_string()
                 );
             }
-            Ok(ServerModelSelection {
-                name: admitted.model_name,
-                context_window: admitted.context_window,
-                offering_id: admitted.offering_id,
+            let reasoning = serde_json::from_value::<
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection,
+            >(admitted.reasoning)
+            .map_err(|error| format!("invalid admitted reasoning response: {error}"))?
+            .config();
+            Ok(AdmittedServerModel {
+                model: ServerModelSelection {
+                    name: admitted.model_name,
+                    context_window: admitted.context_window,
+                    offering_id: admitted.offering_id,
+                },
+                thinking: reasoning,
             })
         })
         .collect()
@@ -863,15 +890,19 @@ pub(crate) async fn resolve_server_offering_selection(
 ) -> Result<ServerModelSelection, String> {
     let request = astra_server_types::ModelAdmissionRequestV1 {
         slots: vec![astra_server_types::ModelAdmissionSlotV1 {
-            offering_id: offering_id.to_string(),
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: offering_id.to_string(),
+            },
             max_output_tokens: None,
             reasoning: serde_json::json!({ "mode": "model_default" }),
+            inherited_reasoning: None,
         }],
     };
     admit_server_model_slots(api, token, request)
         .await?
         .into_iter()
         .next()
+        .map(|admitted| admitted.model)
         .ok_or_else(|| "model admission returned no selected Offering".to_string())
 }
 
@@ -2489,9 +2520,12 @@ mod tests {
             slots: ["offer-a", "offer-b"]
                 .into_iter()
                 .map(|offering_id| astra_server_types::ModelAdmissionSlotV1 {
-                    offering_id: offering_id.to_string(),
+                    selector: astra_turn_types::ModelSelector::OfferingId {
+                        offering_id: offering_id.to_string(),
+                    },
                     max_output_tokens: None,
                     reasoning: serde_json::json!({ "mode": "model_default" }),
+                    inherited_reasoning: None,
                 })
                 .collect(),
         };
@@ -2500,10 +2534,10 @@ mod tests {
             .await
             .expect("exact batch admission");
         assert_eq!(admitted.len(), 2);
-        assert_eq!(admitted[0].offering_id, "offer-a");
-        assert_eq!(admitted[0].name, "model-a");
-        assert_eq!(admitted[1].offering_id, "offer-b");
-        assert_eq!(admitted[1].context_window, Some(128_000));
+        assert_eq!(admitted[0].model.offering_id, "offer-a");
+        assert_eq!(admitted[0].model.name, "model-a");
+        assert_eq!(admitted[1].model.offering_id, "offer-b");
+        assert_eq!(admitted[1].model.context_window, Some(128_000));
 
         let requests = mock.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);

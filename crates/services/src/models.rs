@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
 use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
+use astra_turn_types::ModelSelector;
 mod genesis;
 mod thinking_probe;
 use astra_core::{
@@ -753,6 +754,17 @@ pub enum ModelAccessKind {
     SelfHosted,
 }
 
+/// Non-secret identity of the authorized Offering source, distinct from its
+/// provider transport. Provider-runtime gateways retain this catalog
+/// provenance rather than substituting protocol-derived `provider` or the
+/// endpoint's default access kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedModelSourceIdentity {
+    pub provider: String,
+    pub access_label: String,
+}
+
 /// One declaration policy shared by catalog display and server-default run
 /// admission. No source is inferred from a model name or an API credential.
 pub fn server_model_access_declarations(
@@ -761,30 +773,42 @@ pub fn server_model_access_declarations(
 ) -> Vec<DeclaredModelAccess> {
     let kinds: BTreeSet<_> = kinds.into_iter().collect();
     let mut declared = Vec::new();
-    let mut add = |id: &str, label: &str, kind| {
+    let mut add = |id: &str, kind: ModelAccessKind| {
         declared.push(DeclaredModelAccess {
             id: id.into(),
-            label: label.into(),
+            label: kind.source_label().into(),
             kind,
             execution_placement: ModelExecutionPlacement::Server,
             availability: ModelAccessAvailability::Ready,
         })
     };
     if allows_deployment {
-        add("self-hosted", "Self-hosted", ModelAccessKind::SelfHosted);
+        add("self-hosted", ModelAccessKind::SelfHosted);
     }
     if kinds.contains(&ModelAccessKind::AstraCloud) {
-        add("genesis", "Genesis", ModelAccessKind::AstraCloud);
+        add("genesis", ModelAccessKind::AstraCloud);
     }
     if kinds.contains(&ModelAccessKind::CloudByok)
         || !allows_deployment && !kinds.contains(&ModelAccessKind::AstraCloud)
     {
-        add("cloud-byok", "Cloud BYOK", ModelAccessKind::CloudByok);
+        add("cloud-byok", ModelAccessKind::CloudByok);
     }
     declared
 }
 
 impl ModelAccessKind {
+    /// Stable display/source qualifier used by the authorized model catalog.
+    #[must_use]
+    pub fn source_label(self) -> &'static str {
+        match self {
+            Self::AstraCloud => "Genesis",
+            Self::CloudByok => "Cloud BYOK",
+            Self::Workspace => "Workspace",
+            Self::ThisDevice => "This device",
+            Self::SelfHosted => "Self-hosted",
+        }
+    }
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -836,11 +860,13 @@ impl ModelExecutionPlacement {
 /// Non-serializable execution material produced once at the trusted model
 /// admission boundary and consumed by every inference surface.
 ///
-/// Credential origin is intentionally absent. Executors receive one normalized
-/// invocation shape and never branch on the product source that produced it.
+/// Credentials are normalized for execution. The optional source identity is
+/// non-secret provenance used only to preserve and validate the selected
+/// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
     pub offering_id: String,
+    pub source_identity: Option<ResolvedModelSourceIdentity>,
     pub access_kind: ModelAccessKind,
     pub execution_placement: ModelExecutionPlacement,
     pub model_name: String,
@@ -874,6 +900,7 @@ impl AdmittedModelExecution {
     #[must_use]
     pub fn has_same_execution_identity(&self, other: &Self) -> bool {
         self.offering_id == other.offering_id
+            && self.source_identity == other.source_identity
             && self.access_kind == other.access_kind
             && self.execution_placement == other.execution_placement
             && self.provider == other.provider
@@ -890,6 +917,10 @@ impl AdmittedModelExecution {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
             offering_id: offering.offering_id,
+            source_identity: Some(ResolvedModelSourceIdentity {
+                provider: offering.model.provider.clone(),
+                access_label: ModelAccessKind::SelfHosted.source_label().to_string(),
+            }),
             access_kind: ModelAccessKind::SelfHosted,
             execution_placement: ModelExecutionPlacement::Server,
             model_name: offering.model.model_name,
@@ -921,6 +952,7 @@ impl AdmittedModelExecution {
     ) -> Self {
         Self {
             offering_id,
+            source_identity: None,
             access_kind: ModelAccessKind::ThisDevice,
             execution_placement: ModelExecutionPlacement::Edge,
             model_name,
@@ -1707,6 +1739,115 @@ pub fn validate_model_offering_id(offering_id: &str) -> Result<&str, ModelOfferi
 
 const MAX_MODEL_ADMISSION_BATCH: usize = 64;
 
+fn resolve_model_selector_offerings(
+    selectors: &[ModelSelector],
+    catalog: &[ModelListItem],
+) -> Result<Vec<String>, (StatusCode, Json<ErrorResponse>)> {
+    if selectors.len() > MAX_MODEL_ADMISSION_BATCH {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "model selector batch exceeds the supported limit",
+            "model_admission_batch_invalid",
+        ));
+    }
+    for selector in selectors {
+        selector.validate().map_err(|detail| {
+            error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+        })?;
+    }
+    crate::delegation_model_requirement::resolve_model_selectors(selectors, catalog)
+        .map(|selections| {
+            selections
+                .into_iter()
+                .map(|selection| selection.offering_id)
+                .collect()
+        })
+        .map_err(|detail| {
+            error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+        })
+}
+
+fn model_selection_changed_during_admission() -> (StatusCode, Json<ErrorResponse>) {
+    error_response_coded(
+        StatusCode::CONFLICT,
+        "The selected model changed during admission. Refresh model access and retry.",
+        "model_selection_changed",
+    )
+}
+
+/// Keep the catalog identity that resolved a configured name attached through
+/// the existing admission read. If the Offering changes between those reads,
+/// reject it instead of executing a different model under the same request.
+/// This is an in-memory check and adds no database access.
+fn validate_model_selector_admissions(
+    selectors: &[ModelSelector],
+    offering_ids: &[String],
+    catalog: Option<&[ModelListItem]>,
+    admitted: &[AdmittedModelExecution],
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if selectors.len() != offering_ids.len() || selectors.len() != admitted.len() {
+        return Err(error_response_coded(
+            StatusCode::BAD_GATEWAY,
+            "Model admission returned an incomplete selection batch.",
+            "model_admission_incomplete",
+        ));
+    }
+
+    for ((selector, offering_id), execution) in selectors.iter().zip(offering_ids).zip(admitted) {
+        if execution.offering_id != *offering_id {
+            return Err(model_selection_changed_during_admission());
+        }
+
+        let snapshot_item = if let Some(catalog) = catalog {
+            let mut matches = catalog
+                .iter()
+                .filter(|item| item.offering_id == *offering_id);
+            let item = matches.next();
+            if matches.next().is_some() {
+                return Err(model_selection_changed_during_admission());
+            }
+            item
+        } else {
+            None
+        };
+
+        let Some(item) = snapshot_item else {
+            if matches!(selector, ModelSelector::ConfiguredName { .. }) {
+                return Err(model_selection_changed_during_admission());
+            }
+            continue;
+        };
+
+        if let ModelSelector::ConfiguredName { model_name, source } = selector
+            && (!item.is_active
+                || !astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+                    .supported_by(&item.provider)
+                || !item.name.eq_ignore_ascii_case(model_name)
+                || source.as_deref().is_some_and(|source| {
+                    !item.provider.eq_ignore_ascii_case(source)
+                        && !item.access_label.eq_ignore_ascii_case(source)
+                }))
+        {
+            return Err(model_selection_changed_during_admission());
+        }
+
+        if item.is_active
+            && astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+                .supported_by(&item.provider)
+            && (execution.model_name != item.name
+                || execution.provider != item.provider
+                || execution.access_kind != item.access_kind
+                || execution.execution_placement != item.execution_placement
+                || execution.source_identity.as_ref().is_none_or(|source| {
+                    source.provider != item.provider || source.access_label != item.access_label
+                }))
+        {
+            return Err(model_selection_changed_during_admission());
+        }
+    }
+    Ok(())
+}
+
 fn validate_model_admission_batch(
     offering_ids: &[String],
 ) -> Result<(), ModelOfferingResolutionError> {
@@ -2033,6 +2174,10 @@ fn admitted_user_model_from_row(
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
     Ok(AdmittedModelExecution {
         offering_id: offering_id.to_string(),
+        source_identity: Some(ResolvedModelSourceIdentity {
+            provider: provider.clone(),
+            access_label: ModelAccessKind::CloudByok.source_label().to_string(),
+        }),
         access_kind: ModelAccessKind::CloudByok,
         execution_placement: ModelExecutionPlacement::Server,
         model_name: alias,
@@ -2855,6 +3000,68 @@ pub trait ModelService: Send + Sync {
             ordered.push(execution);
         }
         Ok(ordered)
+    }
+
+    /// Resolve and admit a bounded child selection batch. Exact Offering IDs
+    /// retain the existing admission-only path. Configured names trigger one
+    /// authorized catalog read for the whole batch, followed by the same
+    /// all-or-error Offering admission; no per-slot lookup is permitted.
+    async fn admit_model_selectors(
+        &self,
+        user_id: String,
+        selectors: Vec<ModelSelector>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        if selectors.len() > MAX_MODEL_ADMISSION_BATCH {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "model selector batch exceeds the supported limit",
+                "model_admission_batch_invalid",
+            ));
+        }
+        for selector in &selectors {
+            selector.validate().map_err(|detail| {
+                error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+            })?;
+        }
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (offering_ids, catalog) = if selectors
+            .iter()
+            .any(|selector| matches!(selector, ModelSelector::ConfiguredName { .. }))
+        {
+            let catalog = self.list_models(user_id.clone(), false).await?;
+            let offering_ids = resolve_model_selector_offerings(&selectors, &catalog)?;
+            (offering_ids, Some(catalog))
+        } else {
+            for selector in &selectors {
+                selector.validate().map_err(|detail| {
+                    error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+                })?;
+            }
+            let offering_ids = selectors
+                .iter()
+                .map(|selector| match selector {
+                    ModelSelector::OfferingId { offering_id } => Ok(offering_id.clone()),
+                    ModelSelector::ConfiguredName { .. } => Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        "configured model name requires catalog resolution",
+                        "model_selection_invalid",
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (offering_ids, None)
+        };
+        let admitted = self
+            .admit_model_offerings(user_id, offering_ids.clone())
+            .await?;
+        validate_model_selector_admissions(
+            &selectors,
+            &offering_ids,
+            catalog.as_deref(),
+            &admitted,
+        )?;
+        Ok(admitted)
     }
 
     async fn create_model(
@@ -3851,6 +4058,74 @@ impl ModelService for DatabaseModelService {
         )
         .await
         .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn admit_model_selectors(
+        &self,
+        user_id: String,
+        selectors: Vec<ModelSelector>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        if selectors.len() > MAX_MODEL_ADMISSION_BATCH {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "model selector batch exceeds the supported limit",
+                "model_admission_batch_invalid",
+            ));
+        }
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !selectors
+            .iter()
+            .any(|selector| matches!(selector, ModelSelector::ConfiguredName { .. }))
+        {
+            for selector in &selectors {
+                selector.validate().map_err(|detail| {
+                    error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+                })?;
+            }
+            let offering_ids = selectors
+                .iter()
+                .map(|selector| match selector {
+                    ModelSelector::OfferingId { offering_id } => Ok(offering_id.clone()),
+                    ModelSelector::ConfiguredName { .. } => unreachable!(),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let admitted = self
+                .admit_model_offerings(user_id, offering_ids.clone())
+                .await?;
+            validate_model_selector_admissions(&selectors, &offering_ids, None, &admitted)?;
+            return Ok(admitted);
+        }
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            let catalog = self.genesis_catalog(&subject).await?;
+            let offering_ids = resolve_model_selector_offerings(&selectors, &catalog.items)?;
+            let admitted = offering_ids
+                .iter()
+                .map(|offering_id| self.admit_genesis_from_catalog(&catalog, offering_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_model_selector_admissions(
+                &selectors,
+                &offering_ids,
+                Some(&catalog.items),
+                &admitted,
+            )?;
+            return Ok(admitted);
+        }
+        // `uc_subject` already established that this caller is not mapped to
+        // a Genesis identity. Materialize the normal authorized catalog
+        // directly instead of calling `list_models`, which would repeat the
+        // same identity lookup before reading the catalog.
+        let deployment_allowed = self.allows_deployment_models(user_id.clone()).await?;
+        let catalog = self
+            .list_models_with_deployment_access(user_id.clone(), false, deployment_allowed)
+            .await?;
+        let offering_ids = resolve_model_selector_offerings(&selectors, &catalog)?;
+        let admitted = self
+            .admit_model_offerings(user_id, offering_ids.clone())
+            .await?;
+        validate_model_selector_admissions(&selectors, &offering_ids, Some(&catalog), &admitted)?;
+        Ok(admitted)
     }
 
     async fn create_model(
@@ -6058,6 +6333,62 @@ mod tests {
     }
 
     #[test]
+    fn configured_name_admission_rejects_identity_drift() {
+        let selector = ModelSelector::ConfiguredName {
+            model_name: "selected-model".to_string(),
+            source: Some("openai".to_string()),
+        };
+        let offering_id = "selected-offering".to_string();
+        let catalog = [test_model_list_item(
+            "openai",
+            "selected-model",
+            &offering_id,
+        )];
+        let selected = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: offering_id.clone(),
+            model: sample_resolved_active_model("selected-model"),
+        })
+        .expect("admitted selection");
+
+        validate_model_selector_admissions(
+            std::slice::from_ref(&selector),
+            std::slice::from_ref(&offering_id),
+            Some(&catalog),
+            std::slice::from_ref(&selected),
+        )
+        .expect("unchanged catalog identity is admitted");
+
+        let changed_name = AdmittedModelExecution {
+            model_name: "different-model".to_string(),
+            ..selected.clone()
+        };
+        let error = validate_model_selector_admissions(
+            std::slice::from_ref(&selector),
+            std::slice::from_ref(&offering_id),
+            Some(&catalog),
+            std::slice::from_ref(&changed_name),
+        )
+        .expect_err("admission must not silently change the selected model");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+
+        let changed_source = AdmittedModelExecution {
+            source_identity: Some(ResolvedModelSourceIdentity {
+                provider: "openai".to_string(),
+                access_label: "Different source".to_string(),
+            }),
+            ..selected
+        };
+        let error = validate_model_selector_admissions(
+            std::slice::from_ref(&selector),
+            std::slice::from_ref(&offering_id),
+            Some(&catalog),
+            std::slice::from_ref(&changed_source),
+        )
+        .expect_err("admission must not silently change the selected source");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
     fn catalog_pricing_preserves_explicit_zero_and_unknown_rates() {
         let updated_at = "2026-09-23 12:00:00.000000";
         let priced = catalog_pricing_from_stored(
@@ -6564,6 +6895,18 @@ mod tests {
             ..selected.clone()
         };
         assert!(!selected.has_same_execution_identity(&changed_provider));
+
+        let changed_source = AdmittedModelExecution {
+            source_identity: Some(ResolvedModelSourceIdentity {
+                provider: "openai".to_string(),
+                access_label: "Genesis".to_string(),
+            }),
+            ..selected.clone()
+        };
+        assert!(
+            !selected.has_same_execution_identity(&changed_source),
+            "Offering source identity must remain stable across refreshed admission"
+        );
     }
 
     #[test]

@@ -106,8 +106,9 @@ pub use explain_analyze_projection::{
 };
 pub use inference::{
     AutoModelStrategy, CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose,
-    ModelSelection, RequestedModelPolicy, RequestedModelPolicyError, client_direct_execution_field,
-    resolve_requested_model_selection,
+    ModelSelection, ModelSelector, RequestedModelPolicy, RequestedModelPolicyError,
+    client_direct_execution_field, resolve_requested_model_selection,
+    resolve_requested_model_selector,
 };
 pub use memory_ranking::{
     MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,

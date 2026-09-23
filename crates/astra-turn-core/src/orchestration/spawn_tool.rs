@@ -579,13 +579,13 @@ mod tests {
 
     #[test]
     fn spawn_accepts_a_fixed_offering_policy() {
-        let json = r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"fixed","selection":{"offering_id":"offer-gpt-4o"}}}"#;
+        let json = r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-gpt-4o"}}}"#;
         let input = serde_json::from_str::<SpawnAgentInput>(json)
             .expect("a fixed model policy is part of the typed spawn contract");
         assert_eq!(
             input.requested_model_policy,
             Some(RequestedModelPolicy::Fixed {
-                selection: ModelSelection {
+                selector: ModelSelector::OfferingId {
                     offering_id: "offer-gpt-4o".to_string(),
                 }
             })
@@ -638,13 +638,13 @@ mod tests {
     #[test]
     fn spawn_parses_reasoning_independently_from_model_policy() {
         let input: SpawnAgentInput = serde_json::from_str(
-            r#"{"description":"Review","prompt":"Check it","requested_model_policy":{"mode":"fixed","selection":{"offering_id":"offer-b"}},"reasoning":{"mode":"adaptive","effort":"high"}}"#,
+            r#"{"description":"Review","prompt":"Check it","requested_model_policy":{"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-b"}},"reasoning":{"mode":"adaptive","effort":"high"}}"#,
         )
         .expect("typed reasoning and model policy");
         assert_eq!(
             input.requested_model_policy,
             Some(RequestedModelPolicy::Fixed {
-                selection: ModelSelection {
+                selector: ModelSelector::OfferingId {
                     offering_id: "offer-b".to_string(),
                 },
             })

@@ -8035,9 +8035,6 @@ impl ServerAgenticLoopHost {
             applied_intent_id: source.applied_intent_id.clone(),
             user_intent_digest: source.user_intent_digest.clone(),
         };
-        if presence == Some(astra_services::WorkAdmissionTruth::No) {
-            return DelegationIntentRequirements::Unconstrained { source: origin };
-        }
         let unresolved = |reason: &str| DelegationIntentRequirements::Unresolved {
             source: origin.clone(),
             reason: reason.to_string(),
@@ -19662,26 +19659,16 @@ impl ServerAgenticLoopHost {
                 && current.applied_intent_id == source.applied_intent_id
                 && current.user_intent_digest == source.user_intent_digest
         });
-        let attempt = match (
-            &state
-                .skills
-                .request_constraints
-                .delegated_model_requirements,
-            matches_source,
-        ) {
-            (
-                astra_turn_types::DelegationIntentRequirements::Unavailable { attempts: 1, .. },
-                true,
-            ) => 2,
-            _ => 1,
-        };
-        let retry_unavailable = matches_source && attempt == 2;
-        if !matches_source || retry_unavailable {
+        if !matches_source {
             state
                 .skills
                 .request_constraints
                 .delegated_model_requirements = self
-                .assess_root_delegation_intent(state, &source, &user_text, presence, attempt)
+                // A given authenticated user-intent source is interpreted at
+                // most once. In particular, provider failure does not trigger
+                // an automatic paid retry on the next spawn; changed user
+                // guidance has a new source identity and may be assessed.
+                .assess_root_delegation_intent(state, &source, &user_text, presence, 1)
                 .await;
         }
         let assessed = state
@@ -41732,6 +41719,107 @@ mod tests {
         assert_eq!(admitted.len(), 16);
         assert_eq!(blocked.len(), 1);
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_delegation_intent_is_not_reextracted_until_user_intent_changes() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([json!({
+                "disposition":"resolved",
+                "requirements":[{
+                    "model_quote":null,"source_qualifier_quote":null,
+                    "reasoning_quote":"high","reasoning":"high",
+                    "task_scope_quote":null,"propagation":"direct_children","strength":"hard"
+                }],
+                "unresolved":[]
+            })
+            .to_string()])),
+            requests: requests.clone(),
+        };
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "once-user".into(),
+            "once-session".into(),
+        )
+        .with_test_judgment_clients([
+            Box::new(client) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
+        ])
+        .build();
+        let mut state = create_test_state();
+        state.context_manifest_user_id = Some("once-user".into());
+        state.current_session_id = Some("once-session".into());
+        state.current_run_id = Some("once-run".into());
+        state.canonical_turn_chain_id = Some("once-chain".into());
+        state.current_run_owner_generation = Some(1);
+        state.user_intent = "Use high reasoning for every subagent".into();
+        let source = delegation_intent_source_from_state(&state).expect("intent source");
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements =
+            astra_turn_types::DelegationIntentRequirements::Unavailable {
+                source: astra_turn_types::DelegationUserRequirementSource {
+                    user_id: source.user_id.clone(),
+                    session_id: source.session_id.clone(),
+                    session_turn: source.session_turn,
+                    applied_intent_id: source.applied_intent_id.clone(),
+                    user_intent_digest: source.user_intent_digest.clone(),
+                },
+                reason: "prior assessment did not complete".into(),
+                attempts: 1,
+            };
+        let first = json!({
+            "id":"first-call","type":"function",
+            "function":{"name":"agent","arguments":json!({
+                "action":"spawn","description":"Review","prompt":"Review the diff"
+            }).to_string()}
+        });
+        let (admissions, blocked) = host
+            .admitted_delegation_models(&mut state, std::slice::from_ref(&first))
+            .await;
+        assert!(admissions.is_empty());
+        assert_eq!(blocked.len(), 1, "unavailable extraction must fail closed");
+        assert!(requests.lock().unwrap().is_empty());
+
+        state.user_intent = "Use high reasoning for each delegated task".into();
+        let changed_source =
+            delegation_intent_source_from_state(&state).expect("new intent source");
+        host.pending_work_admission = Some(ClassifiedWorkAdmission {
+            decision: astra_services::WorkAdmissionDecision::NotRequired {
+                domain: None,
+                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+                mutation_completion_scope:
+                    astra_config::user_profile::MutationCompletionScope::Unknown,
+                execution_topology: astra_services::WorkExecutionTopology::Primary,
+                required_capabilities: Vec::new(),
+            },
+            delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::No),
+            source: Some(changed_source),
+            work_handoff_pending: false,
+        });
+        let second = json!({
+            "id":"second-call","type":"function",
+            "function":{"name":"agent","arguments":json!({
+                "action":"spawn","description":"Review","prompt":"Review the diff"
+            }).to_string()}
+        });
+        let (admissions, blocked) = host
+            .admitted_delegation_models(&mut state, std::slice::from_ref(&second))
+            .await;
+        assert!(blocked.is_empty());
+        assert!(matches!(
+            &admissions["second-call"].outcome,
+            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
+                if slots.len() == 1 && slots[0].reasoning.is_some()
+        ));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "a distinct authenticated user-intent source gets one fresh extraction"
+        );
     }
 
     #[tokio::test]

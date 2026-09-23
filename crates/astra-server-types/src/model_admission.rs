@@ -3,6 +3,7 @@
 //! This is a current-state check, not a durable authorization grant. Each
 //! inference request still passes Server execution admission.
 
+use astra_turn_types::ModelSelector;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -11,8 +12,21 @@ use serde_json::Value;
 pub struct ModelAdmissionSlotV1 {
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
-    pub offering_id: String,
+    pub selector: ModelSelector,
     /// Serialized `ReasoningSelection`; Server validates the exact type.
+    pub reasoning: Value,
+    /// Reuse parent reasoning only when name resolution yields this exact
+    /// Offering. This avoids resolving a configured name in one request and
+    /// issuing a second admission request just to decide inheritance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_reasoning: Option<ModelAdmissionReasoningInheritanceV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAdmissionReasoningInheritanceV1 {
+    pub offering_id: String,
+    /// Serialized `ReasoningSelection` inherited from this exact parent Offering.
     pub reasoning: Value,
 }
 

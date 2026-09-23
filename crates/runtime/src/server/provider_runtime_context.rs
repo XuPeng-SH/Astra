@@ -413,6 +413,7 @@ mod tests {
                 selected_model: ExternalSelectedModelResponse {
                     id: "model-requested".to_string(),
                     model: "provider-model".to_string(),
+                    source_identity: None,
                 },
                 runtime_auth: ExternalRuntimeAuthResponse {
                     auth_type: "moi_runtime_grant".to_string(),

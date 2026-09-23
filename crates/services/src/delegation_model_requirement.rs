@@ -1,7 +1,7 @@
 //! Bounded interpretation of user-authored delegation requirements and their
 //! applicability to a batch. Interpretation is evidence, not model-access authority.
 
-use astra_turn_types::{DelegationReasoningEffort, ModelSelection};
+use astra_turn_types::{DelegationReasoningEffort, ModelSelection, ModelSelector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -130,6 +130,24 @@ fn resolve_model_selection(
     qualifier: Option<&str>,
     catalog: &[ModelListItem],
 ) -> Result<Option<ModelSelection>, String> {
+    resolve_catalog_model_selection(name, qualifier, catalog, true)
+}
+
+fn resolve_configured_model_name(
+    name: &str,
+    source: Option<&str>,
+    catalog: &[ModelListItem],
+) -> Result<ModelSelection, String> {
+    resolve_catalog_model_selection(Some(name), source, catalog, false)?
+        .ok_or_else(|| "requested model is unavailable or inaccessible".into())
+}
+
+fn resolve_catalog_model_selection(
+    name: Option<&str>,
+    qualifier: Option<&str>,
+    catalog: &[ModelListItem],
+    include_offering_id: bool,
+) -> Result<Option<ModelSelection>, String> {
     let Some(name) = name else { return Ok(None) };
     let matches = catalog
         .iter()
@@ -137,7 +155,8 @@ fn resolve_model_selection(
             item.is_active
                 && astra_core::model_wire::purpose::ModelRequestPurpose::Chat
                     .supported_by(&item.provider)
-                && (item.name.eq_ignore_ascii_case(name) || item.offering_id == name)
+                && (item.name.eq_ignore_ascii_case(name)
+                    || (include_offering_id && item.offering_id == name))
                 && qualifier.is_none_or(|qualifier| {
                     item.provider.eq_ignore_ascii_case(qualifier)
                         || item.access_label.eq_ignore_ascii_case(qualifier)
@@ -151,6 +170,37 @@ fn resolve_model_selection(
         [] => Err("requested model is unavailable or inaccessible".into()),
         _ => Err("requested model matches multiple authorized sources".into()),
     }
+}
+
+/// Resolve a fixed caller selector against one authorized, complete catalog
+/// snapshot. Offering IDs remain opaque; configured names must identify one
+/// active Chat-capable source exactly.
+pub fn resolve_model_selector(
+    selector: &ModelSelector,
+    catalog: &[ModelListItem],
+) -> Result<ModelSelection, String> {
+    selector.validate().map_err(str::to_string)?;
+    match selector {
+        ModelSelector::OfferingId { offering_id } => Ok(ModelSelection {
+            offering_id: offering_id.clone(),
+        }),
+        ModelSelector::ConfiguredName { model_name, source } => {
+            resolve_configured_model_name(model_name, source.as_deref(), catalog)
+        }
+    }
+}
+
+/// Resolve selectors in input order against the same catalog snapshot. This
+/// is a pure lookup; callers still perform the existing batched Offering
+/// admission before dispatch.
+pub fn resolve_model_selectors(
+    selectors: &[ModelSelector],
+    catalog: &[ModelListItem],
+) -> Result<Vec<ModelSelection>, String> {
+    selectors
+        .iter()
+        .map(|selector| resolve_model_selector(selector, catalog))
+        .collect()
 }
 
 pub fn resolve_delegation_intent_requirements<'a>(
@@ -394,6 +444,89 @@ mod tests {
                 .unwrap()
                 .offering_id,
             "offer-a"
+        );
+    }
+
+    #[test]
+    fn configured_selector_is_exact_authorized_and_fail_closed() {
+        let mut inactive = offered("inactive", "provider-a", "offer-inactive");
+        inactive.is_active = false;
+        let non_chat = offered("judge-only", "typesafe", "offer-judge");
+        let catalog = vec![
+            offered("GLM-5.2", "provider-a", "offer-a"),
+            offered("glm-5.2", "provider-b", "offer-b"),
+            inactive,
+            non_chat,
+            offered("canonical-name", "provider-a", "offer-id-is-not-a-name"),
+        ];
+        let source_qualified = ModelSelector::ConfiguredName {
+            model_name: "glm-5.2".into(),
+            source: Some("provider-a".into()),
+        };
+        assert_eq!(
+            resolve_model_selector(&source_qualified, &catalog)
+                .unwrap()
+                .offering_id,
+            "offer-a"
+        );
+        assert!(
+            resolve_model_selector(
+                &ModelSelector::ConfiguredName {
+                    model_name: "glm-5.2".into(),
+                    source: None,
+                },
+                &catalog,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_model_selector(
+                &ModelSelector::ConfiguredName {
+                    model_name: "offer-id-is-not-a-name".into(),
+                    source: None,
+                },
+                &catalog,
+            )
+            .is_err(),
+            "a configured-name selector must not accept an Offering ID as an alias"
+        );
+        assert!(
+            resolve_model_selector(
+                &ModelSelector::ConfiguredName {
+                    model_name: "inactive".into(),
+                    source: None,
+                },
+                &catalog,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_model_selector(
+                &ModelSelector::ConfiguredName {
+                    model_name: "unknown".into(),
+                    source: None,
+                },
+                &catalog,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_model_selector(
+                &ModelSelector::ConfiguredName {
+                    model_name: "judge-only".into(),
+                    source: Some("typesafe".into()),
+                },
+                &catalog,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            resolve_model_selectors(&[source_qualified.clone(), source_qualified,], &catalog,)
+                .unwrap()
+                .iter()
+                .map(|selection| selection.offering_id.as_str())
+                .collect::<Vec<_>>(),
+            ["offer-a", "offer-a"]
         );
     }
 

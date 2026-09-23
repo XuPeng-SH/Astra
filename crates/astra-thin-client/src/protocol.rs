@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub use astra_turn_types::ExplainAnalyzeEventV1;
-pub use astra_turn_types::{ModelSelection, RequestedModelPolicy};
+pub use astra_turn_types::{ModelSelection, ModelSelector, RequestedModelPolicy};
 
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1133,7 +1133,7 @@ mod tests {
                 offering_id: "offer-m".into(),
             },
             requested_model_policy: Some(RequestedModelPolicy::Fixed {
-                selection: ModelSelection {
+                selector: ModelSelector::OfferingId {
                     offering_id: "offer-m".into(),
                 },
             }),

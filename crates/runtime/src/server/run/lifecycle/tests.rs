@@ -2440,6 +2440,7 @@ impl UserIntentProvider for StaticRunControlProvider {
 struct ActiveTestModelService {
     base_url: String,
     batch_requests: StdMutex<Vec<Vec<String>>>,
+    catalog_requests: StdMutex<usize>,
 }
 
 impl ActiveTestModelService {
@@ -2447,6 +2448,7 @@ impl ActiveTestModelService {
         Self {
             base_url: base_url.into(),
             batch_requests: StdMutex::new(Vec::new()),
+            catalog_requests: StdMutex::new(0),
         }
     }
 }
@@ -2536,7 +2538,11 @@ impl astra_services::ModelService for ActiveTestModelService {
                 }
                 let mut offering = test_resolved_model_offering_at(&self.base_url);
                 offering.offering_id = offering_id.clone();
-                offering.model.model_name = offering_id;
+                offering.model.model_name = if offering_id == "model-test-model" {
+                    "test-model".to_string()
+                } else {
+                    offering_id
+                };
                 astra_services::AdmittedModelExecution::from_offering(offering).map_err(|error| {
                     error_response_coded(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -2561,6 +2567,7 @@ impl astra_services::ModelService for ActiveTestModelService {
         _user_id: String,
         _is_admin: bool,
     ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+        *self.catalog_requests.lock().unwrap() += 1;
         Ok(vec![astra_services::ModelListItem {
             offering_id: "model-test-model".to_string(),
             access_id: "self-hosted".to_string(),
@@ -6550,6 +6557,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .await
         .expect("inherited slots do not query the model service");
     assert!(model_service.batch_requests.lock().unwrap().is_empty());
+    assert_eq!(*model_service.catalog_requests.lock().unwrap(), 0);
     let mut heterogeneous = inputs.clone();
     let mut repeated = inputs[0].clone();
     repeated.fanout_slot_index = Some(2);
@@ -6562,7 +6570,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .zip(["model-b", "model-c", "model-b"])
     {
         input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: ModelSelection {
+            selector: astra_turn_types::ModelSelector::OfferingId {
                 offering_id: offering_id.into(),
             },
         });
@@ -6577,7 +6585,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         &[vec!["model-b".to_string(), "model-c".to_string()]]
     );
     heterogeneous[2].requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-        selection: ModelSelection {
+        selector: astra_turn_types::ModelSelector::OfferingId {
             offering_id: "invalid".into(),
         },
     });
@@ -6618,7 +6626,7 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
     invalid_offering[1].reasoning = None;
     invalid_offering[1].requested_model_policy =
         Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: astra_turn_types::ModelSelection {
+            selector: astra_turn_types::ModelSelector::OfferingId {
                 offering_id: String::new(),
             },
         });
@@ -6629,6 +6637,45 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
             .is_err(),
         "an invalid final-slot Offering must reject the whole batch"
     );
+
+    let name_service = Arc::new(ActiveTestModelService::default());
+    let name_executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_model_service(Some(name_service.clone())),
+    );
+    name_executor
+        .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
+        .await;
+    let mut named_inputs = heterogeneous.iter().take(2).cloned().collect::<Vec<_>>();
+    for input in &mut named_inputs {
+        input.fanout_target_count = Some(2);
+        input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: None,
+            },
+        });
+    }
+    let named_prepared = Arc::clone(&name_executor)
+        .prepare_batch(&named_inputs, &context, None)
+        .await
+        .expect("one exact configured name resolves and admits the full batch");
+    assert_eq!(named_prepared.len(), 2);
+    assert_eq!(*name_service.catalog_requests.lock().unwrap(), 1);
+    assert_eq!(
+        name_service.batch_requests.lock().unwrap().as_slice(),
+        &[vec!["model-test-model".to_string()]],
+        "duplicate selectors share one batched Offering admission"
+    );
+    for prepared in named_prepared {
+        let identity = prepared.model_identity().expect("admitted model identity");
+        assert_eq!(identity.offering_id, "model-test-model");
+        assert_eq!(identity.model_name, "test-model");
+    }
 }
 
 #[tokio::test]
@@ -12013,6 +12060,7 @@ fn prepared_test_request(message: &str) -> ChatRequestData {
     request.resolved_model_selection = Some(ResolvedModelSelection {
         offering_id: "model-test-model".to_string(),
         model_name: "test-model".to_string(),
+        source_identity: None,
     });
     request.admitted_model_execution = Some(test_admitted_model_execution());
     request
@@ -12420,7 +12468,7 @@ async fn durable_subrun_model_policy_conflict_is_rejected_before_activation() {
 
     let mut original = test_executable_subrun_config("policy-replay", admitted.clone());
     original.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-        selection: ModelSelection {
+        selector: astra_turn_types::ModelSelector::OfferingId {
             offering_id: "model-test-model".to_string(),
         },
     });
@@ -13093,6 +13141,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
                 resolved_model_selection: Some(ResolvedModelSelection {
                     offering_id: "model-test-model".to_string(),
                     model_name: "test-model".to_string(),
+                    source_identity: None,
                 }),
                 ..Default::default()
             },
@@ -15491,7 +15540,7 @@ async fn prepare_chat_request_rejects_unavailable_or_conflicting_model_policy_be
 
     let mut mismatched_fixed = test_request("delegate this task");
     mismatched_fixed.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-        selection: ModelSelection {
+        selector: astra_turn_types::ModelSelector::OfferingId {
             offering_id: "other-offering".to_string(),
         },
     });
@@ -15503,6 +15552,87 @@ async fn prepare_chat_request_rejects_unavailable_or_conflicting_model_policy_be
     assert_eq!(
         error.1.0.error_code.as_deref(),
         Some("model_selection_invalid")
+    );
+
+    let mut unprepared_name = test_request("delegate this task");
+    unprepared_name.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "test-model".into(),
+            source: None,
+        },
+    });
+    unprepared_name.model_selection = None;
+    let error = service
+        .prepare_chat_request("u1", unprepared_name)
+        .await
+        .expect_err("the root chat endpoint cannot consume an unprepared configured name");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_selection_invalid")
+    );
+
+    let matching_policy = astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "TEST-MODEL".into(),
+            source: Some("openai".into()),
+        },
+    };
+    let mut prepared_name = test_request("delegate this task");
+    prepared_name.requested_model_policy = Some(matching_policy.clone());
+    let prepared = service
+        .prepare_chat_request("u1", prepared_name)
+        .await
+        .expect("an explicitly admitted Offering may carry configured-name provenance");
+    assert_eq!(prepared.requested_model_policy, Some(matching_policy));
+    assert_eq!(prepared.model.as_deref(), Some("test-model"));
+
+    let mut matching_access_label = test_request("delegate this task");
+    matching_access_label.requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: Some("Self-hosted".into()),
+            },
+        });
+    service
+        .prepare_chat_request("u1", matching_access_label)
+        .await
+        .expect("the admitted Offering's access label is a valid source qualifier");
+
+    let mut drifted_name = test_request("delegate this task");
+    drifted_name.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "other-model".into(),
+            source: None,
+        },
+    });
+    let error = service
+        .prepare_chat_request("u1", drifted_name)
+        .await
+        .expect_err("a name that no longer identifies the admitted Offering must fail closed");
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_identity_changed")
+    );
+
+    let mut mismatched_source = test_request("delegate this task");
+    mismatched_source.requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: Some("anthropic".into()),
+            },
+        });
+    let error = service
+        .prepare_chat_request("u1", mismatched_source)
+        .await
+        .expect_err("a matching name cannot override a conflicting source qualifier");
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_identity_changed")
     );
 }
 
@@ -15571,6 +15701,7 @@ async fn prepare_chat_request_rejects_wire_resolution_without_provider_authoriza
     request.resolved_model_selection = Some(ResolvedModelSelection {
         offering_id: "model-test-model".to_string(),
         model_name: "attacker-model".to_string(),
+        source_identity: None,
     });
 
     let err = service
@@ -15896,6 +16027,122 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             .as_ref()
             .map(|execution| execution.model_name.as_str()),
         Some("test-model")
+    );
+}
+
+#[tokio::test]
+async fn prepare_chat_request_rejects_mismatched_configured_source_for_provider_runtime() {
+    let service = test_service();
+    for conflicting_source in ["openai", "This device", "anthropic"] {
+        let mut request = prepared_test_request("hello");
+        request.provider_runtime_authorized = true;
+        request.admitted_model_execution = None;
+        request
+            .resolved_model_selection
+            .as_mut()
+            .expect("authenticated provider context carries the resolved selection")
+            .source_identity = Some(astra_services::runs::ResolvedModelSourceIdentity {
+            provider: "deepseek".into(),
+            access_label: "Genesis".into(),
+        });
+        request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: Some(conflicting_source.into()),
+            },
+        });
+        request.runtime_auth = Some(RuntimeAuthRequest {
+            authorization: "Bearer runtime-grant".to_string(),
+        });
+        request.capability_descriptors =
+            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+                model_gateway: Some(test_runtime_descriptor(
+                    "moi-model-gateway",
+                    "model_gateway",
+                    "http://127.0.0.1/model-gateway",
+                )),
+                mcp: None,
+                skills: None,
+                edge_agent: None,
+                discovery_snapshot: None,
+            });
+
+        let error = service
+            .prepare_chat_request("u1", request)
+            .await
+            .expect_err("gateway transport must not impersonate Offering source identity");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("model_identity_changed")
+        );
+    }
+}
+
+#[tokio::test]
+async fn prepare_chat_request_preserves_trusted_source_across_provider_gateway_transport() {
+    let service = test_service();
+    let mut request = prepared_test_request("hello");
+    request.provider_runtime_authorized = true;
+    request.admitted_model_execution = None;
+    request
+        .resolved_model_selection
+        .as_mut()
+        .expect("authenticated provider context carries the resolved selection")
+        .source_identity = Some(astra_services::runs::ResolvedModelSourceIdentity {
+        provider: "deepseek".into(),
+        access_label: "Genesis".into(),
+    });
+    request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "test-model".into(),
+            source: Some("Genesis".into()),
+        },
+    });
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model-gateway",
+                "model_gateway",
+                "http://127.0.0.1/model-gateway",
+            )),
+            mcp: None,
+            skills: None,
+            edge_agent: None,
+            discovery_snapshot: None,
+        });
+
+    let prepared = service
+        .prepare_chat_request("u1", request)
+        .await
+        .expect("trusted Genesis source remains valid through OpenAI-compatible gateway");
+    assert_eq!(
+        prepared
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.provider.as_str()),
+        Some("openai"),
+        "gateway protocol is transport provenance, not Offering source"
+    );
+    assert_eq!(
+        prepared
+            .admitted_model_execution
+            .as_ref()
+            .and_then(|execution| execution.source_identity.as_ref())
+            .map(|source| source.access_label.as_str()),
+        Some("Genesis"),
+        "trusted Offering provenance must travel with the admitted execution"
+    );
+    assert_eq!(
+        prepared
+            .resolved_model_selection
+            .as_ref()
+            .and_then(|resolved| resolved.source_identity.as_ref())
+            .map(|source| source.access_label.as_str()),
+        Some("Genesis")
     );
 }
 
@@ -18431,7 +18678,7 @@ fn provider_task_ref_fingerprint_tracks_semantic_routing_but_not_credential_rota
         .expect("provider identity");
 
     request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-        selection: astra_turn_types::ModelSelection {
+        selector: astra_turn_types::ModelSelector::OfferingId {
             offering_id: "selected-offering".to_string(),
         },
     });

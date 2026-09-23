@@ -925,24 +925,29 @@ pub(crate) fn apply_delegation_model_admission(
         let hard =
             slot.model_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard);
         if hard && input.requested_model_policy.is_some() {
-            if input.resolved_model_selection.is_none() {
-                return Err(invalid(
-                    "requested model policy could not be resolved against the parent",
-                ));
+            if input.resolved_model_selection.is_none()
+                && !matches!(
+                    input.requested_model_policy,
+                    Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                        selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
+                    })
+                )
+            {
+                return Err(invalid("requested model policy could not be resolved"));
             }
             if input
                 .resolved_model_selection
                 .as_ref()
                 .is_some_and(|selected| selected != required)
             {
-                return Err(invalid(
-                    "tool model conflicts with hard user requirement; omit requested_model_policy instead of guessing an Offering ID so runtime can apply the resolved selection",
-                ));
+                return Err(invalid("tool model conflicts with hard user requirement"));
             }
         }
         if input.requested_model_policy.is_none() {
             input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                selection: required.clone(),
+                selector: astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: required.offering_id.clone(),
+                },
             });
             input.resolved_model_selection = Some(required.clone());
         }
@@ -1192,12 +1197,42 @@ impl SpawnRunConfig {
         let Some(policy) = self.requested_model_policy.as_ref() else {
             return Ok(());
         };
-        let requested = astra_turn_types::resolve_requested_model_selection(Some(policy), None)
-            .map_err(|error| error.to_string())?;
-        if requested.is_some() && requested != self.resolved_model_selection {
-            return Err("resolved Offering does not match the requested fixed model policy".into());
+        match policy {
+            astra_turn_types::RequestedModelPolicy::Inherit => Ok(()),
+            astra_turn_types::RequestedModelPolicy::Auto { .. } => Err(
+                astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
+                    .to_string(),
+            ),
+            astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::OfferingId { offering_id },
+            } => {
+                let selector = astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: offering_id.clone(),
+                };
+                selector.validate().map_err(str::to_string)?;
+                if self
+                    .resolved_model_selection
+                    .as_ref()
+                    .is_none_or(|selection| selection.offering_id != *offering_id)
+                {
+                    return Err(
+                        "resolved Offering does not match the requested fixed model policy".into(),
+                    );
+                }
+                Ok(())
+            }
+            astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: selector @ astra_turn_types::ModelSelector::ConfiguredName { .. },
+            } => {
+                selector.validate().map_err(str::to_string)?;
+                if self.resolved_model_selection.is_none() {
+                    return Err(
+                        "configured model name was not resolved by trusted preparation".into(),
+                    );
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -3874,11 +3909,19 @@ impl DynamicAgentSpawner {
                 "output-token limit must be positive".into(),
             ));
         }
+        let unresolved_configured_name = matches!(
+            input.requested_model_policy.as_ref(),
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
+            })
+        );
         if let astra_turn_core::thinking_config::ThinkingConfig::Enabled { budget_tokens } =
             astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
                 input.reasoning.as_ref(),
                 input.resolved_model_selection.as_ref(),
-                context.parent_model_reasoning.as_ref(),
+                (!unresolved_configured_name)
+                    .then_some(context.parent_model_reasoning.as_ref())
+                    .flatten(),
             )
             && (budget_tokens < 1024
                 || input
@@ -3928,14 +3971,15 @@ impl DynamicAgentSpawner {
             return Err(SpawnError::ExecutorUnavailable);
         }
         for input in inputs {
-            input
+            let slot_identity = input
                 .fanout_slot_identity()
-                .map_err(SpawnError::InvalidInput)?
-                .ok_or_else(|| {
-                    SpawnError::InvalidInput(
-                        "fanout batch contains a spawn without slot identity".to_string(),
-                    )
-                })?;
+                .map_err(SpawnError::InvalidInput)?;
+            if slot_identity.is_none() && (inputs.len() > 1 || input.fanout_target_count.is_some())
+            {
+                return Err(SpawnError::InvalidInput(
+                    "fanout batch contains a spawn without slot identity".to_string(),
+                ));
+            }
             self.prepare_static_spawn(input, context)?;
         }
         Ok(())
@@ -4200,11 +4244,49 @@ impl DynamicAgentSpawner {
         let cancellation_binding_id = Uuid::new_v4().to_string();
         let agent_id = format!("{}@{}", agent_name, run_id);
 
-        // 3. Determine model and turns
-        let model = context.resolved_model_name.clone();
+        // Trusted preparation carries the exact selected model identity. Use
+        // it before model-sensitive thinking and prefix compatibility are
+        // computed; the caller's configured name is not an execution identity.
+        let prepared_identity = preparation
+            .as_ref()
+            .and_then(|prepared| prepared.model_identity());
+        let prepared_selection =
+            prepared_identity
+                .as_ref()
+                .map(|identity| astra_turn_types::ModelSelection {
+                    offering_id: identity.offering_id.clone(),
+                });
+        if input
+            .resolved_model_selection
+            .as_ref()
+            .zip(prepared_selection.as_ref())
+            .is_some_and(|(requested, prepared)| requested != prepared)
+        {
+            return Err(SpawnError::InvalidInput(
+                "prepared Offering does not match the requested model selection".into(),
+            ));
+        }
+        let resolved_model_selection = input
+            .resolved_model_selection
+            .clone()
+            .or(prepared_selection);
+        if let Some(admission) = context.delegation_model_admission.as_ref() {
+            let mut checked = input.clone();
+            checked.resolved_model_selection = resolved_model_selection.clone();
+            apply_delegation_model_admission(
+                &mut checked,
+                admission,
+                &context.parent_run_id,
+                context.spawn_tool_call_id.as_deref(),
+            )?;
+        }
+        let model = prepared_identity
+            .as_ref()
+            .map(|identity| identity.model_name.clone())
+            .or_else(|| context.resolved_model_name.clone());
         let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
             input.reasoning.as_ref(),
-            input.resolved_model_selection.as_ref(),
+            resolved_model_selection.as_ref(),
             context.parent_model_reasoning.as_ref(),
         );
         // 3b. Resolve fork-prefix inheritance before any side effects
@@ -4705,14 +4787,7 @@ impl DynamicAgentSpawner {
             description: input.description.clone(),
             task: input.prompt.clone(),
             system_prompt_addendum: coordination_addendum,
-            resolved_model_selection: input.resolved_model_selection.clone().or_else(|| {
-                preparation
-                    .as_ref()
-                    .and_then(|prepared| prepared.model_identity())
-                    .map(|identity| astra_turn_types::ModelSelection {
-                        offering_id: identity.offering_id,
-                    })
-            }),
+            resolved_model_selection,
             requested_model_policy: input.requested_model_policy.clone(),
             delegated_model_requirements: context
                 .delegation_model_admission
@@ -9356,7 +9431,9 @@ mod tests {
             offering_id: "offer-child".into(),
         };
         input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: selection.clone(),
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: selection.offering_id.clone(),
+            },
         });
         input.resolved_model_selection = Some(selection);
         input.reasoning = Some(
@@ -9447,7 +9524,9 @@ mod tests {
             offering_id: "offer-reviewed".into(),
         };
         input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: selection.clone(),
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: selection.offering_id.clone(),
+            },
         });
         input.resolved_model_selection = Some(selection);
         let result = spawner
@@ -11338,7 +11417,7 @@ mod tests {
         assert_eq!(
             omitted.requested_model_policy,
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                selection: ModelSelection {
+                selector: astra_turn_types::ModelSelector::OfferingId {
                     offering_id: "offering-b".into(),
                 },
             })
@@ -11385,7 +11464,7 @@ mod tests {
         );
         let mut conflict = make_sync_input();
         conflict.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: ModelSelection {
+            selector: astra_turn_types::ModelSelector::OfferingId {
                 offering_id: "offering-a".into(),
             },
         });
@@ -11396,9 +11475,7 @@ mod tests {
             apply_delegation_model_admission(&mut conflict, &admission, "parent-run", Some("call"))
                 .unwrap_err()
                 .to_string();
-        assert!(conflict_error.contains("hard user requirement"));
-        assert!(conflict_error.contains("omit requested_model_policy"));
-        assert!(conflict_error.contains("resolved selection"));
+        assert!(conflict_error.contains("tool model conflicts with hard user requirement"));
         let mut default_admission = admission.clone();
         let DelegationModelAdmissionOutcome::Constrained { slots } = &mut default_admission.outcome
         else {
@@ -11409,7 +11486,7 @@ mod tests {
             Some(astra_turn_types::DelegationRequirementStrength::Default);
         let mut overridden = make_sync_input();
         overridden.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
-            selection: ModelSelection {
+            selector: astra_turn_types::ModelSelector::OfferingId {
                 offering_id: "offering-a".into(),
             },
         });

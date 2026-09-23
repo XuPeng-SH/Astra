@@ -4822,6 +4822,7 @@ mod tests {
     ) -> DurableInferenceLedger {
         let execution = astra_services::AdmittedModelExecution {
             offering_id: "offering-test".to_string(),
+            source_identity: None,
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             execution_placement: astra_services::ModelExecutionPlacement::Server,
             model_name: "model-test".to_string(),
