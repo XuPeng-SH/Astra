@@ -146,10 +146,14 @@ pub(crate) fn validate_reasoning_control(
     let protocol = execution.thinking_protocol.unwrap_or_default();
     let supported = match thinking {
         ThinkingConfig::ModelDefault => true,
-        ThinkingConfig::Off => matches!(
-            capability,
-            Some(ThinkingCapability::Both | ThinkingCapability::None)
-        ),
+        ThinkingConfig::Off => match capability {
+            Some(ThinkingCapability::None) => true,
+            Some(ThinkingCapability::Both) => {
+                matches!(execution.provider.as_str(), "anthropic" | "bedrock")
+                    || protocol.can_disable()
+            }
+            _ => false,
+        },
         ThinkingConfig::Enabled { budget_tokens } => {
             *budget_tokens >= 1024
                 && capability == Some(ThinkingCapability::Both)
@@ -307,6 +311,54 @@ mod tests {
             "outside the admission test contract",
             "test_operation_unsupported",
         ))
+    }
+
+    #[test]
+    fn explicit_off_requires_an_actual_disabling_contract_for_thinking_models() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::ThinkingCapability;
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
+        let mut execution = AdmittedModelExecution::from_endpoint(
+            "offering".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1/chat/completions".into(),
+            "Bearer fixture".into(),
+            None,
+            128_000,
+        );
+        execution.thinking_capability = Some(ThinkingCapability::Both);
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
+        for protocol in [ThinkingProtocol::Unknown, ThinkingProtocol::ReasoningEffort] {
+            execution.thinking_protocol = Some(protocol);
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::ModelDefault).is_ok());
+        }
+        for protocol in [
+            ThinkingProtocol::EnableThinking,
+            ThinkingProtocol::ThinkingObject,
+            ThinkingProtocol::Moonshot,
+        ] {
+            execution.thinking_protocol = Some(protocol);
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_ok());
+        }
+        execution.thinking_protocol = Some(ThinkingProtocol::Unknown);
+        for provider in ["anthropic", "bedrock"] {
+            execution.provider = provider.into();
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_ok());
+        }
+        execution.provider = "openai".into();
+        execution.thinking_capability = Some(ThinkingCapability::None);
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_ok());
+        for capability in [
+            None,
+            Some(ThinkingCapability::EffortOnly),
+            Some(ThinkingCapability::NativeOnly),
+        ] {
+            execution.thinking_capability = capability;
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
+        }
     }
 
     #[async_trait]
