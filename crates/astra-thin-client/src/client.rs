@@ -38,9 +38,11 @@ const HTTP_STREAM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Edge callbacks are control-plane acknowledgements, not long-lived streams.
 /// A peer that accepts bytes but never returns response headers must not stop
-/// the SSE consumer indefinitely. Server handlers are idempotent for an
+/// the SSE consumer indefinitely. The budget has to outlast one slow database
+/// transaction; 10 seconds was short enough for the client to disconnect before
+/// the acknowledgement returned. Server handlers are idempotent for an
 /// identical request, so one immediate transport retry is safe.
-const CONTROL_CALLBACK_TIMEOUT_SECS: u64 = 10;
+const CONTROL_CALLBACK_TIMEOUT_SECS: u64 = 30;
 const CONTROL_CALLBACK_ATTEMPTS: usize = 2;
 const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 10;
 
