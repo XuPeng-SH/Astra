@@ -38,6 +38,7 @@ export type {
   ExplainAnalyzeAuxiliaryUsageV1,
   ExplainAnalyzeAuxiliaryCallV1,
   ExplainAnalyzeAuxiliaryDetailsV1,
+  ExplainAnalyzeDecisionDetailV1,
   ExplainAnalyzeAdmissionSettlementV1,
   ExplainAnalyzeRequestJudgmentFieldV1,
   ExplainAnalyzeRequestJudgmentResultV1,

@@ -116,6 +116,43 @@ pub struct DelegationIntentRequirement {
     pub strength: DelegationRequirementStrength,
 }
 
+/// Safe, bounded evidence for an exact delegated-model lookup that did not
+/// resolve to one eligible catalog entry. The count is scoped to the single
+/// authorized Chat-catalog snapshot used for that assessment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationCatalogResolutionFailure {
+    /// Zero-based position in the extracted, bounded requirement list.
+    pub requirement_index: u32,
+    /// Eligible exact matches in the already-loaded catalog snapshot.
+    pub match_count: u32,
+}
+
+impl DelegationCatalogResolutionFailure {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.requirement_index >= 16 || self.match_count == 1 {
+            return Err("delegation catalog resolution failure is invalid");
+        }
+        Ok(())
+    }
+
+    /// A user-safe explanation derived only from typed counts, never from the
+    /// extracted quote, provider response, or catalog rows.
+    pub fn safe_message(&self) -> String {
+        let requirement = self.requirement_index.saturating_add(1);
+        if self.match_count == 0 {
+            format!(
+                "No active authorized Chat-capable model exactly matched delegated model requirement {requirement} in the current catalog snapshot; no child was started."
+            )
+        } else {
+            format!(
+                "{} active authorized Chat-capable catalog entries exactly matched delegated model requirement {requirement}; selection is ambiguous, so no child was started.",
+                self.match_count
+            )
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DelegationIntentRequirements {
@@ -133,6 +170,10 @@ pub enum DelegationIntentRequirements {
         reason: String,
         attempts: u8,
     },
+    CatalogResolutionFailed {
+        source: DelegationUserRequirementSource,
+        failure: DelegationCatalogResolutionFailure,
+    },
     Requirements {
         source: DelegationUserRequirementSource,
         requirements: Vec<DelegationIntentRequirement>,
@@ -146,6 +187,7 @@ impl DelegationIntentRequirements {
             Self::Unconstrained { source }
             | Self::Unresolved { source, .. }
             | Self::Unavailable { source, .. }
+            | Self::CatalogResolutionFailed { source, .. }
             | Self::Requirements { source, .. } => source,
         };
         if source.user_id.trim().is_empty()
@@ -163,6 +205,7 @@ impl DelegationIntentRequirements {
             } if reason.trim().is_empty() || !(1..=2).contains(attempts) => {
                 Err("unavailable delegation assessment has invalid retry state")
             }
+            Self::CatalogResolutionFailed { failure, .. } => failure.validate(),
             Self::Requirements { requirements, .. } => {
                 if requirements.is_empty() || requirements.len() > 16 {
                     return Err("delegation requirement set has invalid size");
@@ -251,6 +294,7 @@ impl DelegationModelAdmission {
                 DelegationIntentRequirements::Unconstrained { source }
                 | DelegationIntentRequirements::Unresolved { source, .. }
                 | DelegationIntentRequirements::Unavailable { source, .. }
+                | DelegationIntentRequirements::CatalogResolutionFailed { source, .. }
                 | DelegationIntentRequirements::Requirements { source, .. } => Some(source),
             };
             if origin.is_some_and(|origin| {
@@ -411,5 +455,44 @@ mod tests {
             requirements: Vec::new(),
         };
         assert!(malformed.for_child_descendants().is_err());
+    }
+
+    #[test]
+    fn catalog_resolution_failure_is_bounded_and_survives_durable_encoding() {
+        let failure = DelegationIntentRequirements::CatalogResolutionFailed {
+            source: DelegationUserRequirementSource {
+                user_id: "user".into(),
+                session_id: "session".into(),
+                session_turn: 4,
+                applied_intent_id: None,
+                user_intent_digest: "digest".into(),
+            },
+            failure: DelegationCatalogResolutionFailure {
+                requirement_index: 2,
+                match_count: 3,
+            },
+        };
+        failure.validate().unwrap();
+        assert_eq!(failure.for_child_descendants().unwrap(), failure);
+        let encoded = serde_json::to_value(&failure).unwrap();
+        let restored: DelegationIntentRequirements = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, failure);
+
+        for (requirement_index, match_count) in [(16, 0), (0, 1)] {
+            let invalid = DelegationIntentRequirements::CatalogResolutionFailed {
+                source: DelegationUserRequirementSource {
+                    user_id: "user".into(),
+                    session_id: "session".into(),
+                    session_turn: 4,
+                    applied_intent_id: None,
+                    user_intent_digest: "digest".into(),
+                },
+                failure: DelegationCatalogResolutionFailure {
+                    requirement_index,
+                    match_count,
+                },
+            };
+            assert!(invalid.validate().is_err());
+        }
     }
 }

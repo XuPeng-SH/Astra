@@ -134,14 +134,6 @@ pub enum DelegationRequirementDisposition {
     Unresolved,
 }
 
-fn resolve_model_selection(
-    name: Option<&str>,
-    qualifier: Option<&str>,
-    catalog: &[ModelListItem],
-) -> Result<Option<ModelSelection>, String> {
-    resolve_catalog_model_selection(name, qualifier, catalog, true)
-}
-
 fn resolve_configured_model_name(
     name: &str,
     source: Option<&str>,
@@ -157,27 +149,44 @@ fn resolve_catalog_model_selection(
     catalog: &[ModelListItem],
     include_offering_id: bool,
 ) -> Result<Option<ModelSelection>, String> {
-    let Some(name) = name else { return Ok(None) };
-    let matches = catalog
-        .iter()
-        .filter(|item| {
-            item.is_active
-                && astra_core::model_wire::purpose::ModelRequestPurpose::Chat
-                    .supported_by(&item.provider)
-                && (item.name.eq_ignore_ascii_case(name)
-                    || (include_offering_id && item.offering_id == name))
-                && qualifier.is_none_or(|qualifier| {
-                    item.provider.eq_ignore_ascii_case(qualifier)
-                        || item.access_label.eq_ignore_ascii_case(qualifier)
-                })
+    resolve_catalog_model_selection_with_count(name, qualifier, catalog, include_offering_id)
+        .map_err(|match_count| match match_count {
+            0 => "requested model is unavailable or inaccessible".into(),
+            _ => "requested model matches multiple authorized sources".into(),
         })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [item] => Ok(Some(ModelSelection {
-            offering_id: item.offering_id.clone(),
-        })),
-        [] => Err("requested model is unavailable or inaccessible".into()),
-        _ => Err("requested model matches multiple authorized sources".into()),
+}
+
+fn resolve_catalog_model_selection_with_count(
+    name: Option<&str>,
+    qualifier: Option<&str>,
+    catalog: &[ModelListItem],
+    include_offering_id: bool,
+) -> Result<Option<ModelSelection>, u32> {
+    let Some(name) = name else { return Ok(None) };
+    let mut selected = None;
+    let mut match_count = 0u32;
+    for item in catalog.iter().filter(|item| {
+        item.is_active
+            && astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+                .supported_by(&item.provider)
+            && (item.name.eq_ignore_ascii_case(name)
+                || (include_offering_id && item.offering_id == name))
+            && qualifier.is_none_or(|qualifier| {
+                item.provider.eq_ignore_ascii_case(qualifier)
+                    || item.access_label.eq_ignore_ascii_case(qualifier)
+            })
+    }) {
+        match_count = match_count.saturating_add(1);
+        if match_count == 1 {
+            selected = Some(ModelSelection {
+                offering_id: item.offering_id.clone(),
+            });
+        }
+    }
+    match (match_count, selected) {
+        (0, _) => Err(0),
+        (1, Some(selection)) => Ok(Some(selection)),
+        (count, _) => Err(count),
     }
 }
 
@@ -215,19 +224,28 @@ pub fn resolve_model_selectors(
 pub fn resolve_delegation_intent_requirements<'a>(
     extracted: &'a ExtractedIntentRequirements,
     catalog: &[ModelListItem],
-) -> Result<Vec<(Option<ModelSelection>, &'a ExtractedIntentRequirement)>, String> {
+) -> Result<
+    Vec<(Option<ModelSelection>, &'a ExtractedIntentRequirement)>,
+    astra_turn_types::DelegationCatalogResolutionFailure,
+> {
     extracted
         .requirements
         .iter()
-        .map(|requirement| {
-            Ok((
-                resolve_model_selection(
-                    requirement.model_quote.as_deref(),
-                    requirement.source_qualifier_quote.as_deref(),
-                    catalog,
-                )?,
-                requirement,
-            ))
+        .enumerate()
+        .map(|(requirement_index, requirement)| {
+            let selection = resolve_catalog_model_selection_with_count(
+                requirement.model_quote.as_deref(),
+                requirement.source_qualifier_quote.as_deref(),
+                catalog,
+                true,
+            )
+            .map_err(|match_count| {
+                astra_turn_types::DelegationCatalogResolutionFailure {
+                    requirement_index: requirement_index as u32,
+                    match_count,
+                }
+            })?;
+            Ok((selection, requirement))
         })
         .collect()
 }
@@ -408,16 +426,46 @@ mod tests {
                 .offering_id,
             "offer-a"
         );
-        assert!(resolve_delegation_intent_requirements(&parsed, &[]).is_err());
-        assert!(
-            resolve_delegation_intent_requirements(
-                &parsed,
-                &[offered("B", "typesafe", "judgment-only")]
-            )
-            .is_err()
-        );
+        let no_match = resolve_delegation_intent_requirements(&parsed, &[]).unwrap_err();
+        assert_eq!(no_match.requirement_index, 0);
+        assert_eq!(no_match.match_count, 0);
+        let unsupported = resolve_delegation_intent_requirements(
+            &parsed,
+            &[offered("B", "typesafe", "judgment-only")],
+        )
+        .unwrap_err();
+        assert_eq!(unsupported.requirement_index, 0);
+        assert_eq!(unsupported.match_count, 0);
         let two = vec![one[0].clone(), offered("B", "provider-b", "offer-b")];
-        assert!(resolve_delegation_intent_requirements(&parsed, &two).is_err());
+        let ambiguous = resolve_delegation_intent_requirements(&parsed, &two).unwrap_err();
+        assert_eq!(ambiguous.requirement_index, 0);
+        assert_eq!(ambiguous.match_count, 2);
+        let three = vec![
+            two[0].clone(),
+            two[1].clone(),
+            offered("B", "provider-c", "offer-c"),
+        ];
+        assert_eq!(
+            resolve_delegation_intent_requirements(&parsed, &three)
+                .unwrap_err()
+                .match_count,
+            3
+        );
+
+        let later_source = "Use A and B";
+        let later = json!({"disposition":"resolved","requirements":[
+            {"model_quote":"A","source_qualifier_quote":null,"reasoning_quote":null,"reasoning":null,"task_scope_quote":null,"propagation":"direct_children","strength":"hard"},
+            {"model_quote":"B","source_qualifier_quote":null,"reasoning_quote":null,"reasoning":null,"task_scope_quote":null,"propagation":"direct_children","strength":"hard"}
+        ],"unresolved":[]});
+        let later =
+            parse_delegation_intent_requirements(&later.to_string(), later_source, true).unwrap();
+        let later_failure = resolve_delegation_intent_requirements(
+            &later,
+            &[offered("A", "provider-a", "offer-a")],
+        )
+        .unwrap_err();
+        assert_eq!(later_failure.requirement_index, 1);
+        assert_eq!(later_failure.match_count, 0);
     }
 
     #[test]
