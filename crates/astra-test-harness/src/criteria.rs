@@ -5055,6 +5055,7 @@ mod tests {
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 0,
             turn_rounds: 0,
             cache_hits: 0,

@@ -233,11 +233,10 @@ pub fn resolve_delegation_intent_requirements<'a>(
         .iter()
         .enumerate()
         .map(|(requirement_index, requirement)| {
-            let selection = resolve_catalog_model_selection_with_count(
+            let selection = resolve_natural_language_model_quote(
                 requirement.model_quote.as_deref(),
                 requirement.source_qualifier_quote.as_deref(),
                 catalog,
-                true,
             )
             .map_err(|match_count| {
                 astra_turn_types::DelegationCatalogResolutionFailure {
@@ -248,6 +247,34 @@ pub fn resolve_delegation_intent_requirements<'a>(
             Ok((selection, requirement))
         })
         .collect()
+}
+
+/// Resolve an extracted natural-language model identity exactly first. If
+/// that identity has no match, tolerate one sentence-ending period that the
+/// extractor may have included in its quote. This is intentionally separate
+/// from explicit selector resolution and never weakens uniqueness, source,
+/// activity, or Chat-purpose checks.
+fn resolve_natural_language_model_quote(
+    name: Option<&str>,
+    qualifier: Option<&str>,
+    catalog: &[ModelListItem],
+) -> Result<Option<ModelSelection>, u32> {
+    let exact = resolve_catalog_model_selection_with_count(name, qualifier, catalog, true);
+    match exact {
+        Err(0) => {
+            let Some(normalized) = name.and_then(strip_one_sentence_ending) else {
+                return Err(0);
+            };
+            resolve_catalog_model_selection_with_count(Some(normalized), qualifier, catalog, true)
+        }
+        result => result,
+    }
+}
+
+fn strip_one_sentence_ending(name: &str) -> Option<&str> {
+    let normalized = name.strip_suffix('.').or_else(|| name.strip_suffix('。'))?;
+    (!normalized.is_empty() && !normalized.ends_with('.') && !normalized.ends_with('。'))
+        .then_some(normalized)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -362,6 +389,27 @@ mod tests {
         }
     }
 
+    fn extracted_model(
+        source: &str,
+        model_quote: &str,
+        source_qualifier_quote: Option<&str>,
+    ) -> ExtractedIntentRequirements {
+        let raw = json!({
+            "disposition": "resolved",
+            "requirements": [{
+                "model_quote": model_quote,
+                "source_qualifier_quote": source_qualifier_quote,
+                "reasoning_quote": null,
+                "reasoning": null,
+                "task_scope_quote": null,
+                "propagation": "direct_children",
+                "strength": "hard"
+            }],
+            "unresolved": []
+        });
+        parse_delegation_intent_requirements(&raw.to_string(), source, true).unwrap()
+    }
+
     #[test]
     fn intent_prompt_keeps_natural_language_requirement_separate_from_selector_shape() {
         let source =
@@ -466,6 +514,116 @@ mod tests {
         .unwrap_err();
         assert_eq!(later_failure.requirement_index, 1);
         assert_eq!(later_failure.match_count, 0);
+    }
+
+    #[test]
+    fn natural_language_model_resolution_tolerates_one_terminal_sentence_period() {
+        for ending in [".", "。"] {
+            let quote = format!("foo{ending}");
+            let source = format!("Use {quote}");
+            let parsed = extracted_model(&source, &quote, None);
+            let resolved = resolve_delegation_intent_requirements(
+                &parsed,
+                &[offered("foo", "provider-a", "offer-foo")],
+            )
+            .unwrap();
+
+            assert_eq!(resolved[0].0.as_ref().unwrap().offering_id, "offer-foo");
+            assert_eq!(
+                parsed.requirements[0].model_quote.as_deref(),
+                Some(quote.as_str()),
+                "normalization must not rewrite the extracted user evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn natural_language_model_resolution_is_exact_first_and_fail_closed() {
+        let quote = "foo.";
+        let parsed = extracted_model("Use foo.", quote, None);
+        let exact_and_normalized = vec![
+            offered("foo.", "provider-dot", "offer-with-period"),
+            offered("foo", "provider-plain", "offer-without-period"),
+        ];
+        assert_eq!(
+            resolve_delegation_intent_requirements(&parsed, &exact_and_normalized).unwrap()[0]
+                .0
+                .as_ref()
+                .unwrap()
+                .offering_id,
+            "offer-with-period"
+        );
+
+        let exact_ambiguous = vec![
+            offered("foo.", "provider-a", "offer-a"),
+            offered("foo.", "provider-b", "offer-b"),
+            offered("foo", "provider-c", "offer-c"),
+        ];
+        assert_eq!(
+            resolve_delegation_intent_requirements(&parsed, &exact_ambiguous)
+                .unwrap_err()
+                .match_count,
+            2,
+            "an ambiguous exact match must not fall back to a normalized identity"
+        );
+
+        let normalized_ambiguous = vec![
+            offered("foo", "provider-a", "offer-a"),
+            offered("foo", "provider-b", "offer-b"),
+        ];
+        assert_eq!(
+            resolve_delegation_intent_requirements(&parsed, &normalized_ambiguous)
+                .unwrap_err()
+                .match_count,
+            2
+        );
+
+        let repeated_period = extracted_model("Use foo..", "foo..", None);
+        assert_eq!(
+            resolve_delegation_intent_requirements(
+                &repeated_period,
+                &[offered("foo", "provider-a", "offer-a")]
+            )
+            .unwrap_err()
+            .match_count,
+            0,
+            "continuous sentence-ending periods are not normalized"
+        );
+    }
+
+    #[test]
+    fn natural_language_model_resolution_preserves_qualifiers_and_explicit_selectors() {
+        let parsed = extracted_model("Use foo. from provider-b", "foo.", Some("provider-b"));
+        let catalog = vec![
+            offered("foo", "provider-a", "offer-a"),
+            offered("foo", "provider-b", "offer-b"),
+        ];
+        assert_eq!(
+            resolve_delegation_intent_requirements(&parsed, &catalog).unwrap()[0]
+                .0
+                .as_ref()
+                .unwrap()
+                .offering_id,
+            "offer-b"
+        );
+
+        let wrong_qualifier =
+            extracted_model("Use foo. from provider-c", "foo.", Some("provider-c"));
+        assert_eq!(
+            resolve_delegation_intent_requirements(&wrong_qualifier, &catalog)
+                .unwrap_err()
+                .match_count,
+            0,
+            "fallback must not discard a source qualifier"
+        );
+
+        let explicit = ModelSelector::ConfiguredName {
+            model_name: "foo.".into(),
+            source: None,
+        };
+        assert!(
+            resolve_model_selector(&explicit, &[offered("foo", "provider-a", "offer-a")]).is_err()
+        );
     }
 
     #[test]
