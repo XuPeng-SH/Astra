@@ -118,10 +118,10 @@ pub(crate) fn report_admission_rejection(
             state.pending_recovery = Some(owner.to_string());
         }
         let mut message = admission_rejection_message(draft_restored, true);
-        if owner.is_some() {
-            message.push_str("  To continue existing work, run /resume and choose the session.\n");
-        }
-        message.push_str("  Retry after the current work settles, or use another worktree.\n");
+        message.push_str(&workspace_claim_guidance(
+            owner,
+            workspace_recovery_action(metadata),
+        ));
         message.push_str("  No model or tool ran.");
         ui.show_error(&message);
         return;
@@ -129,6 +129,40 @@ pub(crate) fn report_admission_rejection(
     let mut message = admission_rejection_message(draft_restored, false);
     message.push_str("  No model or tool ran.");
     ui.show_error(&message);
+}
+
+fn workspace_recovery_action(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    let action = metadata
+        .and_then(|value| value.get("recovery_action"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|action| !action.is_empty());
+    if action.is_some() {
+        return action;
+    }
+    match metadata
+        .and_then(|value| value.get("workspace_blocker"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("execution_slot" | "active_run") => Some("wait_or_cancel_session"),
+        Some("writer_or_reservation" | "claim_changed") => Some("retry_session"),
+        Some(
+            "settlement_pending" | "binding_not_ready" | "unresolved_tool" | "owner_unavailable",
+        ) => Some("inspect_session"),
+        _ => None,
+    }
+}
+
+fn workspace_claim_guidance(owner: Option<&str>, recovery_action: Option<&str>) -> String {
+    let owner = owner.unwrap_or("the previous session");
+    match recovery_action {
+        Some("wait_or_cancel_session") => format!(
+            "  Session {owner} still holds this directory.\n  Wait for it to finish, or stop it with `astra session cancel {owner}` and retry.\n  Use another worktree for concurrent work.\n"
+        ),
+        Some("retry_session") => "  A conversation write is still settling. Retry this message; do not cancel the session.\n".to_string(),
+        _ => format!(
+            "  Session {owner} still has unfinished execution state.\n  Inspect it with `astra session show {owner}` before retrying.\n  Use another worktree for concurrent work.\n"
+        ),
+    }
 }
 
 fn admission_rejection_message(draft_restored: bool, workspace_claimed: bool) -> String {
@@ -159,9 +193,12 @@ async fn reconcile_failure_accounting(
         return;
     };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Do not call fresh_access_token here. Its refresh writes auth.json and
+    // outlives this 5s deadline only when settlement is detached; starting it
+    // from a best-effort read is unnecessary and used to cancel mid-rotation.
     let Some(token) = await_failure_reconciliation_before_deadline(
         deadline,
-        crate::cli::session::session_runtime::fresh_access_token(api, profile),
+        crate::cli::session::session_runtime::access_token_without_refresh(profile),
     )
     .await
     .flatten() else {
@@ -182,8 +219,11 @@ async fn reconcile_failure_accounting(
             return;
         }
         let request_timeout = remaining.min(std::time::Duration::from_secs(1));
-        if let Ok(Ok(run)) =
-            tokio::time::timeout(request_timeout, api.get_run(Some(&token), &run_id)).await
+        if let Ok(Ok(run)) = tokio::time::timeout(
+            request_timeout,
+            api.get_run_with_presented_bearer(&token, &run_id),
+        )
+        .await
             && run
                 .get("accounting")
                 .is_some_and(|accounting| apply_durable_run_accounting(partial, accounting))
@@ -394,7 +434,7 @@ mod tests {
     use super::{
         admission_rejection_message, apply_durable_run_accounting,
         await_failure_reconciliation_before_deadline, reconcile_and_report_turn_failure,
-        report_admission_rejection, report_turn_failure,
+        reconcile_failure_accounting, report_admission_rejection, report_turn_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tests::heavy_checkpoint_with_runtime_state;
@@ -551,6 +591,83 @@ mod tests {
         assert_eq!(outcomes.requested, 4);
         assert_eq!(outcomes.executed, 3);
         assert_eq!(outcomes.rejected, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failure_accounting_uses_presented_native_token_without_refresh() {
+        use astra_credentials::native::{Environment, NativeSession, NativeStore, unix_now};
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let origin = server.uri();
+        let issuer = format!("{origin}/realms/moi");
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = NativeStore::with_directory(directory.path().to_path_buf());
+        let saved = store.clone();
+        let session = NativeSession {
+            environment: Environment {
+                issuer: issuer.clone(),
+                astra_url: origin.clone(),
+                moi_url: origin.clone(),
+                authorization_endpoint: format!("{origin}/api/v1/uc/oauth2/authorize"),
+                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            },
+            generation: "replaced-on-publish".into(),
+            subject: "subject-a".into(),
+            session_id: "sid-a".into(),
+            astra_user_id: "astra-a".into(),
+            moi_principal_id: "moi-a".into(),
+            catalog_user_id: "catalog-a".into(),
+            access_token: "presented-access-token".into(),
+            refresh_token: "refresh-must-not-be-sent".into(),
+            expires_at: unix_now().unwrap() + 30,
+            workspace_id: None,
+            role_id: None,
+            refresh_pending: false,
+        };
+        let (published, _) = store.publish(session).unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, published);
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        Mock::given(method("POST"))
+            .and(path("/realms/moi/protocol/openid-connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-accounting"))
+            .and(header("authorization", "Bearer presented-access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accounting": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 4,
+                    "cache_read_tokens": 2,
+                    "cache_creation_tokens": 1
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&origin, None)
+            .unwrap()
+            .with_bearer_provider(binding);
+        let mut partial = crate::PartialTurnData {
+            run_id: Some("run-accounting".into()),
+            ..Default::default()
+        };
+        reconcile_failure_accounting(&api, None, &mut partial).await;
+        assert_eq!(partial.prompt_tokens, 11);
+        assert_eq!(partial.completion_tokens, 4);
+        let current = saved.current().unwrap();
+        assert!(!current.refresh_pending);
+        assert_eq!(current.refresh_token, "refresh-must-not-be-sent");
+        assert_eq!(current.access_token, "presented-access-token");
     }
 
     #[test]
@@ -880,6 +997,46 @@ mod tests {
         assert!(shown.contains("do not cancel"));
         assert!(!shown.contains("astra session cancel"));
         assert!(!shown.contains("astra --resume"));
+    }
+
+    #[test]
+    fn workspace_claim_guidance_follows_the_server_recovery_action() {
+        for (action, expected, forbidden) in [
+            (
+                "wait_or_cancel_session",
+                "astra session cancel owner-session",
+                "/resume",
+            ),
+            ("retry_session", "do not cancel the session", "/resume"),
+            (
+                "inspect_session",
+                "astra session show owner-session",
+                "/resume",
+            ),
+        ] {
+            let mut state = SessionState::default();
+            let failure = crate::TurnFailure {
+                error: "workspace is busy".into(),
+                partial: crate::PartialTurnData {
+                    error_code: Some("execution_workspace_claimed".into()),
+                    error_metadata: Some(serde_json::json!({
+                        "admission_state": "rejected",
+                        "recovery_action": action,
+                        "workspace_blocker": "execution_slot",
+                        "owner_session_id": "owner-session"
+                    })),
+                    admission_rejected: true,
+                    ..Default::default()
+                },
+            };
+            let mut ui = crate::tests::TestUi::default();
+            report_admission_rejection(&mut state, "draft", &failure, &mut ui);
+            let shown = ui.errors.join("\n");
+            assert!(shown.contains("Workspace is already in use"), "{shown}");
+            assert!(shown.contains(expected), "{action}: {shown}");
+            assert!(!shown.contains(forbidden), "{action}: {shown}");
+            assert_eq!(ui.restored_inputs, vec!["draft"]);
+        }
     }
 
     #[test]

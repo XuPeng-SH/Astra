@@ -1935,6 +1935,23 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// Best-effort read that already holds a still-valid token. The installed
+    /// bearer provider is not consulted, so this cannot start a native rotation.
+    pub async fn get_run_with_presented_bearer(
+        &self,
+        bearer: &str,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(bearer)?)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
     /// Request a policy for the next model round; acceptance is not application.
     pub async fn request_run_permission_mode(
         &self,

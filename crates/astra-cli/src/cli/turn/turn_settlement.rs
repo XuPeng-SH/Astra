@@ -248,7 +248,8 @@ mod tests {
         assert!(state.last_turn_event.is_none());
         assert_eq!(ui.errors.len(), 1);
         assert!(ui.errors[0].contains("Workspace is already in use"));
-        assert!(ui.errors[0].contains("/resume"));
+        assert!(ui.errors[0].contains("astra session show session-owner"));
+        assert!(!ui.errors[0].contains("/resume"));
         assert!(ui.errors[0].contains("No model or tool ran"));
         assert_eq!(ui.restored_inputs, vec!["hi"]);
     }

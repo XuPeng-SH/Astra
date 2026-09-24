@@ -11,6 +11,30 @@ pub(crate) struct Binding {
 
 static ACTIVE: RwLock<Option<Arc<Binding>>> = RwLock::new(None);
 
+#[cfg(test)]
+pub(crate) fn binding_for_test(store: NativeStore, session: native::NativeSession) -> Arc<Binding> {
+    Arc::new(Binding { store, session })
+}
+
+#[cfg(test)]
+pub(crate) struct ActiveBindingGuard(Option<Arc<Binding>>);
+
+#[cfg(test)]
+impl Drop for ActiveBindingGuard {
+    fn drop(&mut self) {
+        *ACTIVE.write().expect("native identity lock poisoned") = self.0.take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_active_for_test(binding: Arc<Binding>) -> ActiveBindingGuard {
+    let previous = ACTIVE
+        .write()
+        .expect("native identity lock poisoned")
+        .replace(binding);
+    ActiveBindingGuard(previous)
+}
+
 pub(crate) fn active() -> Option<Arc<Binding>> {
     ACTIVE
         .read()
@@ -45,7 +69,20 @@ impl Binding {
         Ok(current)
     }
 
-    pub(crate) async fn access_token(&self) -> Result<String, String> {
+    /// Same identity check as [`snapshot`], without failing when a rotation is pending.
+    /// The file lock runs on the blocking pool.
+    pub(crate) async fn snapshot_off_runtime(&self) -> Result<native::NativeSession, String> {
+        let current = self.store.current_off_runtime().await?;
+        if current.generation != self.session.generation
+            || current.environment != self.session.environment
+            || current.subject != self.session.subject
+        {
+            return Err("MOI account or environment changed; restart Astra".into());
+        }
+        Ok(current)
+    }
+
+    pub(crate) async fn access_token(&self) -> Result<String, native::CredentialFailure> {
         let credential = self
             .store
             .credential("astra", Some(&self.session.generation))
@@ -54,7 +91,7 @@ impl Binding {
             || credential.subject != self.session.subject
             || credential.environment != self.session.environment.key()
         {
-            return Err("MOI account or environment changed; restart Astra".into());
+            return Err(native::CredentialFailure::AccountChanged);
         }
         Ok(credential.access_token)
     }
@@ -71,9 +108,9 @@ impl astra_thin_client::client::BearerProvider for Binding {
         >,
     > {
         Box::pin(async {
-            self.access_token()
-                .await
-                .map_err(astra_thin_client::ThinClientError::InvalidInput)
+            self.access_token().await.map_err(|error| {
+                astra_thin_client::ThinClientError::InvalidInput(error.to_string())
+            })
         })
     }
 }

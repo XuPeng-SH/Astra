@@ -333,6 +333,7 @@ pub(crate) async fn handle_chat_input(
     handle_chat_input_with_ui(
         line,
         current_token,
+        crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
         state,
         ctx,
         &mut crate::cli::ui_adapter::LineUiAdapter,
@@ -344,6 +345,7 @@ pub(crate) async fn handle_chat_input(
 pub(crate) async fn handle_chat_input_with_ui(
     line: String,
     current_token: Option<&str>,
+    missing_access: crate::cli::session::session_runtime::AccessMiss,
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
@@ -383,7 +385,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     let token = match current_token {
         Some(token) => token,
         None => {
-            ui.show_warning("  Not logged in. Use /login to authenticate.");
+            ui.show_warning(missing_access.user_warning());
             let _ = ui.restore_input(&line, state.session_id.as_deref());
             return Ok(InteractiveTurnOutcome::NotStarted);
         }
@@ -682,6 +684,7 @@ mod tests {
         let outcome = handle_chat_input_with_ui(
             "replayed follow-up".to_string(),
             None,
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
             &mut state,
             ctx,
             &mut ui,
@@ -814,9 +817,16 @@ mod tests {
         };
         let mut ui = crate::tests::TestUi::default();
 
-        handle_chat_input_with_ui("hello".to_string(), Some("token"), &mut state, ctx, &mut ui)
-            .await
-            .expect("a provider preflight failure is settled as a failed turn");
+        handle_chat_input_with_ui(
+            "hello".to_string(),
+            Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect("a provider preflight failure is settled as a failed turn");
 
         let followup_ctx = TurnContext {
             api: &api,
@@ -827,6 +837,7 @@ mod tests {
         handle_chat_input_with_ui(
             "hi".to_string(),
             Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
             &mut state,
             followup_ctx,
             &mut ui,
@@ -913,10 +924,16 @@ mod tests {
         };
         let mut ui = crate::tests::TestUi::default();
 
-        let error =
-            handle_chat_input_with_ui("hello".to_string(), Some("token"), &mut state, ctx, &mut ui)
-                .await
-                .expect_err("session creation must fail before turn admission");
+        let error = handle_chat_input_with_ui(
+            "hello".to_string(),
+            Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect_err("session creation must fail before turn admission");
 
         assert!(error.contains("503"), "{error}");
         assert_eq!(state.session_id, None);
@@ -951,6 +968,7 @@ mod tests {
         let error = handle_chat_input_with_ui(
             "do not execute".to_string(),
             Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
             &mut state,
             ctx,
             &mut ui,

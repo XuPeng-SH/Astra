@@ -8666,7 +8666,11 @@ pub(crate) async fn run_tui_session(
                                         // leave transcript, composer, resize, and interrupt input
                                         // responsive while the visible state remains `Sending`.
                                         let fut = async {
-                                            let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
+                                            let access = crate::cli::session::session_runtime::presented_access_token(api, profile).await;
+                                            let (token, missing_access) = match access {
+                                                Ok(token) => (Some(token), crate::cli::session::session_runtime::AccessMiss::NotLoggedIn),
+                                                Err(missing) => (None, missing),
+                                            };
                                             if runtime_notification_submission {
                                                 crate::cli::turn::turn_entry::handle_runtime_notifications_with_ui(
                                                     token.as_deref(),
@@ -8679,6 +8683,7 @@ pub(crate) async fn run_tui_session(
                                                 crate::cli::turn::turn_entry::handle_chat_input_with_ui(
                                                     submit_text,
                                                     token.as_deref(),
+                                                    missing_access,
                                                     &mut state,
                                                     ctx,
                                                     &mut tui_ui,
