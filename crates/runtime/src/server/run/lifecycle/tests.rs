@@ -20685,7 +20685,11 @@ async fn serial_edge_approvals_each_own_a_complete_wait_resume_lifecycle() {
             &sink,
             request_id,
             "read_file",
-            approved,
+            if approved {
+                crate::server::server_loop_host::EdgeApprovalSettlement::Allow
+            } else {
+                crate::server::server_loop_host::EdgeApprovalSettlement::Deny
+            },
             None,
         )
         .await
@@ -20722,6 +20726,97 @@ async fn serial_edge_approvals_each_own_a_complete_wait_resume_lifecycle() {
             .count(),
         2
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_edge_approval_timeout_is_not_recorded_as_denial() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("edge-approval-timeout", "user-1", "edge-timeout-session")
+        .await
+        .unwrap();
+    let sink = DurableHostInteractionSink {
+        run_engine: svc.run_engine.clone(),
+        user_id: "user-1".to_string(),
+        run_id: "edge-approval-timeout".to_string(),
+        session_id: "edge-timeout-session".to_string(),
+        agent_id: None,
+        event_tx: None,
+    };
+    crate::server::server_loop_host::HostInteractionSink::commit_approval_batch_and_deliver(
+        &sink,
+        json!({
+            "type": "approval_required",
+            "request_id": "bash-timeout",
+            "tool": "bash",
+            "approval_kind": "standard"
+        }),
+        -1,
+        0,
+    )
+    .await
+    .unwrap();
+    crate::server::server_loop_host::HostInteractionSink::begin_edge_approval_wait(
+        &sink,
+        "bash-timeout",
+        -1,
+        0,
+    )
+    .await
+    .unwrap();
+
+    let authority = crate::server::server_loop_host::HostInteractionSink::resolve_edge_approval(
+        &sink,
+        "bash-timeout",
+        "bash",
+        crate::server::server_loop_host::EdgeApprovalSettlement::Timeout,
+        Some("timed out waiting for edge POST /approval/respond (§5.5 ledger)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        authority,
+        crate::server::server_loop_host::EdgeApprovalSettlement::Timeout
+    );
+
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "edge-approval-timeout")
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved = durable
+        .events
+        .iter()
+        .find(|event| event["event_type"] == "approval_resolved")
+        .expect("timeout resolution");
+    assert_eq!(resolved["data"]["decision"], "timeout");
+    assert_eq!(resolved["data"]["outcome"], "timed_out");
+    assert_ne!(resolved["data"]["decision"], "deny");
+    assert_ne!(resolved["data"]["outcome"], "denied");
+
+    let replay = crate::server::server_loop_host::HostInteractionSink::resolve_edge_approval(
+        &sink,
+        "bash-timeout",
+        "bash",
+        crate::server::server_loop_host::EdgeApprovalSettlement::Allow,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay,
+        crate::server::server_loop_host::EdgeApprovalSettlement::Timeout,
+        "a later allow must not overwrite the recorded timeout"
+    );
+    crate::server::server_loop_host::HostInteractionSink::begin_edge_approval_wait(
+        &sink,
+        "bash-timeout",
+        -1,
+        0,
+    )
+    .await
+    .expect("a recorded timeout remains a settled approval across replay");
 }
 
 #[tokio::test(flavor = "current_thread")]

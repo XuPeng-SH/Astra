@@ -406,6 +406,64 @@ fn journal_decision_to_cloud_result(
     Some(result)
 }
 
+/// Terminal edge delivery for an explicit user denial.
+pub fn approval_denial_delivery(tc: &Value, reason: Option<&str>) -> EdgeToolRoundDelivery {
+    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+    let tool_name = tc
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    EdgeToolRoundDelivery {
+        sse_maps: vec![build_tool_call_end_event(
+            id,
+            Value::String(denied_tool_content(reason)),
+        )],
+        tool_messages: vec![json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": llm_safe_tool_content(&denied_tool_content(reason), tool_name),
+        })],
+        persist_tool_results: vec![persist_denied_tool_result(tc, reason)],
+        tool_results: vec![EdgeDeliveredToolResult {
+            execution_completion: None,
+            tool_call_id: id.to_string(),
+            ..terminal_tool_result("denied", "capability_denied", false)
+        }],
+    }
+}
+
+/// Terminal edge delivery for an approval deadline. This is not a user denial.
+pub fn approval_timeout_delivery(tc: &Value) -> EdgeToolRoundDelivery {
+    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+    let tool_name = tc
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    EdgeToolRoundDelivery {
+        sse_maps: vec![build_tool_call_end_event(
+            id,
+            Value::String(MSG_APPROVAL_LEDGER_TIMEOUT.to_string()),
+        )],
+        tool_messages: vec![json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": llm_safe_tool_content(MSG_APPROVAL_LEDGER_TIMEOUT, tool_name),
+        })],
+        persist_tool_results: vec![json!({
+            "tool_call_id": id,
+            "name": tool_name,
+            "result": MSG_APPROVAL_LEDGER_TIMEOUT,
+        })],
+        tool_results: vec![EdgeDeliveredToolResult {
+            execution_completion: None,
+            tool_call_id: id.to_string(),
+            ..terminal_tool_result("timed_out", "approval_timeout", false)
+        }],
+    }
+}
+
 /// After the bridge has yielded `build_approval_required_event`, waits on the approval ledger.
 /// `Ok(())` means allowed; `Err` is a finished tool round (denied / timeout / malformed).
 pub async fn wait_approval_ledger_for_tool(
@@ -548,44 +606,10 @@ async fn wait_approval_ledger_for_tool_with_journal_poll(
     }
 
     match approval_outcome {
-        CloudApprovalResult::Denied { reason } => Err(EdgeToolRoundDelivery {
-            sse_maps: vec![build_tool_call_end_event(
-                id,
-                Value::String(denied_tool_content(reason.as_deref())),
-            )],
-            tool_messages: vec![json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": llm_safe_tool_content(&denied_tool_content(reason.as_deref()), tool_name),
-            })],
-            persist_tool_results: vec![persist_denied_tool_result(tc, reason.as_deref())],
-            tool_results: vec![EdgeDeliveredToolResult {
-                execution_completion: None,
-                tool_call_id: id.to_string(),
-                ..terminal_tool_result("denied", "capability_denied", false)
-            }],
-        }),
-        CloudApprovalResult::Timeout => Err(EdgeToolRoundDelivery {
-            sse_maps: vec![build_tool_call_end_event(
-                id,
-                Value::String(MSG_APPROVAL_LEDGER_TIMEOUT.to_string()),
-            )],
-            tool_messages: vec![json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": llm_safe_tool_content(MSG_APPROVAL_LEDGER_TIMEOUT, tool_name),
-            })],
-            persist_tool_results: vec![json!({
-                "tool_call_id": id,
-                "name": tool_name,
-                "result": MSG_APPROVAL_LEDGER_TIMEOUT,
-            })],
-            tool_results: vec![EdgeDeliveredToolResult {
-                execution_completion: None,
-                tool_call_id: id.to_string(),
-                ..terminal_tool_result("timed_out", "approval_timeout", false)
-            }],
-        }),
+        CloudApprovalResult::Denied { reason } => {
+            Err(approval_denial_delivery(tc, reason.as_deref()))
+        }
+        CloudApprovalResult::Timeout => Err(approval_timeout_delivery(tc)),
         CloudApprovalResult::Malformed => Err(EdgeToolRoundDelivery {
             sse_maps: vec![build_tool_call_end_event(
                 id,

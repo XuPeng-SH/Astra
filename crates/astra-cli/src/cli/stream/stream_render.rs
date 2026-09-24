@@ -1475,6 +1475,64 @@ pub(crate) fn edge_callback_detach_message(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedApprovalDecision {
+    Allow,
+    AllowSession,
+    Deny,
+    Timeout,
+}
+
+impl RecordedApprovalDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::AllowSession => "allow_session",
+            Self::Deny => "deny",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Machine-readable conflict from `POST /approval/respond`. A recorded
+/// terminal decision is not a malformed lifecycle contract.
+fn recorded_approval_decision(
+    error: &astra_thin_client::ThinClientError,
+) -> Option<RecordedApprovalDecision> {
+    let astra_thin_client::ThinClientError::Api { status, body } = error else {
+        return None;
+    };
+    if *status != reqwest::StatusCode::CONFLICT {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("error_code").and_then(serde_json::Value::as_str)
+        != Some("approval_decision_already_recorded")
+    {
+        return None;
+    }
+    match value
+        .pointer("/metadata/decision")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("allow") => Some(RecordedApprovalDecision::Allow),
+        Some("allow_session") => Some(RecordedApprovalDecision::AllowSession),
+        Some("deny") => Some(RecordedApprovalDecision::Deny),
+        Some("timeout") => Some(RecordedApprovalDecision::Timeout),
+        _ => None,
+    }
+}
+
+fn durable_allow_was_acknowledged(result: &Result<(), PostApprovalError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(PostApprovalError::AlreadyRecorded(
+            RecordedApprovalDecision::Allow | RecordedApprovalDecision::AllowSession,
+        )) => true,
+        Err(_) => false,
+    }
+}
+
 fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra_core::ErrorKind {
     match error {
         astra_thin_client::ThinClientError::Api { status, .. }
@@ -1641,6 +1699,7 @@ enum PostApprovalError {
     AuthRefreshFailed,
     TerminalAuthFailure(String),
     RequestFailed(String),
+    AlreadyRecorded(RecordedApprovalDecision),
 }
 
 impl std::fmt::Display for PostApprovalError {
@@ -1648,6 +1707,13 @@ impl std::fmt::Display for PostApprovalError {
         match self {
             Self::AuthRefreshFailed => write!(f, "approval callback authentication failed"),
             Self::TerminalAuthFailure(error) | Self::RequestFailed(error) => f.write_str(error),
+            Self::AlreadyRecorded(decision) => {
+                write!(
+                    f,
+                    "approval_decision_already_recorded:{}",
+                    decision.as_str()
+                )
+            }
         }
     }
 }
@@ -1918,13 +1984,20 @@ impl<'a> CliSseStreamHost<'a> {
             .await;
         match result {
             Ok(_) => Ok(()),
+            Err(e) if recorded_approval_decision(&e).is_some() => {
+                Err(PostApprovalError::AlreadyRecorded(
+                    recorded_approval_decision(&e).expect("decision"),
+                ))
+            }
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
                 let retry = self
                     .api
                     .post_approval(Some(self.token.as_str()), body)
                     .await;
                 if let Err(ref retry_err) = retry {
-                    if self.handle_post_approval_error(&body.run_id, retry_err) {
+                    if let Some(decision) = recorded_approval_decision(retry_err) {
+                        Err(PostApprovalError::AlreadyRecorded(decision))
+                    } else if self.handle_post_approval_error(&body.run_id, retry_err) {
                         Err(PostApprovalError::TerminalAuthFailure(
                             retry_err.to_string(),
                         ))
@@ -5918,14 +5991,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             approval_kind: Some(approval_kind),
         };
         let post_result = self.post_approval_with_auth_retry(&body).await;
-        if allowed && post_result.is_ok() {
+        let acknowledged_allow = durable_allow_was_acknowledged(&post_result);
+        if allowed && acknowledged_allow {
             // Only an acknowledged durable approval can bypass the local
-            // permission check for a coalesced tool_request.
+            // permission check for a coalesced tool_request. A retry that
+            // learns the first allow was already recorded is that acknowledgement.
             self.cloud_pre_approved.insert(request_id.to_string());
         }
         EdgeApprovalResult {
             request_id: request_id.to_string(),
-            decision: if allowed && post_result.is_ok() {
+            decision: if allowed && acknowledged_allow {
                 "allow"
             } else {
                 "deny"
@@ -6016,7 +6091,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             };
             let post_result = if callback_delivery_open {
                 let result = self.post_approval_with_auth_retry(&body).await;
-                if result.is_err() || self.callback_failure.is_some() || self.auth_failure {
+                let settled = matches!(result, Err(PostApprovalError::AlreadyRecorded(_)));
+                if !settled
+                    && (result.is_err() || self.callback_failure.is_some() || self.auth_failure)
+                {
                     callback_delivery_open = false;
                 }
                 result
@@ -6025,12 +6103,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     "approval callback delivery stopped after an earlier failure".to_string(),
                 ))
             };
-            if allowed && post_result.is_ok() {
+            let acknowledged_allow = durable_allow_was_acknowledged(&post_result);
+            if allowed && acknowledged_allow {
                 self.cloud_pre_approved.insert(request.request_id.clone());
             }
             results.push(EdgeApprovalResult {
                 request_id: request.request_id.clone(),
-                decision: if allowed && post_result.is_ok() {
+                decision: if allowed && acknowledged_allow {
                     "allow"
                 } else {
                     "deny"
@@ -8989,18 +9068,20 @@ mod tests {
         ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
         DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeCallbackFailure, EdgeProviderRoundBoundary,
         EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry, EdgeToolCacheValidation,
-        EdgeToolExecResult, PostToolResultError, RenderPolicy, SseRenderEffect, StreamRenderState,
-        ToolBatchRequest, ToolOutputSummary, ToolOutputSummaryKind, ToolResultIdentity, TurnResult,
-        acquire_tool_permit_or_cancel, append_skill_loaded_marker, apply_edge_auth_failure_result,
+        EdgeToolExecResult, PostApprovalError, PostToolResultError, RecordedApprovalDecision,
+        RenderPolicy, SseRenderEffect, StreamRenderState, ToolBatchRequest, ToolOutputSummary,
+        ToolOutputSummaryKind, ToolResultIdentity, TurnResult, acquire_tool_permit_or_cancel,
+        append_skill_loaded_marker, apply_edge_auth_failure_result,
         apply_edge_callback_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
-        catch_tool_execution_panic, dispatch_turn_event_block, edge_callback_detach_message,
-        edge_callback_error_kind, edge_tool_is_cacheable_read, edge_tool_outcome_status,
-        execute_with_invocation_metadata_responsive, execute_with_metadata_responsive,
-        extract_cli_diff_block, file_content_sha256, finalize_cli_skill_execution,
-        format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
-        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
+        catch_tool_execution_panic, dispatch_turn_event_block, durable_allow_was_acknowledged,
+        edge_callback_detach_message, edge_callback_error_kind, edge_tool_is_cacheable_read,
+        edge_tool_outcome_status, execute_with_invocation_metadata_responsive,
+        execute_with_metadata_responsive, extract_cli_diff_block, file_content_sha256,
+        finalize_cli_skill_execution, format_terminal_tool_summary,
+        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
+        normalize_sandbox_denied_outcome, path_mtime_ms, recorded_approval_decision,
         request_token_usage_from_accum, reusable_speculative_output, sanitize_final_stream_text,
         server_context_window_policy_from_accum, server_tool_completion_id,
         server_tool_completion_is_authoritative, server_tool_completion_output,
@@ -9022,7 +9103,7 @@ mod tests {
     use serde_json::Value;
     use std::path::PathBuf;
     use tempfile::tempdir;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -10867,6 +10948,142 @@ mod tests {
         assert_eq!(
             edge_callback_error_kind(&error),
             astra_core::ErrorKind::ContractViolation
+        );
+    }
+
+    #[test]
+    fn recorded_approval_timeout_is_not_a_contract_violation() {
+        let error = astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"detail":"approval decision already recorded for request req run run as timeout","error_code":"approval_decision_already_recorded","metadata":{"decision":"timeout","outcome":"timed_out","request_id":"req","run_id":"run"}}"#.into(),
+        };
+
+        assert_eq!(
+            recorded_approval_decision(&error),
+            Some(RecordedApprovalDecision::Timeout)
+        );
+        assert_eq!(
+            recorded_approval_decision(&astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: r#"{"detail":"approval decision already recorded as deny"}"#.into(),
+            }),
+            None,
+            "a 409 without the recorded-decision code stays a lifecycle contract failure"
+        );
+        assert!(durable_allow_was_acknowledged(&Err(
+            PostApprovalError::AlreadyRecorded(RecordedApprovalDecision::Allow)
+        )));
+        assert!(durable_allow_was_acknowledged(&Err(
+            PostApprovalError::AlreadyRecorded(RecordedApprovalDecision::AllowSession)
+        )));
+        assert!(!durable_allow_was_acknowledged(&Err(
+            PostApprovalError::AlreadyRecorded(RecordedApprovalDecision::Timeout)
+        )));
+    }
+
+    #[tokio::test]
+    async fn recorded_timeout_keeps_later_approval_delivery_open() {
+        let timeout_body = r#"{"detail":"approval decision already recorded for request req-timeout run run-timeout as timeout","error_code":"approval_decision_already_recorded","metadata":{"decision":"timeout","outcome":"timed_out","request_id":"req-timeout","run_id":"run-timeout"}}"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approval/respond"))
+            .and(body_partial_json(
+                serde_json::json!({"request_id": "req-timeout"}),
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_string(timeout_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/approval/respond"))
+            .and(body_partial_json(
+                serde_json::json!({"request_id": "req-next"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: Some(&cancel),
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let requests = [
+            astra_turn_core::chat_turn_sse_dispatch::EdgeApprovalRequest {
+                session_id: Some("session-timeout".into()),
+                run_id: Some("run-timeout".into()),
+                request_id: "req-timeout".into(),
+                tool: "bash".into(),
+                approval_kind: astra_thin_client::ApprovalKind::Standard,
+                detail: None,
+                display_label: None,
+            },
+            astra_turn_core::chat_turn_sse_dispatch::EdgeApprovalRequest {
+                session_id: Some("session-timeout".into()),
+                run_id: Some("run-timeout".into()),
+                request_id: "req-next".into(),
+                tool: "bash".into(),
+                approval_kind: astra_thin_client::ApprovalKind::Standard,
+                detail: None,
+                display_label: None,
+            },
+        ];
+
+        let results = host
+            .resolve_approvals_batch(&requests, Some("session-timeout"), Some("run-timeout"))
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_id, "req-timeout");
+        assert_eq!(
+            results[0].reason.as_deref(),
+            Some("approval_decision_already_recorded:timeout"),
+            "the first callback must observe the recorded timeout, got {results:?}"
+        );
+        assert!(
+            host.callback_failure.is_none(),
+            "a recorded timeout is a settled decision, not a callback failure: {:?}",
+            host.callback_failure
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "a recorded timeout must not cancel the local stream"
+        );
+        let posted = server.received_requests().await.expect("requests");
+        assert_eq!(
+            posted.len(),
+            2,
+            "the approval after a recorded timeout must still be delivered"
+        );
+        assert_eq!(results[1].request_id, "req-next");
+        assert!(
+            results[1].reason.as_deref()
+                != Some("approval callback delivery stopped after an earlier failure"),
+            "later approval was detached after the recorded timeout: {results:?}"
         );
     }
 

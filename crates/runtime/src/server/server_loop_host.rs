@@ -4807,13 +4807,16 @@ pub(crate) trait HostInteractionSink: Send + Sync {
 
     /// Durably settle a client approval callback and release the run wait
     /// before a newly approved action may enter guarded admission.
+    ///
+    /// The returned settlement is the durable authority. A timeout or denial
+    /// already on record is not overwritten by a later local classification.
     async fn resolve_edge_approval(
         &self,
         _request_id: &str,
         _tool_name: &str,
-        _approved: bool,
+        _settlement: EdgeApprovalSettlement,
         _reason: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<EdgeApprovalSettlement, String> {
         Err("interaction sink cannot durably resolve Edge approvals".to_string())
     }
 
@@ -4880,10 +4883,47 @@ struct EdgeActionAdmissionContext {
     llm_round: u32,
 }
 
+/// Durable edge-approval outcome. Timeout is not a user denial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeApprovalSettlement {
+    Allow,
+    Deny,
+    Timeout,
+}
+
+impl EdgeApprovalSettlement {
+    pub(crate) fn decision(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    pub(crate) fn outcome(self) -> &'static str {
+        match self {
+            Self::Allow => "approved",
+            Self::Deny => "denied",
+            Self::Timeout => "timed_out",
+        }
+    }
+
+    pub(crate) fn from_recorded(decision: Option<&str>) -> Option<Self> {
+        match decision {
+            Some("allow" | "allow_session") => Some(Self::Allow),
+            Some("deny") => Some(Self::Deny),
+            Some("timeout") => Some(Self::Timeout),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 enum EdgeApprovalWait {
     Allowed,
     PermissionModeChanged,
     Denied(astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery),
+    TimedOut(astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery),
     Superseded,
     Cancelled,
     FailedClosed(String),
@@ -14836,7 +14876,7 @@ impl ServerAgenticLoopHost {
         let decision = data
             .get("decision")
             .and_then(Value::as_str)
-            .filter(|decision| matches!(*decision, "allow" | "allow_session" | "deny"))
+            .filter(|decision| matches!(*decision, "allow" | "allow_session" | "deny" | "timeout"))
             .ok_or_else(|| {
                 format!("shared approval resolution {request_id} has invalid decision")
             })?;
@@ -14896,6 +14936,11 @@ impl ServerAgenticLoopHost {
     ) -> EdgeApprovalWait {
         use astra_turn_core::cloud_tool_delivery::wait_approval_ledger_for_tool;
 
+        if entry.pointer("/body/decision").and_then(Value::as_str) == Some("timeout") {
+            return EdgeApprovalWait::TimedOut(
+                astra_turn_core::cloud_tool_delivery::approval_timeout_delivery(tool_call),
+            );
+        }
         let context = self.approval_audit_context.as_ref();
         let key = context
             .map(|context| {
@@ -14908,18 +14953,15 @@ impl ServerAgenticLoopHost {
             })
             .unwrap_or_default();
         let replay_ledger = Arc::new(tokio::sync::Mutex::new(HashMap::from([(key, entry)])));
-        match wait_approval_ledger_for_tool(
+        let replayed = wait_approval_ledger_for_tool(
             &replay_ledger,
             &self.user_id,
             tool_call,
             Duration::ZERO,
             context,
         )
-        .await
-        {
-            Ok(()) => EdgeApprovalWait::Allowed,
-            Err(denied) => EdgeApprovalWait::Denied(denied),
-        }
+        .await;
+        edge_approval_wait_from_ledger(replayed)
     }
 
     async fn wait_for_permission_mode_change(
@@ -14995,10 +15037,7 @@ impl ServerAgenticLoopHost {
                         .as_ref()
                         .is_some_and(|sink| sink.has_shared_edge_approval_authority())
                     {
-                        match local {
-                            Ok(()) => EdgeApprovalWait::Allowed,
-                            Err(denied) => EdgeApprovalWait::Denied(denied),
-                        }
+                        edge_approval_wait_from_ledger(local)
                     } else {
                         // A local callback is only a latency hint. Its final
                         // shared-authority read must remain inside the same
@@ -15025,8 +15064,8 @@ impl ServerAgenticLoopHost {
                                 Err(error) => EdgeApprovalWait::FailedClosed(error),
                             },
                             () = &mut approval_deadline => match local {
-                                Err(denied) if edge_tool_delivery_timed_out(&denied) => {
-                                    EdgeApprovalWait::Denied(denied)
+                                Err(delivery) if edge_tool_delivery_timed_out(&delivery) => {
+                                    EdgeApprovalWait::TimedOut(delivery)
                                 }
                                 _ => EdgeApprovalWait::FailedClosed(
                                     "shared durable approval resolution did not arrive before the approval deadline"
@@ -15108,7 +15147,12 @@ impl ServerAgenticLoopHost {
                 }
             }
             if let Err(error) = sink
-                .resolve_edge_approval(&request_id, &tool_name, false, Some(reason))
+                .resolve_edge_approval(
+                    &request_id,
+                    &tool_name,
+                    EdgeApprovalSettlement::Deny,
+                    Some(reason),
+                )
                 .await
             {
                 failures.push(format!("{request_id}: {error}"));
@@ -15128,15 +15172,139 @@ impl ServerAgenticLoopHost {
         &self,
         request_id: &str,
         tool_name: &str,
-        approved: bool,
+        settlement: EdgeApprovalSettlement,
         reason: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<EdgeApprovalSettlement, String> {
         let Some(sink) = self.interaction_sink.as_ref() else {
             // Direct in-process hosts have no durable run wait to release.
-            return Ok(());
+            return Ok(settlement);
         };
-        sink.resolve_edge_approval(request_id, tool_name, approved, reason)
+        sink.resolve_edge_approval(request_id, tool_name, settlement, reason)
             .await
+    }
+
+    /// Finish the approval wait only after the durable settlement is known.
+    /// A local timeout or denial is a latency observation; Explain Analyze must
+    /// publish the decision the resolver actually returned.
+    fn finish_reconciled_edge_approval_wait(
+        &mut self,
+        node_id: Option<&str>,
+        authority: &Result<EdgeApprovalSettlement, String>,
+    ) {
+        let Some(node_id) = node_id else {
+            return;
+        };
+        let outcome = match authority {
+            Ok(EdgeApprovalSettlement::Allow) => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved
+            }
+            Ok(EdgeApprovalSettlement::Deny) => astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected,
+            Ok(EdgeApprovalSettlement::Timeout) => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Blocked
+            }
+            Err(_) => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+        };
+        self.finish_explain_analyze_timed_node(node_id, outcome, Instant::now());
+    }
+
+    /// Reconcile a local denial or timeout with the durable settlement, publish
+    /// that settlement on the approval-wait trace, and record the tool result
+    /// the settlement authorizes.
+    async fn finish_unapproved_edge_approval<'a>(
+        &mut self,
+        tool_call: &'a Value,
+        request_id: &str,
+        tool_name: &str,
+        args: &Value,
+        requested: EdgeApprovalSettlement,
+        local: &astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery,
+        fallback_status: &str,
+        resolution_failure: &str,
+        approval_wait_node: Option<&str>,
+        executable_calls: &mut Vec<&'a Value>,
+        results_by_id: &mut std::collections::HashMap<
+            String,
+            astra_turn_core::sse_stream_host::EdgeToolExecResult,
+        >,
+        tool_calls: &[Value],
+        control: &mut crate::turn::agentic_loop::host::AdmittedToolCallControl,
+    ) {
+        use crate::turn::agentic_loop::host::AdmittedToolCallControl;
+
+        let fallback_output = match requested {
+            EdgeApprovalSettlement::Timeout => "approval deadline elapsed",
+            EdgeApprovalSettlement::Deny | EdgeApprovalSettlement::Allow => {
+                "approval request did not produce a terminal result"
+            }
+        };
+        let output = local
+            .raw_tool_output(0)
+            .unwrap_or(fallback_output)
+            .to_string();
+        let authority = self
+            .resolve_completed_edge_approval(request_id, tool_name, requested, Some(&output))
+            .await;
+        self.finish_reconciled_edge_approval_wait(approval_wait_node, &authority);
+        if matches!(authority, Ok(EdgeApprovalSettlement::Allow)) {
+            executable_calls.push(tool_call);
+            return;
+        }
+        let presentation = match authority.as_ref() {
+            Ok(settlement) => authoritative_unapproved_delivery(local, *settlement, tool_call),
+            Err(_) => local.clone(),
+        };
+        for map in &presentation.sse_maps {
+            self.emit_progress_event(Value::Object(map.clone()));
+        }
+        let resolution_error = authority.err();
+        let status = presentation
+            .tool_results
+            .first()
+            .map(|result| result.status.clone())
+            .unwrap_or_else(|| fallback_status.to_string());
+        let fields = presentation
+            .tool_results
+            .first()
+            .and_then(|result| result.tool_result_fields.clone());
+        let output = presentation
+            .raw_tool_output(0)
+            .unwrap_or(&output)
+            .to_string();
+        results_by_id.insert(
+            request_id.to_string(),
+            astra_turn_core::sse_stream_host::EdgeToolExecResult {
+                execution_completion: None,
+                tool_result_fields: Some(
+                    self.edge_result_fields_with_runtime(request_id, tool_name, args, fields),
+                ),
+                request_id: request_id.to_string(),
+                tool: tool_name.to_string(),
+                args: args.clone(),
+                output,
+                status,
+                duration_ms: 0,
+            },
+        );
+        let Some(error) = resolution_error else {
+            return;
+        };
+        let remaining = tool_calls
+            .iter()
+            .filter(|call| {
+                let (id, _, _) =
+                    astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(call);
+                !results_by_id.contains_key(&id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for result in self.edge_action_blocked_results(
+            &remaining,
+            "approval_resolution_failed",
+            &format!("{resolution_failure}: {error}"),
+        ) {
+            results_by_id.insert(result.request_id.clone(), result);
+        }
+        *control = AdmittedToolCallControl::FailedClosed;
     }
 
     fn edge_action_blocked_results(
@@ -15711,40 +15879,77 @@ impl ServerAgenticLoopHost {
                 let approval_result = self
                     .wait_edge_approval_or_guidance(action_context, tc, effective_approval_wait)
                     .await;
-                let wait_outcome = match &approval_result {
-                    EdgeApprovalWait::Allowed => {
-                        astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved
-                    }
-                    EdgeApprovalWait::Denied(_) => {
-                        astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected
-                    }
+                // Cancellation and supersession are terminal without a durable
+                // approval settlement. Allow, deny, and timeout stay open until
+                // resolve_completed_edge_approval returns the authoritative decision.
+                let local_wait_outcome = match &approval_result {
                     EdgeApprovalWait::Superseded
                     | EdgeApprovalWait::PermissionModeChanged
                     | EdgeApprovalWait::Cancelled => {
-                        astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+                        Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled)
                     }
                     EdgeApprovalWait::FailedClosed(_) => {
-                        astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+                        Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Failed)
                     }
+                    EdgeApprovalWait::Allowed
+                    | EdgeApprovalWait::Denied(_)
+                    | EdgeApprovalWait::TimedOut(_) => None,
                 };
-                if let Some(node_id) = approval_wait_node {
-                    self.finish_explain_analyze_timed_node(&node_id, wait_outcome, Instant::now());
+                if let Some(outcome) = local_wait_outcome
+                    && let Some(node_id) = approval_wait_node.as_deref()
+                {
+                    self.finish_explain_analyze_timed_node(node_id, outcome, Instant::now());
                 }
                 match approval_result {
                     EdgeApprovalWait::Allowed => {
-                        if let Err(error) = self
-                            .resolve_completed_edge_approval(&request_id, &tool_name, true, None)
-                            .await
-                        {
-                            let remaining = tool_calls
-                                .iter()
-                                .filter(|call| {
-                                    let (id, _, _) = parse_flat_tool_call_event(call);
-                                    !results_by_id.contains_key(&id)
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            for result in self.edge_action_blocked_results(
+                        let authority = self
+                            .resolve_completed_edge_approval(
+                                &request_id,
+                                &tool_name,
+                                EdgeApprovalSettlement::Allow,
+                                None,
+                            )
+                            .await;
+                        self.finish_reconciled_edge_approval_wait(
+                            approval_wait_node.as_deref(),
+                            &authority,
+                        );
+                        match authority {
+                            Ok(EdgeApprovalSettlement::Allow) => executable_calls.push(*tc),
+                            Ok(settlement) => {
+                                let (error_kind, reason) = match settlement {
+                                    EdgeApprovalSettlement::Timeout => (
+                                        "approval_timeout",
+                                        "approval deadline elapsed; the tool was not executed",
+                                    ),
+                                    EdgeApprovalSettlement::Deny
+                                    | EdgeApprovalSettlement::Allow => (
+                                        "capability_denied",
+                                        "approval was denied; the tool was not executed",
+                                    ),
+                                };
+                                let blocked_call = vec![(*tc).clone()];
+                                results_by_id.insert(
+                                    request_id.clone(),
+                                    self.edge_action_blocked_results(
+                                        &blocked_call,
+                                        error_kind,
+                                        reason,
+                                    )
+                                    .pop()
+                                    .expect("one blocked approval result"),
+                                );
+                            }
+                            Err(error) => {
+                                let remaining = tool_calls
+                                    .iter()
+                                    .filter(|call| {
+                                        let (id, _, _) = parse_flat_tool_call_event(call);
+                                        !results_by_id.contains_key(&id)
+                                    })
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for result in self.edge_action_blocked_results(
                                 &remaining,
                                 "approval_resolution_failed",
                                 &format!(
@@ -15753,71 +15958,50 @@ impl ServerAgenticLoopHost {
                             ) {
                                 results_by_id.insert(result.request_id.clone(), result);
                             }
-                            control = AdmittedToolCallControl::FailedClosed;
-                            break 'batches;
+                                control = AdmittedToolCallControl::FailedClosed;
+                                break 'batches;
+                            }
                         }
-                        executable_calls.push(*tc)
                     }
                     EdgeApprovalWait::Denied(denied) => {
-                        for map in &denied.sse_maps {
-                            self.emit_progress_event(Value::Object(map.clone()));
+                        self.finish_unapproved_edge_approval(
+                            tc,
+                            &request_id,
+                            &tool_name,
+                            &args,
+                            EdgeApprovalSettlement::Deny,
+                            &denied,
+                            "error",
+                            "Approval was denied, but its durable run wait could not be released",
+                            approval_wait_node.as_deref(),
+                            &mut executable_calls,
+                            &mut results_by_id,
+                            &tool_calls,
+                            &mut control,
+                        )
+                        .await;
+                        if control == AdmittedToolCallControl::FailedClosed {
+                            break 'batches;
                         }
-                        let structured = denied.tool_results.first();
-                        let output = denied
-                            .raw_tool_output(0)
-                            .unwrap_or("approval request did not produce a terminal result")
-                            .to_string();
-                        let resolution_error = self
-                            .resolve_completed_edge_approval(
-                                &request_id,
-                                &tool_name,
-                                false,
-                                Some(&output),
-                            )
-                            .await
-                            .err();
-                        let status = structured
-                            .map(|result| result.status.clone())
-                            .unwrap_or_else(|| "error".to_string());
-                        let fields =
-                            structured.and_then(|result| result.tool_result_fields.clone());
-                        results_by_id.insert(
-                            request_id.clone(),
-                            EdgeToolExecResult {
-                                execution_completion: None,
-                                tool_result_fields: Some(self.edge_result_fields_with_runtime(
-                                    &request_id,
-                                    &tool_name,
-                                    &args,
-                                    fields,
-                                )),
-                                request_id,
-                                tool: tool_name,
-                                args,
-                                output,
-                                status,
-                                duration_ms: 0,
-                            },
-                        );
-                        if let Some(error) = resolution_error {
-                            let remaining = tool_calls
-                                .iter()
-                                .filter(|call| {
-                                    let (id, _, _) = parse_flat_tool_call_event(call);
-                                    !results_by_id.contains_key(&id)
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            for result in self.edge_action_blocked_results(
-                                &remaining,
-                                "approval_resolution_failed",
-                                &format!(
-                                    "Approval was denied, but its durable run wait could not be released: {error}"
-                                ),
-                            ) {
-                                results_by_id.insert(result.request_id.clone(), result);
-                            }
-                            control = AdmittedToolCallControl::FailedClosed;
+                    }
+                    EdgeApprovalWait::TimedOut(timed_out) => {
+                        self.finish_unapproved_edge_approval(
+                            tc,
+                            &request_id,
+                            &tool_name,
+                            &args,
+                            EdgeApprovalSettlement::Timeout,
+                            &timed_out,
+                            "timed_out",
+                            "Approval timed out, but its durable run wait could not be released",
+                            approval_wait_node.as_deref(),
+                            &mut executable_calls,
+                            &mut results_by_id,
+                            &tool_calls,
+                            &mut control,
+                        )
+                        .await;
+                        if control == AdmittedToolCallControl::FailedClosed {
                             break 'batches;
                         }
                     }
@@ -15910,7 +16094,7 @@ impl ServerAgenticLoopHost {
                                 .resolve_completed_edge_approval(
                                     &id,
                                     &name,
-                                    false,
+                                    EdgeApprovalSettlement::Deny,
                                     Some("run cancellation superseded the pending approval"),
                                 )
                                 .await
@@ -23547,6 +23731,41 @@ fn edge_tool_delivery_timed_out(
         .any(|result| result.status == "timed_out")
 }
 
+fn authoritative_unapproved_delivery(
+    local: &astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery,
+    authority: EdgeApprovalSettlement,
+    tool_call: &Value,
+) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
+    use astra_turn_core::cloud_tool_delivery::{
+        approval_denial_delivery, approval_timeout_delivery,
+    };
+
+    let local_status = local
+        .tool_results
+        .first()
+        .map(|result| result.status.as_str());
+    match authority {
+        EdgeApprovalSettlement::Timeout if local_status == Some("timed_out") => local.clone(),
+        EdgeApprovalSettlement::Timeout => approval_timeout_delivery(tool_call),
+        EdgeApprovalSettlement::Deny if local_status == Some("denied") => local.clone(),
+        EdgeApprovalSettlement::Deny | EdgeApprovalSettlement::Allow => {
+            approval_denial_delivery(tool_call, None)
+        }
+    }
+}
+
+fn edge_approval_wait_from_ledger(
+    result: Result<(), astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery>,
+) -> EdgeApprovalWait {
+    match result {
+        Ok(()) => EdgeApprovalWait::Allowed,
+        Err(delivery) if edge_tool_delivery_timed_out(&delivery) => {
+            EdgeApprovalWait::TimedOut(delivery)
+        }
+        Err(delivery) => EdgeApprovalWait::Denied(delivery),
+    }
+}
+
 fn canonical_edge_dispatch_result(
     identity: &astra_services::multi_agent::EdgeDispatchIdentity,
     expected_edge_agent_id: &str,
@@ -25833,12 +26052,247 @@ mod tests {
             EdgeApprovalWait::Denied(_) => {
                 panic!("authority-lost denial was consumed as an ordinary user denial")
             }
+            EdgeApprovalWait::TimedOut(_) => {
+                panic!("authority-lost denial was consumed as an approval timeout")
+            }
             EdgeApprovalWait::Superseded => panic!("authority-lost denial became superseded"),
             EdgeApprovalWait::PermissionModeChanged => {
                 panic!("authority-lost denial became a mode change")
             }
             EdgeApprovalWait::Cancelled => panic!("authority-lost denial became cancellation"),
         }
+    }
+
+    #[tokio::test]
+    async fn edge_approval_deadline_is_timeout_not_denial() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-approval-deadline".to_string(),
+            "s-approval-deadline".to_string(),
+        )
+        .build();
+        host.set_approval_audit_context(test_approval_audit_context(
+            "u-approval-deadline",
+            "s-approval-deadline",
+        ));
+        host.set_interaction_sink(Arc::new(PendingApprovalInteractionSink));
+        let context =
+            test_edge_action_context("u-approval-deadline", "run-approval-deadline").await;
+        let tool_call = json!({
+            "id": "bash-deadline",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        });
+
+        let outcome = host
+            .wait_edge_approval_or_guidance(&context, &tool_call, Duration::from_secs(1))
+            .await;
+        match outcome {
+            EdgeApprovalWait::TimedOut(delivery) => {
+                assert!(edge_tool_delivery_timed_out(&delivery));
+                assert_eq!(
+                    delivery.raw_tool_output(0),
+                    Some(astra_turn_core::cloud_tool_delivery::MSG_APPROVAL_LEDGER_TIMEOUT)
+                );
+            }
+            EdgeApprovalWait::Denied(_) => panic!("approval deadline was recorded as a denial"),
+            other => panic!("approval deadline produced {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_timeout_resolution_stays_a_timeout() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-shared-timeout".to_string(),
+            "s-shared-timeout".to_string(),
+        )
+        .build();
+        host.set_approval_audit_context(test_approval_audit_context(
+            "u-shared-timeout",
+            "s-shared-timeout",
+        ));
+        host.set_interaction_sink(Arc::new(PolledApprovalInteractionSink {
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            resolve_after_poll: 1,
+            resolution: json!({
+                "event_type": "approval_resolved",
+                "data": {
+                    "request_id": "bash-shared-timeout",
+                    "outcome": "timed_out",
+                    "decision": "timeout",
+                    "reason": "approval deadline elapsed",
+                    "tool": "bash",
+                    "approval_kind": "standard",
+                    "_durable_resolution": {"disposition": "resumed"}
+                }
+            }),
+        }));
+        let context = test_edge_action_context("u-shared-timeout", "run-shared-timeout").await;
+        let tool_call = json!({
+            "id": "bash-shared-timeout",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        });
+
+        let outcome = host
+            .wait_edge_approval_or_guidance(&context, &tool_call, Duration::from_secs(300))
+            .await;
+        match outcome {
+            EdgeApprovalWait::TimedOut(delivery) => {
+                assert!(edge_tool_delivery_timed_out(&delivery));
+            }
+            EdgeApprovalWait::Denied(delivery) => {
+                panic!(
+                    "shared timeout was classified as denial status {:?}",
+                    delivery
+                        .tool_results
+                        .first()
+                        .map(|result| result.status.clone())
+                )
+            }
+            other => panic!("shared timeout produced {other:?}"),
+        }
+    }
+
+    struct FixedApprovalSettlementSink {
+        settlement: EdgeApprovalSettlement,
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for FixedApprovalSettlementSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn resolve_edge_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            _settlement: EdgeApprovalSettlement,
+            _reason: Option<&str>,
+        ) -> Result<EdgeApprovalSettlement, String> {
+            Ok(self.settlement)
+        }
+    }
+
+    async fn competing_settlement_after_local_timeout(
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        settlement: EdgeApprovalSettlement,
+    ) -> (AdmittedToolCallOutcome, Vec<Value>) {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            user_id.to_string(),
+            session_id.to_string(),
+        )
+        .with_execution_time_budget(Some(ExecutionTimeBudget {
+            remaining_seconds: 2,
+        }))
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+        .with_interactive_client(true)
+        .build();
+        let mut explain_state = create_test_state();
+        explain_state.current_run_id = Some(run_id.to_string());
+        host.on_turn_started(&explain_state);
+        host.set_approval_audit_context(test_approval_audit_context(user_id, session_id));
+        host.set_interaction_sink(Arc::new(FixedApprovalSettlementSink { settlement }));
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let context = test_edge_action_context(user_id, run_id).await;
+        let call = json!({
+            "id": "bash-compete",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        });
+        let outcome = host
+            .deliver_edge_tools_via_ledger(run_id, "chain", &[call], &context)
+            .await;
+        let approval_waits = host
+            .emitted_events
+            .iter()
+            .filter(|event| {
+                event["type"] == astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE
+                    && event["kind"] == "wait"
+                    && event["transition"] == "finished"
+                    && event["label"]
+                        .as_str()
+                        .is_some_and(|label| label.starts_with("Waiting for approval"))
+            })
+            .cloned()
+            .collect();
+        (outcome, approval_waits)
+    }
+
+    #[tokio::test]
+    async fn competing_denial_replaces_local_approval_timeout_result() {
+        let (outcome, approval_waits) = competing_settlement_after_local_timeout(
+            "u-compete-deny",
+            "s-compete-deny",
+            "run-compete-deny",
+            EdgeApprovalSettlement::Deny,
+        )
+        .await;
+
+        assert_eq!(outcome.results.len(), 1, "control={:?}", outcome.control);
+        assert_eq!(
+            outcome.results[0].status, "denied",
+            "output={} fields={:?}",
+            outcome.results[0].output, outcome.results[0].tool_result_fields
+        );
+        assert!(
+            outcome.results[0].output.contains("REJECTED"),
+            "tool result must follow the durable denial, got {}",
+            outcome.results[0].output
+        );
+        assert!(
+            !outcome.results[0].output.contains("timed out waiting"),
+            "stale timeout text must not survive a durable denial"
+        );
+        assert_eq!(
+            approval_waits.len(),
+            1,
+            "approval wait trace: {approval_waits:?}"
+        );
+        assert_eq!(approval_waits[0]["outcome"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn competing_allow_replaces_local_approval_timeout_trace() {
+        let (outcome, approval_waits) = competing_settlement_after_local_timeout(
+            "u-compete-allow",
+            "s-compete-allow",
+            "run-compete-allow",
+            EdgeApprovalSettlement::Allow,
+        )
+        .await;
+
+        assert_eq!(outcome.results.len(), 1, "control={:?}", outcome.control);
+        assert_ne!(outcome.results[0].status, "timed_out");
+        assert!(
+            !outcome.results[0].output.contains("timed out waiting"),
+            "a durable allow must not keep the local timeout result, got {}",
+            outcome.results[0].output
+        );
+        assert_eq!(
+            approval_waits.len(),
+            1,
+            "approval wait trace: {approval_waits:?}"
+        );
+        assert_eq!(approval_waits[0]["outcome"], "resolved");
     }
 
     struct SequencedSummaryClient {
@@ -28690,10 +29144,10 @@ mod tests {
             &self,
             _request_id: &str,
             _tool_name: &str,
-            _approved: bool,
+            settlement: EdgeApprovalSettlement,
             _reason: Option<&str>,
-        ) -> Result<(), String> {
-            Ok(())
+        ) -> Result<EdgeApprovalSettlement, String> {
+            Ok(settlement)
         }
     }
 
@@ -28739,10 +29193,14 @@ mod tests {
             &self,
             request_id: &str,
             tool_name: &str,
-            approved: bool,
+            settlement: EdgeApprovalSettlement,
             reason: Option<&str>,
-        ) -> Result<(), String> {
-            assert!(!approved, "batch cleanup can only deny unstarted approvals");
+        ) -> Result<EdgeApprovalSettlement, String> {
+            assert_eq!(
+                settlement,
+                EdgeApprovalSettlement::Deny,
+                "batch cleanup can only deny unstarted approvals"
+            );
             self.resolved
                 .lock()
                 .expect("resolved approvals")
@@ -28752,7 +29210,7 @@ mod tests {
                 tool_name.to_string(),
                 reason.map(ToString::to_string),
             ));
-            Ok(())
+            Ok(settlement)
         }
     }
 
@@ -28827,12 +29285,16 @@ mod tests {
             &self,
             _request_id: &str,
             _tool_name: &str,
-            approved: bool,
+            settlement: EdgeApprovalSettlement,
             _reason: Option<&str>,
-        ) -> Result<(), String> {
-            assert!(approved, "the recorded durable decision is allow");
+        ) -> Result<EdgeApprovalSettlement, String> {
+            assert_eq!(
+                settlement,
+                EdgeApprovalSettlement::Allow,
+                "the recorded durable decision is allow"
+            );
             self.approval_releases.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(settlement)
         }
 
         async fn load_edge_approval_resolution(

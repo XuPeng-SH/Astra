@@ -30,6 +30,37 @@ use astra_turn_core::edge_ledger::{
 /// report them again on the next heartbeat cycle.
 const MAX_LAST_SEEN_REQUEST_IDS: usize = 256;
 
+fn recorded_approval_conflict_response(
+    request_id: &str,
+    run_id: &str,
+    existing: &Value,
+) -> (
+    axum::http::StatusCode,
+    axum::Json<astra_core::ErrorResponse>,
+) {
+    let decision = existing
+        .pointer("/data/decision")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let outcome = existing
+        .pointer("/data/outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    astra_core::error_response_coded_with_metadata(
+        axum::http::StatusCode::CONFLICT,
+        format!(
+            "approval decision already recorded for request {request_id} run {run_id} as {decision}"
+        ),
+        "approval_decision_already_recorded",
+        serde_json::json!({
+            "request_id": request_id,
+            "run_id": run_id,
+            "decision": decision,
+            "outcome": outcome,
+        }),
+    )
+}
+
 fn journal_worker_join_error(error: tokio::task::JoinError) -> std::io::Error {
     std::io::Error::other(format!("approval journal worker failed: {error}"))
 }
@@ -785,17 +816,10 @@ pub(crate) async fn post_approval_respond_handler(
                 })));
             }
             Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(existing)) => {
-                return Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "approval decision already recorded for request {} run {} as {}",
-                        body.request_id,
-                        run_id,
-                        existing
-                            .pointer("/data/decision")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                    ),
+                return Err(recorded_approval_conflict_response(
+                    &body.request_id,
+                    run_id,
+                    &existing,
                 ));
             }
             Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest) => {
@@ -1007,17 +1031,10 @@ pub(crate) async fn post_approval_respond_handler(
                 registry.as_ref(),
                 "conflict",
             );
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                format!(
-                    "approval decision already recorded for request {} run {} as {}",
-                    body.request_id,
-                    run_id,
-                    existing
-                        .pointer("/data/decision")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                ),
+            return Err(recorded_approval_conflict_response(
+                &body.request_id,
+                run_id,
+                &existing,
             ));
         }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest) => {

@@ -1171,9 +1171,9 @@ impl DurableHostInteractionSink {
         &self,
         request_id: &str,
         tool_name: &str,
-        approved: bool,
+        settlement: server_loop_host::EdgeApprovalSettlement,
         reason: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<server_loop_host::EdgeApprovalSettlement, String> {
         if let Some(existing) = self
             .run_engine
             .load_run_interaction_event(
@@ -1185,15 +1185,12 @@ impl DurableHostInteractionSink {
             .await?
         {
             let data = existing.get("data").unwrap_or(&existing);
-            let existing_decision = data.get("decision").and_then(Value::as_str);
-            let decision_matches = if approved {
-                matches!(existing_decision, Some("allow" | "allow_session"))
-            } else {
-                existing_decision == Some("deny")
-            };
+            let recorded = server_loop_host::EdgeApprovalSettlement::from_recorded(
+                data.get("decision").and_then(Value::as_str),
+            );
             if data.get("request_id").and_then(Value::as_str) == Some(request_id)
                 && data.get("tool").and_then(Value::as_str) == Some(tool_name)
-                && decision_matches
+                && let Some(recorded) = recorded
             {
                 if data
                     .pointer("/_durable_resolution/disposition")
@@ -1207,10 +1204,8 @@ impl DurableHostInteractionSink {
                 // The callback handler already committed the shared decision.
                 // Do not issue a second resolution transaction from the owner
                 // merely because its local low-latency projection won a race.
-                // `reason` may already have been transformed into the bounded
-                // denial tool result; metadata cannot change allow/deny
-                // authority for this exact request and tool.
-                return Ok(());
+                // A recorded timeout stays a timeout; it is not rewritten as deny.
+                return Ok(recorded);
             }
             return Err(format!(
                 "durable approval {request_id} already has a conflicting outcome: {existing}"
@@ -1218,8 +1213,8 @@ impl DurableHostInteractionSink {
         }
         let response = json!({
             "request_id": request_id,
-            "outcome": if approved { "approved" } else { "denied" },
-            "decision": if approved { "allow" } else { "deny" },
+            "outcome": settlement.outcome(),
+            "decision": settlement.decision(),
             "reason": reason,
             "tool": tool_name,
             "approval_kind": "standard",
@@ -1244,6 +1239,19 @@ impl DurableHostInteractionSink {
                 ));
             }
             astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(existing) => {
+                let data = existing.get("data").unwrap_or(&existing);
+                if data.get("request_id").and_then(Value::as_str) == Some(request_id)
+                    && data.get("tool").and_then(Value::as_str) == Some(tool_name)
+                    && data
+                        .pointer("/_durable_resolution/disposition")
+                        .and_then(Value::as_str)
+                        == Some("resumed")
+                    && let Some(recorded) = server_loop_host::EdgeApprovalSettlement::from_recorded(
+                        data.get("decision").and_then(Value::as_str),
+                    )
+                {
+                    return Ok(recorded);
+                }
                 return Err(format!(
                     "durable approval {request_id} already has a conflicting outcome: {existing}"
                 ));
@@ -1300,7 +1308,7 @@ impl DurableHostInteractionSink {
                 }
             }
         }
-        Ok(())
+        Ok(settlement)
     }
 }
 
@@ -1505,8 +1513,10 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
                     data.pointer("/_durable_resolution/disposition")
                         .and_then(Value::as_str),
                 ) {
-                    (Some("deny" | "allow" | "allow_session"), Some("resumed")) => Ok(()),
-                    (Some("deny" | "allow" | "allow_session"), _) => Err(format!(
+                    (Some("deny" | "allow" | "allow_session" | "timeout"), Some("resumed")) => {
+                        Ok(())
+                    }
+                    (Some("deny" | "allow" | "allow_session" | "timeout"), _) => Err(format!(
                         "approval {request_id} was recorded without durable resume authority"
                     )),
                     _ => Err(format!(
@@ -1658,10 +1668,10 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
         &self,
         request_id: &str,
         tool_name: &str,
-        approved: bool,
+        settlement: server_loop_host::EdgeApprovalSettlement,
         reason: Option<&str>,
-    ) -> Result<(), String> {
-        self.resolve_edge_approval_durably(request_id, tool_name, approved, reason)
+    ) -> Result<server_loop_host::EdgeApprovalSettlement, String> {
+        self.resolve_edge_approval_durably(request_id, tool_name, settlement, reason)
             .await
     }
 
@@ -1691,10 +1701,11 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
         self.resolve_edge_approval_durably(
             request_id,
             tool_name,
-            false,
+            server_loop_host::EdgeApprovalSettlement::Deny,
             Some("newer user guidance superseded this pending action"),
         )
         .await
+        .map(|_| ())
     }
 }
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
