@@ -299,6 +299,31 @@ fn run_chat_turn_boxed<'a>(
     Box::pin(run_chat_turn(request))
 }
 
+/// A handled startup failure is not a completed turn. Follow-up input queued
+/// while authentication was still pending must be restored, not sent.
+#[derive(Clone, Debug)]
+pub(crate) enum InteractiveTurnOutcome {
+    Completed(Option<Box<TurnUsage>>),
+    /// Authentication or another startup gate stopped the turn before it ran.
+    NotStarted,
+    /// The turn was attempted and settled as failed or interrupted.
+    /// Usage already captured for that attempt stays with the outcome.
+    Failed(Option<Box<TurnUsage>>),
+}
+
+fn interactive_outcome(
+    settlement: TurnSettlementOutcome,
+    usage: Option<TurnUsage>,
+) -> InteractiveTurnOutcome {
+    let usage = usage.map(Box::new);
+    match settlement {
+        TurnSettlementOutcome::Succeeded => InteractiveTurnOutcome::Completed(usage),
+        TurnSettlementOutcome::Interrupted | TurnSettlementOutcome::Failed => {
+            InteractiveTurnOutcome::Failed(usage)
+        }
+    }
+}
+
 pub(crate) async fn handle_chat_input(
     line: String,
     current_token: Option<&str>,
@@ -322,7 +347,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<Option<TurnUsage>, String> {
+) -> Result<InteractiveTurnOutcome, String> {
     if let Some(decision) = classify_shell_passthrough(&line) {
         match decision {
             ShellPassthroughDecision::Empty => {}
@@ -352,14 +377,15 @@ pub(crate) async fn handle_chat_input_with_ui(
                 }
             }
         }
-        return Ok(None);
+        return Ok(InteractiveTurnOutcome::Completed(None));
     }
 
     let token = match current_token {
         Some(token) => token,
         None => {
             ui.show_warning("  Not logged in. Use /login to authenticate.");
-            return Ok(None);
+            let _ = ui.restore_input(&line, state.session_id.as_deref());
+            return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
 
@@ -447,10 +473,11 @@ pub(crate) async fn handle_chat_input_with_ui(
             .pending_bg_notifications
             .extend(notifications_arriving_during_settlement);
     }
-    Ok(turn_usage_sink
+    let usage = turn_usage_sink
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .take())
+        .take();
+    Ok(interactive_outcome(settlement, usage))
 }
 
 /// Resume an idle root from runtime-owned background facts without inventing
@@ -464,15 +491,15 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<Option<TurnUsage>, String> {
+) -> Result<InteractiveTurnOutcome, String> {
     if state.pending_bg_notifications.is_empty() {
-        return Ok(None);
+        return Ok(InteractiveTurnOutcome::Completed(None));
     }
     let token = match current_token {
         Some(token) => token,
         None => {
             ui.show_warning("  Background work finished, but Astra is not logged in; the update will be kept for your next turn.");
-            return Ok(None);
+            return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
 
@@ -550,10 +577,11 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         let consumed = notification_count.min(state.pending_bg_notifications.len());
         state.pending_bg_notifications.drain(..consumed);
     }
-    Ok(turn_usage_sink
+    let usage = turn_usage_sink
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .take())
+        .take();
+    Ok(interactive_outcome(settlement, usage))
 }
 
 pub(super) fn acquire_interactive_turn_admission(
@@ -630,14 +658,81 @@ async fn ensure_multi_agent_runtime_for_turn(
 
 #[cfg(test)]
 mod tests {
+    use super::super::turn_retry::TurnSettlementOutcome;
     use super::{
-        ShellPassthroughDecision, TurnContext, TurnUsage, acquire_interactive_turn_admission,
-        classify_shell_passthrough, ensure_interactive_session_identity,
-        ensure_multi_agent_runtime_for_turn, handle_chat_input_with_ui,
-        model_selection_preflight_failure,
+        InteractiveTurnOutcome, ShellPassthroughDecision, TurnContext, TurnUsage,
+        acquire_interactive_turn_admission, classify_shell_passthrough,
+        ensure_interactive_session_identity, ensure_multi_agent_runtime_for_turn,
+        handle_chat_input_with_ui, interactive_outcome, model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::stream::streaming_types::UsageAttribution;
+
+    #[tokio::test]
+    async fn missing_token_restores_the_replayed_line_and_does_not_start() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let outcome = handle_chat_input_with_ui(
+            "replayed follow-up".to_string(),
+            None,
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect("missing credentials are a handled startup failure");
+        assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+        assert_eq!(ui.restored_inputs, vec!["replayed follow-up".to_string()]);
+        assert!(matches!(
+            interactive_outcome(TurnSettlementOutcome::Failed, None),
+            InteractiveTurnOutcome::Failed(None)
+        ));
+        assert!(matches!(
+            interactive_outcome(TurnSettlementOutcome::Succeeded, None),
+            InteractiveTurnOutcome::Completed(None)
+        ));
+    }
+
+    #[test]
+    fn failed_and_interrupted_settlement_keep_partial_usage() {
+        let partial = crate::PartialTurnData {
+            prompt_tokens: 12,
+            completion_tokens: 3,
+            cache_read_tokens: 4,
+            cache_creation_tokens: 1,
+            usage_attribution: UsageAttribution {
+                auxiliary_capture_unavailable: true,
+                ..UsageAttribution::default()
+            },
+            ..Default::default()
+        };
+        let usage = TurnUsage::from_partial(&partial).expect("partial usage must be retained");
+
+        match interactive_outcome(TurnSettlementOutcome::Failed, Some(usage.clone())) {
+            InteractiveTurnOutcome::Failed(Some(kept)) => {
+                assert_eq!(kept.prompt_tokens, 12);
+                assert_eq!(kept.completion_tokens, 3);
+                assert_eq!(kept.cache_read_tokens, 4);
+                assert_eq!(kept.cache_creation_tokens, 1);
+                assert!(kept.usage_attribution.auxiliary_capture_unavailable);
+            }
+            other => panic!("failed settlement dropped usage: {other:?}"),
+        }
+        match interactive_outcome(TurnSettlementOutcome::Interrupted, Some(usage)) {
+            InteractiveTurnOutcome::Failed(Some(kept)) => {
+                assert_eq!(kept.prompt_tokens, 12);
+                assert!(kept.usage_observed);
+            }
+            other => panic!("interrupted settlement dropped usage: {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn bound_interactive_session_is_not_resumed_before_the_next_turn() {

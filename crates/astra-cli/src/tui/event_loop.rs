@@ -2760,13 +2760,49 @@ fn active_submission_routes_to_next_turn(
     output_has_settled: bool,
     foreground_lifecycle_transferred: bool,
     guidance_admission_closed: bool,
+    follow_up_deferred_before_bind: bool,
 ) -> bool {
     guidance_admission_closed
+        || follow_up_deferred_before_bind
         || active_submission_belongs_to_next_turn(
             text,
             output_has_settled,
             foreground_lifecycle_transferred,
         )
+}
+
+/// Current-run guidance needs the durable server run id from `RunBound`.
+/// Until that identity exists, a follow-up stays on the next-turn queue.
+/// An empty id is not a target.
+fn follow_up_waits_for_unbound_run(remote_run_id: Option<&str>) -> bool {
+    remote_run_id
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+        .is_none()
+}
+
+/// Queue one model-facing follow-up while the durable run id is still absent.
+/// The first queued message latches the rest of this turn onto the next-turn
+/// FIFO, so a later `RunBound` cannot deliver a newer message ahead of it.
+/// Keeping this branch shared by the event loop and its regression test is
+/// deliberate: this path must not open a remote guidance submission.
+fn defer_follow_up_before_run_bind(
+    text: &str,
+    remote_run_id: Option<&str>,
+    follow_up_deferred_before_bind: &mut bool,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    if !follow_up_waits_for_unbound_run(remote_run_id) {
+        return false;
+    }
+    if bottom_pane.queue_next_turn_submission(text.to_string()) {
+        *follow_up_deferred_before_bind = true;
+        chat_widget.commit_system(history_cell::system::SystemCell::info(
+            UNBOUND_RUN_FOLLOW_UP_NOTICE.to_string(),
+        ));
+    }
+    true
 }
 
 /// Handle the one active-run slash command that is a pure navigation action.
@@ -2805,9 +2841,243 @@ fn should_start_queued_followups(
     turn_interrupted: bool,
     foreground_lifecycle_transferred: bool,
     exit_after_turn_settlement: bool,
+    turn_not_started: bool,
 ) -> bool {
+    if turn_not_started {
+        return false;
+    }
     (turn_ok && !turn_interrupted || foreground_lifecycle_transferred)
         && !exit_after_turn_settlement
+}
+
+fn model_facing_followup_backlog(queued: &VecDeque<String>) -> bool {
+    queued
+        .iter()
+        .any(|text| !text.trim_start().starts_with('/'))
+}
+
+fn slash_result_releases_followups(result: &slash_dispatch::SlashResult) -> bool {
+    matches!(
+        result,
+        slash_dispatch::SlashResult::Handled | slash_dispatch::SlashResult::OpenWorkTasks
+    )
+}
+
+fn local_slash_releases_followups(
+    synchronous_completion: bool,
+    session_changed: bool,
+    has_active_view: bool,
+) -> bool {
+    synchronous_completion && !session_changed && !has_active_view
+}
+
+#[derive(PartialEq, Eq)]
+enum QueuedFollowupRelease {
+    SubmitNext,
+    HeldWithDraft,
+    Idle,
+}
+
+fn release_next_queued_followup(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> QueuedFollowupRelease {
+    if !queued_followup_submissions.is_empty() && !bottom_pane.composer.is_empty() {
+        let restored = std::mem::take(queued_followup_submissions)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let preview = user_intent_preview(&restored);
+        bottom_pane.restore_into_composer(&restored);
+        chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+            "Queued follow-up kept with your current draft: {preview}",
+        )));
+        return QueuedFollowupRelease::HeldWithDraft;
+    }
+    if let Some(next_turn_submission) = queued_followup_submissions.pop_front() {
+        bottom_pane.composer.set_text(&next_turn_submission);
+        return QueuedFollowupRelease::SubmitNext;
+    }
+    QueuedFollowupRelease::Idle
+}
+
+/// Facts that decide whether a queued follow-up may leave the FIFO.
+///
+/// An empty view stack is not enough: the command that was ahead of the
+/// backlog may still be loading, and a Session rebind must not send the
+/// previous conversation's text.
+#[derive(Clone, Copy)]
+struct FollowupReleaseGate {
+    model_catalog_loading: bool,
+    background_reads_in_flight: bool,
+    session_rebound: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QueuedFollowupHandoff {
+    SubmitNext,
+    HeldWithDraft,
+    RestoredAfterSessionChange,
+    Held,
+    Idle,
+}
+
+fn handoff_queued_followups(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    gate: FollowupReleaseGate,
+) -> QueuedFollowupHandoff {
+    if gate.session_rebound {
+        if queued_followup_submissions.is_empty() {
+            return QueuedFollowupHandoff::Idle;
+        }
+        let restored = std::mem::take(queued_followup_submissions)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        bottom_pane.restore_into_composer(&restored);
+        chat_widget.commit_system(history_cell::system::SystemCell::info(
+            "A message queued for the previous Session was kept in the composer after the Session changed. Review it before sending.".to_string(),
+        ));
+        return QueuedFollowupHandoff::RestoredAfterSessionChange;
+    }
+    if bottom_pane.has_active_view()
+        || gate.model_catalog_loading
+        || gate.background_reads_in_flight
+    {
+        return QueuedFollowupHandoff::Held;
+    }
+    match release_next_queued_followup(queued_followup_submissions, bottom_pane, chat_widget) {
+        QueuedFollowupRelease::SubmitNext => QueuedFollowupHandoff::SubmitNext,
+        QueuedFollowupRelease::HeldWithDraft => QueuedFollowupHandoff::HeldWithDraft,
+        QueuedFollowupRelease::Idle => QueuedFollowupHandoff::Idle,
+    }
+}
+
+fn resume_queued_followups_after_modal(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    event_stream: &mut TuiEventStream,
+    followup_replay_armed: &mut bool,
+    gate: FollowupReleaseGate,
+) -> QueuedFollowupHandoff {
+    let handoff =
+        handoff_queued_followups(queued_followup_submissions, bottom_pane, chat_widget, gate);
+    if handoff == QueuedFollowupHandoff::SubmitNext {
+        // The injected Enter is the queued item itself. The next idle
+        // submission must run it, not append it behind whatever remains.
+        *followup_replay_armed = true;
+        event_stream.push_front(TuiEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+    }
+    handoff
+}
+
+/// A model-facing message typed while an older backlog is still held must
+/// join that FIFO. Slash commands and the one injected replay may proceed.
+fn admit_idle_followup(
+    text: &str,
+    followup_replay_armed: &mut bool,
+    queued_followup_submissions: &mut VecDeque<String>,
+) -> bool {
+    if *followup_replay_armed {
+        *followup_replay_armed = false;
+        return false;
+    }
+    let trimmed = text.trim_start();
+    let model_facing =
+        !trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('!');
+    if !model_facing || queued_followup_submissions.is_empty() {
+        return false;
+    }
+    queued_followup_submissions.push_back(text.to_string());
+    true
+}
+
+fn followup_release_gate(
+    model_catalog_loading: bool,
+    background_reads_in_flight: usize,
+) -> FollowupReleaseGate {
+    FollowupReleaseGate {
+        model_catalog_loading,
+        background_reads_in_flight: background_reads_in_flight > 0,
+        session_rebound: false,
+    }
+}
+
+fn turn_settlement_followup_handoff(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    model_catalog_loading: bool,
+    background_reads_in_flight: usize,
+    followup_replay_armed: &mut bool,
+) -> QueuedFollowupHandoff {
+    let handoff = handoff_queued_followups(
+        queued_followup_submissions,
+        bottom_pane,
+        chat_widget,
+        followup_release_gate(model_catalog_loading, background_reads_in_flight),
+    );
+    if handoff == QueuedFollowupHandoff::SubmitNext {
+        *followup_replay_armed = true;
+    }
+    handoff
+}
+
+fn followup_gate_after_auth(
+    before_session_id: Option<&str>,
+    before_epoch: u64,
+    after_session_id: Option<&str>,
+    after_epoch: u64,
+    model_catalog_loading: bool,
+    background_reads_in_flight: usize,
+) -> FollowupReleaseGate {
+    FollowupReleaseGate {
+        session_rebound: before_session_id != after_session_id || before_epoch != after_epoch,
+        ..followup_release_gate(model_catalog_loading, background_reads_in_flight)
+    }
+}
+
+/// Authentication was refused before any login task or view existed.
+/// The remaining FIFO will not get a later completion, so put it back
+/// in the composer.
+fn recover_followups_after_rejected_authentication(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    recover_queued_followups_after_cancelled_read(
+        queued_followup_submissions,
+        bottom_pane,
+        chat_widget,
+    )
+}
+
+/// A cancelled read will not reach the completion handoff. Put the held
+/// backlog back in the composer so a later manual submit cannot pass it.
+fn recover_queued_followups_after_cancelled_read(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    if queued_followup_submissions.is_empty() {
+        return false;
+    }
+    let restored = std::mem::take(queued_followup_submissions)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    bottom_pane.restore_into_composer(&restored);
+    chat_widget.commit_system(history_cell::system::SystemCell::info(
+        "A queued message was kept in the composer after the background action was stopped. Review it before sending.".to_string(),
+    ));
+    true
 }
 
 fn primary_guidance_disposition_event(
@@ -3303,6 +3573,9 @@ const RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE: &str = "run_intent_settlement_fen
 
 const SETTLEMENT_FENCED_FOLLOW_UP_NOTICE: &str =
     "This run is settling. Your message is queued and will be sent as the next turn.";
+
+const UNBOUND_RUN_FOLLOW_UP_NOTICE: &str =
+    "The current run is starting. Your message is queued and will be sent as the next turn.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum GuidanceSubmissionError {
@@ -6913,6 +7186,7 @@ pub(crate) async fn run_tui_session(
     // FIFO order and re-enter the ordinary submit path rather than presenting
     // an "accepted" acknowledgement that never produces a response.
     let mut queued_followup_submissions = VecDeque::<String>::new();
+    let mut followup_replay_armed = false;
     let mut runtime_notification_turn_pending = false;
     let mut runtime_notification_wake_at: Option<std::time::Instant> = None;
 
@@ -7065,6 +7339,11 @@ pub(crate) async fn run_tui_session(
                         slash_background_read_tasks.abort_all();
                         slash_background_read_count = 0;
                         slash_background_read_generation = slash_background_read_generation.wrapping_add(1);
+                        recover_queued_followups_after_cancelled_read(
+                            &mut queued_followup_submissions,
+                            &mut bottom_pane,
+                            &mut chat_widget,
+                        );
                         let uc = matches!(method, LoginMethod::Uc(_));
                         let api = api.clone();
                         let profile = profile.map(str::to_owned);
@@ -7129,6 +7408,11 @@ pub(crate) async fn run_tui_session(
                         // Recreate its retired memory service using the still-pinned
                         // API; a committed account change cannot reuse this client.
                         restore_login_identity_services(api, profile, &mut state, &mut external_skill_discovery, &mut external_skill_discovery_pending).await;
+                        recover_queued_followups_after_cancelled_read(
+                            &mut queued_followup_submissions,
+                            &mut bottom_pane,
+                            &mut chat_widget,
+                        );
                         if cancelled {
                             while login_progress_rx.try_recv().is_ok() {}
                             chat_widget.commit_system(history_cell::system::SystemCell::response("Login cancelled."));
@@ -7212,6 +7496,14 @@ pub(crate) async fn run_tui_session(
                     completion.effect,
                     &mut bottom_pane,
                     &mut chat_widget,
+                );
+                resume_queued_followups_after_modal(
+                    &mut queued_followup_submissions,
+                    &mut bottom_pane,
+                    &mut chat_widget,
+                    &mut event_stream,
+                    &mut followup_replay_armed,
+                    followup_release_gate(model_catalog_loading, slash_background_read_count),
                 );
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
@@ -7428,6 +7720,14 @@ pub(crate) async fn run_tui_session(
                     flush_chat_widget(&mut guard, &mut chat_widget, width);
                 }
                 bottom_pane.sync_popups();
+                resume_queued_followups_after_modal(
+                    &mut queued_followup_submissions,
+                    &mut bottom_pane,
+                    &mut chat_widget,
+                    &mut event_stream,
+                    &mut followup_replay_armed,
+                    followup_release_gate(model_catalog_loading, slash_background_read_count),
+                );
                 frame_requester.schedule_frame();
             }
             Some(Err(error)) = model_catalog_tasks.join_next(), if !model_catalog_tasks.is_empty() => {
@@ -7437,6 +7737,14 @@ pub(crate) async fn run_tui_session(
                 )));
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
+                resume_queued_followups_after_modal(
+                    &mut queued_followup_submissions,
+                    &mut bottom_pane,
+                    &mut chat_widget,
+                    &mut event_stream,
+                    &mut followup_replay_armed,
+                    followup_release_gate(model_catalog_loading, slash_background_read_count),
+                );
                 frame_requester.schedule_frame();
             }
             Some(effect) = startup_effect_rx.recv() => {
@@ -7539,6 +7847,11 @@ pub(crate) async fn run_tui_session(
                             slash_background_read_count = 0;
                             slash_background_read_generation =
                                 slash_background_read_generation.wrapping_add(1);
+                            recover_queued_followups_after_cancelled_read(
+                                &mut queued_followup_submissions,
+                                &mut bottom_pane,
+                                &mut chat_widget,
+                            );
                             chat_widget.commit_system(history_cell::system::SystemCell::info(
                                 format!(
                                     "Stopped waiting for {dismissed} background action(s). Work already launched locally may finish separately, but its result will not interrupt this session."
@@ -7777,6 +8090,26 @@ pub(crate) async fn run_tui_session(
                                     continue;
                                 }
 
+                                if admit_idle_followup(
+                                    &text,
+                                    &mut followup_replay_armed,
+                                    &mut queued_followup_submissions,
+                                ) {
+                                    let preview = user_intent_preview(&text);
+                                    chat_widget.commit_system(
+                                        history_cell::system::SystemCell::info(format!(
+                                            "Your message is queued behind the command that is still finishing: {preview}",
+                                        )),
+                                    );
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                    finish_submission_feedback(
+                                        &mut bottom_pane,
+                                        &mut status_indicator,
+                                    );
+                                    frame_requester.schedule_frame();
+                                    continue;
+                                }
+
                                 let flush_submission_immediately =
                                     should_flush_submission_immediately(&text);
                                 // Persist the semantic submission, not merely the
@@ -7896,6 +8229,8 @@ pub(crate) async fn run_tui_session(
                                         pending_work_retries: &mut pending_work_retries,
                                     };
                                     let result = slash_dispatch::dispatch(&text, &mut dctx).await;
+                                    let slash_finished_synchronously =
+                                        slash_result_releases_followups(&result);
                                     let flush_slash_response =
                                         should_flush_after_slash_dispatch(&result);
                                     pending_deferred_slash_flush =
@@ -7906,7 +8241,16 @@ pub(crate) async fn run_tui_session(
                                         slash_dispatch::SlashResult::Authenticate { register } => {
                                             if background_registry.running_count() > 0 || work_start_in_flight {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::warning("Wait for or stop background tasks before changing authentication."));
+                                                recover_followups_after_rejected_authentication(
+                                                    &mut queued_followup_submissions,
+                                                    &mut bottom_pane,
+                                                    &mut chat_widget,
+                                                );
                                                 flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                finish_submission_feedback(
+                                                    &mut bottom_pane,
+                                                    &mut status_indicator,
+                                                );
                                                 continue;
                                             }
                                             login_phase.reset();
@@ -8113,6 +8457,36 @@ pub(crate) async fn run_tui_session(
                                         &mut bottom_pane,
                                         &mut status_indicator,
                                     );
+                                    let session_changed = state.session_id != pre_sid
+                                        || state.session_attachment_epoch != pre_attachment_epoch;
+                                    let mut followup_gate = followup_release_gate(
+                                        model_catalog_loading,
+                                        slash_background_read_count,
+                                    );
+                                    followup_gate.session_rebound = session_changed;
+                                    if session_changed
+                                        || local_slash_releases_followups(
+                                            slash_finished_synchronously,
+                                            session_changed,
+                                            bottom_pane.has_active_view(),
+                                        )
+                                    {
+                                        let handoff = resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                    &mut followup_replay_armed,
+                                            followup_gate,
+                                        );
+                                        if matches!(
+                                            handoff,
+                                            QueuedFollowupHandoff::HeldWithDraft
+                                                | QueuedFollowupHandoff::RestoredAfterSessionChange
+                                        ) {
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        }
+                                    }
                                     frame_requester.schedule_frame();
                                 } else {
                                     let submit_text = inline_chat_submit.unwrap_or(text);
@@ -8228,6 +8602,11 @@ pub(crate) async fn run_tui_session(
                                     // Later input stays queued for the next turn. This does not
                                     // mean the visible reply has settled.
                                     let mut guidance_admission_closed = false;
+                                    // Set when a model-facing follow-up was queued before
+                                    // RunBound. Later plain text stays behind it for this
+                                    // turn. Slash-only queue entries must not set this.
+                                    let mut follow_up_deferred_before_bind =
+                                        model_facing_followup_backlog(&queued_followup_submissions);
                                     // Queue length when the in-flight guidance was submitted.
                                     // A delayed fence inserts there, ahead of messages queued
                                     // while that POST was still pending.
@@ -8311,13 +8690,13 @@ pub(crate) async fn run_tui_session(
 
                                         let mut turn_result_ready: Option<
                                             Result<
-                                                Option<crate::cli::turn::turn_entry::TurnUsage>,
+                                                crate::cli::turn::turn_entry::InteractiveTurnOutcome,
                                                 String,
                                             >,
                                         > = None;
                                         let mut terminal_mode_closure_started = false;
                                         let r: Result<
-                                            Option<crate::cli::turn::turn_entry::TurnUsage>,
+                                            crate::cli::turn::turn_entry::InteractiveTurnOutcome,
                                             String,
                                         > = loop {
                                             if let Some(request) =
@@ -8887,13 +9266,39 @@ pub(crate) async fn run_tui_session(
                                                                             output_settled_at.is_some(),
                                                                             foreground_lifecycle_transferred,
                                                                             guidance_admission_closed,
+                                                                            follow_up_deferred_before_bind,
                                                                         ) {
                                                                             // The response stream has ended, foreground
-                                                                            // ownership has moved, or the server has
-                                                                            // fenced current-run guidance. Hold the
-                                                                            // text until this turn hands ownership
-                                                                            // back; do not post it to the fenced run.
+                                                                            // ownership has moved, the server has
+                                                                            // fenced current-run guidance, or an
+                                                                            // earlier follow-up is already waiting
+                                                                            // for RunBound. Hold the text until this
+                                                                            // turn hands ownership back.
                                                                             bottom_pane.queue_next_turn_submission(queued_text);
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        let remote_run_id = astra_core::sync_poison::recover_mutex_lock(
+                                                                            &active_remote_run_id,
+                                                                        )
+                                                                        .clone();
+                                                                        if defer_follow_up_before_run_bind(
+                                                                            &queued_text,
+                                                                            remote_run_id.as_deref(),
+                                                                            &mut follow_up_deferred_before_bind,
+                                                                            &mut bottom_pane,
+                                                                            &mut chat_widget,
+                                                                        ) {
+                                                                            let w = guard
+                                                                                .terminal
+                                                                                .size()
+                                                                                .map(|s| s.width)
+                                                                                .unwrap_or(80);
+                                                                            flush_chat_widget(
+                                                                                &mut guard,
+                                                                                &mut chat_widget,
+                                                                                w,
+                                                                            );
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
@@ -9996,11 +10401,20 @@ pub(crate) async fn run_tui_session(
                                     // runtime performs a final durable intent poll before normal
                                     // settlement, so AcceptedRemote guidance remains server-owned
                                     // even when its Applied projection arrives after visible text.
+                                    let turn_not_started = matches!(
+                                        turn_result,
+                                        Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::NotStarted)
+                                    );
+                                    let turn_succeeded = matches!(
+                                        turn_result,
+                                        Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(_))
+                                    );
                                     let should_start_followups = should_start_queued_followups(
-                                        turn_result.is_ok(),
+                                        turn_succeeded,
                                         state.last_turn_interrupted,
                                         foreground_lifecycle_transferred,
                                         exit_after_turn_settlement,
+                                        turn_not_started,
                                     );
                                     let locally_owned_user_intents =
                                         bottom_pane.take_client_recoverable_user_intents();
@@ -10086,10 +10500,17 @@ pub(crate) async fn run_tui_session(
                                     // admission refreshes and concurrent executors can change
                                     // them while this turn is in flight. This also avoids unsigned
                                     // underflow when a late recovery projection rewinds counters.
-                                    let turn_usage = turn_result
-                                        .as_ref()
-                                        .ok()
-                                        .and_then(|usage| usage.clone());
+                                    let turn_usage = match turn_result.as_ref() {
+                                        Ok(
+                                            crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(
+                                                usage,
+                                            )
+                                            | crate::cli::turn::turn_entry::InteractiveTurnOutcome::Failed(
+                                                usage,
+                                            ),
+                                        ) => usage.clone().map(|usage| *usage),
+                                        _ => None,
+                                    };
                                     let primary_usage = turn_usage.as_ref().map_or_else(
                                         Default::default,
                                             |usage| {
@@ -10189,36 +10610,32 @@ pub(crate) async fn run_tui_session(
                                     tui_cancel_token = new_tok.clone();
                                     state.tui_cancel_token = Some(new_tok);
 
-                                    // A user may keep typing while a queued follow-up is waiting.
-                                    // Preserve that draft instead of replacing it; the queued text
-                                    // is restored beside it so neither intent is silently lost.
-                                    if !queued_followup_submissions.is_empty()
-                                        && !bottom_pane.composer.is_empty()
-                                    {
-                                        let restored = std::mem::take(
-                                            &mut queued_followup_submissions,
-                                        )
-                                        .into_iter()
-                                        .collect::<Vec<_>>()
-                                        .join("\n\n");
-                                        let preview = user_intent_preview(&restored);
-                                        bottom_pane.restore_into_composer(&restored);
-                                        chat_widget.commit_system(
-                                            history_cell::system::SystemCell::info(format!(
-                                                "Queued follow-up kept with your current draft: {preview}",
-                                            )),
-                                        );
-                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                    }
-
-                                    if let Some(next_turn_submission) = queued_followup_submissions.pop_front() {
-                                        bottom_pane.composer.set_text(&next_turn_submission);
+                                    // The same gate used by modal completion. An open view,
+                                    // catalog load, or background read must keep the
+                                    // follow-up queued so a synthetic Enter cannot be
+                                    // consumed by that view.
+                                    let handoff = turn_settlement_followup_handoff(
+                                        &mut queued_followup_submissions,
+                                        &mut bottom_pane,
+                                        &mut chat_widget,
+                                        model_catalog_loading,
+                                        slash_background_read_count,
+                                        &mut followup_replay_armed,
+                                    );
+                                    if handoff == QueuedFollowupHandoff::SubmitNext {
                                         event_stream.push_front(TuiEvent::Key(
                                             crossterm::event::KeyEvent::new(
                                                 crossterm::event::KeyCode::Enter,
                                                 crossterm::event::KeyModifiers::NONE,
                                             ),
                                         ));
+                                    }
+                                    if matches!(
+                                        handoff,
+                                        QueuedFollowupHandoff::HeldWithDraft
+                                            | QueuedFollowupHandoff::RestoredAfterSessionChange
+                                    ) {
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
 
                                 }
@@ -10264,6 +10681,7 @@ pub(crate) async fn run_tui_session(
                                 .await;
                             }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
+                                let mut followup_session_rebound = false;
                                 if let Some(result) = result {
                                     if let bottom_pane::view::ViewResult::WorkspaceTrust(choice) = &result {
                                         match choice {
@@ -10309,6 +10727,17 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                    &mut followup_replay_armed,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10316,6 +10745,8 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
                                     if let bottom_pane::view::ViewResult::Login { username, password } = &result {
+                                        let auth_session_id = state.session_id.clone();
+                                        let auth_epoch = state.session_attachment_epoch;
                                         match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
@@ -10346,6 +10777,21 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                    &mut followup_replay_armed,
+                                            followup_gate_after_auth(
+                                                auth_session_id.as_deref(),
+                                                auth_epoch,
+                                                state.session_id.as_deref(),
+                                                state.session_attachment_epoch,
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10353,6 +10799,8 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
                                     if let bottom_pane::view::ViewResult::Register { username, email, password } = &result {
+                                        let auth_session_id = state.session_id.clone();
+                                        let auth_epoch = state.session_attachment_epoch;
                                         match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
@@ -10383,6 +10831,21 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                    &mut followup_replay_armed,
+                                            followup_gate_after_auth(
+                                                auth_session_id.as_deref(),
+                                                auth_epoch,
+                                                state.session_id.as_deref(),
+                                                state.session_attachment_epoch,
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10429,6 +10892,17 @@ pub(crate) async fn run_tui_session(
                                             Err(e) => history_cell::system::SystemCell::error(e),
                                         };
                                         chat_widget.commit_system(msg);
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                    &mut followup_replay_armed,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10473,6 +10947,17 @@ pub(crate) async fn run_tui_session(
                                             pending_deferred_slash_flush = false;
                                             let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                             flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            resume_queued_followups_after_modal(
+                                                &mut queued_followup_submissions,
+                                                &mut bottom_pane,
+                                                &mut chat_widget,
+                                                &mut event_stream,
+                    &mut followup_replay_armed,
+                                                followup_release_gate(
+                                                    model_catalog_loading,
+                                                    slash_background_read_count,
+                                                ),
+                                            );
                                         } else {
                                             use crate::tui::bottom_pane::list_selection_view::{
                                                 ListSelectionView, SelectionItem,
@@ -10538,6 +11023,17 @@ pub(crate) async fn run_tui_session(
                                         pending_deferred_slash_flush = false;
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                    &mut followup_replay_armed,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
                                         continue;
@@ -10717,6 +11213,7 @@ pub(crate) async fn run_tui_session(
                                         }
                                         let session_rebound = state.session_id != pre_sid
                                             || state.session_attachment_epoch != pre_attachment_epoch;
+                                        followup_session_rebound = session_rebound;
                                         let restored_work_submissions = if session_rebound {
                                             restore_work_start_submissions_after_scope_change(
                                                 &mut pending_work_start_submissions,
@@ -10836,6 +11333,18 @@ pub(crate) async fn run_tui_session(
                                     // as the Agents branch above.
                                     pending_deferred_slash_flush = false;
                                 }
+                                resume_queued_followups_after_modal(
+                                    &mut queued_followup_submissions,
+                                    &mut bottom_pane,
+                                    &mut chat_widget,
+                                    &mut event_stream,
+                    &mut followup_replay_armed,
+                                    FollowupReleaseGate {
+                                        model_catalog_loading,
+                                        background_reads_in_flight: slash_background_read_count > 0,
+                                        session_rebound: followup_session_rebound,
+                                    },
+                                );
                             }
                             BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }
                             BottomPaneAction::Consumed => {}
@@ -13826,26 +14335,496 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(active_submission_routes_to_next_turn(
             "list my workspaces",
             false,
             false,
             true,
+            false,
         ));
         assert!(active_submission_routes_to_next_turn(
             "please continue",
             true,
             false,
             false,
+            false,
+        ));
+        assert!(active_submission_routes_to_next_turn(
+            "再加测试",
+            false,
+            false,
+            false,
+            true,
         ));
     }
 
     #[test]
+    fn unbound_run_holds_follow_up_for_the_next_turn() {
+        assert!(follow_up_waits_for_unbound_run(None));
+        assert!(follow_up_waits_for_unbound_run(Some("")));
+        assert!(follow_up_waits_for_unbound_run(Some("   ")));
+        assert!(!follow_up_waits_for_unbound_run(Some("run-1")));
+
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        let mut deferred = false;
+        assert!(defer_follow_up_before_run_bind(
+            "用 Python 写",
+            None,
+            &mut deferred,
+            &mut bottom_pane,
+            &mut chat_widget,
+        ));
+        assert!(deferred);
+        assert!(run_control.pending_remote_submission_ids().is_empty());
+        assert_eq!(bottom_pane.pending_user_intent_count(), 0);
+
+        // RunBound flips the id, but the latch keeps the newer message behind A.
+        assert!(!defer_follow_up_before_run_bind(
+            "再加测试",
+            Some("run-1"),
+            &mut deferred,
+            &mut bottom_pane,
+            &mut chat_widget,
+        ));
+        assert!(active_submission_routes_to_next_turn(
+            "再加测试",
+            false,
+            false,
+            false,
+            deferred,
+        ));
+        assert!(bottom_pane.queue_next_turn_submission("再加测试".to_string()));
+        assert!(run_control.pending_remote_submission_ids().is_empty());
+
+        // A slash command already queued must not itself arm the latch.
+        let mut slash_only = BottomPane::new();
+        let mut slash_deferred = false;
+        assert!(slash_only.queue_next_turn_submission("/status".to_string()));
+        assert!(!defer_follow_up_before_run_bind(
+            "plain text after slash",
+            Some("run-1"),
+            &mut slash_deferred,
+            &mut slash_only,
+            &mut chat_widget,
+        ));
+        assert!(!slash_deferred);
+
+        let mut queued = bottom_pane.take_queued_next_turn_submissions();
+        let mut followups = std::collections::VecDeque::new();
+        assert!(
+            settle_followup_submissions(&mut followups, std::iter::empty(), &mut queued, true)
+                .is_none()
+        );
+        assert_eq!(
+            followups.into_iter().collect::<Vec<_>>(),
+            vec!["用 Python 写".to_string(), "再加测试".to_string()]
+        );
+        assert!(!UNBOUND_RUN_FOLLOW_UP_NOTICE.contains("HTTP"));
+        assert!(UNBOUND_RUN_FOLLOW_UP_NOTICE.contains("queued"));
+
+        // A is replayed as the next turn while B is still queued. C must stay
+        // behind B even after that turn's run id binds.
+        let mut replayed = VecDeque::from(["用 Python 写".to_string(), "再加测试".to_string()]);
+        let mut replay_pane = BottomPane::new();
+        let mut replay_chat = chat_widget::ChatWidget::new("");
+        assert!(matches!(
+            release_next_queued_followup(&mut replayed, &mut replay_pane, &mut replay_chat),
+            QueuedFollowupRelease::SubmitNext
+        ));
+        assert_eq!(replay_pane.composer.text().trim(), "用 Python 写");
+        replay_pane.composer.set_text("");
+        let replay_latch = model_facing_followup_backlog(&replayed);
+        assert!(replay_latch);
+        assert!(active_submission_routes_to_next_turn(
+            "第三句",
+            false,
+            false,
+            false,
+            replay_latch,
+        ));
+        let mut replay_deferred = replay_latch;
+        assert!(!defer_follow_up_before_run_bind(
+            "第三句",
+            Some("run-1"),
+            &mut replay_deferred,
+            &mut replay_pane,
+            &mut replay_chat,
+        ));
+        assert!(replay_pane.queue_next_turn_submission("第三句".to_string()));
+        let mut post = replay_pane.take_queued_next_turn_submissions();
+        assert!(
+            settle_followup_submissions(&mut replayed, std::iter::empty(), &mut post, true)
+                .is_none()
+        );
+        assert_eq!(
+            replayed.into_iter().collect::<Vec<_>>(),
+            vec!["再加测试".to_string(), "第三句".to_string()]
+        );
+
+        let mut slash_queue = VecDeque::from(["/model gpt".to_string(), "plain A".to_string()]);
+        assert!(local_slash_releases_followups(true, false, false));
+        assert!(!local_slash_releases_followups(true, false, true));
+        assert!(!local_slash_releases_followups(false, false, false));
+        let mut slash_pane = BottomPane::new();
+        let mut slash_chat = chat_widget::ChatWidget::new("");
+        assert!(matches!(
+            release_next_queued_followup(&mut slash_queue, &mut slash_pane, &mut slash_chat),
+            QueuedFollowupRelease::SubmitNext
+        ));
+        assert_eq!(slash_pane.composer.text().trim(), "/model gpt");
+        slash_pane.composer.set_text("");
+        assert!(matches!(
+            release_next_queued_followup(&mut slash_queue, &mut slash_pane, &mut slash_chat),
+            QueuedFollowupRelease::SubmitNext
+        ));
+        assert_eq!(slash_pane.composer.text().trim(), "plain A");
+        assert!(slash_queue.is_empty());
+
+        let mut auth_queue = VecDeque::from(["queued during refresh".to_string()]);
+        let mut auth_post = VecDeque::new();
+        let restored = settle_followup_submissions(
+            &mut auth_queue,
+            std::iter::empty(),
+            &mut auth_post,
+            should_start_queued_followups(true, false, false, false, true),
+        );
+        assert_eq!(restored.as_deref(), Some("queued during refresh"));
+        assert!(auth_queue.is_empty());
+
+        let mut failed_queue = VecDeque::from(["after failed turn".to_string()]);
+        let mut failed_post = VecDeque::new();
+        let restored = settle_followup_submissions(
+            &mut failed_queue,
+            std::iter::empty(),
+            &mut failed_post,
+            should_start_queued_followups(false, false, false, false, false),
+        );
+        assert_eq!(restored.as_deref(), Some("after failed turn"));
+
+        let mut closed_view = VecDeque::from(["plain A".to_string()]);
+        let mut closed_pane = BottomPane::new();
+        let mut closed_chat = chat_widget::ChatWidget::new("");
+        assert!(!closed_pane.has_active_view());
+        assert!(matches!(
+            release_next_queued_followup(&mut closed_view, &mut closed_pane, &mut closed_chat),
+            QueuedFollowupRelease::SubmitNext
+        ));
+        assert_eq!(closed_pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn unrelated_view_close_holds_followup_while_model_catalog_loads() {
+        use bottom_pane::help_view::HelpView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        pane.push_view(Box::new(HelpView::new()));
+        let loading = FollowupReleaseGate {
+            model_catalog_loading: true,
+            background_reads_in_flight: false,
+            session_rebound: false,
+        };
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, loading),
+            QueuedFollowupHandoff::Held
+        );
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            bottom_pane::BottomPaneAction::ViewCompleted { .. }
+        ));
+        assert!(!pane.has_active_view());
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, loading),
+            QueuedFollowupHandoff::Held
+        );
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+
+        let ready = FollowupReleaseGate {
+            model_catalog_loading: false,
+            ..loading
+        };
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, ready),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn config_cancel_releases_the_following_backlog() {
+        use astra_config::runtime_config::RuntimeConfig;
+        use bottom_pane::config_edit_view::ConfigEditView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        pane.push_view(Box::new(ConfigEditView::new(RuntimeConfig::default())));
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    model_catalog_loading: false,
+                    background_reads_in_flight: false,
+                    session_rebound: false,
+                },
+            ),
+            QueuedFollowupHandoff::Held
+        );
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            bottom_pane::BottomPaneAction::ViewCompleted {
+                result: Some(bottom_pane::view::ViewResult::ConfigEdit { .. }),
+                ..
+            }
+        ));
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    model_catalog_loading: false,
+                    background_reads_in_flight: false,
+                    session_rebound: false,
+                },
+            ),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn background_read_in_flight_holds_followup_until_it_finishes() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        let in_flight = FollowupReleaseGate {
+            model_catalog_loading: false,
+            background_reads_in_flight: true,
+            session_rebound: false,
+        };
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, in_flight),
+            QueuedFollowupHandoff::Held
+        );
+        assert!(queued.iter().eq(["plain A".to_string()].iter()));
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    background_reads_in_flight: false,
+                    ..in_flight
+                },
+            ),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn session_rebind_restores_followup_instead_of_submitting() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    model_catalog_loading: false,
+                    background_reads_in_flight: false,
+                    session_rebound: true,
+                },
+            ),
+            QueuedFollowupHandoff::RestoredAfterSessionChange
+        );
+        assert!(queued.is_empty());
+        assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn turn_settlement_keeps_followup_queued_while_tasks_view_is_open() {
+        use bottom_pane::background_task_view::BackgroundTaskView;
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        pane.push_view(Box::new(BackgroundTaskView::new(Vec::new())));
+        assert!(pane.has_active_view());
+        let mut replay_armed = false;
+        assert_eq!(
+            turn_settlement_followup_handoff(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                false,
+                0,
+                &mut replay_armed,
+            ),
+            QueuedFollowupHandoff::Held
+        );
+        assert!(!replay_armed);
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+        assert!(pane.composer.is_empty());
+    }
+
+    #[test]
+    fn turn_settlement_replay_does_not_reorder_a_two_message_backlog() {
+        let mut queued = VecDeque::from(["plain A".to_string(), "plain B".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        let mut replay_armed = false;
+        assert_eq!(
+            turn_settlement_followup_handoff(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                false,
+                0,
+                &mut replay_armed,
+            ),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        let replayed = pane.composer.text();
+        assert_eq!(replayed.trim(), "plain A");
+        assert!(!admit_idle_followup(
+            &replayed,
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert!(!replay_armed);
+        assert_eq!(queued, VecDeque::from(["plain B".to_string()]));
+        assert!(slash_result_releases_followups(
+            &slash_dispatch::SlashResult::OpenWorkTasks
+        ));
+        assert!(!slash_result_releases_followups(
+            &slash_dispatch::SlashResult::Authenticate { register: false }
+        ));
+        assert!(!slash_result_releases_followups(
+            &slash_dispatch::SlashResult::Authenticate { register: true }
+        ));
+    }
+
+    #[test]
+    fn rejected_login_and_register_restore_the_following_message() {
+        for _register in [false, true] {
+            let mut queued = VecDeque::from(["plain A".to_string()]);
+            let mut pane = BottomPane::new();
+            let mut chat = chat_widget::ChatWidget::new("");
+            assert!(recover_followups_after_rejected_authentication(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+            ));
+            assert!(queued.is_empty());
+            assert_eq!(pane.composer.text().trim(), "plain A");
+        }
+    }
+
+    #[test]
+    fn cancelled_background_read_restores_the_held_followup() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        assert!(recover_queued_followups_after_cancelled_read(
+            &mut queued,
+            &mut pane,
+            &mut chat
+        ));
+        assert!(queued.is_empty());
+        assert_eq!(pane.composer.text().trim(), "plain A");
+        assert!(!recover_queued_followups_after_cancelled_read(
+            &mut queued,
+            &mut pane,
+            &mut chat
+        ));
+    }
+
+    #[test]
+    fn auth_session_change_restores_followup_and_same_session_can_submit() {
+        let changed = followup_gate_after_auth(Some("old"), 1, Some("new"), 2, false, 0);
+        assert!(changed.session_rebound);
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, changed),
+            QueuedFollowupHandoff::RestoredAfterSessionChange
+        );
+        assert!(queued.is_empty());
+        assert_eq!(pane.composer.text().trim(), "plain A");
+
+        let same = followup_gate_after_auth(Some("same"), 4, Some("same"), 4, false, 0);
+        assert!(!same.session_rebound);
+        let mut queued = VecDeque::from(["plain B".to_string()]);
+        let mut pane = BottomPane::new();
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, same),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain B");
+    }
+
+    #[test]
+    fn idle_submission_waits_behind_a_held_backlog_unless_it_is_the_replay() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut replay_armed = false;
+        assert!(admit_idle_followup(
+            "manual B",
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert_eq!(
+            queued.into_iter().collect::<Vec<_>>(),
+            vec!["plain A".to_string(), "manual B".to_string()]
+        );
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut replay_armed = true;
+        assert!(!admit_idle_followup(
+            "/model gpt",
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert!(!replay_armed);
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut replay_armed = false;
+        assert!(!admit_idle_followup(
+            "/help",
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+    }
+
+    #[test]
     fn only_completed_ownership_transfer_can_replay_after_interrupted_parent() {
-        assert!(!should_start_queued_followups(false, true, false, false));
-        assert!(should_start_queued_followups(false, true, true, false));
-        assert!(!should_start_queued_followups(false, true, true, true));
+        assert!(!should_start_queued_followups(
+            false, true, false, false, false
+        ));
+        assert!(should_start_queued_followups(
+            false, true, true, false, false
+        ));
+        assert!(!should_start_queued_followups(
+            false, true, true, true, false
+        ));
+        assert!(!should_start_queued_followups(
+            true, false, false, false, true
+        ));
     }
 
     #[test]
