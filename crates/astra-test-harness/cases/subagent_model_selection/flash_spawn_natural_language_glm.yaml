@@ -3,26 +3,75 @@ description: |
   Verify an authenticated natural-language hard model requirement binds a
   child even when the parent leaves the structured selector unset.
 prompt: |
-  For the child verification task, the user requires the authorized chat model
-  named glm-5.2. This is a hard requirement, not a suggestion. It remains in
-  force independently of the optional tool selector: leaving that selector
-  unset or null does not cancel the user's model requirement. Call
-  agent(action="spawn") exactly once; use description "Natural language model
-  requirement check", agent_type "explore", and prompt "Reply exactly
-  GLM-NATURAL-REQUIREMENT-OK". Leave requested_model_policy unset or null; do
-  not pass a model selector. Do not retry or call other tools.
-  After the child finishes, report its exact reply.
+  Please start one small child with Astra's agent tool. Use model glm-5.2 for
+  it; this is a hard user requirement. Astra applies user-level model
+  requirements independently of the optional selector, so leave
+  requested_model_policy unset. Do not inspect files or use shell tools, and do
+  not retry. Invoke agent(action="spawn") once with description "Natural
+  language model requirement check", agent_type "explore", and prompt "Reply
+  exactly GLM-NATURAL-REQUIREMENT-OK". Report the exact reply.
 debug_log: true
 capability: delegation
 timeout_seconds: 180
 criteria:
   - type: exit_code
     code: 0
-  - type: all_of
+  - type: any_of
     criteria:
-      - type: tools_count_between
-        min: 1
-        max: 2
+      - type: all_of
+        criteria:
+          - type: session_event_count
+            event_type: ToolCallStarted
+            min: 1
+            max: 1
+            json_match:
+              path: /event_type
+              equals: ToolCallStarted
+              same_run_as:
+                event_type: agent_spawned
+                run_id_path: /metadata/parent_run_id
+          - type: session_event_count
+            event_type: ToolCallStarted
+            min: 1
+            max: 1
+            json_match:
+              path: /payload/tool_name
+              equals: agent
+              same_run_as:
+                event_type: agent_spawned
+                run_id_path: /metadata/parent_run_id
+      - type: all_of
+        criteria:
+          - type: session_event_count
+            event_type: ToolCallStarted
+            min: 2
+            max: 2
+            json_match:
+              path: /event_type
+              equals: ToolCallStarted
+              same_run_as:
+                event_type: agent_spawned
+                run_id_path: /metadata/parent_run_id
+          - type: session_event_count
+            event_type: ToolCallStarted
+            min: 1
+            max: 1
+            json_match:
+              path: /payload/tool_name
+              equals: tool_search
+              same_run_as:
+                event_type: agent_spawned
+                run_id_path: /metadata/parent_run_id
+          - type: session_event_count
+            event_type: ToolCallStarted
+            min: 1
+            max: 1
+            json_match:
+              path: /payload/tool_name
+              equals: agent
+              same_run_as:
+                event_type: agent_spawned
+                run_id_path: /metadata/parent_run_id
   - type: journal_tool_call_count
     name: agent
     min: 1
@@ -40,11 +89,6 @@ criteria:
   - type: journal_tool_json
     name: agent
     document: arguments
-    path: /prompt
-    equals: Reply exactly GLM-NATURAL-REQUIREMENT-OK
-  - type: journal_tool_json
-    name: agent
-    document: arguments
     path: /requested_model_policy
     equals: null
     allow_missing: true
@@ -58,6 +102,10 @@ criteria:
     document: result
     path: /result
     equals: GLM-NATURAL-REQUIREMENT-OK
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
   - type: session_event_count
     event_type: agent_spawned
     min: 1
