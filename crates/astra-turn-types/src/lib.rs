@@ -79,8 +79,8 @@ pub use context_identity::{
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
 pub use delegation_model_admission::{
-    DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
-    DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
+    DelegationCatalogResolutionFailure, DelegationIntentRequirement, DelegationIntentRequirements,
+    DelegationModelAdmission, DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
     DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
     DelegationRequirementPropagation, DelegationRequirementStrength,
     DelegationUserRequirementSource,
@@ -94,9 +94,9 @@ pub use explain_analyze::{
     ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
     ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
     ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
-    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
-    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
-    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeDecisionDetailV1,
+    ExplainAnalyzeEventV1, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
+    ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
     ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,

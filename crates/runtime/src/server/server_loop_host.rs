@@ -3880,7 +3880,16 @@ impl ExplainAnalyzeContext {
         outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
         usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
     ) -> Option<Value> {
-        self.event_with_context(node, transition, instant, duration_ms, outcome, usage, None)
+        self.event_with_context(
+            node,
+            transition,
+            instant,
+            duration_ms,
+            outcome,
+            usage,
+            None,
+            None,
+        )
     }
 
     fn event_with_context(
@@ -3892,6 +3901,7 @@ impl ExplainAnalyzeContext {
         outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
         usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
         context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+        decision_detail: Option<astra_turn_types::ExplainAnalyzeDecisionDetailV1>,
     ) -> Option<Value> {
         self.event_with_context_and_coverage(
             node,
@@ -3901,6 +3911,7 @@ impl ExplainAnalyzeContext {
             outcome,
             usage,
             context_metrics,
+            decision_detail,
             Vec::new(),
         )
     }
@@ -3914,6 +3925,7 @@ impl ExplainAnalyzeContext {
         outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
         usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
         context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+        decision_detail: Option<astra_turn_types::ExplainAnalyzeDecisionDetailV1>,
         coverage_gaps: Vec<astra_turn_types::ExplainAnalyzeCoverageGapV1>,
     ) -> Option<Value> {
         let (start_elapsed_ms, duration_ms, outcome, usage) = match transition {
@@ -3922,6 +3934,7 @@ impl ExplainAnalyzeContext {
                     || outcome.is_some()
                     || usage.is_some()
                     || context_metrics.is_some()
+                    || decision_detail.is_some()
                 {
                     return None;
                 }
@@ -3952,6 +3965,7 @@ impl ExplainAnalyzeContext {
             start_elapsed_ms,
             duration_ms,
             outcome,
+            decision_detail,
             usage,
             context: context_metrics,
             coverage_gaps,
@@ -4253,6 +4267,8 @@ pub struct ServerAgenticLoopHost {
     explain_analyze_admission_parents:
         Arc<std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteParent>>>,
     explain_analyze_admission_nodes: HashMap<String, String>,
+    explain_analyze_admission_decision_details:
+        HashMap<String, astra_turn_types::ExplainAnalyzeDecisionDetailV1>,
     explain_analyze_tool_nodes: HashMap<String, String>,
     pending_request_preparation_context:
         Option<(u32, u32, astra_turn_types::ExplainAnalyzeContextMetricsV1)>,
@@ -7287,6 +7303,7 @@ impl ServerAgenticLoopHostBuilder {
             explain_analyze_tool_route_observer: None,
             explain_analyze_admission_parents: Arc::new(std::sync::Mutex::new(HashMap::new())),
             explain_analyze_admission_nodes: HashMap::new(),
+            explain_analyze_admission_decision_details: HashMap::new(),
             explain_analyze_tool_nodes: HashMap::new(),
             pending_request_preparation_context: None,
             event_protocol_fault: None,
@@ -7910,6 +7927,7 @@ impl ServerAgenticLoopHost {
         calls: &[PendingDelegationCall],
         error_kind: &str,
         reason: &str,
+        decision_detail: Option<astra_turn_types::ExplainAnalyzeDecisionDetailV1>,
     ) -> (
         std::collections::HashMap<
             String,
@@ -7957,6 +7975,34 @@ impl ServerAgenticLoopHost {
             }
         }
         let mut results = self.server_preflight_blocked_results(&blocked, error_kind, reason);
+        if let Some(detail) = decision_detail {
+            let blocked_ids = blocked
+                .iter()
+                .map(|call| {
+                    astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(call).0
+                })
+                .collect::<HashSet<_>>();
+            for result in &mut results {
+                if !blocked_ids.contains(&result.request_id) {
+                    continue;
+                }
+                result
+                    .tool_result_fields
+                    .get_or_insert_with(Map::new)
+                    .insert(
+                        "decision_detail".to_string(),
+                        serde_json::to_value(&detail)
+                            .expect("typed Explain decision detail serializes"),
+                    );
+                if self.explain_analyze_context.is_some()
+                    && self.explain_analyze_admission_decision_details.len() < 16
+                {
+                    self.explain_analyze_admission_decision_details
+                        .entry(result.request_id.clone())
+                        .or_insert_with(|| detail.clone());
+                }
+            }
+        }
         results.extend(self.server_preflight_blocked_results(
             &unavailable,
             "delegation_preparation_unavailable",
@@ -8024,8 +8070,9 @@ impl ServerAgenticLoopHost {
     ) -> astra_turn_types::DelegationIntentRequirements {
         use astra_services::delegation_model_requirement::DelegationRequirementDisposition;
         use astra_turn_types::{
-            DelegationIntentRequirement, DelegationIntentRequirements,
-            DelegationReasoningRequirement, DelegationUserRequirementSource,
+            DelegationCatalogResolutionFailure, DelegationIntentRequirement,
+            DelegationIntentRequirements, DelegationReasoningRequirement,
+            DelegationUserRequirementSource,
         };
 
         let origin = DelegationUserRequirementSource {
@@ -8091,7 +8138,9 @@ impl ServerAgenticLoopHost {
                 return DelegationIntentRequirements::Unconstrained { source: origin };
             }
             DelegationRequirementDisposition::Unresolved => {
-                return unresolved(&extracted.unresolved.join("; "));
+                return unresolved(
+                    "The requested model or reasoning could not be interpreted; clarify the task and model.",
+                );
             }
             DelegationRequirementDisposition::Resolved => {}
         }
@@ -8119,14 +8168,21 @@ impl ServerAgenticLoopHost {
         let Some(catalog) = catalog else {
             return unavailable("The authorized model catalog is unavailable.");
         };
-        let Ok(resolved) =
+        let resolved = match
             astra_services::delegation_model_requirement::resolve_delegation_intent_requirements(
                 &extracted, &catalog,
             )
-        else {
-            return unresolved(
-                "The requested model is unavailable or ambiguous; choose an exact authorized model.",
-            );
+        {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                return DelegationIntentRequirements::CatalogResolutionFailed {
+                    source: origin,
+                    failure: DelegationCatalogResolutionFailure {
+                        requirement_index: failure.requirement_index,
+                        match_count: failure.match_count,
+                    },
+                };
+            }
         };
         let requirements = resolved
             .into_iter()
@@ -8179,6 +8235,9 @@ impl ServerAgenticLoopHost {
             }
             DelegationIntentRequirements::Unresolved { reason, .. } => return Err(reason.clone()),
             DelegationIntentRequirements::Unavailable { reason, .. } => return Err(reason.clone()),
+            DelegationIntentRequirements::CatalogResolutionFailed { failure, .. } => {
+                return Err(failure.safe_message());
+            }
             DelegationIntentRequirements::Unassessed => {
                 return Err("Delegation model requirements were not assessed.".into());
             }
@@ -13388,6 +13447,21 @@ impl ServerAgenticLoopHost {
         outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
         finished_at: Instant,
     ) {
+        self.finish_explain_analyze_timed_node_with_decision_detail(
+            node_id,
+            outcome,
+            finished_at,
+            None,
+        );
+    }
+
+    fn finish_explain_analyze_timed_node_with_decision_detail(
+        &mut self,
+        node_id: &str,
+        outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+        finished_at: Instant,
+        decision_detail: Option<astra_turn_types::ExplainAnalyzeDecisionDetailV1>,
+    ) {
         let Some(node) = self.explain_analyze_open_nodes.get(node_id) else {
             return;
         };
@@ -13397,7 +13471,15 @@ impl ServerAgenticLoopHost {
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        self.finish_explain_analyze_node_at(node_id, duration_ms, outcome, None, finished_at, None);
+        self.finish_explain_analyze_node_at(
+            node_id,
+            duration_ms,
+            outcome,
+            None,
+            finished_at,
+            None,
+            decision_detail,
+        );
     }
 
     fn finish_explain_analyze_tool_call(&mut self, event: &Value) {
@@ -13434,11 +13516,19 @@ impl ServerAgenticLoopHost {
             },
         };
         let finished_at = Instant::now();
+        let decision_detail = self
+            .explain_analyze_admission_decision_details
+            .remove(&call_id);
         if let Some(node_id) = self.explain_analyze_admission_nodes.remove(&call_id) {
             if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
                 parents.remove(&call_id);
             }
-            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+            self.finish_explain_analyze_timed_node_with_decision_detail(
+                &node_id,
+                outcome,
+                finished_at,
+                decision_detail,
+            );
         }
         if let Some(node_id) = self.explain_analyze_tool_nodes.remove(&call_id) {
             self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
@@ -13559,6 +13649,7 @@ impl ServerAgenticLoopHost {
             None,
             finished_at,
             context_metrics,
+            None,
         );
     }
 
@@ -13570,6 +13661,7 @@ impl ServerAgenticLoopHost {
         usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
         finished_at: Instant,
         context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+        decision_detail: Option<astra_turn_types::ExplainAnalyzeDecisionDetailV1>,
     ) {
         let Some(context) = self.explain_analyze_context.clone() else {
             return;
@@ -13607,6 +13699,14 @@ impl ServerAgenticLoopHost {
                 }
                 node
             });
+        let decision_detail = decision_detail.filter(|_| {
+            node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Admission
+                && matches!(
+                    outcome,
+                    astra_turn_types::ExplainAnalyzeOutcomeV1::Blocked
+                        | astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected
+                )
+        });
         if let Some(event) = context.event_with_context(
             &node,
             astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
@@ -13615,6 +13715,7 @@ impl ServerAgenticLoopHost {
             Some(outcome),
             usage,
             context_metrics,
+            decision_detail,
         ) {
             self.emit_progress_event(event);
         }
@@ -19402,6 +19503,22 @@ fn delegation_requirements_by_strength(
         .chain(requirements.iter().filter(|item| item.strength == Default))
 }
 
+fn delegation_catalog_resolution_explain_detail(
+    requirements: &astra_turn_types::DelegationIntentRequirements,
+) -> Option<astra_turn_types::ExplainAnalyzeDecisionDetailV1> {
+    let astra_turn_types::DelegationIntentRequirements::CatalogResolutionFailed { failure, .. } =
+        requirements
+    else {
+        return None;
+    };
+    Some(
+        astra_turn_types::ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+            requirement_index: failure.requirement_index,
+            match_count: failure.match_count,
+        },
+    )
+}
+
 impl ServerAgenticLoopHost {
     async fn admitted_delegation_models(
         &mut self,
@@ -19452,6 +19569,13 @@ impl ServerAgenticLoopHost {
         }
         if pending.is_empty() {
             return (std::collections::HashMap::new(), Vec::new());
+        }
+        // Start the existing Admission span before any durable preparation
+        // probe, intent extraction, or authorized catalog lookup. Successful
+        // calls close it when dispatch is emitted; pre-execution rejections
+        // close it with their blocked outcome below.
+        for item in &pending {
+            self.start_explain_analyze_tool_admission(&item.call, state.current_round_index);
         }
         let mut frozen = std::collections::HashMap::new();
         let mut missing_probes = std::collections::HashMap::new();
@@ -19527,6 +19651,7 @@ impl ServerAgenticLoopHost {
                     &overflow,
                     "delegation_model_scope_unresolved",
                     "Too many delegated task slots to bind model requirements safely.",
+                    None,
                 )
                 .await;
             frozen.extend(recovered);
@@ -19552,6 +19677,7 @@ impl ServerAgenticLoopHost {
                         &pending,
                         "delegation_model_scope_unresolved",
                         "New user guidance has not been reconciled with inherited model requirements; no child was started.",
+                        None,
                     ).await);
             }
             let inherited = &state
@@ -19565,6 +19691,7 @@ impl ServerAgenticLoopHost {
                         &pending,
                         "delegation_model_scope_unresolved",
                         "Inherited model requirements are malformed; no child was started.",
+                        None,
                     )
                     .await,
                 );
@@ -19572,6 +19699,7 @@ impl ServerAgenticLoopHost {
             let origin = match inherited {
                 DelegationIntentRequirements::Unconstrained { source } => source,
                 DelegationIntentRequirements::Requirements { source, .. } => source,
+                DelegationIntentRequirements::CatalogResolutionFailed { source, .. } => source,
                 DelegationIntentRequirements::Unassessed
                 | DelegationIntentRequirements::Unresolved { .. }
                 | DelegationIntentRequirements::Unavailable { .. } => {
@@ -19580,15 +19708,18 @@ impl ServerAgenticLoopHost {
                         &pending,
                         "delegation_model_scope_unresolved",
                         "Inherited user model requirements are not resolved; no child was started.",
+                        None,
                     ).await);
                 }
             };
+            let decision_detail = delegation_catalog_resolution_explain_detail(inherited);
             let Some(source) = inherited_delegation_source_from_state(state, origin) else {
                 return merge(self.recover_existing_or_block_new_delegation_calls(
                     state,
                     &pending,
                     "delegation_model_scope_unresolved",
                     "Inherited user model requirement provenance is invalid; no child was started.",
+                    None,
                 ).await);
             };
             let scope_evidence = match inherited {
@@ -19617,6 +19748,7 @@ impl ServerAgenticLoopHost {
                             &pending,
                             "delegation_model_scope_unresolved",
                             &reason,
+                            decision_detail,
                         )
                         .await
                     }
@@ -19631,6 +19763,7 @@ impl ServerAgenticLoopHost {
                 &pending,
                 "delegation_model_scope_unresolved",
                 "The authoritative user model requirements are unavailable; no child was started.",
+                None,
             ).await);
         };
         let user_text = authoritative_delegation_user_text(state).expect("source has user text");
@@ -19648,6 +19781,10 @@ impl ServerAgenticLoopHost {
             astra_turn_types::DelegationIntentRequirements::Unconstrained { source }
             | astra_turn_types::DelegationIntentRequirements::Unresolved { source, .. }
             | astra_turn_types::DelegationIntentRequirements::Unavailable { source, .. }
+            | astra_turn_types::DelegationIntentRequirements::CatalogResolutionFailed {
+                source,
+                ..
+            }
             | astra_turn_types::DelegationIntentRequirements::Requirements { source, .. } => {
                 Some(source)
             }
@@ -19676,6 +19813,7 @@ impl ServerAgenticLoopHost {
             .request_constraints
             .delegated_model_requirements
             .clone();
+        let decision_detail = delegation_catalog_resolution_explain_detail(&assessed);
         merge(
             match self
                 .bind_assessed_delegation_models(state, &source, &user_text, &pending, &assessed)
@@ -19688,6 +19826,7 @@ impl ServerAgenticLoopHost {
                         &pending,
                         "delegation_model_scope_unresolved",
                         &reason,
+                        decision_detail,
                     )
                     .await
                 }
@@ -20065,6 +20204,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             self.explain_analyze_context = None;
             self.explain_analyze_open_nodes.clear();
             self.explain_analyze_admission_nodes.clear();
+            self.explain_analyze_admission_decision_details.clear();
             self.explain_analyze_tool_nodes.clear();
             return;
         };
@@ -20082,6 +20222,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         self.explain_analyze_open_nodes.clear();
         self.explain_analyze_admission_nodes.clear();
+        self.explain_analyze_admission_decision_details.clear();
         self.explain_analyze_tool_nodes.clear();
         if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
             parents.clear();
@@ -20234,6 +20375,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 None,
                 finished_at,
                 None,
+                None,
             );
         }
         let unfinished_settlements = self
@@ -20256,15 +20398,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 None,
                 finished_at,
                 None,
+                None,
             );
         }
         let unfinished_admissions = self
             .explain_analyze_admission_nodes
-            .values()
-            .cloned()
+            .iter()
+            .map(|(call_id, node_id)| (call_id.clone(), node_id.clone()))
             .collect::<Vec<_>>();
-        for node_id in unfinished_admissions {
-            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        for (call_id, node_id) in unfinished_admissions {
+            let detail = self
+                .explain_analyze_admission_decision_details
+                .remove(&call_id);
+            self.finish_explain_analyze_timed_node_with_decision_detail(
+                &node_id,
+                outcome,
+                finished_at,
+                detail,
+            );
         }
         let unfinished_tools = self
             .explain_analyze_tool_nodes
@@ -20311,6 +20462,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             Some(outcome),
             None,
             None,
+            None,
             coverage_gaps,
         ) {
             event["auxiliary_usage"] =
@@ -20330,6 +20482,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             self.emit_progress_event(event);
         }
         self.explain_analyze_admission_nodes.clear();
+        self.explain_analyze_admission_decision_details.clear();
         self.explain_analyze_tool_nodes.clear();
         if let Some(executor) = state.runtime_tool_executor.as_deref() {
             executor.set_tool_route_observer(None);
@@ -20400,6 +20553,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             None,
             receipt.finished_at,
             context_metrics,
+            None,
         );
     }
 
@@ -23797,6 +23951,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     Some(result.request_id.as_str()) == invocation.provider_call_id()
                 })?;
                 let fields = result.tool_result_fields.as_ref();
+                if let Some(call_id) = invocation.provider_call_id() {
+                    self.finish_explain_analyze_tool_call(&json!({
+                        "type": "tool_call_end",
+                        "call_id": call_id,
+                        "status": "blocked"
+                    }));
+                }
                 let error_kind = fields
                     .and_then(|fields| fields.get("error_kind"))
                     .and_then(Value::as_str)
@@ -37392,6 +37553,143 @@ mod tests {
         assert_eq!(events[2]["transition"], "finished");
         assert_eq!(events[2]["outcome"], "resolved");
         assert!(events[2]["duration_ms"].as_u64().unwrap() >= 5);
+    }
+
+    #[tokio::test]
+    async fn catalog_resolution_rejection_emits_a_typed_blocked_admission_span() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-explain-catalog".to_string(),
+            "s-explain-catalog".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-explain-catalog".to_string());
+        let requirements =
+            astra_turn_types::DelegationIntentRequirements::CatalogResolutionFailed {
+                source: astra_turn_types::DelegationUserRequirementSource {
+                    user_id: "u-explain-catalog".to_string(),
+                    session_id: "s-explain-catalog".to_string(),
+                    session_turn: 1,
+                    applied_intent_id: None,
+                    user_intent_digest: "source-digest".to_string(),
+                },
+                failure: astra_turn_types::DelegationCatalogResolutionFailure {
+                    requirement_index: 2,
+                    match_count: 0,
+                },
+            };
+        state.current_session_id = Some("s-explain-catalog".to_string());
+        state.context_manifest_user_id = Some("u-explain-catalog".to_string());
+        state.current_run_owner_generation = Some(1);
+        state.canonical_turn_chain_id = Some("chain-explain-catalog".to_string());
+        state.session_turn = 1;
+        state.recursion_depth = 1;
+        state.delegation_chain.push("parent-run".to_string());
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements = requirements;
+        host.on_turn_started(&state);
+
+        let call = json!({
+            "id": "catalog-call",
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "arguments": json!({
+                    "action": "spawn",
+                    "description": "Review",
+                    "prompt": "Review this change"
+                }).to_string()
+            }
+        });
+        let invocation =
+            astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(call);
+        let delivered = host
+            .handle_admitted_tool_invocations(&mut state, &[invocation])
+            .await;
+        assert_eq!(delivered.pre_execution_rejections.len(), 1);
+        assert!(delivered.results.is_empty());
+        assert!(delivered.delegation_model_admissions.is_empty());
+        let rejection: Value =
+            serde_json::from_str(&delivered.pre_execution_rejections[0].result).unwrap();
+        assert_eq!(rejection["error_kind"], "delegation_model_scope_unresolved");
+        assert_eq!(rejection["advisory"]["executed"], false);
+
+        let events = host.take_emitted_events();
+        assert_eq!(
+            events.len(),
+            3,
+            "turn start plus one admission start/finish pair"
+        );
+        let terminal = events
+            .iter()
+            .find(|event| event["kind"] == "admission" && event["transition"] == "finished")
+            .expect("blocked admission terminal fact");
+        assert_eq!(terminal["kind"], "admission");
+        assert_eq!(terminal["transition"], "finished");
+        assert_eq!(terminal["outcome"], "blocked");
+        assert_eq!(
+            terminal["decision_detail"],
+            json!({
+                "kind": "delegation_catalog_resolution",
+                "requirement_index": 2,
+                "match_count": 0
+            })
+        );
+        let mut payload = terminal.clone();
+        payload
+            .as_object_mut()
+            .expect("Explain event object")
+            .remove("type");
+        assert!(
+            serde_json::from_value::<astra_turn_types::ExplainAnalyzeEventV1>(payload)
+                .is_ok_and(|fact| fact.is_valid())
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_admission_cleanup_omits_incompatible_detail_without_dropping_terminal() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-explain-cleanup".to_string(),
+            "s-explain-cleanup".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-explain-cleanup".to_string());
+        host.on_turn_started(&state);
+        let call = json!({
+            "call_id": "cleanup-call",
+            "function": {"name": "agent"}
+        });
+        host.start_explain_analyze_tool_admission(&call, 0);
+        host.explain_analyze_admission_decision_details.insert(
+            "cleanup-call".to_string(),
+            astra_turn_types::ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 0,
+                match_count: 0,
+            },
+        );
+
+        host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
+            .await;
+
+        let events = host.take_emitted_events();
+        let admission = events
+            .iter()
+            .find(|event| event["kind"] == "admission" && event["transition"] == "finished")
+            .expect("unfinished admission still gets a terminal fact");
+        assert_eq!(admission["outcome"], "completed");
+        assert!(admission.get("decision_detail").is_none());
+        assert!(events.iter().any(|event| {
+            event["kind"] == "turn"
+                && event["transition"] == "finished"
+                && event["outcome"] == "completed"
+        }));
     }
 
     #[tokio::test]
