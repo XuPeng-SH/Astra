@@ -1,0 +1,84 @@
+name: flash_spawn_natural_language_glm
+description: |
+  Verify an authenticated natural-language hard model requirement binds a
+  child even when the parent leaves the structured selector unset.
+prompt: |
+  For the child verification task, the user requires the authorized chat model
+  named glm-5.2. This is a hard requirement, not a suggestion. It remains in
+  force independently of the optional tool selector: leaving that selector
+  unset or null does not cancel the user's model requirement. Call
+  agent(action="spawn") exactly once; use description "Natural language model
+  requirement check", agent_type "explore", and prompt "Reply exactly
+  GLM-NATURAL-REQUIREMENT-OK". Leave requested_model_policy unset or null; do
+  not pass a model selector. Do not retry or call other tools.
+  After the child finishes, report its exact reply.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: all_of
+    criteria:
+      - type: tools_count_between
+        min: 1
+        max: 2
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /description
+    equals: Natural language model requirement check
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /prompt
+    equals: Reply exactly GLM-NATURAL-REQUIREMENT-OK
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /requested_model_policy
+    equals: null
+    allow_missing: true
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: completed
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /result
+    equals: GLM-NATURAL-REQUIREMENT-OK
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

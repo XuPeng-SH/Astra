@@ -27,6 +27,15 @@ the account has duplicate names, qualify the source in the case for that
 deployment. The invalid final-slot case must show zero `agent_spawned` events,
 not just a failed terminal answer.
 
+`flash_spawn_natural_language_glm` is the separate intent-binding check: the
+user states a hard `glm-5.2` requirement in ordinary language, while the parent
+tool call leaves `requested_model_policy` unset (omitted or explicit `null`).
+The child must still be admitted and make its provider request using GLM. This
+distinguishes server-side extraction of authenticated user intent from merely
+echoing a model selector supplied by the parent model. The server's offline
+regression tests additionally verify that one user-intent source is assessed
+once and a failed assessment is not automatically retried for the same intent.
+
 `flash_fanout_auto_unavailable` exercises the current fail-closed boundary:
 the typed Auto request must appear in the tool arguments, return an explicit
 unavailable error, and produce zero child start/termination events. It does

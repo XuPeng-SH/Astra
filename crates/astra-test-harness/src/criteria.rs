@@ -277,6 +277,12 @@ pub enum Criterion {
         document: JournalToolDocument,
         path: String,
         equals: serde_json::Value,
+        /// When `equals` is JSON null, also accept a missing pointer. This
+        /// models optional API fields whose omitted and explicit-null forms
+        /// both mean "unset" without weakening exact JSON assertions by
+        /// default.
+        #[serde(default)]
+        allow_missing: bool,
     },
 
     /// Requires a durable JSON-pointer value to be a string containing the
@@ -1148,6 +1154,22 @@ fn journal_tool_document(
         JournalToolDocument::Error => call.error.as_ref(),
         JournalToolDocument::RuntimeMetadata => Some(&call.runtime_metadata),
     }
+}
+
+fn journal_tool_missing_optional_property(value: &serde_json::Value, path: &str) -> bool {
+    let Some((parent_path, property)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let parent = if parent_path.is_empty() {
+        Some(value)
+    } else {
+        value.pointer(parent_path)
+    };
+    let Some(parent) = parent.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let property = property.replace("~1", "/").replace("~0", "~");
+    !parent.contains_key(&property)
 }
 
 fn call_matches_predicates(
@@ -2266,6 +2288,7 @@ fn evaluate_one(
             document,
             path,
             equals,
+            allow_missing,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_json");
@@ -2273,16 +2296,28 @@ fn evaluate_one(
             let calls = session.journal_tool_calls();
             let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
                 let value = journal_tool_document(call, *document);
-                value.and_then(|value| value.pointer(path)) == Some(equals)
+                let actual = value.and_then(|value| value.pointer(path));
+                actual == Some(equals)
+                    || (*allow_missing
+                        && equals.is_null()
+                        && actual.is_none()
+                        && value.is_some_and(|value| {
+                            journal_tool_missing_optional_property(value, path)
+                        }))
             });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "journal tool {name} {document:?} pointer {path:?} {} expected {}",
+                    "journal tool {name} {document:?} pointer {path:?} {} expected {}{}",
                     if passed { "matched" } else { "did not match" },
-                    equals
+                    equals,
+                    if *allow_missing && equals.is_null() {
+                        " (missing also accepted)"
+                    } else {
+                        ""
+                    },
                 ),
                 full_detail: None,
                 score: None,
@@ -4537,15 +4572,15 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             name,
             path,
             document: _,
-            equals: _,
+            equals,
+            allow_missing,
         } => {
             if name.trim().is_empty() {
                 return Err("JournalToolJson.name must not be empty".into());
             }
-            if !path.is_empty() && !path.starts_with('/') {
-                return Err(format!(
-                    "JournalToolJson.path must be an RFC 6901 JSON pointer; got {path:?}"
-                ));
+            validate_json_pointer("JournalToolJson.path", path)?;
+            if *allow_missing && !equals.is_null() {
+                return Err("JournalToolJson.allow_missing requires equals: null".into());
             }
             Ok(())
         }
@@ -6279,18 +6314,21 @@ mod tests {
                 document: JournalToolDocument::Arguments,
                 path: "/target_count".into(),
                 equals: serde_json::json!(3),
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
                 name: "agent_fanout".into(),
                 document: JournalToolDocument::Result,
                 path: "/provenance/all_slots_delivered".into(),
                 equals: serde_json::json!(true),
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
                 name: "submit_task_resolution".into(),
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("provider_schema_validation"),
+                allow_missing: false,
             },
         ];
         let results =
@@ -6308,6 +6346,7 @@ mod tests {
                 document: JournalToolDocument::Result,
                 path: "/fanout/terminal".into(),
                 equals: serde_json::json!(2),
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -6320,6 +6359,7 @@ mod tests {
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("handler_error"),
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -6327,6 +6367,102 @@ mod tests {
         assert!(
             !wrong_stage[0].passed,
             "another rejection stage must not match"
+        );
+    }
+
+    #[test]
+    fn durable_tool_json_can_assert_optional_field_is_unset() {
+        let session_with_args = |args: &str| {
+            mk_session(&[(
+                "turn",
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool_call_id": "spawn-call",
+                        "name": "agent",
+                        "ok": true,
+                        "args_full": args,
+                        "result_full": "{}"
+                    }]
+                }),
+            )])
+        };
+        let criterion = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            allow_missing: true,
+        };
+        let outcome = outcome_with_tools(&[]);
+
+        for args in [
+            r#"{"action":"spawn"}"#,
+            r#"{"action":"spawn","requested_model_policy":null}"#,
+        ] {
+            let session = session_with_args(args);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(result[0].passed, "unset selector should match: {result:?}");
+        }
+
+        let selected =
+            session_with_args(r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected),
+        );
+        assert!(!result[0].passed, "a non-null selection must not match");
+
+        let strict = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            allow_missing: false,
+        };
+        let missing = session_with_args(r#"{"action":"spawn"}"#);
+        let result = evaluate_deterministic_with_session(&[strict], &outcome, Some(&missing));
+        assert!(
+            !result[0].passed,
+            "exact null assertion must continue distinguishing a missing key"
+        );
+
+        for unusable in ["not-json", "[]", "null"] {
+            let session = session_with_args(unusable);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(
+                !result[0].passed,
+                "unusable/non-object arguments must not count as an omitted property: {unusable}"
+            );
+        }
+
+        let missing_document = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{
+                    "tool_call_id": "spawn-call",
+                    "name": "agent",
+                    "ok": true,
+                    "result_full": "{}"
+                }]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&missing_document),
+        );
+        assert!(
+            !result[0].passed,
+            "missing arguments evidence must not count as an omitted property"
         );
     }
 

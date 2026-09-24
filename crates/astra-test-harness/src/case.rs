@@ -646,8 +646,12 @@ mod tests {
     fn shipped_subagent_model_cases_parse_with_strict_criteria() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
         let cases = Case::load_dir(&dir).expect("shipped DeepSeek Flash cases");
-        assert_eq!(cases.len(), 4);
         assert!(cases.iter().all(|case| !case.criteria.is_empty()));
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.name == "flash_spawn_natural_language_glm")
+        );
     }
 
     #[test]
@@ -806,7 +810,8 @@ criteria:
                 "flash_fanout_auto_unavailable",
                 "flash_fanout_invalid_final_slot",
                 "flash_fanout_model_default",
-                "flash_spawn_configured_name_glm"
+                "flash_spawn_configured_name_glm",
+                "flash_spawn_natural_language_glm"
             ]
         );
         assert!(cases.iter().all(|case| case.debug_log));
@@ -819,6 +824,42 @@ criteria:
                         if name == "reflect"
                 )))
         );
+        let natural_language = cases
+            .iter()
+            .find(|case| case.name == "flash_spawn_natural_language_glm")
+            .expect("natural-language intent case must be in the shipped suite");
+        assert!(natural_language.criteria.iter().any(|criterion| matches!(
+            criterion,
+            crate::criteria::Criterion::AllOf { criteria }
+                if criteria.iter().any(|nested| matches!(
+                    nested,
+                    crate::criteria::Criterion::ToolsCountBetween { min: 1, max: 2 }
+                ))
+        )));
+        assert!(natural_language.criteria.iter().any(|criterion| matches!(
+            criterion,
+            crate::criteria::Criterion::JournalToolCallCount {
+                name,
+                min: 1,
+                max: 1,
+                ok: None,
+                document: None,
+                path: None,
+                equals: None,
+            } if name == "agent"
+        )));
+        assert!(natural_language.criteria.iter().any(|criterion| matches!(
+            criterion,
+            crate::criteria::Criterion::JournalToolJson {
+                name,
+                document: crate::criteria::JournalToolDocument::Arguments,
+                path,
+                equals,
+                allow_missing: true,
+            } if name == "agent"
+                && path == "/requested_model_policy"
+                && equals.is_null()
+        )));
     }
 
     #[test]
