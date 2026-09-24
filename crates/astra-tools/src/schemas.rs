@@ -1941,15 +1941,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "server": "Server-owned single-agent lifecycle. Actions: spawn, get_result, send_message. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. For a fixed-size parallel group use agent_fanout."
                     },
                     "x-astra-surface-discovery-summaries": {
-                        "server": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. send_message: action+to+message. Durable task lists use start_work."
+                        "server": "Omitted requested_model_policy preserves user model requirements; hard requirements cannot be overridden. spawn: description+prompt; foreground default. get_result: agent_id; send_message: to+message; Work: start_work."
                     },
                     "x-astra-per-action-discovery-summaries": {
-                        "spawn": "action+description+prompt; foreground fan-in unless the user backgrounds it",
+                        "spawn": "Omitted requested_model_policy preserves user model requirements; hard requirements cannot be overridden. Needs action+description+prompt; foreground default",
                         "get_result": "action+agent_id",
                         "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
                         "send_message": "action+to+message"
                     },
-                    "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: local fixed pipeline with action+name+description+steps, never a durable task list. send_message: action+to+message. Durable task lists use the separate start_work tool.",
+                    "x-astra-discovery-summary": "Omitted requested_model_policy preserves user model requirements; hard requirements cannot be overridden. spawn: description+prompt; foreground default. get_result: agent_id; send_message: to+message; Work: start_work.",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
                         "steps": {
@@ -2037,12 +2037,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
-                        "start": "target_count + exactly that many slots; description+prompt each; no brief/agents/background; never embed diffs",
+                        "start": "Omitted requested_model_policy preserves user model requirements; hard requirements cannot be overridden. target_count slots, description+prompt each; atomic; no brief/agents/background",
                         "get_results": "action+group_id; use bounded result windows and follow next_call",
                         "stop_slot": "action+group_id+slot_index",
                         "stop_group": "action+group_id"
                     },
-                     "x-astra-discovery-summary": "start: target_count + exactly that many slots; description+prompt each; no brief/agents/background; never embed diffs. Omit agent_type=read-only explore; task/general-purpose=mutation. Child surface authoritative.",
+                     "x-astra-discovery-summary": "start: Omitted requested_model_policy preserves user model requirements; hard requirements cannot be overridden. target_count slots, each description+prompt; atomic; no brief/agents/background; tools surface-limited.",
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
                         "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results, stop_slot, and stop_group."},
@@ -2646,6 +2646,45 @@ mod tests {
         assert!(policy_description.contains("never guess one from a display name"));
         assert!(policy_description.contains("omit this field"));
         assert!(policy_description.contains("cannot override a hard user requirement"));
+    }
+
+    #[test]
+    fn deferred_delegation_discovery_preserves_user_model_requirements() {
+        for surface in ["server", "local"] {
+            let mut schemas = all_tool_schemas();
+            project_action_schemas_for_surface(&mut schemas, surface);
+
+            for name in ["agent", "agent_fanout"] {
+                let schema = find_schema(&schemas, name).expect("delegation schema must exist");
+                let selection = crate::tool_search::tool_selection_contract(schema)
+                    .expect("delegation schema must have a discovery contract");
+                if surface == "server" {
+                    assert_eq!(
+                        selection["description_truncated"], false,
+                        "load-bearing Server guidance must fit deferred discovery for {name}"
+                    );
+                }
+                let summary = selection["description"]
+                    .as_str()
+                    .expect("delegation discovery summary");
+                assert!(
+                    summary
+                        .to_ascii_lowercase()
+                        .contains("user model requirements"),
+                    "{surface}/{name}: {summary}"
+                );
+                assert!(
+                    summary
+                        .to_ascii_lowercase()
+                        .contains("omitted requested_model_policy"),
+                    "{surface}/{name}: {summary}"
+                );
+                assert!(
+                    summary.contains("hard requirements cannot be overridden"),
+                    "{surface}/{name}: {summary}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

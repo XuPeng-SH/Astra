@@ -798,6 +798,56 @@ criteria:
 
     #[test]
     fn bundled_subagent_model_selection_cases_forbid_reflect_reads() {
+        fn parent_tool_count_matches(
+            criterion: &crate::criteria::Criterion,
+            count: u32,
+            path: &str,
+            expected: &str,
+        ) -> bool {
+            let crate::criteria::Criterion::SessionEventCount {
+                event_type,
+                min,
+                max,
+                json_match: Some(predicate),
+                ..
+            } = criterion
+            else {
+                return false;
+            };
+            event_type == "ToolCallStarted"
+                && min == &count
+                && max == &Some(count)
+                && predicate.path == path
+                && predicate.equals == serde_json::Value::String(expected.to_string())
+                && predicate.same_run_as.as_ref().is_some_and(|link| {
+                    link.event_type == "agent_spawned"
+                        && link.run_id_path == "/metadata/parent_run_id"
+                })
+        }
+
+        fn exact_parent_tool_set(
+            criterion: &crate::criteria::Criterion,
+            expected_tools: &[&str],
+        ) -> bool {
+            let crate::criteria::Criterion::AllOf { criteria } = criterion else {
+                return false;
+            };
+            criteria.len() == expected_tools.len() + 1
+                && criteria.iter().any(|criterion| {
+                    parent_tool_count_matches(
+                        criterion,
+                        expected_tools.len() as u32,
+                        "/event_type",
+                        "ToolCallStarted",
+                    )
+                })
+                && expected_tools.iter().all(|tool| {
+                    criteria.iter().any(|criterion| {
+                        parent_tool_count_matches(criterion, 1, "/payload/tool_name", tool)
+                    })
+                })
+        }
+
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
         let cases = Case::load_dir(&dir).expect("subagent model cases must parse");
 
@@ -830,11 +880,14 @@ criteria:
             .expect("natural-language intent case must be in the shipped suite");
         assert!(natural_language.criteria.iter().any(|criterion| matches!(
             criterion,
-            crate::criteria::Criterion::AllOf { criteria }
-                if criteria.iter().any(|nested| matches!(
-                    nested,
-                    crate::criteria::Criterion::ToolsCountBetween { min: 1, max: 2 }
-                ))
+            crate::criteria::Criterion::AnyOf { criteria }
+                if criteria.len() == 2
+                    && criteria
+                        .iter()
+                        .any(|nested| exact_parent_tool_set(nested, &["agent"]))
+                    && criteria
+                        .iter()
+                        .any(|nested| exact_parent_tool_set(nested, &["tool_search", "agent"]))
         )));
         assert!(natural_language.criteria.iter().any(|criterion| matches!(
             criterion,
