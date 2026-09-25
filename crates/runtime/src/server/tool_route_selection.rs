@@ -100,7 +100,7 @@ pub(crate) fn tool_execution_class(
     }
 }
 
-fn is_intercepted_turn_pipeline_tool(tool_name: &str) -> bool {
+pub(crate) fn is_intercepted_turn_pipeline_tool(tool_name: &str) -> bool {
     tool_name.eq_ignore_ascii_case(crate::turn::skill_tool::SKILL_TOOL_NAME)
         || tool_name.eq_ignore_ascii_case(crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME)
 }

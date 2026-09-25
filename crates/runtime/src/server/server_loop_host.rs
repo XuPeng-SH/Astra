@@ -35,7 +35,8 @@ use crate::server::tool_admission::{
 use crate::server::tool_route_runtime::ToolRouteObserver;
 use crate::server::tool_route_selection::{
     ToolExecutionClass, ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding,
-    routing_decision_for_binding, runtime_binding_can_use_client_ledger,
+    is_intercepted_turn_pipeline_tool as is_turn_pipeline_tool, routing_decision_for_binding,
+    runtime_binding_can_use_client_ledger,
     should_deliver_edge_bound_tools_via_client_ledger_for_binding, tool_execution_class,
 };
 use crate::server::tool_transport::{
@@ -6797,13 +6798,6 @@ fn call_is_pending_canonical_validation(call: &Value) -> bool {
     raw_args.is_some_and(|args| {
         astra_turn_core::evaluation::normalize_validation_prefix(name, &args).is_some()
     })
-}
-
-fn is_turn_pipeline_tool(name: &str) -> bool {
-    matches!(
-        tool_execution_class(name, &astra_runtime_env::ToolRegistry::builtins()),
-        ToolExecutionClass::TurnPipelineIntercept
-    )
 }
 
 fn append_tool_calls_unique_by_id(target: &mut Vec<Value>, candidates: Vec<Value>) {
@@ -13914,42 +13908,40 @@ impl ServerAgenticLoopHost {
         }
     }
 
+    fn is_client_pipeline_tool_call(&self, state: &AgenticLoopState, tool_call: &Value) -> bool {
+        if !self.has_client_tool_delivery_lane() {
+            return false;
+        }
+        let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(tool_call) else {
+            return false;
+        };
+        if !is_turn_pipeline_tool(name) || !self.runtime_declared_tool_names.contains(name) {
+            return false;
+        }
+        // With no server resolver, the connected client is the only possible
+        // pipeline owner. With both catalogs, route only exact client targets.
+        if state.skills.resolver.is_none() {
+            return true;
+        }
+        if name.eq_ignore_ascii_case(crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME) {
+            return !state.skills.client_pipeline_skill_names.is_empty();
+        }
+        crate::turn::skill_tool::extract_skill_name(tool_call).is_some_and(|target| {
+            state
+                .skills
+                .client_pipeline_skill_names
+                .contains(&target.trim().to_ascii_lowercase())
+        })
+    }
+
     fn client_pipeline_tool_calls(
         &self,
         state: &AgenticLoopState,
         tool_calls: &[Value],
     ) -> Vec<Value> {
-        if !self.has_client_tool_delivery_lane() {
-            return Vec::new();
-        }
         tool_calls
             .iter()
-            .filter(|tool_call| {
-                let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(tool_call)
-                else {
-                    return false;
-                };
-                if !is_turn_pipeline_tool(name) || !self.runtime_declared_tool_names.contains(name)
-                {
-                    return false;
-                }
-                // With no server resolver, the connected client is the only
-                // possible pipeline owner (legacy clients included). When both
-                // catalogs exist, route only calls whose exact target the
-                // client advertised; do not choose by prompt text.
-                if state.skills.resolver.is_none() {
-                    return true;
-                }
-                if name.eq_ignore_ascii_case(crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME) {
-                    return !state.skills.client_pipeline_skill_names.is_empty();
-                }
-                crate::turn::skill_tool::extract_skill_name(tool_call).is_some_and(|target| {
-                    state
-                        .skills
-                        .client_pipeline_skill_names
-                        .contains(&target.trim().to_ascii_lowercase())
-                })
-            })
+            .filter(|tool_call| self.is_client_pipeline_tool_call(state, tool_call))
             .cloned()
             .collect()
     }
@@ -21768,16 +21760,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             };
         }
         self.emit_admitted_tool_call_events(state.current_round_index, tool_calls);
-        let registry = astra_runtime_env::ToolRegistry::builtins();
         let externally_dispatchable = tool_calls
             .iter()
             .filter(|tool_call| {
-                astra_turn_core::tool::args::shape::tool_call_name(tool_call).is_none_or(|name| {
-                    !matches!(
-                        tool_execution_class(name, &registry),
-                        ToolExecutionClass::TurnPipelineIntercept
-                    ) || state.skills.resolver.is_none()
-                })
+                astra_turn_core::tool::args::shape::tool_call_name(tool_call)
+                    .is_none_or(|name| !is_turn_pipeline_tool(name))
+                    || self.is_client_pipeline_tool_call(state, tool_call)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -44770,15 +44758,16 @@ mod tests {
         .with_edge_tools(sample_edge_tools_with_skill())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
+        host.executor_binding.status = ExecutorStatus::Offline;
         install_in_memory_interaction_sink(&mut host);
         let mut state = create_test_state();
-        state.skills.resolver = Some(Arc::new(ServerSkillResolver));
+        state.skills.resolver = Some(Arc::new(ListedSkillResolver));
         let tool_calls = vec![json!({
             "id": "call-skill",
             "type": "function",
             "function": {
                 "name": crate::turn::skill_tool::SKILL_TOOL_NAME,
-                "arguments": r#"{"skill_name":"server-skill"}"#,
+                "arguments": r#"{"skill_name":"review-changes"}"#,
             }
         })];
 
@@ -44790,6 +44779,80 @@ mod tests {
                 .iter()
                 .all(|event| { event.get("type").and_then(Value::as_str) != Some("tool_request") }),
             "a server-resolved skill must not also be dispatched to the client"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admitted_client_skill_routes_with_server_catalog_present() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_skill())
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
+        .build();
+        host.prefer_client_tool_delivery();
+        install_in_memory_interaction_sink(&mut host);
+        let mut state = create_test_state();
+        state.skills.resolver = Some(Arc::new(ListedSkillResolver));
+        state
+            .skills
+            .client_pipeline_skill_names
+            .insert("review-code".to_string());
+        state.current_run_id = Some("test-run".to_string());
+        state.canonical_turn_chain_id = Some("test-chain".to_string());
+        let action_context = test_edge_action_context("u", "test-run").await;
+        state.run_control = Some(action_context.run_control);
+        state.current_run_owner_generation = Some(0);
+        let tool_calls = vec![
+            json!({
+                "id": "call-client",
+                "type": "function",
+                "function": {"name": "skill", "arguments": r#"{"skill_name":"review-code"}"#}
+            }),
+            json!({
+                "id": "call-server",
+                "type": "function",
+                "function": {"name": "skill", "arguments": r#"{"skill_name":"review-changes"}"#}
+            }),
+        ];
+        host.edge_callback_ledger.lock().await.insert(
+            tool_callback_key("u", "s", "call-client"),
+            json!({"body": {
+                "request_id": "call-client",
+                "status": "ok",
+                "output": "local skill instructions"
+            }}),
+        );
+
+        let delivered = host.handle_admitted_tool_calls(&state, &tool_calls).await;
+
+        assert_eq!(delivered.results.len(), 1);
+        assert_eq!(delivered.results[0].request_id, "call-client");
+        assert!(
+            delivered.results[0]
+                .output
+                .contains("local skill instructions")
+        );
+        assert_eq!(
+            delivered.results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields
+                    .get(crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD))
+                .and_then(Value::as_str),
+            Some(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE)
+        );
+        assert_eq!(
+            host.emitted_events
+                .iter()
+                .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_request"))
+                .map(|event| event.get("request_id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![Some("call-client")],
+            "server-owned skill must remain in the turn pipeline"
         );
     }
 
