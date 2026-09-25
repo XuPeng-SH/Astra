@@ -420,6 +420,30 @@ impl ExecutionDeadlineAuthority {
     pub fn monotonic_deadline(self) -> std::time::Instant {
         self.monotonic_deadline
     }
+
+    /// Remaining time according to the monotonic authority clock.
+    pub fn remaining(self) -> Duration {
+        self.monotonic_deadline
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    /// Derive a strictly earlier deadline while reserving time for the parent
+    /// to consume the child result. The absolute deadline is narrowed; it is
+    /// never reconstructed from a relative snapshot, so retries and nested
+    /// delegation cannot replenish elapsed time.
+    pub fn with_parent_reserve(self, reserve: Duration) -> Option<Self> {
+        if self.remaining() <= reserve {
+            return None;
+        }
+        let monotonic_deadline = self.monotonic_deadline.checked_sub(reserve)?;
+        let reserve_ms = reserve.as_nanos().div_ceil(1_000_000);
+        let reserve_ms = u64::try_from(reserve_ms).ok()?;
+        let deadline_unix_ms = self.deadline_unix_ms.checked_sub(reserve_ms)?;
+        Some(Self {
+            deadline_unix_ms,
+            monotonic_deadline,
+        })
+    }
 }
 
 /// Original execution restrictions, not a grant of permission to reconstruct a
@@ -5113,6 +5137,19 @@ pub trait RunStateStore: Send + Sync {
         error_message: Option<&str>,
         events: &[serde_json::Value],
     ) -> Result<bool, String>;
+
+    /// Repair the derived display projection when an owner proves a terminal
+    /// transaction committed after its store response was abandoned. Normal
+    /// transitions perform this refresh in their store call; the default is
+    /// a no-op for stores without a separate projection.
+    async fn repair_terminal_projection_after_receipt(
+        &self,
+        _user_id: &str,
+        _expected_session_id: &str,
+        _run_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Append immutable facts without rewriting lifecycle state, but only
     /// while the exact execution generation and one of the expected statuses
@@ -14583,6 +14620,17 @@ impl DatabaseRunStateStore {
 
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn repair_terminal_projection_after_receipt(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+    ) -> Result<(), String> {
+        self.sync_projection_for_user(user_id, expected_session_id, run_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn request_permission_mode(
         &self,
         user_id: &str,

@@ -318,6 +318,15 @@ If a deployment has one trusted TaaS instance, the user never selects or enters 
 ### Usage and billing
 
 Usage is attributable by run, agent, inference purpose, Model Access, and billing owner.
+The final physical provider request may report an inclusive input total without
+reporting every cache billing lane or output count. That validated input total
+drives context occupancy and the measured per-turn input budget; unknown billing
+lanes remain unknown. Logical retry and run aggregates never replace the final
+physical request's context measurement. Server stream usage carries this
+measurement separately as `last_request_input_tokens` or nested
+`last_request_usage.input_total_tokens`. CLI context observers forward that
+validated measurement independently of complete billing lanes, including
+updates that arrive while those lanes remain unknown.
 
 ```text
 Primary agent       120k tokens   Personal Cloud
@@ -1244,16 +1253,19 @@ scope is an authenticated agent run, a real session-owned operation, or a
 durable Harness run. Memory and compaction require session ownership; Skillify
 requires Harness ownership. Neither fabricates a run or session identity.
 
-Typed judgment responses carry execution-owned `judgment_provenance` alongside
-text and the adapter's model identity. TypeSafe System One supplies
-`provider_probability`; ordinary model execution supplies `discrete_decision`.
-Both streaming and non-streaming adapters preserve this distinction through
-summary, memory and Server completion boundaries. Ordinary prose responses
-omit the field. Judgment consumers reject missing provenance, mismatched answer
-formats and missing execution identity: answer JSON and model-name strings do
-not select the decoder or establish native probability capability. The model
-identity is the existing adapter's execution identity, not a guarantee that
-every upstream provider exposes a resolved model version.
+Version-2 typed judgment responses carry execution-owned `judgment_provenance`
+alongside text and the adapter's model identity. TypeSafe System One supplies
+native Noul/Choice/Score values and distributions; ordinary model execution
+supplies explicit discrete Noul/Choice/Score answers with unknown represented
+directly, never as a fabricated probability. Both streaming and non-streaming
+adapters preserve this distinction through summary, memory and Server completion
+boundaries. Ordinary prose responses omit the field. Judgment consumers reject
+missing provenance, mismatched answer formats and missing execution identity:
+answer JSON and model-name strings do not select the decoder or establish native
+probability capability. Raw TypeSafe response JSON is checked for duplicate
+object keys before conversion into a map. The model identity is the existing
+adapter's execution identity, not a guarantee that every upstream provider
+exposes a resolved model version.
 
 These response facts do not add a ledger, query or persistence projection.
 Malformed judgments use the consumer's existing failure/baseline behavior;

@@ -14,7 +14,6 @@ use crate::interaction_types::tool_counts_as_external_observation;
 use crate::response_guard::{RESPONSE_GUARD_REDACTED_FINISH_REASON, apply_response_guards};
 use crate::tool::args::shape::tool_call_name;
 use astra_pipeline::step_recorder::StepRecorder;
-use astra_turn_types::NormalizedPromptCacheUsage;
 
 /// Read-only slice of [`crate::chat_turn_sse_dispatch::ChatTurnSseAccum`] fields needed for ingest.
 #[derive(Debug, Clone)]
@@ -32,9 +31,29 @@ pub struct AgenticTurnStreamSnapshot<'a> {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub has_usage: bool,
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    pub current_request_usage: Option<astra_turn_types::RequestTokenUsage>,
+    pub current_request_input_tokens: Option<u64>,
     pub error_message: &'a Option<String>,
     /// Pre-classified error kind from the host. When `Some`, skip string re-classification.
     pub error_kind: Option<astra_core::ErrorKind>,
+}
+
+impl AgenticTurnStreamSnapshot<'_> {
+    pub fn measured_request_input_tokens(&self) -> Option<u64> {
+        let partition = (|| {
+            let usage = self.current_request_usage?;
+            usage
+                .fresh_input_tokens
+                .checked_add(usage.cache_read_tokens)?
+                .checked_add(usage.cache_creation_tokens)
+        })();
+        match (self.current_request_input_tokens, partition) {
+            (Some(reported), Some(partition)) if reported != partition => None,
+            (Some(reported), _) => Some(reported),
+            (_, partition) => partition,
+        }
+    }
 }
 
 /// Build [`AgenticTurnStreamSnapshot`] from a [`ChatTurnSseAccum`] plus TTFT (CLI `TurnResult` derefs to accum).
@@ -65,6 +84,11 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
         cache_read_tokens: accum.cache_read_tokens,
         cache_creation_tokens: accum.cache_creation_tokens,
         has_usage: accum.has_usage,
+        qualified_usage: accum.accounted_usage(),
+        current_request_usage: accum.current_request_usage,
+        // Preserve raw evidence so a conflict with the complete physical
+        // partition remains invalid when the snapshot rechecks it.
+        current_request_input_tokens: accum.current_request_input_tokens,
         error_message: &accum.error_message,
         // A host-side kind is an authoritative override, but absence must not
         // erase the typed kind already decoded from the SSE producer.
@@ -134,8 +158,11 @@ pub fn ingest_agentic_turn_stream(
     message: &str,
     _recent_tools: &[String],
     _quiet: bool,
-    mut st: AgenticTurnIngestMut<'_>,
+    st: AgenticTurnIngestMut<'_>,
 ) -> AgenticTurnIngestOutcome {
+    // Measurement is evidence even when response guards or provider errors
+    // end ingestion early. Error-streak accounting remains independent.
+    *st.last_measured_prompt_tokens = snap.measured_request_input_tokens();
     if st.first_ttft_ms.is_none() {
         *st.first_ttft_ms = snap.ttft_ms;
     }
@@ -295,32 +322,10 @@ pub fn ingest_agentic_turn_stream(
         if !snap.full_text.is_empty() && !preserve_prior_final_after_runtime_scaffolding_retry {
             persist_final_assistant_message(st.messages, st.final_text.as_str());
         }
-        record_prompt_calibration_success(snap, &mut st);
         return AgenticTurnIngestOutcome::Break;
     }
 
-    record_prompt_calibration_success(snap, &mut st);
     AgenticTurnIngestOutcome::HasToolCalls
-}
-
-/// After a non-fatal ingest: clear PTL streak and remember provider prompt size when available.
-fn record_prompt_calibration_success(
-    snap: &AgenticTurnStreamSnapshot<'_>,
-    st: &mut AgenticTurnIngestMut<'_>,
-) {
-    *st.consecutive_context_window_errors = 0;
-    let billable_input = NormalizedPromptCacheUsage::new(
-        snap.prompt_tokens,
-        snap.cache_read_tokens,
-        snap.cache_creation_tokens,
-    )
-    .total_input_tokens();
-    // Server-owned terminal totals are execution accounting, not one request's
-    // context occupancy.  The host records the explicit physical request
-    // before ingestion; do not overwrite it with aggregate child usage.
-    if snap.has_usage && billable_input > 0 && snap.server_execution_summary.is_none() {
-        *st.last_measured_prompt_tokens = Some(billable_input);
-    }
 }
 
 fn insert_tool_used(target: &mut HashSet<String>, name: String) {
@@ -442,6 +447,31 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_physical_input_evidence_stays_invalid_through_snapshot_and_ingest() {
+        let accum = ChatTurnSseAccum {
+            current_request_usage: astra_turn_types::RequestTokenUsage::try_new(50, 50, 0, 10).ok(),
+            current_request_input_tokens: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(accum.measured_request_input_tokens(), None);
+
+        let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+        assert_eq!(snap.measured_request_input_tokens(), None);
+        let mut pack = Pack::new();
+        pack.last_measured_prompt_tokens = Some(123);
+        let _ = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "continue this session",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(pack.last_measured_prompt_tokens, None);
+    }
+
+    #[test]
     fn ingest_binds_step_persistence_only_after_authoritative_run_pair() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
@@ -469,6 +499,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &error_message,
             error_kind: None,
@@ -511,6 +544,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &error_message,
             error_kind: None,
@@ -628,14 +664,17 @@ mod tests {
             completion_tokens: 2_000,
             cache_read_tokens: 149_000,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: Some(
+                astra_turn_types::RequestTokenUsage::try_new(1_700, 37_000, 0, 200).unwrap(),
+            ),
             has_usage: true,
             error_message: &error_message,
             error_kind: None,
         };
         let mut p = Pack::new();
-        // The admission host derived this from the terminal event's explicit
-        // last_request_usage: 1,700 fresh + 37,000 cached.
-        p.last_measured_prompt_tokens = Some(38_700);
+        p.last_measured_prompt_tokens = Some(99_000);
 
         let outcome = ingest_agentic_turn_stream(
             &snap,
@@ -663,6 +702,9 @@ mod tests {
     #[test]
     fn snapshot_from_sse_accum_matches_fields() {
         let accum = ChatTurnSseAccum {
+            qualified_usage: Some(
+                astra_turn_types::CanonicalTokenUsage::new(Some(3), None, None, Some(4)).unwrap(),
+            ),
             session_id: Some("s1".into()),
             run_id: Some("r1".into()),
             full_text: "hi".into(),
@@ -685,6 +727,8 @@ mod tests {
         assert_eq!(snap.prompt_tokens, 3);
         assert_eq!(snap.completion_tokens, 4);
         assert!(snap.has_usage);
+        assert_eq!(snap.qualified_usage, accum.qualified_usage);
+        assert_eq!(snap.qualified_usage.unwrap().cached_input_tokens(), None);
         assert_eq!(snap.error_message.as_deref(), Some("e"));
         assert_eq!(
             snap.error_kind,
@@ -758,6 +802,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &err,
             error_kind: None,
@@ -790,6 +837,9 @@ mod tests {
             completion_tokens: 1,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &err,
             error_kind: None,
@@ -826,6 +876,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &err,
             error_kind: None,
@@ -877,6 +930,9 @@ mod tests {
                 completion_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                qualified_usage: None,
+                current_request_input_tokens: None,
+                current_request_usage: None,
                 has_usage: false,
                 error_message: &err,
                 error_kind: None,
@@ -915,6 +971,9 @@ mod tests {
             completion_tokens: 2,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -934,11 +993,93 @@ mod tests {
         assert_eq!(pack.total_prompt, 1);
         assert_eq!(pack.total_completion, 2);
         assert!(pack.has_any_usage);
-        assert_eq!(pack.last_measured_prompt_tokens, Some(1));
+        assert_eq!(pack.last_measured_prompt_tokens, None);
         assert_eq!(pack.consecutive_context_window_errors, 0);
         assert_eq!(pack.messages.len(), 1, "final assistant should persist");
         assert_eq!(pack.messages[0]["role"], "assistant");
         assert_eq!(pack.messages[0]["content"], "ok");
+    }
+
+    #[test]
+    fn prompt_calibration_uses_only_explicit_physical_evidence() {
+        let mut pack = Pack::new();
+        pack.last_measured_prompt_tokens = Some(999);
+        for physical in [
+            None,
+            Some(astra_turn_types::RequestTokenUsage::default()),
+            Some(astra_turn_types::RequestTokenUsage::try_new(100, 900, 20, 5).unwrap()),
+            None,
+        ] {
+            let accum = ChatTurnSseAccum {
+                prompt_tokens: 12_000,
+                cache_read_tokens: 38_000,
+                has_usage: true,
+                qualified_usage: None,
+                current_request_input_tokens: None,
+                current_request_usage: physical,
+                ..Default::default()
+            };
+            let snapshot = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+            ingest_agentic_turn_stream(
+                &snapshot,
+                0,
+                |_| String::new(),
+                "hi",
+                &[],
+                true,
+                pack.ingest_mut(),
+            );
+            assert_eq!(
+                pack.last_measured_prompt_tokens,
+                physical.map(|usage| {
+                    usage.fresh_input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn early_ingest_exits_update_physical_evidence_without_resetting_error_streak() {
+        for guarded in [false, true] {
+            for physical in [None, Some(astra_turn_types::RequestTokenUsage::default())] {
+                let mut pack = Pack::new();
+                pack.last_measured_prompt_tokens = Some(999);
+                pack.consecutive_context_window_errors = 2;
+                let accum = ChatTurnSseAccum {
+                    full_text: if guarded {
+                        "<ask_astra_data><query>previous task?</query></ask_astra_data>".into()
+                    } else {
+                        String::new()
+                    },
+                    error_message: (!guarded).then(|| "context too long".into()),
+                    error_kind: (!guarded).then_some(astra_core::ErrorKind::ContextWindow),
+                    qualified_usage: None,
+                    current_request_input_tokens: None,
+                    current_request_usage: physical,
+                    ..Default::default()
+                };
+                let snapshot = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+                let outcome = ingest_agentic_turn_stream(
+                    &snapshot,
+                    0,
+                    |_| String::new(),
+                    "hi",
+                    &[],
+                    true,
+                    pack.ingest_mut(),
+                );
+                assert_eq!(pack.last_measured_prompt_tokens, physical.map(|_| 0));
+                assert_eq!(
+                    pack.consecutive_context_window_errors,
+                    if guarded { 2 } else { 3 }
+                );
+                if guarded {
+                    assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
+                } else {
+                    assert!(matches!(outcome, AgenticTurnIngestOutcome::Fatal(_)));
+                }
+            }
+        }
     }
 
     #[test]
@@ -954,6 +1095,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &None,
             error_kind: None,
@@ -991,6 +1135,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &None,
             error_kind: None,
@@ -1026,6 +1173,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &None,
             error_kind: None,
@@ -1062,6 +1212,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &None,
             error_kind: None,
@@ -1104,6 +1257,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: false,
             error_message: &None,
             error_kind: None,
@@ -1136,6 +1292,9 @@ mod tests {
             completion_tokens: 2,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1172,6 +1331,9 @@ mod tests {
             completion_tokens: 5,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1225,6 +1387,9 @@ mod tests {
             completion_tokens: 5,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1268,6 +1433,9 @@ mod tests {
             completion_tokens: 200,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1284,7 +1452,7 @@ mod tests {
         );
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert_eq!(pack.final_text, "Here are your recent PRs: ...");
-        assert_eq!(pack.last_measured_prompt_tokens, Some(100));
+        assert_eq!(pack.last_measured_prompt_tokens, None);
         assert_eq!(pack.messages.len(), 1);
         assert_eq!(pack.messages[0]["role"], "assistant");
         assert_eq!(pack.messages[0]["content"], "Here are your recent PRs: ...");
@@ -1304,6 +1472,9 @@ mod tests {
             completion_tokens: 20,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1362,6 +1533,9 @@ mod tests {
             completion_tokens: 50,
             cache_read_tokens: 80,
             cache_creation_tokens: 20,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1420,6 +1594,9 @@ mod tests {
             completion_tokens: 200,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1453,6 +1630,9 @@ mod tests {
             completion_tokens: 200,
             cache_read_tokens: 400,
             cache_creation_tokens: 50,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1487,6 +1667,9 @@ mod tests {
             completion_tokens: 50,
             cache_read_tokens: 90,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &None,
             error_kind: None,
@@ -1543,6 +1726,9 @@ mod tests {
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &err_msg,
             error_kind: None,
@@ -1575,6 +1761,9 @@ mod tests {
             completion_tokens: 10,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
             has_usage: true,
             error_message: &no_err,
             error_kind: None,
