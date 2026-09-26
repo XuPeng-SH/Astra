@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use sha2::Digest;
 use tokio::sync::{RwLock, watch};
 use unicode_normalization::UnicodeNormalization;
 
@@ -103,6 +104,154 @@ fn profile_child_execution(
         parent,
     );
     (execution_profile, thinking)
+}
+
+fn apply_model_slot_constraint(
+    execution_profile: &mut AgentProfile,
+    thinking: &mut astra_turn_core::thinking_config::ThinkingConfig,
+    parent: Option<&astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
+    slot: &astra_turn_types::DelegationModelSlotConstraint,
+) {
+    if let Some(selection) = &slot.model_selection {
+        execution_profile.model_selection = Some(selection.clone());
+        *thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
+            None,
+            Some(selection),
+            parent,
+        );
+    }
+    if let Some(reasoning) = &slot.reasoning {
+        use astra_turn_types::{DelegationReasoningEffort, DelegationReasoningRequirement};
+        *thinking = match reasoning {
+            DelegationReasoningRequirement::ModelDefault => {
+                astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+            }
+            DelegationReasoningRequirement::Off => {
+                astra_turn_core::thinking_config::ThinkingConfig::Off
+            }
+            DelegationReasoningRequirement::Budget { tokens } => {
+                astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+                    budget_tokens: *tokens,
+                }
+            }
+            DelegationReasoningRequirement::Effort { effort } => {
+                astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+                    effort: match effort {
+                        DelegationReasoningEffort::Low => {
+                            astra_turn_core::thinking_config::ThinkingEffort::Low
+                        }
+                        DelegationReasoningEffort::Medium => {
+                            astra_turn_core::thinking_config::ThinkingEffort::Medium
+                        }
+                        DelegationReasoningEffort::High => {
+                            astra_turn_core::thinking_config::ThinkingEffort::High
+                        }
+                        DelegationReasoningEffort::Max => {
+                            astra_turn_core::thinking_config::ThinkingEffort::Max
+                        }
+                    },
+                }
+            }
+        };
+    }
+}
+
+fn inherited_model_slot_constraint(
+    request_constraints: &RequestConstraints,
+) -> Result<Option<astra_turn_types::DelegationModelSlotConstraint>, String> {
+    let astra_turn_types::DelegationIntentRequirements::Requirements {
+        source,
+        requirements,
+    } = &request_constraints.delegated_model_requirements
+    else {
+        return Ok(None);
+    };
+    if requirements
+        .iter()
+        .any(|requirement| requirement.task_scope_quote.is_some())
+    {
+        return Err(
+            "scoped delegated model requirements require canonical slot admission before child execution"
+                .into(),
+        );
+    }
+    let projected = astra_turn_types::DelegationIntentRequirements::Requirements {
+        source: source.clone(),
+        requirements: requirements.clone(),
+    };
+    let (slots, _) =
+        astra_services::delegation_model_requirement::bind_delegation_requirements_to_slots(
+            &projected, None, 1,
+        )?;
+    Ok(slots.into_iter().next())
+}
+
+fn planned_child_execution(
+    profile: &AgentProfile,
+    parent: Option<&astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
+    model_plan: Option<&astra_turn_types::DirectDelegationModelPlan>,
+    slot_index: usize,
+    inherited_constraints: &RequestConstraints,
+) -> Result<
+    (
+        AgentProfile,
+        astra_turn_core::thinking_config::ThinkingConfig,
+        RequestConstraints,
+        Option<astra_turn_types::RequestedModelPolicy>,
+    ),
+    String,
+> {
+    let (mut execution_profile, mut thinking) = profile_child_execution(profile, parent);
+    let mut request_constraints = inherited_constraints.clone();
+    let (slot, child_requirements) = if let Some(model_plan) = model_plan {
+        let slot = match &model_plan.outcome {
+            astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+                slot_count,
+            } if *slot_count as usize == model_plan.child_requirements.len() => None,
+            astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+                ..
+            } => {
+                return Err("direct Team model plan changed its unconstrained slot count".into());
+            }
+            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots } => {
+                let slot = slots
+                    .get(slot_index)
+                    .filter(|slot| slot.slot_index as usize == slot_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        "direct Team model plan is missing a canonical slot".to_string()
+                    })?;
+                Some(slot)
+            }
+        };
+        let child_requirements = model_plan
+            .child_requirements
+            .get(slot_index)
+            .cloned()
+            .ok_or_else(|| "direct Team model plan is missing a child requirement".to_string())?;
+        (slot, child_requirements)
+    } else {
+        let slot = inherited_model_slot_constraint(inherited_constraints)?;
+        let child_requirements = inherited_constraints
+            .delegated_model_requirements
+            .for_child_descendants()
+            .map_err(str::to_string)?;
+        (slot, child_requirements)
+    };
+
+    let requested_model_policy = slot
+        .as_ref()
+        .and_then(|slot| slot.requested_model_policy.clone());
+    if let Some(slot) = slot.as_ref() {
+        apply_model_slot_constraint(&mut execution_profile, &mut thinking, parent, slot);
+    }
+    request_constraints.delegated_model_requirements = child_requirements;
+    Ok((
+        execution_profile,
+        thinking,
+        request_constraints,
+        requested_model_policy,
+    ))
 }
 
 /// Model choice and controls that must be authorized before a durable child
@@ -3819,8 +3968,63 @@ impl DelegationEngine {
             admitted_model_execution,
             None,
             None,
+            None,
+            None,
         )
         .await
+    }
+
+    async fn validate_direct_model_plan(
+        &self,
+        request: &DelegationRequest,
+        model_plan: &astra_turn_types::DirectDelegationModelPlan,
+        command_identity: &astra_turn_types::DirectDelegationCommandIdentity,
+    ) -> Result<(), String> {
+        let agent_ids = match &request.pattern {
+            CoordinationPattern::FanOut { agent_ids, .. }
+            | CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
+            CoordinationPattern::Pipeline { stages, .. } => {
+                stages.iter().map(|stage| stage.agent_id.clone()).collect()
+            }
+            CoordinationPattern::AdversarialReview {
+                producer_id,
+                reviewer_id,
+                ..
+            } => vec![producer_id.clone(), reviewer_id.clone()],
+            CoordinationPattern::Fork { .. } => {
+                return Err("direct Team model plans do not support fork patterns".into());
+            }
+        };
+        let profiles = {
+            let registry = self.registry.read().await;
+            agent_ids
+                .iter()
+                .map(|agent_id| {
+                    registry.get(agent_id).cloned().ok_or_else(|| {
+                        Self::missing_agent_profile_error(
+                            "direct Team model-plan validation",
+                            agent_id,
+                            &registry,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let slot_plan =
+            astra_services::delegation_model_requirement::canonical_team_delegation_slot_plan(
+                request, &profiles,
+            )?;
+        let task_digest = format!("sha256:{:x}", sha2::Sha256::digest(request.task.as_bytes()));
+        model_plan
+            .validate_identity(
+                command_identity,
+                &request.user_id,
+                &request.session_id,
+                &task_digest,
+                &slot_plan.digest,
+                slot_plan.briefs.len(),
+            )
+            .map_err(str::to_string)
     }
 
     /// Execute one delegation with an optional request-scoped child live lane.
@@ -3838,6 +4042,8 @@ impl DelegationEngine {
             astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
         >,
         live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+        model_plan: Option<astra_turn_types::DirectDelegationModelPlan>,
+        command_identity: Option<astra_turn_types::DirectDelegationCommandIdentity>,
     ) -> Result<DelegationResult, String> {
         request
             .context
@@ -3846,9 +4052,13 @@ impl DelegationEngine {
         let enabled_tools = parse_request_allowlist_from_context(
             &mut request.context,
             crate::turn::agentic::delegate_interception::REQUEST_ENABLED_TOOLS_CONTEXT_KEY,
-        )?
-        .or_else(|| Some(HashSet::new()));
-        let request_constraints = RequestConstraints::new(
+        )?;
+        // Server request admission materializes an omitted optional-tool
+        // allowlist as `Some(empty)`. A local CLI has no server capability
+        // boundary and deliberately leaves it as `None`; preserving that
+        // distinction keeps direct Team children from losing their normal
+        // optional network-tool surface.
+        let mut request_constraints = RequestConstraints::new(
             parse_request_allowlist_from_context(
                 &mut request.context,
                 crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
@@ -3863,9 +4073,28 @@ impl DelegationEngine {
                 crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY,
             )?,
         );
+        if let Some(value) = request
+            .context
+            .remove(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY)
+        {
+            request_constraints.delegated_model_requirements = serde_json::from_value(value)
+                .map_err(|_| "delegated model handoff is malformed".to_string())?;
+            request_constraints
+                .delegated_model_requirements
+                .validate()
+                .map_err(str::to_string)?;
+        }
 
         // Validate first
         self.validate(&request, source_agent_id).await?;
+        match (&model_plan, &command_identity) {
+            (Some(model_plan), Some(command_identity)) => {
+                self.validate_direct_model_plan(&request, model_plan, command_identity)
+                    .await?;
+            }
+            (None, None) => {}
+            _ => return Err("direct Team model plan has incomplete command identity".into()),
+        }
         let child_recursion_depth =
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth_u32(
                 request.depth,
@@ -4006,6 +4235,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     effective_parent_model_reasoning.as_ref(),
                     &request_constraints,
+                    model_plan.as_ref(),
                     child_recursion_depth,
                     interaction_mode,
                     *timeout_sec,
@@ -4027,6 +4257,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     effective_parent_model_reasoning.as_ref(),
                     &request_constraints,
+                    model_plan.as_ref(),
                     child_recursion_depth,
                     interaction_mode,
                     *timeout_sec,
@@ -4048,6 +4279,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     effective_parent_model_reasoning.as_ref(),
                     &request_constraints,
+                    model_plan.as_ref(),
                     child_recursion_depth,
                     interaction_mode,
                     *timeout_sec,
@@ -4072,6 +4304,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     effective_parent_model_reasoning.as_ref(),
                     &request_constraints,
+                    model_plan.as_ref(),
                     child_recursion_depth,
                     interaction_mode,
                     *timeout_sec,
@@ -4186,6 +4419,7 @@ impl DelegationEngine {
             &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
         >,
         request_constraints: &RequestConstraints,
+        model_plan: Option<&astra_turn_types::DirectDelegationModelPlan>,
         child_recursion_depth: u8,
         interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
@@ -4214,13 +4448,28 @@ impl DelegationEngine {
         let session_id = Self::session_id_for(request);
         let child_plans = agent_ids
             .iter()
-            .map(|agent_id| {
+            .enumerate()
+            .map(|(slot_index, agent_id)| {
                 let profile = reg.get(agent_id).cloned().ok_or_else(|| {
                     Self::missing_agent_profile_error("fanout spawn", agent_id, &reg)
                 })?;
-                let (profile, thinking) = profile_child_execution(&profile, parent_model_reasoning);
+                let (profile, thinking, slot_constraints, requested_model_policy) =
+                    planned_child_execution(
+                        &profile,
+                        parent_model_reasoning,
+                        model_plan,
+                        slot_index,
+                        request_constraints,
+                    )?;
                 let delegation_chain = Self::delegation_chain_for_child(request, agent_id)?;
-                Ok((agent_id.clone(), profile, thinking, delegation_chain))
+                Ok((
+                    agent_id.clone(),
+                    profile,
+                    thinking,
+                    delegation_chain,
+                    slot_constraints,
+                    requested_model_policy,
+                ))
             })
             .collect::<Result<Vec<_>, String>>()?;
         drop(reg);
@@ -4230,7 +4479,7 @@ impl DelegationEngine {
         // or persist rows with a parent Offering that differs from execution.
         let model_requests = child_plans
             .iter()
-            .map(|(_, profile, thinking, _)| SubRunModelRequest {
+            .map(|(_, profile, thinking, _, _, _)| SubRunModelRequest {
                 user_id: request.user_id.clone(),
                 selection: profile.model_selection.clone(),
                 parent_model_reasoning: parent_model_reasoning.cloned(),
@@ -4253,8 +4502,17 @@ impl DelegationEngine {
         let mut owner_generations = HashMap::new();
         let mut started_children = Vec::new();
         let mut startup_error = None;
-        for ((agent_id, profile, thinking, delegation_chain), prepared_model) in
-            child_plans.into_iter().zip(prepared_models)
+        for (
+            (
+                agent_id,
+                profile,
+                thinking,
+                delegation_chain,
+                slot_constraints,
+                requested_model_policy,
+            ),
+            prepared_model,
+        ) in child_plans.into_iter().zip(prepared_models)
         {
             if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 startup_error = Some(
@@ -4273,7 +4531,7 @@ impl DelegationEngine {
                     &agent_id,
                     None,
                     interaction_mode,
-                    request_constraints,
+                    &slot_constraints,
                     &thinking,
                     prepared_model.as_ref(),
                     cancel_token,
@@ -4411,10 +4669,10 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: prepared_model.clone(),
-                requested_model_policy: None,
+                requested_model_policy,
                 thinking: thinking.clone(),
                 interaction_mode,
-                request_constraints: request_constraints.clone(),
+                request_constraints: slot_constraints,
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
                 initial_turns: None,
@@ -4495,7 +4753,8 @@ impl DelegationEngine {
         };
 
         // Store config templates for fan-out gate retry support.
-        // Maps agent_id → (AgentProfile, task, session_id, user_id, context, delegation_chain, thinking)
+        // Maps agent_id → frozen execution profile, task/context identity,
+        // thinking, request constraints, and prepared route for exact retries.
         let mut retry_templates: HashMap<
             String,
             (
@@ -4506,7 +4765,9 @@ impl DelegationEngine {
                 HashMap<String, serde_json::Value>,
                 Vec<String>,
                 astra_turn_core::thinking_config::ThinkingConfig,
+                RequestConstraints,
                 Option<PreparedSubRunModel>,
+                Option<astra_turn_types::RequestedModelPolicy>,
             ),
         > = HashMap::new();
         for config in &configs {
@@ -4524,7 +4785,9 @@ impl DelegationEngine {
                     retry_context,
                     config.delegation_chain.clone(),
                     config.thinking.clone(),
+                    config.request_constraints.clone(),
                     config.prepared_model.clone(),
+                    config.requested_model_policy.clone(),
                 ),
             );
         }
@@ -4794,7 +5057,7 @@ impl DelegationEngine {
                     );
                     template.clone()
                 });
-                let expected_model = template.as_ref().and_then(|template| template.7.as_ref());
+                let expected_model = template.as_ref().and_then(|template| template.8.as_ref());
                 let gated = self
                     .apply_gate(
                         &request.user_id,
@@ -4821,7 +5084,9 @@ impl DelegationEngine {
                                 ctx,
                                 delegation_chain,
                                 thinking,
+                                retry_constraints,
                                 _,
+                                requested_model_policy,
                             )) = template.clone()
                             else {
                                 return Err(format!(
@@ -4848,10 +5113,10 @@ impl DelegationEngine {
                                 forward_headers: forward_headers.clone(),
                                 admitted_model_execution: admitted_model_execution.cloned(),
                                 prepared_model: None,
-                                requested_model_policy: None,
+                                requested_model_policy,
                                 thinking: thinking.clone(),
                                 interaction_mode,
-                                request_constraints: request_constraints.clone(),
+                                request_constraints: retry_constraints,
                                 recursion_depth: child_recursion_depth,
                                 max_turns: None,
                                 initial_turns: None,
@@ -4912,6 +5177,7 @@ impl DelegationEngine {
             &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
         >,
         request_constraints: &RequestConstraints,
+        model_plan: Option<&astra_turn_types::DirectDelegationModelPlan>,
         child_recursion_depth: u8,
         interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
@@ -4940,7 +5206,14 @@ impl DelegationEngine {
                     Self::missing_agent_profile_error("sequential spawn", agent_id, &registry)
                 })?
             };
-            let (profile, thinking) = profile_child_execution(&profile, parent_model_reasoning);
+            let (profile, thinking, slot_constraints, requested_model_policy) =
+                planned_child_execution(
+                    &profile,
+                    parent_model_reasoning,
+                    model_plan,
+                    stage_index,
+                    request_constraints,
+                )?;
             let model_request = SubRunModelRequest {
                 user_id: request.user_id.clone(),
                 selection: profile.model_selection.clone(),
@@ -4994,7 +5267,7 @@ impl DelegationEngine {
                     agent_id,
                     None,
                     interaction_mode,
-                    request_constraints,
+                    &slot_constraints,
                     &thinking,
                     prepared_model.as_ref(),
                     cancel_token,
@@ -5167,10 +5440,10 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: prepared_model.clone(),
-                requested_model_policy: None,
+                requested_model_policy: requested_model_policy.clone(),
                 thinking: thinking.clone(),
                 interaction_mode,
-                request_constraints: request_constraints.clone(),
+                request_constraints: slot_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
                 initial_turns: None,
@@ -5267,10 +5540,10 @@ impl DelegationEngine {
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
                             prepared_model: None,
-                            requested_model_policy: None,
+                            requested_model_policy: requested_model_policy.clone(),
                             thinking: thinking.clone(),
                             interaction_mode,
-                            request_constraints: request_constraints.clone(),
+                                request_constraints: slot_constraints.clone(),
                             recursion_depth: child_recursion_depth,
                             max_turns: None,
                             initial_turns: None,
@@ -5333,6 +5606,7 @@ impl DelegationEngine {
             &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
         >,
         request_constraints: &RequestConstraints,
+        model_plan: Option<&astra_turn_types::DirectDelegationModelPlan>,
         child_recursion_depth: u8,
         interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
@@ -5350,10 +5624,22 @@ impl DelegationEngine {
         let reviewer_profile = reg.get(reviewer_id).cloned().ok_or_else(|| {
             Self::missing_agent_profile_error("adversarial reviewer", reviewer_id, &reg)
         })?;
-        let (producer_profile, producer_thinking) =
-            profile_child_execution(&producer_profile, parent_model_reasoning);
-        let (reviewer_profile, reviewer_thinking) =
-            profile_child_execution(&reviewer_profile, parent_model_reasoning);
+        let (producer_profile, producer_thinking, producer_constraints, producer_model_policy) =
+            planned_child_execution(
+                &producer_profile,
+                parent_model_reasoning,
+                model_plan,
+                0,
+                request_constraints,
+            )?;
+        let (reviewer_profile, reviewer_thinking, reviewer_constraints, reviewer_model_policy) =
+            planned_child_execution(
+                &reviewer_profile,
+                parent_model_reasoning,
+                model_plan,
+                1,
+                request_constraints,
+            )?;
         let producer_delegation_chain = Self::delegation_chain_for_child(request, producer_id)?;
         let reviewer_delegation_chain = Self::delegation_chain_for_child(request, reviewer_id)?;
         drop(reg);
@@ -5428,7 +5714,7 @@ impl DelegationEngine {
                     producer_id,
                     None,
                     interaction_mode,
-                    request_constraints,
+                    &producer_constraints,
                     &producer_thinking,
                     producer_model.as_ref(),
                     cancel_token,
@@ -5620,10 +5906,10 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: producer_model.clone(),
-                requested_model_policy: None,
+                requested_model_policy: producer_model_policy.clone(),
                 thinking: producer_thinking.clone(),
                 interaction_mode,
-                request_constraints: request_constraints.clone(),
+                request_constraints: producer_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
                 initial_turns: None,
@@ -5718,10 +6004,10 @@ impl DelegationEngine {
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
                             prepared_model: None,
-                            requested_model_policy: None,
+                            requested_model_policy: producer_model_policy.clone(),
                             thinking: producer_thinking.clone(),
                             interaction_mode,
-                            request_constraints: request_constraints.clone(),
+                            request_constraints: producer_constraints.clone(),
                             recursion_depth: child_recursion_depth,
                             max_turns: None,
                             initial_turns: None,
@@ -5784,7 +6070,7 @@ impl DelegationEngine {
                     reviewer_id,
                     None,
                     interaction_mode,
-                    request_constraints,
+                    &reviewer_constraints,
                     &reviewer_thinking,
                     reviewer_model.as_ref(),
                     cancel_token,
@@ -5964,10 +6250,10 @@ impl DelegationEngine {
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
                 prepared_model: reviewer_model.clone(),
-                requested_model_policy: None,
+                requested_model_policy: reviewer_model_policy.clone(),
                 thinking: reviewer_thinking.clone(),
                 interaction_mode,
-                request_constraints: request_constraints.clone(),
+                request_constraints: reviewer_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
                 initial_turns: None,
@@ -6947,6 +7233,8 @@ impl DelegationExecutor for DelegationEngine {
         request: DelegationRequest,
         source_agent_id: &str,
         profile_snapshot: AgentProfileRegistry,
+        model_plan: Option<astra_turn_types::DirectDelegationModelPlan>,
+        command_identity: Option<astra_turn_types::DirectDelegationCommandIdentity>,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         // Team profiles are request authority. Execute against an isolated,
@@ -6963,7 +7251,17 @@ impl DelegationExecutor for DelegationEngine {
             projection_store: self.projection_store.clone(),
         };
         isolated
-            .execute(request, source_agent_id, cancel_token)
+            .execute_with_forward_headers_and_live_events(
+                request,
+                source_agent_id,
+                cancel_token,
+                HashMap::new(),
+                None,
+                None,
+                None,
+                model_plan,
+                command_identity,
+            )
             .await
     }
 
@@ -7209,6 +7507,235 @@ mod tests {
                 tool_calls: 0,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn direct_team_model_plan_is_validated_then_drives_real_child_admission() {
+        use astra_turn_types::{
+            DelegationIntentRequirement, DelegationIntentRequirements,
+            DelegationModelAdmissionOutcome, DelegationModelSlotConstraint,
+            DelegationReasoningEffort, DelegationReasoningRequirement,
+            DelegationRequirementPropagation, DelegationRequirementStrength,
+            DelegationUserRequirementSource, DirectDelegationModelPlan, ModelSelection,
+        };
+
+        let request = fan_out_request(vec!["coder", "reviewer"]);
+        let (registry, run_engine, tracker) = setup();
+        start_model_parent(&run_engine, &request, "offer-parent").await;
+        let profiles = {
+            let registry = registry.read().await;
+            vec![
+                registry.get("coder").unwrap().clone(),
+                registry.get("reviewer").unwrap().clone(),
+            ]
+        };
+        let slot_plan =
+            astra_services::delegation_model_requirement::canonical_team_delegation_slot_plan(
+                &request, &profiles,
+            )
+            .unwrap();
+        let task_digest = format!("sha256:{:x}", sha2::Sha256::digest(request.task.as_bytes()));
+        let command_identity = astra_turn_types::DirectDelegationCommandIdentity {
+            command_intent_id: "6c4d6059-e438-4c2b-8c72-385711027465".into(),
+            session_turn: 1,
+        };
+        let source = DelegationUserRequirementSource {
+            user_id: request.user_id.clone(),
+            session_id: request.session_id.clone(),
+            session_turn: 1,
+            applied_intent_id: None,
+            command_intent_id: Some(command_identity.command_intent_id.clone()),
+            user_intent_digest: task_digest,
+        };
+        let coder_requirement = DelegationIntentRequirements::Unconstrained {
+            source: source.clone(),
+        };
+        let reviewer_requirement = DelegationIntentRequirements::Requirements {
+            source: source.clone(),
+            requirements: vec![DelegationIntentRequirement {
+                requirement_id: "nested-review-model".into(),
+                model_selection: Some(ModelSelection {
+                    offering_id: "offer-nested-review".into(),
+                }),
+                requested_model_policy: None,
+                reasoning: None,
+                task_scope_quote: Some("review descendants".into()),
+                propagation: DelegationRequirementPropagation::Descendants,
+                strength: DelegationRequirementStrength::Hard,
+            }],
+        };
+        let model_plan = DirectDelegationModelPlan {
+            source,
+            slot_plan_digest: slot_plan.digest,
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![
+                    DelegationModelSlotConstraint {
+                        slot_index: 0,
+                        model_selection: Some(ModelSelection {
+                            offering_id: "offer-direct-coder".into(),
+                        }),
+                        requested_model_policy: None,
+                        model_strength: Some(DelegationRequirementStrength::Hard),
+                        reasoning: Some(DelegationReasoningRequirement::Effort {
+                            effort: DelegationReasoningEffort::Low,
+                        }),
+                        reasoning_strength: Some(DelegationRequirementStrength::Hard),
+                        task_scope_quote: Some("implementation".into()),
+                    },
+                    DelegationModelSlotConstraint {
+                        slot_index: 1,
+                        model_selection: Some(ModelSelection {
+                            offering_id: "offer-direct-reviewer".into(),
+                        }),
+                        requested_model_policy: None,
+                        model_strength: Some(DelegationRequirementStrength::Hard),
+                        reasoning: Some(DelegationReasoningRequirement::Effort {
+                            effort: DelegationReasoningEffort::High,
+                        }),
+                        reasoning_strength: Some(DelegationRequirementStrength::Hard),
+                        task_scope_quote: Some("review".into()),
+                    },
+                ],
+            },
+            child_requirements: vec![coder_requirement.clone(), reviewer_requirement.clone()],
+        };
+        model_plan
+            .validate_identity(
+                &command_identity,
+                &request.user_id,
+                &request.session_id,
+                &model_plan.source.user_intent_digest,
+                &model_plan.slot_plan_digest,
+                2,
+            )
+            .unwrap();
+
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker,
+            Arc::new(ModelAdmissionExecutor {
+                rejected_offering: None,
+                resolved_model_name: None,
+                drift_model_name_after_first_batch: false,
+                preparation_started: None,
+                preparation_release: None,
+                batches: batches.clone(),
+                executions: executions.clone(),
+            }),
+        );
+
+        let mut changed_task = request.clone();
+        changed_task.task.push_str(" changed after assessment");
+        let rejection = engine
+            .execute_with_forward_headers_and_live_events(
+                changed_task,
+                "orch",
+                None,
+                HashMap::new(),
+                None,
+                None,
+                None,
+                Some(model_plan.clone()),
+                Some(command_identity.clone()),
+            )
+            .await
+            .expect_err("a plan for another task must be rejected before child admission");
+        assert!(
+            rejection.contains("another command or slot plan"),
+            "{rejection}"
+        );
+        assert!(batches.lock().unwrap().is_empty());
+        assert!(executions.lock().unwrap().is_empty());
+
+        let result = engine
+            .execute_with_forward_headers_and_live_events(
+                request.clone(),
+                "orch",
+                None,
+                HashMap::new(),
+                None,
+                None,
+                None,
+                Some(model_plan.clone()),
+                Some(command_identity.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.agent_results.len(), 2);
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![vec![
+                "offer-direct-coder".to_string(),
+                "offer-direct-reviewer".to_string()
+            ]]
+        );
+
+        for child in &result.agent_results {
+            let durable = run_engine
+                .load_run(&request.user_id, &child.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let (expected_offering, expected_thinking, expected_requirement) =
+                if child.agent_id == "coder" {
+                    (
+                        "offer-direct-coder",
+                        astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+                            effort: astra_turn_core::thinking_config::ThinkingEffort::Low,
+                        },
+                        coder_requirement.clone(),
+                    )
+                } else {
+                    (
+                        "offer-direct-reviewer",
+                        astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+                            effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                        },
+                        reviewer_requirement.clone(),
+                    )
+                };
+            assert_eq!(
+                durable.model_offering_id.as_deref(),
+                Some(expected_offering)
+            );
+            assert_eq!(
+                crate::server::run::engine::durable_run_generation_controls(&durable)
+                    .unwrap()
+                    .thinking,
+                expected_thinking
+            );
+            assert_eq!(
+                crate::server::run::engine::durable_run_delegated_model_requirements(&durable)
+                    .unwrap(),
+                Some(expected_requirement)
+            );
+        }
+        assert_eq!(executions.lock().unwrap().len(), 2);
+
+        let other_command = astra_turn_types::DirectDelegationCommandIdentity {
+            command_intent_id: "f2dbd6e8-2f9f-4f36-8f6d-b8d51b0f0d77".into(),
+            session_turn: command_identity.session_turn,
+        };
+        let replay = engine
+            .execute_with_forward_headers_and_live_events(
+                request,
+                "orch",
+                None,
+                HashMap::new(),
+                None,
+                None,
+                None,
+                Some(model_plan),
+                Some(other_command),
+            )
+            .await
+            .expect_err("a plan cannot be replayed under another command identity");
+        assert!(replay.contains("another command or slot plan"), "{replay}");
+        assert_eq!(batches.lock().unwrap().len(), 1);
+        assert_eq!(executions.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -7695,6 +8222,7 @@ mod tests {
                 session_id: "session".into(),
                 session_turn: 1,
                 applied_intent_id: None,
+                command_intent_id: None,
                 user_intent_digest: "intent-digest".into(),
             },
             requirements: vec![DelegationIntentRequirement {
@@ -7702,6 +8230,7 @@ mod tests {
                 model_selection: Some(ModelSelection {
                     offering_id: "review-offering".into(),
                 }),
+                requested_model_policy: None,
                 reasoning: None,
                 task_scope_quote: None,
                 propagation: DelegationRequirementPropagation::Descendants,
@@ -7893,6 +8422,233 @@ mod tests {
         let (resolved, thinking) = profile_child_execution(&explicit, Some(&parent));
         assert_eq!(resolved.model_selection, explicit.model_selection);
         assert_eq!(thinking, ThinkingConfig::ModelDefault);
+    }
+
+    #[test]
+    fn direct_team_model_plan_is_applied_per_slot_and_kept_for_descendants() {
+        use astra_turn_core::orchestration_spawn_tool::ParentModelReasoning;
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        use astra_turn_types::{
+            DelegationIntentRequirement, DelegationIntentRequirements,
+            DelegationModelAdmissionOutcome, DelegationModelSlotConstraint,
+            DelegationReasoningEffort, DelegationReasoningRequirement,
+            DelegationRequirementPropagation, DelegationRequirementStrength,
+            DelegationUserRequirementSource, DirectDelegationModelPlan, ModelSelection,
+        };
+
+        let source = DelegationUserRequirementSource {
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            session_turn: 3,
+            applied_intent_id: None,
+            command_intent_id: Some("6c4d6059-e438-4c2b-8c72-385711027465".into()),
+            user_intent_digest: "sha256:task".into(),
+        };
+        let inherited = DelegationIntentRequirements::Unconstrained {
+            source: source.clone(),
+        };
+        let descendants = DelegationIntentRequirements::Requirements {
+            source: source.clone(),
+            requirements: vec![DelegationIntentRequirement {
+                requirement_id: "nested-review".into(),
+                model_selection: Some(ModelSelection {
+                    offering_id: "nested-review-model".into(),
+                }),
+                requested_model_policy: None,
+                reasoning: None,
+                task_scope_quote: Some("review descendants".into()),
+                propagation: DelegationRequirementPropagation::Descendants,
+                strength: DelegationRequirementStrength::Hard,
+            }],
+        };
+        let plan = DirectDelegationModelPlan {
+            source,
+            slot_plan_digest: "sha256:slot-plan".into(),
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![
+                    DelegationModelSlotConstraint {
+                        slot_index: 0,
+                        model_selection: Some(ModelSelection {
+                            offering_id: "coder-model".into(),
+                        }),
+                        requested_model_policy: None,
+                        model_strength: Some(DelegationRequirementStrength::Hard),
+                        reasoning: Some(DelegationReasoningRequirement::Effort {
+                            effort: DelegationReasoningEffort::Low,
+                        }),
+                        reasoning_strength: Some(DelegationRequirementStrength::Hard),
+                        task_scope_quote: Some("implementation".into()),
+                    },
+                    DelegationModelSlotConstraint {
+                        slot_index: 1,
+                        model_selection: Some(ModelSelection {
+                            offering_id: "reviewer-model".into(),
+                        }),
+                        requested_model_policy: None,
+                        model_strength: Some(DelegationRequirementStrength::Hard),
+                        reasoning: Some(DelegationReasoningRequirement::Effort {
+                            effort: DelegationReasoningEffort::High,
+                        }),
+                        reasoning_strength: Some(DelegationRequirementStrength::Hard),
+                        task_scope_quote: Some("review".into()),
+                    },
+                ],
+            },
+            child_requirements: vec![inherited.clone(), descendants.clone()],
+        };
+        let parent = ParentModelReasoning {
+            selection: ModelSelection {
+                offering_id: "parent-model".into(),
+            },
+            resolved_model_name: Some("parent".into()),
+            thinking: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+        };
+        let mut coder = AgentProfile::new("coder", "Coder", AgentTier::System);
+        coder.model_selection = Some(ModelSelection {
+            offering_id: "profile-model".into(),
+        });
+        let reviewer = AgentProfile::new("reviewer", "Reviewer", AgentTier::System);
+        let base_constraints = RequestConstraints::default();
+
+        let (coder, coder_thinking, coder_constraints, coder_model_policy) =
+            planned_child_execution(&coder, Some(&parent), Some(&plan), 0, &base_constraints)
+                .unwrap();
+        let (reviewer, reviewer_thinking, reviewer_constraints, reviewer_model_policy) =
+            planned_child_execution(&reviewer, Some(&parent), Some(&plan), 1, &base_constraints)
+                .unwrap();
+
+        assert_eq!(coder.model_selection.unwrap().offering_id, "coder-model");
+        assert_eq!(
+            coder_thinking,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low
+            }
+        );
+        assert_eq!(
+            reviewer.model_selection.unwrap().offering_id,
+            "reviewer-model"
+        );
+        assert_eq!(
+            reviewer_thinking,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High
+            }
+        );
+        assert_eq!(coder_constraints.delegated_model_requirements, inherited);
+        assert_eq!(
+            reviewer_constraints.delegated_model_requirements,
+            descendants
+        );
+        assert_eq!(coder_model_policy, None);
+        assert_eq!(reviewer_model_policy, None);
+        assert_eq!(
+            base_constraints.delegated_model_requirements,
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn direct_team_model_plan_rejects_slot_index_drift_before_execution() {
+        use astra_turn_types::{
+            DelegationIntentRequirements, DelegationModelAdmissionOutcome,
+            DelegationModelSlotConstraint, DelegationReasoningRequirement,
+            DelegationRequirementStrength, DelegationUserRequirementSource,
+            DirectDelegationModelPlan, ModelSelection,
+        };
+        let source = DelegationUserRequirementSource {
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            session_turn: 1,
+            applied_intent_id: None,
+            command_intent_id: Some("6c4d6059-e438-4c2b-8c72-385711027465".into()),
+            user_intent_digest: "sha256:task".into(),
+        };
+        let plan = DirectDelegationModelPlan {
+            source: source.clone(),
+            slot_plan_digest: "sha256:slot-plan".into(),
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![DelegationModelSlotConstraint {
+                    slot_index: 1,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "model".into(),
+                    }),
+                    requested_model_policy: None,
+                    model_strength: Some(DelegationRequirementStrength::Hard),
+                    reasoning: Some(DelegationReasoningRequirement::ModelDefault),
+                    reasoning_strength: Some(DelegationRequirementStrength::Hard),
+                    task_scope_quote: None,
+                }],
+            },
+            child_requirements: vec![DelegationIntentRequirements::Unconstrained { source }],
+        };
+        let error = planned_child_execution(
+            &AgentProfile::new("coder", "Coder", AgentTier::System),
+            None,
+            Some(&plan),
+            0,
+            &RequestConstraints::default(),
+        )
+        .expect_err("a reordered slot must not receive another child's model");
+        assert!(error.contains("canonical slot"), "{error}");
+    }
+
+    #[test]
+    fn unspecified_child_inherits_resolved_auto_policy_from_parent_constraints() {
+        use astra_turn_types::{
+            DelegationIntentRequirement, DelegationIntentRequirements,
+            DelegationRequirementPropagation, DelegationRequirementStrength,
+            DelegationUserRequirementSource, ModelSelection, RequestedModelPolicy,
+        };
+
+        let source = DelegationUserRequirementSource {
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            session_turn: 1,
+            applied_intent_id: None,
+            command_intent_id: None,
+            user_intent_digest: "sha256:task".into(),
+        };
+        let requirements = DelegationIntentRequirements::Requirements {
+            source,
+            requirements: vec![DelegationIntentRequirement {
+                requirement_id: "auto-descendant".into(),
+                model_selection: Some(ModelSelection {
+                    offering_id: "auto-selected".into(),
+                }),
+                requested_model_policy: Some(RequestedModelPolicy::Auto {
+                    strategy: astra_turn_types::AutoModelStrategy::Balanced,
+                }),
+                reasoning: None,
+                task_scope_quote: None,
+                propagation: DelegationRequirementPropagation::Descendants,
+                strength: DelegationRequirementStrength::Hard,
+            }],
+        };
+        let mut constraints = RequestConstraints::default();
+        constraints.delegated_model_requirements = requirements.clone();
+
+        let (profile, _, child_constraints, policy) = planned_child_execution(
+            &AgentProfile::new("reviewer", "Reviewer", AgentTier::System),
+            None,
+            None,
+            0,
+            &constraints,
+        )
+        .unwrap();
+
+        assert_eq!(
+            profile.model_selection.unwrap().offering_id,
+            "auto-selected"
+        );
+        assert_eq!(
+            policy,
+            Some(RequestedModelPolicy::Auto {
+                strategy: astra_turn_types::AutoModelStrategy::Balanced,
+            })
+        );
+        assert_eq!(child_constraints.delegated_model_requirements, requirements);
     }
 
     #[test]
@@ -8916,6 +9672,8 @@ mod tests {
                 None,
                 None,
                 Some(Arc::new(NoopLiveSink)),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -10039,6 +10797,8 @@ mod tests {
                     thinking: expected.clone(),
                 }),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -10150,6 +10910,25 @@ mod tests {
         assert!(
             !context.contains_key(key),
             "key should be removed from context"
+        );
+    }
+
+    #[test]
+    fn optional_tool_context_distinguishes_unmanaged_cli_from_explicit_disable() {
+        let key = crate::turn::agentic::delegate_interception::REQUEST_ENABLED_TOOLS_CONTEXT_KEY;
+        let mut local_cli_context = HashMap::new();
+        assert_eq!(
+            parse_request_allowlist_from_context(&mut local_cli_context, key)
+                .expect("omitted optional-tool context is valid"),
+            None
+        );
+
+        let mut explicitly_disabled_context =
+            HashMap::from([(key.to_string(), serde_json::json!([]))]);
+        assert_eq!(
+            parse_request_allowlist_from_context(&mut explicitly_disabled_context, key)
+                .expect("explicit optional-tool deny set is valid"),
+            Some(HashSet::new())
         );
     }
 
@@ -13036,7 +13815,6 @@ mod tests {
                 request.pattern = CoordinationPattern::Fork {
                     tasks: vec!["one".into(), "two".into()],
                     agent_id: "coder".into(),
-                    max_turns: 5,
                     aggregation: AggregationStrategy::AllResults,
                     timeout_sec: 1,
                 };

@@ -82,11 +82,13 @@ pub use context_identity::{
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
 pub use delegation_model_admission::{
-    DelegationCatalogResolutionFailure, DelegationIntentRequirement, DelegationIntentRequirements,
-    DelegationModelAdmission, DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
+    DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
+    DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
+    DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
     DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
     DelegationRequirementPropagation, DelegationRequirementStrength,
-    DelegationUserRequirementSource,
+    DelegationUserRequirementSource, DirectDelegationCommandIdentity, DirectDelegationModelPlan,
+    MAX_DIRECT_DELEGATION_SLOTS,
 };
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,

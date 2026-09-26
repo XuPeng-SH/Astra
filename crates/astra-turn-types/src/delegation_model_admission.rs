@@ -4,7 +4,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ModelSelection;
+use crate::{ModelSelection, RequestedModelPolicy};
+
+/// Reserved request-context field used only for an authenticated CLI child
+/// handoff. The value is a typed, source-bound requirement snapshot; it is not
+/// a general-purpose client override.
+pub const DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY: &str = "__astra_delegated_model_requirements";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +49,10 @@ pub struct DelegationModelSlotConstraint {
     /// Zero-based index in the admitted canonical delegation batch.
     pub slot_index: u32,
     pub model_selection: Option<ModelSelection>,
+    /// The requested policy remains distinct from the resolved Offering.
+    /// Auto may already have a concrete selection after routing, while its
+    /// provenance still needs to be visible on the child run.
+    pub requested_model_policy: Option<RequestedModelPolicy>,
     pub model_strength: Option<DelegationRequirementStrength>,
     pub reasoning: Option<DelegationReasoningRequirement>,
     pub reasoning_strength: Option<DelegationRequirementStrength>,
@@ -77,6 +86,35 @@ pub struct DelegationModelAdmission {
     pub child_requirements: Vec<DelegationIntentRequirements>,
 }
 
+/// Trusted, command-scoped selection for the local Team execution path.
+/// Unlike a Server tool admission, it has no fabricated run, turn-chain,
+/// generation, or invocation identity. The executor verifies the authenticated
+/// command source and the canonical slot-plan digest before starting children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectDelegationCommandIdentity {
+    pub command_intent_id: String,
+    pub session_turn: u32,
+}
+
+impl DirectDelegationCommandIdentity {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !is_canonical_command_intent_id(&self.command_intent_id) {
+            return Err("direct delegation command identity is invalid");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectDelegationModelPlan {
+    pub source: DelegationUserRequirementSource,
+    pub slot_plan_digest: String,
+    pub outcome: DelegationModelAdmissionOutcome,
+    pub child_requirements: Vec<DelegationIntentRequirements>,
+}
+
+pub const MAX_DIRECT_DELEGATION_SLOTS: usize = 32;
+
 /// Human instruction provenance survives child creation. It is deliberately
 /// separate from the current run's dispatch epoch and invocation identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +124,126 @@ pub struct DelegationUserRequirementSource {
     pub session_id: String,
     pub session_turn: u32,
     pub applied_intent_id: Option<String>,
+    /// Distinguishes a direct authenticated command from another intent in
+    /// the same session turn. Server conversational turns leave it absent.
+    pub command_intent_id: Option<String>,
     pub user_intent_digest: String,
+}
+
+impl DelegationUserRequirementSource {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.user_id.trim().is_empty()
+            || self.session_id.trim().is_empty()
+            || self.user_intent_digest.trim().is_empty()
+        {
+            return Err("delegation requirement source is incomplete");
+        }
+        if self.command_intent_id.as_deref().is_some_and(|command_id| {
+            self.applied_intent_id.is_some() || !is_canonical_command_intent_id(command_id)
+        }) {
+            return Err("delegation command source identity is invalid");
+        }
+        Ok(())
+    }
+}
+
+impl DirectDelegationModelPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_identity(
+        &self,
+        command: &DirectDelegationCommandIdentity,
+        user_id: &str,
+        session_id: &str,
+        task_digest: &str,
+        slot_plan_digest: &str,
+        expected_slots: usize,
+    ) -> Result<(), &'static str> {
+        command.validate()?;
+        self.source.validate()?;
+        if expected_slots == 0 || expected_slots > MAX_DIRECT_DELEGATION_SLOTS {
+            return Err("direct delegation plan has invalid slot count");
+        }
+        if self.source.user_id != user_id
+            || self.source.session_id != session_id
+            || self.source.session_turn != command.session_turn
+            || self.source.command_intent_id.as_deref() != Some(command.command_intent_id.as_str())
+            || self.source.applied_intent_id.is_some()
+            || self.source.user_intent_digest != task_digest
+            || self.slot_plan_digest != slot_plan_digest
+            || !is_sha256_digest(&self.slot_plan_digest)
+        {
+            return Err("direct delegation model plan belongs to another command or slot plan");
+        }
+        if self.child_requirements.len() != expected_slots {
+            return Err("direct delegation child requirements have wrong slot count");
+        }
+        for child in &self.child_requirements {
+            child.validate()?;
+            let origin = match child {
+                DelegationIntentRequirements::Unassessed => None,
+                DelegationIntentRequirements::Unconstrained { source }
+                | DelegationIntentRequirements::Unresolved { source, .. }
+                | DelegationIntentRequirements::Unavailable { source, .. }
+                | DelegationIntentRequirements::CatalogResolutionFailed { source, .. }
+                | DelegationIntentRequirements::Requirements { source, .. } => Some(source),
+            }
+            .ok_or("direct delegation child requirement is unassessed")?;
+            if origin.user_id != self.source.user_id
+                || origin.session_id != self.source.session_id
+                || origin.session_turn != self.source.session_turn
+                || origin.applied_intent_id != self.source.applied_intent_id
+                || origin.command_intent_id != self.source.command_intent_id
+                || origin.user_intent_digest != self.source.user_intent_digest
+            {
+                return Err("direct delegation child requirement source changed");
+            }
+        }
+        match &self.outcome {
+            DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { slot_count }
+                if *slot_count as usize == expected_slots => {}
+            DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { .. } => {
+                return Err("direct delegation plan has invalid slot count");
+            }
+            DelegationModelAdmissionOutcome::Constrained { slots } => {
+                if slots.len() != expected_slots {
+                    return Err("direct delegation plan has missing or extra slots");
+                }
+                let mut has_requirement = false;
+                for (index, slot) in slots.iter().enumerate() {
+                    if slot.slot_index != index as u32
+                        || (slot.model_selection.is_some() || slot.requested_model_policy.is_some())
+                            != slot.model_strength.is_some()
+                        || slot.reasoning.is_some() != slot.reasoning_strength.is_some()
+                    {
+                        return Err("direct delegation plan has invalid slot identity or strength");
+                    }
+                    has_requirement |= slot.model_selection.is_some()
+                        || slot.requested_model_policy.is_some()
+                        || slot.reasoning.is_some();
+                }
+                if !has_requirement {
+                    return Err("direct delegation plan has no effective constraints");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn is_canonical_command_intent_id(value: &str) -> bool {
+    if value.len() != 36 || value.to_ascii_lowercase() != value {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| match index {
+        8 | 13 | 18 | 23 => byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +265,7 @@ pub enum DelegationRequirementStrength {
 pub struct DelegationIntentRequirement {
     pub requirement_id: String,
     pub model_selection: Option<ModelSelection>,
+    pub requested_model_policy: Option<RequestedModelPolicy>,
     pub reasoning: Option<DelegationReasoningRequirement>,
     /// A task-specific requirement still needs admitted applicability at each
     /// invocation; this quote alone never authorizes a slot assignment.
@@ -190,12 +348,7 @@ impl DelegationIntentRequirements {
             | Self::CatalogResolutionFailed { source, .. }
             | Self::Requirements { source, .. } => source,
         };
-        if source.user_id.trim().is_empty()
-            || source.session_id.trim().is_empty()
-            || source.user_intent_digest.trim().is_empty()
-        {
-            return Err("delegation requirement source is incomplete");
-        }
+        source.validate()?;
         match self {
             Self::Unresolved { reason, .. } if reason.trim().is_empty() => {
                 Err("unresolved delegation requirement has no reason")
@@ -214,7 +367,9 @@ impl DelegationIntentRequirements {
                 for item in requirements {
                     if item.requirement_id.trim().is_empty()
                         || !ids.insert(item.requirement_id.as_str())
-                        || (item.model_selection.is_none() && item.reasoning.is_none())
+                        || (item.model_selection.is_none()
+                            && item.requested_model_policy.is_none()
+                            && item.reasoning.is_none())
                         || item
                             .model_selection
                             .as_ref()
@@ -298,7 +453,10 @@ impl DelegationModelAdmission {
                 | DelegationIntentRequirements::Requirements { source, .. } => Some(source),
             };
             if origin.is_some_and(|origin| {
-                origin.user_id != self.source.user_id || origin.session_id != self.source.session_id
+                origin.user_id != self.source.user_id
+                    || origin.session_id != self.source.session_id
+                    || origin.applied_intent_id != self.source.applied_intent_id
+                    || origin.user_intent_digest != self.source.user_intent_digest
             }) {
                 return Err("delegation child requirement source changed owner");
             }
@@ -317,16 +475,18 @@ impl DelegationModelAdmission {
                     if slot.slot_index != index as u32 {
                         return Err("delegation model admission has missing or reordered slots");
                     }
-                    if slot.model_selection.is_some() != slot.model_strength.is_some()
+                    if (slot.model_selection.is_some() || slot.requested_model_policy.is_some())
+                        != slot.model_strength.is_some()
                         || slot.reasoning.is_some() != slot.reasoning_strength.is_some()
                     {
                         return Err("delegation model requirement strength is missing or orphaned");
                     }
                 }
-                if slots
-                    .iter()
-                    .all(|slot| slot.model_selection.is_none() && slot.reasoning.is_none())
-                {
+                if slots.iter().all(|slot| {
+                    slot.model_selection.is_none()
+                        && slot.requested_model_policy.is_none()
+                        && slot.reasoning.is_none()
+                }) {
                     return Err("constrained delegation has no model requirements");
                 }
             }
@@ -364,6 +524,7 @@ mod tests {
                         model_selection: Some(ModelSelection {
                             offering_id: "offer-b".into(),
                         }),
+                        requested_model_policy: None,
                         model_strength: Some(DelegationRequirementStrength::Hard),
                         reasoning: None,
                         reasoning_strength: None,
@@ -372,6 +533,7 @@ mod tests {
                     DelegationModelSlotConstraint {
                         slot_index: 1,
                         model_selection: None,
+                        requested_model_policy: None,
                         model_strength: None,
                         reasoning: None,
                         reasoning_strength: None,
@@ -396,12 +558,125 @@ mod tests {
     }
 
     #[test]
+    fn direct_team_plan_is_bound_to_command_task_and_ordered_slots() {
+        let command_id = "6bca9f9c-6d18-4579-bce1-2b45f573a098";
+        let command = DirectDelegationCommandIdentity {
+            command_intent_id: command_id.into(),
+            session_turn: 4,
+        };
+        let source = DelegationUserRequirementSource {
+            user_id: "user".into(),
+            session_id: "session".into(),
+            session_turn: 4,
+            applied_intent_id: None,
+            command_intent_id: Some(command_id.into()),
+            user_intent_digest: "sha256:task-digest".into(),
+        };
+        let child = DelegationIntentRequirements::Unconstrained {
+            source: source.clone(),
+        };
+        let mut plan = DirectDelegationModelPlan {
+            source,
+            slot_plan_digest: format!("sha256:{}", "a".repeat(64)),
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![DelegationModelSlotConstraint {
+                    slot_index: 0,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "authorized-offering".into(),
+                    }),
+                    requested_model_policy: None,
+                    model_strength: Some(DelegationRequirementStrength::Hard),
+                    reasoning: None,
+                    reasoning_strength: None,
+                    task_scope_quote: None,
+                }],
+            },
+            child_requirements: vec![child],
+        };
+        let plan_digest = plan.slot_plan_digest.clone();
+        assert!(
+            plan.validate_identity(
+                &command,
+                "user",
+                "session",
+                "sha256:task-digest",
+                &plan_digest,
+                1,
+            )
+            .is_ok()
+        );
+        assert!(
+            plan.validate_identity(
+                &command,
+                "other-user",
+                "session",
+                "sha256:task-digest",
+                &plan_digest,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            plan.validate_identity(
+                &command,
+                "user",
+                "session",
+                "sha256:changed-task",
+                &plan_digest,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            plan.validate_identity(
+                &command,
+                "user",
+                "session",
+                "sha256:task-digest",
+                &plan_digest,
+                2,
+            )
+            .is_err()
+        );
+        plan.slot_plan_digest = "sha256:truncated".into();
+        assert!(
+            plan.validate_identity(
+                &command,
+                "user",
+                "session",
+                "sha256:task-digest",
+                &plan_digest,
+                1,
+            )
+            .is_err()
+        );
+        plan.slot_plan_digest = plan_digest.clone();
+        let other_command = DirectDelegationCommandIdentity {
+            command_intent_id: "a6f7e88f-7dd5-4cfb-b4b2-3c1db1a8e72c".into(),
+            session_turn: 4,
+        };
+        assert!(
+            plan.validate_identity(
+                &other_command,
+                "user",
+                "session",
+                "sha256:task-digest",
+                &plan_digest,
+                1,
+            )
+            .is_err(),
+            "a plan cannot be replayed under a different authenticated command"
+        );
+    }
+
+    #[test]
     fn child_projection_consumes_direct_only_requirement_without_losing_source() {
         let source = DelegationUserRequirementSource {
             user_id: "user".into(),
             session_id: "session".into(),
             session_turn: 1,
             applied_intent_id: None,
+            command_intent_id: None,
             user_intent_digest: "digest".into(),
         };
         let requirement = |id: &str, propagation| DelegationIntentRequirement {
@@ -409,6 +684,7 @@ mod tests {
             model_selection: Some(ModelSelection {
                 offering_id: "offer".into(),
             }),
+            requested_model_policy: None,
             reasoning: None,
             task_scope_quote: None,
             propagation,
@@ -450,6 +726,7 @@ mod tests {
                 session_id: "session".into(),
                 session_turn: 1,
                 applied_intent_id: None,
+                command_intent_id: None,
                 user_intent_digest: "digest".into(),
             },
             requirements: Vec::new(),
@@ -465,6 +742,7 @@ mod tests {
                 session_id: "session".into(),
                 session_turn: 4,
                 applied_intent_id: None,
+                command_intent_id: None,
                 user_intent_digest: "digest".into(),
             },
             failure: DelegationCatalogResolutionFailure {
@@ -485,6 +763,7 @@ mod tests {
                     session_id: "session".into(),
                     session_turn: 4,
                     applied_intent_id: None,
+                    command_intent_id: None,
                     user_intent_digest: "digest".into(),
                 },
                 failure: DelegationCatalogResolutionFailure {

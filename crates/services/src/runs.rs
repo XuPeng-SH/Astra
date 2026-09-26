@@ -6096,6 +6096,9 @@ impl InMemoryRunStateStore {
                 requested_session_id,
             ));
         }
+        if !claim_existing && runs.contains_key(&run_id) {
+            return Err(format!("run identity {run_id} is already bound"));
+        }
         reconcile_in_memory_execution_slot_for_session(
             &mut slots,
             &runs,

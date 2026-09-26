@@ -931,7 +931,7 @@ criteria:
                 .map(|case| case.name.as_str())
                 .collect::<Vec<_>>(),
             [
-                "flash_fanout_auto_unavailable",
+                "flash_fanout_auto_balanced",
                 "flash_fanout_invalid_final_slot",
                 "flash_fanout_model_default",
                 "flash_spawn_configured_name_glm",

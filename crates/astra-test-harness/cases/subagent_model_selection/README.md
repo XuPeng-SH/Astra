@@ -36,10 +36,14 @@ echoing a model selector supplied by the parent model. The server's offline
 regression tests additionally verify that one user-intent source is assessed
 once and a failed assessment is not automatically retried for the same intent.
 
-`flash_fanout_auto_unavailable` exercises the current fail-closed boundary:
-the typed Auto request must appear in the tool arguments, return an explicit
-unavailable error, and produce zero child start/termination events. It does
-not claim Auto routing works; that remains a separate product workstream.
+`flash_fanout_auto_balanced` is a negative control, not evidence that the
+router works: it asks for Auto Balanced and verifies that the current product
+explains why it cannot route, without silently inheriting the parent model or
+starting a child. Auto is intentionally unavailable until comparable
+task-level total-cost, quality/reliability, and completion-time evidence exists.
+The offline admission test also verifies that a structured Auto tool request
+cannot bypass that boundary. This case makes no claim about router quality or
+savings.
 
 These cases deliberately do not call `reflect` or add model-request-ledger
 reads. The configured-name case proves provider-call identity from the existing

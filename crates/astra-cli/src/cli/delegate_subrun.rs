@@ -217,6 +217,22 @@ impl CliDelegateSubRunExecutor {
             .and_then(|provider| provider())
             .unwrap_or_else(|| self.token.clone())
     }
+
+    fn build_skill_state(
+        &self,
+        request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints,
+        effective_root: &Path,
+    ) -> SkillState {
+        SkillState {
+            request_constraints,
+            resolver: self.skill_resolver.clone(),
+            quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
+            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
+            tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(effective_root),
+            session_event_hooks: astra_skills::hooks::load_session_event_hooks(effective_root),
+            ..Default::default()
+        }
+    }
 }
 
 /// Build the set of restricted tools from an agent profile's `skill_filter`.
@@ -777,14 +793,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 s
             },
             telemetry: Default::default(),
-            skills: SkillState {
-                resolver: self.skill_resolver.clone(),
-                quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
-                session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
-                ..Default::default()
-            },
+            skills: self.build_skill_state(config.request_constraints, &effective_root),
             hooks: StopHookState {
                 workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
                 ..Default::default()
@@ -1145,7 +1154,7 @@ mod tests {
     };
     use crate::cli::permission_manager::PermissionMode;
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn register_default_agents_populates_registry() {
@@ -1194,6 +1203,55 @@ mod tests {
             astra_runtime::orchestration::PermissionMode::Auto
         );
         assert!(executor.inherited_permissions.is_background);
+    }
+
+    #[test]
+    fn delegate_child_state_retains_authenticated_request_constraints() {
+        let executor = CliDelegateSubRunExecutor::new(
+            astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            "token".to_string(),
+            None,
+            PathBuf::from("."),
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Auto),
+            None,
+        );
+        let source = astra_turn_types::DelegationUserRequirementSource {
+            user_id: "user".into(),
+            session_id: "session".into(),
+            session_turn: 1,
+            applied_intent_id: None,
+            command_intent_id: None,
+            user_intent_digest: "sha256:request".into(),
+        };
+        let mut constraints =
+            astra_runtime::turn::agentic_loop::host::RequestConstraints::default();
+        constraints.delegated_model_requirements =
+            astra_turn_types::DelegationIntentRequirements::Unconstrained { source };
+        constraints.allowed_tools = Some(HashSet::from(["read_file".to_string()]));
+        let expected = constraints.clone();
+
+        let state = executor.build_skill_state(constraints, Path::new("."));
+
+        assert_eq!(
+            state.request_constraints.delegated_model_requirements,
+            expected.delegated_model_requirements
+        );
+        assert_eq!(
+            state.request_constraints.allowed_tools,
+            expected.allowed_tools
+        );
+        assert_eq!(
+            state.request_constraints.enabled_tools, None,
+            "local CLI children do not inherit the server's explicit optional-tool deny set"
+        );
+
+        let mut explicitly_disabled = expected;
+        explicitly_disabled.enabled_tools = Some(HashSet::new());
+        let disabled_state = executor.build_skill_state(explicitly_disabled, Path::new("."));
+        assert_eq!(
+            disabled_state.request_constraints.enabled_tools,
+            Some(HashSet::new())
+        );
     }
 
     #[test]

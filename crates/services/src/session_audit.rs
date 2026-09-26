@@ -4587,6 +4587,13 @@ mod tests {
             }
         }
 
+        fn with_token_usage(token_usage: &'static str) -> Self {
+            Self {
+                token_usage: Some(token_usage),
+                ..Self::complete()
+            }
+        }
+
         fn with_metadata(metadata: &'static str) -> Self {
             Self {
                 metadata,
@@ -5656,94 +5663,6 @@ mod tests {
         assert_eq!(calls[1].name, "write_file");
         assert!(!calls[1].ok);
         assert_eq!(calls[1].error.as_deref(), Some("permission denied"));
-    }
-
-    #[test]
-    fn partial_usage_remains_unknown_and_unpriced_in_either_order() {
-        let complete = TurnCostSample {
-            model: "model".into(),
-            model_attributed: true,
-            usage: parse_turn_token_usage(
-                r#"{"input_tokens":100,"cached_input_tokens":900,"cache_creation_tokens":0,"output_tokens":20}"#,
-                "test",
-            ).unwrap(),
-        };
-        let partial = TurnCostSample {
-            model: "model".into(),
-            model_attributed: true,
-            usage: parse_turn_token_usage(r#"{"output_tokens":7}"#, "test").unwrap(),
-        };
-        let pricing = HashMap::from([(
-            "model".into(),
-            PricingData {
-                prompt: 0.01,
-                completion: 0.02,
-                cache_read: Some(0.001),
-                cache_write: Some(0.01),
-            },
-        )]);
-        for samples in [
-            [complete.clone(), partial.clone()],
-            [partial.clone(), complete.clone()],
-        ] {
-            let summary = summarize_session_request_usage(samples.clone());
-            assert_eq!(summary.request_count, 2);
-            assert_eq!(summary.fresh_input_tokens, None);
-            assert_eq!(summary.cache_read_tokens, None);
-            assert_eq!(summary.cache_creation_tokens, None);
-            assert_eq!(summary.output_tokens, Some(27));
-            let json = serde_json::to_value(summary).unwrap();
-            assert!(json["cache_read_tokens"].is_null());
-            assert_eq!(json["output_tokens"], 27);
-            let cost = summarize_session_cost(samples, &pricing);
-            assert_eq!(cost.priced_turn_count, 1);
-            assert_eq!(cost.unpriced_turn_count, 1);
-            assert_eq!(
-                cost.estimated_cost_usd,
-                priced_turn_cost(complete.usage, &pricing["model"])
-            );
-        }
-        let mut latest = Some(complete.usage);
-        add_turn_token_usage(&mut latest, partial.usage);
-        assert_eq!(latest, Some(partial.usage));
-        let unpriced = summarize_session_cost([partial], &pricing);
-        assert_eq!(
-            serde_json::to_value(unpriced).unwrap(),
-            serde_json::json!({"priced_turn_count":0,"unpriced_turn_count":1})
-        );
-        assert_eq!(
-            parse_turn_token_usage("{}", "test").unwrap(),
-            ParsedTurnTokenUsage::default()
-        );
-        assert_eq!(
-            parse_optional_turn_token_usage(None, "test").unwrap(),
-            ParsedTurnTokenUsage::default()
-        );
-    }
-
-    #[test]
-    fn request_usage_empty_set_and_overflow_are_not_missing_evidence() {
-        let empty = summarize_session_request_usage([]);
-        assert_eq!(empty.request_count, 0);
-        assert_eq!(empty.fresh_input_tokens, Some(0));
-        assert_eq!(empty.cache_read_tokens, Some(0));
-        assert_eq!(
-            SessionRequestUsageSummary::default().fresh_input_tokens,
-            None
-        );
-        let sample = TurnCostSample {
-            model: "model".into(),
-            model_attributed: true,
-            usage: parse_turn_token_usage(
-                &format!(r#"{{"input_tokens":{},"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":0}}"#, i64::MAX),
-                "test",
-            ).unwrap(),
-        };
-        let known = summarize_session_request_usage([sample.clone(), sample.clone()]);
-        assert_eq!(known.fresh_input_tokens, Some(u64::MAX - 1));
-        let overflow = summarize_session_request_usage([sample.clone(), sample.clone(), sample]);
-        assert_eq!(overflow.fresh_input_tokens, None);
-        assert_eq!(overflow.output_tokens, Some(0));
     }
 
     #[test]

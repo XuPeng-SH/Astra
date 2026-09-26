@@ -1,4 +1,5 @@
 use super::*;
+use crate::orchestration::ProgressEventType;
 
 #[path = "trace_ingestion_tests.rs"]
 mod trace_ingestion_tests;
@@ -15935,14 +15936,32 @@ async fn prepare_chat_request_rejects_unavailable_or_conflicting_model_policy_be
     automatic.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Auto {
         strategy: astra_turn_types::AutoModelStrategy::Balanced,
     });
+    automatic.model_selection = None;
     let error = service
         .prepare_chat_request("u1", automatic)
         .await
-        .expect_err("unsupported automatic routing must fail before Offering admission");
+        .expect_err("automatic routing without a concrete Offering must fail closed");
     assert_eq!(error.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         error.1.0.error_code.as_deref(),
         Some("model_routing_unavailable")
+    );
+
+    let mut admitted_automatic = test_request("delegate this task");
+    admitted_automatic.requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Auto {
+            strategy: astra_turn_types::AutoModelStrategy::Balanced,
+        });
+    let prepared = service
+        .prepare_chat_request("u1", admitted_automatic)
+        .await
+        .expect("a concrete Offering may retain Auto as caller-policy provenance");
+    assert_eq!(
+        prepared
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.offering_id.as_str()),
+        Some("model-test-model")
     );
 
     let mut mismatched_fixed = test_request("delegate this task");
@@ -16041,6 +16060,36 @@ async fn prepare_chat_request_rejects_unavailable_or_conflicting_model_policy_be
         error.1.0.error_code.as_deref(),
         Some("model_identity_changed")
     );
+}
+
+#[test]
+fn delegated_model_handoff_requires_authenticated_user_and_session() {
+    let source = astra_turn_types::DelegationUserRequirementSource {
+        user_id: "user-1".into(),
+        session_id: "session-1".into(),
+        session_turn: 3,
+        applied_intent_id: None,
+        command_intent_id: Some("6bca9f9c-6d18-4579-bce1-2b45f573a098".into()),
+        user_intent_digest: "sha256:task".into(),
+    };
+    let mut request = test_request("child work");
+    request.session_id = Some("session-1".into());
+    let mut context = serde_json::Map::new();
+    context.insert(
+        astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY.into(),
+        serde_json::to_value(
+            astra_turn_types::DelegationIntentRequirements::Unconstrained { source },
+        )
+        .unwrap(),
+    );
+    request.context = Some(context);
+    let constraints = AgenticRunLifecycleService::try_request_constraints(&request).unwrap();
+
+    assert!(validate_delegated_model_handoff("user-1", &request, &constraints).is_ok());
+    assert!(validate_delegated_model_handoff("other-user", &request, &constraints).is_err());
+
+    request.session_id = Some("other-session".into());
+    assert!(validate_delegated_model_handoff("user-1", &request, &constraints).is_err());
 }
 
 #[tokio::test]
@@ -23801,6 +23850,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
                 session_id: "same-session".into(),
                 session_turn: 7,
                 applied_intent_id: None,
+                command_intent_id: None,
                 user_intent_digest: "original-digest".into(),
             },
         };
@@ -23932,6 +23982,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
                 session_id: "same-session".into(),
                 session_turn: 7,
                 applied_intent_id: None,
+                command_intent_id: None,
                 user_intent_digest: "original-digest".into(),
             },
         }

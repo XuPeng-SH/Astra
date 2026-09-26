@@ -153,7 +153,7 @@ impl std::fmt::Display for RequestedModelPolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AutomaticRoutingUnavailable => {
-                f.write_str("automatic model routing is not available yet")
+                f.write_str("automatic model routing is not available yet: comparable task-level cost, quality, and completion-time evidence is unavailable; choose a fixed model")
             }
             Self::ConfiguredNameRequiresCatalog => {
                 f.write_str("configured model names must be resolved by Server admission")

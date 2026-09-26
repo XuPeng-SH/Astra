@@ -1,7 +1,8 @@
 //! One auxiliary judgment, using the canonical Server session and inference owners.
 
 use astra_thin_client::{
-    CompletionOperation, CompletionRequest, SessionCreateRequest, ThinClient, ThinClientError,
+    CompletionOperation, CompletionRequest, CompletionResponse, SessionCreateRequest, ThinClient,
+    ThinClientError,
 };
 use astra_turn_types::{JudgmentRequest, judgment_messages, normalize_judgment_response};
 use serde_json::{Value, json};
@@ -164,13 +165,231 @@ pub(crate) async fn execute(
     result
 }
 
+/// Run one bounded model-requirement stage for a direct Team command.
+///
+/// The caller supplies the already authenticated session and one command UUID.
+/// This deliberately does not create a second session, retry a request, or
+/// accept an arbitrary operation identity.
+pub(crate) async fn execute_delegation_requirement_stage(
+    api: &ThinClient,
+    token: &str,
+    session_id: &str,
+    turn: u32,
+    command_intent_id: &str,
+    operation: CompletionOperation,
+    messages: Vec<Value>,
+    max_tokens: u32,
+) -> Result<CompletionResponse, String> {
+    if !matches!(
+        operation,
+        CompletionOperation::DelegationIntentExtraction
+            | CompletionOperation::DelegationScopeBinding
+    ) {
+        return Err("unsupported direct Team requirement stage".into());
+    }
+    let mut request = CompletionRequest::new(operation, session_id, turn, 0, 0, messages)
+        .with_command_intent_id(command_intent_id)
+        .with_timeout(std::time::Duration::from_secs(30));
+    request.max_tokens = max_tokens;
+    request.temperature = 0.0;
+    request.validate()?;
+    api.post_completions(token, &request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Interpret one direct `/team run` command and freeze its exact ordered slot
+/// constraints. Extraction runs once for this authenticated command; the
+/// authorized Chat catalog is loaded only when the response contains a model
+/// identity, and scope binding runs only when a requirement is scoped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn assess_direct_team_model_plan(
+    api: &ThinClient,
+    token: &str,
+    user_id: &str,
+    session_id: &str,
+    command_identity: &astra_turn_types::DirectDelegationCommandIdentity,
+    task: &str,
+    request: &astra_services::coordination::DelegationRequest,
+    profiles: &[astra_services::coordination::AgentProfile],
+) -> Result<astra_turn_types::DirectDelegationModelPlan, String> {
+    use astra_services::delegation_model_requirement::{
+        bind_delegation_requirements_to_slots, canonical_team_delegation_slot_plan,
+        delegation_intent_requirement_messages, delegation_scope_binding_messages,
+        parse_delegation_intent_requirements, parse_delegation_scope_binding,
+    };
+    use astra_turn_types::{
+        DelegationIntentRequirements, DelegationModelAdmissionOutcome,
+        DelegationUserRequirementSource,
+    };
+    use sha2::Digest;
+
+    if request.user_id != user_id || request.session_id != session_id || request.task != task {
+        return Err("Team command identity or task changed before model assessment".into());
+    }
+    let slot_plan = canonical_team_delegation_slot_plan(request, profiles)?;
+    let task_digest = format!("sha256:{:x}", sha2::Sha256::digest(task.as_bytes()));
+    let source = DelegationUserRequirementSource {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+        session_turn: command_identity.session_turn,
+        applied_intent_id: None,
+        command_intent_id: Some(command_identity.command_intent_id.clone()),
+        user_intent_digest: task_digest,
+    };
+    source.validate().map_err(str::to_string)?;
+
+    let extraction = execute_delegation_requirement_stage(
+        api,
+        token,
+        session_id,
+        command_identity.session_turn,
+        &command_identity.command_intent_id,
+        CompletionOperation::DelegationIntentExtraction,
+        delegation_intent_requirement_messages(task)?,
+        768,
+    )
+    .await?;
+    if extraction
+        .choices
+        .first()
+        .is_none_or(|choice| choice.finish_reason != "stop")
+    {
+        return Err(
+            "Delegated model requirements did not finish normally; no child was started.".into(),
+        );
+    }
+    let extracted = parse_delegation_intent_requirements(
+        extraction
+            .first_text()
+            .ok_or("Delegated model assessment omitted its response")?,
+        task,
+        // The direct CLI command has no separate WorkAdmission fact. The
+        // structured extraction contract is the sole authority here; do not
+        // replace it with a keyword heuristic that can misread task prose.
+        false,
+    )?;
+    let catalog_required =
+        astra_services::delegation_model_requirement::requires_authorized_model_catalog(&extracted);
+    let catalog = if catalog_required {
+        let (items, _) = super::session::session_runtime::load_server_model_catalog(
+            api,
+            token,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await?;
+        items
+            .into_iter()
+            .map(astra_services::ModelListItem::from)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let assessed =
+        astra_services::delegation_model_requirement::materialize_delegation_intent_requirements(
+            &extracted,
+            source.clone(),
+            &catalog,
+        )
+        .map_err(|failure| failure.safe_message())?;
+    if let DelegationIntentRequirements::Unresolved { reason, .. }
+    | DelegationIntentRequirements::Unavailable { reason, .. } = &assessed
+    {
+        return Err(reason.clone());
+    }
+
+    let scoped = match &assessed {
+        DelegationIntentRequirements::Requirements { requirements, .. } => requirements
+            .iter()
+            .filter(|requirement| requirement.task_scope_quote.is_some())
+            .cloned()
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let binding = if scoped.is_empty() {
+        None
+    } else {
+        let response = execute_delegation_requirement_stage(
+            api,
+            token,
+            session_id,
+            command_identity.session_turn,
+            &command_identity.command_intent_id,
+            CompletionOperation::DelegationScopeBinding,
+            delegation_scope_binding_messages(task, &scoped, &slot_plan.briefs)?,
+            512,
+        )
+        .await?;
+        if response
+            .choices
+            .first()
+            .is_none_or(|choice| choice.finish_reason != "stop")
+        {
+            return Err(
+                "Delegated task scopes did not finish binding; no child was started.".into(),
+            );
+        }
+        let binding = parse_delegation_scope_binding(
+            response
+                .first_text()
+                .ok_or("Delegated scope binding omitted its response")?,
+            &scoped,
+            slot_plan.briefs.len(),
+        )?;
+        let unmatched_direct_scope = scoped.iter().any(|requirement| {
+            requirement.propagation
+                == astra_turn_types::DelegationRequirementPropagation::DirectChildren
+                && binding.assignments.iter().any(|assignment| {
+                    assignment.requirement_id == requirement.requirement_id
+                        && assignment.slot_indices.is_empty()
+                })
+        });
+        if unmatched_direct_scope {
+            return Err(
+                "A direct-child model requirement does not match any Team task; no child was started."
+                    .into(),
+            );
+        }
+        Some(binding)
+    };
+    let (slots, child_requirements) =
+        bind_delegation_requirements_to_slots(&assessed, binding.as_ref(), slot_plan.briefs.len())?;
+    let outcome = if slots.iter().all(|slot| {
+        slot.model_selection.is_none()
+            && slot.requested_model_policy.is_none()
+            && slot.reasoning.is_none()
+    }) {
+        DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+            slot_count: slots.len() as u32,
+        }
+    } else {
+        DelegationModelAdmissionOutcome::Constrained { slots }
+    };
+    let plan = astra_turn_types::DirectDelegationModelPlan {
+        source,
+        slot_plan_digest: slot_plan.digest,
+        outcome,
+        child_requirements,
+    };
+    plan.validate_identity(
+        command_identity,
+        user_id,
+        session_id,
+        &plan.source.user_intent_digest,
+        &plan.slot_plan_digest,
+        slot_plan.briefs.len(),
+    )
+    .map_err(str::to_string)?;
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use astra_turn_types::JUDGMENT_SCHEMA_VERSION;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path},
+        matchers::{body_partial_json, header, method, path},
     };
 
     const SESSION: &str = "6bca9f9c-6d18-4579-bce1-2b45f573a098";
@@ -274,6 +493,351 @@ mod tests {
             assert_eq!(result["completion_id"], "completion-1");
             assert!(result["judgment"].is_null());
         }
+    }
+
+    #[tokio::test]
+    async fn direct_team_requirement_stage_uses_bound_session_and_never_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"completion-team-1", "object":"chat.completion",
+                "offering_id":"offering-1", "model":"flash",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":40,"completion_tokens":5,"total_tokens":45}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let command_id = "eb1b8c4a-4fc0-4a56-86e8-c1fc36d0d21a";
+        let response = execute_delegation_requirement_stage(
+            &api,
+            "test-token",
+            SESSION,
+            7,
+            command_id,
+            CompletionOperation::DelegationIntentExtraction,
+            vec![json!({"role":"user","content":"use flash"})],
+            768,
+        )
+        .await
+        .expect("one bounded extraction completion");
+
+        assert_eq!(response.usage.as_ref().unwrap().total_tokens, 45);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["operation"], "delegation_intent_extraction");
+        assert_eq!(body["command_intent_id"], command_id);
+        assert_eq!(body["session_id"], SESSION);
+        assert_eq!(body["turn"], 7);
+        assert_eq!(body["max_tokens"], 768);
+        assert_eq!(body["round"], 0);
+        assert_eq!(body["logical_attempt"], 0);
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.path() == "/sessions")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_team_keeps_unmatched_descendant_scope_for_nested_tasks() {
+        use astra_services::coordination::{
+            AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
+        };
+
+        let server = MockServer::start().await;
+        let extracted = json!({
+            "disposition": "resolved",
+            "requirements": [{
+                "model_quote": "flash",
+                "source_qualifier_quote": null,
+                "reasoning_quote": null,
+                "reasoning": null,
+                "task_scope_quote": "nested reviewers",
+                "propagation": "descendants",
+                "strength": "hard"
+            }],
+            "unresolved": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({
+                "operation": "delegation_intent_extraction"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "completion-extraction",
+                "object": "chat.completion",
+                "offering_id": "offering-judge",
+                "model": "judge",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": extracted.to_string()},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({
+                "operation": "delegation_scope_binding"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "completion-scope",
+                "object": "chat.completion",
+                "offering_id": "offering-judge",
+                "model": "judge",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "{\"assignments\":[{\"requirement_id\":\"0\",\"slot_indices\":[]}],\"unresolved\":[]}"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 12, "total_tokens": 52}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{
+                    "offering_id": "offering-flash",
+                    "access_id": "self-hosted",
+                    "access_kind": "self_hosted",
+                    "access_label": "Self-hosted",
+                    "execution_placement": "server",
+                    "name": "flash",
+                    "provider": "test",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 64000,
+                    "max_completion_tokens": 512,
+                    "architecture": null,
+                    "thinking_capability": null
+                }],
+                "total": 1,
+                "limit": 50,
+                "next_cursor": null,
+                "catalog_revision": "sha256:direct-team-test"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request = DelegationRequest {
+            session_id: SESSION.into(),
+            delegation_id: "delegation-1".into(),
+            parent_run_id: "parent-1".into(),
+            task: "Use flash for nested reviewers".into(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 60,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            delegation_chain: Vec::new(),
+            context: std::collections::HashMap::new(),
+            execution_metadata: None,
+        };
+        let profiles = vec![
+            AgentProfile::new("coder", "Coder", AgentTier::User),
+            AgentProfile::new("reviewer", "Reviewer", AgentTier::User),
+        ];
+        let identity = astra_turn_types::DirectDelegationCommandIdentity {
+            command_intent_id: "eb1b8c4a-4fc0-4a56-86e8-c1fc36d0d21a".into(),
+            session_turn: 7,
+        };
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let plan = assess_direct_team_model_plan(
+            &api,
+            "test-token",
+            "user-1",
+            SESSION,
+            &identity,
+            &request.task,
+            &request,
+            &profiles,
+        )
+        .await
+        .expect("descendant scope may have no current direct slot");
+
+        assert!(matches!(
+            plan.outcome,
+            astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+                slot_count: 2
+            }
+        ));
+        assert_eq!(plan.child_requirements.len(), 2);
+        for child in plan.child_requirements {
+            let astra_turn_types::DelegationIntentRequirements::Requirements {
+                requirements, ..
+            } = child
+            else {
+                panic!("descendant requirement was dropped");
+            };
+            assert_eq!(requirements.len(), 1);
+            assert_eq!(
+                requirements[0]
+                    .model_selection
+                    .as_ref()
+                    .unwrap()
+                    .offering_id,
+                "offering-flash"
+            );
+            assert_eq!(
+                requirements[0].propagation,
+                astra_turn_types::DelegationRequirementPropagation::Descendants
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn direct_team_rejects_unmatched_direct_scope_before_children() {
+        use astra_services::coordination::{
+            AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
+        };
+
+        let server = MockServer::start().await;
+        let extracted = json!({
+            "disposition": "resolved",
+            "requirements": [{
+                "model_quote": null,
+                "source_qualifier_quote": null,
+                "reasoning_quote": "high",
+                "reasoning": "high",
+                "task_scope_quote": "nested reviewers",
+                "propagation": "direct_children",
+                "strength": "hard"
+            }],
+            "unresolved": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({
+                "operation": "delegation_intent_extraction"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "completion-extraction",
+                "object": "chat.completion",
+                "offering_id": "offering-judge",
+                "model": "judge",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": extracted.to_string()},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({
+                "operation": "delegation_scope_binding"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "completion-scope",
+                "object": "chat.completion",
+                "offering_id": "offering-judge",
+                "model": "judge",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "{\"assignments\":[{\"requirement_id\":\"0\",\"slot_indices\":[]}],\"unresolved\":[]}"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 12, "total_tokens": 52}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let request = DelegationRequest {
+            session_id: SESSION.into(),
+            delegation_id: "delegation-direct-scope-1".into(),
+            parent_run_id: "parent-direct-scope-1".into(),
+            task: "Use high reasoning for nested reviewers".into(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 60,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            delegation_chain: Vec::new(),
+            context: std::collections::HashMap::new(),
+            execution_metadata: None,
+        };
+        let profiles = vec![
+            AgentProfile::new("coder", "Coder", AgentTier::User),
+            AgentProfile::new("reviewer", "Reviewer", AgentTier::User),
+        ];
+        let identity = astra_turn_types::DirectDelegationCommandIdentity {
+            command_intent_id: "91e5a4fd-ea43-4d87-9eb9-bc5a9bb3d6a2".into(),
+            session_turn: 8,
+        };
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let error = assess_direct_team_model_plan(
+            &api,
+            "test-token",
+            "user-1",
+            SESSION,
+            &identity,
+            &request.task,
+            &request,
+            &profiles,
+        )
+        .await
+        .expect_err("an unmatched direct-child scope must fail closed");
+
+        assert!(error.contains("direct-child model requirement"), "{error}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "assessment stops before any child admission or execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_direct_team_requirement_completion_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(504))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+
+        let error = execute_delegation_requirement_stage(
+            &api,
+            "test-token",
+            SESSION,
+            7,
+            "eb1b8c4a-4fc0-4a56-86e8-c1fc36d0d21a",
+            CompletionOperation::DelegationIntentExtraction,
+            vec![json!({"role":"user","content":"use flash"})],
+            768,
+        )
+        .await
+        .expect_err("uncertain delivery fails closed");
+
+        assert!(!error.is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

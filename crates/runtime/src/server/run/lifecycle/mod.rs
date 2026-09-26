@@ -102,13 +102,13 @@ fn valid_runtime_http_endpoint(endpoint: &str) -> bool {
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
+use crate::orchestration::SpawnAgentExecutor;
 use crate::orchestration::spawner::PreparedSpawn;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, AgentTranscriptLocation, CancellationOrigin,
     DurableAgentReconciler, DynamicAgentSpawner, FANOUT_GROUP_CANCELLED_EVENT_TYPE,
-    InheritedPermissions, PermissionMode, PermissionSyncContext, ProgressBroadcaster,
-    SpawnContext, SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult,
-    SpawnedAgentState,
+    InheritedPermissions, PermissionMode, PermissionSyncContext, ProgressBroadcaster, SpawnContext,
+    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult, SpawnedAgentState,
 };
 use crate::server::run::cloud_workspace_provisioning::CloudWorkspaceProvisioner;
 use crate::server::run::workspace_provisioning::{
@@ -6906,7 +6906,22 @@ impl AgenticRunLifecycleService {
         let enabled_tools =
             normalize_request_allowlist(request.enabled_tools.as_deref(), "enabled_tools")?
                 .or_else(|| Some(HashSet::new()));
-        Ok(RequestConstraints::new(
+        let delegated_model_requirements = request
+            .context
+            .as_ref()
+            .and_then(|context| {
+                context.get(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY)
+            })
+            .map(|value| {
+                serde_json::from_value::<astra_turn_types::DelegationIntentRequirements>(
+                    value.clone(),
+                )
+                .map_err(|_| "delegated model handoff is malformed".to_string())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        delegated_model_requirements.validate()?;
+        let mut constraints = RequestConstraints::new(
             normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")?,
             enabled_tools,
             normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")?,
@@ -6914,7 +6929,9 @@ impl AgenticRunLifecycleService {
                 request.allow_skill_sources.as_deref(),
                 "allow_skill_sources",
             )?,
-        ))
+        );
+        constraints.delegated_model_requirements = delegated_model_requirements;
+        Ok(constraints)
     }
 
     fn root_permission_mode_from_request(request: &ChatRequestData) -> PermissionMode {
@@ -8909,6 +8926,8 @@ impl AgenticRunLifecycleService {
         }
         let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        validate_delegated_model_handoff(user_id, request, &request_constraints)
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         if let Some(enabled_tools) = request_constraints.enabled_tools.as_ref() {
             let fallback_registry = astra_runtime_env::ToolRegistry::builtins();
             let registry = self
@@ -9983,14 +10002,20 @@ impl AgenticRunLifecycleService {
         }
         Self::validate_effective_user_input(&request)?;
         match request.requested_model_policy.as_ref() {
-            Some(astra_turn_types::RequestedModelPolicy::Auto { .. }) => {
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+                if request.model_selection.is_none() =>
+            {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
-                    astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
+                    &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
                         .to_string(),
                     "model_routing_unavailable",
                 ));
             }
+            // Auto is a caller policy, not a second execution selector. The
+            // edge child router may already have selected an Offering; the
+            // Server still freshly authorizes that exact Offering below.
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. }) => {}
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
                 selector:
                     astra_turn_types::ModelSelector::OfferingId {
@@ -21422,6 +21447,41 @@ fn spawn_child_request_constraints(
     Ok(constraints)
 }
 
+fn validate_delegated_model_handoff(
+    user_id: &str,
+    request: &ChatRequestData,
+    constraints: &RequestConstraints,
+) -> Result<(), String> {
+    let handoff_present = request.context.as_ref().is_some_and(|context| {
+        context.contains_key(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY)
+    });
+    let source = match &constraints.delegated_model_requirements {
+        astra_turn_types::DelegationIntentRequirements::Unassessed => {
+            if handoff_present {
+                return Err("delegated model handoff is missing a typed requirement state".into());
+            }
+            return Ok(());
+        }
+        astra_turn_types::DelegationIntentRequirements::Unconstrained { source }
+        | astra_turn_types::DelegationIntentRequirements::Unresolved { source, .. }
+        | astra_turn_types::DelegationIntentRequirements::Unavailable { source, .. }
+        | astra_turn_types::DelegationIntentRequirements::CatalogResolutionFailed {
+            source, ..
+        }
+        | astra_turn_types::DelegationIntentRequirements::Requirements { source, .. } => source,
+    };
+    if source.user_id != user_id {
+        return Err("delegated model handoff belongs to another user".into());
+    }
+    if request.session_id.as_deref() != Some(source.session_id.as_str()) {
+        return Err("delegated model handoff belongs to another session".into());
+    }
+    if handoff_present && source.command_intent_id.is_none() {
+        return Err("delegated model handoff has no authenticated command identity".into());
+    }
+    Ok(())
+}
+
 fn delegated_edge_tool_schema_names(constraints: &RequestConstraints) -> Vec<String> {
     let mut names = constraints
         .allowed_tools
@@ -21897,8 +21957,8 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let mut selectors_to_admit = Vec::new();
         for input in inputs {
             input.fanout_slot_identity()?;
-            let selector = astra_turn_types::resolve_requested_model_selector(
-                input.requested_model_policy.as_ref(),
+            let selector = crate::orchestration::selector_for_admitted_spawn_input(
+                input,
                 inherited_selection.as_ref(),
             )
             .map_err(|error| error.to_string())?;
@@ -22551,14 +22611,15 @@ impl ServerSpawnAgentExecutor {
             harness_sink: context.harness_sink.clone(),
         };
 
-        let executor = self.build_subrun_executor(
-            child_permissions,
-            dynamic_agent_spawner,
-            config.client_tool_delivery_tx.clone(),
-            Some(&admitted_model_execution),
-            child_runtime_context.edge_tools.clone(),
-        )
-        .with_admitted_execution_deadline(config.execution_deadline);
+        let executor = self
+            .build_subrun_executor(
+                child_permissions,
+                dynamic_agent_spawner,
+                config.client_tool_delivery_tx.clone(),
+                Some(&admitted_model_execution),
+                child_runtime_context.edge_tools.clone(),
+            )
+            .with_admitted_execution_deadline(config.execution_deadline);
         #[cfg(feature = "e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
             executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())

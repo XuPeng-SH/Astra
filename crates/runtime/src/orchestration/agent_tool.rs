@@ -1020,7 +1020,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent setting unless `requested_model_policy` selects a fixed model by exact Offering ID or exact configured name; explicit `inherit` overrides lower-priority defaults. Auto policies are currently rejected before admission because routing is not enabled. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent setting unless `requested_model_policy` selects a fixed model by exact Offering ID or exact configured name; explicit `inherit` overrides lower-priority defaults. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1276,9 +1276,6 @@ async fn handle_agent_fanout_start_action_with_deadline(
         Some(c) => c,
         None => return render_agent_runtime_binding_error("agent_fanout", "start"),
     };
-    if !ctx.spawner.has_executor() {
-        return render_agent_runtime_binding_error("agent_fanout", "start");
-    }
     let mut input = match validated {
         Ok(input) => input,
         Err(error) => return render_agent_tool_error(None, error.message()),
@@ -1314,12 +1311,9 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 .and_then(|defaults| defaults.allowed_tools.as_ref())
                 .into_iter()
                 .flatten(),
-        );
-    let unavailable =
-        unavailable_requested_tools(requested_optional_tools, ctx.enabled_tools.as_ref());
-    if !unavailable.is_empty() {
-        return render_unavailable_delegation_capabilities(&unavailable);
-    }
+        )
+        .cloned()
+        .collect::<Vec<_>>();
     if let Some(existing) = ctx.spawner.fanout_group_for_parent_run(&ctx.run_id).await {
         let same_start = existing.group_id == group_id
             || input._tool_call_id.as_deref().is_some_and(|tool_call_id| {
@@ -1341,7 +1335,8 @@ async fn handle_agent_fanout_start_action_with_deadline(
             })
             .to_string();
         }
-        if existing.start_request_fingerprint.as_deref() != Some(start_request_fingerprint.as_str()) {
+        if existing.start_request_fingerprint.as_deref() != Some(start_request_fingerprint.as_str())
+        {
             return json!({
                 "status": "failed",
                 "error_kind": "fanout_group_replay_conflict",
@@ -1372,6 +1367,38 @@ async fn handle_agent_fanout_start_action_with_deadline(
             "instruction": "This fanout start was already accepted. Observe the existing group with agent_fanout.get_results; no replacement agents were launched."
         })
         .to_string();
+    }
+    if !ctx.spawner.has_executor() {
+        return render_agent_runtime_binding_error("agent_fanout", "start");
+    }
+    let mut start_claim = match ctx
+        .spawner
+        .reserve_fanout_start(
+            &ctx.run_id,
+            &group_id,
+            input.target_count,
+            &start_request_fingerprint,
+        )
+        .await
+    {
+        Ok(super::spawner::FanoutStartClaim::Acquired(claim)) => claim,
+        Ok(super::spawner::FanoutStartClaim::InProgress { group_id }) => {
+            return json!({
+                "status": "pending",
+                "outcome": "fanout_start_in_progress",
+                "retryable": false,
+                "executed": false,
+                "group_id": group_id,
+                "instruction": "An identical fanout start is already being admitted. Wait for it to publish, then inspect it with agent_fanout.get_results; do not issue a replacement start."
+            })
+            .to_string();
+        }
+        Err(error) => return render_agent_tool_error(None, &error.to_string()),
+    };
+    let unavailable =
+        unavailable_requested_tools(requested_optional_tools.iter(), ctx.enabled_tools.as_ref());
+    if !unavailable.is_empty() {
+        return render_unavailable_delegation_capabilities(&unavailable);
     }
     let child_execution_deadline = match derive_foreground_child_deadline(ctx.execution_deadline) {
         Ok(deadline) => deadline,
@@ -1407,10 +1434,16 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .map(|parent| &parent.selection)
         .or(ctx.current_model_selection.as_ref());
     for (_, slot_id, spawn_input) in &mut planned_slots {
-        match astra_turn_types::resolve_requested_model_selector(
-            spawn_input.requested_model_policy.as_ref(),
-            inherited_selection,
-        ) {
+        if matches!(
+            spawn_input.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+        ) && spawn_input.resolved_model_selection.is_none()
+        {
+            // The trusted delegation admission below must resolve Auto. Do
+            // not treat it as ordinary inheritance while that is pending.
+            continue;
+        }
+        match super::selector_for_admitted_spawn_input(spawn_input, inherited_selection) {
             Ok(Some(astra_turn_types::ModelSelector::OfferingId { offering_id })) => {
                 let selection = astra_turn_types::ModelSelection { offering_id };
                 if spawn_input
@@ -1448,6 +1481,17 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
             }
         }
+    }
+    if planned_slots.iter().any(|(_, _, input)| {
+        matches!(
+            input.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+        ) && input.resolved_model_selection.is_none()
+    }) {
+        return render_agent_tool_error(
+            None,
+            &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable.to_string(),
+        );
     }
     let mut resolved_inputs: Vec<_> = planned_slots
         .iter()
@@ -1495,15 +1539,39 @@ async fn handle_agent_fanout_start_action_with_deadline(
         }
     };
     let capacity_reservation_owner = _capacity_reservation.owner_id().map(str::to_owned);
-    let preparations = match ctx
-        .spawner
-        .prepare_spawn_batch(
-            &resolved_inputs,
-            &spawn_context,
-            ctx.current_model_selection.as_ref(),
+    let start_cancellation = start_claim.cancellation().clone();
+    let shutdown = ctx.spawner.background_shutdown_token();
+    let preparation_cutoff = child_execution_deadline.map(|deadline| {
+        let min_child_budget =
+            astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET;
+        tokio::time::Instant::from_std(
+            deadline
+                .monotonic_deadline()
+                .checked_sub(min_child_budget)
+                .unwrap_or_else(std::time::Instant::now),
         )
-        .await
-    {
+    });
+    let preparation = ctx.spawner.prepare_spawn_batch(
+        &resolved_inputs,
+        &spawn_context,
+        ctx.current_model_selection.as_ref(),
+    );
+    let preparations = match tokio::select! {
+        _ = start_cancellation.cancelled() => {
+            return render_agent_tool_error(None, "fanout start cancelled during model admission");
+        }
+        _ = shutdown.cancelled() => {
+            return render_agent_tool_error(None, "runtime shutting down during fanout model admission");
+        }
+        _ = async {
+            if let Some(cutoff) = preparation_cutoff {
+                tokio::time::sleep_until(cutoff).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => return execution_deadline_too_short_outcome(),
+        result = preparation => result,
+    } {
         Ok(preparations) => preparations,
         Err(error) => {
             return render_agent_tool_error(None, &format!("fanout admission failed: {error}"));
@@ -1559,7 +1627,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
     }
     let declared_new = match ctx
         .spawner
-        .declare_fanout_group_with_owner(
+        .declare_fanout_group_with_start_claim(
             &group_id,
             &title,
             input.target_count,
@@ -1568,7 +1636,9 @@ async fn handle_agent_fanout_start_action_with_deadline(
             ctx.trace_context
                 .as_ref()
                 .map(|trace| (trace.user_id.as_str(), trace.session_id.as_str())),
-            Some(&start_request_fingerprint),
+            &start_request_fingerprint,
+            &mut start_claim,
+            child_execution_deadline,
         )
         .await
     {
@@ -1647,10 +1717,13 @@ async fn handle_agent_fanout_start_action_with_deadline(
         Err(_) => {
             let reason = "foreground fanout settlement deadline elapsed before terminal delivery"
                 .to_string();
-            let _ = ctx
+            let cancellation = ctx
                 .spawner
                 .cancel_fanout_group_for_deadline_in_parent(&ctx.run_id, &group_id, &reason)
                 .await;
+            if cancellation.is_some() {
+                start_claim.finish_dispatch();
+            }
             return render_agent_fanout_results(
                 ctx,
                 &group_id,
@@ -1661,6 +1734,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
             .await;
         }
     };
+    start_claim.finish_dispatch();
     // Restore slot-index order.
     agents.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
     // `Launched` is possible only after the user explicitly promotes the
@@ -2368,10 +2442,33 @@ async fn handle_agent_fanout_stop_group_action(
     if group_id.is_empty() {
         return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
     }
-    // Control decisions must be based on the durable run state, not merely
-    // the last in-memory fanout projection. In particular, ancestor
-    // cancellation can terminalize a remotely-owned child without a local
-    // executor callback.
+    // A pending start has no projection to reconcile yet. Let the exact
+    // parent claim arbitrate cancellation first, avoiding a needless durable
+    // read and ensuring stop can interrupt model admission.
+    let mut group = find_fanout_group(ctx, group_id).await;
+    if group.is_none() {
+        if ctx
+            .spawner
+            .cancel_pending_fanout_start_in_parent(&ctx.run_id, group_id)
+            .await
+        {
+            return json!({
+                "status": "completed",
+                "stop_outcome": "cancelled_before_admission",
+                "group_id": group_id,
+                "stopped_count": 0,
+                "fanout": null,
+            })
+            .to_string();
+        }
+        group = find_fanout_group(ctx, group_id).await;
+        if group.is_none() {
+            return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
+        }
+    }
+    // Control decisions for a published group must be based on durable run
+    // state, not merely the last in-memory projection. Ancestor cancellation
+    // can terminalize a remote child without a local executor callback.
     if let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await {
         tracing::warn!(
             target: "fanout",
@@ -2600,6 +2697,11 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
     status.as_str()
 }
 
+fn next_fanout_group_id(ctx: &AgentToolContext) -> String {
+    let id = NEXT_FANOUT_GROUP_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{}-fanout-{id}", ctx.run_id)
+}
+
 /// Handle `agent(action='spawn')`.
 pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
     handle_agent_spawn_action_with_controls(args, ctx, SpawnDeadline::Derive, None, None).await
@@ -2702,10 +2804,15 @@ async fn handle_agent_spawn_input_with_controls(
         .as_ref()
         .map(|parent| &parent.selection)
         .or(ctx.current_model_selection.as_ref());
-    match astra_turn_types::resolve_requested_model_selector(
-        input.requested_model_policy.as_ref(),
-        inherited_selection,
-    ) {
+    let unresolved_auto = matches!(
+        input.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+    ) && input.resolved_model_selection.is_none();
+    match if unresolved_auto {
+        Ok(None)
+    } else {
+        super::selector_for_admitted_spawn_input(&input, inherited_selection)
+    } {
         Ok(Some(astra_turn_types::ModelSelector::OfferingId { offering_id })) => {
             let selection = astra_turn_types::ModelSelection { offering_id };
             if input
@@ -2736,6 +2843,16 @@ async fn handle_agent_spawn_input_with_controls(
         ) {
             return render_agent_tool_error(None, &error.to_string());
         }
+    }
+    if matches!(
+        input.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+    ) && input.resolved_model_selection.is_none()
+    {
+        return render_agent_tool_error(
+            None,
+            &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable.to_string(),
+        );
     }
     let unavailable = unavailable_requested_tools(
         input.allowed_tools.as_deref().unwrap_or_default(),
@@ -3110,6 +3227,7 @@ pub(crate) fn canonical_delegation_slot_briefs(
                 .map_err(|error| error.to_string())?;
             Ok(vec![DelegationSlotBrief {
                 description: input.description,
+                system_prompt: None,
                 prompt: input.prompt,
             }])
         }
@@ -3121,6 +3239,7 @@ pub(crate) fn canonical_delegation_slot_briefs(
                 .into_iter()
                 .map(|slot| DelegationSlotBrief {
                     description: slot.description,
+                    system_prompt: None,
                     prompt: slot.prompt,
                 })
                 .collect())
@@ -4773,6 +4892,7 @@ mod tests {
                         model_selection: Some(ModelSelection {
                             offering_id: "required".into(),
                         }),
+                        requested_model_policy: None,
                         model_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
                         reasoning: None,
                         reasoning_strength: None,
@@ -4781,6 +4901,7 @@ mod tests {
                     DelegationModelSlotConstraint {
                         slot_index: 1,
                         model_selection: None,
+                        requested_model_policy: None,
                         model_strength: None,
                         reasoning: None,
                         reasoning_strength: None,

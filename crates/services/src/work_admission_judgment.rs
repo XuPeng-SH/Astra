@@ -211,7 +211,9 @@ fn decode_evidence(
     TurnIntentJudgeError,
 > {
     let canonical = work_admission_classification_request(&TurnIntentJudgeContext::default());
-    if request.schema_version != canonical.schema_version || request.questions != canonical.questions {
+    if request.schema_version != canonical.schema_version
+        || request.questions != canonical.questions
+    {
         return Err(malformed(raw, "noncanonical classification questions"));
     }
     let normalized = normalize_judgment_response(request, raw, model, provenance)

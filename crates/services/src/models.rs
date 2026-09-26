@@ -5681,6 +5681,27 @@ impl From<ModelListItem> for ModelListItemResponse {
     }
 }
 
+impl From<ModelListItemResponse> for ModelListItem {
+    fn from(item: ModelListItemResponse) -> Self {
+        Self {
+            offering_id: item.offering_id,
+            access_id: item.access_id,
+            access_kind: item.access_kind,
+            access_label: item.access_label,
+            execution_placement: item.execution_placement,
+            name: item.name,
+            provider: item.provider,
+            description: item.description,
+            is_active: item.is_active,
+            context_window: item.context_window,
+            max_completion_tokens: item.max_completion_tokens,
+            architecture: item.architecture,
+            thinking_capability: item.thinking_capability,
+            pricing: item.pricing,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredModelAccess {

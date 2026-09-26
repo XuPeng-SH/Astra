@@ -674,8 +674,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let requested_selectors: Vec<_> = inputs
             .iter()
             .map(|input| {
-                let selector = astra_turn_types::resolve_requested_model_selector(
-                    input.requested_model_policy.as_ref(),
+                let selector = astra_runtime::orchestration::selector_for_admitted_spawn_input(
+                    input,
                     parent_selection,
                 )
                 .map_err(|error| error.to_string())?;

@@ -1,0 +1,27 @@
+name: flash_fanout_auto_balanced
+description: |
+  Negative control: an explicit Auto Balanced request is rejected because
+  comparable task-level routing evidence is not available; no child starts.
+prompt: |
+  I need two independent subtasks, but do not substitute the parent model or
+  silently pick a fixed model. Request Auto Balanced for the batch. If the
+  system explains that automatic routing is unavailable because comparable
+  task-level cost, quality, and completion-time evidence is missing, report
+  that limitation and ask me to name a fixed authorized model. Do not retry,
+  change the requested policy, or start children. Do not call Reflect.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: text_contains
+    needle: "automatic model routing is not available yet"
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

@@ -553,6 +553,24 @@ impl AgenticLoopHost for SubRunHost {
                 .map_err(|error| format!("serialize requested model policy: {error}"))?;
         }
 
+        // A local delegated child may make its next tool call through the
+        // canonical Server loop. Preserve the already-authenticated
+        // requirement snapshot across that transport boundary; the Server
+        // validates its source/session binding before using it and otherwise
+        // falls back to its normal root assessment.
+        let delegated_requirements = &state
+            .skills
+            .request_constraints
+            .delegated_model_requirements;
+        if !matches!(
+            delegated_requirements,
+            astra_turn_types::DelegationIntentRequirements::Unassessed
+        ) {
+            payload["context"][astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY] =
+                serde_json::to_value(delegated_requirements)
+                    .map_err(|error| format!("serialize delegated model handoff: {error}"))?;
+        }
+
         attach_runtime_volatile_injections(&mut payload, &runtime_volatile_injections);
 
         if let Some(max_tokens) = self.max_completion_tokens {

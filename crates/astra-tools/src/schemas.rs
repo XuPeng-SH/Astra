@@ -1295,7 +1295,7 @@ macro_rules! heap_schema_vec {
 
 fn requested_model_policy_schema() -> Value {
     json!({
-        "description": "Requested model behavior, distinct from the resolved Offering. Omission applies any trusted user model requirement before ordinary parent inheritance. A fixed selector may use an exact Offering ID or an exact configured model name, optionally qualified by its exact provider/access source; never put a display name in offering_id and never guess an Offering ID. A configured name must resolve to exactly one authorized active Chat model or admission fails before any child starts. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto is currently unavailable.",
+        "description": "Requested model behavior, distinct from the resolved Offering. Omission applies any trusted user model requirement before ordinary parent inheritance. A fixed selector may use an exact Offering ID or an exact configured model name, optionally qualified by its exact provider/access source; never put a display name in offering_id and never guess an Offering ID. A configured name must resolve to exactly one authorized active Chat model or admission fails before any child starts. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
         "oneOf": [
             {
                 "type": "object",

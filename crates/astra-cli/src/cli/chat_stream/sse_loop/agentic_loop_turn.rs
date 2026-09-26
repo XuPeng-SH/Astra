@@ -590,6 +590,15 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
             context.insert(field.to_string(), value.clone());
         }
     }
+    if let Some(value) = source
+        .get("context")
+        .and_then(|context| context.get(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY))
+    {
+        context.insert(
+            astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY.to_string(),
+            value.clone(),
+        );
+    }
 
     let mut request = serde_json::Map::from_iter([
         ("message".to_string(), Value::String(message.to_string())),
@@ -2131,6 +2140,46 @@ mod tests {
                 .get("execution_time_budget")
                 .is_none(),
             "dynamic time must not enter the cache-stable edge profile"
+        );
+    }
+
+    #[test]
+    fn server_loop_admission_carries_typed_delegated_model_handoff() {
+        let source = astra_turn_types::DelegationUserRequirementSource {
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            session_turn: 3,
+            applied_intent_id: None,
+            command_intent_id: Some("6bca9f9c-6d18-4579-bce1-2b45f573a098".into()),
+            user_intent_digest: "sha256:task".into(),
+        };
+        let handoff = serde_json::to_value(
+            astra_turn_types::DelegationIntentRequirements::Unconstrained { source },
+        )
+        .expect("typed handoff serializes");
+        let mut context = serde_json::Map::new();
+        context.insert(
+            astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY.to_string(),
+            handoff,
+        );
+        let prepared = json!({
+            "model_selection": {"offering_id": "child-offering"},
+            "edge_executor_id": "edge-1",
+            "capabilities": [],
+            "edge_profile": {"cwd": "/workspace"},
+            "context": context
+        });
+
+        let admitted = server_loop_admission_payload(&prepared, "child request", false, None)
+            .expect("Server loop admission");
+        assert_eq!(
+            admitted["context"][astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY]["state"],
+            "unconstrained"
+        );
+        assert_eq!(
+            admitted["context"][astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY]["source"]
+                ["session_id"],
+            "session-1"
         );
     }
 
