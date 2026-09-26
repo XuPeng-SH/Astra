@@ -1990,6 +1990,29 @@ pub async fn revalidate_admitted_model_executions(
     offering_ids: &[String],
     provided_pool: Option<&sqlx::MySqlPool>,
 ) -> Result<Vec<AdmittedModelExecution>, ModelOfferingResolutionError> {
+    revalidate_admitted_model_executions_with_access(
+        matrixone,
+        encryptor,
+        user_id,
+        offering_ids,
+        provided_pool,
+        None,
+    )
+    .await
+}
+
+/// Same batch revalidation when the caller already performed the request's
+/// deployment-access check while loading the authorized catalog. Reusing that
+/// fact avoids a second identity/policy query; the exact model rows are still
+/// read here immediately before provider execution.
+async fn revalidate_admitted_model_executions_with_access(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    user_id: &str,
+    offering_ids: &[String],
+    provided_pool: Option<&sqlx::MySqlPool>,
+    deployment_access: Option<bool>,
+) -> Result<Vec<AdmittedModelExecution>, ModelOfferingResolutionError> {
     validate_model_admission_batch(offering_ids)?;
     if offering_ids.is_empty() {
         return Ok(Vec::new());
@@ -2039,6 +2062,8 @@ pub async fn revalidate_admitted_model_executions(
         .collect();
     let deployment_allowed = if unresolved.is_empty() {
         false
+    } else if let Some(allowed) = deployment_access {
+        allowed
     } else {
         deployment_models_allowed(&pool, user_id)
             .await
@@ -3463,6 +3488,40 @@ impl DatabaseModelService {
         .await
         .map_err(internal_error)
     }
+
+    async fn admit_row_model_offerings(
+        &self,
+        user_id: &str,
+        offering_ids: &[String],
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        revalidate_admitted_model_executions(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            user_id,
+            offering_ids,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn admit_row_model_offerings_with_access(
+        &self,
+        user_id: &str,
+        offering_ids: &[String],
+        deployment_allowed: bool,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        revalidate_admitted_model_executions_with_access(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            user_id,
+            offering_ids,
+            self.pool.as_ref().map(SharedPool::get),
+            Some(deployment_allowed),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
 }
 
 pub const MODEL_SELECT_COLS: &str = "\
@@ -4021,15 +4080,13 @@ impl ModelService for DatabaseModelService {
         if let Some(subject) = self.uc_subject(&user_id).await? {
             return self.admit_genesis(&subject, &offering_id).await;
         }
-        revalidate_admitted_model_execution(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &user_id,
-            &offering_id,
-            self.pool.as_ref().map(SharedPool::get),
-        )
-        .await
-        .map_err(model_offering_resolution_error_response)
+        self.admit_row_model_offerings(&user_id, std::slice::from_ref(&offering_id))
+            .await
+            .map(|mut executions| {
+                executions
+                    .pop()
+                    .expect("singleton model admission returned no execution")
+            })
     }
 
     async fn admit_model_offerings(
@@ -4049,15 +4106,8 @@ impl ModelService for DatabaseModelService {
                 .map(|offering_id| self.admit_genesis_from_catalog(&catalog, offering_id))
                 .collect();
         }
-        revalidate_admitted_model_executions(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &user_id,
-            &offering_ids,
-            self.pool.as_ref().map(SharedPool::get),
-        )
-        .await
-        .map_err(model_offering_resolution_error_response)
+        self.admit_row_model_offerings(&user_id, &offering_ids)
+            .await
     }
 
     async fn admit_model_selectors(
@@ -4122,7 +4172,7 @@ impl ModelService for DatabaseModelService {
             .await?;
         let offering_ids = resolve_model_selector_offerings(&selectors, &catalog)?;
         let admitted = self
-            .admit_model_offerings(user_id, offering_ids.clone())
+            .admit_row_model_offerings_with_access(&user_id, &offering_ids, deployment_allowed)
             .await?;
         validate_model_selector_admissions(&selectors, &offering_ids, Some(&catalog), &admitted)?;
         Ok(admitted)

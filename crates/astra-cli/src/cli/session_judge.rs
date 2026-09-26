@@ -715,7 +715,7 @@ mod tests {
                 "model_quote": null,
                 "source_qualifier_quote": null,
                 "reasoning_quote": "high",
-                "reasoning": "high",
+                "reasoning": {"mode": "effort", "effort": "high"},
                 "task_scope_quote": "nested reviewers",
                 "propagation": "direct_children",
                 "strength": "hard"

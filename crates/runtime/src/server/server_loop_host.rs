@@ -18938,7 +18938,7 @@ impl ServerAgenticLoopHost {
             "The delegated task shape is invalid; no new child was started.",
         ));
         let pending = needs_admission;
-        let mut slot_capacity = 16;
+        let mut slot_capacity = astra_turn_types::MAX_MODEL_ADMISSION_SLOTS;
         let (pending, overflow): (Vec<_>, Vec<_>) = pending.into_iter().partition(|item| {
             if item.slots.len() > slot_capacity {
                 false
@@ -41145,7 +41145,7 @@ mod tests {
                 "disposition":"resolved",
                 "requirements":[{
                     "model_quote":null,"source_qualifier_quote":null,
-                    "reasoning_quote":"high","reasoning":"high",
+                    "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
                     "task_scope_quote":null,"propagation":"direct_children","strength":"hard"
                 }],
                 "unresolved":[]
@@ -41234,20 +41234,43 @@ mod tests {
         ));
         assert_eq!(requests.lock().unwrap().len(), 1);
 
-        let many = (0..17)
+        for (batch_size, expected_admitted, expected_blocked) in
+            [(16, 16, 0), (17, 17, 0), (50, 50, 0), (51, 50, 1)]
+        {
+            let batch = (0..batch_size)
+                .map(|index| {
+                    json!({
+                        "id":format!("batch-{batch_size}-{index}"),"type":"function",
+                        "function":{"name":"agent","arguments":json!({
+                            "action":"spawn","description":format!("Task {index}"),
+                            "prompt":format!("Check item {index}")
+                        }).to_string()}
+                    })
+                })
+                .collect::<Vec<_>>();
+            let (admitted, blocked) = host.admitted_delegation_models(&mut state, &batch).await;
+            assert_eq!(admitted.len(), expected_admitted, "batch size {batch_size}");
+            assert_eq!(blocked.len(), expected_blocked, "batch size {batch_size}");
+        }
+        let fanout_slots = (0..50)
             .map(|index| {
                 json!({
-                    "id":format!("batch-{index}"),"type":"function",
-                    "function":{"name":"agent","arguments":json!({
-                        "action":"spawn","description":format!("Task {index}"),
-                        "prompt":format!("Check item {index}")
-                    }).to_string()}
+                    "description": format!("Fanout task {index}"),
+                    "prompt": format!("Check fanout item {index}")
                 })
             })
             .collect::<Vec<_>>();
-        let (admitted, blocked) = host.admitted_delegation_models(&mut state, &many).await;
-        assert_eq!(admitted.len(), 16);
-        assert_eq!(blocked.len(), 1);
+        let fanout = json!({
+            "id":"fanout-50","type":"function",
+            "function":{"name":"agent_fanout","arguments":json!({
+                "action":"start","target_count":50,"slots":fanout_slots
+            }).to_string()}
+        });
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, std::slice::from_ref(&fanout))
+            .await;
+        assert!(blocked.is_empty());
+        assert_eq!(admitted["fanout-50"].child_requirements.len(), 50);
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
@@ -41260,7 +41283,7 @@ mod tests {
                 "disposition":"resolved",
                 "requirements":[{
                     "model_quote":null,"source_qualifier_quote":null,
-                    "reasoning_quote":"high","reasoning":"high",
+                    "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
                     "task_scope_quote":null,"propagation":"direct_children","strength":"hard"
                 }],
                 "unresolved":[]
@@ -41374,7 +41397,7 @@ mod tests {
         .with_test_judgment_clients([
             client(json!({"disposition":"resolved","requirements":[{
                 "model_quote":null,"source_qualifier_quote":null,
-                "reasoning_quote":"high","reasoning":"high",
+                "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
                 "task_scope_quote":"review","propagation":"direct_children","strength":"hard"
             }],"unresolved":[]})),
             client(
@@ -41465,7 +41488,7 @@ mod tests {
         .with_test_judgment_clients([
             client(json!({"disposition":"resolved","requirements":[{
                 "model_quote":null,"source_qualifier_quote":null,
-                "reasoning_quote":"high","reasoning":"high",
+                "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
                 "task_scope_quote":"review","propagation":"direct_children","strength":"hard"
             }],"unresolved":[]})),
             client(json!({"assignments":[{

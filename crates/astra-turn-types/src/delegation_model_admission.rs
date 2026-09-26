@@ -113,6 +113,11 @@ pub struct DirectDelegationModelPlan {
     pub child_requirements: Vec<DelegationIntentRequirements>,
 }
 
+/// Maximum slots accepted by the shared model-admission contract. The public
+/// agent fanout contract is 50 slots; direct Team keeps its narrower
+/// `MAX_DIRECT_DELEGATION_SLOTS` boundary because it has a separate command
+/// contract.
+pub const MAX_MODEL_ADMISSION_SLOTS: usize = 50;
 pub const MAX_DIRECT_DELEGATION_SLOTS: usize = 32;
 
 /// Human instruction provenance survives child creation. It is deliberately
@@ -463,12 +468,18 @@ impl DelegationModelAdmission {
         }
         match &self.outcome {
             DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { slot_count } => {
-                if *slot_count == 0 || *slot_count > 16 || *slot_count as usize != expected_slots {
+                if *slot_count == 0
+                    || *slot_count as usize > MAX_MODEL_ADMISSION_SLOTS
+                    || *slot_count as usize != expected_slots
+                {
                     return Err("delegation model admission has invalid slot count");
                 }
             }
             DelegationModelAdmissionOutcome::Constrained { slots } => {
-                if slots.is_empty() || slots.len() > 16 || slots.len() != expected_slots {
+                if slots.is_empty()
+                    || slots.len() > MAX_MODEL_ADMISSION_SLOTS
+                    || slots.len() != expected_slots
+                {
                     return Err("delegation model admission has invalid slots");
                 }
                 for (index, slot) in slots.iter().enumerate() {
@@ -555,6 +566,40 @@ mod tests {
             slots.swap(0, 1);
         }
         assert!(admission.validate_identity("call", "args", 2, 2).is_err());
+    }
+
+    #[test]
+    fn shared_admission_uses_the_public_fanout_bound() {
+        let source = DelegationModelInstructionSource {
+            user_id: "u".into(),
+            session_id: "s".into(),
+            run_id: "r".into(),
+            turn_chain_id: "t".into(),
+            owner_generation: 1,
+            control_epoch: 2,
+            applied_intent_id: None,
+            session_turn: 3,
+            user_intent_digest: "digest".into(),
+        };
+        let admission = |slot_count: usize| DelegationModelAdmission {
+            source: source.clone(),
+            invocation_id: "call".into(),
+            arguments_digest: "args".into(),
+            child_requirements: vec![Default::default(); slot_count],
+            outcome: DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+                slot_count: slot_count as u32,
+            },
+        };
+        assert!(
+            admission(MAX_MODEL_ADMISSION_SLOTS)
+                .validate_identity("call", "args", 2, MAX_MODEL_ADMISSION_SLOTS,)
+                .is_ok()
+        );
+        assert!(
+            admission(MAX_MODEL_ADMISSION_SLOTS + 1)
+                .validate_identity("call", "args", 2, MAX_MODEL_ADMISSION_SLOTS + 1,)
+                .is_err()
+        );
     }
 
     #[test]

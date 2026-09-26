@@ -1400,9 +1400,15 @@ mod tests {
             );
             assert_eq!(result[0].passed, optional);
             assert!(
-                result[0].detail.contains("cache ratio")
-                    || result[0].detail.contains("cache-ratio")
+                result[0]
+                    .detail
+                    .contains("unknown (incomplete input evidence)")
             );
+            if optional {
+                assert!(result[0].detail.contains("optional criterion skipped"));
+            } else {
+                assert!(result[0].detail.contains("cannot evaluate cache ratio"));
+            }
         }
     }
 

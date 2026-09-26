@@ -236,7 +236,6 @@ pub(crate) fn build_judger_request(question: &str, outcome: &RunOutcome) -> Judg
                 )
             })
             .collect(),
-        explicit_answer_ids: Vec::new(),
     }
 }
 

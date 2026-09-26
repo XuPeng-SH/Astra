@@ -2022,7 +2022,7 @@ mod tests {
 
     #[test]
     fn render_text_uses_total_input_for_cache_read_share() {
-        let r = SuiteReport {
+        let mut r = SuiteReport {
             runs: vec![CaseRunReport {
                 case_name: "cache".into(),
                 model: "m".into(),

@@ -1438,7 +1438,10 @@ pub(crate) fn apply_delegation_model_admission(
     }
     let target_count = input.fanout_target_count.unwrap_or(1);
     let slot_index = input.fanout_slot_index.unwrap_or(0);
-    if target_count == 0 || target_count > 16 || slot_index >= target_count {
+    if target_count == 0
+        || target_count > astra_turn_types::MAX_MODEL_ADMISSION_SLOTS
+        || slot_index >= target_count
+    {
         return Err(invalid("invalid target slot"));
     }
     let slot = match &admission.outcome {

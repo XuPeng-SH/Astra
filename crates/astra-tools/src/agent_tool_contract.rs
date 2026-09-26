@@ -13,7 +13,7 @@ pub const AGENT_FANOUT_ACTIONS_DISPLAY: &str = "start, get_results, stop_slot, s
 /// caller cannot request an unbounded group through another surface. The
 /// serialized tool schema remains structurally stable so this safety fix does
 /// not churn the prompt-cache prefix.
-pub const AGENT_FANOUT_MAX_TARGET_COUNT: u64 = 50;
+pub const AGENT_FANOUT_MAX_TARGET_COUNT: u64 = astra_turn_types::MAX_MODEL_ADMISSION_SLOTS as u64;
 pub const AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS: u64 = 256;
 pub const AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS: u64 = 4096;
 
