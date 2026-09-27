@@ -1404,6 +1404,13 @@ pub struct ToolExecutor {
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Optional agent spawning context for `agent(action='spawn'|'get_result')`.
     pub spawn_context: Option<agent_spawning::AgentActionContext>,
+    /// CLI has no trusted natural-language binder for inherited descendant
+    /// requirements. A constrained child must not delegate without one.
+    delegation_requires_admission: bool,
+    /// Effective request setting, published after payload preparation. This
+    /// bounded snapshot is copied into each child admission context.
+    parent_model_reasoning:
+        std::sync::Mutex<Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>>,
     /// Optional shared context cache for cross-agent knowledge sharing.
     /// Used by share_context and query_context tools.
     pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
@@ -1570,6 +1577,8 @@ impl ToolExecutor {
             bg_task_list_cache: None,
             bash_detach_slot: None,
             spawn_context: None,
+            delegation_requires_admission: false,
+            parent_model_reasoning: std::sync::Mutex::new(None),
             context_cache: None,
             agent_id: None,
             send_message_context: std::sync::Mutex::new(None),
@@ -1682,12 +1691,47 @@ impl ToolExecutor {
 
     /// Set the spawn context for agent spawning.
     pub fn with_spawn_context(mut self, ctx: agent_spawning::AgentActionContext) -> Self {
+        *self.parent_model_reasoning.lock_recover() = ctx.parent_model_reasoning.clone();
         self.spawn_context = Some(ctx);
         #[cfg(test)]
         {
             self.install_default_test_visible_surface();
         }
         self
+    }
+
+    pub(crate) fn require_delegation_admission(mut self, required: bool) -> Self {
+        self.delegation_requires_admission = required;
+        self
+    }
+
+    pub(crate) fn publish_parent_model_reasoning(
+        &self,
+        offering_id: Option<&str>,
+        resolved_model_name: Option<&str>,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    ) {
+        *self.parent_model_reasoning.lock_recover() = offering_id.map(|offering_id| {
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: offering_id.to_string(),
+                },
+                resolved_model_name: resolved_model_name.map(str::to_string),
+                thinking,
+            }
+        });
+    }
+
+    fn spawn_context_for_admission(&self) -> Option<agent_spawning::AgentActionContext> {
+        let mut context = self.spawn_context.clone()?;
+        context.parent_model_reasoning = self.parent_model_reasoning_snapshot();
+        Some(context)
+    }
+
+    pub(crate) fn parent_model_reasoning_snapshot(
+        &self,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.parent_model_reasoning.lock_recover().clone()
     }
 
     /// Bind memory lifecycle events to one host-owned producer identity. Tool
@@ -5217,14 +5261,22 @@ impl ToolExecutor {
                             }
                         }
                         astra_tools::agent_tool_contract::AgentAction::Spawn => {
-                            agent_spawning::handle_agent_spawn_action(
+                            if self.delegation_requires_admission {
+                                *source_is_error = Some(true);
+                                return "Error: inherited model requirements cannot be bound to a CLI child delegation".into();
+                            }
+                            let context = self.spawn_context_for_admission();
+                            agent_spawning::handle_agent_spawn_action(args, context.as_ref()).await
+                        }
+                        astra_tools::agent_tool_contract::AgentAction::GetResult => {
+                            agent_spawning::handle_agent_get_result_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
-                        astra_tools::agent_tool_contract::AgentAction::GetResult => {
-                            agent_spawning::handle_agent_get_result_action(
+                        astra_tools::agent_tool_contract::AgentAction::List => {
+                            agent_spawning::handle_agent_list_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
@@ -5246,6 +5298,12 @@ impl ToolExecutor {
                     }
                 }
                 "agent_fanout" => {
+                    if self.delegation_requires_admission
+                        && args.get("action").and_then(Value::as_str) == Some("start")
+                    {
+                        *source_is_error = Some(true);
+                        return "Error: inherited model requirements cannot be bound to a CLI child delegation".into();
+                    }
                     if self.spawn_context.is_none()
                         && args.get("action").and_then(Value::as_str) == Some("get_results")
                         && let Some(group_id) = args.get("group_id").and_then(Value::as_str)
@@ -5254,8 +5312,8 @@ impl ToolExecutor {
                     {
                         projection.snapshot.output
                     } else {
-                        agent_spawning::handle_agent_fanout_tool(args, self.spawn_context.as_ref())
-                            .await
+                        let context = self.spawn_context_for_admission();
+                        agent_spawning::handle_agent_fanout_tool(args, context.as_ref()).await
                     }
                 }
                 // ── Consolidated session tool ──────────────────────────────
@@ -6332,6 +6390,9 @@ mod tests {
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
             current_model: None,
+            current_model_selection: None,
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: PathBuf::from("."),
@@ -6349,6 +6410,98 @@ mod tests {
             transcript_location:
                 astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
         }
+    }
+
+    #[test]
+    fn spawn_admission_snapshots_effective_parent_reasoning() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let executor = ToolExecutor::new(std::path::Path::new("."))
+            .with_spawn_context(fanout_test_context(test_spawner()));
+        executor.publish_parent_model_reasoning(
+            Some("offer-a"),
+            Some("model-a"),
+            ThinkingConfig::Enabled {
+                budget_tokens: 8192,
+            },
+        );
+        let admitted = executor.spawn_context_for_admission().unwrap();
+        executor.publish_parent_model_reasoning(
+            Some("offer-b"),
+            Some("model-b"),
+            ThinkingConfig::Off,
+        );
+        let updated = executor.spawn_context_for_admission().unwrap();
+        let admitted = admitted.parent_model_reasoning.unwrap();
+        assert_eq!(admitted.selection.offering_id, "offer-a");
+        assert_eq!(
+            admitted.thinking,
+            ThinkingConfig::Enabled {
+                budget_tokens: 8192
+            }
+        );
+        let updated = updated.parent_model_reasoning.unwrap();
+        assert_eq!(updated.selection.offering_id, "offer-b");
+        assert_eq!(updated.thinking, ThinkingConfig::Off);
+        executor.publish_parent_model_reasoning(None, None, ThinkingConfig::Off);
+        assert!(
+            executor
+                .spawn_context_for_admission()
+                .unwrap()
+                .parent_model_reasoning
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_cli_child_cannot_start_unbound_nested_delegation() {
+        let spawner = test_spawner();
+        let executor = test_executor()
+            .with_spawn_context(fanout_test_context(spawner.clone()))
+            .require_delegation_admission(true);
+        let spawn = executor
+            .execute(
+                "agent",
+                &serde_json::json!({
+                    "action":"spawn","description":"Review","prompt":"Review the diff"
+                }),
+            )
+            .await;
+        assert!(spawn.contains("inherited model requirements cannot be bound"));
+        let fanout = executor
+            .execute(
+                "agent_fanout",
+                &serde_json::json!({
+                    "action":"start","target_count":1,
+                    "slots":[{"id":"review","description":"Review","prompt":"Review the diff"}]
+                }),
+            )
+            .await;
+        assert!(fanout.contains("inherited model requirements cannot be bound"));
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert!(spawner.list_fanout_groups().await.is_empty());
+
+        let result_lookup = executor
+            .execute(
+                "agent",
+                &serde_json::json!({"action":"get_result","agent_id":"unknown"}),
+            )
+            .await;
+        assert!(!result_lookup.contains("inherited model requirements cannot be bound"));
+
+        let unconstrained = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
+        let allowed = unconstrained
+            .execute(
+                "agent",
+                &serde_json::json!({
+                    "action":"spawn","description":"Review","prompt":"Review the diff"
+                }),
+            )
+            .await;
+        assert!(!allowed.contains("inherited model requirements cannot be bound"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&allowed).unwrap()["status"],
+            "completed"
+        );
     }
 
     fn test_spawner() -> Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
@@ -6560,6 +6713,7 @@ mod tests {
                 tool_call_id: Some(tool_call_id),
                 admission_source: None,
                 expected_control_epoch: None,
+                delegation_model_admission: None,
             }
         }
 
@@ -6747,6 +6901,7 @@ mod tests {
                     tool_call_id: Some("call-external-noop"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
             )
             .await;

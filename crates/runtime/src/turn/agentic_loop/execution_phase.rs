@@ -39,6 +39,285 @@ const MAX_USER_INTENT_BOUNDARY_PAGES: usize = 16;
 const MAX_USER_INTENT_BOUNDARY_FACTS: usize = 4_096;
 const MAX_TEXTLESS_RESPONSE_RETRIES: u32 = 1;
 
+const DIRECT_CHILD_WAIT_LIMIT: Duration = Duration::from_secs(300);
+const DIRECT_CHILD_RESULT_SCHEMA: &str = "direct_child_completion.v1";
+
+/// Use the existing journal/trace sink, including its early-error flush. The
+/// digest joins the adopted evidence to the required-context payload without
+/// copying potentially private child output into another trace field.
+fn record_direct_child_barrier<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    parent_run_id: &str,
+    outcome: &str,
+    children: &serde_json::Value,
+    started: Instant,
+) {
+    let children = children.as_array().cloned().unwrap_or_default();
+    let identities: Vec<_> = children
+        .iter()
+        .map(|child| {
+            serde_json::json!({
+                "agent_id": child["agent_id"],
+                "run_id": child["run_id"],
+                "parent_agent_id": child["parent_agent_id"],
+                "status": child["status"],
+                "result_sha256": child["result_sha256"],
+                "result_truncated": child["result_truncated"],
+            })
+        })
+        .collect();
+    let attrs = std::collections::HashMap::from([
+        ("parent_run_id".to_string(), parent_run_id.to_string()),
+        ("outcome".to_string(), outcome.to_string()),
+        (
+            "children".to_string(),
+            serde_json::json!(identities).to_string(),
+        ),
+        (
+            "round_index".to_string(),
+            state.current_round_index.to_string(),
+        ),
+    ]);
+    tracing::info!(target: "astra::direct_child_barrier", parent_run_id, outcome,
+        children = %serde_json::json!(identities), duration_ms = started.elapsed().as_millis() as u64,
+        "parent-child completion barrier");
+    host.on_direct_child_completion_boundary(state, outcome, children.len(), started);
+    let end_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    if let Some(buffer) = state.turn_event_buffer.as_mut() {
+        let event = astra_services::session_journal::TraceSpanBuilder::default()
+            .session_id(state.current_session_id.as_deref())
+            .turn(Some(state.session_turn))
+            .span_id(format!("direct_child_barrier_{}", Uuid::new_v4()))
+            .name("direct_child_completion_barrier".into())
+            .trace_id(Some(parent_run_id.to_string()))
+            .start_us(end_us.saturating_sub(started.elapsed().as_micros() as u64))
+            .end_us(end_us)
+            .attrs(Some(&attrs))
+            .build()
+            .with_producer_scope(Some(parent_run_id));
+        buffer.record(event);
+    }
+}
+
+fn stage_direct_child_results<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
+    let Some(owner) = host.direct_child_completion_owner(state) else {
+        return;
+    };
+    // The required-context lane is checkpointed. After a process restart the
+    // producer may reconstruct the same terminal child from its recovery
+    // snapshot; do not inject a second copy of an already retained result.
+    let retained: HashSet<_> = state
+        .volatile_pending
+        .iter()
+        .filter(|injection| injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA)
+        .filter_map(|injection| injection.payload["children"].as_array())
+        .flatten()
+        .filter_map(|child| Some((child["agent_id"].as_str()?, child["run_id"].as_str()?)))
+        .collect();
+    let children: Vec<_> = owner
+        .take_completed_direct_children()
+        .into_iter()
+        .filter(|child| !retained.contains(&(child.agent_id.as_str(), child.run_id.as_str())))
+        .collect();
+    if children.is_empty() {
+        return;
+    }
+    let children = serde_json::json!(children);
+    record_direct_child_barrier(
+        host,
+        state,
+        owner.parent_run_id(),
+        "results_staged",
+        &children,
+        Instant::now(),
+    );
+    // This accumulative, required lane survives provider-attempt failure and
+    // cannot overwrite an unrelated mailbox message or sibling result.
+    state.push_volatile_payload(super::host::VolatileKind::BackgroundTaskNotification, serde_json::json!({
+        "schema": DIRECT_CHILD_RESULT_SCHEMA,
+        "parent_run_id": owner.parent_run_id(),
+        "children": children,
+        "instruction": "These are producer-owned terminal child outcomes. Use the actual results in your next decision; report failures and incomplete work truthfully before finalizing.",
+    }));
+}
+
+fn finish_direct_child_barrier_incomplete(state: &mut AgenticLoopState, reason: &str) {
+    // A tentative provider answer cannot become the interruption's partial
+    // answer when it was composed without the required child evidence.
+    state.hooks.completion_settlement.latest_provider_text = None;
+    state.hooks.completion_settlement.deferred_candidate_text = None;
+    state.final_text = "The child work could not be collected and incorporated before this run stopped. Progress is preserved, but the request is incomplete.".into();
+    state.final_text_streamed = false;
+    if state.interruption.is_none() {
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::ExecutionIncomplete,
+            ResumeAction::ContinueImmediately,
+            interruption_state_summary(state, Some(reason.to_string())),
+        ));
+    }
+}
+
+pub(super) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) {
+    let Some(owner) = host.direct_child_completion_owner(state) else {
+        return;
+    };
+    if !owner.has_direct_child_completion_history() {
+        return;
+    }
+    let children = owner.pending_direct_children();
+    let undelivered = state.volatile_pending.iter().any(|injection| {
+        injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+            && injection.payload["observed_by_provider"] != true
+    });
+    let incomplete = !children.is_empty() || undelivered;
+    if incomplete {
+        finish_direct_child_barrier_incomplete(
+            state,
+            "parent finalization reached an unobserved direct-child obligation",
+        );
+    }
+    record_direct_child_barrier(
+        host,
+        state,
+        owner.parent_run_id(),
+        if incomplete {
+            "finalization_incomplete"
+        } else if state.interruption.is_some() {
+            "finalization_interrupted"
+        } else {
+            "finalization_accepted"
+        },
+        &serde_json::json!(children),
+        Instant::now(),
+    );
+    if !incomplete && state.interruption.is_none() {
+        state
+            .volatile_pending
+            .retain(|injection| injection.payload["schema"] != DIRECT_CHILD_RESULT_SCHEMA);
+    }
+}
+
+/// Wait only at a proposed final answer; ordinary tool/model work stays
+/// concurrent. Return true to enter one normal, accounted synthesis boundary.
+async fn await_direct_children_before_completion<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    continuation: ContinuationAuthority,
+) -> Result<bool, astra_core::ClassifiedError> {
+    let Some(owner) = host.direct_child_completion_owner(state) else {
+        return Ok(false);
+    };
+    if !owner.has_pending_direct_children() {
+        return Ok(false);
+    }
+    state.final_text.clear();
+    state.final_text_streamed = false;
+    let started = Instant::now();
+    let remaining = host.execution_time_budget_remaining();
+    let slice_exhausted =
+        state.remaining_turns == 0 || state.current_round_index as usize + 1 >= state.max_turns;
+    let no_synthesis_budget = (slice_exhausted
+        && !super::lifecycle::adaptive_budget_is_renewable(state))
+        || state
+            .agentic_turn_budget
+            .hard_turn_limit
+            .is_some_and(|limit| state.llm_rounds_completed as usize >= limit.get());
+    let outcome = if continuation != ContinuationAuthority::Runtime {
+        "remote_owner_unsettled"
+    } else if no_synthesis_budget {
+        "synthesis_budget_exhausted"
+    } else {
+        let children = serde_json::json!(owner.pending_direct_children());
+        record_direct_child_barrier(
+            host,
+            state,
+            owner.parent_run_id(),
+            "wait_started",
+            &children,
+            started,
+        );
+        host.emit_headless_line(
+            HeadlessStderrStyle::Dim,
+            "Waiting for child work before the final answer.".into(),
+        );
+        let wait_budget = remaining.map_or(DIRECT_CHILD_WAIT_LIMIT, |remaining| {
+            remaining.saturating_sub(
+                astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET,
+            )
+        });
+        tokio::select! {
+            biased;
+            _ = direct_child_parent_cancelled(&state.cancellation) => {
+                record_direct_child_barrier(host, state, owner.parent_run_id(), "cancelled", &children, started);
+                return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                    "parent cancelled while waiting for direct children"));
+            }
+            result = tokio::time::timeout(wait_budget, owner.wait_for_direct_children()) => {
+                if result.is_ok() { "synthesis_ready" } else { "deadline" }
+            }
+        }
+    };
+    record_direct_child_barrier(
+        host,
+        state,
+        owner.parent_run_id(),
+        outcome,
+        &serde_json::json!(owner.pending_direct_children()),
+        started,
+    );
+    if outcome == "synthesis_ready" {
+        // Continue through normal preparation, accounting, and budget checks.
+        // This barrier never extends a slice or a user-owned hard limit.
+        return Ok(true);
+    }
+    let _ = super::lifecycle::cancel_unfinished_child_agents(
+        host,
+        state,
+        "parent direct-child completion boundary stopped",
+        crate::orchestration::CancellationOrigin::Runtime,
+    )
+    .await;
+    finish_direct_child_barrier_incomplete(state, outcome);
+    Ok(false)
+}
+
+async fn direct_child_parent_cancelled(cancellation: &super::host::CancellationState) {
+    let flagged = || {
+        cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            || cancellation
+                .execution_lease_lost
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    };
+    if flagged() {
+        return;
+    }
+    if let Some(token) = &cancellation.token {
+        token.cancelled().await;
+    } else if cancellation.flag.is_some() || cancellation.execution_lease_lost.is_some() {
+        // Legacy hosts may have only an atomic flag. No per-parent timer is
+        // scheduled for the normal token-backed runtime.
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if flagged() {
+                return;
+            }
+        }
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderBoundaryGate {
     Authorized,
@@ -4494,6 +4773,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     super::guards::refresh_work_evidence_context(state);
+    stage_direct_child_results(host, state);
 
     // Project the immutable policy revision selected at the preceding
     // authoritative tool boundary. Request retries and preparation reruns
@@ -4967,7 +5247,46 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
     let mut turn_result = match turn_result {
         Ok(turn_result) => {
+            let delivered_children: Vec<_> = state
+                .volatile_pending
+                .iter()
+                .filter(|injection| {
+                    injection.attempt_leased
+                        && injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                })
+                .map(|injection| injection.payload.clone())
+                .collect();
+            for payload in &delivered_children {
+                let outcome = if providerless_control_plane_turn
+                    || turn_result.accum.error_message.is_some()
+                {
+                    "result_delivery_deferred"
+                } else {
+                    "results_adopted"
+                };
+                record_direct_child_barrier(
+                    host,
+                    state,
+                    payload["parent_run_id"].as_str().unwrap_or_default(),
+                    outcome,
+                    &payload["children"],
+                    llm_wall_start,
+                );
+            }
             state.commit_volatile_attempt_lease();
+            // Provider context is not guaranteed to be append-only. Retain
+            // child evidence across later tool/model rounds and checkpoint
+            // boundaries; one successful response is delivery, not durable
+            // conversation history or proof the model used the result.
+            for mut payload in delivered_children {
+                if !providerless_control_plane_turn && turn_result.accum.error_message.is_none() {
+                    payload["observed_by_provider"] = serde_json::Value::Bool(true);
+                }
+                state.push_volatile_payload(
+                    super::host::VolatileKind::BackgroundTaskNotification,
+                    payload,
+                );
+            }
             turn_result
         }
         Err(error) => {
@@ -5786,6 +6105,34 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 try_write_heavy_checkpoint(state);
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
+
+            // Child completion is a producer fact, never assistant prose.
+            // Fence it before committing final user-intent/Work settlement.
+            if host
+                .direct_child_completion_owner(state)
+                .is_some_and(|owner| owner.has_pending_direct_children())
+            {
+                // Close provider timing before waiting. The wait is its own
+                // Explain interval, never part of model inference time.
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("direct_child_completion_wait"),
+                );
+                let child_barrier =
+                    await_direct_children_before_completion(host, state, continuation_authority)
+                        .await;
+                state.step_recorder.end_turn(false);
+                try_write_heavy_checkpoint(state);
+                return child_barrier.map(|continue_loop| {
+                    if continue_loop {
+                        TurnExecutionControl::ContinueLoop
+                    } else {
+                        TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
+                    }
+                });
             }
 
             let user_intent_settlement_fence = commit_user_intent_settlement_fence(state).await?;
@@ -9046,6 +9393,51 @@ mod tests {
     };
     use crate::turn::run_control::{RunStatusProvider, UserIntentPoll, UserIntentProvider};
     use astra_turn_core::chat_turn_sse_dispatch::{ChatTurnSseAccum, ServerLoopExecutionSummary};
+
+    #[tokio::test]
+    async fn delivered_direct_child_evidence_survives_a_provider_round() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": DIRECT_CHILD_RESULT_SCHEMA,
+                "parent_run_id": "parent-run",
+                "children": [{"agent_id": "child", "status": "completed", "result_sha256": "sha256:test"}],
+            }),
+        );
+        // The production host leases required context when assembling the
+        // provider request; the lightweight mock only does so with an owner.
+        state.volatile_pending[0].attempt_leased = true;
+        let mut read = make_edge_tool("read_file", "evidence");
+        read.args = serde_json::json!({"path": "/app/evidence.txt"});
+        let mut host = MockHost::new(vec![edge_tool_result(vec![read], 10, 5, Some(1))])
+            .with_valid_tools(&["read_file"]);
+        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+            .await
+            .expect("provider round");
+        assert!(
+            host.executed_volatile[0]
+                .iter()
+                .any(|entry| { entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA })
+        );
+        assert!(
+            state.volatile_pending.iter().any(|entry| {
+                entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                    && entry.payload["observed_by_provider"] == true
+                    && !entry.attempt_leased
+            }),
+            "pending={:?}",
+            state.volatile_pending
+        );
+        let mut next = MockHost::new(vec![text_result("Done", 10, 5, Some(1))]);
+        execute_turn_and_ingest_phase(&mut next, &mut state, 1, prep(false))
+            .await
+            .expect("next provider round");
+        assert!(next.executed_volatile[0].iter().any(|entry| {
+            entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                && entry.payload["observed_by_provider"] == true
+        }));
+    }
 
     #[test]
     fn restored_workspace_observation_unavailable_does_not_grant_repair_or_success() {

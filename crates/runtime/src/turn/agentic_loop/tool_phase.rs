@@ -2201,17 +2201,41 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
         state.hooks.completion_settlement.text_only = true;
     }
-    let admitted_tool_calls = admission.admitted;
-    let admitted_logical_calls = admitted_tool_calls
+    let mut admitted_tool_calls = admission.admitted;
+    let mut admitted_logical_calls = admitted_tool_calls
         .iter()
         .map(|call| call.logical_target_call().clone())
         .collect::<Vec<_>>();
     let mut admitted_tool_call_control = super::host::AdmittedToolCallControl::Continue;
+    let mut delegation_model_admissions = std::collections::HashMap::new();
     if !admitted_logical_calls.is_empty() {
         let delivered = host
             .handle_admitted_tool_invocations(state, &admitted_tool_calls)
             .await;
         admitted_tool_call_control = delivered.control;
+        delegation_model_admissions = delivered.delegation_model_admissions;
+        if !delivered.pre_execution_rejections.is_empty() {
+            let rejected_ids = delivered
+                .pre_execution_rejections
+                .iter()
+                .map(|rejected| rejected.provider_call_id().to_string())
+                .collect::<HashSet<_>>();
+            admitted_tool_calls.retain(|call| {
+                call.provider_call_id()
+                    .is_none_or(|id| !rejected_ids.contains(id))
+            });
+            admitted_logical_calls.retain(|call| {
+                call.get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| !rejected_ids.contains(id))
+            });
+            admission
+                .rejected
+                .extend(delivered.pre_execution_rejections);
+        }
+        if let Some(usage) = delivered.auxiliary_usage {
+            state.settle_admitted_auxiliary_usage(usage);
+        }
         record_trusted_client_pipeline_skills(state, &admitted_logical_calls, &delivered.results);
         turn_result.edge_tool_round.extend(delivered.results);
     }
@@ -2461,6 +2485,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     }
                 },
             ),
+            delegation_model_admissions: Some(&delegation_model_admissions),
             physical_tool_calls,
             logical_tool_calls: all_tool_calls,
             deferred_activations_by_call_id: &deferred_activations_by_call_id,
@@ -3561,6 +3586,44 @@ mod tests {
         assert!(
             projected_without_owner_snapshot.is_empty(),
             "a rejected journal disposition cannot override the typed terminal owner"
+        );
+    }
+
+    #[test]
+    fn server_preflight_rejection_has_one_record_and_reliable_terminal_owner() {
+        let mut state = make_state();
+        let call = json!({
+            "id": "blocked-fanout",
+            "type": "function",
+            "function": {"name": "agent_fanout", "arguments": "{}"}
+        });
+        let rejection = super::super::host::RejectedToolCall::ordinary(
+            call,
+            json!({
+                "status": "failed",
+                "error_kind": "delegation_model_scope_unresolved",
+                "advisory": {"executed": false},
+                "error": "Model requirement assessment did not complete."
+            })
+            .to_string(),
+        );
+        let (_, pre_resolved) =
+            crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+                &mut state,
+                vec![rejection],
+            );
+        assert_eq!(pre_resolved.len(), 1);
+        assert_eq!(pre_resolved[0].call_id, "blocked-fanout");
+        let records = &state.stall.tool_call_records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        );
+        assert!(!records[0].was_executed());
+        assert_eq!(
+            pre_resolved_server_tool_terminal_records(records, &[], &HashSet::new(), &[]).len(),
+            1
         );
     }
 
@@ -6180,7 +6243,7 @@ esac
 
         // LiveRuntimeProvider
         assert_eq!(provider.token_pressure(), 0.0);
-        assert_eq!(provider.cache_hit_ratio(), 0.0);
+        assert_eq!(provider.cache_hit_ratio(), None);
         assert_eq!(provider.current_error_rate(), 0.0);
         assert_eq!(provider.budget_remaining(), 10);
         assert_eq!(provider.budget_max(), 10);

@@ -1,9 +1,10 @@
+use astra_server_types::{ModelAdmissionRequestV1, ModelAdmissionResponseV1};
 use astra_services::{MAX_API_LIST_LIMIT, models::*};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::AppState;
-use astra_core::{ErrorResponse, error_response, internal_error};
+use astra_core::{ErrorResponse, error_response, error_response_coded, internal_error};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -471,6 +472,33 @@ pub async fn get_model_access_handler(
     Ok(Json(projection))
 }
 
+/// Check all requested child Offerings before a CLI fanout launches any slot.
+/// The response is a safe display projection, never credential material or a
+/// grant that bypasses the next inference admission.
+pub async fn admit_child_models_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ModelAdmissionRequestV1>,
+) -> Result<Json<ModelAdmissionResponseV1>, (StatusCode, Json<ErrorResponse>)> {
+    if request.slots.is_empty() || request.slots.len() > 64 {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "model admission requires 1 to 64 slots",
+            "model_admission_batch_invalid",
+        ));
+    }
+    let slots = crate::server::model_execution_admission::prepare_child_model_slots(request.slots)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    Ok(Json(
+        crate::server::model_execution_admission::admit_child_model_slots(
+            &state.model_service,
+            user.user_id,
+            slots,
+        )
+        .await?,
+    ))
+}
+
 pub async fn get_model_handler(
     State(state): State<AppState>,
     Path(model_name): Path<String>,
@@ -644,6 +672,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }
     }
 

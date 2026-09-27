@@ -436,6 +436,13 @@ pub(crate) async fn stream_chat_sse(
                 agent_id: root_agent_id.to_string(),
                 delegation_chain: Vec::new(),
                 current_model: p.model.map(str::to_string),
+                delegation_model_admission: None,
+                parent_model_reasoning: None,
+                current_model_selection: p.offering_id.as_ref().map(|offering_id| {
+                    astra_turn_types::ModelSelection {
+                        offering_id: offering_id.clone(),
+                    }
+                }),
                 recursion_depth: 0,
                 is_fork_child: false,
                 working_dir: project_root.clone(),
@@ -1041,7 +1048,7 @@ pub(crate) async fn stream_chat_sse(
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,
-        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         permission_context: Some(root_permission_context),
         applied_permission_mode: None,
         permission_handler: None,

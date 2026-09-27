@@ -703,6 +703,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
             context.agent_tool_context.as_ref(),
             args,
             invocation.tool_call_id,
+            invocation.delegation_model_admission,
         )
         .await
     }
@@ -743,6 +744,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentFanoutToolHandler {
             context.agent_tool_context.as_ref(),
             args,
             invocation.tool_call_id,
+            invocation.delegation_model_admission,
         )
         .await
     }

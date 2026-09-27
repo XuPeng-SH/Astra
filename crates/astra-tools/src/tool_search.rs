@@ -1133,11 +1133,11 @@ mod tests {
         let fanout = &parsed["matches"][0];
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("exactly that many slots")
+            desc.contains("target_count slots")
                 && desc.contains("description+prompt")
-                && desc.contains("never embed diffs")
-                && desc.contains("no brief/agents/background"),
-            "selection summary must keep the current fanout shape and shared-workspace constraints: {desc}"
+                && desc.contains("atomic")
+                && desc.contains("Hard requirements cannot be overridden"),
+            "selection summary must keep the current fanout admission contract: {desc}"
         );
 
         let result = tool_search(&schemas, &json!({"query": "select:agent"}));
@@ -1146,9 +1146,10 @@ mod tests {
         let desc = agent["description"].as_str().unwrap_or_default();
         assert!(
             desc.contains("description+prompt")
-                && desc.contains("agent_id")
-                && desc.contains("foreground")
-                && desc.contains("run_chain"),
+                && desc.contains("launched")
+                && desc.contains("parent continues")
+                && desc.contains("list: status")
+                && desc.contains("get_result: result"),
             "selection summary must keep agent action constraints: {desc}"
         );
     }

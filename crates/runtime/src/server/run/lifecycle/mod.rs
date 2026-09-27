@@ -102,12 +102,13 @@ fn valid_runtime_http_endpoint(endpoint: &str) -> bool {
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
+use crate::orchestration::SpawnAgentExecutor;
+use crate::orchestration::spawner::PreparedSpawn;
 use crate::orchestration::{
     AgentProgressEvent, AgentToolContext, AgentTranscriptLocation, CancellationOrigin,
     DurableAgentReconciler, DynamicAgentSpawner, FANOUT_GROUP_CANCELLED_EVENT_TYPE,
-    InheritedPermissions, PermissionMode, PermissionSyncContext, ProgressBroadcaster,
-    ProgressEventType, SpawnAgentExecutor, SpawnRunCancellationDurability, SpawnRunConfig,
-    SpawnRunResult, SpawnedAgentState,
+    InheritedPermissions, PermissionMode, PermissionSyncContext, ProgressBroadcaster, SpawnContext,
+    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult, SpawnedAgentState,
 };
 use crate::server::run::cloud_workspace_provisioning::CloudWorkspaceProvisioner;
 use crate::server::run::workspace_provisioning::{
@@ -6907,7 +6908,22 @@ impl AgenticRunLifecycleService {
         let enabled_tools =
             normalize_request_allowlist(request.enabled_tools.as_deref(), "enabled_tools")?
                 .or_else(|| Some(HashSet::new()));
-        Ok(RequestConstraints::new(
+        let delegated_model_requirements = request
+            .context
+            .as_ref()
+            .and_then(|context| {
+                context.get(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY)
+            })
+            .map(|value| {
+                serde_json::from_value::<astra_turn_types::DelegationIntentRequirements>(
+                    value.clone(),
+                )
+                .map_err(|_| "delegated model handoff is malformed".to_string())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        delegated_model_requirements.validate()?;
+        let mut constraints = RequestConstraints::new(
             normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")?,
             enabled_tools,
             normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")?,
@@ -6915,7 +6931,9 @@ impl AgenticRunLifecycleService {
                 request.allow_skill_sources.as_deref(),
                 "allow_skill_sources",
             )?,
-        ))
+        );
+        constraints.delegated_model_requirements = delegated_model_requirements;
+        Ok(constraints)
     }
 
     fn root_permission_mode_from_request(request: &ChatRequestData) -> PermissionMode {
@@ -7089,10 +7107,23 @@ impl AgenticRunLifecycleService {
         let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
             fanout_admission: entry.spawner.fanout_parent(run_id),
+            delegation_model_admission: None,
             run_id: run_id.to_string(),
             agent_id,
             delegation_chain: Vec::new(),
             current_model: request.model.clone(),
+            current_model_selection: request.model_selection.clone(),
+            parent_model_reasoning: request.model_selection.clone().map(|selection| {
+                astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                    selection,
+                    resolved_model_name: request.model.clone(),
+                    thinking: Self::thinking_from_chat_context(
+                        &request.context,
+                        request.model.as_deref(),
+                    )
+                    .expect("request thinking validated before dynamic tool wiring"),
+                }
+            }),
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: workspace.to_path_buf(),
@@ -7844,6 +7875,10 @@ impl AgenticRunLifecycleService {
             request,
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
+        );
+        context.generation_controls = Some(
+            Self::root_generation_controls(request)
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?,
         );
         context.work_binding = work_binding.map(ValidatedWorkRuntimeBinding::durable_binding);
         use astra_services::runs::{
@@ -8856,8 +8891,30 @@ impl AgenticRunLifecycleService {
                 "runtime_executor_authorization_invalid",
             )
         })?;
-        Self::thinking_from_chat_context(&request.context, request.model.as_deref())
+        // Parse malformed controls at the request boundary. When a caller
+        // explicitly supplied thinking, validate it against the already
+        // admitted Offering before inference; an absent field preserves the
+        // ordinary chat default without inventing an explicit `off` request.
+        let controls = Self::root_generation_controls(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        let thinking = controls.thinking;
+        let initial_output_limit = controls.first_output_max_tokens;
+        if let Some(limit) = initial_output_limit {
+            thinking
+                .validate_output_budget(u64::from(limit))
+                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        }
+        if request
+            .context
+            .as_ref()
+            .is_some_and(|context| context.contains_key("thinking"))
+            && let Some(execution) = request.admitted_model_execution.as_ref()
+        {
+            crate::server::model_execution_admission::validate_reasoning_control(
+                execution, &thinking,
+            )
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        }
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
@@ -8870,6 +8927,8 @@ impl AgenticRunLifecycleService {
             ));
         }
         let request_constraints = Self::try_request_constraints(request)
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        validate_delegated_model_handoff(user_id, request, &request_constraints)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         if let Some(enabled_tools) = request_constraints.enabled_tools.as_ref() {
             let fallback_registry = astra_runtime_env::ToolRegistry::builtins();
@@ -9944,6 +10003,57 @@ impl AgenticRunLifecycleService {
             ));
         }
         Self::validate_effective_user_input(&request)?;
+        match request.requested_model_policy.as_ref() {
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+                if request.model_selection.is_none() =>
+            {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
+                        .to_string(),
+                    "model_routing_unavailable",
+                ));
+            }
+            // Auto is a caller policy, not a second execution selector. The
+            // edge child router may already have selected an Offering; the
+            // Server still freshly authorizes that exact Offering below.
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. }) => {}
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector:
+                    astra_turn_types::ModelSelector::OfferingId {
+                        offering_id: requested,
+                    },
+            }) if request
+                .model_selection
+                .as_ref()
+                .is_none_or(|selected| selected.offering_id != *requested) =>
+            {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "requested fixed model does not match the admitted Offering selection",
+                    "model_selection_invalid",
+                ));
+            }
+            Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::ConfiguredName { .. },
+            }) if request.model_selection.is_none() => {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "configured model names require a matching admitted Offering selection",
+                    "model_selection_invalid",
+                ));
+            }
+            None
+            | Some(astra_turn_types::RequestedModelPolicy::Inherit)
+            | Some(astra_turn_types::RequestedModelPolicy::Fixed { .. }) => {}
+        }
+        if let Some(expected_model_name) = request.expected_model_name.as_deref() {
+            exact_runtime_string(
+                "expected_model_name",
+                expected_model_name,
+                "model_identity_invalid",
+            )?;
+        }
         if request.admitted_execution_deadline.is_none() {
             let now_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -9984,11 +10094,12 @@ impl AgenticRunLifecycleService {
                 || request.model_selection.is_some()
                 || request.resolved_model_selection.is_some()
                 || request.admitted_model_execution.is_some()
+                || request.expected_model_name.is_some()
                 || request.model.is_some()
             {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
-                    "Server-default model selection cannot be combined with explicit or provider runtime model state",
+                    "Server-default model selection cannot be combined with explicit or expected model identity",
                     "model_selection_invalid",
                 ));
             }
@@ -10017,6 +10128,7 @@ impl AgenticRunLifecycleService {
             let resolved = ResolvedModelSelection {
                 offering_id: admitted.offering_id.clone(),
                 model_name: admitted.model_name.clone(),
+                source_identity: admitted_source_identity(&admitted),
             };
             request.model_selection = Some(selection);
             request.model = Some(resolved.model_name.clone());
@@ -10059,18 +10171,23 @@ impl AgenticRunLifecycleService {
                     "provider_runtime_context_required",
                 )
             })?;
-            request.admitted_model_execution = Some(
-                crate::server::model_execution_admission::admit_model_execution(
-                    &self.model_service,
-                    astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
-                    user_id,
-                    selection,
-                    Some(resolved),
-                    Some(gateway),
-                    request.runtime_auth.as_ref(),
-                )
-                .await?,
-            );
+            let admitted = crate::server::model_execution_admission::admit_model_execution(
+                &self.model_service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+                user_id,
+                selection,
+                Some(resolved),
+                Some(gateway),
+                request.runtime_auth.as_ref(),
+            )
+            .await?;
+            validate_expected_model_name(&request, &resolved.model_name)?;
+            validate_requested_configured_model_name(
+                &request,
+                &resolved.model_name,
+                resolved.source_identity.as_ref(),
+            )?;
+            request.admitted_model_execution = Some(admitted);
             request.model = Some(resolved.model_name.clone());
             return Ok(request);
         }
@@ -10091,9 +10208,17 @@ impl AgenticRunLifecycleService {
             None,
         )
         .await?;
+        validate_expected_model_name(&request, &admitted.model_name)?;
+        let source_identity = admitted_source_identity(&admitted);
+        validate_requested_configured_model_name(
+            &request,
+            &admitted.model_name,
+            source_identity.as_ref(),
+        )?;
         let resolved = ResolvedModelSelection {
             offering_id: admitted.offering_id.clone(),
             model_name: admitted.model_name.clone(),
+            source_identity,
         };
         request.model = Some(resolved.model_name.clone());
         request.resolved_model_selection = Some(resolved);
@@ -10450,7 +10575,7 @@ impl AgenticRunLifecycleService {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
-        let request_identity = json!({
+        let mut request_identity = json!({
             "version": 1,
             "message": request.message,
             "user_intent": request.user_intent,
@@ -10497,6 +10622,14 @@ impl AgenticRunLifecycleService {
             "interaction_mode": request.interaction_mode,
             "interactive_client": request.interactive_client,
         });
+        // Preserve the existing fingerprint for ordinary requests while
+        // binding explicit delegation policy to provider-task retries. A
+        // changed policy must not attach to a run admitted under another one
+        // or bypass Auto's fail-closed preparation check.
+        if let Some(policy) = request.requested_model_policy.as_ref() {
+            request_identity["requested_model_policy"] = serde_json::to_value(policy)
+                .expect("requested model policy must remain JSON serializable");
+        }
         let request_fingerprint = format!(
             "{:x}",
             Sha256::digest(astra_core::canonical_json_string(&request_identity).as_bytes())
@@ -11697,6 +11830,8 @@ impl AgenticRunLifecycleService {
         plan_authoring_active: bool,
         work_runtime_binding: Option<&ValidatedWorkRuntimeBinding>,
     ) -> server_loop_host::ServerAgenticLoopHost {
+        let generation_controls = Self::root_generation_controls(request)
+            .expect("generation controls validated before host construction");
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
             self.encryptor.clone(),
@@ -11704,6 +11839,8 @@ impl AgenticRunLifecycleService {
             session_id.to_string(),
         )
         .with_model(request.model.clone())
+        .with_initial_output_limit(generation_controls.first_output_max_tokens)
+        .with_preserved_thinking(generation_controls.preserve_thinking)
         .with_model_service(Some(self.model_service.clone()))
         .with_admitted_execution_deadline(request.admitted_execution_deadline)
         .with_admitted_model_execution(request.admitted_model_execution.clone())
@@ -12277,6 +12414,7 @@ impl AgenticRunLifecycleService {
             run_id,
             workspace_override,
             edge_context,
+            &request_constraints,
         )?;
         let environment = self.assemble_loop_environment(
             user_id,
@@ -12315,6 +12453,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         workspace_override: Option<&std::path::Path>,
         edge_context: &EdgeContext,
+        request_constraints: &RequestConstraints,
     ) -> Result<LoopExecutionFacts, (StatusCode, Json<ErrorResponse>)> {
         use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
         use astra_turn_core::stop_hooks_yaml::{
@@ -12409,6 +12548,9 @@ impl AgenticRunLifecycleService {
                 turn_guard: TurnGuard::with_profile(task_profile),
                 message: prompt_user_message.clone(),
                 user_intent: prompt_user_intent,
+                delegated_model_requirements: request_constraints
+                    .delegated_model_requirements
+                    .clone(),
                 turn_intent: None,
                 task_profile,
                 session_turn: 0,
@@ -12475,6 +12617,9 @@ impl AgenticRunLifecycleService {
     ) -> AgenticLoopState {
         use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
         use astra_text_utils::semantic_dedup::SemanticDedup;
+        let mut request_constraints = request_constraints;
+        request_constraints.delegated_model_requirements =
+            facts.original.delegated_model_requirements.clone();
         let LoopEnvironment {
             skill_registry,
             skill_resolver,
@@ -12483,9 +12628,9 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             harness,
         } = environment;
-        let thinking_config =
-            Self::thinking_from_chat_context(&request.context, request.model.as_deref())
-                .expect("thinking configuration was validated during request admission");
+        let thinking_config = Self::root_generation_controls(request)
+            .expect("generation controls validated during request admission")
+            .thinking;
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(request.model.as_deref());
@@ -12667,6 +12812,25 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    fn root_generation_controls(
+        request: &ChatRequestData,
+    ) -> Result<crate::server::run::engine::RunGenerationControls, String> {
+        let thinking =
+            Self::thinking_from_chat_context(&request.context, request.model.as_deref())?;
+        let first_output_max_tokens =
+            Self::initial_output_limit_from_chat_context(&request.context)?;
+        let preserve_thinking = request
+            .context
+            .as_ref()
+            .is_some_and(|context| context.contains_key("thinking"))
+            && thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+        Ok(crate::server::run::engine::RunGenerationControls {
+            thinking,
+            first_output_max_tokens,
+            preserve_thinking,
+        })
+    }
+
     fn thinking_from_chat_context(
         context: &Option<Map<String, Value>>,
         model: Option<&str>,
@@ -12675,9 +12839,25 @@ impl AgenticRunLifecycleService {
             return astra_turn_core::thinking_config::ThinkingConfig::from_payload_value(value);
         }
         Ok(model
-            .map(|name| astra_turn_core::thinking_config::resolve_model_thinking(name).1)
+            .map(|name| astra_turn_core::thinking_config::resolve_model_thinking_request(name).1)
             .unwrap_or_default())
     }
+    fn initial_output_limit_from_chat_context(
+        context: &Option<Map<String, Value>>,
+    ) -> Result<Option<u32>, String> {
+        context
+            .as_ref()
+            .and_then(|context| context.get("max_output_tokens"))
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "context.max_output_tokens must be a positive u32".to_string())
+            })
+            .transpose()
+    }
+
     /// Extract edge tools from the request context, or provide empty defaults.
     /// Parse the request context into a typed [`EdgeContext`].
     fn extract_edge_context(
@@ -13491,6 +13671,65 @@ fn exact_runtime_string(
         ));
     }
     Ok(())
+}
+
+fn validate_expected_model_name(
+    request: &ChatRequestData,
+    resolved_model_name: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if request
+        .expected_model_name
+        .as_deref()
+        .is_some_and(|expected| expected != resolved_model_name)
+    {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "The selected Offering resolved to a different model after child preflight; retry delegation to prepare the current identity",
+            "model_identity_changed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_requested_configured_model_name(
+    request: &ChatRequestData,
+    resolved_model_name: &str,
+    source_identity: Option<&astra_services::runs::ResolvedModelSourceIdentity>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName { model_name, source },
+    }) = request.requested_model_policy.as_ref()
+    else {
+        return Ok(());
+    };
+    let name_matches = model_name.eq_ignore_ascii_case(resolved_model_name);
+    let source_matches = source.as_deref().is_none_or(|source| {
+        source_identity.is_some_and(|identity| {
+            source.eq_ignore_ascii_case(&identity.provider)
+                || source.eq_ignore_ascii_case(&identity.access_label)
+        })
+    });
+    if !name_matches || !source_matches {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "The selected Offering no longer matches the configured child model selector; retry delegation to prepare the current identity",
+            "model_identity_changed",
+        ));
+    }
+    Ok(())
+}
+
+fn admitted_source_identity(
+    admitted: &astra_services::AdmittedModelExecution,
+) -> Option<astra_services::runs::ResolvedModelSourceIdentity> {
+    admitted.source_identity.clone().or_else(|| {
+        (admitted.execution_placement == astra_services::ModelExecutionPlacement::Server).then(
+            || astra_services::runs::ResolvedModelSourceIdentity {
+                provider: admitted.provider.clone(),
+                access_label: admitted.access_kind.source_label().to_string(),
+            },
+        )
+    })
 }
 
 fn exact_runtime_id(
@@ -20547,6 +20786,13 @@ impl ServerSpawnAgentExecutor {
                 "server dynamic agent executor requires parent run lineage".to_string()
             })?;
 
+        self.runtime_context_for_parent_run(parent_run_id).await
+    }
+
+    async fn runtime_context_for_parent_run(
+        &self,
+        parent_run_id: &str,
+    ) -> Result<ServerSpawnRuntimeContext, String> {
         let registry = self.runtime_context_registry.read().await;
         registry
             .current_context_id_by_run
@@ -20558,6 +20804,59 @@ impl ServerSpawnAgentExecutor {
                     "server dynamic agent executor has no runtime context for parent run {parent_run_id}"
                 )
             })
+    }
+
+    async fn select_spawn_model_execution(
+        &self,
+        parent: &ServerSpawnRuntimeContext,
+        selection: Option<&ModelSelection>,
+    ) -> Result<astra_services::AdmittedModelExecution, String> {
+        let parent_execution = parent.admitted_model_execution.as_ref();
+        let Some(selection) = selection else {
+            return parent_execution.cloned().ok_or_else(|| {
+                "server dynamic child cannot inherit a missing parent model admission".to_string()
+            });
+        };
+        astra_services::validate_model_offering_id(&selection.offering_id)
+            .map_err(|error| format!("invalid child model selection: {error}"))?;
+        if let Some(parent_execution) = parent_execution
+            && parent_execution.offering_id == selection.offering_id
+        {
+            return Ok(parent_execution.clone());
+        }
+        if let Some(model_service) = self.model_service.as_ref() {
+            return crate::server::model_execution_admission::admit_model_execution(
+                model_service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+                &parent.user_id,
+                selection,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|(_, body)| body.0.detail);
+        }
+        astra_services::revalidate_admitted_model_execution(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &parent.user_id,
+            &selection.offering_id,
+            self.shared_pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn prepare_spawn_model(
+        &self,
+        parent: &ServerSpawnRuntimeContext,
+        selection: Option<&ModelSelection>,
+        thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    ) -> Result<astra_services::AdmittedModelExecution, String> {
+        let execution = self.select_spawn_model_execution(parent, selection).await?;
+        crate::server::model_execution_admission::validate_reasoning_control(&execution, thinking)?;
+        Ok(execution)
     }
 
     /// Publish the child as the next possible parent before its loop starts.
@@ -20573,6 +20872,7 @@ impl ServerSpawnAgentExecutor {
         parent: &ServerSpawnRuntimeContext,
         config: &SpawnRunConfig,
         request_constraints: RequestConstraints,
+        admitted_model_execution: astra_services::AdmittedModelExecution,
     ) -> Result<(ServerSpawnRuntimeContext, ExecutionOwnerGenerationGuard), String> {
         // A child owns its own local control handles. Parent cancellation is
         // inherited through the token tree, while a child's direct pause or
@@ -20600,7 +20900,7 @@ impl ServerSpawnAgentExecutor {
             session_id: parent.session_id.clone(),
             trace_context: parent.trace_context.clone(),
             forward_headers: parent.forward_headers.clone(),
-            admitted_model_execution: parent.admitted_model_execution.clone(),
+            admitted_model_execution: Some(admitted_model_execution),
             interaction_mode: parent.interaction_mode,
             edge_tools: parent.edge_tools.clone(),
             request_constraints,
@@ -21083,7 +21383,7 @@ impl ServerSpawnAgentExecutor {
 fn spawn_child_request_constraints(
     parent: &RequestConstraints,
     config: &SpawnRunConfig,
-) -> RequestConstraints {
+) -> Result<RequestConstraints, &'static str> {
     let child_allowed = if config.allowed_tools.iter().any(|tool| tool == "*") {
         if config.read_only {
             // `read_only` here describes workspace mutation, not a ban on
@@ -21136,12 +21436,50 @@ fn spawn_child_request_constraints(
         allowed_tools.insert("settle_work_item".to_string());
     }
 
-    RequestConstraints::new(
+    let mut constraints = RequestConstraints::new(
         allowed_tools,
         parent.enabled_tools.clone(),
         parent.allowed_skills.clone(),
         parent.allowed_skill_sources.clone(),
-    )
+    );
+    config.delegated_model_requirements.validate()?;
+    constraints.delegated_model_requirements = config.delegated_model_requirements.clone();
+    Ok(constraints)
+}
+
+fn validate_delegated_model_handoff(
+    user_id: &str,
+    request: &ChatRequestData,
+    constraints: &RequestConstraints,
+) -> Result<(), String> {
+    let handoff_present = request.context.as_ref().is_some_and(|context| {
+        context.contains_key(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY)
+    });
+    let source = match &constraints.delegated_model_requirements {
+        astra_turn_types::DelegationIntentRequirements::Unassessed => {
+            if handoff_present {
+                return Err("delegated model handoff is missing a typed requirement state".into());
+            }
+            return Ok(());
+        }
+        astra_turn_types::DelegationIntentRequirements::Unconstrained { source }
+        | astra_turn_types::DelegationIntentRequirements::Unresolved { source, .. }
+        | astra_turn_types::DelegationIntentRequirements::Unavailable { source, .. }
+        | astra_turn_types::DelegationIntentRequirements::CatalogResolutionFailed {
+            source, ..
+        }
+        | astra_turn_types::DelegationIntentRequirements::Requirements { source, .. } => source,
+    };
+    if source.user_id != user_id {
+        return Err("delegated model handoff belongs to another user".into());
+    }
+    if request.session_id.as_deref() != Some(source.session_id.as_str()) {
+        return Err("delegated model handoff belongs to another session".into());
+    }
+    if handoff_present && source.command_intent_id.is_none() {
+        return Err("delegated model handoff has no authenticated command identity".into());
+    }
+    Ok(())
 }
 
 fn delegated_edge_tool_schema_names(constraints: &RequestConstraints) -> Vec<String> {
@@ -21512,8 +21850,327 @@ impl DurableSubrunControlAuthority {
     }
 }
 
+async fn admit_model_offering_batch(
+    model_service: Option<&Arc<dyn ModelService>>,
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    user_id: &str,
+    shared_pool: Option<&SharedPool>,
+    offering_ids: &[String],
+) -> Result<Vec<AdmittedModelExecution>, String> {
+    if offering_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let executions = if let Some(model_service) = model_service {
+        model_service
+            .admit_model_offerings(user_id.to_string(), offering_ids.to_vec())
+            .await
+            .map_err(|(_, body)| body.0.detail)?
+    } else {
+        astra_services::revalidate_admitted_model_executions(
+            matrixone,
+            encryptor,
+            user_id,
+            offering_ids,
+            shared_pool.map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    };
+    if executions.len() != offering_ids.len()
+        || executions
+            .iter()
+            .zip(offering_ids)
+            .any(|(execution, requested)| execution.offering_id != *requested)
+    {
+        return Err(
+            "batch model admission returned an incomplete or mismatched Offering set".into(),
+        );
+    }
+    Ok(executions)
+}
+
+struct ServerPreparedSpawn {
+    max_output_tokens: Option<u32>,
+    executor: Arc<ServerSpawnAgentExecutor>,
+    parent: ServerSpawnRuntimeContext,
+    execution: astra_services::AdmittedModelExecution,
+    requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
+    resolved_selection: Option<ModelSelection>,
+    thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
+    delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
+}
+
+#[async_trait]
+impl PreparedSpawn for ServerPreparedSpawn {
+    fn model_identity(&self) -> Option<crate::orchestration::PreparedSpawnModelIdentity> {
+        Some(crate::orchestration::PreparedSpawnModelIdentity {
+            offering_id: self.execution.offering_id.clone(),
+            model_name: self.execution.model_name.clone(),
+            provenance: "admission_validated",
+        })
+    }
+
+    async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        let parent_run_id = config
+            .parent_address
+            .as_ref()
+            .map(|address| address.run_id.as_str());
+        if parent_run_id != Some(self.parent.parent_run_id.as_str())
+            || config.fanout_slot != self.slot
+            || config.delegated_model_requirements != self.delegated_model_requirements
+            || config.requested_model_policy != self.requested_model_policy
+            || config.thinking != self.thinking
+            || config.max_output_tokens != self.max_output_tokens
+            || config.resolved_model_selection != self.resolved_selection
+        {
+            return Err("prepared child execution does not match its admitted parent, slot, Offering, or reasoning".to_string());
+        }
+        let current = self.executor.runtime_context_for_config(&config).await?;
+        if current.runtime_context_id != self.parent.runtime_context_id {
+            return Err("prepared child parent generation is no longer current".to_string());
+        }
+        self.executor
+            .execute_with_admitted_model(config, self.parent, self.execution)
+            .await
+    }
+}
+
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
+    async fn prepare_batch(
+        self: Arc<Self>,
+        inputs: &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput],
+        context: &SpawnContext,
+        _parent_selection: Option<&ModelSelection>,
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        let parent = self
+            .runtime_context_for_parent_run(&context.parent_run_id)
+            .await?;
+        let inherited = parent.admitted_model_execution.as_ref();
+        let inherited_selection = inherited.map(|execution| ModelSelection {
+            offering_id: execution.offering_id.clone(),
+        });
+        let mut slot_selectors = Vec::with_capacity(inputs.len());
+        let mut initial_selections = Vec::with_capacity(inputs.len());
+        let mut selectors_to_admit = Vec::new();
+        for input in inputs {
+            input.fanout_slot_identity()?;
+            let selector = crate::orchestration::selector_for_admitted_spawn_input(
+                input,
+                inherited_selection.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+            let selection = match selector.as_ref() {
+                Some(astra_turn_types::ModelSelector::OfferingId { offering_id }) => {
+                    astra_services::validate_model_offering_id(offering_id)
+                        .map_err(|error| format!("invalid child model selection: {error}"))?;
+                    Some(ModelSelection {
+                        offering_id: offering_id.clone(),
+                    })
+                }
+                Some(astra_turn_types::ModelSelector::ConfiguredName { .. }) => None,
+                None => inherited_selection.clone(),
+            };
+            if let (Some(prepared), Some(selection)) =
+                (input.resolved_model_selection.as_ref(), selection.as_ref())
+                && prepared != selection
+            {
+                return Err(
+                    "resolved child Offering does not match its requested model policy".into(),
+                );
+            }
+            if selector.is_none() && selection.is_none() {
+                return Err(
+                    "server dynamic child cannot inherit a missing parent model admission"
+                        .to_string(),
+                );
+            }
+            let requires_admission = match selector.as_ref() {
+                Some(astra_turn_types::ModelSelector::ConfiguredName { .. }) => true,
+                Some(astra_turn_types::ModelSelector::OfferingId { offering_id }) => {
+                    inherited.is_none_or(|parent| parent.offering_id != *offering_id)
+                }
+                None => input
+                    .resolved_model_selection
+                    .as_ref()
+                    .zip(inherited_selection.as_ref())
+                    .is_some_and(|(requested, parent)| requested != parent),
+            };
+            if requires_admission {
+                let selector = selector
+                    .clone()
+                    .or_else(|| {
+                        input.resolved_model_selection.as_ref().map(|selection| {
+                            astra_turn_types::ModelSelector::OfferingId {
+                                offering_id: selection.offering_id.clone(),
+                            }
+                        })
+                    })
+                    .ok_or_else(|| "child model selection is missing".to_string())?;
+                if !selectors_to_admit.contains(&selector) {
+                    selectors_to_admit.push(selector);
+                }
+            }
+            slot_selectors.push(selector);
+            initial_selections.push(selection);
+        }
+        let admitted_executions = if selectors_to_admit.is_empty() {
+            Vec::new()
+        } else if let Some(model_service) = self.model_service.as_ref() {
+            model_service
+                .admit_model_selectors(parent.user_id.clone(), selectors_to_admit.clone())
+                .await
+                .map_err(|(_, body)| body.0.detail)?
+        } else if selectors_to_admit
+            .iter()
+            .all(|selector| matches!(selector, astra_turn_types::ModelSelector::OfferingId { .. }))
+        {
+            let offering_ids = selectors_to_admit
+                .iter()
+                .map(|selector| match selector {
+                    astra_turn_types::ModelSelector::OfferingId { offering_id } => {
+                        offering_id.clone()
+                    }
+                    astra_turn_types::ModelSelector::ConfiguredName { .. } => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            admit_model_offering_batch(
+                None,
+                &self.matrixone,
+                self.encryptor.as_ref(),
+                &parent.user_id,
+                self.shared_pool.as_ref(),
+                &offering_ids,
+            )
+            .await?
+        } else {
+            return Err(
+                "configured model names require the authenticated model catalog service".into(),
+            );
+        };
+        if admitted_executions.len() != selectors_to_admit.len() {
+            return Err("batch model admission returned an incomplete Offering set".into());
+        }
+        let admitted_by_selector: Vec<_> = selectors_to_admit
+            .into_iter()
+            .zip(admitted_executions)
+            .collect();
+        let mut admitted_by_id = HashMap::new();
+        for (_, execution) in &admitted_by_selector {
+            admitted_by_id
+                .entry(execution.offering_id.clone())
+                .or_insert_with(|| execution.clone());
+        }
+        let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let slot = input.fanout_slot_identity()?;
+            let selector = slot_selectors[index].as_ref();
+            let mut requested_selection = initial_selections[index].clone();
+            let selected_execution = selector
+                .and_then(|selector| {
+                    admitted_by_selector
+                        .iter()
+                        .find(|(admitted_selector, _)| admitted_selector == selector)
+                        .map(|(_, execution)| execution)
+                })
+                .cloned();
+            if let Some(execution) = selected_execution.as_ref() {
+                let selected = ModelSelection {
+                    offering_id: execution.offering_id.clone(),
+                };
+                if input
+                    .resolved_model_selection
+                    .as_ref()
+                    .is_some_and(|prepared| prepared != &selected)
+                {
+                    return Err(
+                        "resolved child Offering changed after model-policy preparation".into(),
+                    );
+                }
+                requested_selection = Some(selected);
+            }
+            if requested_selection.is_none() {
+                return Err(
+                    "configured model selector did not resolve to an admitted Offering".into(),
+                );
+            }
+            if let Some(admission) = context.delegation_model_admission.as_ref() {
+                let mut checked = input.clone();
+                checked.resolved_model_selection = requested_selection.clone();
+                crate::orchestration::spawner::apply_delegation_model_admission(
+                    &mut checked,
+                    admission,
+                    &context.parent_run_id,
+                    context.spawn_tool_call_id.as_deref(),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            let delegated_model_requirements = match context.delegation_model_admission.as_ref() {
+                Some(admission) => admission
+                    .child_requirements
+                    .get(input.fanout_slot_index.unwrap_or(0))
+                    .cloned()
+                    .ok_or_else(|| "prepared child requirement slot is missing".to_string())?,
+                None => Default::default(),
+            };
+            delegated_model_requirements
+                .validate()
+                .map_err(str::to_string)?;
+            let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
+                input.reasoning.as_ref(),
+                requested_selection.as_ref(),
+                context.parent_model_reasoning.as_ref(),
+            );
+            let execution = if let Some(execution) = selected_execution {
+                execution
+            } else if inherited.is_some_and(|parent| {
+                requested_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.offering_id == parent.offering_id)
+            }) {
+                inherited.cloned().ok_or_else(|| {
+                    "server dynamic child cannot inherit a missing parent model admission"
+                        .to_string()
+                })?
+            } else {
+                let selection = requested_selection
+                    .as_ref()
+                    .ok_or_else(|| "child model selection is missing".to_string())?;
+                admitted_by_id
+                    .get(&selection.offering_id)
+                    .cloned()
+                    .ok_or_else(|| "batch model admission lost a selected Offering".to_string())?
+            };
+            astra_services::models::validate_model_execution_purpose(
+                &execution,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+            )
+            .map_err(|(_, body)| body.0.detail)?;
+            crate::server::model_execution_admission::validate_reasoning_control(
+                &execution, &thinking,
+            )?;
+            if let Some(limit) = input.max_output_tokens {
+                thinking.validate_output_budget(u64::from(limit))?;
+            }
+            let resolved_selection = ModelSelection {
+                offering_id: execution.offering_id.clone(),
+            };
+            prepared.push(Box::new(ServerPreparedSpawn {
+                max_output_tokens: input.max_output_tokens,
+                executor: Arc::clone(&self),
+                parent: parent.clone(),
+                execution,
+                requested_model_policy: input.requested_model_policy.clone(),
+                resolved_selection: Some(resolved_selection),
+                thinking,
+                slot,
+                delegated_model_requirements,
+            }));
+        }
+        Ok(prepared)
+    }
     async fn cancel_spawned_run(
         &self,
         run_id: &str,
@@ -21799,7 +22456,27 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     }
 
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        config.validate_requested_model_policy()?;
         let context = self.runtime_context_for_config(&config).await?;
+        let admitted_model_execution = self
+            .prepare_spawn_model(
+                &context,
+                config.resolved_model_selection.as_ref(),
+                &config.thinking,
+            )
+            .await?;
+        self.execute_with_admitted_model(config, context, admitted_model_execution)
+            .await
+    }
+}
+
+impl ServerSpawnAgentExecutor {
+    async fn execute_with_admitted_model(
+        &self,
+        config: SpawnRunConfig,
+        context: ServerSpawnRuntimeContext,
+        admitted_model_execution: astra_services::AdmittedModelExecution,
+    ) -> Result<SpawnRunResult, String> {
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
             "server dynamic agent lifecycle is no longer available for this session".to_string()
         })?;
@@ -21808,15 +22485,23 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         // keep alive the supervisor that owns that same future.
         let dynamic_agent_spawner = dynamic_agent_spawner.task_handle();
         let request_constraints =
-            spawn_child_request_constraints(&context.request_constraints, &config);
+            spawn_child_request_constraints(&context.request_constraints, &config)
+                .map_err(str::to_string)?;
         let (child_runtime_context, _generation_publication_guard) = self
-            .register_child_runtime_context(&context, &config, request_constraints.clone())
+            .register_child_runtime_context(
+                &context,
+                &config,
+                request_constraints.clone(),
+                admitted_model_execution.clone(),
+            )
             .await?;
 
         let mut profile =
             AgentProfile::new(&config.agent_id, &config.description, AgentTier::System);
         profile.system_prompt = Some(spawn_system_prompt(&config));
-        profile.model_selection = None;
+        profile.model_selection = Some(ModelSelection {
+            offering_id: admitted_model_execution.offering_id.clone(),
+        });
         profile.skill_filter = config.allowed_tools.clone();
         profile.metadata.insert(
             "spawn_agent_type".to_string(),
@@ -21886,6 +22571,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let mut child_permissions = config.inherited_permissions.clone();
         child_permissions.allowed_tools = request_constraints.allowed_tools.clone();
         let subrun = SubRunConfig {
+            max_output_tokens: config.max_output_tokens,
             execution_owner_generation: None,
             execution_owner_generation_sink: Some(Arc::clone(
                 &child_runtime_context.execution_owner_generation,
@@ -21899,7 +22585,10 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             previous_output: None,
             context: subrun_context,
             forward_headers: context.forward_headers.clone(),
-            admitted_model_execution: context.admitted_model_execution.clone(),
+            admitted_model_execution: Some(admitted_model_execution.clone()),
+            prepared_model: None,
+            requested_model_policy: config.requested_model_policy.clone(),
+            thinking: config.thinking.clone(),
             interaction_mode: child_runtime_context.interaction_mode,
             request_constraints,
             recursion_depth: config.recursion_depth,
@@ -21927,7 +22616,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 child_permissions,
                 dynamic_agent_spawner,
                 config.client_tool_delivery_tx.clone(),
-                context.admitted_model_execution.as_ref(),
+                Some(&admitted_model_execution),
                 child_runtime_context.edge_tools.clone(),
             )
             .with_admitted_execution_deadline(config.execution_deadline);
@@ -22312,6 +23001,32 @@ impl ServerSubRunExecutor {
                 .ok_or_else(|| "durable sub-run parent has no ancestor root".to_string())?
         };
         if let Some(existing) = existing {
+            if crate::server::run::engine::durable_run_requested_model_policy(&existing)?
+                != config.requested_model_policy
+            {
+                return Err("durable sub-run retry changed its requested model policy".into());
+            }
+            let requested_controls = crate::server::run::engine::RunGenerationControls {
+                thinking: config.thinking.clone(),
+                first_output_max_tokens: config.max_output_tokens,
+                preserve_thinking: config.thinking
+                    != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+            };
+            if crate::server::run::engine::durable_run_generation_controls(&existing)?
+                != requested_controls
+            {
+                return Err("durable sub-run retry changed its generation controls".into());
+            }
+            if crate::server::run::engine::durable_run_delegated_model_requirements(&existing)?
+                != Some(
+                    config
+                        .request_constraints
+                        .delegated_model_requirements
+                        .clone(),
+                )
+            {
+                return Err("durable sub-run retry changed inherited model requirements".into());
+            }
             if existing.session_id != config.session_id
                 || existing.parent_run_id.as_deref() != Some(config.parent_run_id.as_str())
             {
@@ -22446,14 +23161,29 @@ impl ServerSubRunExecutor {
                 None,
                 crate::server::run::engine::RunStartContext {
                     interaction_mode: config.interaction_mode,
+                    requested_model_policy: config.requested_model_policy.clone(),
+                    generation_controls: Some(crate::server::run::engine::RunGenerationControls {
+                        thinking: config.thinking.clone(),
+                        first_output_max_tokens: config.max_output_tokens,
+                        preserve_thinking: config.thinking
+                            != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                    }),
+                    delegated_model_requirements: Some(
+                        config
+                            .request_constraints
+                            .delegated_model_requirements
+                            .clone(),
+                    ),
                     agent_binding_name: Some(config.agent_profile.name.clone()),
                     provider_run_owner: inherited_provider_run_owner(&config.context)?,
+                    model_identity_admitted: execution.is_some(),
                     model_selection: execution.map(|execution| ModelSelection {
                         offering_id: execution.offering_id.clone(),
                     }),
                     resolved_model_selection: execution.map(|execution| ResolvedModelSelection {
                         offering_id: execution.offering_id.clone(),
                         model_name: execution.model_name.clone(),
+                        source_identity: admitted_source_identity(execution),
                     }),
                     work_binding,
                     validated_work_item_assignment: config.work_item.is_some(),
@@ -22473,19 +23203,43 @@ impl ServerSubRunExecutor {
         &self,
         config: &SubRunConfig,
         selected_execution: Option<&astra_services::AdmittedModelExecution>,
-    ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
+        durable_run: Option<&astra_services::runs::DurableRunRecord>,
+    ) -> Result<
+        (
+            Option<astra_services::AdmittedModelExecution>,
+            crate::server::run::engine::RunGenerationControls,
+        ),
+        String,
+    > {
         let inherited_execution = selected_execution
             .or(config.admitted_model_execution.as_ref())
             .or(self.admitted_model_execution.as_ref());
-        let Some(run_engine) = self.durable_run_engine() else {
-            return Ok(inherited_execution.cloned());
+        let requested_controls = crate::server::run::engine::RunGenerationControls {
+            thinking: config.thinking.clone(),
+            first_output_max_tokens: config.max_output_tokens,
+            preserve_thinking: config.thinking
+                != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         };
-        let run = run_engine
-            .load_run(&config.user_id, &config.run_id)
-            .await?
-            .ok_or_else(|| {
-                "durable sub-run disappeared before model materialization".to_string()
-            })?;
+        let Some(run) = durable_run else {
+            if self.durable_run_engine().is_some() {
+                return Err("durable sub-run disappeared before model materialization".into());
+            }
+            return Ok((inherited_execution.cloned(), requested_controls));
+        };
+        let durable_controls = crate::server::run::engine::durable_run_generation_controls(run)?;
+        if durable_controls != requested_controls {
+            return Err("durable sub-run generation controls changed before execution".into());
+        }
+        if crate::server::run::engine::durable_run_delegated_model_requirements(run)?
+            != Some(
+                config
+                    .request_constraints
+                    .delegated_model_requirements
+                    .clone(),
+            )
+        {
+            return Err("durable sub-run model requirements changed before execution".into());
+        }
         let offering_id = run.model_offering_id.as_deref().ok_or_else(|| {
             "durable sub-run is missing its admitted Offering identity".to_string()
         })?;
@@ -22500,7 +23254,7 @@ impl ServerSubRunExecutor {
                         .to_string(),
                 );
             }
-            return Ok(Some(execution.clone()));
+            return Ok((Some(execution.clone()), durable_controls));
         }
         let execution = self.admit_offering(&config.user_id, offering_id).await?;
         if execution.model_name != expected_model_name {
@@ -22509,13 +23263,32 @@ impl ServerSubRunExecutor {
                     .to_string(),
             );
         }
-        Ok(Some(execution))
+        Ok((Some(execution), durable_controls))
     }
 
     async fn select_subrun_execution(
         &self,
         config: &SubRunConfig,
     ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
+        if let Some(prepared) = config.prepared_model.as_ref() {
+            if config
+                .agent_profile
+                .model_selection
+                .as_ref()
+                .is_some_and(|selection| selection.offering_id != prepared.offering_id)
+            {
+                return Err("prepared sub-run Offering changed before execution".into());
+            }
+            let execution = prepared.admitted_execution.as_ref().ok_or_else(|| {
+                "server sub-run is missing its pre-admitted model execution".to_string()
+            })?;
+            if execution.offering_id != prepared.offering_id
+                || execution.model_name != prepared.model_name
+            {
+                return Err("prepared sub-run model material changed before execution".into());
+            }
+            return Ok(Some(execution.clone()));
+        }
         let Some(selection) = config.agent_profile.model_selection.as_ref() else {
             return Ok(config
                 .admitted_model_execution
@@ -22523,6 +23296,14 @@ impl ServerSubRunExecutor {
                 .or(self.admitted_model_execution.as_ref())
                 .cloned());
         };
+        if let Some(execution) = config
+            .admitted_model_execution
+            .as_ref()
+            .or(self.admitted_model_execution.as_ref())
+            && execution.offering_id == selection.offering_id
+        {
+            return Ok(Some(execution.clone()));
+        }
         let execution = self
             .admit_offering(&config.user_id, &selection.offering_id)
             .await?;
@@ -23187,6 +23968,121 @@ impl SubRunExecutor for ServerSubRunExecutor {
         true
     }
 
+    async fn prepare_model_batch(
+        &self,
+        requests: &[crate::server::delegation::engine::SubRunModelRequest],
+    ) -> Result<Vec<Option<crate::server::delegation::engine::PreparedSubRunModel>>, String> {
+        use crate::server::delegation::engine::PreparedSubRunModel;
+
+        let Some(user_id) = requests.first().map(|request| request.user_id.as_str()) else {
+            return Ok(Vec::new());
+        };
+        if requests.iter().any(|request| request.user_id != user_id) {
+            return Err("one sub-run model batch cannot span multiple owners".into());
+        }
+
+        let inherited = self.admitted_model_execution.as_ref();
+        let mut requested = Vec::new();
+        for request in requests {
+            let offering_id = request
+                .selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str())
+                .or_else(|| {
+                    request
+                        .parent_model_reasoning
+                        .as_ref()
+                        .map(|parent| &parent.selection)
+                        .map(|selection| selection.offering_id.as_str())
+                })
+                .or_else(|| {
+                    request
+                        .inherited_execution
+                        .as_ref()
+                        .or(inherited)
+                        .map(|execution| execution.offering_id.as_str())
+                });
+            let Some(offering_id) = offering_id else {
+                continue;
+            };
+            astra_services::validate_model_offering_id(offering_id)
+                .map_err(|error| format!("invalid child model selection: {error}"))?;
+            let parent_execution = request.inherited_execution.as_ref().or(inherited);
+            if parent_execution.is_none_or(|execution| execution.offering_id != offering_id)
+                && !requested
+                    .iter()
+                    .any(|requested_id| requested_id == offering_id)
+            {
+                requested.push(offering_id.to_string());
+            }
+        }
+
+        let admitted = admit_model_offering_batch(
+            self.model_service.as_ref(),
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            user_id,
+            self.shared_pool.as_ref(),
+            &requested,
+        )
+        .await?;
+        let admitted_by_id: HashMap<_, _> = requested.into_iter().zip(admitted).collect();
+
+        requests
+            .iter()
+            .map(|request| {
+                let offering_id = request
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.offering_id.as_str())
+                    .or_else(|| {
+                        request
+                            .parent_model_reasoning
+                            .as_ref()
+                            .map(|parent| &parent.selection)
+                            .map(|selection| selection.offering_id.as_str())
+                    })
+                    .or_else(|| {
+                        request
+                            .inherited_execution
+                            .as_ref()
+                            .or(inherited)
+                            .map(|execution| execution.offering_id.as_str())
+                    });
+                let Some(offering_id) = offering_id else {
+                    return Ok(None);
+                };
+                let execution = request
+                    .inherited_execution
+                    .as_ref()
+                    .or(inherited)
+                    .filter(|execution| execution.offering_id == offering_id)
+                    .cloned()
+                    .or_else(|| admitted_by_id.get(offering_id).cloned())
+                    .ok_or_else(|| {
+                        "batch model admission lost a selected child Offering".to_string()
+                    })?;
+                astra_services::models::validate_model_execution_purpose(
+                    &execution,
+                    astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+                )
+                .map_err(|(_, body)| body.0.detail)?;
+                crate::server::model_execution_admission::validate_reasoning_control(
+                    &execution,
+                    &request.thinking,
+                )?;
+                if let Some(limit) = request.max_output_tokens {
+                    request.thinking.validate_output_budget(u64::from(limit))?;
+                }
+                Ok(Some(PreparedSubRunModel {
+                    offering_id: execution.offering_id.clone(),
+                    model_name: execution.model_name.clone(),
+                    admitted_execution: Some(execution),
+                }))
+            })
+            .collect()
+    }
+
     async fn execute(
         &self,
         mut config: SubRunConfig,
@@ -23337,15 +24233,26 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let mut durable_terminal_committed = false;
         let mut atomic_terminal_attempted = false;
         let execution = AssertUnwindSafe(async {
-            let durable_work_binding = match self.durable_run_engine() {
-            Some(engine) => engine
-                .load_run(&config.user_id, &config.run_id)
-                .await?
-                .and_then(|run| run.work_binding),
-            None => None,
+            let durable_run = match self.durable_run_engine() {
+                Some(engine) => Some(
+                    engine
+                        .load_run(&config.user_id, &config.run_id)
+                        .await?
+                        .ok_or_else(|| {
+                            "durable sub-run disappeared before model materialization".to_string()
+                        })?,
+                ),
+                None => None,
             };
-        let admitted_model_execution = self
-            .materialize_durable_subrun_execution(&config, selected_execution.as_ref())
+            let durable_work_binding = durable_run
+                .as_ref()
+                .and_then(|run| run.work_binding.clone());
+        let (admitted_model_execution, generation_controls) = self
+            .materialize_durable_subrun_execution(
+                &config,
+                selected_execution.as_ref(),
+                durable_run.as_ref(),
+            )
             .await?;
         let child_model_name = admitted_model_execution
             .as_ref()
@@ -23468,6 +24375,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.session_id.clone(),
         )
         .with_model(child_model_name.clone())
+        .with_initial_output_limit(generation_controls.first_output_max_tokens)
+        .with_preserved_thinking(generation_controls.preserve_thinking)
         .with_model_service(self.model_service.clone())
         .with_admitted_model_execution(admitted_model_execution)
         .with_admitted_execution_deadline(self.admitted_execution_deadline)
@@ -23763,7 +24672,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            thinking: generation_controls.thinking.clone(),
             permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
@@ -23960,10 +24869,19 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 workspace_mutation.set(inherited_workspace_mutation);
                 executor.set_agent_tool_context(AgentToolContext {
                     fanout_admission: spawner.fanout_parent(&config.run_id),
+                    delegation_model_admission: None,
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),
                     delegation_chain: config.delegation_chain.clone(),
                     current_model: child_model_name.clone(),
+                    current_model_selection: config.agent_profile.model_selection.clone(),
+                    parent_model_reasoning: config.agent_profile.model_selection.clone().map(|selection| {
+                        astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                            selection,
+                            resolved_model_name: child_model_name.clone(),
+                            thinking: config.thinking.clone(),
+                        }
+                    }),
                     recursion_depth: config.recursion_depth,
                     is_fork_child: config.inherited_prefix.is_some(),
                     working_dir: agent_working_dir,
