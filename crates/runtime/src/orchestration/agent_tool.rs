@@ -1775,6 +1775,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
                     "error_truncated": rendered_value.get("error_truncated").cloned().unwrap_or(Value::Null),
                     "error_kind": rendered_value.get("error_kind").cloned().unwrap_or(Value::Null),
                     "transcript_location": rendered_value.get("transcript_location").cloned().unwrap_or(Value::Null),
+                    "prepared_model": rendered_value.get("prepared_model").cloned().unwrap_or(Value::Null),
                 })
             })
         })
@@ -2103,6 +2104,11 @@ async fn render_agent_fanout_results(
                 "run_id": value.get("run_id").cloned().unwrap_or(Value::Null),
                 "result": value,
             });
+            // Preserve this bounded identity when a large aggregate later
+            // replaces the nested result with a text preview.
+            if let Some(model) = item["result"].get("prepared_model").cloned() {
+                item["prepared_model"] = model;
+            }
             if needs_recovery {
                 let object = item.as_object_mut().expect("slot result item object");
                 object.insert(
@@ -3396,6 +3402,16 @@ async fn enrich_collected_agent_result(
     if let Some(state) = ctx.spawner.get_agent_state_any(agent_id).await {
         object.insert("run_id".into(), json!(state.run_id));
         object.insert("tool_calls".into(), json!(state.metrics.tool_calls));
+        if let Some(model) = state.prepared_model {
+            object.insert(
+                "prepared_model".into(),
+                json!({
+                    "offering_id": model.offering_id,
+                    "model_name": model.model_name,
+                    "provenance": model.provenance,
+                }),
+            );
+        }
         let duration_ms = state
             .ended_at
             .unwrap_or_else(std::time::SystemTime::now)
@@ -4019,6 +4035,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for LargeInterruptedSpawnExecutor {
+        async fn prepare_batch(
+            self: Arc<Self>,
+            inputs: &[SpawnAgentInput],
+            _context: &SpawnContext,
+            _parent_selection: Option<&astra_turn_types::ModelSelection>,
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+            Ok(inputs
+                .iter()
+                .map(|_| {
+                    Box::new(LargeInterruptedPrepared(Arc::clone(&self)))
+                        as Box<dyn crate::orchestration::PreparedSpawn>
+                })
+                .collect())
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -4037,6 +4068,26 @@ mod tests {
                 permission_requests_approved: 0,
                 tools_blocked: 0,
             })
+        }
+    }
+
+    struct LargeInterruptedPrepared(Arc<LargeInterruptedSpawnExecutor>);
+
+    #[async_trait::async_trait]
+    impl crate::orchestration::PreparedSpawn for LargeInterruptedPrepared {
+        fn model_identity(&self) -> Option<crate::orchestration::PreparedSpawnModelIdentity> {
+            Some(crate::orchestration::PreparedSpawnModelIdentity {
+                offering_id: "offer-parent-test".into(),
+                model_name: "MiniMax-M2.7".into(),
+                provenance: "test_prepared",
+            })
+        }
+
+        async fn execute(
+            self: Box<Self>,
+            config: SpawnRunConfig,
+        ) -> Result<SpawnRunResult, String> {
+            self.0.execute(config).await
         }
     }
 
@@ -5038,9 +5089,11 @@ mod tests {
                     },
                     DelegationModelSlotConstraint {
                         slot_index: 1,
-                        model_selection: None,
+                        model_selection: Some(ModelSelection {
+                            offering_id: "required-other".into(),
+                        }),
                         requested_model_policy: None,
-                        model_strength: None,
+                        model_strength: Some(astra_turn_types::DelegationRequirementStrength::Hard),
                         reasoning: None,
                         reasoning_strength: None,
                         task_scope_quote: None,
@@ -5056,8 +5109,9 @@ mod tests {
                 "target_count": 2,
                 "slots": [
                     {"id": "review", "description": "Review", "prompt": "Review the diff",
-                     "requested_model_policy": {"mode":"fixed","selector":{"kind":"offering_id","offering_id":"wrong"}}},
-                    {"id": "survey", "description": "Survey", "prompt": "Survey the code"}
+                     "requested_model_policy": {"mode":"fixed","selector":{"kind":"offering_id","offering_id":"required-other"}}},
+                    {"id": "survey", "description": "Survey", "prompt": "Survey the code",
+                     "requested_model_policy": {"mode":"fixed","selector":{"kind":"offering_id","offering_id":"required"}}}
                 ]
             }),
             Some(&ctx),
@@ -5067,6 +5121,77 @@ mod tests {
         assert_eq!(executor.spawn_count(), 0);
         assert!(spawner.list_all_agents().await.is_empty());
         assert!(spawner.list_fanout_groups().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fanout_uses_trusted_user_model_when_tool_names_it_inexactly() {
+        use astra_turn_types::{
+            DelegationModelAdmission, DelegationModelAdmissionOutcome,
+            DelegationModelInstructionSource, DelegationModelSlotConstraint,
+            DelegationRequirementStrength, ModelSelection, ModelSelector, RequestedModelPolicy,
+        };
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner, Some("parent-model"));
+        ctx.delegation_model_admission = Some(DelegationModelAdmission {
+            source: DelegationModelInstructionSource {
+                user_id: "user".into(),
+                session_id: "session".into(),
+                run_id: ctx.run_id.clone(),
+                turn_chain_id: "chain".into(),
+                owner_generation: 1,
+                control_epoch: 2,
+                applied_intent_id: None,
+                session_turn: 1,
+                user_intent_digest: "sha256:intent".into(),
+            },
+            invocation_id: "fanout-call".into(),
+            arguments_digest: "sha256:args".into(),
+            child_requirements: vec![Default::default()],
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![DelegationModelSlotConstraint {
+                    slot_index: 0,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-glm".into(),
+                    }),
+                    requested_model_policy: Some(RequestedModelPolicy::Fixed {
+                        selector: ModelSelector::OfferingId {
+                            offering_id: "offer-glm".into(),
+                        },
+                    }),
+                    model_strength: Some(DelegationRequirementStrength::Hard),
+                    reasoning: None,
+                    reasoning_strength: None,
+                    task_scope_quote: None,
+                }],
+            },
+        });
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "_tool_call_id": "fanout-call",
+                "target_count": 1,
+                "slots": [{
+                    "description": "Review",
+                    "prompt": "Review the code",
+                    "requested_model_policy": {
+                        "mode": "fixed",
+                        "selector": {"kind": "configured_name", "model_name": "GLM 5.2"}
+                    }
+                }]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let result = collect_fanout_start(&result, &ctx).await;
+        assert_eq!(result["status"], "completed", "{result}");
+        assert_eq!(executor.spawn_count(), 1);
+        assert_eq!(
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offer-glm".into())
+        );
     }
 
     #[tokio::test]
@@ -7812,6 +7937,32 @@ mod tests {
                 .as_array()
                 .is_some_and(|results| results.iter().all(|item| item["result"].is_string())),
             "the regression must cross the aggregate presentation boundary: {collected_value}"
+        );
+        assert!(
+            collected_value["results"]
+                .as_array()
+                .is_some_and(|results| {
+                    results
+                        .iter()
+                        .all(|item| item["prepared_model"]["offering_id"] == "offer-parent-test")
+                }),
+            "aggregate truncation must retain typed model identity: {collected_value}"
+        );
+        let window = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": collected_value["group_id"],
+                "slot_index": 0,
+                "offset": 0,
+                "max_bytes": FANOUT_RESULT_DEFAULT_MAX_BYTES,
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let window: Value = serde_json::from_str(&window).unwrap();
+        assert_eq!(
+            window["results"][0]["prepared_model"]["model_name"],
+            "MiniMax-M2.7"
         );
         assert!(
             collected_value["instruction"].as_str().is_some_and(

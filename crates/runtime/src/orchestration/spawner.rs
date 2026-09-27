@@ -524,6 +524,35 @@ fn restored_agent_result_from_journal(
     })
 }
 
+fn restored_prepared_model_from_journal(
+    events: &[astra_services::session_journal::JournalEvent],
+    run_id: &str,
+) -> Option<PreparedSpawnModelIdentity> {
+    let spawn = events.iter().rev().find(|event| {
+        event.event_type == astra_services::session_journal::JournalEventType::AgentSpawned
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("run_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(run_id)
+    })?;
+    let selection = spawn
+        .metadata
+        .as_ref()?
+        .pointer("/model_configuration/prepared_selection")?;
+    let offering_id = selection.get("offering_id")?.as_str()?.trim();
+    let model_name = selection.get("model_name")?.as_str()?.trim();
+    if offering_id.is_empty() || model_name.is_empty() {
+        return None;
+    }
+    Some(PreparedSpawnModelIdentity {
+        offering_id: offering_id.to_string(),
+        model_name: model_name.to_string(),
+        provenance: "local_journal",
+    })
+}
+
 fn restored_agent_status(
     projection: &astra_services::session_workspace::BackgroundLocalAgentTaskProjection,
     exact_result: Option<String>,
@@ -1266,6 +1295,7 @@ fn durable_pre_durable_child_terminals(
                     run_in_background: true,
                     fanout_slot: Some(slot),
                     execution_metadata: None,
+                    prepared_model: None,
                 })
             })
         })
@@ -1692,6 +1722,28 @@ pub(crate) fn apply_delegation_model_admission(
             {
                 return Err(invalid("tool model conflicts with hard user requirement"));
             }
+            // A configured name in a tool proposal is not the authenticated
+            // user's model authority. The fused assessment has already bound
+            // this hard requirement to one authorized Offering; materialize
+            // that exact identity before batch preparation, which otherwise
+            // re-resolves the proposal as a literal name and can reject a
+            // valid natural-language request (for example "GLM 5.2"). The
+            // original proposal remains in the tool invocation evidence.
+            if matches!(
+                (&slot.requested_model_policy, &input.requested_model_policy),
+                (
+                    Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                        selector: astra_turn_types::ModelSelector::OfferingId { .. }
+                    }),
+                    Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                        selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
+                    })
+                )
+            ) && hard
+            {
+                input.requested_model_policy = slot.requested_model_policy.clone();
+                input.resolved_model_selection = Some(required.clone());
+            }
         }
         if input.requested_model_policy.is_none() {
             input.requested_model_policy = slot.requested_model_policy.clone().or_else(|| {
@@ -1816,6 +1868,8 @@ pub struct SpawnedAgentState {
     pub run_in_background: bool,
     pub fanout_slot: Option<AgentFanoutSlotIdentity>,
     pub execution_metadata: Option<serde_json::Value>,
+    /// Admitted child model, when known. Preparation is not provider acceptance.
+    pub prepared_model: Option<PreparedSpawnModelIdentity>,
 }
 
 // SpawnedAgentInfo is re-exported from orchestration_types above.
@@ -4012,6 +4066,10 @@ impl DynamicAgentSpawner {
                 run_in_background: true,
                 fanout_slot: fanout_slot.clone(),
                 execution_metadata: None,
+                prepared_model: restored_prepared_model_from_journal(
+                    &journal_events,
+                    &projection.run_id,
+                ),
             };
             if let Some(existing) = self.get_agent_state_any(&state.agent_id).await {
                 if existing.run_id == state.run_id && existing.parent_run_id == state.parent_run_id
@@ -4099,6 +4157,15 @@ impl DynamicAgentSpawner {
                 run_in_background: true,
                 fanout_slot: spawn.and_then(|spawn| spawn.fanout_slot.clone()),
                 execution_metadata: None,
+                prepared_model: run
+                    .model_offering_id
+                    .as_ref()
+                    .zip(run.resolved_model_name.as_ref())
+                    .map(|(offering_id, model_name)| PreparedSpawnModelIdentity {
+                        offering_id: offering_id.clone(),
+                        model_name: model_name.clone(),
+                        provenance: "durable_run",
+                    }),
             };
             if let Some(existing) = self.get_agent_state_any(&state.agent_id).await {
                 if existing.run_id == state.run_id && existing.parent_run_id == state.parent_run_id
@@ -4217,6 +4284,7 @@ impl DynamicAgentSpawner {
                 run_in_background: true,
                 fanout_slot: None,
                 execution_metadata: None,
+                prepared_model: None,
             };
             self.restore_direct_child_completion(&state);
             self.durable_observed_agent_ids
@@ -6688,6 +6756,7 @@ impl DynamicAgentSpawner {
             run_in_background: input.run_in_background,
             fanout_slot: fanout_slot.clone(),
             execution_metadata: context.execution_metadata.clone(),
+            prepared_model: prepared_identity.clone(),
         };
         #[cfg(test)]
         let reservation_hook = self
@@ -14943,8 +15012,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let agent_id = match result {
-            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+        let (agent_id, run_id) = match result {
+            SpawnAgentOutput::Launched {
+                agent_id, run_id, ..
+            } => (agent_id, run_id),
             other => panic!("expected launched child, got {other:?}"),
         };
         let status = spawner
@@ -14973,6 +15044,34 @@ mod tests {
                 .get("provider_accepted")
                 .is_none()
         );
+        let restored = DynamicAgentSpawner::new(mock_router())
+            .with_session("prepared-model-snapshot".to_string());
+        let projection = astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+            id: agent_id.clone(),
+            run_id,
+            parent_run_id: "root".into(),
+            status: "failed".into(),
+            title: "review".into(),
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            output_tail: None,
+            terminal_reason: Some("provider failed".into()),
+            fanout: None,
+        };
+        assert_eq!(
+            restored
+                .restore_workspace_agent_projections(&[projection])
+                .await,
+            1
+        );
+        let model = restored
+            .get_agent_state_any(&agent_id)
+            .await
+            .and_then(|state| state.prepared_model)
+            .expect("model identity survives local journal recovery");
+        assert_eq!(model.offering_id, "offer-reviewed");
+        assert_eq!(model.model_name, "same-display-name");
+        assert_eq!(model.provenance, "local_journal");
     }
 
     #[tokio::test]
@@ -17091,6 +17190,41 @@ mod tests {
             Some("call"),
         )
         .unwrap();
+        assert_eq!(
+            selector_for_admitted_spawn_input(&same_offering, None).unwrap(),
+            Some(ModelSelector::OfferingId {
+                offering_id: "offering-b".into(),
+            })
+        );
+
+        // The user-selected Offering, not the model-authored spelling, is
+        // the executable selector. This must work before any provider or DB
+        // preparation attempts to resolve the proposed name literally.
+        let mut natural_name = make_sync_input();
+        natural_name.requested_model_policy = Some(RequestedModelPolicy::Fixed {
+            selector: ModelSelector::ConfiguredName {
+                model_name: "GLM 5.2".into(),
+                source: None,
+            },
+        });
+        apply_delegation_model_admission(&mut natural_name, &admission, "parent-run", Some("call"))
+            .unwrap();
+        assert_eq!(
+            natural_name.requested_model_policy,
+            Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: "offering-b".into(),
+                },
+            })
+        );
+        assert_eq!(
+            natural_name.resolved_model_selection,
+            Some(ModelSelection {
+                offering_id: "offering-b".into(),
+            })
+        );
+        apply_delegation_model_admission(&mut natural_name, &admission, "parent-run", Some("call"))
+            .expect("preparation and spawn both revalidate the same canonical selection");
 
         let mut different_offering = same_offering;
         different_offering.resolved_model_selection = Some(ModelSelection {
@@ -17195,6 +17329,7 @@ mod tests {
             run_in_background: true,
             fanout_slot: None,
             execution_metadata: None,
+            prepared_model: None,
         }
     }
 
@@ -22478,6 +22613,14 @@ mod tests {
                 .unwrap();
             let results = parent.take_completed_direct_children();
             assert_eq!(results.len(), 1);
+            assert!(
+                spawner
+                    .get_agent_state_any(&results[0].agent_id)
+                    .await
+                    .unwrap()
+                    .prepared_model
+                    .is_none()
+            );
             match &results[0].status {
                 AgentStatus::Interrupted {
                     partial_result,

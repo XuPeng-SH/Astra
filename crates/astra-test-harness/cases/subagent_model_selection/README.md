@@ -27,9 +27,11 @@ the account has duplicate names, qualify the source in the case for that
 deployment. The invalid final-slot case must show zero `agent_spawned` events,
 not just a failed terminal answer.
 
-`flash_spawn_natural_language_glm` is the separate intent-binding check: the
-user states a hard `glm-5.2` requirement in ordinary language, while the parent
-tool call leaves `requested_model_policy` unset (omitted or explicit `null`).
+`flash_spawn_natural_language_glm` is a scripted intent-binding check: it
+explicitly asks the parent to leave `requested_model_policy` unset (omitted or
+`null`) while stating a hard `glm-5.2` requirement. It is not a natural user
+journey; `flash_semantic_model_reference_glm` and
+`flash_natural_parallel_models_high` cover that boundary.
 The child must still be admitted and make its provider request using GLM. This
 distinguishes server-side extraction of authenticated user intent from merely
 echoing a model selector supplied by the parent model. The server's offline
@@ -73,6 +75,16 @@ configuration, so it catches model or reasoning cross-wiring. It is
 deliberately a protocol smoke test; it does not claim that the reviewer
 consumed the first child's result or that either model produced a high-quality
 plan/review.
+
+`flash_natural_parallel_models_high` is the user-facing counterpart. Its
+Chinese prompt asks for two parallel helpers, names GLM 5.2 and
+deepseek-v4-flash, and asks the latter to think with high effort. It does not
+mention Astra tools, selectors, slots, IDs, or schemas. The agent may choose
+how to delegate; the oracle checks both child model rounds, the high-effort
+prepared configuration, child termination, and mentions of both models in the
+parent's answer. It does not yet verify that the answer accurately attributes
+each child finding. A passing run is an end-to-end sample, not a reliability claim; run
+several independent trials before quoting a success rate.
 
 `flash_fanout_auto_balanced` is a negative control, not evidence that the
 router works: it asks for Auto Balanced and verifies that the current product
