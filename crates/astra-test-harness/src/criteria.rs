@@ -291,6 +291,9 @@ pub enum Criterion {
         document: JournalToolDocument,
         path: String,
         equals: serde_json::Value,
+        /// Optional predicate on the same durable call as `path`.
+        #[serde(default)]
+        where_match: Option<JournalJsonPredicate>,
         /// When `equals` is JSON null, also accept a missing pointer. This
         /// models optional API fields whose omitted and explicit-null forms
         /// both mean "unset" without weakening exact JSON assertions by
@@ -2442,6 +2445,7 @@ fn evaluate_one_with_primary_cache(
             document,
             path,
             equals,
+            where_match,
             allow_missing,
         } => {
             let Some(session) = session else {
@@ -2450,6 +2454,13 @@ fn evaluate_one_with_primary_cache(
             let calls = session.journal_tool_calls();
             let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
                 let value = journal_tool_document(call, *document);
+                if let Some(predicate) = where_match
+                    && journal_tool_document(call, predicate.document)
+                        .and_then(|value| value.pointer(&predicate.path))
+                        != Some(&predicate.equals)
+                {
+                    return false;
+                }
                 let actual = value.and_then(|value| value.pointer(path));
                 actual == Some(equals)
                     || (*allow_missing
@@ -4463,12 +4474,16 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             path,
             document: _,
             equals,
+            where_match,
             allow_missing,
         } => {
             if name.trim().is_empty() {
                 return Err("JournalToolJson.name must not be empty".into());
             }
             validate_json_pointer("JournalToolJson.path", path)?;
+            if let Some(predicate) = where_match {
+                validate_json_pointer("JournalToolJson.where_match.path", &predicate.path)?;
+            }
             if *allow_missing && !equals.is_null() {
                 return Err("JournalToolJson.allow_missing requires equals: null".into());
             }
@@ -6400,6 +6415,7 @@ mod tests {
                 document: JournalToolDocument::Arguments,
                 path: "/target_count".into(),
                 equals: serde_json::json!(3),
+                where_match: None,
                 allow_missing: false,
             },
             Criterion::JournalToolJson {
@@ -6407,6 +6423,7 @@ mod tests {
                 document: JournalToolDocument::Result,
                 path: "/provenance/all_slots_delivered".into(),
                 equals: serde_json::json!(true),
+                where_match: None,
                 allow_missing: false,
             },
             Criterion::JournalToolJson {
@@ -6414,6 +6431,7 @@ mod tests {
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("provider_schema_validation"),
+                where_match: None,
                 allow_missing: false,
             },
         ];
@@ -6432,6 +6450,7 @@ mod tests {
                 document: JournalToolDocument::Result,
                 path: "/fanout/terminal".into(),
                 equals: serde_json::json!(2),
+                where_match: None,
                 allow_missing: false,
             }],
             &outcome_with_tools(&[]),
@@ -6445,6 +6464,7 @@ mod tests {
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("handler_error"),
+                where_match: None,
                 allow_missing: false,
             }],
             &outcome_with_tools(&[]),
@@ -6477,6 +6497,11 @@ mod tests {
             document: JournalToolDocument::Arguments,
             path: "/requested_model_policy".into(),
             equals: serde_json::Value::Null,
+            where_match: Some(JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/action".into(),
+                equals: serde_json::json!("spawn"),
+            }),
             allow_missing: true,
         };
         let outcome = outcome_with_tools(&[]);
@@ -6503,11 +6528,63 @@ mod tests {
         );
         assert!(!result[0].passed, "a non-null selection must not match");
 
+        let selected_then_retrieved = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool_call_id":"spawn-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#,
+                     "result_full":"{}"},
+                    {"tool_call_id":"get-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"get_result","agent_id":"child"}"#,
+                     "result_full":"{}"}
+                ]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected_then_retrieved),
+        );
+        assert!(
+            !result[0].passed,
+            "get_result must not supply the spawn's absent selector"
+        );
+
+        let null_filter: Criterion = serde_json::from_value(serde_json::json!({
+            "type":"journal_tool_json", "name":"agent", "document":"arguments",
+            "path":"/requested_model_policy", "equals":null,
+            "allow_missing":true,
+            "where_match":{"document":"arguments","path":"/action","equals":null}
+        }))
+        .unwrap();
+        assert!(matches!(
+            &null_filter,
+            Criterion::JournalToolJson { where_match: Some(predicate), .. }
+                if predicate.equals.is_null()
+        ));
+        let explicit_null = session_with_args(r#"{"action":null,"requested_model_policy":null}"#);
+        assert!(
+            evaluate_deterministic_with_session(
+                &[null_filter.clone()],
+                &outcome,
+                Some(&explicit_null)
+            )[0]
+            .passed
+        );
+        let missing_action = session_with_args(r#"{"requested_model_policy":null}"#);
+        assert!(
+            !evaluate_deterministic_with_session(&[null_filter], &outcome, Some(&missing_action))
+                [0]
+            .passed
+        );
+
         let strict = Criterion::JournalToolJson {
             name: "agent".into(),
             document: JournalToolDocument::Arguments,
             path: "/requested_model_policy".into(),
             equals: serde_json::Value::Null,
+            where_match: None,
             allow_missing: false,
         };
         let missing = session_with_args(r#"{"action":"spawn"}"#);

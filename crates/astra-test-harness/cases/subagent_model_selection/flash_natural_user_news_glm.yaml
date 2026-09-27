@@ -33,3 +33,7 @@ criteria:
     min_distinct_child_runs: 1
   - type: text_contains
     needle: sina.com.cn
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

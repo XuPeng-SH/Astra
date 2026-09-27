@@ -885,6 +885,9 @@ criteria:
                 "flash_fanout_invalid_final_slot",
                 "flash_fanout_model_default",
                 "flash_fanout_plan_and_high_review",
+                "flash_missing_child_model_fail_closed",
+                "flash_natural_user_news_glm",
+                "flash_semantic_model_reference_glm",
                 "flash_spawn_configured_name_glm",
                 "flash_spawn_natural_language_glm",
                 "flash_spawn_prohibited_model_fail_closed"
@@ -911,10 +914,12 @@ criteria:
                 min: 1,
                 max: 1,
                 ok: None,
-                document: None,
-                path: None,
-                equals: None,
+                document: Some(crate::criteria::JournalToolDocument::Arguments),
+                path: Some(path),
+                equals: Some(equals),
             } if name == "agent"
+                && path == "/action"
+                && equals == "spawn"
         )));
         assert!(natural_language.criteria.iter().any(|criterion| matches!(
             criterion,
@@ -923,10 +928,17 @@ criteria:
                 document: crate::criteria::JournalToolDocument::Arguments,
                 path,
                 equals,
+                where_match: Some(crate::criteria::JournalJsonPredicate {
+                    document: crate::criteria::JournalToolDocument::Arguments,
+                    path: where_path,
+                    equals: where_equals,
+                }),
                 allow_missing: true,
             } if name == "agent"
                 && path == "/requested_model_policy"
                 && equals.is_null()
+                && where_path == "/action"
+                && where_equals == "spawn"
         )));
     }
 

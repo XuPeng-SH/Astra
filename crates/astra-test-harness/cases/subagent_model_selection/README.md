@@ -35,6 +35,11 @@ distinguishes server-side extraction of authenticated user intent from merely
 echoing a model selector supplied by the parent model. The server's offline
 regression tests additionally verify that one user-intent source is assessed
 once and a failed assessment is not automatically retried for the same intent.
+The spawn receipt exposes `prepared_model` so the parent can identify the
+runtime-selected model without another lookup. That field is pre-execution
+evidence, not proof of a provider call; the child `LlmRoundCompleted` event
+linked by run ID remains the execution check. A subsequent `agent.get_result`
+is normal retrieval and must not count as a second spawn.
 
 `flash_natural_user_news_glm` checks the unscripted user journey: the prompt is
 only the original Chinese request, including the ordinary spelling `glm5.2`.

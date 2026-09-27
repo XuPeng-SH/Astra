@@ -166,6 +166,7 @@ impl WorkspaceMutationAuthority {
 fn render_spawn_agent_output(
     output: SpawnAgentOutput,
     transcript_location: AgentTranscriptLocation,
+    prepared_model: Option<&super::spawner::PreparedSpawnModelIdentity>,
 ) -> String {
     let mut value = match serde_json::to_value(&output) {
         Ok(value) => value,
@@ -178,6 +179,16 @@ fn render_spawn_agent_output(
         "transcript_location".to_string(),
         Value::String(transcript_location.wire_value().to_string()),
     );
+    if let Some(model) = prepared_model {
+        object.insert(
+            "prepared_model".to_string(),
+            serde_json::json!({
+                "offering_id": model.offering_id,
+                "model_name": model.model_name,
+                "provenance": model.provenance,
+            }),
+        );
+    }
     let status = object
         .get("status")
         .and_then(Value::as_str)
@@ -3016,12 +3027,15 @@ async fn handle_agent_spawn_input_with_controls(
             }
         };
     }
-    let prepared_selection = preparation
+    let prepared_model = preparation
         .as_ref()
-        .and_then(|prepared| prepared.model_identity())
-        .map(|identity| astra_turn_types::ModelSelection {
-            offering_id: identity.offering_id,
-        });
+        .and_then(|prepared| prepared.model_identity());
+    let prepared_selection =
+        prepared_model
+            .as_ref()
+            .map(|identity| astra_turn_types::ModelSelection {
+                offering_id: identity.offering_id.clone(),
+            });
     if input
         .resolved_model_selection
         .as_ref()
@@ -3096,7 +3110,9 @@ async fn handle_agent_spawn_input_with_controls(
     });
     let spawn = AbortOnDropJoinHandle::new(tokio::spawn(spawn_future));
     match spawn.await {
-        Ok(Ok(output)) => render_spawn_agent_output(output, ctx.transcript_location),
+        Ok(Ok(output)) => {
+            render_spawn_agent_output(output, ctx.transcript_location, prepared_model.as_ref())
+        }
         Ok(Err(SpawnError::ExecutorUnavailable)) => {
             render_agent_runtime_binding_error("agent", "spawn")
         }
@@ -3563,8 +3579,14 @@ mod tests {
         let rendered = render_spawn_agent_output(
             SpawnAgentOutput::launched("reviewer-1", "run-1", "review runtime"),
             AgentTranscriptLocation::DurableServer,
+            Some(&crate::orchestration::PreparedSpawnModelIdentity {
+                offering_id: "offer-1".into(),
+                model_name: "glm-5.2".into(),
+                provenance: "prepared",
+            }),
         );
         let parsed: Value = serde_json::from_str(&rendered).expect("spawn output is JSON");
+        assert_eq!(parsed["prepared_model"]["model_name"], "glm-5.2");
         let observation: WorkUnitObservation =
             serde_json::from_value(parsed[WORK_UNIT_OBSERVATION_FIELD].clone())
                 .expect("spawn output carries a typed work observation");

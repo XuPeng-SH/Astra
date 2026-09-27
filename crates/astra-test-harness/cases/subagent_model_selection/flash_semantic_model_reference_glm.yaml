@@ -28,3 +28,7 @@ criteria:
         run_id_path: /metadata/run_id
   - type: text_contains
     needle: ASTRA-SEMANTIC-MODEL-OK
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

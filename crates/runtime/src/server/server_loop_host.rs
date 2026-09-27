@@ -7499,9 +7499,7 @@ impl ServerAgenticLoopHost {
             }
             Ok(_) => {
                 return (
-                    unresolved(
-                        "The model requirement response did not finish with stop; clarify the task and model.",
-                    ),
+                    unavailable("Model requirement assessment did not complete."),
                     None,
                 );
             }
@@ -7516,10 +7514,12 @@ impl ServerAgenticLoopHost {
             ) {
                 Ok(extracted) => extracted,
                 Err(error) => {
-                    let reason = format!(
-                        "The model requirement response failed bounded validation ({error}); clarify the task and model."
+                    return (
+                        unavailable(&format!(
+                            "Model requirement assessment failed bounded validation ({error})."
+                        )),
+                        None,
                     );
-                    return (unresolved(&reason), None);
                 }
             };
         *summary = Some(extracted.summary.clone());
@@ -15499,6 +15499,7 @@ impl ServerAgenticLoopHost {
                         | "execution_time_budget_exhausted"
                         | "invalid_delegation_model_scope"
                         | "delegation_model_scope_unresolved"
+                        | "delegation_model_assessment_unavailable"
                         | "delegation_model_unavailable"
                 );
                 let result = json!({
@@ -19346,10 +19347,18 @@ impl ServerAgenticLoopHost {
             {
                 Ok(admissions) => (admissions, Vec::new()),
                 Err(reason) => {
+                    let error_kind = if matches!(
+                        assessed,
+                        astra_turn_types::DelegationIntentRequirements::Unavailable { .. }
+                    ) {
+                        "delegation_model_assessment_unavailable"
+                    } else {
+                        "delegation_model_scope_unresolved"
+                    };
                     self.recover_existing_or_block_new_delegation_calls(
                         state,
                         &pending,
-                        "delegation_model_scope_unresolved",
+                        error_kind,
                         &reason,
                         decision_detail,
                     )
@@ -41581,6 +41590,14 @@ mod tests {
             .await;
         assert!(admissions.is_empty());
         assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
+            "delegation_model_assessment_unavailable"
+        );
+        assert_eq!(
+            blocked[0].tool_result_fields.as_ref().unwrap()["retryable"],
+            false
+        );
         assert!(requests.lock().unwrap().is_empty());
         assert!(matches!(
             state

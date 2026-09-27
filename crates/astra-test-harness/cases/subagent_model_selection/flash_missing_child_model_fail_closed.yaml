@@ -18,3 +18,7 @@ criteria:
     event_type: agent_terminated
     min: 0
     max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0
