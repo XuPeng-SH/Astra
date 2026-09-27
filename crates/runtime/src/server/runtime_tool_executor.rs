@@ -11372,6 +11372,29 @@ esac
     }
 
     #[tokio::test]
+    async fn server_tool_search_multi_selection_remains_complete_and_activatable() {
+        let (exec, _dir) = test_executor_with_agent_context();
+        exec.set_current_searchable_tool_schemas(&[json!({
+            "type":"function", "function":{"name":"tool_search"}
+        })]);
+        exec.set_current_activatable_tool_names(HashSet::from([
+            "agent".to_string(),
+            "agent_fanout".to_string(),
+        ]));
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query":"select:agent,agent_fanout"}))
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(
+            astra_tools::model_result_presentation(result.metadata.as_ref()),
+            astra_tools::ModelResultPresentation::SourceBounded
+        );
+        let activations = astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(&result.output);
+        assert_eq!(activations.len(), 2);
+        assert!(result.output.len() <= astra_tools::tool_search::MAX_SELECTION_RESULT_BYTES);
+    }
+
+    #[tokio::test]
     async fn server_tool_search_uses_production_surface_not_tool_engine_inventory() {
         let (exec, _dir) = test_executor_with_agent_context();
         let exec = exec

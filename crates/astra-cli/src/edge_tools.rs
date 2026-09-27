@@ -4930,7 +4930,12 @@ impl ToolExecutor {
                 // Uses the local CLI catalog plus plugin-installed schemas,
                 // so `select:NAME` matches the tools this surface actually
                 // exposes while still resolving MCP/skill-backed tools.
-                "tool_search" => self.tool_search(args),
+                "tool_search" => {
+                    let result = self.tool_search(args);
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
+                }
                 "read_file" => {
                     let result = self.read_file_with_metadata(args);
                     *source_is_error = Some(result.is_error);
@@ -9069,6 +9074,16 @@ mod tests {
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
         assert_eq!(tool_search_match_names(&parsed), vec!["memory".to_string()]);
         assert!(parsed["matches"][0].get("parameters").is_some());
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "tool_search",
+            &serde_json::json!({"query":"select:memory"}),
+        )
+        .await;
+        assert_eq!(
+            astra_tools::model_result_presentation(result.metadata.as_ref()),
+            astra_tools::ModelResultPresentation::SourceBounded
+        );
     }
 
     #[tokio::test]

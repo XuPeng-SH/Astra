@@ -3303,6 +3303,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorded_tool_selection_reaches_model_and_activation_history_intact() {
+        let selected = astra_tools::tool_search::tool_search_result(
+            &astra_tools::schemas::all_tool_schemas(),
+            &json!({"query":"select:agent,agent_fanout"}),
+        );
+        assert!(!selected.is_error);
+        assert!(
+            selected.output.len() > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+        );
+        for (metadata, expected_names) in [
+            (selected.metadata.clone(), vec!["agent", "agent_fanout"]),
+            (None, vec![]),
+        ] {
+            let mut harness = PipelineHarness::new();
+            harness.messages.push(json!({
+                "role":"assistant",
+                "tool_calls":[{"id":"call-search","function":{
+                    "name":"tool_search","arguments":"{\"query\":\"select:agent,agent_fanout\"}"
+                }}]
+            }));
+            let mut pipeline = harness.pipeline();
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: "call-search".into(),
+                        name: "tool_search".into(),
+                        args: json!({"query":"select:agent,agent_fanout"}),
+                        result_str: selected.output.clone(),
+                        tool_result_fields: metadata,
+                        authoritative_is_error: Some(false),
+                        pending_runtime_completion: None,
+                        confirmed_invocation: None,
+                        edge_duration_ms: 0,
+                        is_edge_tool: false,
+                        edge_result_missing: false,
+                        edge_terminal_authority: false,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: None,
+                    pre_tool_context: None,
+                    is_err: false,
+                    error_kind: None,
+                    executed_ms: 1,
+                })
+                .await;
+            drop(pipeline);
+            let names = astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_messages(&harness.messages)
+                .into_iter()
+                .map(|activation| activation.name)
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected_names);
+            let body = harness.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap();
+            if expected_names.is_empty() {
+                assert!(body.contains("could not be delivered intact"));
+            } else {
+                assert_eq!(body, selected.output);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn edge_nonexecution_and_real_failure_keep_distinct_dispositions_and_steps() {
         use astra_pipeline::step_protocol::StepEventType;
         use astra_services::session_journal::ToolCallDisposition;

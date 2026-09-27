@@ -17290,6 +17290,9 @@ impl ServerAgenticLoopHost {
         // Execution ownership is server-derived after exact ledger delivery;
         // never preserve a client-authored assertion of that authority.
         fields.remove(crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD);
+        // Model-result presentation can bypass generic truncation. An Edge
+        // callback cannot grant that server-owned presentation authority.
+        fields.remove(astra_tools::MODEL_RESULT_PRESENTATION_FIELD);
         if !fields.contains_key("runtime_environment_advertisement") {
             let registry = astra_runtime_env::ToolRegistry::builtins();
             let request = ToolExecutionRequest {
@@ -48392,13 +48395,20 @@ mod tests {
             "call-spoofed",
             "skill",
             &json!({"skill_name": "project-review"}),
-            Some(Map::from_iter([(
-                crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.to_string(),
-                Value::String(
-                    crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE
+            Some(Map::from_iter([
+                (
+                    crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD
                         .to_string(),
+                    Value::String(
+                        crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE
+                            .to_string(),
+                    ),
                 ),
-            )])),
+                (
+                    astra_tools::MODEL_RESULT_PRESENTATION_FIELD.to_string(),
+                    json!({"schema_version":1,"kind":"source_bounded"}),
+                ),
+            ])),
         );
 
         assert!(
@@ -48407,6 +48417,7 @@ mod tests {
             ),
             "only post-ledger server selection may stamp pipeline ownership"
         );
+        assert!(!fields.contains_key(astra_tools::MODEL_RESULT_PRESENTATION_FIELD));
     }
 
     #[test]

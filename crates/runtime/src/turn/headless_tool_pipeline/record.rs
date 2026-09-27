@@ -38,6 +38,36 @@ use astra_turn_core::tool_result_sanitize::{
 pub(crate) const CANONICAL_WORK_TASK_BOARD_UPDATE_FIELD: &str =
     "_astra_canonical_work_task_board_update";
 
+/// Tool discovery is an authority-bearing round trip: a sanitized, hooked,
+/// or oversized selection is not the contract the producer issued. Fail the
+/// tool call instead of letting a partial model message authorize a carrier.
+fn tool_search_presentation_is_intact(
+    produced: &str,
+    presented: &str,
+    is_error: bool,
+    post_tool_modified: bool,
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    let budget = if astra_tools::model_result_presentation(metadata)
+        == astra_tools::ModelResultPresentation::SourceBounded
+    {
+        astra_tools::tool_search::MAX_SELECTION_RESULT_BYTES
+    } else {
+        astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+    };
+    if produced != presented || post_tool_modified || presented.len() > budget {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(presented) else {
+        return false;
+    };
+    if is_error {
+        value["mode"] == "error" && value["status"] == "failed"
+    } else {
+        value["mode"] == "select" && value["status"] == "completed"
+    }
+}
+
 fn projected_writer_applied_bound(
     execution: &HeadlessResolvedExecution,
     record: &ToolCallRecord,
@@ -561,6 +591,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             error_kind: source_error_kind,
             executed_ms,
         } = executed;
+        let tool_search_produced =
+            (execution.name == "tool_search").then(|| execution.result_str.clone());
         // The executor may briefly hold a raw result, but no downstream
         // ledger, hook, event, journal, step recorder, or model message may.
         // Redact before any persistence or presentation so a failed edit or
@@ -609,6 +641,22 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         execution.result_str =
             astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&execution.result_str)
                 .content;
+        let mut selection_presentation_rejected = false;
+        if let Some(produced) = tool_search_produced.as_deref()
+            && !tool_search_presentation_is_intact(
+                produced,
+                &execution.result_str,
+                is_err,
+                post_tool_modified,
+                execution.tool_result_fields.as_ref(),
+            )
+        {
+            let failure = astra_tools::tool_search::selection_presentation_failure();
+            execution.result_str = failure.output;
+            execution.tool_result_fields = failure.metadata;
+            is_err = true;
+            selection_presentation_rejected = true;
+        }
         let exit_semantics = execution
             .tool_result_fields
             .as_ref()
@@ -663,11 +711,38 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(metadata)
                 .metadata
         });
+        if !selection_presentation_rejected
+            && let Some(produced) = tool_search_produced.as_deref()
+            && !tool_search_presentation_is_intact(
+                produced,
+                &execution.result_str,
+                is_err,
+                post_tool_modified,
+                execution.tool_result_fields.as_ref(),
+            )
+        {
+            let failure = astra_tools::tool_search::selection_presentation_failure();
+            execution.result_str = failure.output;
+            execution.tool_result_fields = failure.metadata;
+            is_err = true;
+            selection_presentation_rejected = true;
+        }
         let mut error_kind =
             execution_error_kind(execution.tool_result_fields.as_ref()).or(source_error_kind);
+        if selection_presentation_rejected {
+            error_kind = Some(astra_core::ErrorKind::ContractViolation);
+        }
 
-        let journal_result_source =
+        let mut journal_result_source =
             tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
+        if execution.name == "tool_search" && journal_result_source != execution.result_str {
+            let failure = astra_tools::tool_search::selection_presentation_failure();
+            execution.result_str = failure.output.clone();
+            execution.tool_result_fields = failure.metadata;
+            journal_result_source = failure.output;
+            is_err = true;
+            error_kind = Some(astra_core::ErrorKind::ContractViolation);
+        }
         let journal_result_inline =
             truncate_tool_result_for_model(&execution.name, &journal_result_source);
         let full_guidance = runtime_advisories.join("\n");
@@ -1108,6 +1183,44 @@ mod tests {
     use super::*;
     use astra_services::session_journal::JournalDirGuard;
     use astra_services::session_journal::ToolCallDisposition;
+
+    #[test]
+    fn tool_search_presentation_requires_the_complete_producer_result() {
+        let result = astra_tools::tool_search::tool_search_result(
+            &astra_tools::schemas::all_tool_schemas(),
+            &serde_json::json!({"query":"select:agent,agent_fanout"}),
+        );
+        assert!(!result.is_error);
+        assert!(result.output.len() > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS);
+        assert!(tool_search_presentation_is_intact(
+            &result.output,
+            &result.output,
+            false,
+            false,
+            result.metadata.as_ref(),
+        ));
+        assert!(!tool_search_presentation_is_intact(
+            &result.output,
+            &result.output.replace("agent_fanout", "other_tool"),
+            false,
+            false,
+            result.metadata.as_ref(),
+        ));
+        assert!(!tool_search_presentation_is_intact(
+            &result.output,
+            &result.output,
+            false,
+            true,
+            result.metadata.as_ref(),
+        ));
+        assert!(!tool_search_presentation_is_intact(
+            &result.output,
+            &result.output,
+            false,
+            false,
+            None,
+        ));
+    }
     use serde_json::json;
 
     #[test]
