@@ -29,6 +29,17 @@ A delegation should record:
 
 Fanout creates multiple child runs or work branches. Fanin merges results through a declared aggregation step.
 
+Ordinary `agent.spawn` creates one independent child. A parent may propose several
+spawns in one model response when the admitted execution topology permits
+parallel children; each call retains its own identity, admission result, and
+terminal state. A failed sibling does not roll back an already accepted child.
+Use `agent_fanout.start` when the parent needs a fixed group with all-slot
+preflight and group-level control. Preflight prevents launching a group with
+an invalid slot, but provider or child execution can still fail after launch.
+Neither carrier may override an authoritative primary-only Work topology.
+Provider-authored parallel calls do not cancel a user-requested durable Work
+graph or its deferred activation; a conflicting proposal is rejected.
+
 Required fields:
 
 ```text
@@ -54,6 +65,15 @@ remain distinct. Only one eligible Offering may be selected; ambiguous or
 unavailable names stop the child before execution. Explicit structured model
 selectors keep their exact-match contract. This lookup reuses the admission
 catalog snapshot and does not trigger a second catalog read.
+
+The auxiliary interpretation of one user turn covers all proposed children in
+one bounded judgment. Its compact output identifies exact user evidence,
+eligible candidate IDs, optional task scopes, and reasoning controls; the
+runtime verifies those facts and binds them to the original user text and
+catalog snapshot. An invalid or uncertain judgment cannot silently choose a
+nearby model, relax a hard requirement, or authorize Auto. A tool's proposed
+selector is matching context, never user authority. This interpretation does
+not add a separate catalog query or database write.
 
 Dynamic spawn and fanout resolve reasoning separately from the Offering.
 After per-slot and shared defaults, an omitted reasoning control inherits the

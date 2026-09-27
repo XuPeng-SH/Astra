@@ -616,24 +616,41 @@ fn primary_work_defer_call(provider_tool_calls: &[Value]) -> Option<&Value> {
     })
 }
 
-/// Return whether the provider selected the explicit parallel fanout carrier.
+/// Return whether the provider proposed explicit parallel child execution.
 /// A mixed batch containing `start_work` is deliberately excluded: the
 /// canonical Work declaration remains the stronger lifecycle boundary there.
-fn primary_explicit_fanout_start(provider_tool_calls: &[Value]) -> bool {
+fn primary_explicit_parallel_children(provider_tool_calls: &[Value]) -> bool {
     let has_start_work = provider_tool_calls
         .iter()
         .any(|call| astra_turn_core::tool::args::shape::tool_call_name(call) == Some("start_work"));
-    !has_start_work
-        && provider_tool_calls.iter().any(|call| {
-            if astra_turn_core::tool::args::shape::tool_call_name(call) != Some("agent_fanout") {
-                return false;
+    if has_start_work {
+        return false;
+    }
+    let mut direct_spawns = 0;
+    for call in provider_tool_calls {
+        let name = astra_turn_core::tool::args::shape::tool_call_name(call);
+        if !matches!(name, Some("agent" | "agent_fanout")) {
+            continue;
+        }
+        let Ok(arguments) = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+        else {
+            continue;
+        };
+        let action = arguments.get("action").and_then(Value::as_str);
+        if name == Some("agent_fanout") && action == Some("start") {
+            let count = arguments.get("target_count").and_then(Value::as_u64);
+            let slots = arguments.get("slots").and_then(Value::as_array);
+            if count.is_some_and(|count| {
+                count >= 2 && slots.is_some_and(|slots| slots.len() as u64 == count)
+            }) {
+                return true;
             }
-            let Ok(arguments) = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
-            else {
-                return false;
-            };
-            arguments.get("action").and_then(Value::as_str) == Some("start")
-        })
+        }
+        if name == Some("agent") && action == Some("spawn") {
+            direct_spawns += 1;
+        }
+    }
+    direct_spawns > 1
 }
 
 /// A one-slot fanout is a valid explicit delegation carrier even though it
@@ -649,52 +666,6 @@ fn single_child_fanout_start(arguments: &Value) -> bool {
             .get("slots")
             .and_then(Value::as_array)
             .is_some_and(|slots| slots.len() == 1)
-}
-
-/// A valid root `agent_fanout.start` is itself the typed parallel execution
-/// carrier.  The optional Work classifier runs before the primary response
-/// and can conservatively call the same request durable Work; that prediction
-/// must not manufacture a second graph around an already explicit fanout.
-/// Convert the classifier's semantic projection to the non-durable parallel
-/// form while retaining its effect/domain fields.  This is a typed transition
-/// at the provider boundary, not a user-text or tool-description heuristic.
-fn explicit_fanout_admission_decision(
-    decision: astra_services::WorkAdmissionDecision,
-) -> astra_services::WorkAdmissionDecision {
-    let assessment = decision.assessment();
-    let (domain, workspace_mutation, mutation_completion_scope, mut required_capabilities) =
-        match decision {
-            astra_services::WorkAdmissionDecision::NotRequired {
-                domain,
-                workspace_mutation,
-                mutation_completion_scope,
-                required_capabilities,
-                ..
-            }
-            | astra_services::WorkAdmissionDecision::Required {
-                domain,
-                workspace_mutation,
-                mutation_completion_scope,
-                required_capabilities,
-                ..
-            } => (
-                domain,
-                workspace_mutation,
-                mutation_completion_scope,
-                required_capabilities,
-            ),
-        };
-    if !required_capabilities.contains(&astra_services::WorkAdmissionCapability::AgentSpawner) {
-        required_capabilities.push(astra_services::WorkAdmissionCapability::AgentSpawner);
-    }
-    astra_services::WorkAdmissionDecision::NotRequired {
-        assessment,
-        domain,
-        workspace_mutation,
-        mutation_completion_scope,
-        execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
-        required_capabilities,
-    }
 }
 
 /// Optional classification may inform Work/topology without installing a
@@ -3141,7 +3112,7 @@ impl SummaryClientWorkAdmissionJudge {
             let repair_instruction = if semantic_conflict {
                 "The previous object chose an unsupported combination: durable Work plus parallel sub-runs. Re-evaluate the user-facing acceptance boundary. Intermediate agents, reviewers, perspectives, findings, and fanout slots that feed one synthesized final answer are not independently accepted outcomes. Return work_lifecycle=not_required with execution_topology=parallel_subruns, required_capabilities=[agent_spawner] unless the user explicitly requested durable task lifecycle control. Only retain required+parallel when both facts are explicit. Return one complete JSON object matching the original schema, with no prose."
             } else {
-                "The previous object was malformed, truncated, or inconsistent with the schema. Re-evaluate the acceptance boundary from the original user request; the previous lifecycle and graph are not authoritative until they form one valid contract. Return one compact, complete JSON object matching the original schema. Every not_required object must include execution_topology; return classification fields only, not output descriptions. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. Only an explicit required lifecycle decision creates the Work graph. A cohesive change, its checks, and its report remain one ordinary turn. Multiple outputs without an explicit durable lifecycle request remain ordinary; parallel units remain fanout outputs. Do not use string matching or infer lifecycle from tool counts. An explicit same-turn multi-agent request without tracked lifecycle is not durable Work. Required Work omits execution_topology because the runtime owns its primary topology. Preserve every requested lifecycle mutation after the initial graph. Mutation objects use kind=add|cancel|replace (not action or type): add requires task; cancel requires target_initial_task; replace requires both. `target_initial_task` is a 1-based integer ordinal into initial_tasks, never task text; choose an initial target only when the user delegates that choice. Never invent an externally bound target or omit a requested mutation. Mutation after_initial_tasks gates graph changes; nested task.after_initial_tasks gates execution. Preserve the requested payload and source in additions. Cancel+add remain two mutations and must not become replace. For read_only or may_mutate, mutation_completion_scope is unknown; for external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Do not declare counts or final state; runtime derives them. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning. No prose."
+                "The previous object was malformed, truncated, or inconsistent with the schema. Re-evaluate the acceptance boundary from the original user request; the previous lifecycle and graph are not authoritative until they form one valid contract. Return one compact, complete JSON object matching the original schema. Every not_required object must include execution_topology; return classification fields only, not output descriptions. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. Only an explicit required lifecycle decision creates the Work graph. A cohesive change, its checks, and its report remain one ordinary turn. Multiple outputs without an explicit durable lifecycle request remain ordinary; parallel children remain non-durable subrun outputs. Do not use string matching or infer lifecycle from tool counts. An explicit same-turn multi-agent request without tracked lifecycle is not durable Work. Required Work omits execution_topology because the runtime owns its primary topology. Preserve every requested lifecycle mutation after the initial graph. Mutation objects use kind=add|cancel|replace (not action or type): add requires task; cancel requires target_initial_task; replace requires both. `target_initial_task` is a 1-based integer ordinal into initial_tasks, never task text; choose an initial target only when the user delegates that choice. Never invent an externally bound target or omit a requested mutation. Mutation after_initial_tasks gates graph changes; nested task.after_initial_tasks gates execution. Preserve the requested payload and source in additions. Cancel+add remain two mutations and must not become replace. For read_only or may_mutate, mutation_completion_scope is unknown; for external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Do not declare counts or final state; runtime derives them. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning. No prose."
             };
             let repair_instruction = if classification.is_some() {
                 "Repair only the graph and JSON shape. The classification in the system message is authoritative: preserve lifecycle=required, activation, domain, mutation intent, completion scope, and capabilities exactly. Never reclassify or downgrade. Return the complete Required graph schema with all requested tasks, dependencies, and mutations, no prose."
@@ -7061,30 +7032,6 @@ fn append_tool_calls_unique_by_id(target: &mut Vec<Value>, candidates: Vec<Value
         if seen.insert(id.to_string()) {
             target.push(call);
         }
-    }
-}
-
-fn direct_parallel_agent_rejection(
-    topology_authoritative: bool,
-    execution_topology: astra_services::WorkExecutionTopology,
-) -> (&'static str, &'static str) {
-    if topology_authoritative
-        && execution_topology == astra_services::WorkExecutionTopology::ParallelSubruns
-    {
-        (
-            "parallel_topology_requires_fanout",
-            "The admitted execution topology requires one fixed child group. Use agent_fanout.start; independent agent.spawn calls cannot partially create that group.",
-        )
-    } else if topology_authoritative {
-        (
-            "parallel_topology_not_admitted",
-            "The authoritative execution topology for this turn is primary. Continue in the current agent; multiple direct child calls cannot change that decision.",
-        )
-    } else {
-        (
-            "parallel_topology_admission_unavailable",
-            "Concurrent direct child calls are not an authorized parallel carrier. Continue in the current agent or propose one fixed agent_fanout.start group when the runtime surface offers it; runtime admission still applies.",
-        )
     }
 }
 
@@ -11024,13 +10971,9 @@ impl ServerAgenticLoopHost {
     /// Reconcile the admission judge's execution mode with an explicit typed
     /// activation emitted by the primary model.
     ///
-    /// The sidecar judge remains authoritative for durable Work unless the
-    /// primary response carries a standalone, validly-shaped fanout carrier.
-    /// That carrier is already the explicit parallel topology transition, so
-    /// wrapping it in a synthetic Work graph would make the primary attempt
-    /// reject its own fanout. A conflicting `defer` is still fail-closed for
-    /// an explicit Work carrier: dispatching an outcome the user kept pending
-    /// is a larger product failure than requiring a later continuation. No
+    /// Durable Work and its activation remain authoritative. For a non-Work
+    /// turn, explicit parallel child calls may refine primary to parallel
+    /// topology without changing the user's lifecycle decision. No
     /// provider tool side effect has run yet because this reconciliation
     /// happens before the canonical synthetic call is admitted.
     fn reconcile_work_activation_from_primary(
@@ -11067,13 +11010,9 @@ impl ServerAgenticLoopHost {
         if self.pending_work_decision().is_none() {
             return;
         }
-        // A provider-visible fanout start is the typed execution carrier for a
-        // standalone parallel group. It must not be surrounded by a durable
-        // Work graph solely because the optional classifier conservatively
-        // predicted Required before seeing the provider's typed choice. A
-        // currently owned Work attempt remains stronger: nested fanout still
-        // requires the topology admitted for that attempt.
-        if primary_explicit_fanout_start(provider_tool_calls) {
+        // Parallel tool proposals refine only a non-Work primary decision.
+        // They never revoke required/deferred or already-owned Work.
+        if primary_explicit_parallel_children(provider_tool_calls) {
             let active_work_attempt = self.work_item_attempt_bound
                 || state.runtime_tool_executor.as_deref().is_some_and(
                     crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
@@ -11084,15 +11023,47 @@ impl ServerAgenticLoopHost {
                     tracing::info!(
                         target: "astra::work",
                         ?topology,
-                        "retaining Work topology for nested provider fanout"
+                        "retaining Work topology for nested provider children"
                     );
                 }
                 return;
             }
+            if crate::turn::agentic::turn_intent::trusted_loaded_workflow_execution_topology(
+                &state.skills.execution.invoked,
+            ) == Some(astra_services::WorkExecutionTopology::Primary)
+            {
+                return;
+            }
+            if self
+                .pending_work_admission
+                .as_ref()
+                .is_some_and(|admission| {
+                    matches!(
+                        &admission.decision,
+                        astra_services::WorkAdmissionDecision::Required { .. }
+                    )
+                })
+            {
+                // Tool calls cannot revoke a user-owned durable Work obligation.
+                // In particular, a deferred graph must not begin execution.
+                return;
+            }
             if let Some(mut assessment) = self.pending_work_admission.take() {
-                assessment.decision = project_complete_admission_effect(
-                    explicit_fanout_admission_decision(assessment.decision),
-                );
+                if let astra_services::WorkAdmissionDecision::NotRequired {
+                    execution_topology,
+                    required_capabilities,
+                    ..
+                } = &mut assessment.decision
+                {
+                    *execution_topology = astra_services::WorkExecutionTopology::ParallelSubruns;
+                    if !required_capabilities
+                        .contains(&astra_services::WorkAdmissionCapability::AgentSpawner)
+                    {
+                        required_capabilities
+                            .push(astra_services::WorkAdmissionCapability::AgentSpawner);
+                    }
+                }
+                assessment.decision = project_complete_admission_effect(assessment.decision);
                 let decision = assessment.decision.clone();
                 self.apply_classified_work_admission(assessment);
                 if let Some(intent) = state.turn_intent.as_mut() {
@@ -11119,13 +11090,13 @@ impl ServerAgenticLoopHost {
                 tracing::info!(
                     target: "astra::work",
                     topology = ?decision.execution_topology(),
-                    "explicit provider fanout selected the parallel topology"
+                    "explicit provider children selected the parallel topology"
                 );
                 return;
             }
             tracing::debug!(
                 target: "astra::work",
-                "provider fanout remains a primary typed proposal subject to runtime admission"
+                "provider children remain a primary typed proposal subject to runtime admission"
             );
             return;
         }
@@ -11251,16 +11222,12 @@ impl ServerAgenticLoopHost {
                                 arguments
                                     .get("action")
                                     .and_then(Value::as_str)
-                                    .map(|action| matches!(action, "spawn" | "run_chain"))
+                                    .map(|action| action == "spawn")
                             })
                             .unwrap_or(false)
                 })
                 .count();
             let parallel_fanout_admitted = self.fanout_start_proposal_available(state);
-            let direct_parallel_rejection = direct_parallel_agent_rejection(
-                self.work_admission_topology_authoritative,
-                self.work_admission_execution_topology,
-            );
             // Settlement advances the runtime-owned active attempt. A provider
             // batch is concurrent from the state machine's perspective, so a
             // sibling capability must never execute across that transition.
@@ -11333,23 +11300,19 @@ impl ServerAgenticLoopHost {
                     continue;
                 }
                 if name == Some("agent")
-                    && arguments
-                        .get("action")
-                        .and_then(Value::as_str)
-                        .is_some_and(|action| matches!(action, "spawn" | "run_chain"))
+                    && arguments.get("action").and_then(Value::as_str) == Some("spawn")
                     && direct_agent_batch_count > 1
+                    && !parallel_fanout_admitted
                 {
-                    let (error_kind, error) = direct_parallel_rejection;
-                    let retryable = error_kind == "parallel_topology_requires_fanout";
                     admission
                         .rejected
                         .push(crate::turn::agentic_loop::host::RejectedToolCall {
                             invocation: call,
                             result: json!({
                                 "status": "rejected",
-                                "error_kind": error_kind,
-                                "retryable": retryable,
-                                "error": error,
+                                "error_kind": "parallel_topology_not_admitted",
+                                "retryable": false,
+                                "error": "This Work attempt does not admit parallel children; continue the assigned primary attempt.",
                             })
                             .to_string(),
                         });
@@ -11401,13 +11364,7 @@ impl ServerAgenticLoopHost {
             return admission;
         }
         let work_is_required = self.work_lifecycle_is_required(state);
-        let parallel_topology_admitted = self.work_admission_topology_authoritative
-            && self.work_admission_execution_topology
-                == astra_services::WorkExecutionTopology::ParallelSubruns;
-        let direct_parallel_rejection = direct_parallel_agent_rejection(
-            self.work_admission_topology_authoritative,
-            self.work_admission_execution_topology,
-        );
+        let parallel_spawns_allowed = self.fanout_start_proposal_available(state);
         // A model may return start_work and a task-executing tool in one
         // parallel tool-call batch. The latter cannot be allowed to race the
         // graph establishment merely because admission observed the binding
@@ -11446,12 +11403,10 @@ impl ServerAgenticLoopHost {
         let coordinator_has_work = coordinator_has_active_work
             || work_is_established_in_batch
             || work_established_this_turn;
-        // A provider batch is executed concurrently by definition. Multiple
-        // direct agent lifecycle calls in one batch therefore express the
-        // same topology as `agent_fanout`, even when the optional semantic
-        // admission sidecar was skipped for a bound Work continuation. Keep
-        // this invariant structural: it is derived from typed call shapes,
-        // never from prompt text or an inferred keyword.
+        // Multiple ordinary spawns are independent child lifecycles. They may
+        // finish or fail separately; fanout adds group preflight and control,
+        // but execution can still partially fail. Topology gates parallel
+        // execution, not the carrier.
         let direct_agent_batch_count = admission
             .admitted
             .iter()
@@ -11468,7 +11423,7 @@ impl ServerAgenticLoopHost {
                         arguments
                             .get("action")
                             .and_then(Value::as_str)
-                            .map(|action| matches!(action, "spawn" | "run_chain"))
+                            .map(|action| action == "spawn")
                     })
                     .unwrap_or(false)
             })
@@ -11616,12 +11571,14 @@ impl ServerAgenticLoopHost {
                     "run_next_work_item is a coordinator transition. Do not execute another capability in the same provider batch; wait for its typed result.",
                 )),
                 "agent"
-                    if matches!(action, Some("spawn" | "run_chain"))
-                        && (parallel_topology_admitted
-                            || direct_parallel_batch
-                            || fanout_start_in_batch) =>
+                    if action == Some("spawn")
+                        && direct_parallel_batch
+                        && !parallel_spawns_allowed =>
                 {
-                    Some(direct_parallel_rejection)
+                    Some((
+                        "parallel_topology_not_admitted",
+                        "This turn does not admit parallel children; continue the primary task or use the authorized Work path.",
+                    ))
                 }
                 "agent"
                     if matches!(action, Some("spawn" | "run_chain"))
@@ -11710,17 +11667,13 @@ impl ServerAgenticLoopHost {
                         | "work_already_bound"
                         | "canonical_work_post_completion_execution_not_allowed"
                         | "parallel_topology_not_admitted"
-                        | "parallel_topology_admission_unavailable"
                 );
-                let mut rejection_result = json!({
+                let rejection_result = json!({
                     "status": "rejected",
                     "error_kind": error_kind,
                     "retryable": retryable,
                     "error": error,
                 });
-                if error_kind == "parallel_topology_admission_unavailable" {
-                    rejection_result["admission_diagnostic"] = self.work_admission_diagnostic();
-                }
                 admission
                     .rejected
                     .push(crate::turn::agentic_loop::host::RejectedToolCall {
@@ -31948,18 +31901,18 @@ mod tests {
                 "arguments": r#"{"action":"spawn","description":"one child","prompt":"Review one concern"}"#
             }
         });
-        let fanout_call = json!({
-            "id": "typed-fanout",
+        let second_agent_call = json!({
+            "id": "direct-agent-b",
             "type": "function",
             "function": {
-                "name": "agent_fanout",
-                "arguments": r#"{"action":"start","target_count":2,"slots":[{"description":"A","prompt":"Review A"},{"description":"B","prompt":"Review B"}]}"#
+                "name": "agent",
+                "arguments": r#"{"action":"spawn","description":"second child","prompt":"Review another concern"}"#
             }
         });
-        let direct_parallel_calls = [direct_agent_call, fanout_call];
+        let direct_parallel_calls = [direct_agent_call, second_agent_call];
 
-        // A serial admission permits one child. An authoritative parallel
-        // admission must still use the complete fanout execution carrier.
+        // A primary topology permits one child; a parallel topology permits
+        // independent children with their original call identities.
         direct_parallel_bound.work_admission_execution_topology =
             astra_services::WorkExecutionTopology::Primary;
         let single_child_admission = AgenticLoopHost::admit_tool_calls(
@@ -31994,36 +31947,25 @@ mod tests {
             &direct_parallel_calls,
             Some("tool_calls"),
         );
-        assert_eq!(
-            direct_parallel_terminal.len(),
-            1,
-            "terminal projection must remove the single-agent substitution"
-        );
+        assert_eq!(direct_parallel_terminal.len(), 2);
         let direct_parallel_admission = AgenticLoopHost::admit_tool_calls(
             &mut direct_parallel_bound,
             &direct_parallel_calls,
             Some("tool_calls"),
         );
-        assert_eq!(direct_parallel_admission.admitted.len(), 1);
+        assert_eq!(direct_parallel_admission.admitted.len(), 2);
         assert_eq!(
             direct_parallel_admission.admitted[0].logical_target_call()["function"]["name"],
-            "agent_fanout"
+            "agent"
         );
-        let rejected = direct_parallel_admission
-            .rejected
-            .first()
-            .expect("single-agent substitution must be rejected");
         assert_eq!(
-            serde_json::from_str::<Value>(&rejected.result)
-                .expect("typed fanout topology rejection")["error_kind"],
-            "parallel_topology_requires_fanout"
+            direct_parallel_admission.admitted[1].logical_target_call()["id"],
+            "direct-agent-b"
         );
+        assert!(direct_parallel_admission.rejected.is_empty());
 
-        // The same structural boundary must hold when a bound continuation
-        // skipped the optional semantic admission judge. A provider batch
-        // containing two direct child lifecycles is already concurrent; it
-        // must be redirected to the atomic fanout carrier rather than
-        // starting an untracked sibling pair.
+        // A bound session with no active Work attempt and no usable optional
+        // topology judgment keeps the ordinary independent-spawn path.
         let mut bound_without_pending_topology = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -32064,20 +32006,8 @@ mod tests {
             &direct_agent_batch,
             Some("tool_calls"),
         );
-        assert!(
-            direct_agent_admission.admitted.is_empty(),
-            "a concurrent direct-agent batch must not bypass the fanout carrier"
-        );
-        assert_eq!(direct_agent_admission.rejected.len(), 2);
-        for rejection in direct_agent_admission.rejected {
-            let result = serde_json::from_str::<Value>(&rejection.result)
-                .expect("typed batch topology rejection");
-            assert_eq!(
-                result["error_kind"],
-                "parallel_topology_admission_unavailable"
-            );
-            assert_eq!(result["retryable"], false);
-        }
+        assert_eq!(direct_agent_admission.admitted.len(), 2);
+        assert!(direct_agent_admission.rejected.is_empty());
         assert!(
             active_primary_deferred.contains("web_fetch"),
             "an active primary Work attempt keeps an admitted browser capability in the deferred catalog"
@@ -32457,7 +32387,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_fixed_subruns_reject_partial_single_agent_execution() {
+    fn admitted_parallel_subruns_allow_independent_single_agent_execution() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -32477,7 +32407,7 @@ mod tests {
             "type": "function",
             "function": {
                 "name": "agent",
-                "arguments": r#"{"action":"spawn","prompt":"inspect one half"}"#
+                "arguments": r#"{"action":"spawn","description":"inspect one half","prompt":"inspect one half"}"#
             }
         });
 
@@ -32490,13 +32420,8 @@ mod tests {
             },
         );
 
-        assert!(admission.admitted.is_empty());
-        assert_eq!(admission.rejected.len(), 1);
-        assert!(
-            admission.rejected[0]
-                .result
-                .contains("parallel_topology_requires_fanout")
-        );
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(admission.rejected.is_empty());
     }
 
     #[test]
@@ -33650,7 +33575,7 @@ mod tests {
             .expect("final server agent schema");
         assert_eq!(
             agent.pointer("/function/parameters/properties/action/enum"),
-            Some(&json!(["spawn", "get_result", "send_message"]))
+            Some(&json!(["spawn", "list", "get_result", "send_message"]))
         );
         assert!(
             agent
@@ -40277,7 +40202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_primary_fanout_overrides_speculative_required_admission() {
+    async fn explicit_primary_fanout_cannot_override_required_admission() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -40331,17 +40256,16 @@ mod tests {
                 .is_some_and(|decision| {
                     matches!(
                         &decision.decision,
-                        astra_services::WorkAdmissionDecision::NotRequired {
-                            execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
-                            required_capabilities,
+                        astra_services::WorkAdmissionDecision::Required {
+                            execution_topology: astra_services::WorkExecutionTopology::Primary,
                             ..
-                        } if required_capabilities.contains(&astra_services::WorkAdmissionCapability::AgentSpawner)
+                        }
                     )
                 })
         );
         assert_eq!(
             host.work_admission_execution_topology,
-            astra_services::WorkExecutionTopology::ParallelSubruns
+            astra_services::WorkExecutionTopology::Primary
         );
     }
 
@@ -41530,34 +41454,29 @@ mod tests {
             "disposition": "resolved",
             "requirements": [{
                 "candidate_id": "offer-selected",
-                "evidence": {
-                    "model_quote": "PrivateModel", "source_qualifier_quote": null,
-                    "reasoning_quote": null, "reasoning": null,
-                    "task_scope_quote": "review", "propagation": "direct_children",
-                    "strength": "hard"
-                },
-                "slot_indices": [0]
-            }],
-            "unresolved": []
+                "model_quote": "PrivateModel",
+                "scope_quote": "review",
+                "slots": [0]
+            }]
         });
         for (response, outcome, error_kind) in [
             (resolved, "resolved", Value::Null),
             (
-                json!({"disposition":"not_applicable","requirements":[],"unresolved":[]}),
+                json!({"disposition":"not_applicable"}),
                 "resolved",
                 Value::Null,
             ),
             (
-                json!({"disposition":"unresolved","requirements":[],"unresolved":[
+                json!({"disposition":"unresolved","reason":
                     "Ambiguous PrivateModel: private provider payload sk-test-do-not-record"
-                ]}),
+                }),
                 "blocked",
                 json!("delegation_model_scope_unresolved"),
             ),
             (
-                json!({"disposition":"unresolved","requirements":[],"unresolved":[
+                json!({"disposition":"unresolved","reason":
                     "Unavailable PrivateModel at https://private.invalid sk-test-do-not-record"
-                ]}),
+                }),
                 "blocked",
                 json!("delegation_model_scope_unresolved"),
             ),
@@ -41843,12 +41762,8 @@ mod tests {
         let reads = Arc::new(std::sync::Mutex::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let response = json!({"disposition":"resolved","requirements":[{
-            "candidate_id":"offer-a", "evidence":{
-                "model_quote":"Model-A", "source_qualifier_quote":null,
-                "reasoning_quote":null, "reasoning":null, "automatic_strategy":null,
-                "task_scope_quote":null, "propagation":"direct_children", "strength":"hard"
-            }, "slot_indices":null
-        }],"unresolved":[]})
+            "candidate_id":"offer-a", "model_quote":"Model-A"
+        }]})
         .to_string();
         let client = |response: String| {
             Box::new(SequencedSummaryClient {
@@ -41906,17 +41821,11 @@ mod tests {
         let reads = Arc::new(std::sync::Mutex::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let response = json!({"disposition":"resolved","requirements":[
-            {"candidate_id":null,"evidence":{
-                "model_quote":"auto balanced","source_qualifier_quote":null,
-                "reasoning_quote":null,"reasoning":null,"automatic_strategy":"balanced",
-                "task_scope_quote":"group X","propagation":"direct_children","strength":"hard"
-            },"slot_indices":[0]},
-            {"candidate_id":"offer-a","evidence":{
-                "model_quote":"Model-A","source_qualifier_quote":null,
-                "reasoning_quote":null,"reasoning":null,"automatic_strategy":null,
-                "task_scope_quote":"group Y","propagation":"direct_children","strength":"hard"
-            },"slot_indices":[1]}
-        ],"unresolved":[]})
+            {"model_quote":"auto balanced","automatic_strategy":"balanced",
+             "scope_quote":"group X","slots":[0]},
+            {"candidate_id":"offer-a","model_quote":"Model-A",
+             "scope_quote":"group Y","slots":[1]}
+        ]})
         .to_string();
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -41975,12 +41884,9 @@ mod tests {
         let reads = Arc::new(std::sync::Mutex::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let first = json!({"disposition":"resolved","requirements":[{
-            "candidate_id":"offer-a","evidence":{
-                "model_quote":"Model-A","source_qualifier_quote":null,
-                "reasoning_quote":null,"reasoning":null,"automatic_strategy":null,
-                "task_scope_quote":"review","propagation":"direct_children","strength":"hard"
-            },"slot_indices":[0,2]
-        }],"unresolved":[]})
+            "candidate_id":"offer-a","model_quote":"Model-A",
+            "scope_quote":"review","slots":[0,2]
+        }]})
         .to_string();
         let later = json!({"assignments":[{"requirement_id":"0","slot_indices":[0]}],
             "unresolved":[]})
@@ -43346,10 +43252,16 @@ mod tests {
         let fanout = json!({
             "function": {
                 "name": "agent_fanout",
-                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[]}"
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
             }
         });
-        assert!(primary_explicit_fanout_start(std::slice::from_ref(&fanout)));
+        assert!(primary_explicit_parallel_children(std::slice::from_ref(
+            &fanout
+        )));
+        assert!(!primary_explicit_parallel_children(&[json!({
+            "function": {"name": "agent_fanout", "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[]}"
+            }
+        })]));
         assert!(single_child_fanout_start(&json!({
             "action": "start",
             "target_count": 1,
@@ -43360,13 +43272,36 @@ mod tests {
             "target_count": 2,
             "slots": [{"description": "child", "prompt": "inspect"}]
         })));
-        assert!(!primary_explicit_fanout_start(&[
+        assert!(!primary_explicit_parallel_children(&[
             fanout,
             json!({"function": {"name": "start_work", "arguments": "{}"}}),
         ]));
-        assert!(!primary_explicit_fanout_start(&[json!({
+        assert!(!primary_explicit_parallel_children(&[json!({
             "content": "please fan out"
         })]));
+        let spawn = |id: &str| {
+            json!({
+                "id": id,
+                "function": {
+                    "name": "agent",
+                    "arguments": format!(r#"{{"action":"spawn","description":"{id}","prompt":"inspect"}}"#)
+                }
+            })
+        };
+        assert!(!primary_explicit_parallel_children(&[spawn("a")]));
+        assert!(!primary_explicit_parallel_children(&[
+            spawn("a"),
+            json!({"function": {"name": "agent", "arguments": "{"}}),
+        ]));
+        assert!(primary_explicit_parallel_children(&[
+            spawn("a"),
+            spawn("b")
+        ]));
+        assert!(!primary_explicit_parallel_children(&[
+            spawn("a"),
+            spawn("b"),
+            json!({"function": {"name": "start_work", "arguments": "{}"}}),
+        ]));
     }
 
     #[test]
@@ -43703,7 +43638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_fanout_replaces_speculative_required_work_projection() {
+    async fn explicit_parallel_calls_cannot_revoke_required_work() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -43759,17 +43694,26 @@ mod tests {
                 "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
             }
         })]);
+        host.reconcile_work_activation_from_primary(
+            &mut state,
+            &["a", "b"].map(|id| json!({
+                "function": {
+                    "name": "agent",
+                    "arguments": format!(r#"{{"action":"spawn","description":"{id}","prompt":"review {id}"}}"#)
+                }
+            })),
+        );
 
         assert_eq!(
             host.work_admission_execution_topology,
-            astra_services::WorkExecutionTopology::ParallelSubruns
+            astra_services::WorkExecutionTopology::Primary
         );
         assert_eq!(
             host.pending_work_admission
                 .as_ref()
                 .and_then(|admission| admission.delegation_model_requirement),
             Some(astra_services::WorkAdmissionTruth::Yes),
-            "fanout topology reconciliation must preserve the user's model requirement"
+            "parallel tool calls must preserve the user's model requirement"
         );
         assert!(
             host.pending_work_admission
@@ -43777,17 +43721,12 @@ mod tests {
                 .is_some_and(|decision| {
                     matches!(
                         &decision.decision,
-                        astra_services::WorkAdmissionDecision::NotRequired {
-                            execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
-                            required_capabilities,
+                        astra_services::WorkAdmissionDecision::Required {
+                            execution_topology: astra_services::WorkExecutionTopology::Primary,
                             ..
-                        } if required_capabilities.contains(&astra_services::WorkAdmissionCapability::AgentSpawner)
+                        }
                     )
                 })
-        );
-        assert!(
-            host.take_admitted_work_establishment_call(&state).is_none(),
-            "an explicit fanout carrier must not synthesize a durable Work graph"
         );
         host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
             .await;
@@ -43802,12 +43741,12 @@ mod tests {
         );
         assert_eq!(
             terminal["auxiliary_details"]["admission"]["decision"]["classification"]["work_required"],
-            false,
-            "terminal Explain must report the reconciled fanout decision"
+            true,
+            "terminal Explain must retain required Work despite tool proposals"
         );
         assert_eq!(
             terminal["auxiliary_details"]["admission"]["decision"]["classification"]["parallel_subruns"],
-            true
+            false
         );
     }
 
@@ -43881,6 +43820,163 @@ mod tests {
     }
 
     #[test]
+    fn independent_spawns_select_parallel_from_non_work_primary() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-direct-precedence".into(),
+            "s-direct-precedence".into(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
+            domain: None,
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: vec![],
+        });
+        let calls = ["a", "b"].map(|id| json!({
+            "id": id,
+            "function": {
+                "name": "agent",
+                "arguments": format!(r#"{{"action":"spawn","description":"{id}","prompt":"review {id}"}}"#)
+            }
+        }));
+        let mut state = create_test_state();
+        host.reconcile_work_activation_from_primary(&mut state, &calls);
+
+        assert_eq!(
+            host.work_admission_execution_topology,
+            astra_services::WorkExecutionTopology::ParallelSubruns
+        );
+        assert!(host.take_admitted_work_establishment_call(&state).is_none());
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: ordinary_admitted(calls),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(admission.admitted.len(), 2);
+        assert!(admission.rejected.is_empty());
+    }
+
+    #[test]
+    fn deferred_work_cannot_be_started_by_parallel_tool_proposal() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-deferred-children".into(),
+            "s-deferred-children".into(),
+        )
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
+            domain: None,
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            goal: "Track this work after approval".into(),
+            tasks: vec![astra_services::WorkAdmissionTask {
+                after_initial_tasks: vec![],
+                objective: "Review".into(),
+                expected_result: "Findings".into(),
+            }],
+            deferred_graph_mutations: vec![],
+            activation: astra_services::WorkAdmissionActivation::Defer,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: vec![],
+        });
+        let mut state = create_test_state();
+        let calls = ["a", "b"].map(|id| json!({
+            "function": {
+                "name": "agent",
+                "arguments": format!(r#"{{"action":"spawn","description":"{id}","prompt":"review {id}"}}"#)
+            }
+        }));
+        host.reconcile_work_activation_from_primary(&mut state, &calls);
+        assert!(matches!(
+            host.pending_work_admission
+                .as_ref()
+                .map(|admission| &admission.decision),
+            Some(astra_services::WorkAdmissionDecision::Required {
+                activation: astra_services::WorkAdmissionActivation::Defer,
+                execution_topology: astra_services::WorkExecutionTopology::Primary,
+                ..
+            })
+        ));
+        assert!(!host.fanout_start_proposal_available(&state));
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: ordinary_admitted(calls),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 2);
+    }
+
+    #[test]
+    fn trusted_primary_workflow_rejects_parallel_spawn_proposal() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-primary-workflow".into(),
+            "s-primary-workflow".into(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
+            domain: None,
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: vec![],
+        });
+        let mut state = create_test_state();
+        state.skills.execution.invoked.insert(
+            "serial-review".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "serial-review".into(),
+                content: "Review in the primary agent".into(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+                execution_topology: Some(astra_services::WorkExecutionTopology::Primary),
+            },
+        );
+        let calls = ["a", "b"].map(|id| json!({
+            "function": {
+                "name": "agent",
+                "arguments": format!(r#"{{"action":"spawn","description":"{id}","prompt":"review {id}"}}"#)
+            }
+        }));
+        host.reconcile_work_activation_from_primary(&mut state, &calls);
+        assert_eq!(
+            host.work_admission_execution_topology,
+            astra_services::WorkExecutionTopology::Primary
+        );
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: ordinary_admitted(calls),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 2);
+    }
+
+    #[test]
     fn nested_provider_fanout_keeps_active_work_topology() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -43916,6 +44012,15 @@ mod tests {
                     "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
                 }
             })],
+        );
+        host.reconcile_work_activation_from_primary(
+            &mut state,
+            &["a", "b"].map(|id| json!({
+                "function": {
+                    "name": "agent",
+                    "arguments": format!(r#"{{"action":"spawn","description":"{id}","prompt":"review {id}"}}"#)
+                }
+            })),
         );
 
         assert!(matches!(
