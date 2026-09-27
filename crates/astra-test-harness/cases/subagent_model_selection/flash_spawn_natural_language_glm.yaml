@@ -86,3 +86,7 @@ criteria:
     name: reflect
     min: 0
     max: 0
+  - type: journal_tool_call_count
+    name: submit_task_resolution
+    min: 0
+    max: 0

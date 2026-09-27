@@ -39,6 +39,10 @@ an invalid slot, but provider or child execution can still fail after launch.
 Neither carrier may override an authoritative primary-only Work topology.
 Provider-authored parallel calls do not cancel a user-requested durable Work
 graph or its deferred activation; a conflicting proposal is rejected.
+An explicit Required Work decision is a turn-wide establishment fence:
+neither a one-slot nor a multi-slot fanout proposal, valid or malformed, can
+start work or authorize sibling calls before the `start_work` receipt. An
+already-bound WorkItem retains its own execution authority.
 
 Required fields:
 
@@ -75,6 +79,13 @@ nearby model, relax a hard requirement, or authorize Auto. A tool's proposed
 selector is matching context, never user authority. This interpretation does
 not add a separate catalog query or database write.
 
+A model-only request does not imply a reasoning level. Reasoning needs a
+separate, affirmative control phrase that names reasoning, thinking, or effort
+and maps to the exact requested control; a bare level token, answer literal,
+negated phrase, or model-name-only quote is not authority for hard `high`.
+Unrecognized phrasing is unresolved.
+The runtime never downgrades an unsupported exact effort into generic thinking.
+
 Dynamic spawn and fanout resolve reasoning separately from the Offering.
 After per-slot and shared defaults, an omitted reasoning control inherits the
 effective parent setting only when the Offering identity matches. An explicit
@@ -103,6 +114,14 @@ control through route defaults, convergence, or settlement heuristics.
 
 - Child failure is recorded as branch failure.
 - Parent may continue if aggregation policy allows partial results.
+- A launched `spawn` receipt or running `get_result` response is nonterminal,
+  not a failed child. It stops blocking final reconciliation only after the
+  same child's successful producer-owned terminal result has been observed by
+  the parent; final quality evaluation consumes the same typed proof.
+  Failed or unobserved terminal results still block completion. When the
+  parent has no independent work, it proposes a final answer; the existing
+  completion barrier waits for direct children and resumes synthesis with
+  their results, without shell sleeps, polling, or an extra database read.
 - Cancellation propagates according to delegation policy.
 - Missing `action` or malformed delegation calls should produce targeted diagnostics and retry guidance.
 

@@ -628,25 +628,30 @@ fn primary_explicit_parallel_children(provider_tool_calls: &[Value]) -> bool {
     }
     let mut direct_spawns = 0;
     for call in provider_tool_calls {
-        let name = astra_turn_core::tool::args::shape::tool_call_name(call);
-        if !matches!(name, Some("agent" | "agent_fanout")) {
+        let Some(name @ ("agent" | "agent_fanout")) =
+            astra_turn_core::tool::args::shape::tool_call_name(call)
+        else {
             continue;
-        }
+        };
         let Ok(arguments) = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
         else {
             continue;
         };
-        let action = arguments.get("action").and_then(Value::as_str);
-        if name == Some("agent_fanout") && action == Some("start") {
-            let count = arguments.get("target_count").and_then(Value::as_u64);
-            let slots = arguments.get("slots").and_then(Value::as_array);
-            if count.is_some_and(|count| {
-                count >= 2 && slots.is_some_and(|slots| slots.len() as u64 == count)
-            }) {
-                return true;
-            }
+        if !matches!(
+            (name, arguments.get("action").and_then(Value::as_str)),
+            ("agent", Some("spawn")) | ("agent_fanout", Some("start"))
+        ) {
+            continue;
         }
-        if name == Some("agent") && action == Some("spawn") {
+        let Ok(slots) =
+            crate::orchestration::agent_tool::canonical_delegation_slot_briefs(name, &arguments)
+        else {
+            continue;
+        };
+        if name == "agent_fanout" && slots.len() >= 2 {
+            return true;
+        }
+        if name == "agent" {
             direct_spawns += 1;
         }
     }
@@ -7460,11 +7465,11 @@ impl ServerAgenticLoopHost {
                 presence == Some(astra_services::WorkAdmissionTruth::Yes),
             ) {
                 Ok(extracted) => extracted,
-                Err(error) => {
+                Err(_) => {
                     return (
-                        unavailable(&format!(
-                            "Model requirement assessment failed bounded validation ({error})."
-                        )),
+                        unresolved(
+                            "The model or reasoning requirement could not be bound to valid user evidence; no child was started.",
+                        ),
                         None,
                     );
                 }
@@ -11429,20 +11434,6 @@ impl ServerAgenticLoopHost {
             })
             .count();
         let direct_parallel_batch = direct_agent_batch_count > 1;
-        let fanout_start_in_batch = admission.admitted.iter().any(|call| {
-            if astra_turn_core::tool::args::shape::tool_call_name(call) != Some("agent_fanout") {
-                return false;
-            }
-            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
-                .ok()
-                .and_then(|arguments| {
-                    arguments
-                        .get("action")
-                        .and_then(Value::as_str)
-                        .map(|action| action == "start")
-                })
-                .unwrap_or(false)
-        });
         // An unavailable optional semantic sidecar must preserve the normal
         // typed tool surface. It is not evidence that an arbitrary multi-tool
         // batch is a Work violation: a broad call-count gate made valid
@@ -11542,14 +11533,13 @@ impl ServerAgenticLoopHost {
                     "canonical_work_establishment_in_progress",
                     "start_work must settle before any sibling capability is executed. Wait for its typed receipt and initial WorkItem assignment, then continue in the next provider round.",
                 )),
-                // A fixed-size fanout already has one server-owned durable
-                // group lifecycle (stable group/slot identity, target-count
-                // settlement, and journaled child termination). Requiring a
-                // second Work graph after the model discovered the fanout
-                // tool creates an impossible cycle: start_work(start) binds a
-                // primary attempt, and primary attempts correctly cannot
-                // delegate. Keep ordinary multi-step execution behind Work,
-                // but admit this independently durable execution carrier.
+                // A typed Required decision fences every other root tool,
+                // including topology proposals. Apply this before individual
+                // tool rules so none can accidentally grant a Work bypass.
+                _ if work_is_required && !coordinator_has_work && name != "start_work" => Some((
+                    "canonical_work_establishment_required",
+                    "This turn requires canonical Work. Establish its task list with start_work before root exploration or task execution; the server will then route task execution through run_next_work_item.",
+                )),
                 "run_next_work_item"
                     if !run_next_work_authorized && !work_is_established_in_batch =>
                 {
@@ -11606,20 +11596,6 @@ impl ServerAgenticLoopHost {
                             "The current trusted workflow or canonical Work lifecycle does not admit this parallel start. No parallel children were created by this call. Continue through the existing authorized execution carrier.",
                         ))
                     }
-                }
-                // `Required` comes from the LLM turn-intent policy, not from
-                // a text heuristic.  It makes Work establishment a hard
-                // admission boundary: the root cannot explore first and add a
-                // decorative task list after doing the task itself.
-                _ if work_is_required
-                    && !coordinator_has_work
-                    && !fanout_start_in_batch
-                    && name != "start_work" =>
-                {
-                    Some((
-                        "canonical_work_establishment_required",
-                        "This turn requires canonical Work. Establish its task list with start_work before root exploration or task execution; the server will then route task execution through run_next_work_item.",
-                    ))
                 }
                 // A bound Work makes the root a coordinator. Task execution
                 // is allowed only through the exact Work-specific endpoint.
@@ -32539,6 +32515,38 @@ mod tests {
             Some("canonical_work_establishment_required")
         );
 
+        // A fanout proposal is not a Work-establishment receipt and cannot
+        // grant its siblings early execution, even when the fanout is valid.
+        for arguments in [
+            r#"{"action":"start","target_count":1,"slots":[{"description":"A","prompt":"A"}]}"#,
+            r#"{"action":"start","target_count":2,"slots":[{"description":"A","prompt":"A"},{"description":"B","prompt":"B"}]}"#,
+            r#"{"action":"start","target_count":2,"slots":[]}"#,
+        ] {
+            let calls = vec![
+                json!({"id":"fanout","type":"function","function":{"name":"agent_fanout","arguments":arguments}}),
+                direct_exploration[0].clone(),
+            ];
+            required.admit_terminal_tool_calls(&required_state, &calls, Some("tool_calls"));
+            let admission =
+                AgenticLoopHost::admit_tool_calls(&mut required, &calls, Some("tool_calls"));
+            assert!(
+                admission.admitted.is_empty(),
+                "{arguments}: admitted={:?}, rejected={:?}",
+                admission.admitted,
+                admission.rejected
+            );
+            let read = admission
+                .rejected
+                .iter()
+                .find(|call| call.provider_call_id() == "direct-read")
+                .expect("the sibling read must be rejected");
+            assert_eq!(
+                serde_json::from_str::<Value>(&read.result).unwrap()["error_kind"],
+                "canonical_work_establishment_required",
+                "{arguments}"
+            );
+        }
+
         let mut bound = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -43293,6 +43301,13 @@ mod tests {
             spawn("a"),
             json!({"function": {"name": "agent", "arguments": "{"}}),
         ]));
+        assert!(!primary_explicit_parallel_children(&[
+            spawn("a"),
+            json!({"function": {"name": "agent", "arguments": "{\"action\":\"spawn\",\"description\":\"missing prompt\"}"}}),
+        ]));
+        assert!(!primary_explicit_parallel_children(&[json!({
+            "function": {"name": "agent_fanout", "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\",\"unexpected\":true}]}"}
+        })]));
         assert!(primary_explicit_parallel_children(&[
             spawn("a"),
             spawn("b")
@@ -45414,6 +45429,7 @@ mod tests {
             messages: Vec::new(),
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
+            terminal_child_evaluation_refs: None,
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,

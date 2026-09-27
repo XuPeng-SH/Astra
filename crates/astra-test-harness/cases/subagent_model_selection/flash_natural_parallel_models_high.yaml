@@ -65,3 +65,7 @@ criteria:
     needle: glm-5.2
   - type: text_contains
     needle: deepseek-v4-flash
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0

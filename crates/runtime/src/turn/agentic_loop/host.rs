@@ -3434,6 +3434,13 @@ pub struct AgenticLoopState {
     /// wire layer (`wire_assembly::assemble_llm_messages`) drains this
     /// field on every call, so producers just append and move on.
     pub volatile_pending: Vec<VolatileInjection>,
+    /// Exact child tool receipts resolved by producer-owned, observed terminal
+    /// outcomes at finalization. Run-local evaluation evidence, never model
+    /// context or checkpoint input.
+    pub terminal_child_evaluation_refs: Option<(
+        String,
+        Vec<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
+    )>,
     /// In-memory ring of recent LLM-round summaries. Fed from the same
     /// site that records into the journal buffer, but available at
     /// introspect time regardless of `full_llm_capture` setting. Capped
@@ -5510,6 +5517,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         messages: Vec::new(),
         run_transcript_capture: None,
         volatile_pending: Vec::new(),
+        terminal_child_evaluation_refs: None,
         recent_rounds: Vec::new(),
         tool_results: Vec::new(),
         current_session_id: None,
@@ -7478,6 +7486,7 @@ pub(crate) mod tests {
             messages: Vec::new(),
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
+            terminal_child_evaluation_refs: None,
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             // Tests that attach durable run-control authority must carry the

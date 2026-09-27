@@ -17221,6 +17221,117 @@ fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_too
     assert_eq!(metadata["success"], false);
 }
 
+#[tokio::test]
+async fn completed_direct_child_supersedes_launch_receipt_in_final_evaluation() {
+    use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};
+
+    let svc = test_service();
+    let request = test_request("delegate one check");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    let completion = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+        identity: astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "session-1",
+            "run-1",
+            "chain-1",
+            "spawn-call",
+        )
+        .unwrap(),
+        edge_agent_id: "edge-1".into(),
+        result_hash: "sha256:test".into(),
+    });
+    state.stall.tool_call_records.push(ToolCallRecord {
+        name: "agent".into(),
+        ok: true,
+        disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+        execution_completion: Some(completion),
+        args_full: Some(r#"{"action":"spawn","description":"check","prompt":"check"}"#.into()),
+        result_full: Some(r#"{"status":"launched","agent_id":"child@run"}"#.into()),
+        ..Default::default()
+    });
+    let evaluate = |state: &AgenticLoopState| {
+        build_runtime_turn_evaluation_event("session-1", "server_runtime", state, STATUS_COMPLETED)
+            .metadata
+            .unwrap()
+    };
+    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+        serde_json::json!({
+            "schema": "direct_child_completion.v1",
+            "parent_run_id": "run-1",
+            "observed_by_provider": true,
+            "children": [{"agent_id":"child@run","status":"completed"}]
+        }),
+    );
+    let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+    host.direct_child_owner = Some(
+        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "run-1",
+            "child@run",
+        ),
+    );
+    crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
+        &mut host, &mut state,
+    )
+    .await;
+    assert!(
+        state.volatile_pending.is_empty(),
+        "terminal context was retired"
+    );
+    let settled = evaluate(&state);
+    assert_eq!(settled["tool_evaluation_success"], true);
+    assert_eq!(settled["success"], true);
+    state.current_run_id = Some("other-run".into());
+    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+}
+
+#[tokio::test]
+async fn mismatched_child_owner_cannot_retire_terminal_notification() {
+    let svc = test_service();
+    let request = test_request("delegate one check");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "other-run",
+        None,
+        None,
+        None,
+    );
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+        serde_json::json!({
+            "schema": "direct_child_completion.v1",
+            "parent_run_id": "run-1",
+            "observed_by_provider": true,
+            "children": [{"agent_id":"child@run","status":"completed"}]
+        }),
+    );
+    let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+    host.direct_child_owner = Some(
+        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "run-1",
+            "child@run",
+        ),
+    );
+    crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
+        &mut host, &mut state,
+    )
+    .await;
+    assert_eq!(state.volatile_pending.len(), 1);
+    assert!(state.terminal_child_evaluation_refs.is_none());
+    assert!(state.interruption.is_some());
+}
+
 #[test]
 fn finalize_run_events_appends_run_finished_for_failures() {
     let svc = test_service();

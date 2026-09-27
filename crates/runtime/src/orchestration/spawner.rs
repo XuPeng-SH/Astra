@@ -973,6 +973,20 @@ impl Drop for FanoutStartReservation {
 }
 
 impl FanoutParentAdmission {
+    #[cfg(test)]
+    pub(crate) fn consumed_direct_child_for_test(parent_run_id: &str, agent_id: &str) -> Arc<Self> {
+        let owner = Arc::new(Self {
+            parent_run_id: parent_run_id.into(),
+            state: std::sync::Mutex::new(FanoutParentState::default()),
+            group_terminal: std::sync::atomic::AtomicBool::new(false),
+            direct_children: std::sync::Mutex::new(BTreeMap::new()),
+            direct_child_changed: Arc::new(tokio::sync::Notify::new()),
+        });
+        astra_core::sync_poison::recover_mutex_lock(&owner.direct_children)
+            .insert(agent_id.into(), None);
+        owner
+    }
+
     pub fn parent_run_id(&self) -> &str {
         &self.parent_run_id
     }

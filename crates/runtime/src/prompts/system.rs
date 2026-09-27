@@ -773,6 +773,14 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
         body.push_str(&format!(
             "         - `task` is an agent type, not a callable tool name. {surface_guidance}; use `start_work` for durable tracked outcomes. Never invent `task(...)` or use background task controls as the Work graph.\n"
         ));
+        body.push_str(
+            "         - For user-named delegated models, let delegation admission resolve the authorized catalog; do not inspect local configuration or credentials.\n",
+        );
+    }
+    if agent_visible {
+        body.push_str(
+            "         - After `agent.spawn`, continue independent parent work. If none remains, propose the final answer without polling or shell sleep: the runtime waits for direct children, delivers terminal results, and gives another synthesis round. A `get_result` still-running snapshot is not a child failure.\n",
+        );
     }
     if tool_visible(tool_names, "bash") {
         body.push_str(
@@ -1683,6 +1691,7 @@ mod tests {
         let agent_surface = build_main_system_prompt(&["agent"], "");
         assert!(agent_surface.contains("`task` is an agent type, not a callable tool name"));
         assert!(agent_surface.contains("Use visible `agent` with `agent_type=task`"));
+        assert!(agent_surface.contains("the runtime waits for direct children"));
         let fanout_surface = build_main_system_prompt(&["agent_fanout"], "");
         assert!(
             fanout_surface.contains("Use visible `agent_fanout` with `defaults.agent_type=task`")

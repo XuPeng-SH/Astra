@@ -162,7 +162,7 @@ fn finish_direct_child_barrier_incomplete(state: &mut AgenticLoopState, reason: 
     }
 }
 
-pub(super) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
+pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
@@ -177,7 +177,13 @@ pub(super) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
         injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
             && injection.payload["observed_by_provider"] != true
     });
-    let incomplete = !children.is_empty() || undelivered;
+    let owner_matches_run = state.current_run_id.as_deref() == Some(owner.parent_run_id());
+    let foreign_notification = state.volatile_pending.iter().any(|injection| {
+        injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+            && injection.payload["parent_run_id"].as_str() != Some(owner.parent_run_id())
+    });
+    let incomplete =
+        !owner_matches_run || foreign_notification || !children.is_empty() || undelivered;
     if incomplete {
         finish_direct_child_barrier_incomplete(
             state,
@@ -199,6 +205,19 @@ pub(super) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
         Instant::now(),
     );
     if !incomplete && state.interruption.is_none() {
+        // The journal is evaluated after this fence. Snapshot only exact,
+        // observed receipt refs before removing provider context so recovery
+        // cannot replay the completed child message into another round.
+        state.terminal_child_evaluation_refs = Some((
+            owner.parent_run_id().to_string(),
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .filter(|record| nonterminal_child_receipt_superseded(state, record))
+                .filter_map(|record| record.execution_completion.clone())
+                .collect(),
+        ));
         state
             .volatile_pending
             .retain(|injection| injection.payload["schema"] != DIRECT_CHILD_RESULT_SCHEMA);
@@ -2831,6 +2850,58 @@ fn terminally_relevant_unresolved_tool_outcomes(
         .collect()
 }
 
+/// A launch receipt or running snapshot is not a failed child. It stops
+/// blocking completion only after the same child has a producer-owned
+/// successful terminal result that the parent model actually observed.
+pub(crate) fn nonterminal_child_receipt_superseded(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if record.name != "agent"
+        || !record.ok
+        || record.disposition
+            != Some(astra_services::session_journal::ToolCallDisposition::Executed)
+    {
+        return false;
+    }
+    let Some(args) = record
+        .authoritative_args_full()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return false;
+    };
+    let Some(result) = record
+        .runtime_model_result_full
+        .as_deref()
+        .or(record.result_full.as_deref())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return false;
+    };
+    let Some(agent_id) = result["agent_id"].as_str() else {
+        return false;
+    };
+    if !matches!(
+        (args["action"].as_str(), result["status"].as_str()),
+        (Some("spawn"), Some("launched")) | (Some("get_result"), Some("still_running"))
+    ) || (args["action"] == "get_result" && args["agent_id"] != agent_id)
+    {
+        return false;
+    }
+    state.volatile_pending.iter().any(|entry| {
+        entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+            && entry.payload["parent_run_id"].as_str() == state.current_run_id.as_deref()
+            && entry.payload["observed_by_provider"] == true
+            && entry.payload["children"]
+                .as_array()
+                .is_some_and(|children| {
+                    children.iter().any(|child| {
+                        child["agent_id"] == agent_id && child["status"] == "completed"
+                    })
+                })
+    })
+}
+
 fn unresolved_tool_outcome_is_terminally_relevant(
     state: &AgenticLoopState,
     failure: &astra_turn_core::evaluation::UnresolvedToolOutcome,
@@ -2840,6 +2911,17 @@ fn unresolved_tool_outcome_is_terminally_relevant(
         astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_AGENT_INCOMPLETE
             | astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_FANOUT_INCOMPLETE
     ) {
+        if failure.result_class
+            == astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_AGENT_INCOMPLETE
+            && failure.invocation.as_ref().is_some_and(|reference| {
+                state.stall.tool_call_records.iter().any(|record| {
+                    record.execution_completion.as_ref() == Some(reference)
+                        && nonterminal_child_receipt_superseded(state, record)
+                })
+            })
+        {
+            return false;
+        }
         return true;
     }
 
@@ -9394,6 +9476,64 @@ mod tests {
     };
     use crate::turn::run_control::{RunStatusProvider, UserIntentPoll, UserIntentProvider};
     use astra_turn_core::chat_turn_sse_dispatch::{ChatTurnSseAccum, ServerLoopExecutionSummary};
+
+    #[test]
+    fn child_receipt_requires_observed_matching_successful_terminal() {
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        let record = ToolCallRecord {
+            name: "agent".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            args_full: Some(r#"{"action":"get_result","agent_id":"child@run"}"#.into()),
+            result_full: Some(r#"{"status":"still_running","agent_id":"child@run"}"#.into()),
+            ..Default::default()
+        };
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": DIRECT_CHILD_RESULT_SCHEMA,
+                "parent_run_id": "parent-run",
+                "children": [{"agent_id":"child@run","status":"completed"}]
+            }),
+        );
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["observed_by_provider"] = serde_json::json!(true);
+        assert!(nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["parent_run_id"] = serde_json::json!("other-parent");
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["parent_run_id"] = serde_json::json!("parent-run");
+        state.volatile_pending[0].payload["children"][0]["agent_id"] =
+            serde_json::json!("other@run");
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["children"][0]["agent_id"] =
+            serde_json::json!("child@run");
+        state.volatile_pending[0].payload["children"][0]["status"] = serde_json::json!("failed");
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["children"][0]["status"] = serde_json::json!("completed");
+        let launched = ToolCallRecord {
+            args_full: Some(r#"{"action":"spawn","description":"child","prompt":"work"}"#.into()),
+            result_full: Some(r#"{"status":"launched","agent_id":"child@run"}"#.into()),
+            ..record.clone()
+        };
+        assert!(nonterminal_child_receipt_superseded(&state, &launched));
+        let mut failed_call = launched.clone();
+        failed_call.ok = false;
+        assert!(!nonterminal_child_receipt_superseded(&state, &failed_call));
+        let mut rejected_call = launched.clone();
+        rejected_call.disposition = Some(ToolCallDisposition::Rejected);
+        assert!(!nonterminal_child_receipt_superseded(
+            &state,
+            &rejected_call
+        ));
+        let mut terminal_failure = record.clone();
+        terminal_failure.result_full =
+            Some(r#"{"status":"interrupted","agent_id":"child@run"}"#.into());
+        assert!(!nonterminal_child_receipt_superseded(
+            &state,
+            &terminal_failure
+        ));
+    }
 
     #[tokio::test]
     async fn delivered_direct_child_evidence_survives_a_provider_round() {

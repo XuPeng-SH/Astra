@@ -4135,22 +4135,27 @@ fn build_runtime_turn_evaluation_event(
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
     let eval_thresholds = crate::turn::runtime_policy::configured_evaluation_thresholds();
-    let eval =
-        astra_turn_core::evaluation::evaluate_tool_call_records_with_thresholds_and_telemetry(
-            &state.message,
-            &state.recent_tools,
-            &state.stall.tool_call_records,
-            state.stall.events.len(),
-            verdict_warning,
-            state.telemetry.first_budget_pressure,
-            eval_thresholds,
-            astra_turn_core::evaluation::TurnEvaluationTelemetry {
-                llm_rounds: Some(state.llm_rounds_completed),
-                prompt_tokens: Some(state.total_prompt),
-                first_round_prompt_tokens: state.telemetry.first_round_prompt_tokens,
-                max_round_prompt_tokens: state.telemetry.max_round_prompt_tokens,
-            },
-        );
+    let resolved_children = state
+        .terminal_child_evaluation_refs
+        .as_ref()
+        .filter(|(run_id, _)| state.current_run_id.as_deref() == Some(run_id.as_str()))
+        .map_or(&[][..], |(_, refs)| refs.as_slice());
+    let eval = astra_turn_core::evaluation::evaluate_tool_call_records_with_resolved_children(
+        &state.message,
+        &state.recent_tools,
+        &state.stall.tool_call_records,
+        state.stall.events.len(),
+        verdict_warning,
+        state.telemetry.first_budget_pressure,
+        eval_thresholds,
+        astra_turn_core::evaluation::TurnEvaluationTelemetry {
+            llm_rounds: Some(state.llm_rounds_completed),
+            prompt_tokens: Some(state.total_prompt),
+            first_round_prompt_tokens: state.telemetry.first_round_prompt_tokens,
+            max_round_prompt_tokens: state.telemetry.max_round_prompt_tokens,
+        },
+        resolved_children,
+    );
     let mut event = astra_turn_core::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
         Some(state.session_turn),
@@ -12676,6 +12681,7 @@ impl AgenticRunLifecycleService {
             messages: facts.messages,
             run_transcript_capture: None,
             volatile_pending: facts.original.pending_context,
+            terminal_child_evaluation_refs: None,
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(session_id.to_string()),
@@ -24574,6 +24580,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             messages: vec![user_message],
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
+            terminal_child_evaluation_refs: None,
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(config.session_id.clone()),
