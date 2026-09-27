@@ -2098,6 +2098,7 @@ mod edge_callback_insert_tests {
             }
             Ok(RunStatusRecord {
                 artifact_publication: None,
+                explain_requested: false,
                 root_run_id: Some(run_id.clone()),
                 run_id,
                 session_id: self.session_id.clone(),
@@ -2252,7 +2253,10 @@ mod edge_callback_insert_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<crate::ErrorResponse>)> {
+        ) -> Result<
+            astra_services::runs::DurableRunEventDelta,
+            (StatusCode, Json<crate::ErrorResponse>),
+        > {
             unreachable!("approval callback does not stream runs")
         }
 

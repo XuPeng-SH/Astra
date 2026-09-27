@@ -177,7 +177,7 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
         last_index: u32,
-    ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)>;
+    ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>;
 
     async fn stream_run_live(
         &self,
@@ -185,7 +185,10 @@ pub trait RunLifecycleService: Send + Sync {
         user_id: String,
         last_index: u32,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        let events = self.stream_run(run_id.clone(), user_id, last_index).await?;
+        let events = self
+            .stream_run(run_id.clone(), user_id, last_index)
+            .await?
+            .events;
         Ok(ChatStreamRecord {
             session_id: String::new(),
             run_id,
@@ -1177,6 +1180,8 @@ pub struct ChatStreamRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStatusRecord {
     pub artifact_publication: Option<serde_json::Value>,
+    /// Durable root run-start intent, available from the bounded status read.
+    pub explain_requested: bool,
     pub run_id: String,
     pub session_id: String,
     /// Durable run-tree identity. A missing parent identifies the root
@@ -3053,6 +3058,7 @@ pub struct DurableRunStatusSnapshot {
     pub parent_run_id: Option<String>,
     pub root_run_id: Option<String>,
     pub depth: u32,
+    pub explain_requested: bool,
     pub status: String,
     pub waiting_for: Option<String>,
     pub run_generation: u64,
@@ -16079,33 +16085,43 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         after_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+        let Some((session_id, status, last_event_idx)) =
+            sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT session_id, status, last_event_idx
+                 FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_optional(self.pool.get())
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|source| db_error("load_run_event_delta_head", run_id, source).to_string())?
         else {
             return Ok(None);
         };
-        let rows = sqlx::query(
-            "SELECT payload_json, event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx > ?
-             ORDER BY event_idx ASC",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .bind(after_event_idx)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
-        let events = rows
-            .into_iter()
-            .map(|row| decode_run_event_payload(&row, run_id))
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
+        let events = if after_event_idx < last_event_idx {
+            let rows = sqlx::query(
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND run_id = ? AND event_idx > ? AND event_idx <= ?
+                 ORDER BY event_idx ASC",
+            )
+            .bind(user_id)
+            .bind(run_id)
+            .bind(after_event_idx)
+            .bind(last_event_idx)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
+            rows.into_iter()
+                .map(|row| decode_run_event_payload(&row, run_id))
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+        } else {
+            Vec::new()
+        };
         Ok(Some(DurableRunEventDelta {
-            session_id: run.session_id,
-            status: run.status,
-            last_event_idx: run.last_event_idx,
+            session_id,
+            status,
+            last_event_idx,
             events,
         }))
     }
@@ -24337,6 +24353,7 @@ fn run_status_snapshot_from_run(run: &DurableRunRecord) -> DurableRunStatusSnaps
         parent_run_id: run.parent_run_id.clone(),
         root_run_id: run.root_run_id.clone(),
         depth: run.depth,
+        explain_requested: run_requested_explain_analyze(run),
         status: run.status.clone(),
         waiting_for: run.waiting_for.clone(),
         run_generation: run.run_generation,
@@ -26392,7 +26409,7 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _run_id: String,
         _user_id: String,
         _last_index: u32,
-    ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",
@@ -43651,6 +43668,23 @@ mod tests {
         assert_eq!(snapshot.executor.unwrap()["kind"], "edge");
         assert_eq!(snapshot.transport.as_deref(), Some("edge"));
         assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 11);
+    }
+
+    #[tokio::test]
+    async fn run_status_snapshot_carries_root_explain_intent() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("status-explain-intent");
+        run.events = vec![make_event(
+            "run_started",
+            json!({"explain_analyze_requested": true}),
+        )];
+        store.insert_run(run).await.unwrap();
+        let snapshot = store
+            .load_run_status_snapshot("u1", "status-explain-intent")
+            .await
+            .unwrap()
+            .expect("status snapshot");
+        assert!(snapshot.explain_requested);
     }
 
     #[test]
