@@ -1823,6 +1823,26 @@ mod tests {
     }
 
     #[test]
+    fn rejected_assessment_error_does_not_echo_untrusted_text() {
+        let secret = "sensitive-user-sentinel";
+        let response = json!({
+            "disposition": "resolved",
+            "requirements": [{
+                "candidate_id": "missing-candidate",
+                "model_quote": secret
+            }]
+        });
+        let error = assess(
+            &response,
+            &format!("Use {secret}"),
+            &[candidate(secret, "offer-a")],
+        )
+        .expect_err("unknown candidate must be rejected");
+        assert!(!error.contains(secret));
+        assert!(!error.contains("missing-candidate"));
+    }
+
+    #[test]
     fn fused_assessment_materializes_and_binds_without_another_judgment() {
         let source =
             "Use Model-7 with high reasoning for review and its descendants. Private task details.";

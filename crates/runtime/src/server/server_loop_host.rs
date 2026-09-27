@@ -7465,11 +7465,11 @@ impl ServerAgenticLoopHost {
                 presence == Some(astra_services::WorkAdmissionTruth::Yes),
             ) {
                 Ok(extracted) => extracted,
-                Err(_) => {
+                Err(error) => {
                     return (
-                        unresolved(
-                            "The model or reasoning requirement could not be bound to valid user evidence; no child was started.",
-                        ),
+                        unresolved(&format!(
+                            "Model requirement evidence was rejected ({error}); no child was started."
+                        )),
                         None,
                     );
                 }

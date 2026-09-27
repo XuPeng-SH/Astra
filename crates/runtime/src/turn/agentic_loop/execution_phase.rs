@@ -15961,11 +15961,13 @@ mod tests {
     fn rejected_work_settlement_opens_repair_before_budget_settlement() {
         let mut state = make_state();
         let mut rejected_settlement = executed_record("settle_work_item", false, None);
+        rejected_settlement.tool_call_id = Some("call-settle".into());
         rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
         rejected_settlement.result_full = Some(
             serde_json::json!({
                 "status": "rejected",
                 "error_kind": "unresolved_work_validation",
+                "retryable": false,
                 "validation_state": "failed"
             })
             .to_string(),
@@ -16017,6 +16019,28 @@ mod tests {
             entry.payload["signal"] == "canonical_validation_failed_repair_once"
                 && entry.payload["origin"] == "rejected_work_settlement"
         }));
+        super::super::tool_phase::settle_non_retryable_tool_rejections(
+            &mut state,
+            &[serde_json::json!({
+                "id": "call-settle",
+                "type": "function",
+                "function": {"name": "settle_work_item", "arguments": "{}"}
+            })],
+            2,
+            false,
+            true,
+        );
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .as_ref()
+                .map(|window| &window.action),
+            Some(&CompletionAction::CanonicalWorkRepair),
+            "the later terminal-rejection gate must not revoke Work repair authority"
+        );
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
         // The same rejection cannot authorize repair after a local suffix
         // record is lost. Keep the positive control above.
         state.stall.verification_frontier =
