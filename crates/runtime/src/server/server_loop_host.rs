@@ -7676,10 +7676,13 @@ impl ServerAgenticLoopHost {
         assessed: &astra_turn_types::DelegationIntentRequirements,
         prebound: Option<&astra_services::delegation_model_requirement::DelegationScopeBinding>,
     ) -> Result<
-        std::collections::HashMap<
-            String,
-            crate::turn::agentic_loop::host::PreparedDelegationModelAdmission,
-        >,
+        (
+            std::collections::HashMap<
+                String,
+                crate::turn::agentic_loop::host::PreparedDelegationModelAdmission,
+            >,
+            Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult>,
+        ),
         String,
     > {
         use astra_turn_types::{
@@ -7734,7 +7737,7 @@ impl ServerAgenticLoopHost {
                     state,
                     &operation_id,
                     "delegation_scope_binding",
-                    512,
+                    astra_services::delegation_model_requirement::DELEGATION_SCOPE_BINDING_OUTPUT_TOKENS,
                     &messages,
                 )
                 .await
@@ -7751,27 +7754,78 @@ impl ServerAgenticLoopHost {
                 )?,
             )
         };
-        let (bound_slots, child_requirements) =
-            astra_services::delegation_model_requirement::bind_delegation_requirements_to_slots(
-                assessed,
-                binding.as_ref(),
-                &slots,
-            )?;
+        // Validate the fused indices before partitioning. Filtering an invalid
+        // global index into local scopes would otherwise hide a malformed
+        // judgment instead of rejecting it.
+        if binding.as_ref().is_some_and(|binding| {
+            binding.assignments.iter().any(|assignment| {
+                assignment
+                    .slot_indices
+                    .iter()
+                    .any(|&index| index >= slots.len())
+            })
+        }) {
+            return Err("delegation task scope assignment has invalid slots".into());
+        }
         let mut admissions = std::collections::HashMap::new();
+        let mut blocked = Vec::new();
         let mut offset = 0;
         for item in pending {
             let end = offset + item.slots.len();
-            let slots = bound_slots[offset..end]
-                .iter()
-                .enumerate()
-                .map(|(index, slot)| {
-                    let mut slot = slot.clone();
-                    slot.slot_index = index as u32;
-                    slot
-                })
-                .collect::<Vec<_>>();
-            let child_requirements = child_requirements[offset..end].to_vec();
+            let local_binding = binding.as_ref().map(|binding| {
+                astra_services::delegation_model_requirement::DelegationScopeBinding {
+                    assignments: binding
+                        .assignments
+                        .iter()
+                        .map(|assignment| {
+                            astra_services::delegation_model_requirement::DelegationScopeAssignment {
+                                requirement_id: assignment.requirement_id.clone(),
+                                slot_indices: assignment
+                                    .slot_indices
+                                    .iter()
+                                    .filter(|&&index| (offset..end).contains(&index))
+                                    .map(|index| index - offset)
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                    unresolved: binding.unresolved.clone(),
+                }
+            });
             offset += item.slots.len();
+            let (slots, child_requirements) = match astra_services::delegation_model_requirement::bind_delegation_requirements_to_slots(
+                assessed,
+                local_binding.as_ref(),
+                &item.slots,
+            ) {
+                Ok(bound) => bound,
+                Err(reason) => {
+                    let error_kind = if [
+                        astra_turn_types::AutoModelStrategy::Balanced,
+                        astra_turn_types::AutoModelStrategy::CostPriority,
+                    ]
+                    .into_iter()
+                    .any(|strategy| {
+                        reason == astra_services::delegation_model_requirement::automatic_model_routing_unavailable_reason(strategy)
+                    }) {
+                        "delegation_model_unavailable"
+                    } else {
+                        "delegation_model_scope_unresolved"
+                    };
+                    let (recovered, rejected) = self
+                        .recover_existing_or_block_new_delegation_calls(
+                            state,
+                            std::slice::from_ref(item),
+                            error_kind,
+                            &reason,
+                            None,
+                        )
+                        .await;
+                    admissions.extend(recovered);
+                    blocked.extend(rejected);
+                    continue;
+                }
+            };
             let outcome = if slots.iter().all(|slot| {
                 slot.model_selection.is_none()
                     && slot.requested_model_policy.is_none()
@@ -7797,7 +7851,7 @@ impl ServerAgenticLoopHost {
                 },
             );
         }
-        Ok(admissions)
+        Ok((admissions, blocked))
     }
 
     pub(crate) fn bind_execution_handoff(
@@ -18975,6 +19029,27 @@ struct PendingDelegationCall {
     valid_shape: bool,
 }
 
+fn annotate_delegation_slots(
+    slots: &mut [astra_services::delegation_model_requirement::DelegationSlotBrief],
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &Value,
+) {
+    for (slot_index, slot) in slots.iter_mut().enumerate() {
+        slot.invocation = Some(
+            astra_services::delegation_model_requirement::DelegationSlotInvocation {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                group_id: args
+                    .get("group_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                slot_index,
+            },
+        );
+    }
+}
+
 fn merge_prepared_delegation_outcome(
     mut outcome: (
         std::collections::HashMap<
@@ -19058,13 +19133,14 @@ impl ServerAgenticLoopHost {
             let Some(id) = call.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            let (slots, valid_shape) =
+            let (mut slots, valid_shape) =
                 match crate::orchestration::agent_tool::canonical_delegation_slot_briefs(
                     name, &args,
                 ) {
                     Ok(slots) => (slots, true),
                     Err(_) => (Vec::new(), false),
                 };
+            annotate_delegation_slots(&mut slots, id, name, &args);
             pending.push(PendingDelegationCall {
                 call: call.clone(),
                 id: id.to_string(),
@@ -19142,7 +19218,49 @@ impl ServerAgenticLoopHost {
             "invalid_delegation_model_scope",
             "The delegated task shape is invalid; no new child was started.",
         ));
-        let pending = needs_admission;
+        // Unsupported Auto affects only its own invocation. Partition before
+        // slot accounting so it cannot crowd out unrelated fixed-model calls.
+        let (pending, auto_pending): (Vec<_>, Vec<_>) =
+            needs_admission.into_iter().partition(|call| {
+                !call.slots.iter().any(|slot| {
+                    matches!(
+                        slot.requested_model_policy,
+                        Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+                    )
+                })
+            });
+        let (balanced, cost_priority): (Vec<_>, Vec<_>) =
+            auto_pending.into_iter().partition(|call| {
+                call.slots.iter().any(|slot| {
+                    matches!(
+                        slot.requested_model_policy,
+                        Some(astra_turn_types::RequestedModelPolicy::Auto {
+                            strategy: astra_turn_types::AutoModelStrategy::Balanced
+                        })
+                    )
+                })
+            });
+        for (strategy, calls) in [
+            (astra_turn_types::AutoModelStrategy::Balanced, balanced),
+            (
+                astra_turn_types::AutoModelStrategy::CostPriority,
+                cost_priority,
+            ),
+        ] {
+            if !calls.is_empty() {
+                let (recovered, rejected) = self
+                    .recover_existing_or_block_new_delegation_calls(
+                        state,
+                        &calls,
+                        "delegation_model_unavailable",
+                        &astra_services::delegation_model_requirement::automatic_model_routing_unavailable_reason(strategy),
+                        None,
+                    )
+                    .await;
+                frozen.extend(recovered);
+                blocked.extend(rejected);
+            }
+        }
         let mut slot_capacity = astra_turn_types::MAX_MODEL_ADMISSION_SLOTS;
         let (pending, overflow): (Vec<_>, Vec<_>) = pending.into_iter().partition(|item| {
             if item.slots.len() > slot_capacity {
@@ -19253,7 +19371,7 @@ impl ServerAgenticLoopHost {
                     )
                     .await
                 {
-                    Ok(admissions) => (admissions, Vec::new()),
+                    Ok(outcome) => outcome,
                     Err(reason) => {
                         self.recover_existing_or_block_new_delegation_calls(
                             state,
@@ -19345,13 +19463,22 @@ impl ServerAgenticLoopHost {
                 )
                 .await
             {
-                Ok(admissions) => (admissions, Vec::new()),
+                Ok(outcome) => outcome,
                 Err(reason) => {
                     let error_kind = if matches!(
                         assessed,
                         astra_turn_types::DelegationIntentRequirements::Unavailable { .. }
                     ) {
                         "delegation_model_assessment_unavailable"
+                    } else if [
+                        astra_turn_types::AutoModelStrategy::Balanced,
+                        astra_turn_types::AutoModelStrategy::CostPriority,
+                    ]
+                    .into_iter()
+                    .any(|strategy| {
+                        reason == astra_services::delegation_model_requirement::automatic_model_routing_unavailable_reason(strategy)
+                    }) {
+                        "delegation_model_unavailable"
                     } else {
                         "delegation_model_scope_unresolved"
                     };
@@ -41555,6 +41682,470 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delegation_slots_keep_invocation_local_position_after_flattening() {
+        let mut first =
+            vec![astra_services::delegation_model_requirement::DelegationSlotBrief::default()];
+        let mut second =
+            vec![astra_services::delegation_model_requirement::DelegationSlotBrief::default(); 2];
+        annotate_delegation_slots(
+            &mut first,
+            "spawn-call",
+            "agent",
+            &json!({"action":"spawn"}),
+        );
+        annotate_delegation_slots(
+            &mut second,
+            "fanout-call",
+            "agent_fanout",
+            &json!({
+                "action":"start", "group_id":"review-group"
+            }),
+        );
+        let flattened = first.into_iter().chain(second).collect::<Vec<_>>();
+        assert_eq!(flattened[0].invocation.as_ref().unwrap().slot_index, 0);
+        assert_eq!(flattened[1].invocation.as_ref().unwrap().slot_index, 0);
+        assert_eq!(flattened[2].invocation.as_ref().unwrap().slot_index, 1);
+        assert_eq!(
+            flattened[1].invocation.as_ref().unwrap().tool_call_id,
+            "fanout-call"
+        );
+        assert_eq!(
+            flattened[1]
+                .invocation
+                .as_ref()
+                .unwrap()
+                .group_id
+                .as_deref(),
+            Some("review-group")
+        );
+    }
+
+    struct DelegationCatalogSpy {
+        reads: Arc<std::sync::Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl astra_services::ModelService for DelegationCatalogSpy {
+        async fn create_model(
+            &self,
+            _: String,
+            _: astra_services::ModelCreateRequestData,
+        ) -> Result<
+            astra_services::ModelRecord,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        > {
+            unreachable!("delegation assessment only lists authorized models")
+        }
+
+        async fn list_models(
+            &self,
+            _: String,
+            _: bool,
+        ) -> Result<
+            Vec<astra_services::ModelListItem>,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        > {
+            *self.reads.lock().unwrap() += 1;
+            Ok(vec![astra_services::ModelListItem {
+                offering_id: "offer-a".into(),
+                access_id: "self-hosted".into(),
+                access_kind: astra_services::ModelAccessKind::SelfHosted,
+                access_label: "Self-hosted".into(),
+                execution_placement: astra_services::ModelExecutionPlacement::Server,
+                name: "Model-A".into(),
+                provider: "openai".into(),
+                description: None,
+                is_active: true,
+                context_window: 128_000,
+                max_completion_tokens: None,
+                architecture: None,
+                thinking_capability: None,
+                pricing: None,
+            }])
+        }
+
+        async fn get_model(
+            &self,
+            _: String,
+        ) -> Result<
+            astra_services::ModelRecord,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        > {
+            unreachable!("delegation assessment only lists authorized models")
+        }
+
+        async fn resolve_model_offering(
+            &self,
+            _: String,
+        ) -> Result<
+            astra_services::ResolvedModelOffering,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        > {
+            unreachable!("execution admission is outside this assessment test")
+        }
+
+        async fn update_model(
+            &self,
+            _: String,
+            _: astra_services::ModelUpdateRequestData,
+        ) -> Result<
+            astra_services::ModelRecord,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        > {
+            unreachable!("delegation assessment only lists authorized models")
+        }
+
+        async fn delete_model(
+            &self,
+            _: String,
+        ) -> Result<
+            (),
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        > {
+            unreachable!("delegation assessment only lists authorized models")
+        }
+
+        async fn check_model(
+            &self,
+            _: String,
+        ) -> Result<
+            astra_services::ModelRecord,
+            (
+                axum::http::StatusCode,
+                axum::Json<astra_core::ErrorResponse>,
+            ),
+        > {
+            unreachable!("delegation assessment only lists authorized models")
+        }
+    }
+
+    #[tokio::test]
+    async fn fused_delegation_assessment_reuses_intent_without_catalog_or_judge_read() {
+        let reads = Arc::new(std::sync::Mutex::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response = json!({"disposition":"resolved","requirements":[{
+            "candidate_id":"offer-a", "evidence":{
+                "model_quote":"Model-A", "source_qualifier_quote":null,
+                "reasoning_quote":null, "reasoning":null, "automatic_strategy":null,
+                "task_scope_quote":null, "propagation":"direct_children", "strength":"hard"
+            }, "slot_indices":null
+        }],"unresolved":[]})
+        .to_string();
+        let client = |response: String| {
+            Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
+                requests: requests.clone(),
+            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
+        };
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "catalog-user".into(),
+            "catalog-session".into(),
+        )
+        .with_model_service(Some(Arc::new(DelegationCatalogSpy {
+            reads: reads.clone(),
+        })))
+        .with_test_judgment_clients([client(response.clone()), client(response)])
+        .build();
+        let mut state = create_test_state();
+        state.context_manifest_user_id = Some("catalog-user".into());
+        state.current_session_id = Some("catalog-session".into());
+        state.current_run_id = Some("catalog-run".into());
+        state.canonical_turn_chain_id = Some("catalog-chain".into());
+        state.current_run_owner_generation = Some(1);
+        let make_call = |id: &str| {
+            json!({"id":id,"type":"function","function":{
+                "name":"agent", "arguments":json!({
+                    "action":"spawn","description":"Independent","prompt":"Reply OK"
+                }).to_string()
+            }})
+        };
+        for (text, id, expected_calls) in [
+            ("Use Model-A for every delegated child.", "first", 1),
+            ("Use Model-A for every delegated child.", "second", 1),
+            ("Use Model-A for each delegated child.", "third", 2),
+        ] {
+            state.user_intent = text.into();
+            let (admitted, blocked) = host
+                .admitted_delegation_models(&mut state, &[make_call(id)])
+                .await;
+            assert!(blocked.is_empty(), "{id}: {blocked:?}");
+            assert!(matches!(
+                &admitted[id].outcome,
+                astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
+                    if slots.len() == 1 && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
+            ));
+            assert_eq!(*reads.lock().unwrap(), expected_calls);
+            assert_eq!(requests.lock().unwrap().len(), expected_calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_auto_rejects_only_its_invocation_not_an_independent_fixed_child() {
+        let reads = Arc::new(std::sync::Mutex::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response = json!({"disposition":"resolved","requirements":[
+            {"candidate_id":null,"evidence":{
+                "model_quote":"auto balanced","source_qualifier_quote":null,
+                "reasoning_quote":null,"reasoning":null,"automatic_strategy":"balanced",
+                "task_scope_quote":"group X","propagation":"direct_children","strength":"hard"
+            },"slot_indices":[0]},
+            {"candidate_id":"offer-a","evidence":{
+                "model_quote":"Model-A","source_qualifier_quote":null,
+                "reasoning_quote":null,"reasoning":null,"automatic_strategy":null,
+                "task_scope_quote":"group Y","propagation":"direct_children","strength":"hard"
+            },"slot_indices":[1]}
+        ],"unresolved":[]})
+        .to_string();
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "mixed-user".into(),
+            "mixed-session".into(),
+        )
+        .with_model_service(Some(Arc::new(DelegationCatalogSpy {
+            reads: reads.clone(),
+        })))
+        .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
+            requests: requests.clone(),
+        })
+            as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
+        .build();
+        let mut state = create_test_state();
+        state.context_manifest_user_id = Some("mixed-user".into());
+        state.current_session_id = Some("mixed-session".into());
+        state.current_run_id = Some("mixed-run".into());
+        state.canonical_turn_chain_id = Some("mixed-chain".into());
+        state.current_run_owner_generation = Some(1);
+        state.user_intent = "Use auto balanced for group X and Model-A for group Y".into();
+        let call = |id: &str, description: &str| {
+            json!({"id":id,"type":"function","function":{
+                "name":"agent","arguments":json!({
+                    "action":"spawn","description":description,"prompt":"Reply OK"
+                }).to_string()
+            }})
+        };
+        let (admitted, blocked) = host
+            .admitted_delegation_models(
+                &mut state,
+                &[call("auto-x", "group X"), call("fixed-y", "group Y")],
+            )
+            .await;
+        assert_eq!(*reads.lock().unwrap(), 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(blocked[0].request_id, "auto-x");
+        assert_eq!(
+            blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
+            "delegation_model_unavailable"
+        );
+        assert_eq!(admitted.len(), 1);
+        assert!(matches!(
+            &admitted["fixed-y"].outcome,
+            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
+                if slots.len() == 1 && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn scoped_fixed_binding_is_local_to_each_invocation_and_reused_later() {
+        let reads = Arc::new(std::sync::Mutex::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first = json!({"disposition":"resolved","requirements":[{
+            "candidate_id":"offer-a","evidence":{
+                "model_quote":"Model-A","source_qualifier_quote":null,
+                "reasoning_quote":null,"reasoning":null,"automatic_strategy":null,
+                "task_scope_quote":"review","propagation":"direct_children","strength":"hard"
+            },"slot_indices":[0,2]
+        }],"unresolved":[]})
+        .to_string();
+        let later = json!({"assignments":[{"requirement_id":"0","slot_indices":[0]}],
+            "unresolved":[]})
+        .to_string();
+        let client = |response: String| {
+            Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
+                requests: requests.clone(),
+            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
+        };
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "scoped-user".into(),
+            "scoped-session".into(),
+        )
+        .with_model_service(Some(Arc::new(DelegationCatalogSpy {
+            reads: reads.clone(),
+        })))
+        .with_test_judgment_clients([client(first), client(later)])
+        .build();
+        let mut state = create_test_state();
+        state.context_manifest_user_id = Some("scoped-user".into());
+        state.current_session_id = Some("scoped-session".into());
+        state.current_run_id = Some("scoped-run".into());
+        state.canonical_turn_chain_id = Some("scoped-chain".into());
+        state.current_run_owner_generation = Some(1);
+        state.user_intent = "Use Model-A for review.".into();
+        let fanout = json!({"id":"fanout","type":"function","function":{
+            "name":"agent_fanout","arguments":json!({
+                "action":"start","group_id":"scoped-group","target_count":2,
+                "slots":[{"description":"review","prompt":"Review"},
+                         {"description":"plan","prompt":"Plan"}]
+            }).to_string()
+        }});
+        let spawn = |id: &str, policy: Option<Value>| {
+            let mut args = json!({"action":"spawn","description":"review","prompt":"Review"});
+            if let Some(policy) = policy {
+                args["requested_model_policy"] = policy;
+            }
+            json!({"id":id,"type":"function","function":{
+                "name":"agent","arguments":args.to_string()
+            }})
+        };
+        let bad = spawn(
+            "bad",
+            Some(json!({"mode":"fixed","selector":{
+                "kind":"offering_id","offering_id":"wrong-offering"
+            }})),
+        );
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[fanout, bad])
+            .await;
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(blocked[0].request_id, "bad");
+        assert_eq!(admitted.len(), 1);
+        assert!(matches!(&admitted["fanout"].outcome,
+            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
+                if slots.len() == 2
+                    && slots[0].slot_index == 0
+                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
+                    && slots[1].slot_index == 1
+                    && slots[1].model_selection.is_none()
+        ));
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[spawn("later", None)])
+            .await;
+        assert!(blocked.is_empty(), "{blocked:?}");
+        assert!(matches!(&admitted["later"].outcome,
+            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
+                if slots.len() == 1
+                    && slots[0].slot_index == 0
+                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
+        ));
+        assert_eq!(*reads.lock().unwrap(), 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unsupported_auto_proposal_is_rejected_without_catalog_or_judgment() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "auto-user".into(),
+            "auto-session".into(),
+        )
+        .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+            responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            requests: requests.clone(),
+        })
+            as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
+        .build();
+        let mut state = create_test_state();
+        state.context_manifest_user_id = Some("auto-user".into());
+        state.current_session_id = Some("auto-session".into());
+        state.current_run_id = Some("auto-run".into());
+        state.canonical_turn_chain_id = Some("auto-chain".into());
+        state.current_run_owner_generation = Some(1);
+        state.user_intent = "Choose a balanced model for these children".into();
+        let call = json!({"id":"auto-call","type":"function","function":{
+            "name":"agent_fanout", "arguments":json!({
+                "action":"start", "group_id":"auto-test", "target_count":2,
+                "defaults":{"requested_model_policy":{"mode":"auto","strategy":"balanced"}},
+                "slots":[{"description":"First","prompt":"First task"},
+                         {"description":"Second","prompt":"Second task"}]
+            }).to_string()
+        }});
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, std::slice::from_ref(&call))
+            .await;
+        assert!(admitted.is_empty());
+        assert_eq!(blocked.len(), 1);
+        let fields = blocked[0].tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["error_kind"], "delegation_model_unavailable");
+        assert_eq!(fields["retryable"], false);
+        assert!(
+            blocked[0]
+                .output
+                .contains("automatic model routing is not available yet")
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(matches!(
+            state
+                .skills
+                .request_constraints
+                .delegated_model_requirements,
+            astra_turn_types::DelegationIntentRequirements::Unassessed
+        ));
+
+        let fixed = json!({"id":"fixed-call","type":"function","function":{
+            "name":"agent", "arguments":json!({
+                "action":"spawn", "description":"Independent", "prompt":"Reply OK",
+                "requested_model_policy":{"mode":"fixed","selector":{
+                    "kind":"configured_name","model_name":"glm-5.2"}}
+            }).to_string()
+        }});
+        for calls in [
+            vec![call.clone(), fixed.clone()],
+            vec![fixed.clone(), call.clone()],
+        ] {
+            let (admitted, blocked) = host.admitted_delegation_models(&mut state, &calls).await;
+            assert!(admitted.is_empty());
+            assert_eq!(blocked.len(), 2);
+            let error_for = |id: &str| {
+                blocked
+                    .iter()
+                    .find(|item| item.request_id == id)
+                    .unwrap()
+                    .tool_result_fields
+                    .as_ref()
+                    .unwrap()["error_kind"]
+                    .clone()
+            };
+            assert_eq!(error_for("auto-call"), "delegation_model_unavailable");
+            assert_eq!(
+                error_for("fixed-call"),
+                "delegation_model_assessment_unavailable"
+            );
+            assert!(requests.lock().unwrap().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn delegation_model_assessment_unavailable_is_recorded_before_inference() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -41805,411 +42396,6 @@ mod tests {
             serde_json::from_str(&delivered.pre_execution_rejections[0].result).unwrap();
         assert_eq!(rejection["error_kind"], "delegation_model_scope_unresolved");
         assert_eq!(rejection["advisory"]["executed"], false);
-    }
-
-    #[tokio::test]
-    async fn intent_reasoning_requirement_is_reused_across_spawn_batches_without_catalog_io() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([json!({
-                "disposition":"resolved",
-                "requirements":[{
-                    "model_quote":null,"source_qualifier_quote":null,
-                    "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
-                    "task_scope_quote":null,"propagation":"direct_children","strength":"hard"
-                }],
-                "unresolved":[]
-            })
-            .to_string()])),
-            requests: requests.clone(),
-        };
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "reasoning-user".into(),
-            "reasoning-session".into(),
-        )
-        .with_test_judgment_clients([
-            Box::new(client) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        ])
-        .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("reasoning-user".into());
-        state.current_session_id = Some("reasoning-session".into());
-        state.current_run_id = Some("reasoning-run".into());
-        state.canonical_turn_chain_id = Some("reasoning-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use high reasoning for every subagent".into();
-        let source = delegation_intent_source_from_state(&state).unwrap();
-        host.pending_work_admission = Some(ClassifiedWorkAdmission {
-            decision: astra_services::WorkAdmissionDecision::NotRequired {
-                assessment: None,
-                domain: None,
-                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
-                mutation_completion_scope:
-                    astra_config::user_profile::MutationCompletionScope::Unknown,
-                execution_topology: astra_services::WorkExecutionTopology::Primary,
-                required_capabilities: Vec::new(),
-            },
-            delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
-            source: Some(source.clone()),
-            work_handoff_pending: false,
-        });
-        let call = json!({
-            "id":"review-call","type":"function",
-            "function":{"name":"agent","arguments":json!({
-                "action":"spawn","description":"Review","prompt":"Review the diff"
-            }).to_string()}
-        });
-        let (admissions, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&call))
-            .await;
-        assert!(blocked.is_empty());
-        let admission = admissions.get("review-call").unwrap();
-        assert_eq!(admission.source, source);
-        assert!(matches!(
-            &admission.outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1 && matches!(
-                    slots[0].reasoning.as_ref(),
-                    Some(astra_turn_types::DelegationReasoningRequirement::Effort {
-                        effort: astra_turn_types::DelegationReasoningEffort::High
-                    })
-                )
-        ));
-        assert!(matches!(
-            admission.child_requirements.as_slice(),
-            [astra_turn_types::DelegationIntentRequirements::Unconstrained { .. }]
-        ));
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        let second = json!({
-            "id":"investigation-call","type":"function",
-            "function":{"name":"agent","arguments":json!({
-                "action":"spawn","description":"Investigate","prompt":"Investigate the failure"
-            }).to_string()}
-        });
-        let malformed = json!({
-            "id":"malformed-call","type":"function",
-            "function":{"name":"agent_fanout","arguments":json!({
-                "action":"start","target_count":2,"slots":[]
-            }).to_string()}
-        });
-        let (reused, blocked) = host
-            .admitted_delegation_models(&mut state, &[malformed, second])
-            .await;
-        assert_eq!(blocked.len(), 1, "only the malformed sibling is blocked");
-        assert!(matches!(
-            &reused["investigation-call"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1 && slots[0].reasoning.is_some()
-        ));
-        assert_eq!(requests.lock().unwrap().len(), 1);
-
-        for (batch_size, expected_admitted, expected_blocked) in
-            [(16, 16, 0), (17, 17, 0), (50, 50, 0), (51, 50, 1)]
-        {
-            let batch = (0..batch_size)
-                .map(|index| {
-                    json!({
-                        "id":format!("batch-{batch_size}-{index}"),"type":"function",
-                        "function":{"name":"agent","arguments":json!({
-                            "action":"spawn","description":format!("Task {index}"),
-                            "prompt":format!("Check item {index}")
-                        }).to_string()}
-                    })
-                })
-                .collect::<Vec<_>>();
-            let (admitted, blocked) = host.admitted_delegation_models(&mut state, &batch).await;
-            assert_eq!(admitted.len(), expected_admitted, "batch size {batch_size}");
-            assert_eq!(blocked.len(), expected_blocked, "batch size {batch_size}");
-        }
-        let fanout_slots = (0..50)
-            .map(|index| {
-                json!({
-                    "description": format!("Fanout task {index}"),
-                    "prompt": format!("Check fanout item {index}")
-                })
-            })
-            .collect::<Vec<_>>();
-        let fanout = json!({
-            "id":"fanout-50","type":"function",
-            "function":{"name":"agent_fanout","arguments":json!({
-                "action":"start","target_count":50,"slots":fanout_slots
-            }).to_string()}
-        });
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&fanout))
-            .await;
-        assert!(blocked.is_empty());
-        assert_eq!(admitted["fanout-50"].child_requirements.len(), 50);
-        assert_eq!(requests.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn unavailable_delegation_intent_is_not_reextracted_until_user_intent_changes() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([json!({
-                "disposition":"resolved",
-                "requirements":[{
-                    "model_quote":null,"source_qualifier_quote":null,
-                    "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
-                    "task_scope_quote":null,"propagation":"direct_children","strength":"hard"
-                }],
-                "unresolved":[]
-            })
-            .to_string()])),
-            requests: requests.clone(),
-        };
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "once-user".into(),
-            "once-session".into(),
-        )
-        .with_test_judgment_clients([
-            Box::new(client) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        ])
-        .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("once-user".into());
-        state.current_session_id = Some("once-session".into());
-        state.current_run_id = Some("once-run".into());
-        state.canonical_turn_chain_id = Some("once-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use high reasoning for every subagent".into();
-        let source = delegation_intent_source_from_state(&state).expect("intent source");
-        state
-            .skills
-            .request_constraints
-            .delegated_model_requirements =
-            astra_turn_types::DelegationIntentRequirements::Unavailable {
-                source: astra_turn_types::DelegationUserRequirementSource {
-                    user_id: source.user_id.clone(),
-                    session_id: source.session_id.clone(),
-                    session_turn: source.session_turn,
-                    applied_intent_id: source.applied_intent_id.clone(),
-                    command_intent_id: None,
-                    user_intent_digest: source.user_intent_digest.clone(),
-                },
-                reason: "prior assessment did not complete".into(),
-                attempts: 1,
-            };
-        let first = json!({
-            "id":"first-call","type":"function",
-            "function":{"name":"agent","arguments":json!({
-                "action":"spawn","description":"Review","prompt":"Review the diff"
-            }).to_string()}
-        });
-        let (admissions, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&first))
-            .await;
-        assert!(admissions.is_empty());
-        assert_eq!(blocked.len(), 1, "unavailable extraction must fail closed");
-        assert!(requests.lock().unwrap().is_empty());
-
-        state.user_intent = "Use high reasoning for each delegated task".into();
-        let changed_source =
-            delegation_intent_source_from_state(&state).expect("new intent source");
-        host.pending_work_admission = Some(ClassifiedWorkAdmission {
-            decision: astra_services::WorkAdmissionDecision::NotRequired {
-                assessment: None,
-                domain: None,
-                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
-                mutation_completion_scope:
-                    astra_config::user_profile::MutationCompletionScope::Unknown,
-                execution_topology: astra_services::WorkExecutionTopology::Primary,
-                required_capabilities: Vec::new(),
-            },
-            delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::No),
-            source: Some(changed_source),
-            work_handoff_pending: false,
-        });
-        let second = json!({
-            "id":"second-call","type":"function",
-            "function":{"name":"agent","arguments":json!({
-                "action":"spawn","description":"Review","prompt":"Review the diff"
-            }).to_string()}
-        });
-        let (admissions, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&second))
-            .await;
-        assert!(blocked.is_empty());
-        assert!(matches!(
-            &admissions["second-call"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1 && slots[0].reasoning.is_some()
-        ));
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            1,
-            "a distinct authenticated user-intent source gets one fresh extraction"
-        );
-    }
-
-    #[tokio::test]
-    async fn scoped_intent_binds_canonical_tasks_without_reextracting_across_batches() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = |response: Value| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    response.to_string()
-                ])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "scope-user".into(),
-            "scope-session".into(),
-        )
-        .with_test_judgment_clients([
-            client(json!({"disposition":"resolved","requirements":[{
-                "model_quote":null,"source_qualifier_quote":null,
-                "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
-                "task_scope_quote":"review","propagation":"direct_children","strength":"hard"
-            }],"unresolved":[]})),
-            client(
-                json!({"assignments":[{"requirement_id":"0","slot_indices":[0]}],"unresolved":[]}),
-            ),
-            client(
-                json!({"assignments":[{"requirement_id":"0","slot_indices":[]}],"unresolved":[]}),
-            ),
-            client(json!({"assignments":[],"unresolved":["task scope is unclear"]})),
-        ])
-        .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("scope-user".into());
-        state.current_session_id = Some("scope-session".into());
-        state.current_run_id = Some("scope-run".into());
-        state.canonical_turn_chain_id = Some("scope-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use high reasoning for review subagent".into();
-        let review = json!({
-            "id":"review-call","type":"function",
-            "function":{"name":"agent","arguments":json!({
-                "action":"spawn","description":"Review","prompt":"Review the code diff"
-            }).to_string()}
-        });
-        let (review_admission, blocked) =
-            host.admitted_delegation_models(&mut state, &[review]).await;
-        assert!(blocked.is_empty());
-        assert!(matches!(
-            &review_admission["review-call"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1 && slots[0].reasoning.is_some()
-        ));
-        let investigation = json!({
-            "id":"investigation-call","type":"function",
-            "function":{"name":"agent","arguments":json!({
-                "action":"spawn","description":"Investigate","prompt":"Investigate the timeout"
-            }).to_string()}
-        });
-        let (other, blocked) = host
-            .admitted_delegation_models(&mut state, &[investigation])
-            .await;
-        assert!(blocked.is_empty());
-        assert!(matches!(
-            other["investigation-call"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { .. }
-        ));
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            3,
-            "one intent assessment and one scoped binding per distinct task batch"
-        );
-        let ambiguous = json!({
-            "id":"ambiguous-call","type":"function",
-            "function":{"name":"agent","arguments":json!({
-                "action":"spawn","description":"Inspect","prompt":"Inspect the result"
-            }).to_string()}
-        });
-        let (unresolved, blocked) = host
-            .admitted_delegation_models(&mut state, &[ambiguous])
-            .await;
-        assert!(unresolved.is_empty());
-        assert_eq!(
-            blocked.len(),
-            1,
-            "uncertain applicability must not start a child"
-        );
-        assert_eq!(requests.lock().unwrap().len(), 4);
-    }
-
-    #[tokio::test]
-    async fn scoped_batch_reindexes_slots_per_invocation_after_binding() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = |response: Value| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    response.to_string()
-                ])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "batch-scope-user".into(),
-            "batch-scope-session".into(),
-        )
-        .with_test_judgment_clients([
-            client(json!({"disposition":"resolved","requirements":[{
-                "model_quote":null,"source_qualifier_quote":null,
-                "reasoning_quote":"high","reasoning":{"mode":"effort","effort":"high"},
-                "task_scope_quote":"review","propagation":"direct_children","strength":"hard"
-            }],"unresolved":[]})),
-            client(json!({"assignments":[{
-                "requirement_id":"0","slot_indices":[1]
-            }],"unresolved":[]})),
-        ])
-        .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("batch-scope-user".into());
-        state.current_session_id = Some("batch-scope-session".into());
-        state.current_run_id = Some("batch-scope-run".into());
-        state.canonical_turn_chain_id = Some("batch-scope-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use high reasoning for the review subagent".into();
-        let make_call = |id: &str, description: &str, prompt: &str| {
-            json!({
-                "id":id,"type":"function",
-                "function":{"name":"agent","arguments":json!({
-                    "action":"spawn","description":description,"prompt":prompt
-                }).to_string()}
-            })
-        };
-        let (admissions, blocked) = host
-            .admitted_delegation_models(
-                &mut state,
-                &[
-                    make_call("investigate-call", "Investigate", "Investigate the timeout"),
-                    make_call("review-call", "Review", "Review the code diff"),
-                ],
-            )
-            .await;
-
-        assert!(blocked.is_empty());
-        assert!(matches!(
-            &admissions["investigate-call"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
-                slot_count: 1
-            }
-        ));
-        assert!(
-            matches!(
-                &admissions["review-call"].outcome,
-                astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                    if slots.len() == 1 && slots[0].slot_index == 0 && slots[0].reasoning.is_some()
-            ),
-            "each tool invocation indexes its own slots from zero"
-        );
-        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[test]

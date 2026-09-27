@@ -3270,7 +3270,7 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
 
     if obj.contains_key("run_in_background") {
         return Err(
-            "unsupported `run_in_background` field for `agent(action='spawn')`: foreground fan-in is the safe default and backgrounding is an explicit user control. Omit the field; in the terminal the user can press Ctrl+B while the child is running."
+            "unsupported `run_in_background` field for `agent(action='spawn')`: spawn returns a launched receipt while the child runs. Omit the field; use agent(action='list') for status and agent(action='get_result') when its outcome is needed."
                 .to_string(),
         );
     }
@@ -3311,6 +3311,7 @@ pub(crate) fn canonical_delegation_slot_briefs(
                     .reasoning
                     .as_ref()
                     .map(delegation_reasoning_requirement),
+                invocation: None,
             }])
         }
         ("agent_fanout", Some("start")) => {
@@ -3334,6 +3335,7 @@ pub(crate) fn canonical_delegation_slot_briefs(
                         .as_ref()
                         .or_else(|| input.defaults.as_ref().and_then(|d| d.reasoning.as_ref()))
                         .map(delegation_reasoning_requirement),
+                    invocation: None,
                 })
                 .collect())
         }
@@ -3786,7 +3788,9 @@ mod tests {
             }))
             .expect_err("backgrounding is an explicit user control");
             assert!(err.contains("run_in_background"), "{err}");
-            assert!(err.contains("Ctrl+B"), "{err}");
+            assert!(err.contains("launched receipt"), "{err}");
+            assert!(err.contains("agent(action='list')"), "{err}");
+            assert!(err.contains("agent(action='get_result')"), "{err}");
         }
     }
 

@@ -51,6 +51,11 @@ criteria:
     document: result
     path: /status
     equals: launched
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /prepared_model/model_name
+    equals: glm-5.2
   - type: text_contains
     needle: GLM-NATURAL-REQUIREMENT-OK
   - type: session_event_count
