@@ -545,6 +545,16 @@ pub trait AgenticLoopHost: Send {
             .direct_child_completion_owner()
     }
 
+    /// Wait at the final-answer barrier. The default is entirely local;
+    /// durable hosts may reconcile remotely owned children while waiting.
+    async fn wait_for_direct_children(
+        &mut self,
+        _state: &AgenticLoopState,
+        owner: Arc<crate::orchestration::FanoutParentAdmission>,
+    ) {
+        owner.wait_for_direct_children().await;
+    }
+
     /// Project shared child-completion facts through the host's canonical
     /// Explain stream. Child output stays in required context, never labels.
     fn on_direct_child_completion_boundary(

@@ -31,6 +31,9 @@
 //! 5. `recover_active_runs()` — On startup, loads runs that were active when process died
 //! 6. `load_run()` — Loads a run from store (cache miss path)
 
+#[path = "remote_child_wake.rs"]
+mod remote_child_wake;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -351,6 +354,7 @@ fn restart_session_continuation_event(
 #[derive(Clone)]
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
+    remote_child_wake: Arc<remote_child_wake::RemoteChildWakeHub>,
     projection_store: Option<Arc<DatabaseStateProjectionStore>>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
@@ -1192,6 +1196,7 @@ impl RunEngine {
     /// Create a new engine backed by the given store.
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
         Self {
+            remote_child_wake: remote_child_wake::RemoteChildWakeHub::new(store.clone()),
             store,
             projection_store: None,
             metrics_registry: None,
@@ -4490,6 +4495,31 @@ impl RunEngine {
         receipt: &astra_services::runs::PreDurableChildTerminal,
     ) -> Result<astra_services::runs::PreDurableChildTerminalCommit, String> {
         self.store.commit_pre_durable_child_terminal(receipt).await
+    }
+
+    pub async fn load_session_agent_recovery_for(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_ids: &[String],
+    ) -> Result<astra_services::runs::DurableSessionRunPage, String> {
+        self.store
+            .load_session_agent_recovery_for(user_id, session_id, run_ids)
+            .await
+    }
+
+    /// Process-wide, batched wake hints. Receivers own their subscription;
+    /// dropping the last receiver removes its observation on the next sweep.
+    /// A hint requires an exact durable recovery read, never finalization.
+    pub fn subscribe_remote_child_wake(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+        child_run_ids: &[String],
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        self.remote_child_wake
+            .subscribe(user_id, session_id, parent_run_id, child_run_ids)
     }
 
     /// Access the underlying store (for advanced queries).

@@ -949,6 +949,7 @@ pub(crate) async fn handle_team_command(
                 match crate::cli::session_judge::assess_direct_team_model_plan(
                     api,
                     &token,
+                    state.journal.as_ref(),
                     &user_id,
                     &session_id,
                     &command_identity,

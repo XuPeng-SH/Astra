@@ -3359,8 +3359,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let duration_secs =
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
         let request_usage = load_session_request_usage(&pool, user_id, session_id).await?;
-        // The ledger has physical usage but no historical price snapshot.
-        // Current model-name prices must not rewrite historical spending.
+        // Routes now retain optional admission prices, but this projection
+        // does not yet join and price every physical attempt in the task tree.
+        // Keep cost unknown until that coverage can be proven; today's catalog
+        // prices must never substitute for missing historical evidence.
         let cost = SessionCostSummary::default();
 
         Ok(SessionAuditSummary {

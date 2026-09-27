@@ -110,6 +110,80 @@ pub(crate) fn configured_pricing_from_stored(raw: &str) -> Option<ConfiguredPric
     Some(price)
 }
 
+/// Immutable configured price basis captured at model admission. This is an
+/// admission-rate estimate basis, not a verified provider bill. Private fields
+/// ensure that only validated USD-per-token rates enter the inference ledger.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct InferencePriceSnapshot {
+    calculation_version: u32,
+    #[serde(flatten)]
+    pricing: ModelCatalogPricing,
+}
+
+impl InferencePriceSnapshot {
+    fn from_configured(raw: &str, configuration_updated_at: &str) -> Option<Self> {
+        Some(Self {
+            calculation_version: 1,
+            pricing: catalog_pricing_from_stored(raw, configuration_updated_at)?,
+        })
+    }
+
+    /// Decode retained evidence without consulting today's model catalog.
+    /// Unsupported versions or malformed rates remain unknown.
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct Stored {
+            calculation_version: u32,
+            #[serde(flatten)]
+            pricing: ModelCatalogPricing,
+        }
+        let stored: Stored = serde_json::from_str(raw).ok()?;
+        let price = &stored.pricing;
+        if stored.calculation_version != 1
+            || price.currency != "USD"
+            || price.unit != "per_token"
+            || price.source != "configured"
+            || price.configuration_updated_at.trim().is_empty()
+        {
+            return None;
+        }
+        validate_pricing_data(&PricingData {
+            prompt: price.prompt,
+            completion: price.completion,
+            cache_read: price.cache_read,
+            cache_write: price.cache_write,
+        })
+        .ok()?;
+        Some(Self {
+            calculation_version: stored.calculation_version,
+            pricing: stored.pricing,
+        })
+    }
+
+    /// All token lanes must be observed. In particular, an absent cache count
+    /// is not zero, and an observed cache count needs its own configured rate.
+    pub fn estimated_cost_usd(
+        &self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> Option<f64> {
+        PricingData {
+            prompt: self.pricing.prompt,
+            completion: self.pricing.completion,
+            cache_read: self.pricing.cache_read,
+            cache_write: self.pricing.cache_write,
+        }
+        .estimated_cost_usd(
+            input_tokens?,
+            output_tokens?,
+            cache_read_tokens?,
+            cache_write_tokens?,
+        )
+    }
+}
+
 impl PricingData {
     #[must_use]
     pub fn is_valid(&self) -> bool {
@@ -689,6 +763,7 @@ pub fn model_catalog_revision(items: &[ModelListItem]) -> String {
 /// any future `tracing::debug!(?model)` would otherwise leak the raw key.
 #[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
+    pub price_snapshot: Option<InferencePriceSnapshot>,
     /// Local model name used for routing, telemetry, fallback_chain lookups,
     /// and capture-file labels. Unique per row.
     pub model_name: String,
@@ -865,6 +940,7 @@ impl ModelExecutionPlacement {
 /// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
+    pub price_snapshot: Option<InferencePriceSnapshot>,
     pub offering_id: String,
     pub source_identity: Option<ResolvedModelSourceIdentity>,
     pub access_kind: ModelAccessKind,
@@ -916,6 +992,7 @@ impl AdmittedModelExecution {
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
+            price_snapshot: offering.model.price_snapshot,
             offering_id: offering.offering_id,
             source_identity: Some(ResolvedModelSourceIdentity {
                 provider: offering.model.provider.clone(),
@@ -951,6 +1028,7 @@ impl AdmittedModelExecution {
         context_window: u32,
     ) -> Self {
         Self {
+            price_snapshot: None,
             offering_id,
             source_identity: None,
             access_kind: ModelAccessKind::ThisDevice,
@@ -1420,6 +1498,16 @@ fn build_resolved_active_llm_from_row(
     }
 
     Ok(ResolvedActiveLlmModel {
+        price_snapshot: row
+            .try_get::<Option<String>, _>("pricing_json")
+            .ok()
+            .flatten()
+            .zip(
+                row.try_get::<Option<String>, _>("configuration_updated_at")
+                    .ok()
+                    .flatten(),
+            )
+            .and_then(|(raw, revision)| InferencePriceSnapshot::from_configured(&raw, &revision)),
         model_name,
         wire_model_name,
         api_key,
@@ -1643,6 +1731,7 @@ pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
 /// Shared columns for all model-resolution queries.
 const RESOLVE_COLS: &str = "\
     model_name, api_key_encrypted, base_url, provider, \
+    CAST(updated_at AS CHAR) AS configuration_updated_at, \
     CAST(quirks AS CHAR) AS quirks_json, \
     CAST(pricing AS CHAR) AS pricing_json, \
     CAST(tags AS CHAR) AS tags_json, \
@@ -2198,6 +2287,7 @@ fn admitted_user_model_from_row(
     let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
     Ok(AdmittedModelExecution {
+        price_snapshot: None,
         offering_id: offering_id.to_string(),
         source_identity: Some(ResolvedModelSourceIdentity {
             provider: provider.clone(),
@@ -6906,6 +6996,7 @@ mod tests {
 
     fn sample_resolved_active_model(name: &str) -> ResolvedActiveLlmModel {
         ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: name.to_string(),
             wire_model_name: None,
             api_key: "sk-test".to_string(),
@@ -7304,6 +7395,71 @@ mod tests {
     // -- PricingData --
 
     #[test]
+    fn inference_price_snapshot_survives_catalog_price_change_and_restore() {
+        let mut model = sample_resolved_active_model("priced-model");
+        model.price_snapshot = InferencePriceSnapshot::from_configured(
+            r#"{"currency":"USD","unit":"per_token","prompt":0.000001,"completion":0.000002,"cache_read":0.0000001,"cache_write":0}"#,
+            "2026-09-27 01:00:00.000000",
+        );
+        let admitted = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: "priced-offering".into(),
+            model: model.clone(),
+        })
+        .unwrap();
+        let retained = serde_json::to_string(admitted.price_snapshot.as_ref().unwrap()).unwrap();
+
+        model.price_snapshot = InferencePriceSnapshot::from_configured(
+            r#"{"currency":"USD","unit":"per_token","prompt":1,"completion":2}"#,
+            "2026-09-27 02:00:00.000000",
+        );
+        let restored = InferencePriceSnapshot::from_stored(&retained).unwrap();
+        assert_eq!(Some(&restored), admitted.price_snapshot.as_ref());
+        assert_ne!(Some(&restored), model.price_snapshot.as_ref());
+        let estimate = restored
+            .estimated_cost_usd(Some(100), Some(20), Some(50), Some(0))
+            .unwrap();
+        assert!((estimate - 0.000145).abs() < 1e-12);
+    }
+
+    #[test]
+    fn inference_price_snapshot_keeps_absent_rates_and_usage_unknown() {
+        let snapshot = InferencePriceSnapshot::from_configured(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+            "2026-09-27",
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.estimated_cost_usd(Some(100), Some(20), Some(0), Some(0)),
+            Some(0.0)
+        );
+        for counts in [
+            [Some(100), Some(20), Some(1), Some(0)],
+            [Some(100), Some(20), Some(0), Some(1)],
+            [Some(100), None, Some(0), Some(0)],
+            [Some(100), Some(20), None, Some(0)],
+            [None, Some(20), Some(0), Some(0)],
+        ] {
+            assert_eq!(
+                snapshot.estimated_cost_usd(counts[0], counts[1], counts[2], counts[3]),
+                None
+            );
+        }
+        assert!(InferencePriceSnapshot::from_configured("{}", "2026-09-27").is_none());
+        let stored = serde_json::to_value(&snapshot).unwrap();
+        for (field, value) in [
+            ("currency", serde_json::json!("CNY")),
+            ("unit", serde_json::json!("per_million_tokens")),
+            ("calculation_version", serde_json::json!(2)),
+            ("prompt", serde_json::json!(-1)),
+            ("cache_read", serde_json::json!(-1)),
+        ] {
+            let mut invalid = stored.clone();
+            invalid[field] = value;
+            assert!(InferencePriceSnapshot::from_stored(&invalid.to_string()).is_none());
+        }
+    }
+
+    #[test]
     fn pricing_data_serialization_roundtrip() {
         let p = PricingData {
             prompt: 0.000_003,
@@ -7457,6 +7613,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_prefers_wire_model_name_when_set() {
         let r = ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: "deepseek-v4-pro-anthropic".into(),
             wire_model_name: Some("deepseek-v4-pro".into()),
             api_key: "k".into(),
@@ -7481,6 +7638,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_falls_back_to_local_name_when_unset() {
         let r = ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: "claude-sonnet-4-6".into(),
             wire_model_name: None,
             api_key: "k".into(),

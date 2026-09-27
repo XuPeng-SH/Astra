@@ -4467,17 +4467,55 @@ struct ServerDurableAgentReconciler {
 struct ServerDurableAgentReconcileState {
     last_attempt: Option<Instant>,
     cached: Option<Result<Vec<DurableRunRecord>, String>>,
+    // None is the discovery page; exact refreshes cache their full identity set.
+    cached_run_ids: Option<Vec<String>>,
     cancellation_cursor: Option<String>,
 }
 
 #[async_trait]
 impl DurableAgentReconciler for ServerDurableAgentReconciler {
+    fn subscribe_remote_child_wake(
+        &self,
+        parent_run_id: &str,
+        child_run_ids: &[String],
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        self.run_engine.subscribe_remote_child_wake(
+            &self.user_id,
+            &self.session_id,
+            parent_run_id,
+            child_run_ids,
+        )
+    }
+
     async fn load_agent_recovery(&self) -> Result<Vec<DurableRunRecord>, String> {
+        self.load_agent_recovery_selected(None).await
+    }
+
+    async fn load_agent_recovery_for(
+        &self,
+        run_ids: &[String],
+    ) -> Result<Vec<DurableRunRecord>, String> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut run_ids = run_ids.to_vec();
+        run_ids.sort();
+        run_ids.dedup();
+        self.load_agent_recovery_selected(Some(run_ids)).await
+    }
+}
+
+impl ServerDurableAgentReconciler {
+    async fn load_agent_recovery_selected(
+        &self,
+        run_ids: Option<Vec<String>>,
+    ) -> Result<Vec<DurableRunRecord>, String> {
         const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
         let mut state = self.state.lock().await;
         if state
             .last_attempt
             .is_some_and(|attempt| attempt.elapsed() < MIN_REFRESH_INTERVAL)
+            && state.cached_run_ids == run_ids
             && let Some(cached) = &state.cached
         {
             return cached.clone();
@@ -4485,15 +4523,14 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
         let cancellation_cursor = state.cancellation_cursor.clone();
         let mut next_cancellation_cursor = None;
         let result = async {
-            let mut page = self
-                .run_engine
-                .load_session_agent_recovery_after(
-                    &self.user_id,
-                    &self.session_id,
-                    200,
-                    cancellation_cursor.as_deref(),
-                )
-                .await?;
+            let mut page = match &run_ids {
+                Some(run_ids) => self.run_engine.load_session_agent_recovery_for(
+                    &self.user_id, &self.session_id, run_ids,
+                ).await?,
+                None => self.run_engine.load_session_agent_recovery_after(
+                    &self.user_id, &self.session_id, 200, cancellation_cursor.as_deref(),
+                ).await?,
+            };
             next_cancellation_cursor = page.recovery_next_cursor.clone();
             let recovery_cancellation_run_ids = page
                 .recovery_cancellation_run_ids
@@ -4618,10 +4655,11 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
         }
         .await;
         state.last_attempt = Some(Instant::now());
-        if result.is_ok() {
+        if result.is_ok() && run_ids.is_none() {
             // An empty seek page wraps the cancellation lane to the beginning.
             state.cancellation_cursor = next_cancellation_cursor;
         }
+        state.cached_run_ids = run_ids;
         state.cached = Some(result.clone());
         result
     }
@@ -7106,7 +7144,7 @@ impl AgenticRunLifecycleService {
             .unwrap_or_else(|| "root-agent".to_string());
         let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
-            fanout_admission: entry.spawner.fanout_parent(run_id),
+            fanout_admission: entry.spawner.attach_fanout_parent(run_id).await,
             delegation_model_admission: None,
             run_id: run_id.to_string(),
             agent_id,

@@ -206,6 +206,7 @@ pub(crate) async fn execute_delegation_requirement_stage(
 pub(crate) async fn assess_direct_team_model_plan(
     api: &ThinClient,
     token: &str,
+    journal: Option<&astra_services::session_journal::JournalWriter>,
     user_id: &str,
     session_id: &str,
     command_identity: &astra_turn_types::DirectDelegationCommandIdentity,
@@ -223,6 +224,49 @@ pub(crate) async fn assess_direct_team_model_plan(
         DelegationUserRequirementSource,
     };
     use sha2::Digest;
+    let started_at = std::time::Instant::now();
+    let record_assessment = |outcome: &str,
+                             extraction: Option<&CompletionResponse>,
+                             summary: Option<
+        &astra_services::delegation_model_requirement::DelegationCandidateJudgmentSummary,
+    >| {
+        let Some(journal) = journal else { return };
+        use astra_services::session_journal::{JournalEvent, TraceSpanBuilder};
+        let finished_us = chrono::Utc::now().timestamp_micros().max(0) as u64;
+        let attrs = std::collections::HashMap::from([(
+            "delegation_model_assessment".to_string(),
+            json!({
+                "schema_version": 1,
+                "command_intent_id": command_identity.command_intent_id,
+                "operation_id": format!("{}:{}", CompletionOperation::DelegationIntentExtraction.operation_id(), command_identity.command_intent_id),
+                "outcome": outcome,
+                "summary": summary,
+                "completion_id": extraction.map(|response| &response.id),
+                "usage": extraction.map(|response| &response.usage),
+            })
+            .to_string(),
+        )]);
+        let event = JournalEvent::trace_span_v2(
+            TraceSpanBuilder::default()
+                .session_id(Some(session_id))
+                .turn(Some(command_identity.session_turn))
+                .span_id(format!(
+                    "delegation_model_assessment_{}",
+                    command_identity.command_intent_id
+                ))
+                .name("delegation_model_assessment".into())
+                .trace_id(Some(command_identity.command_intent_id.clone()))
+                .start_us(finished_us.saturating_sub(started_at.elapsed().as_micros() as u64))
+                .end_us(finished_us)
+                .attrs(Some(&attrs)),
+        );
+        super::cli_config::cli_utils::append_journal_event_or_warn(
+            journal,
+            Some(session_id),
+            &event,
+            "direct_team:delegation_model_assessment",
+        );
+    };
 
     if request.user_id != user_id || request.session_id != session_id || request.task != task {
         return Err("Team command identity or task changed before model assessment".into());
@@ -265,28 +309,47 @@ pub(crate) async fn assess_direct_team_model_plan(
         )?)
         .map_err(|_| "Delegated model assessment exceeds its output budget")?,
     )
-    .await?;
-    if extraction
+    .await;
+    let extraction = match extraction {
+        Ok(extraction) => extraction,
+        Err(error) => {
+            record_assessment("unavailable", None, None);
+            return Err(error);
+        }
+    };
+    let extracted = if extraction
         .choices
         .first()
         .is_none_or(|choice| choice.finish_reason != "stop")
     {
-        return Err(
-            "Delegated model requirements did not finish normally; no child was started.".into(),
-        );
-    }
-    let extracted = parse_delegation_intent_requirements(
-        extraction
-            .first_text()
-            .ok_or("Delegated model assessment omitted its response")?,
-        task,
-        &candidates,
-        Some(&slot_plan.briefs),
-        // The direct CLI command has no separate WorkAdmission fact. The
-        // structured extraction contract is the sole authority here; do not
-        // replace it with a keyword heuristic that can misread task prose.
-        false,
-    )?;
+        Err("Delegated model requirements did not finish normally; no child was started.".into())
+    } else if let Some(text) = extraction.first_text() {
+        parse_delegation_intent_requirements(
+            text,
+            task,
+            &candidates,
+            Some(&slot_plan.briefs),
+            // The direct CLI command has no separate WorkAdmission fact. The
+            // structured extraction contract is the sole authority here; do not
+            // replace it with a keyword heuristic that can misread task prose.
+            false,
+        )
+    } else {
+        Err("Delegated model assessment omitted its response".into())
+    };
+    record_assessment(
+        if extracted.is_ok() {
+            "parsed"
+        } else {
+            "invalid"
+        },
+        Some(&extraction),
+        extracted
+            .as_ref()
+            .ok()
+            .map(|assessment| &assessment.summary),
+    );
+    let extracted = extracted?;
     let assessed =
         astra_services::delegation_model_requirement::materialize_delegation_intent_requirements(
             &extracted,
@@ -519,6 +582,10 @@ mod tests {
             AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
         };
 
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _journal_scope =
+            astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let journal = astra_services::session_journal::JournalWriter::new(SESSION).unwrap();
         let server = MockServer::start().await;
         let extracted = json!({
             "disposition": "resolved",
@@ -615,6 +682,7 @@ mod tests {
         let plan = assess_direct_team_model_plan(
             &api,
             "test-token",
+            Some(&journal),
             "user-1",
             SESSION,
             &identity,
@@ -654,6 +722,41 @@ mod tests {
             );
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let events = astra_services::session_journal::read_journal(SESSION).unwrap();
+        let assessment = events
+            .iter()
+            .find(|event| {
+                event
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata["name"].as_str())
+                    == Some("delegation_model_assessment")
+            })
+            .expect("candidate decision must be in the existing session trace");
+        let evidence: Value = serde_json::from_str(
+            assessment.metadata.as_ref().unwrap()["attrs"]["delegation_model_assessment"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence["summary"]["candidate_snapshot_digest"].is_string(),
+            true
+        );
+        assert_eq!(
+            evidence["summary"]["selections"][0]["candidate_id"],
+            "offering-flash"
+        );
+        assert_eq!(
+            evidence["summary"]["selections"][0]["slot_indices"],
+            json!([])
+        );
+        assert_eq!(evidence["usage"]["total_tokens"], 60);
+        assert_eq!(
+            evidence["operation_id"],
+            format!("delegation_intent:{}", identity.command_intent_id)
+        );
+        assert!(!format!("{evidence}").contains("nested reviewers"));
     }
 
     #[tokio::test]
@@ -662,6 +765,10 @@ mod tests {
             AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
         };
 
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _journal_scope =
+            astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let journal = astra_services::session_journal::JournalWriter::new(SESSION).unwrap();
         let server = MockServer::start().await;
         let extracted = json!({
             "disposition": "resolved",
@@ -741,6 +848,7 @@ mod tests {
         let error = assess_direct_team_model_plan(
             &api,
             "test-token",
+            Some(&journal),
             "user-1",
             SESSION,
             &identity,
@@ -756,6 +864,15 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             2,
             "assessment stops before any child admission or execution"
+        );
+        assert!(
+            astra_services::session_journal::read_journal(SESSION)
+                .unwrap()
+                .iter()
+                .any(|event| event
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["name"] == "delegation_model_assessment"))
         );
     }
 

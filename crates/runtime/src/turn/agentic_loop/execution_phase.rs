@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
@@ -259,7 +260,7 @@ async fn await_direct_children_before_completion<H: AgenticLoopHost>(
                 return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
                     "parent cancelled while waiting for direct children"));
             }
-            result = tokio::time::timeout(wait_budget, owner.wait_for_direct_children()) => {
+            result = tokio::time::timeout(wait_budget, host.wait_for_direct_children(state, Arc::clone(&owner))) => {
                 if result.is_ok() { "synthesis_ready" } else { "deadline" }
             }
         }

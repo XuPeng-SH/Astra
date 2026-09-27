@@ -458,6 +458,7 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    price_snapshot: None,
                     model_name: "server-model".into(),
                     wire_model_name: Some("wire-model".into()),
                     api_key: "server-secret".into(),

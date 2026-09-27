@@ -327,6 +327,7 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id: id,
                 model: ResolvedActiveLlmModel {
+                    price_snapshot: None,
                     model_name: "jev".into(),
                     wire_model_name: None,
                     api_key: self.key.clone(),

@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
@@ -120,6 +120,14 @@ fn cancellation_retry_global_capacity() -> &'static Arc<tokio::sync::Semaphore> 
             CANCELLATION_RETRY_GLOBAL_CONCURRENCY,
         ))
     })
+}
+
+fn remote_child_recovery_capacity() -> &'static Arc<Semaphore> {
+    static CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    // A terminal burst must queue before taking database connections. This
+    // bounds reconciliation across all sessions in this process, unlike the
+    // per-spawner lock that only serializes one session's snapshots.
+    CAPACITY.get_or_init(|| Arc::new(Semaphore::new(16)))
 }
 
 fn effective_spawn_allowed_tools(
@@ -2291,6 +2299,28 @@ pub trait DurableAgentReconciler: Send + Sync {
     async fn load_agent_recovery(
         &self,
     ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String>;
+
+    /// A final-answer wait supplies its exact unresolved child/parent IDs.
+    /// Production reads them as one bounded batch instead of rescanning an
+    /// unrelated session page. Test and in-memory implementations may reuse
+    /// their ordinary snapshot.
+    async fn load_agent_recovery_for(
+        &self,
+        _run_ids: &[String],
+    ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+        self.load_agent_recovery().await
+    }
+
+    /// Subscribe to a process-wide durable wake hint for remote direct children.
+    /// The hint is not completion evidence; callers must reload exact run IDs.
+    /// A reconciler without a remote observer may return None (local-only hosts).
+    fn subscribe_remote_child_wake(
+        &self,
+        _parent_run_id: &str,
+        _child_run_ids: &[String],
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        Ok(None)
+    }
 }
 
 // ─── Dynamic Agent Spawner ──────────────────────────────────────────────────
@@ -2792,7 +2822,9 @@ impl DynamicAgentSpawner {
     }
 
     /// Acquire before recovery and retain for the parent execution, including
-    /// all cloned tool calls. No session-lifetime cancellation tombstones.
+    /// all cloned tool calls. If recovery already ran, use
+    /// [`Self::attach_fanout_parent`] to attach its in-memory child projections.
+    /// No session-lifetime cancellation tombstones.
     pub fn fanout_parent(&self, parent_run_id: &str) -> Arc<FanoutParentAdmission> {
         let mut parents = astra_core::sync_poison::recover_mutex_lock(&self.fanout_parents);
         parents.retain(|_, parent| parent.strong_count() > 0);
@@ -2810,6 +2842,31 @@ impl DynamicAgentSpawner {
             direct_child_changed: Arc::new(tokio::sync::Notify::new()),
         });
         parents.insert(parent_run_id.to_string(), Arc::downgrade(&parent));
+        parent
+    }
+
+    /// Attach an executing parent after session recovery. Only this exact
+    /// run's direct background children are registered, using existing memory
+    /// without re-reading the journal or refreshing durable state. Recovery's
+    /// interrupted/waiting evidence is preserved as-is.
+    pub async fn attach_fanout_parent(&self, parent_run_id: &str) -> Arc<FanoutParentAdmission> {
+        let parent = self.fanout_parent(parent_run_id);
+        {
+            // Register under the read guard so a live transition cannot publish
+            // between reading the child and installing its completion obligation.
+            let active = self.active_agents.read().await;
+            for state in active.values() {
+                parent.register_direct_child(state);
+            }
+        }
+        {
+            let archived = self.completed_agents.read().await;
+            // Live registrations, newer publications and consumed tombstones
+            // win over history. Within history, prefer the newest projection.
+            for state in archived.iter().rev() {
+                parent.register_direct_child(state);
+            }
+        }
         parent
     }
 
@@ -2979,11 +3036,19 @@ impl DynamicAgentSpawner {
     /// Refresh only read-only, remotely-owned observations. Locally executing
     /// child state is never overwritten by a database snapshot.
     pub async fn reconcile_durable_agent_runs(&self) -> Result<usize, String> {
+        self.reconcile_durable_agent_runs_for(&[]).await
+    }
+
+    async fn reconcile_durable_agent_runs_for(&self, run_ids: &[String]) -> Result<usize, String> {
         let _reconcile_guard = self.durable_reconcile_lock.lock().await;
         let Some(reconciler) = self.durable_reconciler.read().await.clone() else {
             return Ok(0);
         };
-        let runs = reconciler.load_agent_recovery().await?;
+        let runs = if run_ids.is_empty() {
+            reconciler.load_agent_recovery().await?
+        } else {
+            reconciler.load_agent_recovery_for(run_ids).await?
+        };
         if runs.is_empty() {
             return Ok(0);
         }
@@ -3039,6 +3104,104 @@ impl DynamicAgentSpawner {
             }
         }
         Ok(restored + changed.len())
+    }
+
+    /// Local children notify in memory; remote children use one process-wide
+    /// batched observer. A hint only triggers exact durable reconciliation.
+    pub async fn wait_for_direct_children(&self, parent: &FanoutParentAdmission) {
+        let mut failures = 0u32;
+        loop {
+            let notified = parent.direct_child_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let pending = parent.pending_direct_children();
+            if pending.iter().all(|child| child.status.is_terminal()) {
+                return;
+            }
+            let active = self.active_agents.read().await;
+            let run_ids = pending
+                .iter()
+                .filter(|child| {
+                    !child.status.is_terminal() && !active.contains_key(&child.agent_id)
+                })
+                .map(|child| child.run_id.clone())
+                .collect::<Vec<_>>();
+            drop(active);
+            if run_ids.is_empty() {
+                notified.await;
+                continue;
+            }
+            let reconciler = self.durable_reconciler.read().await.clone();
+            let Some(reconciler) = reconciler else {
+                notified.await;
+                continue;
+            };
+            let subscription =
+                reconciler.subscribe_remote_child_wake(parent.parent_run_id(), &run_ids);
+            let mut receiver = match subscription {
+                Ok(Some(receiver)) => receiver,
+                Ok(None) => {
+                    // Local-only test/recovery providers can still observe an
+                    // already-settled child once, but never create a poller.
+                    let mut exact = run_ids;
+                    exact.push(parent.parent_run_id().to_string());
+                    let _ = self.reconcile_durable_agent_runs_for(&exact).await;
+                    notified.await;
+                    continue;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures.is_multiple_of(10) {
+                        tracing::warn!(parent_run_id = parent.parent_run_id(), failures,
+                            %error, "remote direct-child wake subscription failed");
+                    }
+                    tokio::select! {
+                        _ = &mut notified => {},
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                    }
+                    continue;
+                }
+            };
+            tokio::select! {
+                _ = &mut notified => {},
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        failures = failures.saturating_add(1);
+                        tokio::select! {
+                            _ = &mut notified => {},
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                        }
+                        continue;
+                    }
+                    let mut exact = run_ids;
+                    exact.push(parent.parent_run_id().to_string());
+                    exact.sort_unstable();
+                    exact.dedup();
+                    let permit = tokio::select! {
+                        permit = remote_child_recovery_capacity().acquire() => permit,
+                        _ = &mut notified => continue,
+                    };
+                    let result = match permit {
+                        Ok(_permit) => self.reconcile_durable_agent_runs_for(&exact).await,
+                        Err(error) => Err(error.to_string()),
+                    };
+                    if let Err(error) = result {
+                        failures = failures.saturating_add(1);
+                        if failures == 1 || failures.is_multiple_of(10) {
+                            tracing::warn!(parent_run_id = parent.parent_run_id(), failures,
+                                %error, "remote direct-child recovery refresh failed");
+                        }
+                        let seconds = (1u64 << failures.min(5)).min(30);
+                        tokio::select! {
+                            _ = &mut notified => {},
+                            _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
+                        }
+                    } else {
+                        failures = 0;
+                    }
+                }
+            }
+        }
     }
 
     fn ensure_cancellation_retry_supervisor(&self) {
@@ -3779,9 +3942,10 @@ impl DynamicAgentSpawner {
         }
     }
 
-    /// Restore obligations only for an execution that acquired its owner
-    /// before recovery. The session history is not an owner and must not keep
-    /// old parent executions alive or resurrect consumed results.
+    /// Restore obligations for an already-attached execution. A later owner
+    /// attaches from the in-memory projections via `attach_fanout_parent`.
+    /// Session history must not keep old parent executions alive or resurrect
+    /// consumed results.
     fn restore_direct_child_completion(&self, state: &SpawnedAgentState) {
         let parent = astra_core::sync_poison::recover_mutex_lock(&self.fanout_parents)
             .get(&state.parent_run_id)
@@ -4026,23 +4190,42 @@ impl DynamicAgentSpawner {
                 self.restore_direct_child_completion(&existing);
                 continue;
             }
-            let parent = astra_core::sync_poison::recover_mutex_lock(&self.fanout_parents)
-                .get(parent_run_id)
-                .and_then(std::sync::Weak::upgrade);
-            if let Some(parent) = parent {
-                parent.register_direct_child_completion(DirectChildCompletion {
-                    agent_id: spawn.agent_id.clone(),
-                    run_id: run_id.clone(),
-                    parent_agent_id: runs
-                        .iter()
-                        .find(|run| run.run_id == parent_run_id)
-                        .and_then(|run| run.agent_id.clone())
-                        .unwrap_or_else(|| "root".into()),
-                    status: AgentStatus::Waiting {
-                        reason: "accepted child is absent from the recovery snapshot".into(),
-                    },
-                });
-            }
+            let state = SpawnedAgentState {
+                agent_id: spawn.agent_id.clone(),
+                run_id: run_id.clone(),
+                cancellation_binding_id: None,
+                parent_run_id: parent_run_id.to_string(),
+                agent_type: spawn.agent_type.clone(),
+                description: spawn.description.clone(),
+                status: AgentStatus::Waiting {
+                    reason: "accepted child is absent from the recovery snapshot".into(),
+                },
+                work_revision: 1,
+                messaging_address: None,
+                worktree_path: None,
+                started_at: SystemTime::now(),
+                ended_at: None,
+                metrics: SpawnedAgentMetrics::default(),
+                permission_summary: PermissionSummary::default(),
+                parent_agent_id: runs
+                    .iter()
+                    .find(|run| run.run_id == parent_run_id)
+                    .and_then(|run| run.agent_id.clone())
+                    .unwrap_or_else(|| "root".into()),
+                trace_context: None,
+                spawn_tool_call_id: None,
+                run_in_background: true,
+                fanout_slot: None,
+                execution_metadata: None,
+            };
+            self.restore_direct_child_completion(&state);
+            self.durable_observed_agent_ids
+                .write()
+                .await
+                .insert(state.agent_id.clone());
+            self.publish_background_agent(&state);
+            self.archive_state(state).await;
+            restored += 1;
         }
         self.restore_recovered_fanout_batches(
             &recovered,
@@ -8683,6 +8866,17 @@ impl DynamicAgentSpawner {
         // contain the terminal state, deadline cancellation can still query
         // the active map and help publish the same terminal projection.
         self.active_agents.write().await.remove(agent_id);
+        if !settled_state.status.is_terminal() {
+            // A parent may have consumed the earlier Waiting notification
+            // while this child still appeared locally active. Notify again
+            // after retiring local ownership so it installs a durable wake.
+            if let Some(parent) = astra_core::sync_poison::recover_mutex_lock(&self.fanout_parents)
+                .get(&settled_state.parent_run_id)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                parent.direct_child_changed.notify_waiters();
+            }
+        }
         self.notify_completion(agent_id).await;
         let spawner = self.clone_for_task();
         let agent_id = agent_id.to_string();
@@ -8898,19 +9092,34 @@ impl DynamicAgentSpawner {
     }
 
     async fn archive_state(&self, state: SpawnedAgentState) {
+        let mut observed = self.durable_observed_agent_ids.write().await;
         let mut completed = self.completed_agents.write().await;
         const MAX_COMPLETED_AGENTS: usize = 256;
-        if completed.len() >= MAX_COMPLETED_AGENTS {
-            // Non-terminal entries may own the mailbox/worktree capability
-            // needed by durable cancellation reconciliation. Evict history,
-            // never live ownership. If every entry is non-terminal, allow the
-            // queue to exceed the history target until one settles; active and
-            // in-flight admission bounds that exceptional growth.
-            if let Some(position) = completed
+        while completed.len() >= MAX_COMPLETED_AGENTS {
+            // A remote observation does not own execution or cleanup. Its
+            // parent obligation survives in the fanout parent, and exact
+            // recovery can rehydrate it after eviction. A seized cancellation
+            // job, local mailbox, or worktree must remain resident.
+            let position = completed
                 .iter()
                 .position(|archived| archived.status.is_terminal())
-            {
-                completed.remove(position);
+                .or_else(|| {
+                    // Receipt recovery may already hold a read guard while a
+                    // cancellation writer is queued. Never await a recursive
+                    // read here: Tokio's writer preference would deadlock.
+                    // Failing to evict this time is safer than dropping an
+                    // active cancellation owner.
+                    let owners = self.in_flight_cancellations.try_read().ok()?;
+                    completed.iter().position(|archived| {
+                        observed.contains(&archived.agent_id)
+                            && !owners.contains_key(&archived.agent_id)
+                            && archived.messaging_address.is_none()
+                            && archived.worktree_path.is_none()
+                    })
+                });
+            let Some(position) = position else { break };
+            if let Some(evicted) = completed.remove(position) {
+                observed.remove(&evicted.agent_id);
             }
         }
         completed.push_back(state);
@@ -10654,15 +10863,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_direct_child_completion_wakes_parent_without_an_external_poll() {
+        for locally_yielded in [false, true] {
+            let spawner = DynamicAgentSpawner::new(mock_router());
+            let mut child = durable_run("remote-child", 1, astra_core::STATUS_RUNNING);
+            child.agent_id = Some("remote-reviewer".into());
+            spawner.restore_durable_agent_runs(&[child.clone()]).await;
+            if locally_yielded {
+                // A local child can retire its executor while leaving a
+                // nonterminal archived projection. It still needs refresh.
+                spawner.durable_observed_agent_ids.write().await.clear();
+            }
+            let parent = spawner.attach_fanout_parent("root-run").await;
+            assert!(parent.has_pending_direct_children());
+            child.status = astra_core::STATUS_FAILED.into();
+            child.error_message = Some("remote reviewer failed".into());
+            spawner
+                .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                    runs: vec![child],
+                }))
+                .await;
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                spawner.wait_for_direct_children(&parent),
+            )
+            .await
+            .expect("the final-answer barrier itself must refresh remote durable truth");
+            let delivered = parent.take_completed_direct_children();
+            assert_eq!(delivered.len(), 1);
+            assert!(
+                matches!(&delivered[0].status, AgentStatus::Failed { error, .. } if error == "remote reviewer failed")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_child_handoff_notifies_parent_after_active_ownership_retires() {
+        struct HandoffReconciler {
+            child: std::sync::Mutex<astra_services::runs::DurableRunRecord>,
+            wake: tokio::sync::watch::Sender<u64>,
+            subscribed: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl DurableAgentReconciler for HandoffReconciler {
+            async fn load_agent_recovery(
+                &self,
+            ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+                Ok(vec![self.child.lock().unwrap().clone()])
+            }
+
+            fn subscribe_remote_child_wake(
+                &self,
+                _parent_run_id: &str,
+                _child_run_ids: &[String],
+            ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+                self.subscribed.notify_one();
+                Ok(Some(self.wake.subscribe()))
+            }
+        }
+
+        let spawner = Arc::new(DynamicAgentSpawner::new(mock_router()));
+        let parent = spawner.fanout_parent("root-run");
+        let mut child = completed_test_state(999);
+        child.agent_id = "handoff-child".into();
+        child.run_id = "handoff-run".into();
+        child.parent_run_id = "root-run".into();
+        child.status = AgentStatus::Running {
+            activity: "executing".into(),
+        };
+        parent.register_direct_child(&child);
+        spawner
+            .active_agents
+            .write()
+            .await
+            .insert(child.agent_id.clone(), child.clone());
+        let mut durable = durable_run("handoff-run", 1, astra_core::STATUS_RUNNING);
+        durable.agent_id = Some(child.agent_id.clone());
+        durable.parent_run_id = Some("root-run".into());
+        let (wake, _) = tokio::sync::watch::channel(0);
+        let reconciler = Arc::new(HandoffReconciler {
+            child: std::sync::Mutex::new(durable),
+            wake,
+            subscribed: tokio::sync::Notify::new(),
+        });
+        spawner
+            .set_durable_agent_reconciler(reconciler.clone())
+            .await;
+
+        // Hold archival between the first Waiting publication and local
+        // active-map retirement. The parent consumes that first notification
+        // while it still sees a local executor.
+        let archive_guard = spawner.completed_agents.write().await;
+        let first_notice = parent.direct_child_changed.notified();
+        tokio::pin!(first_notice);
+        first_notice.as_mut().enable();
+        let finalizer = {
+            let spawner = Arc::clone(&spawner);
+            let agent_id = child.agent_id.clone();
+            tokio::spawn(async move {
+                spawner
+                    .finalize_background_agent(
+                        &agent_id,
+                        AgentStatus::Waiting {
+                            reason: "executor yielded".into(),
+                        },
+                        SPAWN_STATUS_WAITING,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), first_notice)
+            .await
+            .expect("waiting publication must notify the parent");
+        let waiter_reached_local_boundary = Arc::new(tokio::sync::Notify::new());
+        let waiter = {
+            let spawner = Arc::clone(&spawner);
+            let parent = Arc::clone(&parent);
+            let reached = Arc::clone(&waiter_reached_local_boundary);
+            tokio::spawn(async move {
+                let wait = spawner.wait_for_direct_children(&parent);
+                tokio::pin!(wait);
+                assert!(futures_util::poll!(&mut wait).is_pending());
+                reached.notify_one();
+                wait.await;
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            waiter_reached_local_boundary.notified(),
+        )
+        .await
+        .expect("parent must be waiting while child remains locally active");
+        assert!(
+            spawner
+                .active_agents
+                .read()
+                .await
+                .contains_key(&child.agent_id)
+        );
+        drop(archive_guard);
+        tokio::time::timeout(Duration::from_secs(1), finalizer)
+            .await
+            .expect("handoff must retire active ownership")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reconciler.subscribed.notified())
+            .await
+            .expect("retirement notification must install remote wake");
+        {
+            let mut durable = reconciler.child.lock().unwrap();
+            durable.status = astra_core::STATUS_FAILED.into();
+            durable.error_message = Some("remote failure".into());
+        }
+        reconciler.wake.send_replace(1);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("durable terminal hint must settle the parent")
+            .unwrap();
+        assert_eq!(parent.take_completed_direct_children().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_direct_child_wait_never_reads_durable_recovery() {
+        struct NoDurableReads;
+        #[async_trait]
+        impl DurableAgentReconciler for NoDurableReads {
+            async fn load_agent_recovery(
+                &self,
+            ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+                panic!("local child completion must not query durable recovery")
+            }
+        }
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        spawner
+            .set_durable_agent_reconciler(Arc::new(NoDurableReads))
+            .await;
+        let parent = spawner.fanout_parent("root");
+        let mut child = completed_test_state(999);
+        child.status = AgentStatus::Running {
+            activity: String::new(),
+        };
+        spawner
+            .active_agents
+            .write()
+            .await
+            .insert(child.agent_id.clone(), child.clone());
+        parent.register_direct_child(&child);
+        let publish = async {
+            tokio::task::yield_now().await;
+            child.status = AgentStatus::Completed {
+                result: "done".into(),
+                finish_reason: None,
+            };
+            parent.publish_direct_child(&child);
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(spawner.wait_for_direct_children(&parent), publish);
+        })
+        .await
+        .expect("a local child wakes its parent without durable I/O");
+    }
+
+    #[tokio::test]
     async fn direct_child_durable_recovery_missing_row_fails_closed_across_pages() {
         let spawner = DynamicAgentSpawner::new(mock_router());
-        let parent = spawner.fanout_parent("root-run");
         let mut root = durable_run("root-run", 0, astra_core::STATUS_RUNNING);
         root.events.push(json!({
             "type": "agent_spawned", "run_id": "missing-child", "agent_id": "reviewer",
             "parent_run_id": "root-run", "fanout_slot": null,
         }));
-        assert_eq!(spawner.restore_durable_agent_runs(&[root.clone()]).await, 0);
+        assert_eq!(spawner.restore_durable_agent_runs(&[root.clone()]).await, 1);
+        let parent = spawner.attach_fanout_parent("root-run").await;
         assert!(matches!(
             &parent.pending_direct_children()[0].status,
             AgentStatus::Waiting { reason } if reason.contains("absent")
@@ -10678,7 +11093,10 @@ mod tests {
         let mut child = durable_run("missing-child", 1, astra_core::STATUS_COMPLETED);
         child.agent_id = Some("reviewer".into());
         // A terminal row without its result cannot invent successful evidence.
-        assert_eq!(spawner.restore_durable_agent_runs(&[child]).await, 1);
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler { runs: vec![child] }))
+            .await;
+        assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 1);
         tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .unwrap();
@@ -10701,10 +11119,10 @@ mod tests {
         use crate::turn::agentic_loop::host::{AgenticLoopOutcome, run_agentic_loop_with_host};
 
         let spawner = DynamicAgentSpawner::new(mock_router());
-        let parent = spawner.fanout_parent("root-run");
         let mut child = durable_run("child-run", 1, astra_core::STATUS_RUNNING);
         child.agent_id = Some("reviewer".into());
         spawner.restore_durable_agent_runs(&[child.clone()]).await;
+        let parent = spawner.attach_fanout_parent("root-run").await;
         child.status = astra_core::STATUS_FAILED.into();
         child.error_message = Some("recovered reviewer failed".into());
         spawner
@@ -17388,6 +17806,74 @@ mod tests {
         assert_eq!(completed.len(), 256);
         assert_eq!(completed.front().unwrap().agent_id, "agent-4");
         assert_eq!(completed.back().unwrap().agent_id, "agent-259");
+    }
+
+    #[tokio::test]
+    async fn remote_waiting_observations_do_not_grow_the_session_archive_without_bound() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        for index in 0..300 {
+            let mut observation = completed_test_state(index);
+            observation.status = AgentStatus::Waiting {
+                reason: "remote executor yielded".into(),
+            };
+            observation.ended_at = None;
+            spawner
+                .durable_observed_agent_ids
+                .write()
+                .await
+                .insert(observation.agent_id.clone());
+            spawner.archive_state(observation).await;
+        }
+        assert_eq!(spawner.completed_agents.read().await.len(), 256);
+        assert_eq!(spawner.durable_observed_agent_ids.read().await.len(), 256);
+    }
+
+    #[tokio::test]
+    async fn archive_does_not_reacquire_cancellation_read_behind_a_queued_writer() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        for index in 0..256 {
+            let mut observation = completed_test_state(index);
+            observation.status = AgentStatus::Waiting {
+                reason: "remote".into(),
+            };
+            spawner
+                .durable_observed_agent_ids
+                .write()
+                .await
+                .insert(observation.agent_id.clone());
+            spawner.archive_state(observation).await;
+        }
+        {
+            let held_read = spawner.in_flight_cancellations.read().await;
+            let queued_writer = spawner.in_flight_cancellations.write();
+            tokio::pin!(queued_writer);
+            assert!(futures_util::poll!(&mut queued_writer).is_pending());
+            let mut next = completed_test_state(256);
+            next.status = AgentStatus::Waiting {
+                reason: "remote".into(),
+            };
+            spawner
+                .durable_observed_agent_ids
+                .write()
+                .await
+                .insert(next.agent_id.clone());
+            tokio::time::timeout(Duration::from_secs(1), spawner.archive_state(next))
+                .await
+                .expect("archive must not await a recursive read behind the writer");
+            assert_eq!(spawner.completed_agents.read().await.len(), 257);
+            drop(held_read);
+        }
+        let mut next = completed_test_state(257);
+        next.status = AgentStatus::Waiting {
+            reason: "remote".into(),
+        };
+        spawner
+            .durable_observed_agent_ids
+            .write()
+            .await
+            .insert(next.agent_id.clone());
+        spawner.archive_state(next).await;
+        assert_eq!(spawner.completed_agents.read().await.len(), 256);
     }
 
     #[tokio::test]

@@ -2834,6 +2834,17 @@ impl RuntimeToolExecutor {
         ))
     }
 
+    pub async fn wait_for_direct_children(
+        &self,
+        owner: &crate::orchestration::FanoutParentAdmission,
+    ) {
+        if let Some(context) = self.agent_tool_context.as_ref() {
+            context.spawner.wait_for_direct_children(owner).await;
+        } else {
+            owner.wait_for_direct_children().await;
+        }
+    }
+
     /// Publish the root semantic effect boundary to the already-wired dynamic
     /// agent context before a spawn/fanout call can execute.
     pub fn set_workspace_mutation_intent(

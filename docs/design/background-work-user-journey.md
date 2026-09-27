@@ -177,6 +177,22 @@ rules, including auxiliary judgments and failed attempts. This contract does
 not create a second cost ledger, extra per-child database reads, or an
 automatic router before comparable evidence exists.
 
+The comparable unit is one case and one complete root execution, including its
+children. Keep the tested case/input digest, plan/configuration digest, runtime
+revision, selection method and catalog digest, root and child run IDs, and the
+evaluator/rubric version with the evaluated artifact. Follow the existing
+selection, tool invocation, child run, inference invocation and physical
+request identities rather than matching display model names or timestamps.
+Report task quality, execution success, wall-clock latency, provider token
+coverage, and cost separately. Sum physical attempts across the task tree,
+including selection, retries and failures, without counting replayed receipts
+twice; concurrent child durations must not be summed into wall-clock latency.
+Historical monetary estimates require a price basis frozen when the route is
+admitted. If the price, cache rate, or usage is missing, expose the priced
+subtotal and missing coverage instead of zero or a complete-cost claim. A
+provider-completed request is not a quality label, and a later price update
+must not rewrite an earlier experiment.
+
 Client disconnect is not cancellation. Explicit cancel is a durable control
 that converges the root and descendants. A slow live stream may drop a
 non-terminal presentation event, but durable replay must reconstruct the

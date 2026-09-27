@@ -7611,6 +7611,7 @@ impl ServerAgenticLoopHost {
                     "schema_version": 1,
                     "method": astra_services::delegation_model_requirement::DelegationRequirementJudgmentMethod::CandidateAwareOneCallV1,
                     "source_digest": source.user_intent_digest,
+                    "operation_id": delegation_judgment_operation_id("intent", &source.user_intent_digest),
                     "round_index": state.current_round_index,
                     "attempt_index": attempt,
                     "outcome": outcome,
@@ -19440,6 +19441,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .runtime_tool_executor
             .as_deref()?
             .direct_child_completion_owner()
+    }
+
+    async fn wait_for_direct_children(
+        &mut self,
+        state: &AgenticLoopState,
+        owner: Arc<crate::orchestration::FanoutParentAdmission>,
+    ) {
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            executor.wait_for_direct_children(&owner).await;
+        } else {
+            owner.wait_for_direct_children().await;
+        }
     }
 
     fn on_direct_child_completion_boundary(
@@ -40303,6 +40316,7 @@ mod tests {
         .build();
         with_model_requirement.apply_classified_work_admission(ClassifiedWorkAdmission {
             decision: astra_services::WorkAdmissionDecision::NotRequired {
+                assessment: None,
                 domain: None,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
                 mutation_completion_scope:
@@ -41261,6 +41275,7 @@ mod tests {
         state.user_intent = "Review with B".into();
         let source = delegation_intent_source_from_state(&state).expect("source");
         let decision = astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -41305,6 +41320,7 @@ mod tests {
         )
         .build();
         let decision = astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -41471,6 +41487,10 @@ mod tests {
             assert_eq!(evidence["assessment"], json!(assessment.summary));
             assert_eq!(evidence["method"], "candidate_aware_one_call_v1");
             assert_eq!(evidence["source_digest"], "source-digest");
+            assert_eq!(
+                evidence["operation_id"],
+                delegation_judgment_operation_id("intent", "source-digest")
+            );
             assert_eq!(evidence["round_index"], 2);
             assert_eq!(evidence["attempt_index"], 1);
             assert_eq!(evidence["outcome"], outcome);
@@ -41807,6 +41827,7 @@ mod tests {
         let source = delegation_intent_source_from_state(&state).unwrap();
         host.pending_work_admission = Some(ClassifiedWorkAdmission {
             decision: astra_services::WorkAdmissionDecision::NotRequired {
+                assessment: None,
                 domain: None,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
                 mutation_completion_scope:
@@ -41977,6 +41998,7 @@ mod tests {
             delegation_intent_source_from_state(&state).expect("new intent source");
         host.pending_work_admission = Some(ClassifiedWorkAdmission {
             decision: astra_services::WorkAdmissionDecision::NotRequired {
+                assessment: None,
                 domain: None,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
                 mutation_completion_scope:
@@ -49142,6 +49164,7 @@ mod tests {
         astra_services::ResolvedModelOffering {
             offering_id: "offer-primary".to_string(),
             model: astra_services::ResolvedActiveLlmModel {
+                price_snapshot: None,
                 model_name: "catalog-model".to_string(),
                 wire_model_name: Some("upstream-model".to_string()),
                 api_key: "provider-secret".to_string(),
@@ -53890,7 +53913,7 @@ mod tests {
             state
                 .messages
                 .push(json!({"role":"assistant","content":"later response"}));
-            host.resolve_pending_work_admission(true).await;
+            host.resolve_pending_work_admission(None, true).await;
             host.flush_completed_work_admission_phase(&mut state);
             let recorded = astra_turn_types::user_turn_semantics(&state.messages[4])
                 .unwrap()
