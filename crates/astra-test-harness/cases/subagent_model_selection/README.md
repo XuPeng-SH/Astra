@@ -64,6 +64,9 @@ inheriting DeepSeek Flash or substituting another model.
 `flash_missing_child_model_fail_closed` uses an unavailable fixed identity and
 checks that no child starts. A parent may decline the delegation itself or
 submit a call that admission rejects; neither path permits a silent fallback.
+`flash_near_version_must_not_substitute` checks the harder adjacent-version
+case: where the authorized catalog has GLM 5.2 but no GLM 5.3, a request for
+5.3 must not spawn a 5.2 child. Skip this case if GLM 5.3 is actually offered.
 
 `flash_fanout_plan_and_high_review` is the fixed-model control journey: one
 slot uses GLM-5.2 for a plan-shaped task and another uses DeepSeek Flash with
@@ -85,6 +88,18 @@ prepared configuration, child termination, and mentions of both models in the
 parent's answer. It does not yet verify that the answer accurately attributes
 each child finding. A passing run is an end-to-end sample, not a reliability claim; run
 several independent trials before quoting a success rate.
+
+`flash_reasoning_phrase_is_subject` and `flash_reasoning_correction` test the
+single semantic judgment rather than a second keyword parser. The former
+asks a child to explain a quoted phrase about high reasoning and verifies that
+no high-effort child is started; the latter changes high to medium before
+execution and verifies the actual child configuration. Both require a real
+child model round and zero Bash configuration probes. These are samples of a
+probabilistic interpretation, not proof that every paraphrase is understood;
+run independent variants before claiming reliability. The former's external
+oracle cannot by itself distinguish a correct judge result from a parent that
+later independently chooses the same effective child settings; inspect the
+typed judgment evidence in the session trace before attributing the result.
 
 `flash_fanout_auto_balanced` is a negative control, not evidence that the
 router works: it asks for Auto Balanced and verifies that the current product

@@ -61,29 +61,35 @@ summary
 
 Per-agent model override is an orchestration decision, but it must still respect budget, policy, and trace requirements.
 
-When a user names a delegated model in natural language, admission resolves
-that name against the current authorized Chat catalog. Case and ordinary word
-separators may vary (including an omitted separator between letters and a
-version number), but numeric versions, suffixes, and namespace prefixes must
-remain distinct. Only one eligible Offering may be selected; ambiguous or
-unavailable names stop the child before execution. Explicit structured model
-selectors keep their exact-match contract. This lookup reuses the admission
-catalog snapshot and does not trigger a second catalog read.
+When a user names a delegated model in natural language, one candidate-aware
+judgment resolves the request against the current authorized Chat catalog.
+It must preserve the requested family, version, variant, namespace and source;
+an unavailable or ambiguous model stops the child before execution. Runtime
+checks exact quoted text, candidate membership, canonical IDs/names, scope,
+authorization and capability, but does not run a second lexical parser over
+model aliases. Semantic alias interpretation can still be wrong; its accuracy
+needs live evaluation and the chosen identity remains visible in Explain.
+Explicit structured selectors retain their exact-match contract. The judgment
+reuses the admission catalog snapshot without a second catalog read.
 
 The auxiliary interpretation of one user turn covers all proposed children in
 one bounded judgment. Its compact output identifies exact user evidence,
-eligible candidate IDs, optional task scopes, and reasoning controls; the
-runtime verifies those facts and binds them to the original user text and
-catalog snapshot. An invalid or uncertain judgment cannot silently choose a
-nearby model, relax a hard requirement, or authorize Auto. A tool's proposed
-selector is matching context, never user authority. This interpretation does
-not add a separate catalog query or database write.
+eligible candidate IDs, optional task scopes, and reasoning controls. Runtime
+verifies the deterministic facts and binds them to the original user text and
+catalog snapshot; semantic accuracy is evaluated separately. An invalid or
+uncertain judgment cannot silently choose a nearby model, relax a hard
+requirement, or authorize Auto. A tool's proposed selector is matching context,
+never user authority. This interpretation adds no separate catalog query or
+database write.
 
-A model-only request does not imply a reasoning level. Reasoning needs a
-separate, affirmative control phrase that names reasoning, thinking, or effort
-and maps to the exact requested control; a bare level token, answer literal,
-negated phrase, or model-name-only quote is not authority for hard `high`.
-Unrecognized phrasing is unresolved.
+A model-only request does not imply a reasoning level. The same judgment must
+distinguish a request to *use* a reasoning control from a phrase the child is
+asked to explain, compare, quote or output, and must account for negations and
+later corrections. Its typed reasoning and exact source quote travel together.
+Runtime checks that pairing, positive budgets, slot conflicts and provider
+support; it no longer guesses semantic intent from a fixed phrase, negation or
+sentence-separator list. Ambiguous intent is unresolved. A plausible but wrong
+semantic judgment remains a measurable risk, not a deterministic guarantee.
 The runtime never downgrades an unsupported exact effort into generic thinking.
 
 Dynamic spawn and fanout resolve reasoning separately from the Offering.
