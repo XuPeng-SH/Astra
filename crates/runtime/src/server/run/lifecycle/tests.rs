@@ -17328,7 +17328,7 @@ async fn mismatched_child_owner_cannot_retire_terminal_notification() {
     )
     .await;
     assert_eq!(state.volatile_pending.len(), 1);
-    assert!(state.terminal_child_evaluation_refs.is_none());
+    assert!(state.stall.terminal_child_evaluation_refs.is_none());
     assert!(state.interruption.is_some());
 }
 

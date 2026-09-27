@@ -208,7 +208,7 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
         // The journal is evaluated after this fence. Snapshot only exact,
         // observed receipt refs before removing provider context so recovery
         // cannot replay the completed child message into another round.
-        state.terminal_child_evaluation_refs = Some((
+        state.stall.terminal_child_evaluation_refs = Some((
             owner.parent_run_id().to_string(),
             state
                 .stall

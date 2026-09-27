@@ -45429,7 +45429,6 @@ mod tests {
             messages: Vec::new(),
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
-            terminal_child_evaluation_refs: None,
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,

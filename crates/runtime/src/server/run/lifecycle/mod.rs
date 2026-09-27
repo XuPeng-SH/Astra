@@ -4136,6 +4136,7 @@ fn build_runtime_turn_evaluation_event(
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
     let eval_thresholds = crate::turn::runtime_policy::configured_evaluation_thresholds();
     let resolved_children = state
+        .stall
         .terminal_child_evaluation_refs
         .as_ref()
         .filter(|(run_id, _)| state.current_run_id.as_deref() == Some(run_id.as_str()))
@@ -12681,7 +12682,6 @@ impl AgenticRunLifecycleService {
             messages: facts.messages,
             run_transcript_capture: None,
             volatile_pending: facts.original.pending_context,
-            terminal_child_evaluation_refs: None,
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(session_id.to_string()),
@@ -24580,7 +24580,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             messages: vec![user_message],
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
-            terminal_child_evaluation_refs: None,
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(config.session_id.clone()),
