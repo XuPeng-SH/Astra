@@ -171,6 +171,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::WaitingForModel
         | TuiAppEvent::ModelResponding
         | TuiAppEvent::StatusLine(_)
+        | TuiAppEvent::ClientUpdateNotice(_)
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
@@ -329,6 +330,7 @@ mod tests {
             TuiAppEvent::WaitingForModel,
             TuiAppEvent::ModelResponding,
             TuiAppEvent::StatusLine("hello".into()),
+            TuiAppEvent::ClientUpdateNotice(Some("Update available".into())),
             TuiAppEvent::UserIntentApplied {
                 intent_id: "input-1".into(),
                 delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,

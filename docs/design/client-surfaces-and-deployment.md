@@ -101,9 +101,16 @@ lifetime. The updater needs an exclusive lock, never kills clients, and cannot
 switch while a consumer is admitted. Under the lock, clients reject an
 unfinished installation transaction or an executable no longer selected by
 `current`. Protocol/version probes are offline; update checks never read UC,
-Memoria, Genesis, or provider credentials. TUI startup may show cached notices
-and launch a bounded anonymous metadata check; machine/helper commands remain
-quiet. Hosted Runner updates remain image deployment operations.
+Memoria, Genesis, or provider credentials. TUI startup shows cached notices
+below the composer/status strip and launches a bounded anonymous metadata check.
+Its completion refreshes the notice in the same TUI session, including while a
+turn is running. Notices remain visible in the compact chat surface until the
+user exits (modal views keep their existing layout); narrow terminals wrap the
+text. They never enter conversation history. Installable releases say
+`Update available (<bundle>) · Exit Astra, then run astra update to upgrade.`
+The paired moi-cli owns check throttling; this is a startup check, not periodic
+polling or automatic installation. Machine/helper commands remain quiet.
+Hosted Runner updates remain image deployment operations.
 
 Cached notices distinguish an installable update from
 `CLI_UPDATE_COMPATIBILITY_CHANGE`: the latter advertises a new release that

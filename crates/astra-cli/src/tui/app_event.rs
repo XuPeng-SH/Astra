@@ -18,6 +18,8 @@ pub(crate) type RestoreInputQueue =
 /// into the main TUI event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum TuiAppEvent {
+    /// Local installation notice; never a conversation/transcript event.
+    ClientUpdateNotice(Option<String>),
     // ── Mapped from StreamEvent (one-layer bridge) ──────────────────────
     /// The accepted stream established the canonical session identity.
     ///

@@ -6971,6 +6971,12 @@ pub(crate) async fn run_tui_session(
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+    if let Ok(executable) = std::env::current_exe() {
+        let update_tx = tui_tx.clone();
+        astra_core::client_installation::startup_notice(&executable, move |notice| {
+            let _ = update_tx.blocking_send(TuiAppEvent::ClientUpdateNotice(notice));
+        });
+    }
     let restore_input_queue: RestoreInputQueue =
         std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
     // One identity per TUI process, shared by Work attachment renewals. This
@@ -12190,6 +12196,9 @@ fn handle_app_event(
         status_indicator.mark_dispatched();
     }
     match ev {
+        TuiAppEvent::ClientUpdateNotice(notice) => {
+            bottom_pane.update_notice.clone_from(notice);
+        }
         TuiAppEvent::SessionBound(_) | TuiAppEvent::RunBound(_) => {
             // Session binding is consumed by the foreground workbench reducer
             // before this presentation-only status reducer runs.
@@ -18962,6 +18971,32 @@ mod tests {
             !after_late_progress.contains("Enter queues follow-up"),
             "late progress resurrected a terminal turn: {after_late_progress:?}"
         );
+    }
+
+    #[test]
+    fn update_notice_event_preserves_active_turn_and_draft() {
+        let mut pane = BottomPane::new();
+        let mut indicator = status_indicator::StatusIndicator::new();
+        begin_submission_dispatch_feedback(&mut pane, &mut indicator, std::time::Instant::now());
+        pane.composer.set_text("unsent");
+        let notice = Some("Update available · Exit Astra, then run astra update".into());
+        handle_app_event(
+            &TuiAppEvent::ClientUpdateNotice(notice.clone()),
+            &mut pane,
+            &mut indicator,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(pane.update_notice, notice);
+        assert!(pane.footer.is_turn_active);
+        assert_eq!(pane.composer.text(), "unsent");
+        handle_app_event(
+            &TuiAppEvent::ClientUpdateNotice(None),
+            &mut pane,
+            &mut indicator,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(pane.update_notice.is_none());
+        assert!(pane.footer.is_turn_active);
     }
 
     #[test]

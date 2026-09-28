@@ -41,6 +41,8 @@ mod plan_review_integration_tests;
 mod queue_preview_tests;
 #[cfg(test)]
 mod slash_integration_tests;
+#[cfg(test)]
+mod update_notice_tests;
 
 use chat_composer::{ChatComposer, ComposerAction};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -73,6 +75,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub(crate) struct BottomPane {
     pub composer: ChatComposer,
     pub footer: Footer,
+    pub update_notice: Option<String>,
     view_stack: Vec<Box<dyn BottomPaneView>>,
     /// Stable browser-like order for retained conversation workspaces.
     ///
@@ -245,6 +248,7 @@ impl BottomPane {
         Self {
             composer: ChatComposer::new(),
             footer: Footer::new(),
+            update_notice: None,
             view_stack: Vec::new(),
             conversation_tab_order: Vec::new(),
             task_status: TaskStatus::Idle,
@@ -1615,7 +1619,12 @@ impl BottomPane {
         // One quiet row above the composer is reserved for the context rail.
         // Keeping it stable avoids shifting the input when the first usage
         // measurement arrives; before that it simply acts as breathing room.
-        content_h + approval_h + queue_h + popup_h + 2
+        content_h
+            + approval_h
+            + queue_h
+            + popup_h
+            + 2
+            + self.update_notice_lines(width).len() as u16
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -2098,6 +2107,16 @@ impl BottomPane {
             return;
         }
 
+        // Keep installation notices below the composer/status strip, outside
+        // conversation history. Modal views retain their existing layout.
+        let notice_lines = self.update_notice_lines(area.width);
+        let notice_h = (notice_lines.len() as u16).min(area.height.saturating_sub(3));
+        let content_area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
+        ratatui::widgets::Paragraph::new(notice_lines).render(
+            Rect::new(area.x, content_area.bottom(), area.width, notice_h),
+            buf,
+        );
+        let area = content_area;
         let popup_h = self.popup_height();
         let content_h = self.composer.desired_height(area.width);
         let intent_queue_h = self.user_intent_height();
@@ -2149,6 +2168,19 @@ impl BottomPane {
                 .render(chunks[4], buf, self.has_pending_composer_queue());
             self.footer.render(chunks[5], buf);
         }
+    }
+
+    fn update_notice_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(notice) = &self.update_notice else {
+            return Vec::new();
+        };
+        super::wrapping::word_wrap_lines(
+            [Line::styled(
+                notice.clone(),
+                Style::default().fg(super::theme::current().warn),
+            )],
+            width.max(1) as usize,
+        )
     }
 
     fn render_focused_approval(&self, area: Rect, buf: &mut Buffer) {
@@ -2342,6 +2374,10 @@ impl BottomPane {
         if let Some(view) = self.active_view() {
             return view.cursor_pos(area);
         }
+
+        let notice_h =
+            (self.update_notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
+        let area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
 
         let approval_h = self.focused_approval_height(area.width);
         let intent_queue_h = self.user_intent_height();
