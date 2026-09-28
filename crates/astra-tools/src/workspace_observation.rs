@@ -360,17 +360,36 @@ fn quarantine_observation_state(
     mut aliases: Vec<PathBuf>,
     ownership_unsettled: bool,
 ) {
-    state
+    let was_quarantined = state
         .quarantined
-        .store(true, std::sync::atomic::Ordering::Release);
-    if ownership_unsettled {
-        state
+        .swap(true, std::sync::atomic::Ordering::AcqRel);
+    let newly_unsettled = if ownership_unsettled {
+        !state
             .ownership_unsettled
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-    state
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    } else {
+        false
+    };
+    let epoch = state
         .epoch
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        .wrapping_add(1);
+    if !was_quarantined || newly_unsettled {
+        // Correlate later refusals without logging local paths or shell input.
+        let root_digest = aliases.first().map(|root| observation_root_digest(root));
+        tracing::warn!(
+            component = "workspace_observation",
+            operation = "quarantine",
+            reason = if ownership_unsettled {
+                "ownership_unsettled"
+            } else {
+                "attribution_uncertain"
+            },
+            root_digest,
+            epoch,
+            "workspace observations quarantined for the lifetime of this executor process"
+        );
+    }
     // Preserve every alias that was registered while the invocation still
     // held the state. This closes the symlink/rebind race: a terminal path
     // lookup must quarantine the pre-existing state, not create a new clean
@@ -2714,11 +2733,23 @@ impl ExternalEffectFingerprint {
             .map(|(declared_path, observation_root)| {
                 target_hasher.update(declared_path.as_os_str().as_encoded_bytes());
                 target_hasher.update([0]);
-                let root_before = WorkspaceFingerprint::capture(observation_root).ok_or_else(|| {
-                    format!(
+                let root_before = WorkspaceFingerprint::capture_with_reason(observation_root).map_err(|reason| {
+                    match reason {
+                        FingerprintUnavailable::Quarantined => {
+                            tracing::warn!(
+                                component = "workspace_observation",
+                                operation = "capture_external_preimage",
+                                error_code = "external_state_observation_quarantined",
+                                root_digest = observation_root_digest(observation_root),
+                                "external observation refused by persistent attribution quarantine"
+                            );
+                            "external_state_observation_quarantined: Changes to this path cannot be safely verified after earlier work. The command was not run. Before restarting Astra or astra-edge, verify that earlier background work has stopped. Starting a new conversation alone will not clear this condition.".to_string()
+                        }
+                        FingerprintUnavailable::Unavailable => format!(
                         "external state root is unavailable, ambiguous, or exceeds observation bounds: {}",
                         observation_root.display()
-                    )
+                        ),
+                    }
                 })?;
                 let leaf_before = (!declared_path.is_dir())
                     .then(|| external_leaf_fingerprint(declared_path))
@@ -2899,6 +2930,16 @@ pub fn is_authoritative_external_effect_receipt(receipt: &serde_json::Value) -> 
             })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FingerprintUnavailable {
+    Quarantined,
+    Unavailable,
+}
+
+fn observation_root_digest(root: &Path) -> String {
+    hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()))
+}
+
 impl WorkspaceFingerprint {
     /// Capture a bounded fingerprint for `root`.
     ///
@@ -2907,8 +2948,14 @@ impl WorkspaceFingerprint {
     /// bounded metadata manifest.  If the manifest exceeds its bound or any
     /// required metadata cannot be read, return `None` so callers fail closed.
     pub fn capture(root: &Path) -> Option<Self> {
-        let root = root.canonicalize().ok()?;
-        let writer_state = writer_epoch_state(&root)?;
+        Self::capture_with_reason(root).ok()
+    }
+
+    fn capture_with_reason(root: &Path) -> Result<Self, FingerprintUnavailable> {
+        let root = root
+            .canonicalize()
+            .map_err(|_| FingerprintUnavailable::Unavailable)?;
+        let writer_state = writer_epoch_state(&root).ok_or(FingerprintUnavailable::Unavailable)?;
         let epoch_before = writer_state
             .epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -2921,8 +2968,11 @@ impl WorkspaceFingerprint {
         // A recursive/typed writer already in flight makes the snapshot
         // ambiguous.  Do not sample a half-written tree and later attribute
         // it to the surrounding Bash call.
-        if active_before != 0 || quarantined_before {
-            return None;
+        if quarantined_before {
+            return Err(FingerprintUnavailable::Quarantined);
+        }
+        if active_before != 0 {
+            return Err(FingerprintUnavailable::Unavailable);
         }
         let digest = match git_status_fingerprint(&root) {
             GitFingerprint::Captured(digest) => Some(digest),
@@ -2931,7 +2981,8 @@ impl WorkspaceFingerprint {
             // still cannot produce trustworthy evidence.
             GitFingerprint::Unknown => None,
             GitFingerprint::UseManifest => manifest_fingerprint(&root),
-        }?;
+        }
+        .ok_or(FingerprintUnavailable::Unavailable)?;
         let epoch_after = writer_state
             .epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -2944,14 +2995,13 @@ impl WorkspaceFingerprint {
         // The writer may have started and finished while the bounded probe
         // was running.  An epoch or active-count change makes this sample
         // un-attributable; fail closed instead of producing a false receipt.
-        if epoch_before != epoch_after
-            || active_before != active_after
-            || active_after != 0
-            || quarantined_after
-        {
-            return None;
+        if quarantined_after {
+            return Err(FingerprintUnavailable::Quarantined);
         }
-        Some(Self {
+        if epoch_before != epoch_after || active_before != active_after || active_after != 0 {
+            return Err(FingerprintUnavailable::Unavailable);
+        }
+        Ok(Self {
             digest,
             writer_state,
             writer_epoch: epoch_after,
@@ -5895,6 +5945,60 @@ mod tests {
             acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1)).is_none(),
             "a writer whose descendants may still run must block later work admission"
         );
+    }
+
+    #[test]
+    fn external_preimage_reports_sticky_quarantine_without_exposing_paths() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"external_state_paths": [external.path()]});
+        assert!(ExternalEffectFingerprint::capture_from_args(&args, workspace.path()).is_ok());
+        let handle = WorkspaceAttributionState::capture(external.path()).unwrap();
+        handle.quarantine();
+        drop(handle);
+        for _ in 0..2 {
+            let error = ExternalEffectFingerprint::capture_from_args(&args, workspace.path())
+                .err()
+                .unwrap();
+            assert!(error.starts_with("external_state_observation_quarantined:"));
+            // English recovery copy must not promise that a new session or restart is safe.
+            assert!(error.contains("verify that earlier background work has stopped"));
+            assert!(error.contains("Starting a new conversation alone will not clear"));
+            assert!(!error.contains(external.path().to_str().unwrap()));
+            assert!(matches!(
+                WorkspaceFingerprint::capture_with_reason(external.path()),
+                Err(FingerprintUnavailable::Quarantined)
+            ));
+        }
+        assert_eq!(
+            workspace_ownership_is_unsettled(external.path()),
+            Some(false)
+        );
+        let output = fs::read_to_string(log.path()).unwrap();
+        assert!(output.contains("attribution_uncertain"));
+        assert!(output.contains("external_state_observation_quarantined"));
+        assert!(output.contains(&observation_root_digest(
+            &external.path().canonicalize().unwrap()
+        )));
+        assert!(!output.contains(external.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn missing_root_is_not_reported_as_quarantine() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            WorkspaceFingerprint::capture_with_reason(&root.path().join("missing")),
+            Err(FingerprintUnavailable::Unavailable)
+        ));
+        assert!(WorkspaceFingerprint::capture(&root.path().join("missing")).is_none());
     }
 
     #[test]

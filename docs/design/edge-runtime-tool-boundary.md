@@ -123,6 +123,15 @@ or prevent the next command. Unsettled execution ownership and a replaced or
 tampered binding still prevent admission. Every receipt-producing path must
 check receipt authority independently of the coordination check used to launch.
 
+Quarantine is retained per observation root for the executor process lifetime,
+not per conversation. Explicit external-state preimage capture reports
+`external_state_observation_quarantined` separately from ordinary unavailable,
+ambiguous or over-bound fingerprints. The command is not launched in this case.
+Quarantine establishment and later refusals log a root digest, not local paths
+or shell input. A new conversation does not clear quarantine; before restarting
+the affected Astra or astra-edge process, verify that earlier background work
+has stopped. Restart alone does not stop escaped descendants or prove safety.
+
 ### Prepared directory inspection
 
 Prepared Unix Bash invocations inspect targets through the same retained
