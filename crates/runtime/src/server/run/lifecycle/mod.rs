@@ -218,6 +218,37 @@ const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committe
 /// must not be treated as one.
 const SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE: &str = "session_execution_slot_occupied";
 
+const EXECUTION_AUTHORITY_NOT_CURRENT_ERROR_CODE: &str = "execution_authority_not_current";
+
+// A failed renewal predicate does not identify which ownership condition changed.
+// The durable run already exists: do not label this as pre-admission rejection.
+fn execution_authority_not_current_response(
+    stage: &'static str,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    expected_generation: u64,
+) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::warn!(
+        target: "astra_runtime::run_lifecycle",
+        component = "run_lifecycle",
+        operation = "confirm_execution_authority",
+        stage,
+        error_code = EXECUTION_AUTHORITY_NOT_CURRENT_ERROR_CODE,
+        reason = "owner_renewal_not_matched",
+        user_id,
+        session_id,
+        run_id,
+        expected_generation,
+        "run activation refused; durable recovery retains ownership of the persisted run"
+    );
+    error_response_coded(
+        StatusCode::CONFLICT,
+        "This run could not start. Check the session status before trying again.".to_string(),
+        EXECUTION_AUTHORITY_NOT_CURRENT_ERROR_CODE,
+    )
+}
+
 fn explain_artifact_publishable_status(status: RunStatus) -> bool {
     RunStatus::TERMINAL.contains(&status)
 }
@@ -15321,10 +15352,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     .await;
                 }
                 return match failed {
-                    Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
-                        StatusCode::CONFLICT,
-                        "durable execution authority expired before activation".to_string(),
-                    )),
+                    Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                        Err(execution_authority_not_current_response(
+                            "before_activation",
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            execution_owner_generation,
+                        ))
+                    }
                     Err(error) => Err(error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("failed to confirm durable execution authority: {error}"),
@@ -16107,11 +16143,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "idempotent run activation failed before side effects; durable recovery owns the row"
                     );
                     return match failed {
-                        Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
-                            StatusCode::CONFLICT,
-                            "durable execution authority expired after idempotent claim"
-                                .to_string(),
-                        )),
+                        Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                            Err(execution_authority_not_current_response(
+                                "after_idempotent_claim",
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                owner_generation,
+                            ))
+                        }
                         Err(error) => Err(error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("failed to activate durable execution authority: {error}"),
@@ -16983,11 +17023,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     .await;
                 }
                 return match failed {
-                    Ok(ExecutionAuthorityConfirmation::Superseded) => Err(error_response(
-                        StatusCode::CONFLICT,
-                        "durable execution authority expired before streaming activation"
-                            .to_string(),
-                    )),
+                    Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                        Err(execution_authority_not_current_response(
+                            "before_streaming_activation",
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            execution_owner_generation,
+                        ))
+                    }
                     Err(error) => Err(error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("failed to confirm durable execution authority: {error}"),

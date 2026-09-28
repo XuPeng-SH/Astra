@@ -17771,12 +17771,111 @@ async fn create_run_returns_running_status() {
 }
 
 #[tokio::test]
+async fn refused_activation_returns_coded_conflict_without_rejecting_durable_admission() {
+    for entrypoint in ["create", "stream", "idempotent_stream"] {
+        let store =
+            Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_refused_activation_renewal());
+        let svc = test_service_with_store(store);
+        let mut request = test_request("hello");
+        request.session_id = Some("authority-session".into());
+        if entrypoint == "idempotent_stream" {
+            request.run_start_idempotency = Some(
+                RunStartIdempotency::new(
+                    RunStartIdempotencyKind::WorkTurn,
+                    "authority-run",
+                    "1".repeat(64),
+                )
+                .unwrap(),
+            );
+        }
+        let response = if entrypoint == "create" {
+            err(svc.create_run("user-1".into(), request).await)
+        } else {
+            err(svc.stream_chat("user-1".into(), request).await)
+        };
+        assert_eq!(response.0, StatusCode::CONFLICT, "{entrypoint}");
+        assert_eq!(
+            response.1.0.error_code.as_deref(),
+            Some("execution_authority_not_current"),
+            "{entrypoint}"
+        );
+        let body = serde_json::to_value(&response.1.0).unwrap();
+        assert!(body.get("admission_state").is_none());
+        assert!(body.get("metadata").is_none_or(serde_json::Value::is_null));
+        // English error-display contract: no unproven expiry or raw storage details.
+        assert_eq!(
+            response.1.0.detail,
+            "This run could not start. Check the session status before trying again."
+        );
+        assert!(
+            svc.runs.read().await.is_empty(),
+            "no local execution may start"
+        );
+        if entrypoint == "idempotent_stream" {
+            let run = svc
+                .run_engine
+                .load_run("user-1", "authority-run")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                run.status, STATUS_RUNNING,
+                "durable recovery still owns the row"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn create_run_uses_provided_session_id() {
     let svc = test_service();
     let mut req = test_request("hi");
     req.session_id = Some("custom-session".into());
     let result = ok(svc.create_run("user-1".into(), req).await);
     assert_eq!(result.session_id, "custom-session");
+}
+
+#[test]
+fn refused_activation_logs_stage_and_identity_without_claiming_expiry() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let writer = log.reopen().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.try_clone().unwrap())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for stage in [
+            "before_activation",
+            "after_idempotent_claim",
+            "before_streaming_activation",
+        ] {
+            let _ = execution_authority_not_current_response(
+                stage,
+                "test-user",
+                "test-session",
+                "test-run",
+                7,
+            );
+        }
+    });
+    let output = std::fs::read_to_string(log.path()).unwrap();
+    for field in [
+        "before_activation",
+        "after_idempotent_claim",
+        "before_streaming_activation",
+        "test-session",
+        "test-run",
+        "expected_generation=7",
+        "owner_renewal_not_matched",
+        "execution_authority_not_current",
+    ] {
+        assert!(
+            output.contains(field),
+            "missing diagnostic {field}: {output}"
+        );
+    }
+    assert!(!output.contains("expired"));
 }
 
 #[tokio::test]

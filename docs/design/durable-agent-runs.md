@@ -51,6 +51,12 @@ Checkpoint must include enough information to resume safely:
 
 - Only the owner may advance active execution.
 - Lease expiry enables recovery.
+- Start activation whose owner renewal no longer matches returns HTTP 409 with
+  `execution_authority_not_current`. This does not prove lease expiry: owner,
+  generation, status, cancellation, or lease predicates may have changed.
+  The persisted run remains subject to durable recovery, not pre-admission
+  rejection. Logs identify the activation stage, session, run and expected
+  generation; clients should inspect session status before another submission.
 - A local owner-lease deadline bounds an unconfirmed terminal attempt. If the
   store response stalls, the exact-generation durable status and event receipt
   are checked before reporting failure. The heartbeat allows this bounded
