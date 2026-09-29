@@ -175,8 +175,8 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
     if let Some(binding) = &native_binding {
         let matches_owner = binding.profile_name() == identity.profile_name
             && binding
-                .snapshot()
-                .is_ok_and(|session| Some(session.astra_user_id) == identity.account_id);
+                .account_id()
+                .is_ok_and(|account_id| Some(account_id) == identity.account_id);
         return CliOwnerAuthSnapshot {
             owner_scope,
             access_token: None,
@@ -235,8 +235,7 @@ pub(crate) fn configure_cli_profile_identity(
     admission: CliProfileIdentityAdmission,
 ) -> Result<(), String> {
     if let Some(binding) = crate::cli::native_auth::active() {
-        let session = binding.snapshot()?;
-        return install_cli_profile_identity(binding.profile_name(), Some(session.astra_user_id));
+        return install_cli_profile_identity(binding.profile_name(), Some(binding.account_id()?));
     }
     let creds = credential_store()
         .load()

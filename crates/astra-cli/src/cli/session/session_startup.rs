@@ -6,7 +6,7 @@ use crate::cli::cli_config::cli_utils::{
     preflight_remote_resume_session,
 };
 use crate::cli::cloud_sync::{
-    append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
+    CloudPullResult, append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
 };
 use crate::cli::edge_lifecycle::register_and_start_heartbeat;
 use crate::cli::permission_manager;
@@ -682,6 +682,19 @@ pub(crate) async fn complete_session_startup(
     // Install signal handlers so SIGTERM/SIGHUP can drain through normal REPL shutdown.
     install_sigterm_handler();
     let shutdown_signal_rx = subscribe_shutdown_signal();
+    // Resolve native auth before optional cloud work. An unavailable issuer
+    // should leave the local workbench usable and give the user a clear hint.
+    let native_binding = crate::cli::native_auth::active();
+    let native_startup_auth = if let Some(binding) = native_binding.as_ref() {
+        let result = crate::cli::native_auth::startup_access_token(binding).await;
+        if let Err(miss) = &result {
+            eprintln!("warning: {}", miss.startup_warning());
+        }
+        Some(result)
+    } else {
+        None
+    };
+    let native_auth_unavailable = native_startup_auth.as_ref().is_some_and(Result::is_err);
 
     // --session-id: override with explicit session UUID
     if let Some(sid) = cli_context.session_id.as_deref() {
@@ -762,8 +775,18 @@ pub(crate) async fn complete_session_startup(
             astra_turn_core::tool_health_persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
             astra_turn_core::tool_health_persistence::load_synced_tool_health(profile_name);
-        let cloud_pull_result = try_cloud_pull(profile_name).await;
-        let pref_keys = try_cloud_pull_preferences(state).await;
+        let cloud_pull_result = if native_auth_unavailable {
+            CloudPullResult {
+                cloud_reachable: false,
+            }
+        } else {
+            try_cloud_pull(profile_name).await
+        };
+        let pref_keys = if native_auth_unavailable {
+            Vec::new()
+        } else {
+            try_cloud_pull_preferences(state).await
+        };
         (cross_session_health_entries, cloud_pull_result, pref_keys)
     };
     tracer.phase("learning_state");
@@ -773,7 +796,11 @@ pub(crate) async fn complete_session_startup(
         state.synced_tool_health_entries = cross_session_health_entries;
     }
 
-    state.session_memory_extractor = build_cli_session_memory_extractor(api, profile).await;
+    state.session_memory_extractor = if native_auth_unavailable {
+        None
+    } else {
+        build_cli_session_memory_extractor(api, profile).await
+    };
     state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
         api.api_origin(),
         profile,
@@ -791,7 +818,25 @@ pub(crate) async fn complete_session_startup(
         &pref_keys_after_pull,
     );
 
-    let startup_token = session_runtime::fresh_access_token(api, profile).await;
+    let native_final_auth = match (native_binding.as_ref(), native_startup_auth) {
+        (Some(binding), Some(Ok(_))) => {
+            // The early token may be near expiry after other startup work.
+            let result = crate::cli::native_auth::startup_access_token(binding).await;
+            if let Err(miss) = &result {
+                eprintln!("warning: {}", miss.startup_warning());
+            }
+            Some(result)
+        }
+        (_, result) => result,
+    };
+    let banner_native_auth = native_final_auth
+        .as_ref()
+        .map(|result| result.as_ref().map(|_| ()).map_err(|miss| *miss));
+    let startup_token = match native_final_auth {
+        Some(Ok(token)) => Some(token),
+        Some(Err(_)) => None,
+        None => session_runtime::fresh_access_token(api, profile).await,
+    };
 
     // Keep startup on the same model-selection state machine used by turns and
     // account commands. The local flag carries the one UI-specific outcome
@@ -809,7 +854,9 @@ pub(crate) async fn complete_session_startup(
         false
     };
     tracer.phase("model_check");
-    prune_stale_pending_recovery(api, profile, state).await;
+    if native_binding.is_none() || startup_token.is_some() {
+        prune_stale_pending_recovery(api, profile, state).await;
+    }
 
     if state.session_id.is_none()
         && let Some(sid) = resume_session_id
@@ -817,7 +864,7 @@ pub(crate) async fn complete_session_startup(
         slash_session::restore_session_into_state(sid, profile, api, state).await?;
     }
 
-    print_session_banner(profile, state);
+    print_session_banner(profile, state, banner_native_auth);
     tracer.phase("banner");
 
     // Pending recovery is silently retained in state for /resume; no startup banner.

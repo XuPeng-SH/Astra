@@ -1730,12 +1730,28 @@ fn banner_clip(text: &str, width: usize) -> String {
     result
 }
 
-pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
+pub(crate) fn print_session_banner(
+    profile: Option<&str>,
+    state: &SessionState,
+    native_auth: Option<Result<(), AccessMiss>>,
+) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
     let p = creds.profiles.get(&pname);
-    let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some()
+    let legacy_logged_in = p.and_then(|p| p.access_token.as_ref()).is_some()
         || active_env_access_token(chrono::Utc::now().timestamp()).is_some();
+    let (auth_status, welcome_back) = match native_auth {
+        Some(Ok(())) => ("logged in", true),
+        Some(Err(AccessMiss::RefreshInProgress)) => ("sign-in refreshing", p.is_some()),
+        Some(Err(AccessMiss::ReauthenticationRequired)) => ("sign-in needs renewal", p.is_some()),
+        Some(Err(AccessMiss::NetworkUnavailable | AccessMiss::Unavailable)) => {
+            ("sign-in unavailable", p.is_some())
+        }
+        Some(Err(AccessMiss::AccountChanged)) => ("sign-in changed", p.is_some()),
+        Some(Err(AccessMiss::NotLoggedIn)) => ("not logged in", false),
+        None if legacy_logged_in => ("logged in", true),
+        None => ("not logged in", false),
+    };
     let model_display = state.model.as_deref().unwrap_or("auto");
     let version = env!("CARGO_PKG_VERSION");
     let skills_count = state.unified_skill_registry.len();
@@ -1848,14 +1864,7 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     ));
     right.push(style_banner_text(
         trunc_vis(
-            &format!(
-                "{skills_count} skills · {}",
-                if logged_in {
-                    "logged in"
-                } else {
-                    "not logged in"
-                }
-            ),
+            &format!("{skills_count} skills · {auth_status}"),
             right_col_w,
         ),
         BannerTextStyle::Body,
@@ -2055,7 +2064,7 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     }
 
     eprintln!();
-    let welcome = banner_welcome_text(p, logged_in);
+    let welcome = banner_welcome_text(p, welcome_back);
     let model_hint = if model_display == "auto" {
         format!(
             "{} {}",
@@ -2173,13 +2182,71 @@ mod tests {
         if std::env::var_os("ASTRA_TEST_BANNER_CHILD").is_none() {
             return;
         }
+        let native_auth = match std::env::var("ASTRA_TEST_BANNER_AUTH").as_deref() {
+            Ok("refreshing") => Some(Err(super::AccessMiss::RefreshInProgress)),
+            Ok("renewal") => Some(Err(super::AccessMiss::ReauthenticationRequired)),
+            Ok("signed_in") => Some(Ok(())),
+            _ => None,
+        };
+        if native_auth.is_some() {
+            let mut credentials = astra_credentials::CredentialsFile::default();
+            credentials.profiles.insert(
+                "default".to_string(),
+                astra_credentials::Profile {
+                    username: Some("test-user".to_string()),
+                    ..Default::default()
+                },
+            );
+            crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        }
+        let long_profile = "moi-internal-profile-".repeat(10);
+        let profile = if native_auth.is_some() {
+            "default"
+        } else {
+            &long_profile
+        };
         super::print_session_banner(
-            Some(&"moi-internal-profile-".repeat(10)),
+            Some(profile),
             &super::SessionState {
                 model: Some("模型-deepseek-".repeat(10)),
                 ..Default::default()
             },
+            native_auth,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn banner_distinguishes_refreshing_from_reauthentication() {
+        use std::process::Command;
+
+        for (auth, expected) in [
+            ("refreshing", "sign-in refreshing"),
+            ("renewal", "sign-in needs renewal"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::session::session_runtime::tests::banner_pty_child",
+                    "--nocapture",
+                ])
+                .env("ASTRA_TEST_BANNER_CHILD", "1")
+                .env("ASTRA_TEST_BANNER_AUTH", auth)
+                .env("ASTRA_CLI_CREDENTIALS_DIR", home.path())
+                .env("HOME", home.path())
+                .env("NO_COLOR", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let visible = String::from_utf8_lossy(&output.stderr);
+            assert!(visible.contains(expected), "{auth}: {visible}");
+            assert!(!visible.contains("not logged in"), "{auth}: {visible}");
+            assert!(
+                visible.contains("Welcome back, test-user"),
+                "{auth}: {visible}"
+            );
+        }
     }
 
     #[cfg(unix)]
