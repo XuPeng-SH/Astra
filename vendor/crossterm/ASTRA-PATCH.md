@@ -50,6 +50,18 @@ enters quarantine after 500 ms; response storage is limited to 256 bytes. Bracke
 contents are never interpreted as query responses. Querying is startup-only;
 callers own terminal modes and must not run an EventStream concurrently.
 
+`query_startup_attributes` also writes `CSI ?u` immediately before its existing
+`CSI c`, and `StartupAttributes.keyboard_enhancement_flags` carries any reply.
+This reuses DA1 as the completion sentinel the Kitty keyboard-protocol spec
+recommends: a supporting terminal answers `?u` at or before DA1, so a still-missing
+flags reply once DA1 arrives means the terminal does not support the protocol,
+with no second query. Do not call crossterm's own upstream
+`supports_keyboard_enhancement`/`query_keyboard_enhancement_flags` during Astra's
+startup window for this reason -- their independent `CSI ?u CSI c` write is a
+competing query outside this bounded round trip, which
+`pty_late_da1_is_unknown_until_reply` asserts against (exactly one `CSI c` in
+the child's output).
+
 Also fixes filtered-read FIFO order and preserving skipped events on input errors.
 No public Event variants or Windows input behavior are changed.
 

@@ -123,13 +123,19 @@ mod textarea_tests {
         let mut ta = TextArea::new();
         ta.set_text("hello");
         assert_eq!(ta.handle_key(key(KeyCode::Enter)), TextAreaAction::Submit);
+        // Submit does not consume or alter the draft; the caller reads it
+        // separately before clearing.
+        assert_eq!(ta.text(), "hello");
     }
 
     #[test]
     fn shift_enter_inserts_newline() {
         let mut ta = TextArea::new();
         ta.set_text("line1");
-        ta.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(
+            ta.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            TextAreaAction::Changed
+        );
         ta.handle_key(key(KeyCode::Char('2')));
         assert_eq!(ta.text(), "line1\n2");
     }

@@ -133,7 +133,37 @@ fn probe_child() {
     }
     let sixel_before = astra_tools::display_sixel::cached_sixel_support();
     startup.prepare_tui().unwrap();
-    let mut guard = crate::tui::terminal::TerminalGuard::init().unwrap();
+    if case == "keyboard_enhancement_panic" {
+        // Exercises the P2 review finding on #914: Push/Pop is a stack, not
+        // an idempotent toggle, so a panic that runs both the global panic
+        // hook and TerminalGuard's own Drop during unwind must still only
+        // remove Astra's own entry once. `_guard` deliberately lives inside
+        // this closure, not outside it, so its Drop runs as part of the
+        // unwind that catch_unwind stops here -- the same order a real
+        // uncaught panic during the interactive session would hit.
+        assert!(
+            startup.keyboard_enhancement_supported(),
+            "fixture must simulate a terminal that supports the protocol"
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard =
+                crate::tui::terminal::TerminalGuard::init(startup.keyboard_enhancement_supported())
+                    .unwrap();
+            panic!("deliberate panic to exercise keyboard-enhancement cleanup ownership");
+        }));
+        assert!(result.is_err(), "fixture must actually panic");
+        startup.handoff();
+        drop(startup);
+        let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+        println!(
+            "{RESULT}{}",
+            serde_json::json!({ "restored": terminal_modes_restored(&before, &after) })
+        );
+        return;
+    }
+    let mut guard =
+        crate::tui::terminal::TerminalGuard::init(startup.keyboard_enhancement_supported())
+            .unwrap();
     if case == "resize_missed" {
         // The shared reader is initialized by startup. Discard SIGWINCH to
         // exercise the size watchdog, without a synthetic resize event.
@@ -481,6 +511,14 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                         std::thread::sleep(remaining);
                     }
                 }
+                if case == "keyboard_enhancement_panic" {
+                    // Answers CSI ?u before DA1, exactly like a real
+                    // supporting terminal per the Kitty protocol's own
+                    // recommended detection order -- flags=0 (no
+                    // enhancement currently active from any parent
+                    // program), which is still `Some(..)`, not `None`.
+                    master.write_all(b"\x1b[?0u").unwrap();
+                }
                 let da1 = if case == "no_sixel" {
                     b"\x1b[?1;2c".as_slice()
                 } else {
@@ -613,6 +651,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             | "poll_escape"
             | "early_palette"
             | "early_theme"
+            | "keyboard_enhancement_panic"
     ) {
         return (value, output);
     }
@@ -741,6 +780,44 @@ fn pty_late_da1_is_unknown_until_reply() {
     );
     assert!(value["sixel_before"].is_null());
     assert_eq!(value["sixel_after"], true);
+}
+
+/// Regression for the P2 review finding on #914: Push/Pop keyboard
+/// enhancement is a stack, not an idempotent toggle like bracketed paste.
+/// A panic after a successful init runs both the global panic hook and
+/// TerminalGuard's own Drop during unwind; only one of them may actually
+/// consume the still-outstanding push. Popping twice would, on a terminal
+/// where some parent program already had its own entry pushed, remove that
+/// parent's entry instead of harmlessly no-op'ing.
+#[test]
+fn pty_keyboard_enhancement_push_and_pop_survive_a_panic_exactly_once() {
+    let (_value, output) = run_case("keyboard_enhancement_panic");
+    let count = |needle: &[u8]| {
+        output
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    };
+    assert_eq!(
+        count(b"\x1b[?u"),
+        1,
+        "must query keyboard enhancement exactly once: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        count(b"\x1b[>1u"),
+        1,
+        "must push exactly once for a supported, detected terminal: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        count(b"\x1b[<1u"),
+        1,
+        "the panic hook and TerminalGuard::drop must not both pop the same \
+         outstanding push -- that would remove a pre-existing parent \
+         program's own keyboard mode instead of a no-op: {}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[cfg(debug_assertions)]

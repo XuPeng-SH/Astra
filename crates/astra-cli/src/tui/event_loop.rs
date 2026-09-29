@@ -6912,9 +6912,10 @@ pub(crate) async fn run_tui_session(
     // Take terminal ownership before spawning any TUI-owned worker. If the
     // terminal vanished during startup, retire the startup-owned runtime now
     // instead of detaching heartbeat/agent work from a TUI that never ran.
+    let keyboard_enhancement_supported = startup_terminal.keyboard_enhancement_supported();
     let mut guard = match startup_terminal
         .prepare_tui()
-        .and_then(|()| TerminalGuard::init())
+        .and_then(|()| TerminalGuard::init(keyboard_enhancement_supported))
     {
         Ok(guard) => guard,
         Err(error) => {
