@@ -63,11 +63,12 @@ current working directory. `/session list` remains accepted as an alias for
 `/resume`. `/session fork` is a line-mode command and is not available in the
 TUI.
 
-If a new session targets a checkout already owned by another session, admission
-stops before model or tool work. The TUI keeps the new session attached and
-returns the draft to its composer; use `/resume` and choose a session explicitly
-to continue existing work, or switch to another worktree for the new session.
-Astra never resumes or takes over a session implicitly.
+Starting a new session in a directory already used by another session is
+allowed when the new session has no unresolved execution debt. Sessions keep
+their own binding and history; they do not take over one another. Physical
+workspace operations are serialized by the executor-owned lease, and a
+temporarily unavailable lease returns a typed retryable result. Use `/resume`
+only when you intend to continue the existing session.
 
 ## Work
 

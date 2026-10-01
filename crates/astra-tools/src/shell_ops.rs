@@ -1203,8 +1203,9 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
                 {
                     return crate::cancelled_tool_result("bash", false);
                 }
-                return ToolResult::error(
-                    "Error: workspace coordination lock is unavailable, contended past the command deadline, or the host temporary lock namespace is not trustworthy; no bash command was run. Retry after the active workspace writer finishes or repair the host temporary-directory ownership and sticky-bit permissions.".into(),
+                return crate::workspace_lease_unavailable_tool_result_for_workspace(
+                    "bash",
+                    &ctx.workspace_root,
                 );
             }
         }

@@ -48,6 +48,26 @@ impl SkillVerifier {
         self.verify_criteria(&criteria).await
     }
 
+    /// Verify a read-only child without opening a second shell execution path.
+    ///
+    /// Filesystem observers and an already-authorized LLM judge remain
+    /// available. Any command-backed criterion, including one nested inside a
+    /// composite, is reported as unsuccessful instead of being executed.
+    pub async fn verify_read_only(
+        &self,
+        manifest: &SkillManifest,
+    ) -> (bool, Vec<VerificationResult>) {
+        if manifest.success_criteria.is_empty() {
+            return (true, Vec::new());
+        }
+        let criteria: Vec<VerificationCriterion> = manifest
+            .success_criteria
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+        self.verify_criteria_read_only(&criteria).await
+    }
+
     /// Run a specific set of criteria.
     ///
     /// Returns `(all_required_passed, results)`.
@@ -55,9 +75,39 @@ impl SkillVerifier {
         &self,
         criteria: &[VerificationCriterion],
     ) -> (bool, Vec<VerificationResult>) {
+        self.verify_criteria_with_policy(criteria, false).await
+    }
+
+    /// Read-only counterpart of [`Self::verify_criteria`].
+    pub async fn verify_criteria_read_only(
+        &self,
+        criteria: &[VerificationCriterion],
+    ) -> (bool, Vec<VerificationResult>) {
+        self.verify_criteria_with_policy(criteria, true).await
+    }
+
+    async fn verify_criteria_with_policy(
+        &self,
+        criteria: &[VerificationCriterion],
+        read_only: bool,
+    ) -> (bool, Vec<VerificationResult>) {
         let mut results = Vec::with_capacity(criteria.len());
 
         for criterion in criteria {
+            if read_only && verifier_requires_shell(&criterion.verifier) {
+                results.push(VerificationResult {
+                    criterion_id: criterion.id.clone(),
+                    passed: false,
+                    evidence: String::new(),
+                    expected: "verification without shell execution".to_string(),
+                    duration_ms: 0,
+                    error: Some(
+                        "command-backed verification is unavailable in a read-only child"
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
             // Skip LlmJudge if no judge is configured
             if matches!(criterion.verifier, VerifierKind::LlmJudge { .. })
                 && self.runner.llm_judge.is_none()
@@ -81,6 +131,22 @@ impl SkillVerifier {
             .all(|(c, r)| !c.required || r.passed);
 
         (all_required_passed, results)
+    }
+}
+
+fn verifier_requires_shell(verifier: &VerifierKind) -> bool {
+    match verifier {
+        VerifierKind::Command { .. }
+        | VerifierKind::CommandOutput { .. }
+        | VerifierKind::BuildPass { .. }
+        | VerifierKind::TestPass { .. } => true,
+        VerifierKind::Composite { criteria, .. } => criteria
+            .iter()
+            .any(|criterion| verifier_requires_shell(&criterion.verifier)),
+        VerifierKind::FileExists { .. }
+        | VerifierKind::GrepCheck { .. }
+        | VerifierKind::ReadFileContains { .. }
+        | VerifierKind::LlmJudge { .. } => false,
     }
 }
 
@@ -214,6 +280,63 @@ mod tests {
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
+        assert!(passed);
+        assert!(results[0].passed);
+    }
+
+    #[tokio::test]
+    async fn read_only_verification_blocks_shell_criteria_without_running_them() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("marker");
+        let mut manifest = SkillManifest::default();
+        manifest
+            .success_criteria
+            .push(criterion_to_value(VerificationCriterion {
+                id: "command-check".to_string(),
+                description: "Command must pass".to_string(),
+                verifier: VerifierKind::Command {
+                    cmd: format!("touch {}", marker.display()),
+                    expected_exit: 0,
+                },
+                required: true,
+                timeout_sec: 10,
+                global_only: false,
+            }));
+
+        let verifier = SkillVerifier::new(dir.path().to_path_buf());
+        let (passed, results) = verifier.verify_read_only(&manifest).await;
+        assert!(!passed);
+        assert!(!results[0].passed);
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("read-only"))
+        );
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn read_only_verification_keeps_typed_file_observers() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("output.txt");
+        std::fs::write(&file_path, "ready").unwrap();
+        let mut manifest = SkillManifest::default();
+        manifest
+            .success_criteria
+            .push(criterion_to_value(VerificationCriterion {
+                id: "output-exists".to_string(),
+                description: "Output file must exist".to_string(),
+                verifier: VerifierKind::FileExists {
+                    paths: vec![file_path.to_string_lossy().to_string()],
+                },
+                required: true,
+                timeout_sec: 10,
+                global_only: false,
+            }));
+
+        let verifier = SkillVerifier::new(dir.path().to_path_buf());
+        let (passed, results) = verifier.verify_read_only(&manifest).await;
         assert!(passed);
         assert!(results[0].passed);
     }

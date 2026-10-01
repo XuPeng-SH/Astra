@@ -323,6 +323,11 @@ impl ToolResult {
 /// failure. Keep the envelope in the shared tools crate so CLI, edge, and
 /// server-local executors cannot drift into different plain-text contracts.
 pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
+pub const TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
+pub const TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED: &str = "workspace_ownership_unsettled";
+pub const TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE: &str = "workspace_binding_unavailable";
+pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED: &str = "workspace_effect_unsettled";
+pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED: &str = "workspace_effect_undeclared";
 
 pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult {
     let message = if execution_started {
@@ -358,6 +363,146 @@ pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult 
         is_error: true,
         exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
     }
+}
+
+/// A workspace lease admission failure is a fact about scheduling, not a
+/// failed tool invocation.  Keep it structured so the invocation ledger can
+/// record “not executed, retryable” without every transport inventing its own
+/// prose-only variant.
+pub fn workspace_lease_unavailable_tool_result(name: &str) -> ToolResult {
+    workspace_lease_result(
+        TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE,
+        format!(
+            "Tool '{name}' was not executed because its workspace is temporarily unavailable; retry after the active workspace operation finishes"
+        ),
+        true,
+    )
+}
+
+/// Preserve the reason for a failed workspace admission. Contention is safe
+/// to retry; an unsettled owner or a missing binding is not. This keeps the
+/// model-facing contract typed without making every lease caller duplicate
+/// the classification logic.
+pub fn workspace_lease_unavailable_tool_result_for_workspace(
+    name: &str,
+    workspace_root: &Path,
+) -> ToolResult {
+    match workspace_observation::classify_workspace_lease_failure(workspace_root) {
+        workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => workspace_lease_result(
+            TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
+            format!(
+                "Tool '{name}' was not executed because a previous workspace owner did not settle; inspect or re-bind the workspace before continuing, and do not replay the call"
+            ),
+            false,
+        ),
+        workspace_observation::WorkspaceLeaseFailure::BindingUnavailable => workspace_lease_result(
+            TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE,
+            format!(
+                "Tool '{name}' was not executed because its workspace binding is unavailable; repair or re-bind the workspace before continuing"
+            ),
+            false,
+        ),
+        workspace_observation::WorkspaceLeaseFailure::Contended => {
+            workspace_lease_unavailable_tool_result(name)
+        }
+    }
+}
+
+fn workspace_lease_result(error_kind: &str, message: String, retryable: bool) -> ToolResult {
+    ToolResult {
+        output: json!({
+            "status": "rejected",
+            "error_kind": error_kind,
+            "error": &message,
+            "execution_started": false,
+            "disposition": "rejected",
+            "execution_fact": "not_executed",
+            "retryable": retryable,
+        })
+        .to_string(),
+        metadata: Some(Map::from_iter([
+            (
+                "error_kind".to_string(),
+                Value::String(error_kind.to_string()),
+            ),
+            ("execution_started".to_string(), Value::Bool(false)),
+            (
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            ),
+            (
+                "execution_fact".to_string(),
+                Value::String("not_executed".to_string()),
+            ),
+            ("retryable".to_string(), Value::Bool(retryable)),
+        ])),
+        is_error: true,
+        exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
+    }
+}
+
+pub fn mcp_workspace_effect_undeclared_tool_result(name: &str) -> ToolResult {
+    let message = format!(
+        "MCP tool '{name}' was not executed because its workspace effect was not declared; the provider must declare readOnlyHint=true or return the workspace settlement contract"
+    );
+    ToolResult {
+        output: json!({
+            "status": "rejected",
+            "error_kind": TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED,
+            "error": message,
+            "execution_started": false,
+            "disposition": "rejected",
+            "execution_fact": "not_executed",
+            "retryable": false,
+        })
+        .to_string(),
+        metadata: Some(Map::from_iter([
+            (
+                "error_kind".to_string(),
+                Value::String(TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED.to_string()),
+            ),
+            ("execution_started".to_string(), Value::Bool(false)),
+            (
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            ),
+            (
+                "execution_fact".to_string(),
+                Value::String("not_executed".to_string()),
+            ),
+            ("retryable".to_string(), Value::Bool(false)),
+        ])),
+        is_error: true,
+        exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
+    }
+}
+
+/// A workspace-capable provider call returned without proving that its
+/// physical effects have settled.  The caller must quarantine the workspace;
+/// this result is deliberately non-retryable because replay could duplicate
+/// an effect that is still in flight.
+pub fn workspace_effect_unsettled_tool_result(name: &str, mut result: ToolResult) -> ToolResult {
+    let message = format!(
+        "Tool '{name}' returned before its workspace effects were proven settled; the workspace was quarantined and the call must not be replayed"
+    );
+    result.output = if result.output.is_empty() {
+        message.clone()
+    } else {
+        format!("{}\n\nError: {message}", result.output)
+    };
+    result.is_error = true;
+    let metadata = result.metadata.get_or_insert_with(Map::new);
+    metadata.extend(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED.to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(true)),
+        ("side_effects_maybe".to_string(), Value::Bool(true)),
+        ("retryable".to_string(), Value::Bool(false)),
+        ("workspace_effect_settled".to_string(), Value::Bool(false)),
+    ]));
+    result
 }
 
 /// Trait for executing tools. Implementations provide the actual tool logic
@@ -922,6 +1067,27 @@ mod tests {
         assert!(r.output.is_empty());
         assert!(!r.is_error);
         assert!(r.metadata.is_none());
+    }
+
+    #[test]
+    fn workspace_lease_result_distinguishes_missing_binding_from_contention() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let missing = root.path().join("missing-workspace");
+        let unavailable = workspace_lease_unavailable_tool_result_for_workspace("bash", &missing);
+        let unavailable_fields = unavailable.metadata.as_ref().unwrap();
+        assert_eq!(
+            unavailable_fields["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE
+        );
+        assert_eq!(unavailable_fields["retryable"], false);
+
+        let contended = workspace_lease_unavailable_tool_result_for_workspace("bash", root.path());
+        let contended_fields = contended.metadata.as_ref().unwrap();
+        assert_eq!(
+            contended_fields["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE
+        );
+        assert_eq!(contended_fields["retryable"], true);
     }
 
     #[test]

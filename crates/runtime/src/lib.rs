@@ -236,8 +236,7 @@ pub use introspection::{
 
 pub use server::build_test_router;
 pub use server::delegation::engine::{
-    CheckpointGate, DefaultQualityGate, DelegationEngine, DelegationTracker, GateVerdict,
-    QualityThresholds, VerificationGate,
+    DelegationEngine, DelegationTracker, GateVerdict, VerificationGate,
 };
 pub use server::run::engine::RunEngine;
 pub use server::run::lifecycle::AgenticRunLifecycleService;

@@ -483,9 +483,9 @@ impl ToolExecutor for DefaultToolExecutor {
                             .clear_authority(&self.convergence_authority);
                         return crate::cancelled_tool_result(name, false);
                     }
-                    return ToolResult::error(
-                        "workspace coordination lock was cancelled, contended, or the host temporary lock namespace is not trustworthy; no tool was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .into(),
+                    return crate::workspace_lease_unavailable_tool_result_for_workspace(
+                        name,
+                        &self.ctx.workspace_root,
                     );
                 }
             }
@@ -512,9 +512,9 @@ impl ToolExecutor for DefaultToolExecutor {
             {
                 Some(guard) => Some(guard),
                 None => {
-                    return ToolResult::error(
-                        "workspace writer coordination was cancelled, contended, or the host temporary lock namespace is not trustworthy; run_script was not run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .into(),
+                    return crate::workspace_lease_unavailable_tool_result_for_workspace(
+                        name,
+                        &self.ctx.workspace_root,
                     );
                 }
             }
@@ -988,7 +988,7 @@ impl DefaultToolExecutor {
             // ── Utility tools ────────────────────────────────────────
             "tool_search" => {
                 let schemas = self.tool_schemas();
-                string_to_result(crate::tool_search::tool_search(&schemas, args))
+                crate::tool_search::tool_search_result(&schemas, args)
             }
             "env" => string_to_result(crate::env_tools::env_tool(args)),
             "config" => {
@@ -1179,6 +1179,17 @@ pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
 
         _ => false,
     }
+}
+
+/// Return whether a top-level invocation must serialize against other
+/// operations on the same physical workspace.
+///
+/// Provider-owned MCP effects are resolved from their discovered declaration
+/// by the MCP manager and are intentionally not classified here. This
+/// function is the typed-tool predicate shared by Edge and Server; MCP uses
+/// the same lease implementation through its provider effect contract.
+pub fn requires_workspace_serialization(name: &str, args: &Value) -> bool {
+    is_workspace_mutation_tool(name, args)
 }
 
 fn validate_host_owned_write_boundary(

@@ -773,6 +773,7 @@ async fn model_router_http_dashboard_canary_outcome_and_rollback_on_matrixone() 
         offering_id: "strong".into(),
     });
     context.resolved_model_selection = Some(astra_services::runs::ResolvedModelSelection {
+        source_identity: None,
         offering_id: "strong".into(),
         model_name: "strong-model".into(),
     });

@@ -150,6 +150,13 @@ impl TaskCell {
         }
     }
 
+    /// Remove live child detail when a later typed ownership event proves
+    /// that the child belongs to a dedicated agent transcript. The parent
+    /// row then returns to its compact delegation-only presentation.
+    pub fn clear_children(&mut self) {
+        self.children.clear();
+    }
+
     /// Terminal transition for the parent task. `status_str` follows
     /// the shared canonical tool-result convention. Agent delegation is
     /// also a successful terminal outcome, so `"delegated"` renders like

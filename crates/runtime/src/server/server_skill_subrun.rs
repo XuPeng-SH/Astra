@@ -148,6 +148,7 @@ impl Drop for OuterSkillDispatchGuard {
 /// Creates a [`ServerAgenticLoopHost`] for each sub-run with isolated context
 /// but shared LLM credentials and skill resolver.
 pub struct ServerSkillSubRunExecutor {
+    model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -245,7 +246,13 @@ impl ServerSkillSubRunExecutor {
                     service
                         .admit_model_offering(self.user_id.clone(), id)
                         .await
-                        .map_err(|(_, body)| body.0.detail)
+                        .map_err(|(status, body)| {
+                            crate::server::run::lifecycle::safe_model_service_error_with_code(
+                                status,
+                                body.0.error_code.as_deref(),
+                            )
+                            .to_string()
+                        })
                 } else {
                     astra_services::revalidate_admitted_model_execution(
                         &self.matrixone,
@@ -255,13 +262,22 @@ impl ServerSkillSubRunExecutor {
                         self.shared_pool.as_ref().map(SharedPool::get),
                     )
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| {
+                        crate::server::run::lifecycle::safe_model_offering_error_with_code(error)
+                    })
                 }
             },
         )
         .await
     }
 
+    pub fn with_model_catalog_reader(
+        mut self,
+        reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
+    ) -> Self {
+        self.model_catalog_reader = reader;
+        self
+    }
     pub fn with_model_service(
         mut self,
         service: Option<Arc<dyn astra_services::ModelService>>,
@@ -277,6 +293,7 @@ impl ServerSkillSubRunExecutor {
     ) -> Self {
         Self {
             model_service: None,
+            model_catalog_reader: None,
             matrixone,
             encryptor,
             shared_pool: None,
@@ -573,6 +590,7 @@ impl ServerSkillSubRunExecutor {
             None,
         )
         .with_reflect_service(Arc::clone(&self.reflect_service))
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
             self.reflect_service.is_configured(),
@@ -990,6 +1008,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         )
         .with_model(effective_model.clone())
         .with_model_service(self.model_service.clone())
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
+        .with_provider_scope_bound(admitted_model_execution.as_ref().is_some_and(|execution| {
+            execution.execution_placement == astra_services::models::ModelExecutionPlacement::Edge
+        }))
         .with_admitted_model_execution(admitted_model_execution.clone())
         .with_inference_owner_pod_id(Some(parent_owner_pod_id.to_string()))
         .with_edge_tools(self.edge_tools.clone())
@@ -1096,6 +1118,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             runtime_manifest: None,
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
+            current_model_item_id: None,
+            final_text_model_item_id: None,
             final_text_streamed: false,
             final_output_ready_notified: false,
             total_prompt: 0,
@@ -1198,7 +1222,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             delegation_chain: Vec::new(),
             self_agent_id: "main".to_string(),
             project_context: None,
-            checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
@@ -1434,7 +1457,11 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(error.contains("Genesis Offering unavailable"), "{error}");
+        assert!(
+            error.contains("[model_offering_not_found]")
+                || error.contains("[model_offering_unavailable]"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1826,6 +1853,7 @@ mod tests {
                     },
                 ),
                 None,
+                None,
             )
             .await;
         assert!(
@@ -1867,6 +1895,7 @@ mod tests {
                         expected_execution_binding_generation: None,
                     },
                 ),
+                None,
                 None,
             )
             .await;

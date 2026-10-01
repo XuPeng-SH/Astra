@@ -41,6 +41,7 @@ impl OutcomeFixture {
             offering_id: "strong".into(),
         });
         context.resolved_model_selection = Some(astra_services::runs::ResolvedModelSelection {
+            source_identity: None,
             offering_id: "strong".into(),
             model_name: "strong-model".into(),
         });

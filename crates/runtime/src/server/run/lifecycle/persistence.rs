@@ -1556,16 +1556,24 @@ pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
         let already_has_final = messages
             .last()
             .and_then(|message| {
+                if let Some(id) = state.final_text_model_item_id.as_deref() {
+                    return Some(astra_turn_types::model_item_id(message) == Some(id));
+                }
                 let role = message.get("role")?.as_str()?;
                 let content = message.get("content")?.as_str()?;
                 Some(role == "assistant" && content.trim() == final_text)
             })
             .unwrap_or(false);
         if !already_has_final {
-            messages.push(json!({
+            let mut message = json!({
                 "role": "assistant",
                 "content": final_text,
-            }));
+            });
+            astra_turn_types::mark_model_message(
+                &mut message,
+                state.final_text_model_item_id.as_deref(),
+            );
+            messages.push(message);
         }
     }
     messages
@@ -1926,6 +1934,8 @@ pub(crate) struct TranscriptPersistItem {
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TranscriptPersistPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2087,7 +2097,13 @@ fn terminal_assistant_transcript_item(
         run_id: Some(run_id.to_string()),
         role: "assistant",
         content: state.final_text.clone(),
-        payload: None,
+        payload: state
+            .final_text_model_item_id
+            .as_ref()
+            .map(|id| TranscriptPersistPayload {
+                model_item_id: Some(id.clone()),
+                ..Default::default()
+            }),
         source_event_id: trace_event_id("response", &[run_id, &trace.turn_id]),
     })
 }
@@ -2169,19 +2185,24 @@ pub(crate) async fn persist_session_transcript_items(
 
 #[derive(Clone, Debug, Default)]
 struct TranscriptReasoningProjection {
+    model_item_id: Option<String>,
     text: String,
     done: bool,
 }
 
 impl TranscriptReasoningProjection {
     fn append_delta(&mut self, delta: &str) {
-        if !delta.is_empty() && !self.text.ends_with(delta) {
+        if !delta.is_empty() {
             self.text.push_str(delta);
         }
     }
 
     fn is_empty(&self) -> bool {
         self.text.is_empty() && !self.done
+    }
+
+    fn matches_payload(&self, payload: Option<&TranscriptPersistPayload>) -> bool {
+        payload.and_then(|payload| payload.model_item_id.as_ref()) == self.model_item_id.as_ref()
     }
 }
 
@@ -2190,6 +2211,9 @@ fn payload_with_reasoning_projection(
     reasoning: &TranscriptReasoningProjection,
 ) -> Option<TranscriptPersistPayload> {
     if reasoning.is_empty() {
+        return payload;
+    }
+    if !reasoning.matches_payload(payload.as_ref()) {
         return payload;
     }
     let mut payload = payload.unwrap_or_default();
@@ -2274,6 +2298,28 @@ fn apply_reasoning_event_payload(projection: &mut TranscriptReasoningProjection,
         .get("event_type")
         .or_else(|| payload.get("type"))
         .and_then(Value::as_str);
+    if matches!(
+        event_type,
+        Some(
+            "reasoning_delta"
+                | "thinking_delta"
+                | "reasoning_message_content"
+                | "reasoning_done"
+                | "thinking_done"
+        )
+    ) {
+        let model_item_id = payload
+            .get("model_item_id")
+            .or_else(|| payload.pointer("/data/model_item_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if projection.model_item_id != model_item_id {
+            *projection = TranscriptReasoningProjection {
+                model_item_id,
+                ..Default::default()
+            };
+        }
+    }
     match event_type {
         Some("reasoning_delta" | "thinking_delta" | "reasoning_message_content") => {
             let content = payload
@@ -2414,8 +2460,13 @@ async fn update_run_assistant_transcript_reasoning_in_tx(
                 "decode stored transcript payload for run {run_id}: {error}"
             ))
         })?;
-    let payload = payload_with_reasoning_projection(payload, reasoning)
-        .expect("non-empty reasoning always materializes a transcript payload");
+    if !reasoning.matches_payload(payload.as_ref()) {
+        return Ok(());
+    }
+    let Some(payload) = payload_with_reasoning_projection(payload, reasoning) else {
+        // Reasoning from another model item cannot materialize this row.
+        return Ok(());
+    };
     let payload_json = serde_json::to_string(&payload).map_err(|error| {
         sqlx::Error::Protocol(format!(
             "serialize transcript reasoning for run {run_id}: {error}"
@@ -3015,6 +3066,8 @@ pub(crate) fn build_tool_trace_events(
         terminal.metadata = json!({
             "ok": record.ok,
             "disposition": disposition,
+            "result_class": record.result_class,
+            "exit_semantics": record.exit_semantics,
             "action": action,
             "args_preview": record.args_preview,
             "result_preview": record.result_preview,
@@ -5210,6 +5263,68 @@ mod tests {
     }
 
     #[test]
+    fn terminal_model_item_identity_covers_only_accepted_item_and_matching_reasoning() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "same answer".into();
+        state.final_text_model_item_id = Some("accepted-A".into());
+        state.current_model_item_id = Some("partial-P".into());
+        let accepted =
+            terminal_assistant_transcript_item("u", "s", "run", None, "", &state).unwrap();
+        let payload = accepted.payload.as_ref().unwrap();
+        assert_eq!(payload.model_item_id.as_deref(), Some("accepted-A"));
+        assert!(payload.reasoning.is_none());
+        assert_ne!(accepted.source_event_id, "accepted-A");
+
+        let mut reasoning = TranscriptReasoningProjection::default();
+        apply_reasoning_event_payload(
+            &mut reasoning,
+            &json!({"type":"reasoning_delta", "model_item_id":"partial-P", "content":"unfinished reasoning"}),
+        );
+        assert!(!reasoning.matches_payload(None));
+        assert!(!reasoning.matches_payload(accepted.payload.as_ref()));
+        let projected =
+            payload_with_reasoning_projection(accepted.payload.clone(), &reasoning).unwrap();
+        assert_eq!(projected.model_item_id.as_deref(), Some("accepted-A"));
+        assert!(
+            projected.reasoning.is_none(),
+            "another response cannot claim reasoning coverage"
+        );
+
+        apply_reasoning_event_payload(
+            &mut reasoning,
+            &json!({"type":"reasoning_delta", "model_item_id":"accepted-A", "content":"echo"}),
+        );
+        assert!(reasoning.matches_payload(accepted.payload.as_ref()));
+        apply_reasoning_event_payload(
+            &mut reasoning,
+            &json!({"type":"reasoning_delta", "model_item_id":"accepted-A", "content":"echo"}),
+        );
+        let projected =
+            payload_with_reasoning_projection(accepted.payload.clone(), &reasoning).unwrap();
+        assert_eq!(
+            projected.reasoning.as_deref(),
+            Some("echoecho"),
+            "equal fragments are distinct, not text-deduplicated"
+        );
+
+        state.final_text_model_item_id = Some("resume-B".into());
+        let resumed =
+            terminal_assistant_transcript_item("u", "s", "run", None, "", &state).unwrap();
+        assert_eq!(resumed.content, accepted.content);
+        let stale = stored_transcript_fixture(&accepted, accepted.payload.clone());
+        assert!(
+            !stored_transcript_matches_canonical_or_reasoning_projection(
+                &resumed,
+                &stale,
+                "run",
+                Some(&accepted.source_event_id),
+                &TranscriptReasoningProjection::default()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn durable_run_evidence_and_reasoning_keep_typed_identity() {
         let mut reasoning = TranscriptReasoningProjection::default();
         apply_reasoning_event_payload(
@@ -5262,7 +5377,6 @@ mod tests {
                 "payload_kind": payload_kind,
                 "summary": "bounded summary",
                 "timestamp_ms": 42,
-                "requires_ack": false
             })
         };
         assert_eq!(
@@ -5334,6 +5448,7 @@ mod tests {
         );
 
         let reasoning = TranscriptReasoningProjection {
+            model_item_id: None,
             text: "checked the invariant".to_string(),
             done: true,
         };
@@ -5362,6 +5477,7 @@ mod tests {
             source_event_id: "response-1".to_string(),
         };
         let reasoning = TranscriptReasoningProjection {
+            model_item_id: None,
             text: "checked the invariant".to_string(),
             done: true,
         };

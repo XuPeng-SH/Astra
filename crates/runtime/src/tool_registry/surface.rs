@@ -368,11 +368,11 @@ impl ToolSurface {
 ///
 /// The canonical catalog keeps the complete contract. A model can select that
 /// contract explicitly with `tool_search`; deferred targets then use the stable
-/// carrier, while a resident target remains directly callable. This is a
+/// carrier, including advanced shapes of a resident target. This is a
 /// prompt-surface optimization rather than an executor capability reduction.
 /// Keeping rare, safety-specialized fields off the default prefix prevents a
 /// single broad tool from consuming the budget meant for every first request.
-fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
+pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
     let Some(function) = schema.get_mut("function").and_then(Value::as_object_mut) else {
         return schema;
     };
@@ -398,7 +398,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "ready_check",
                 "background_ttl",
             ][..],
-            "Run shell in the bounded workspace. Before external mutations, set external_state_paths to the smallest absolute external roots. Evidence requires an owned foreground delta. Omit for workspace-only or read-only work.",
+            "Before external mutations: external_state_paths=minimal absolute external roots; evidence needs owned foreground delta. Omit for workspace/read-only.",
         ),
         "str_replace" => (
             &[
@@ -409,45 +409,56 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "replace_all",
                 "allow_structural_change",
             ][..],
-            "Replace file text. Batch/structural overrides: tool_search select:str_replace.",
+            "Edit text; batch: select:str_replace.",
         ),
         "ask_user" => (
             &["context", "questions"][..],
-            "Ask focused questions. Choices/headers/multi-select: tool_search select:ask_user.",
+            "Ask; advanced: select:ask_user.",
+        ),
+        "agent" => (
+            &[
+                "action",
+                "agent_type",
+                "description",
+                "prompt",
+                // Reasoning is a first-class child execution control. Keep it
+                // on the resident spawn contract so ordinary language such as
+                // “use high reasoning” cannot produce a valid canonical field
+                // that the model's visible schema rejects.
+                "reasoning",
+                "agent_id",
+                "timeout_ms",
+                "to",
+                "message",
+                "message_type",
+                "request_id",
+            ][..],
+            "Spawn action=spawn; description+prompt, optional agent_type/reasoning; model selection via candidate-aware admission.",
         ),
         "introspect" => (
             &[
-                "topic",
                 "facet",
-                "depth",
-                "horizon",
                 "question",
-                "source_policy",
-                "include_context",
-                "format",
                 "artifact",
                 "explain",
                 "offset",
                 "max_bytes",
             ][..],
-            "question=label. Server Explain: explain={target:previous} OR artifact=handle; never both.",
+            "Current state; Explain: explain={target:previous} or explain={target:run,run_id}; questions: question=label; recovery: artifact=handle; never both; history: select:reflect; models: select:model_catalog.",
         ),
         "reflect" => (
             &["question"][..],
-            "History; typed: tool_search select:reflect;invoke_tool.",
+            "Session-scoped history; no exact run selector or live prerequisite. Use Explain for one exact run. select:reflect;invoke_tool.",
         ),
         "memory" => (
             &["action", "content", "query", "memory_type", "scope"][..],
-            "remember:content; recall:query; scope=session. forget/update: tool_search select:memory; invoke_tool.",
+            "remember/recall; advanced: select:memory.",
         ),
         "read_file" => (
             &["path", "start_line", "end_line", "outline"][..],
-            "Read a bounded file range or return its code outline.",
+            "Read lines/outline.",
         ),
-        "list_dir" => (
-            &["path", "depth"][..],
-            "List entries in a bounded workspace directory.",
-        ),
+        "list_dir" => (&["path", "depth"][..], "List directory."),
         "grep" => (
             &[
                 "pattern",
@@ -458,7 +469,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "max_matches",
                 "output_mode",
             ][..],
-            "Search workspace files with a bounded regular-expression query.",
+            "Regex search.",
         ),
         "glob" => (
             &["pattern", "path", "sort_by", "offset", "head_limit"][..],
@@ -466,28 +477,19 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "write_file" => (
             &["path", "content", "delete"][..],
-            "Create, overwrite, or delete one workspace file. Use str_replace for targeted edits.",
+            "Write/delete; edit: str_replace.",
         ),
         "skill" => (
             &["skill_name", "task"][..],
-            "Run a listed skill before substantive work.",
+            "Run a listed skill for work this agent owns.",
         ),
-        "tool_search" => (
-            &["query"][..],
-            "Select deferred tools explicitly with select:NAME or select:NAME1,NAME2.",
-        ),
-        "notify" => (
-            &["message", "notification_type"][..],
-            "Send a user notification or status update.",
-        ),
+        "tool_search" => (&["query"][..], "Select: select:NAME or select:NAME1,NAME2."),
+        "notify" => (&["message", "notification_type"][..], "Notify user."),
         "start_work" => (
             &["goal", "activation", "tasks"][..],
-            "Create one canonical Work graph: start assigns; defer waits. Once bound, never call start_work again; use a revision-pinned proposal.",
+            "one canonical Work graph; never call start_work again; revision-pinned proposal.",
         ),
-        "run_next_work_item" => (
-            &[][..],
-            "Request the next canonical Work assignment only when start or settlement returned none.",
-        ),
+        "run_next_work_item" => (&[][..], "Next Work only if start/settlement returned none."),
         "settle_work_item" => (
             &[
                 "outcome",
@@ -495,7 +497,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "blocker_kind",
                 "unavailable_capabilities",
             ][..],
-            "Settle the active Work attempt truthfully before the final response; use blocked or failed when delivery evidence is incomplete.",
+            "Settle assigned WorkItem only; child wait is not Work.",
         ),
         _ => return schema,
     };
@@ -506,7 +508,35 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
     else {
         return schema;
     };
-    if name == "str_replace" {
+    if name == "agent" {
+        parameters.insert("required".to_string(), serde_json::json!(["action"]));
+        parameters.retain(|key, _| {
+            !key.starts_with("x-astra-")
+                || matches!(
+                    key.as_str(),
+                    "x-astra-per-action-required" | "x-astra-per-action-allowed"
+                )
+        });
+        for key in ["x-astra-per-action-required", "x-astra-per-action-allowed"] {
+            if let Some(actions) = parameters.get_mut(key).and_then(Value::as_object_mut) {
+                actions.retain(|action, _| {
+                    matches!(
+                        action.as_str(),
+                        "spawn" | "list" | "get_result" | "wait" | "send_message"
+                    )
+                });
+                if key == "x-astra-per-action-allowed" {
+                    for fields in actions.values_mut().filter_map(Value::as_array_mut) {
+                        fields.retain(|field| {
+                            field
+                                .as_str()
+                                .is_some_and(|field| resident_fields.contains(&field))
+                        });
+                    }
+                }
+            }
+        }
+    } else if name == "str_replace" {
         parameters.insert(
             "x-astra-per-action-required".to_string(),
             serde_json::json!({"single": ["path", "old_str", "new_str"]}),
@@ -523,11 +553,9 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
     // are removed, close the reduced object so omitted advanced fields cannot
     // bypass deferred activation at execution admission.
     parameters.insert("additionalProperties".to_string(), Value::Bool(false));
-    if name == "start_work" {
-        // Discovery consumes the untouched catalog, not this resident wire
-        // schema. Its task guidance is already retained below at the field.
-        parameters.remove("x-astra-discovery-summary");
-    }
+    // Discovery consumes the untouched catalog; this duplicates resident prose
+    // and is not an argument-validation constraint.
+    parameters.remove("x-astra-discovery-summary");
     let Some(properties) = parameters
         .get_mut("properties")
         .and_then(Value::as_object_mut)
@@ -541,6 +569,14 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         action.insert(
             "enum".to_string(),
             serde_json::json!(["remember", "recall"]),
+        );
+    }
+    if name == "agent"
+        && let Some(action) = properties.get_mut("action").and_then(Value::as_object_mut)
+    {
+        action.insert(
+            "enum".to_string(),
+            serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"]),
         );
     }
     if name == "ask_user"

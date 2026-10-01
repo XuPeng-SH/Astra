@@ -107,7 +107,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-27-v90";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-29-v91";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3767,27 +3767,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "session_execution_workspace_claims",
-        "CREATE TABLE IF NOT EXISTS session_execution_workspace_claims (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            workspace_identity_hash CHAR(64) NOT NULL,
-            workspace_identity VARCHAR(8192) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, workspace_identity_hash),
-            UNIQUE KEY uq_session_execution_workspace_claim_session
-                (isolation_domain, owner_user_id, session_id, branch_id),
-            INDEX idx_session_execution_workspace_claim_owner_session
-                (owner_user_id, session_id, branch_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
         "session_execution_switches",
         "CREATE TABLE IF NOT EXISTS session_execution_switches (
             isolation_domain VARCHAR(128) NOT NULL,
@@ -5181,6 +5160,7 @@ async fn ensure_core_schema_while_leased(
             execution_placement VARCHAR(32) NOT NULL,
             access_kind VARCHAR(32) NOT NULL,
             purpose VARCHAR(64) NOT NULL,
+            price_snapshot_json JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, route_id),
             CONSTRAINT chk_inference_routes_scope_kind

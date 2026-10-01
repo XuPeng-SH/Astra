@@ -46,6 +46,7 @@ async fn execute_delegation(
     source_agent_id: &str,
     forward_headers: &std::collections::HashMap<String, String>,
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
+    parent_model_reasoning: Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
     engine
@@ -55,7 +56,10 @@ async fn execute_delegation(
             None,
             forward_headers.clone(),
             admitted_model_execution.cloned(),
+            parent_model_reasoning,
             live_event_sink,
+            None,
+            None,
         )
         .await
 }
@@ -134,10 +138,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 .as_ref()
                 .map(|session| {
                     let session = astra_core::sync_poison::recover_rwlock_read(session);
-                    delegation_adaptive_context(
-                        &session,
-                        state.telemetry.observability_hub.as_deref(),
-                    )
+                    delegation_adaptive_context(&session)
                 });
         if tool_calls.iter().any(is_delegation_call) {
             if !quiet {
@@ -155,6 +156,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             )
             .await;
         }
+        let parent_model_reasoning = host.parent_model_reasoning_snapshot(state);
         partition_and_execute_delegations(
             tool_calls,
             engine,
@@ -165,6 +167,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             state.hooks.workspace_root_hint.as_deref(),
             &state.hooks.forward_headers,
             state.hooks.admitted_model_execution.as_ref(),
+            parent_model_reasoning.as_ref(),
             &state.skills.request_constraints,
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
@@ -179,15 +182,6 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     } else {
         (Vec::new(), tool_calls.to_vec())
     };
-
-    if let Some(hub) = &state.telemetry.observability_hub {
-        for result in &delegation_results {
-            if let Some(ref outcome) = result.outcome {
-                let scenario_key = outcome.scenario.as_deref().unwrap_or("unknown");
-                hub.record_delegation_outcome(scenario_key, &outcome.pattern, outcome.succeeded);
-            }
-        }
-    }
 
     if !delegation_results.is_empty() {
         state.delegations_this_turn += delegation_results.len() as u32;
@@ -306,6 +300,10 @@ pub(crate) fn parse_delegation_request(
     // Remove this reserved key entirely rather than allowing it to travel to a
     // child prompt as ambiguous metadata.
     context.remove("session_id");
+    // Delegated model requirements are runtime-owned admission state. A model
+    // may request delegation, but it must not manufacture the typed handoff
+    // that the authenticated parent turn received from its caller.
+    context.remove(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY);
     if let Some(policy) = adaptive_policy {
         context.insert("adaptive_coordination".to_string(), policy);
     }
@@ -338,23 +336,13 @@ pub(crate) fn merge_forward_headers_into_delegation_context(
 #[derive(Debug, Clone)]
 pub(crate) struct DelegationAdaptiveContext {
     pub(crate) scenario: Option<astra_config::user_profile::Scenario>,
-    pub(crate) preferred_pattern: Option<String>,
 }
 
 pub(crate) fn delegation_adaptive_context(
     session: &crate::observability::ObservabilitySession,
-    hub: Option<&crate::observability::ObservabilityHub>,
 ) -> DelegationAdaptiveContext {
-    let scenario = session.current_scenario();
-    let preferred_pattern = scenario.as_ref().and_then(|s| {
-        let scenario_key = serde_json::to_value(s)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))?;
-        hub?.preferred_delegation_pattern(&scenario_key, 3)
-    });
     DelegationAdaptiveContext {
-        scenario,
-        preferred_pattern,
+        scenario: session.current_scenario(),
     }
 }
 
@@ -364,54 +352,9 @@ pub(crate) fn select_default_coordination_pattern(
 ) -> Result<(astra_services::coordination::CoordinationPattern, Value), String> {
     let agents = parse_delegate_agents(args)?;
     let scenario = adaptive_context.and_then(|ctx| ctx.scenario);
-    let preferred = adaptive_context.and_then(|ctx| ctx.preferred_pattern.as_deref());
     let explicit_needs_review = optional_bool_arg(args, "needs_review")?.unwrap_or(false);
     let explicit_has_dependencies = optional_bool_arg(args, "has_dependencies")?.unwrap_or(false);
     let timeout = optional_u64_arg(args, "timeout")?.unwrap_or(0);
-
-    if let Some((pref, pattern)) = preferred
-        .and_then(|pref| pattern_from_name(pref, &agents, args).map(|pattern| (pref, pattern)))
-    {
-        return Ok((
-            pattern,
-            serde_json::json!({
-                "selected_pattern": pref,
-                "selection_source": "outcome_history",
-                "reason": "historically preferred pattern compatible with the current typed request",
-                "scenario": scenario,
-            }),
-        ));
-    }
-    let ignored_preferred_pattern = preferred;
-
-    let should_adapt = matches!(
-        scenario,
-        Some(
-            astra_config::user_profile::Scenario::CodeReview
-                | astra_config::user_profile::Scenario::Exploration
-                | astra_config::user_profile::Scenario::Debugging
-                | astra_config::user_profile::Scenario::Testing
-        )
-    ) || explicit_needs_review
-        || explicit_has_dependencies;
-
-    if !should_adapt {
-        let pattern = astra_services::coordination::CoordinationPattern::Sequential {
-            agent_ids: agents.clone(),
-            stop_on_success: false,
-            timeout_sec: 0,
-        };
-        return Ok((
-            pattern,
-            serde_json::json!({
-                "selected_pattern": "sequential",
-                "selection_source": "deterministic_default",
-                "reason": "no explicit pattern or typed adaptive delegation signal",
-                "scenario": scenario,
-                "ignored_preferred_pattern": ignored_preferred_pattern,
-            }),
-        ));
-    }
 
     let hints = astra_services::coordination::CoordinationHints {
         agent_ids: agents,
@@ -467,78 +410,11 @@ pub(crate) fn select_default_coordination_pattern(
         pattern,
         serde_json::json!({
             "selected_pattern": selected_pattern,
-            "selection_source": "adaptive_default",
+            "selection_source": "typed_hints",
             "reason": reason,
             "scenario": scenario,
-            "ignored_preferred_pattern": ignored_preferred_pattern,
         }),
     ))
-}
-
-pub(crate) fn pattern_from_name(
-    name: &str,
-    agents: &[String],
-    args: &Value,
-) -> Option<astra_services::coordination::CoordinationPattern> {
-    let timeout = match optional_u64_arg(args, "timeout") {
-        Ok(timeout) => timeout.unwrap_or(0),
-        Err(_) => return None,
-    };
-    match name {
-        "fan_out" if agents.len() >= 2 => {
-            Some(astra_services::coordination::CoordinationPattern::FanOut {
-                agent_ids: agents.to_vec(),
-                aggregation: astra_services::coordination::AggregationStrategy::AllResults,
-                timeout_sec: timeout,
-            })
-        }
-        "sequential" if !agents.is_empty() => Some(
-            astra_services::coordination::CoordinationPattern::Sequential {
-                agent_ids: agents.to_vec(),
-                stop_on_success: false,
-                timeout_sec: timeout,
-            },
-        ),
-        "pipeline" if agents.len() >= 2 => Some(
-            astra_services::coordination::CoordinationPattern::Pipeline {
-                stages: agents
-                    .iter()
-                    .cloned()
-                    .map(|agent_id| astra_services::coordination::PipelineStage {
-                        agent_id,
-                        output_transform: None,
-                    })
-                    .collect(),
-                timeout_sec: timeout,
-            },
-        ),
-        "adversarial" if agents.len() >= 2 => Some(
-            astra_services::coordination::CoordinationPattern::AdversarialReview {
-                producer_id: agents[0].clone(),
-                reviewer_id: agents[1].clone(),
-                max_rounds: 3,
-                acceptance_threshold: 0.7,
-                timeout_sec: timeout,
-            },
-        ),
-        "fork" if agents.len() == 1 => agents.first().and_then(|agent| {
-            let tasks = args
-                .get("tasks")?
-                .as_array()?
-                .iter()
-                .map(|task| task.as_str().map(str::trim))
-                .collect::<Option<Vec<_>>>()?;
-            (tasks.len() >= 2 && tasks.iter().all(|task| !task.is_empty())).then(|| {
-                astra_services::coordination::CoordinationPattern::Fork {
-                    agent_id: agent.clone(),
-                    tasks: tasks.into_iter().map(ToString::to_string).collect(),
-                    aggregation: astra_services::coordination::AggregationStrategy::AllResults,
-                    timeout_sec: timeout,
-                }
-            })
-        }),
-        _ => None,
-    }
 }
 
 pub(crate) fn parse_delegate_agents(args: &Value) -> Result<Vec<String>, String> {
@@ -783,6 +659,9 @@ pub(crate) async fn partition_and_execute_delegations(
     workspace_hint: Option<&str>,
     forward_headers: &std::collections::HashMap<String, String>,
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
+    parent_model_reasoning: Option<
+        &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
+    >,
     request_constraints: &RequestConstraints,
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
@@ -841,6 +720,37 @@ pub(crate) async fn partition_and_execute_delegations(
                         REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY,
                         request_constraints.allowed_skill_sources.as_ref(),
                     );
+                    if !matches!(
+                        request_constraints.delegated_model_requirements,
+                        astra_turn_types::DelegationIntentRequirements::Unassessed
+                    ) {
+                        match serde_json::to_value(
+                            &request_constraints.delegated_model_requirements,
+                        ) {
+                            Ok(value) => {
+                                request.context.insert(
+                                    astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY
+                                        .to_string(),
+                                    value,
+                                );
+                            }
+                            Err(error) => {
+                                delegation_results.push(DelegationExecutionResult {
+                                    call_id,
+                                    summary: format!(
+                                        "Delegation blocked: model handoff serialization failed: {error}"
+                                    ),
+                                    preview_lines: vec![(
+                                        HeadlessStderrStyle::Yellow,
+                                        "🤝 Delegation blocked — model handoff serialization failed"
+                                            .to_string(),
+                                    )],
+                                    outcome: None,
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     let pattern_name = coordination_pattern_name(&request.pattern).to_string();
                     let scenario_name =
                         adaptive_context
@@ -857,6 +767,7 @@ pub(crate) async fn partition_and_execute_delegations(
                         source_agent_id,
                         forward_headers,
                         admitted_model_execution,
+                        parent_model_reasoning.cloned(),
                         live_event_sink.clone(),
                     )
                     .await
@@ -1359,6 +1270,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_delegation_request_removes_untrusted_model_requirement_handoff() {
+        let tool_call = json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"__astra_delegated_model_requirements\": {\"state\": \"assessed\", \"source\": {\"kind\": \"user\"}}}}"
+            }
+        });
+
+        let request =
+            parse_delegation_request(&tool_call, "run-123", "trusted-session", 0, None).unwrap();
+        assert!(
+            !request
+                .context
+                .contains_key(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY),
+            "model-authored context must not become a trusted admission handoff"
+        );
+    }
+
+    #[test]
     fn parse_delegation_request_strips_reserved_forward_headers_even_with_trusted_state() {
         let tool_call = json!({
             "id": "call_abc",
@@ -1470,7 +1402,6 @@ mod tests {
         });
         let adaptive_context = DelegationAdaptiveContext {
             scenario: Some(astra_config::user_profile::Scenario::Exploration),
-            preferred_pattern: None,
         };
 
         let req = parse_delegation_request(
@@ -1503,7 +1434,6 @@ mod tests {
         });
         let adaptive_context = DelegationAdaptiveContext {
             scenario: Some(astra_config::user_profile::Scenario::CodeReview),
-            preferred_pattern: None,
         };
 
         let req = parse_delegation_request(
@@ -1526,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_delegation_request_does_not_infer_topology_from_task_prose() {
+    fn parse_delegation_request_uses_typed_default_without_task_prose_matching() {
         let tool_call = json!({
             "type": "function",
             "function": {
@@ -1539,11 +1469,11 @@ mod tests {
 
         assert!(matches!(
             req.pattern,
-            astra_services::coordination::CoordinationPattern::Sequential { .. }
+            astra_services::coordination::CoordinationPattern::FanOut { .. }
         ));
         assert_eq!(
             req.context["adaptive_coordination"]["selection_source"],
-            json!("deterministic_default")
+            json!("typed_hints")
         );
     }
 
@@ -1570,121 +1500,14 @@ mod tests {
     }
 
     #[test]
-    fn pattern_from_name_fan_out() {
-        let agents = vec!["a".to_string(), "b".to_string()];
-        let args = json!({"timeout": 60});
-        let pattern = pattern_from_name("fan_out", &agents, &args).unwrap();
-        match pattern {
-            astra_services::coordination::CoordinationPattern::FanOut {
-                agent_ids,
-                timeout_sec,
-                ..
-            } => {
-                assert_eq!(agent_ids, vec!["a", "b"]);
-                assert_eq!(timeout_sec, 60);
-            }
-            _ => panic!("expected FanOut"),
-        }
-    }
-
-    #[test]
-    fn pattern_from_name_sequential() {
-        let agents = vec!["x".to_string()];
-        let args = json!({});
-        let pattern = pattern_from_name("sequential", &agents, &args).unwrap();
-        assert!(matches!(
-            pattern,
-            astra_services::coordination::CoordinationPattern::Sequential { .. }
-        ));
-    }
-
-    #[test]
-    fn pattern_from_name_pipeline() {
-        let agents = vec!["plan".to_string(), "verify".to_string()];
-        let args = json!({"timeout": 45});
-        let pattern = pattern_from_name("pipeline", &agents, &args).unwrap();
-        match pattern {
-            astra_services::coordination::CoordinationPattern::Pipeline {
-                stages,
-                timeout_sec,
-            } => {
-                assert_eq!(timeout_sec, 45);
-                assert_eq!(stages.len(), 2);
-                assert_eq!(stages[0].agent_id, "plan");
-                assert_eq!(stages[1].agent_id, "verify");
-            }
-            _ => panic!("expected Pipeline"),
-        }
-    }
-
-    #[test]
-    fn pattern_from_name_fork_preserves_explicit_tasks() {
-        let agents = vec!["code-review".to_string()];
-        let args = json!({"tasks": ["inspect", "verify"]});
-        let pattern = pattern_from_name("fork", &agents, &args).unwrap();
-        assert!(matches!(
-            pattern,
-            astra_services::coordination::CoordinationPattern::Fork { tasks, .. }
-                if tasks == ["inspect", "verify"]
-        ));
-    }
-
-    #[test]
-    fn pattern_from_name_unknown_returns_none() {
-        let agents = vec!["a".to_string()];
-        let args = json!({});
-        assert!(pattern_from_name("unknown_pattern", &agents, &args).is_none());
-    }
-
-    #[test]
-    fn select_default_uses_history_when_available() {
-        let args = json!({"agents": ["coder", "reviewer"]});
-        let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(astra_config::user_profile::Scenario::CodeReview),
-            preferred_pattern: Some("fan_out".to_string()),
-        };
-        let (pattern, policy) =
-            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
-        assert!(
-            matches!(
-                pattern,
-                astra_services::coordination::CoordinationPattern::FanOut { .. }
-            ),
-            "history should override scenario heuristic"
-        );
-        assert_eq!(policy["selection_source"], "outcome_history");
-    }
-
-    #[test]
-    fn select_default_uses_pipeline_history_when_available() {
-        let args = json!({"agents": ["plan", "verify"]});
-        let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(astra_config::user_profile::Scenario::Testing),
-            preferred_pattern: Some("pipeline".to_string()),
-        };
-        let (pattern, policy) =
-            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
-        assert!(
-            matches!(
-                pattern,
-                astra_services::coordination::CoordinationPattern::Pipeline { .. }
-            ),
-            "history should restore learned pipeline preference"
-        );
-        assert_eq!(policy["selection_source"], "outcome_history");
-        assert_eq!(policy["selected_pattern"], "pipeline");
-    }
-
-    #[test]
     fn select_default_debugging_scenario() {
         let args = json!({"agents": ["coder"]});
         let adaptive_context = DelegationAdaptiveContext {
             scenario: Some(astra_config::user_profile::Scenario::Debugging),
-            preferred_pattern: None,
         };
         let (_pattern, policy) =
             select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
-        assert_eq!(policy["selection_source"], "adaptive_default");
+        assert_eq!(policy["selection_source"], "typed_hints");
         assert_eq!(
             policy["reason"],
             "debugging_scenario_prefers_sequential_with_stop"
@@ -1696,11 +1519,10 @@ mod tests {
         let args = json!({"agents": ["coder", "tester"]});
         let adaptive_context = DelegationAdaptiveContext {
             scenario: Some(astra_config::user_profile::Scenario::Testing),
-            preferred_pattern: None,
         };
         let (_pattern, policy) =
             select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
-        assert_eq!(policy["selection_source"], "adaptive_default");
+        assert_eq!(policy["selection_source"], "typed_hints");
         assert_eq!(
             policy["reason"],
             "testing_scenario_prefers_parallel_execution"
@@ -1712,7 +1534,6 @@ mod tests {
         let args = json!({"agents": ["tester"]});
         let adaptive_context = DelegationAdaptiveContext {
             scenario: Some(astra_config::user_profile::Scenario::Testing),
-            preferred_pattern: Some("adversarial".to_string()),
         };
         let (pattern, policy) =
             select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
@@ -1724,7 +1545,51 @@ mod tests {
             policy["reason"],
             "typed_scenario_fallback_for_available_agents"
         );
-        assert_eq!(policy["ignored_preferred_pattern"], "adversarial");
+    }
+
+    #[test]
+    fn select_default_preserves_all_agents_and_timeout() {
+        let args = json!({
+            "agents": ["first", "second", "third"],
+            "timeout": 45,
+        });
+
+        let (pattern, policy) = select_default_coordination_pattern(&args, None).unwrap();
+        match pattern {
+            astra_services::coordination::CoordinationPattern::FanOut {
+                agent_ids,
+                timeout_sec,
+                ..
+            } => {
+                assert_eq!(agent_ids, ["first", "second", "third"]);
+                assert_eq!(timeout_sec, 45);
+            }
+            other => panic!("expected fan-out for independent agents, got {other:?}"),
+        }
+        assert_eq!(policy["selection_source"], "typed_hints");
+    }
+
+    #[test]
+    fn select_default_dependency_hint_preserves_order_and_timeout() {
+        let args = json!({
+            "agents": ["plan", "verify", "publish"],
+            "has_dependencies": true,
+            "timeout": 30,
+        });
+
+        let (pattern, _) = select_default_coordination_pattern(&args, None).unwrap();
+        match pattern {
+            astra_services::coordination::CoordinationPattern::Sequential {
+                agent_ids,
+                timeout_sec,
+                stop_on_success,
+            } => {
+                assert_eq!(agent_ids, ["plan", "verify", "publish"]);
+                assert_eq!(timeout_sec, 30);
+                assert!(!stop_on_success);
+            }
+            other => panic!("expected sequential dependencies, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1971,6 +1836,7 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
             None,
+            None,
             &RequestConstraints::default(),
             None,
             &[],
@@ -2010,6 +1876,7 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
             None,
+            None,
             &RequestConstraints::default(),
             None,
             &[],
@@ -2039,6 +1906,7 @@ mod tests {
             "main",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,
@@ -2074,6 +1942,7 @@ mod tests {
             "main",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,
@@ -2111,6 +1980,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,

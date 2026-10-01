@@ -34,6 +34,36 @@ its contract and capability remain current. Selection is knowledge, not a
 permission grant: request projection and execution still enforce current provider
 and policy admission. After compaction removes necessary argument knowledge,
 rediscovery is legitimate; do not require or prohibit it merely by turn count.
+Ordinary `agent` spawn, status (`list`), result collection (`get_result`), wait (`wait`), and
+communication (`send_message`) share a compact resident contract when the
+delegation capability is admitted. Its fields and per-action requirements and
+allowlists come from the canonical schema; a field valid for one action does
+not become valid for every action. The resident spawn contract includes
+`agent_type` so the parent can select the appropriate persona directly.
+Advanced fields use the canonical contract through `invoke_tool`; when that
+contract is not already known, discover it with `tool_search`. Both routes share the same executor and
+admission checks. If the final authorized surface omits `tool_search`, the
+visible `agent` instead carries its full owner-authorized contract directly;
+filtering discovery must not strand child messaging or result retrieval.
+The resident projection must remain inside the fixed tool
+schema budget, so ordinary delegation does not add a large repeated prompt.
+Child completion notifications contain bounded previews, not execution failures
+when output is truncated. The executing parent retains the complete terminal
+result until settlement; `agent.get_result` reads that retained result before
+durable reconciliation. Larger tool output uses the existing authorized
+artifact reader when available. Output recovery must not rerun completed work.
+`agent.wait` admits a current-run input wait with an optional bounded timeout.
+The shared loop waits after sibling tools settle, releases execution capacity,
+and applies child results, semantic messages, or user guidance through its
+existing input boundary. It does not turn `get_result` into a wait or add a
+database poller. Observation timeout preserves child execution; actual run
+expiry and cancellation retain their original authority. The wait trace binds
+the invoking tool call, and Explain distinguishes timeout from interruption.
+Resident `introspect` exposes live facets, Explain selectors and artifact
+pagination using the canonical summary/current-turn defaults. Select its full
+contract for custom topic, depth, horizon, source policy, context inclusion or
+format; these advanced options remain supported without repeating their schemas
+in every request.
 
 ## Relationship
 

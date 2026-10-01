@@ -51,6 +51,17 @@ fn approval_unavailable_tool_output(reason: &str) -> String {
     )
 }
 
+fn rejected_tool_result_fields() -> Map<String, Value> {
+    Map::from_iter([
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "disposition".to_string(),
+            serde_json::to_value(ToolCallDisposition::Rejected)
+                .expect("tool disposition must serialize"),
+        ),
+    ])
+}
+
 pub(crate) fn agent_control_action(args: &Value) -> Option<&str> {
     args.get("action")
         .and_then(Value::as_str)
@@ -323,16 +334,45 @@ pub(crate) fn tool_output_event_text(_tool: &str, output: &str) -> String {
             "target_count",
             "transcript_location",
             "parent_run_id",
-            "agents",
             "fanout",
         ] {
             if let Some(value) = parsed.get(key) {
                 compact.insert(key.to_string(), value.clone());
             }
         }
+        for key in ["agents", "results"] {
+            if let Some(slots) = parsed.get(key).and_then(Value::as_array) {
+                let identities = slots
+                    .iter()
+                    .map(|slot| {
+                        let mut identity = Map::new();
+                        for field in [
+                            "id",
+                            "slot_index",
+                            "agent_id",
+                            "run_id",
+                            "status",
+                            "transcript_location",
+                        ] {
+                            if let Some(value) = slot.get(field) {
+                                identity.insert(field.to_string(), value.clone());
+                            }
+                        }
+                        if !identity.contains_key("status") {
+                            if let Some(status) = slot.pointer("/result/status") {
+                                identity.insert("status".to_string(), status.clone());
+                            }
+                        }
+                        Value::Object(identity)
+                    })
+                    .collect();
+                compact.insert(key.to_string(), Value::Array(identities));
+            }
+        }
         let mut rendered = Value::Object(compact.clone()).to_string();
         if rendered.len() > STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
             compact.remove("agents");
+            compact.remove("results");
             compact.remove("fanout");
             compact.insert(
                 "control_membership_omitted".to_string(),
@@ -1308,7 +1348,7 @@ struct CliSseStreamHost<'a> {
     /// answer suffix in order. It is sent immediately before
     /// `AssistantOutputSettled`, allowing the TUI to reconcile a complete
     /// answer without duplicating the prefix that was already delivered.
-    deferred_token_projection: Option<String>,
+    deferred_token_projection: Option<std::collections::VecDeque<chat_stream::StreamEvent>>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
@@ -1321,6 +1361,10 @@ struct CliSseStreamHost<'a> {
     /// When a `tool_request` arrives with one of these IDs, the local permission
     /// check is skipped — the user has already approved the operation.
     cloud_pre_approved: std::collections::HashSet<String>,
+    /// Server-issued immutable execution ceilings, keyed by the exact request
+    /// identity. This is kept on the host rather than in model arguments so a
+    /// parent approval or replay cannot widen a read-only child request.
+    read_only_tool_requests: std::collections::HashSet<String>,
     /// Per-invocation server-approved deadline token. This is separate from
     /// parent turn cancellation so sibling tool calls cannot cancel each other.
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -1803,6 +1847,7 @@ impl<'a> CliSseStreamHost<'a> {
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
+            read_only_tool_requests: std::collections::HashSet::new(),
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
             active_turn_rollback,
@@ -2137,6 +2182,18 @@ impl<'a> CliSseStreamHost<'a> {
         self.tool_result_identities.get(request_id).cloned()
     }
 
+    fn callback_tool_belongs_to_foreground(&self, request_id: &str) -> bool {
+        self.last_bound_run_id
+            .as_deref()
+            .is_some_and(|root_run_id| {
+                self.tool_result_identities
+                    .get(request_id)
+                    .is_some_and(|identity| {
+                        !root_run_id.is_empty() && identity.run_id == root_run_id
+                    })
+            })
+    }
+
     fn tool_result_request(
         &self,
         request_id: &str,
@@ -2190,7 +2247,9 @@ impl<'a> CliSseStreamHost<'a> {
         let (output, _) =
             astra_tools::credential_redaction::redact_credentials_for_display(&output);
         let typed_fields = tool_result_fields.as_ref();
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             let output_summary = self
                 .render
                 .format_output_summary(tool, &output, &status)
@@ -2970,7 +3029,9 @@ impl<'a> CliSseStreamHost<'a> {
             astra_tools::credential_redaction::redact_credentials_in_json(value);
         }
 
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(&req.request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             let output_summary = self
                 .render
                 .format_output_summary(&req.tool, &output, status)
@@ -3467,11 +3528,21 @@ impl CliSseStreamHost<'_> {
     }
 
     fn try_emit_stream_observation(&mut self, event: chat_stream::StreamEvent) {
-        if let chat_stream::StreamEvent::Token(text) = event.clone() {
+        if let chat_stream::StreamEvent::Token {
+            model_item_id,
+            text,
+        } = &event
+        {
             if let Some(pending) = self.deferred_token_projection.as_mut() {
-                pending.push_str(&text);
+                match pending.back_mut() {
+                    Some(chat_stream::StreamEvent::Token {
+                        model_item_id: pending_id,
+                        text: pending_text,
+                    }) if pending_id == model_item_id => pending_text.push_str(text),
+                    _ => pending.push_back(event.clone()),
+                }
                 if let Some(sink) = &self.stream_event_sink {
-                    sink.send(chat_stream::StreamEvent::Token(text));
+                    sink.send(event);
                 }
                 return;
             }
@@ -3482,21 +3553,23 @@ impl CliSseStreamHost<'_> {
                 return;
             };
             if tx.capacity() <= RELIABLE_STREAM_EVENT_RESERVE {
-                self.deferred_token_projection = Some(text.clone());
+                self.deferred_token_projection =
+                    Some(std::collections::VecDeque::from([event.clone()]));
                 if let Some(sink) = &self.stream_event_sink {
-                    sink.send(chat_stream::StreamEvent::Token(text.clone()));
+                    sink.send(event);
                 }
                 return;
             }
-            match tx.try_send(chat_stream::StreamEvent::Token(text.clone())) {
+            match tx.try_send(event.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    self.deferred_token_projection = Some(text.clone());
+                    self.deferred_token_projection =
+                        Some(std::collections::VecDeque::from([event.clone()]));
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
             if let Some(sink) = &self.stream_event_sink {
-                sink.send(chat_stream::StreamEvent::Token(text));
+                sink.send(event);
             }
             return;
         }
@@ -4482,6 +4555,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        if event.get("type").and_then(Value::as_str) == Some("tool_request") {
+            let read_only_execution = match event.get("read_only_execution") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err("tool_request read_only_execution must be a boolean".to_string());
+                }
+            };
+            if read_only_execution {
+                let request_id = event
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .filter(|request_id| !request_id.is_empty())
+                    .ok_or_else(|| "read-only tool_request omitted request_id".to_string())?;
+                self.read_only_tool_requests.insert(request_id.to_string());
+            }
+        }
         if event.get("type").and_then(Value::as_str) == Some("permission_mode_applied") {
             let data = event.get("data").unwrap_or(event);
             let session_id = data.get("session_id").and_then(Value::as_str);
@@ -4721,6 +4811,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.server_tool_completed_calls.clear();
             self.server_tool_client_owned_ids.clear();
             self.server_tool_completed_terminals.clear();
+            self.read_only_tool_requests.clear();
             self.server_tool_protocol_error = None;
         }
         result
@@ -4859,14 +4950,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             use crate::cli::chat_stream::StreamEvent;
             for effect in &effects {
                 let ev = match effect {
-                    SseRenderEffect::StreamText(s) if !s.is_empty() => {
-                        Some(StreamEvent::Token(s.clone()))
-                    }
+                    SseRenderEffect::StreamText {
+                        model_item_id,
+                        text: s,
+                    } if !s.is_empty() => Some(StreamEvent::Token {
+                        model_item_id: model_item_id.clone(),
+                        text: s.clone(),
+                    }),
                     SseRenderEffect::StartThinkingSpinner => Some(StreamEvent::Thinking(true)),
                     SseRenderEffect::StopThinkingSpinner => Some(StreamEvent::Thinking(false)),
-                    SseRenderEffect::ThinkingPreviewChunk(s) if !s.is_empty() => {
-                        Some(StreamEvent::ThinkingChunk(s.clone()))
-                    }
+                    SseRenderEffect::ThinkingPreviewChunk {
+                        model_item_id,
+                        text: s,
+                    } if !s.is_empty() => Some(StreamEvent::ThinkingChunk {
+                        model_item_id: model_item_id.clone(),
+                        text: s.clone(),
+                    }),
                     _ => None,
                 };
                 if let Some(ev) = ev {
@@ -4885,10 +4984,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     match effect {
                         SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
                         SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
-                        SseRenderEffect::ThinkingPreviewChunk(s) => {
+                        SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                             self.render.push_thinking_preview_chunk(s);
                         }
-                        SseRenderEffect::StreamText(_) => {} // suppressed
+                        SseRenderEffect::StreamText { .. } => {} // suppressed
                     }
                 }
                 return;
@@ -4905,13 +5004,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // the pane on every token.
                     let skip = policy == RenderPolicy::PlanDecompose
                         && i + 1 < effects.len()
-                        && matches!(&effects[i + 1], SseRenderEffect::StreamText(_));
+                        && matches!(&effects[i + 1], SseRenderEffect::StreamText { .. });
                     if !skip {
                         self.render.stop_thinking();
                     }
                     i += 1;
                 }
-                SseRenderEffect::StreamText(s) => {
+                SseRenderEffect::StreamText { text: s, .. } => {
                     if policy == RenderPolicy::PlanDecompose {
                         // Plan decompose mode: don't show the raw JSON body in
                         // the thinking preview.  Only genuine <thinking> content
@@ -4933,7 +5032,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     self.render.start_thinking();
                     i += 1;
                 }
-                SseRenderEffect::ThinkingPreviewChunk(s) => {
+                SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                     self.render.push_thinking_preview_chunk(s);
                     i += 1;
                 }
@@ -4962,9 +5061,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     ) -> EdgeToolExecResult {
         self.sync_permission_manager_session_id();
 
-        // Forward tool-started event to observer channel
+        // Child tool detail already arrives through the canonical AgentLive
+        // lane. Only an exact root callback can also be foreground UI.
         let tool_description = self.render.format_tool_description(tool, args);
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             if tool == "agent"
                 && let Some(action) = agent_control_action(args)
             {
@@ -4993,9 +5095,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // tools are atomic and never emit progress. Cleanup (abort
         // ticker, clear sink) happens unconditionally at the bottom
         // of `execute_tool` via `_progress_guard`.
-        let _progress_guard = (tool == "bash").then(|| {
-            BashProgressGuard::install(&self.executor, tool, self.stream_event_tx.as_ref())
-        });
+        let _progress_guard = (tool == "bash"
+            && self.callback_tool_belongs_to_foreground(request_id))
+        .then(|| BashProgressGuard::install(&self.executor, tool, self.stream_event_tx.as_ref()));
 
         // Clear text that was rendered or buffered BEFORE the first tool call
         // (intermediate draft). After first tool, keep buffering new text.
@@ -5118,9 +5220,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // the cloud approval gate (approval_required → user approved → tool_request).
         // This eliminates the double-prompt issue where the same operation requires
         // both cloud approval and local approval.
+        let read_only_execution = self.read_only_tool_requests.contains(request_id);
         let cloud_approved = self.cloud_pre_approved.remove(request_id);
 
-        let decision = if cloud_approved {
+        let decision = if read_only_execution {
+            match self.perm_manager.as_mut() {
+                Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                    Some(&mut **pm),
+                    tool,
+                    args,
+                ),
+                None => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                    None, tool, args,
+                ),
+            }
+        } else if cloud_approved {
             crate::cli::permission_manager::GateOutcome::Allow
         } else {
             match self.perm_manager.as_mut() {
@@ -5469,10 +5583,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if let Some(exec) = self.streaming_tool_exec.clone() {
                         exec.discard(request_id).await;
                     }
+                    let skill_context = self
+                        .perm_manager
+                        .as_ref()
+                        .map(|manager| {
+                            let inherited = manager.runtime_permission_context().inherited;
+                            astra_runtime::turn::skill_tool::SkillContext {
+                                read_only_execution: inherited.read_only_execution
+                                    || read_only_execution,
+                                ..Default::default()
+                            }
+                        })
+                        .unwrap_or_default();
                     let executed = astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
                         args,
+                        &skill_context,
                     )
                     .await;
                     let (skill_output, execution_topology, loaded) =
@@ -5545,6 +5672,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
                 if let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outcome) {
+                    tool_result_fields = outcome.tool_result_fields.clone();
                     if let Some(expand_dir) = self.sandbox_expansion_scope(args, &sandbox_msg) {
                         let execution_cancel = self.effective_tool_cancel_token();
                         if let Some(pm) = &mut self.perm_manager {
@@ -5755,6 +5883,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
+        if !allowed {
+            tool_result_fields
+                .get_or_insert_with(Map::new)
+                .extend(rejected_tool_result_fields());
+        }
         // The stream renderer emits ToolCompleted, tool_call_end, and the
         // callback request before the runtime's durable record pass.  Keep
         // those earlier lanes on the same executor-owned redacted value.
@@ -5829,7 +5962,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // Forward tool-completed event to observer channel
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             let output_summary = self
                 .render
                 .format_output_summary(tool, &output, &status)
@@ -6235,15 +6370,28 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Read-only tools hit the fast-path in check_nonblocking (SideEffect::Read → Allow).
         let mut all_allowed = true;
         for (_, req) in &conc_reqs {
-            let decision = match self.perm_manager.as_mut() {
-                Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                    Some(&mut **pm),
-                    &req.tool,
-                    &req.args,
-                ),
-                None => crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                    None, &req.tool, &req.args,
-                ),
+            let decision = if self.read_only_tool_requests.contains(&req.request_id) {
+                match self.perm_manager.as_mut() {
+                    Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                        Some(&mut **pm),
+                        &req.tool,
+                        &req.args,
+                    ),
+                    None => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                        None, &req.tool, &req.args,
+                    ),
+                }
+            } else {
+                match self.perm_manager.as_mut() {
+                    Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                        Some(&mut **pm),
+                        &req.tool,
+                        &req.args,
+                    ),
+                    None => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                        None, &req.tool, &req.args,
+                    ),
+                }
             };
             let ok = matches!(decision, crate::cli::permission_manager::GateOutcome::Allow);
             if !ok {
@@ -6276,7 +6424,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         for (i, (_, req)) in conc_reqs.iter().enumerate() {
             // Forward tool-started event.
             let desc = self.render.format_tool_description(&req.tool, &req.args);
-            if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+            if self.callback_tool_belongs_to_foreground(&req.request_id)
+                && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+            {
                 if req.tool == "agent"
                     && let Some(action) = agent_control_action(&req.args)
                 {
@@ -6455,7 +6605,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                             output: format!(
                                                 "Tool blocked by hook '{hook_id}': {reason}"
                                             ),
-                                            tool_result_fields: None,
+                                            tool_result_fields: Some(rejected_tool_result_fields()),
                                             is_error: true,
                                         },
                                         0u64,
@@ -6579,10 +6729,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 .saturating_sub(now_unix_ms)
                 .min(req.execution_timeout_ms);
             if remaining_execution_ms == 0 {
-                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                outputs[pos].0.output =
                     "Server-issued tool execution deadline expired before sandbox retry"
-                        .to_string(),
-                );
+                        .to_string();
+                outputs[pos].0.is_error = true;
                 outputs[pos].1 = 0;
                 continue;
             }
@@ -6599,9 +6749,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
             let Some(expand_dir) = self.sandbox_expansion_scope(&args, &sandbox_msg) else {
-                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
-                    crate::sandbox_retry::sandbox_retry_no_expand_dir_output(&tool, &sandbox_msg),
-                );
+                outputs[pos].0.output =
+                    crate::sandbox_retry::sandbox_retry_no_expand_dir_output(&tool, &sandbox_msg);
+                outputs[pos].0.is_error = true;
                 continue;
             };
             let guard_args = serde_json::json!({
@@ -6703,10 +6853,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 continue;
             }
             if retry_cancel.is_cancelled() {
-                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                outputs[pos].0.output =
                     "Server-issued tool execution deadline expired before sandbox retry"
-                        .to_string(),
-                );
+                        .to_string();
+                outputs[pos].0.is_error = true;
                 outputs[pos].1 = 0;
                 continue;
             }
@@ -6743,7 +6893,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let output = outcome.output;
 
             // Forward tool-completed event.
-            if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+            if self.callback_tool_belongs_to_foreground(&req.request_id)
+                && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+            {
                 let output_summary = self
                     .render
                     .format_output_summary(&req.tool, &output, status)
@@ -7017,7 +7169,8 @@ pub(crate) struct TurnResult {
     pub(crate) pending_explain_analyze_snapshot: Option<chat_stream::StreamEvent>,
     /// Answer suffix held after token observation backpressure. It is emitted
     /// before `AssistantOutputSettled` by the Server-admission host.
-    pub(crate) deferred_token_projection: Option<String>,
+    pub(crate) deferred_token_projection:
+        Option<std::collections::VecDeque<chat_stream::StreamEvent>>,
 }
 
 impl Deref for TurnResult {
@@ -8530,6 +8683,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
             tool_call_id: tool_call_id_for_blocking.as_deref(),
             admission_source: admission_source_for_blocking,
             expected_control_epoch: None,
+            delegation_model_admission: None,
         };
         executor_for_blocking.execute_blocking_shell_tool(
             &tool_for_blocking,
@@ -8674,7 +8828,7 @@ fn apply_sse_render_effects(
     }
     for effect in effects {
         match effect {
-            SseRenderEffect::StreamText(s) => {
+            SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
                 } else {
@@ -8685,7 +8839,9 @@ fn apply_sse_render_effects(
             }
             SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
             SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
-            SseRenderEffect::ThinkingPreviewChunk(s) => render.push_thinking_preview_chunk(&s),
+            SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
+                render.push_thinking_preview_chunk(&s)
+            }
         }
     }
 }
@@ -9094,6 +9250,7 @@ mod tests {
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::stream::streaming_md;
+    use astra_services::session_journal::ToolCallDisposition;
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use astra_turn_core::sse_stream_host::SseStreamHost;
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
@@ -9112,6 +9269,56 @@ mod tests {
         assert!(output.contains("Git command crosses the allowed boundary"));
         assert!(output.contains("Approval is unavailable"));
         assert!(!output.contains("ghp_123456789012345678901234567890123456"));
+    }
+
+    #[tokio::test]
+    async fn server_read_only_tool_request_binds_an_immutable_local_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut cache = EdgeToolCache::new(2);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_request",
+            "request_id": "child-write",
+            "read_only_execution": true,
+            "tool": "write_file",
+            "args": {"path": "marker", "content": "blocked"}
+        }))
+        .await
+        .expect("valid server authority event");
+        assert!(host.read_only_tool_requests.contains("child-write"));
+
+        let malformed = serde_json::json!({
+            "type": "tool_request",
+            "request_id": "bad-authority",
+            "read_only_execution": "true"
+        });
+        assert!(host.on_accepted_sse_event(&malformed).await.is_err());
     }
 
     #[tokio::test]
@@ -9159,6 +9366,15 @@ mod tests {
                 80,
                 false,
             );
+            host.tool_result_identities.insert(
+                "denied-git".to_string(),
+                ToolResultIdentity {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
+                    request_id: "denied-git".to_string(),
+                },
+            );
             let result = host.execute_tool("denied-git", "bash", &args).await;
             assert_eq!(result.status, "failed", "{}", result.output);
             assert!(
@@ -9171,6 +9387,33 @@ mod tests {
                 "{}",
                 result.output
             );
+            assert_eq!(
+                result
+                    .tool_result_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("execution_started")),
+                Some(&Value::Bool(false))
+            );
+            assert_eq!(
+                result
+                    .tool_result_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("disposition")),
+                Some(&Value::String("rejected".to_string()))
+            );
+            let fields = result.tool_result_fields.as_ref().unwrap();
+            assert_eq!(
+                ToolCallDisposition::from_execution_metadata(
+                    fields.get("disposition"),
+                    fields.get("execution_started").and_then(Value::as_bool),
+                    ToolCallDisposition::Executed,
+                ),
+                ToolCallDisposition::Rejected
+            );
+            let requests = server.received_requests().await.expect("requests");
+            let callback: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(callback["tool_result_fields"]["execution_started"], false);
+            assert_eq!(callback["tool_result_fields"]["disposition"], "rejected");
         }
     }
 
@@ -10405,7 +10648,10 @@ mod tests {
         // make the next short user turn appear to hang.
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the saturation fixture");
         }
         let mut congested = event.clone();
@@ -10424,14 +10670,17 @@ mod tests {
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
             ));
         }
 
         host.last_bound_run_id = Some("run-1".into());
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the publication fixture");
         }
         let publication = astra_turn_types::ArtifactPublicationV1 {
@@ -10456,7 +10705,7 @@ mod tests {
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
             ));
         }
         host.on_sse_done(&ChatTurnSseAccum::default())
@@ -10488,7 +10737,10 @@ mod tests {
             .expect("the fixture is a canonical Explain Analyze fact");
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the snapshot saturation fixture");
         }
         let canonical_accum = ChatTurnSseAccum {
@@ -10513,7 +10765,7 @@ mod tests {
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
             ));
         }
         host.on_sse_done(&canonical_accum)
@@ -10533,7 +10785,10 @@ mod tests {
         // `send().await` forever.
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the final text fixture");
         }
         host.on_accepted_sse_event(&publication.to_wire())
@@ -10568,7 +10823,7 @@ mod tests {
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
             ));
         }
         host.on_sse_done(&ChatTurnSseAccum {
@@ -10584,12 +10839,18 @@ mod tests {
         ));
 
         for _ in 0..8 {
-            host.try_emit_stream_event(chat_stream::StreamEvent::Token("queued".into()));
+            host.try_emit_stream_event(chat_stream::StreamEvent::Token {
+                model_item_id: None,
+                text: "queued".into(),
+            });
         }
         host.render_policy = RenderPolicy::Stream;
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            host.on_render_effects(vec![SseRenderEffect::StreamText("answer".into())]),
+            host.on_render_effects(vec![SseRenderEffect::StreamText {
+                model_item_id: None,
+                text: "answer".into(),
+            }]),
         )
         .await
         .expect("full TUI queue must not block final text capture");
@@ -10616,7 +10877,10 @@ mod tests {
             "group_id": "review-group",
             "title": "Review",
             "target_count": 2,
-            "results": [{"result": "x".repeat(70_000)}],
+            "results": [{
+                "slot_index": 0, "agent_id": "a", "run_id": "run-a",
+                "result": {"status": "completed", "result": "x".repeat(70_000)}
+            }],
             "fanout": {
                 "group_id": "review-group",
                 "target_count": 2,
@@ -10642,7 +10906,10 @@ mod tests {
         assert_eq!(parsed["group_id"], "review-group");
         assert_eq!(parsed["target_count"], 2);
         assert_eq!(parsed["fanout"]["slots"].as_array().map(Vec::len), Some(2));
-        assert!(parsed.get("results").is_none());
+        assert_eq!(parsed["results"][0]["agent_id"], "a");
+        assert_eq!(parsed["results"][0]["run_id"], "run-a");
+        assert_eq!(parsed["results"][0]["status"], "completed");
+        assert!(parsed["results"][0].get("result").is_none());
         assert!(event.len() < 4_000, "compact envelope was too large");
     }
 
@@ -12106,6 +12373,7 @@ mod tests {
         std::fs::write(&second, "two\n").expect("second");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
@@ -12119,7 +12387,7 @@ mod tests {
                 render_policy: RenderPolicy::Silent,
                 perm_manager: Some(&mut pm),
                 cancel_token: None,
-                stream_event_tx: None,
+                stream_event_tx: Some(tx),
                 stream_event_sink: None,
                 approval_request_tx: None,
                 ask_user_request_tx: None,
@@ -12135,6 +12403,11 @@ mod tests {
             false,
         );
 
+        host.on_accum_update(&ChatTurnSseAccum {
+            run_id: Some("test-run".into()),
+            ..Default::default()
+        });
+        while rx.try_recv().is_ok() {}
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
@@ -12149,7 +12422,7 @@ mod tests {
                 },
                 ToolBatchRequest {
                     session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
+                    run_id: "child-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-2".to_string(),
                     execution_timeout_ms: 300_000,
@@ -12169,6 +12442,108 @@ mod tests {
                 .output
                 .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
         }));
+        let mut foreground = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                chat_stream::StreamEvent::ToolStarted { tool_use_id, .. }
+                | chat_stream::StreamEvent::ToolCompleted { tool_use_id, .. } => {
+                    foreground.push(tool_use_id)
+                }
+                other => panic!("unexpected callback presentation: {other:?}"),
+            }
+        }
+        assert_eq!(
+            foreground,
+            ["pf-1", "pf-1"],
+            "parallel child callback must not be foreground"
+        );
+        for (request_id, run_id, expected_ui) in [
+            ("serial-root", "test-run", 2),
+            ("serial-child", "child-run", 0),
+        ] {
+            let results = host
+                .execute_tools_batch(vec![ToolBatchRequest {
+                    session_id: "test-session".into(),
+                    run_id: run_id.into(),
+                    turn_chain_id: "test-chain".into(),
+                    request_id: request_id.into(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
+                    tool: "list_dir".into(),
+                    args: serde_json::json!({"path": project}),
+                }])
+                .await;
+            assert_eq!(results[0].status, "completed");
+            if request_id == "serial-child" {
+                let fields = results[0]
+                    .tool_result_fields
+                    .as_ref()
+                    .expect("cache evidence");
+                assert_eq!(fields.get("executed"), Some(&Value::Bool(false)));
+                assert_eq!(
+                    fields.get("disposition"),
+                    Some(&Value::String("reused".into()))
+                );
+            }
+            let mut count = 0;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    chat_stream::StreamEvent::ToolStarted { tool_use_id, .. }
+                    | chat_stream::StreamEvent::ToolCompleted { tool_use_id, .. } => {
+                        assert_eq!(tool_use_id, request_id);
+                        count += 1;
+                    }
+                    other => panic!("unexpected callback presentation: {other:?}"),
+                }
+            }
+            assert_eq!(
+                count, expected_ui,
+                "serial presentation follows exact accepted owner"
+            );
+        }
+        let rejected = host
+            .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "test-session".into(),
+                run_id: "child-run".into(),
+                turn_chain_id: "test-chain".into(),
+                request_id: "child-synthetic".into(),
+                execution_timeout_ms: 300_000,
+                execution_deadline_unix_ms: 4_102_444_800_000,
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": first, "transaction_id": 1}),
+            }])
+            .await;
+        assert_eq!(rejected[0].status, "failed");
+        assert!(
+            rx.try_recv().is_err(),
+            "child synthetic rejection stays out of root UI"
+        );
+        assert!(!host.callback_tool_belongs_to_foreground("unknown-request"));
+        let mut callbacks: Vec<(String, String)> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                (
+                    body["request_id"].as_str().unwrap().to_owned(),
+                    body["run_id"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        callbacks.sort();
+        assert_eq!(
+            callbacks,
+            vec![
+                ("child-synthetic".into(), "child-run".into()),
+                ("pf-1".into(), "test-run".into()),
+                ("pf-2".into(), "child-run".into()),
+                ("serial-child".into(), "child-run".into()),
+                ("serial-root".into(), "test-run".into()),
+            ],
+            "UI filtering must not lose or reattribute callback settlement"
+        );
     }
 
     #[serial_test::serial]
@@ -15866,9 +16241,24 @@ mod tests {
             false,
         );
 
+        host.on_accum_update(&ChatTurnSseAccum {
+            run_id: Some("cache-root".into()),
+            ..Default::default()
+        });
+        while event_rx.try_recv().is_ok() {}
         let result = host
-            .execute_tool("cache-read-hit", "read_file", &read_args)
-            .await;
+            .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "cache-session".into(),
+                run_id: "cache-root".into(),
+                turn_chain_id: "cache-chain".into(),
+                request_id: "cache-read-hit".into(),
+                execution_timeout_ms: 300_000,
+                execution_deadline_unix_ms: 4_102_444_800_000,
+                tool: "read_file".into(),
+                args: read_args,
+            }])
+            .await
+            .remove(0);
         assert_eq!(result.status, "completed");
         assert_eq!(result.output, "v1\n");
 

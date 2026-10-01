@@ -155,10 +155,12 @@ pub(crate) async fn handle_slash_command(
                     let thinking_cap =
                         selected_model.and_then(model_list_entry_thinking_capability);
                     let provider = selected_model.and_then(model_list_entry_provider);
-                    let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
-                        &chosen,
+                    let opts = astra_turn_core::thinking_config::thinking_options(
                         provider,
                         thinking_cap,
+                        selected_model
+                            .and_then(|model| model.thinking_protocol)
+                            .unwrap_or_default(),
                     );
                     let model_with_suffix = if opts.is_empty() {
                         chosen.clone()
@@ -408,7 +410,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/messaging" => {
-            handle_messaging_command(arg, state).await;
+            handle_messaging_command(arg, state);
         }
 
         "/agent" => {
@@ -662,6 +664,9 @@ mod model_list_json_tests {
 
     fn catalog_entry() -> super::ModelCatalogEntry {
         super::ModelCatalogEntry {
+            thinking_protocol: Some(
+                astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,
+            ),
             offering_id: "offer-coding".into(),
             access_id: "self-hosted".into(),
             access_kind: astra_services::ModelAccessKind::SelfHosted,
@@ -675,6 +680,7 @@ mod model_list_json_tests {
             max_completion_tokens: Some(8192),
             architecture: None,
             thinking_capability: Some(astra_services::models::ThinkingCapability::Both),
+            pricing: None,
         }
     }
 
