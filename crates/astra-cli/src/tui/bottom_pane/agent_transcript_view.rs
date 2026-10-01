@@ -38,22 +38,11 @@ enum LiveTranscriptItem {
 #[derive(Debug, Default)]
 struct LiveTranscript {
     items: Vec<LiveTranscriptItem>,
-    /// Terminal status does not prove persistence. Only a page representing
-    /// the exact model item and part can retire its live projection.
-    settled: bool,
 }
 
 impl LiveTranscript {
     fn is_empty(&self) -> bool {
         self.items.is_empty()
-    }
-
-    fn mark_active(&mut self) {
-        self.settled = false;
-    }
-
-    fn mark_settled(&mut self) {
-        self.settled = true;
     }
 
     fn reconcile_durable_items(
@@ -139,7 +128,6 @@ impl LiveTranscript {
         if text.is_empty() {
             return;
         }
-        self.mark_active();
         match self.items.last_mut() {
             Some(LiveTranscriptItem::Assistant(cell))
                 if cell.is_live() && cell.model_item_id() == model_item_id =>
@@ -160,7 +148,6 @@ impl LiveTranscript {
         if text.is_empty() {
             return;
         }
-        self.mark_active();
         match self.items.last_mut() {
             Some(LiveTranscriptItem::Reasoning(cell))
                 if cell.is_live() && cell.model_item_id() == model_item_id =>
@@ -178,7 +165,6 @@ impl LiveTranscript {
     }
 
     fn tool_started(&mut self, tool_use_id: String, name: String, description: String) {
-        self.mark_active();
         self.finish_open_model_item();
         if self
             .items
@@ -205,7 +191,6 @@ impl LiveTranscript {
         output_summary: Option<String>,
         output: Option<String>,
     ) {
-        self.mark_active();
         let tool = self.items.iter_mut().rev().find_map(|item| match item {
             LiveTranscriptItem::Tool {
                 tool_use_id: id,
@@ -236,7 +221,6 @@ impl LiveTranscript {
         evidence: Option<astra_turn_types::AgentTranscriptEvidence>,
     ) {
         if !text.trim().is_empty() {
-            self.mark_active();
             self.finish_open_model_item();
             self.items
                 .push(LiveTranscriptItem::Notice { text, evidence });
@@ -690,14 +674,11 @@ impl AgentTranscriptView {
             .iter()
             .any(|item| !matches!(item, LiveTranscriptItem::Notice { .. }))
         {
-            let state = if self.live.settled {
-                "Local agent result · awaiting durable reconciliation"
-            } else {
-                "Live agent projection · awaiting durable reconciliation"
-            };
+            // A terminal edge does not promise that every streamed part is
+            // persisted. Report loaded coverage, not a guessed storage state.
             projected.push(TranscriptItem::rendered(
                 TranscriptItemId::from_widget_id(LIVE_ID_BASE - 1),
-                vec![Line::from(state)],
+                vec![Line::from("Live activity · not in loaded history")],
                 0,
             ));
         }
@@ -831,9 +812,8 @@ impl AgentTranscriptView {
                     // The canonical run remains resumable, but this executor
                     // has released it. Freeze the current suffix so the UI
                     // does not keep animating output that can no longer
-                    // arrive; a later resumed delta calls `mark_active`.
+                    // arrive; a resumed delta opens a new streaming cell.
                     self.live.finish_all_model_items();
-                    self.live.mark_settled();
                 }
                 if let AgentLiveSignal::RunStarted {
                     transcript_location,
@@ -856,7 +836,6 @@ impl AgentTranscriptView {
                 } = signal
                 {
                     self.live.finish_all_model_items();
-                    self.live.mark_settled();
                     self.transcript_target = Some(match transcript_location {
                         astra_turn_types::AgentTranscriptLocation::LocalJournal => {
                             crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal
@@ -926,7 +905,6 @@ impl AgentTranscriptView {
                     }
                 };
                 self.live.notice(notice, None);
-                self.live.mark_settled();
                 // Local sub-runners and the durable server attempt transcript
                 // persistence before publishing this terminal lifecycle edge.
                 // Refresh exactly once; the I/O remains an async view action
@@ -1827,7 +1805,7 @@ mod tests {
         }));
         let live = rendered(&view);
         assert!(
-            live.contains("Live agent projection · awaiting durable reconciliation"),
+            live.contains("Live activity · not in loaded history"),
             "{live}"
         );
         assert!(live.contains("unreconciled live finding"), "{live}");
@@ -1843,7 +1821,7 @@ mod tests {
         }));
         let settled = rendered(&view);
         assert!(
-            settled.contains("Local agent result · awaiting durable reconciliation"),
+            settled.contains("Live activity · not in loaded history"),
             "{settled}"
         );
         assert!(settled.contains("unreconciled live finding"), "{settled}");
@@ -1969,7 +1947,7 @@ mod tests {
         let output = rendered(&view);
         assert_eq!(output.matches("Found the race.").count(), 1, "{output}");
         assert!(
-            !output.contains("awaiting durable reconciliation"),
+            !output.contains("Live activity · not in loaded history"),
             "{output}"
         );
     }
