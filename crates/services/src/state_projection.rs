@@ -47,15 +47,6 @@ fn bounded_state_item_id_from_readable(
     }
 }
 
-fn bounded_bubble_state_item_id(source_run_id: &str, depth: u32) -> String {
-    let depth = depth.to_string();
-    bounded_state_item_id_from_readable(
-        format!("state-bubble:{source_run_id}:{depth}"),
-        "bubble",
-        &[source_run_id, &depth],
-    )
-}
-
 #[derive(Debug, Error)]
 pub enum StateProjectionError {
     #[error("database operation failed: operation={operation}, entity={entity}, source={source}")]
@@ -168,13 +159,6 @@ pub struct StateItemUpsert {
     pub payload_json: serde_json::Value,
     pub token_estimate: u32,
     pub mutation: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct BubbleUpTarget {
-    pub session_id: String,
-    pub run_id: String,
-    pub depth: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -693,109 +677,6 @@ impl DatabaseStateProjectionStore {
         Ok(())
     }
 
-    pub async fn bubble_up_finding(
-        &self,
-        user_id: &str,
-        source_run_id: &str,
-        original_item_id: &str,
-        severity: &str,
-        summary: &str,
-        targets: &[BubbleUpTarget],
-    ) -> Result<(), StateProjectionError> {
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "acquire_bubble_up",
-                entity: source_run_id.to_string(),
-                source,
-            })?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "begin_bubble_up",
-                entity: source_run_id.to_string(),
-                source,
-            })?;
-        for (idx, target) in targets.iter().enumerate() {
-            let item_key = format!("bubble:{source_run_id}:{}", target.depth);
-            let item_id = bounded_bubble_state_item_id(source_run_id, target.depth);
-            let payload = json!({
-                "bubble_seq": idx + 1,
-                "severity": severity,
-                "source_run_id": source_run_id,
-                "original_item_id": original_item_id,
-                "bubble_target_scope": "root_session",
-                "summary": summary,
-                "target_run_id": target.run_id,
-                "target_depth": target.depth,
-            });
-            let payload_json =
-                serde_json::to_string(&payload).map_err(|source| StateProjectionError::Json {
-                    operation: "serialize_bubble_up",
-                    entity: source_run_id.to_string(),
-                    source,
-                })?;
-            let payload_hash = content_hash(&payload_json);
-            sqlx::query(
-                "INSERT INTO session_state_items
-                 (item_id, user_id, session_id, scope, category, item_key, status, priority,
-                  source, run_id, title, summary_text, payload_json, payload_hash,
-                  token_estimate, version, created_at, updated_at)
-                 VALUES (?, ?, ?, 'session', 'delegation_state', ?, 'active', 100,
-                         'delegation_bubble_up', ?, ?, ?, ?, ?, 80, 1, NOW(6), NOW(6))
-                 ON DUPLICATE KEY UPDATE
-                  summary_text = VALUES(summary_text), payload_json = VALUES(payload_json),
-                  payload_hash = VALUES(payload_hash), version = version + 1, updated_at = NOW(6)",
-            )
-            .bind(&item_id)
-            .bind(user_id)
-            .bind(&target.session_id)
-            .bind(&item_key)
-            .bind(&target.run_id)
-            .bind(format!("Critical finding from {source_run_id}"))
-            .bind(summary)
-            .bind(&payload_json)
-            .bind(&payload_hash)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "upsert_bubble_state_item",
-                entity: item_id.clone(),
-                source,
-            })?;
-            sqlx::query(
-                "INSERT INTO session_state_item_events
-                 (event_id, item_id, user_id, session_id, category, item_key, mutation, next_hash,
-                  payload_json, created_at)
-                 VALUES (?, ?, ?, ?, 'delegation_state', ?, 'bubble_up', ?, ?, NOW(6))",
-            )
-            .bind(new_state_item_event_id())
-            .bind(&item_id)
-            .bind(user_id)
-            .bind(&target.session_id)
-            .bind(&item_key)
-            .bind(&payload_hash)
-            .bind(&payload_json)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "insert_bubble_up_event",
-                entity: item_id,
-                source,
-            })?;
-        }
-        tx.commit()
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "commit_bubble_up",
-                entity: source_run_id.to_string(),
-                source,
-            })?;
-        connection.release();
-        Ok(())
-    }
-
     pub async fn load_user_anchor_memory(
         &self,
         user_id: &str,
@@ -1265,8 +1146,8 @@ fn artifact_ids_from_state_payload(payload: &serde_json::Value) -> Vec<String> {
 
 pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionError> {
     match mutation {
-        "insert" | "update" | "replace" | "archive" | "delete" | "bubble_up"
-        | "apply_suggestion" | "activate" => Ok(()),
+        "insert" | "update" | "replace" | "archive" | "delete" | "apply_suggestion"
+        | "activate" => Ok(()),
         other => Err(StateProjectionError::InvalidMutation {
             mutation: other.to_string(),
         }),
@@ -1310,14 +1191,6 @@ mod tests {
         assert_eq!(
             bounded_state_item_id("summary", &["session-1", "run-1"]),
             "state-summary-session-1-run-1"
-        );
-    }
-
-    #[test]
-    fn bubble_state_item_id_preserves_existing_short_format() {
-        assert_eq!(
-            bounded_bubble_state_item_id("run-1", 0),
-            "state-bubble:run-1:0"
         );
     }
 
@@ -1516,18 +1389,19 @@ mod tests {
             "replace",
             "archive",
             "delete",
-            "bubble_up",
             "apply_suggestion",
             "activate",
         ] {
             validate_state_mutation(mutation).expect("valid mutation");
         }
 
-        let error = validate_state_mutation("teleport").expect_err("unknown mutation");
-        assert!(matches!(
-            error,
-            StateProjectionError::InvalidMutation { mutation } if mutation == "teleport"
-        ));
+        for unsupported in ["teleport", "bubble_up"] {
+            let error = validate_state_mutation(unsupported).expect_err("unsupported mutation");
+            assert!(matches!(
+                error,
+                StateProjectionError::InvalidMutation { mutation } if mutation == unsupported
+            ));
+        }
     }
 
     #[test]

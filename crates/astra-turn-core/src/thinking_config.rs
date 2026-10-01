@@ -72,6 +72,28 @@ fn default_effort() -> ThinkingEffort {
     ThinkingEffort::High
 }
 
+impl From<&astra_turn_types::DelegationReasoningRequirement> for ThinkingConfig {
+    fn from(requirement: &astra_turn_types::DelegationReasoningRequirement) -> Self {
+        use astra_turn_types::{DelegationReasoningEffort, DelegationReasoningRequirement};
+        match requirement {
+            DelegationReasoningRequirement::ModelDefault => Self::ModelDefault,
+            DelegationReasoningRequirement::Off => Self::Off,
+            DelegationReasoningRequirement::On {} => Self::On {},
+            DelegationReasoningRequirement::Budget { tokens } => Self::Enabled {
+                budget_tokens: *tokens,
+            },
+            DelegationReasoningRequirement::Effort { effort } => Self::Adaptive {
+                effort: match effort {
+                    DelegationReasoningEffort::Low => ThinkingEffort::Low,
+                    DelegationReasoningEffort::Medium => ThinkingEffort::Medium,
+                    DelegationReasoningEffort::High => ThinkingEffort::High,
+                    DelegationReasoningEffort::Max => ThinkingEffort::Max,
+                },
+            },
+        }
+    }
+}
+
 impl ThinkingConfig {
     /// One exact control contract for selection and execution admission.
     /// Capability is the catalog's machine-owned value, not provider prose.

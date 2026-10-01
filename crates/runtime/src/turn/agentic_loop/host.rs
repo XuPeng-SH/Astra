@@ -10721,32 +10721,6 @@ pub(crate) mod tests {
         assert_eq!(state.final_text, "Passed through.");
     }
 
-    #[tokio::test]
-    async fn e2e_adversarial_delegation_pattern() {
-        let turns = vec![
-            delegate_tool_call_result(
-                "call_adversarial",
-                r#"{"task": "write secure auth", "agents": ["coder", "reviewer"], "pattern": "adversarial", "max_rounds": 2}"#,
-                200,
-                100,
-            ),
-            text_result("Adversarial review complete.", 80, 40, None),
-        ];
-
-        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "write and review auth"}));
-        state.current_run_id = Some("run-adversarial".to_string());
-        state.delegation_engine =
-            Some(make_test_delegation_engine("run-adversarial", "test-session").await);
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Adversarial review complete.");
-    }
-
     // ── Auto-injection tests ────────────────────────────────────────────────
 
     #[tokio::test]

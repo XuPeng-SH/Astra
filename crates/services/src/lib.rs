@@ -17,7 +17,6 @@ pub mod coordination;
 pub mod data_versioning;
 pub mod db_row;
 pub mod decisions;
-pub mod delegated_findings;
 pub mod edge_context;
 pub mod evaluation;
 pub mod event_ingestion;
@@ -182,8 +181,8 @@ pub use context_manifest::{
     budget_for_turn_intent, expired_artifact_placeholder,
 };
 pub use coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
-    CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage, aggregate_results,
+    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AggregationStrategy,
+    CoordinationPattern, DelegationRequest, DelegationResult, aggregate_results,
 };
 pub use data_versioning::{
     DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
@@ -378,7 +377,7 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    BubbleUpTarget, DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
     StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
 };
 pub use state_sync::{

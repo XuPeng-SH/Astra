@@ -68,7 +68,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_saas_events_and_audit_cross_user_isolation` | `journey_saas_platform_matrix.rs` | Foreign-user `GET /events`, session audit, and activity return 404; filtered global events do not leak the foreign session |
 | `e2e_matrix_team_crud_and_db` | `journey_team_crud_matrix.rs` | Team CRUD + upsert via second `POST /teams`, empty `GET .../executions`, SQL `team_definitions` |
 | `e2e_matrix_team_snapshots_and_db` | `journey_team_snapshots_matrix.rs` | `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`, SQL `team_snapshots` |
-| `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget, adversarial size) |
+| `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget), schema rejection 422 (unsupported coordination strategy) |
 | `e2e_matrix_team_http_db_fidelity` | `journey_team_data_fidelity_matrix.rs` | `GET` detail vs `team_definitions` JSON columns; list `len` = SQL `COUNT(*)`; snapshot blob + list fields; `executions?limit=` |
 | `e2e_matrix_team_cross_user_isolation` | `journey_team_isolation_matrix.rs` | Second user: 404 on other user's team; list has no foreign team name |
 | `e2e_matrix_meta_health` | `journey_meta_matrix.rs` | `GET /`, `GET /health` (root metadata, DB connected, persist counters) |

@@ -251,23 +251,21 @@ mod tests {
         assert!(parent.try_recv().is_some());
     }
 
-    /// Adversarial review uses the same caller-owned parent across rounds.
+    /// Ordered children report to the same caller-owned parent.
     #[tokio::test]
-    async fn adversarial_review_uses_caller_owned_parent() {
+    async fn sequential_children_use_caller_owned_parent() {
         let (executor, results) = ProgressReportingExecutor::new();
         let h = setup_harness(Arc::new(executor));
         let _parent = h.register_parent("parent-run").await;
 
         let request = make_request(
-            CoordinationPattern::AdversarialReview {
-                producer_id: "team-review-producer".into(),
-                reviewer_id: "team-review-reviewer".into(),
-                max_rounds: 2,
+            CoordinationPattern::Sequential {
+                agent_ids: vec!["team-review-producer".into(), "team-review-reviewer".into()],
+                stop_on_success: false,
                 timeout_sec: 10,
-                acceptance_threshold: 0.8,
             },
             "parent-run",
-            "del-adv-auto",
+            "del-sequential",
         );
 
         let result = h.execute(request, None).await;
@@ -275,8 +273,8 @@ mod tests {
 
         let results = results.lock().await;
         assert!(
-            results.len() >= 2,
-            "should have at least producer + reviewer results"
+            results.len() == 2,
+            "both ordered children should report progress"
         );
         for (agent_id, send_result) in results.iter() {
             assert!(

@@ -115,16 +115,16 @@ impl TeamRegistry {
     fn register_builtins(&mut self) {
         use astra_services::team_persistence::TeamCoordination;
 
-        // Code review team: producer + reviewer
+        // Independent reviews use the same parallel execution as other tasks.
         self.teams.insert(
             "review".to_string(),
             Team {
                 team_id: uuid::Uuid::new_v4().to_string(),
                 name: "review".to_string(),
-                description: "Adversarial code review: one agent produces the review, another critiques it for thoroughness".into(),
+                description: "Independent code reviews with aggregated findings".into(),
                 members: vec![
                     TeamMember {
-                        role: "producer".to_string(),
+                        role: "correctness_reviewer".to_string(),
                         description: "Performs code review. Use admitted tools to inspect recent commits and diffs \
                             (git log/show through Bash when available), and read_file/grep to understand \
                             context. Produce a detailed review covering correctness, security, \
@@ -135,9 +135,9 @@ impl TeamRegistry {
                     },
                     TeamMember {
                         role: "reviewer".to_string(),
-                        description: "Critiques the producer's review for completeness. \
-                            Use admitted tools to inspect commit diffs and read files to independently verify claims. \
-                            Check if the producer missed bugs, security issues, or edge cases."
+                        description: "Independently review security and edge cases. \
+                            Use admitted tools to inspect commit diffs and read files. \
+                            Provide actionable, evidence-backed findings."
                             .into(),
                         skills: vec![],
                         model_selection: None,
@@ -145,9 +145,8 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Shared,
-                coordination: Some(TeamCoordination::Adversarial {
-                    max_rounds: 3,
-                    threshold: 0.8,
+                coordination: Some(TeamCoordination::FanOut {
+                    aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
                 }),
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
@@ -177,7 +176,9 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Shared,
-                coordination: Some(TeamCoordination::Pipeline),
+                coordination: Some(TeamCoordination::Sequential {
+                    stop_on_success: false,
+                }),
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -214,7 +215,9 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Isolated,
-                coordination: Some(TeamCoordination::Pipeline),
+                coordination: Some(TeamCoordination::Sequential {
+                    stop_on_success: false,
+                }),
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -611,12 +614,16 @@ pub(crate) async fn handle_team_command(
         }
 
         "create" => {
-            // /team create <name> [--mode pipeline|adversarial|fanout|sequential] [description]
+            // /team create <name> [--mode fanout|sequential] [description]
             let mut parts = sub_arg.splitn(2, ' ');
             let name = parts.next().unwrap_or("").trim();
             let rest = parts.next().unwrap_or("").trim();
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /team create <name> [--mode pipeline|adversarial|fanout|sequential] [description]".yellow());
+                eprintln!(
+                    "{}",
+                    "  Usage: /team create <name> [--mode fanout|sequential] [description]"
+                        .yellow()
+                );
                 return;
             }
             let (coordination, desc) = if rest.starts_with("--mode ") {
@@ -625,15 +632,6 @@ pub(crate) async fn handle_team_command(
                 let mode_str = mode_parts.next().unwrap_or("");
                 let d = mode_parts.next().unwrap_or("").trim();
                 let coord = match mode_str {
-                    "pipeline" => {
-                        Some(astra_services::team_persistence::TeamCoordination::Pipeline)
-                    }
-                    "adversarial" => Some(
-                        astra_services::team_persistence::TeamCoordination::Adversarial {
-                            max_rounds: 3,
-                            threshold: 0.8,
-                        },
-                    ),
                     "fanout" | "fan-out" => {
                         Some(astra_services::team_persistence::TeamCoordination::FanOut {
                             aggregation:
@@ -647,7 +645,7 @@ pub(crate) async fn handle_team_command(
                     ),
                     other => {
                         eprintln!(
-                            "  {} Unknown mode '{}'. Options: pipeline, adversarial, fanout, sequential",
+                            "  {} Unknown mode '{}'. Options: fanout, sequential",
                             theme::icon_err(),
                             other
                         );
@@ -2021,19 +2019,22 @@ mod tests {
         assert!(matches!(
             reg.get("review")
                 .and_then(|team| team.coordination.as_ref()),
-            Some(TeamCoordination::Adversarial {
-                max_rounds: 3,
-                threshold: 0.8,
+            Some(TeamCoordination::FanOut {
+                aggregation: astra_services::team_persistence::TeamAggregation::AllResults
             })
         ));
         assert!(matches!(
             reg.get("research")
                 .and_then(|team| team.coordination.as_ref()),
-            Some(TeamCoordination::Pipeline)
+            Some(TeamCoordination::Sequential {
+                stop_on_success: false
+            })
         ));
         assert!(matches!(
             reg.get("dev").and_then(|team| team.coordination.as_ref()),
-            Some(TeamCoordination::Pipeline)
+            Some(TeamCoordination::Sequential {
+                stop_on_success: false
+            })
         ));
         assert_eq!(reg.list().len(), 3);
     }
@@ -2619,13 +2620,17 @@ mod tests {
     fn create_with_explicit_coordination() {
         use astra_services::team_persistence::TeamCoordination;
         let mut reg = TeamRegistry::new();
-        let coord = Some(TeamCoordination::Pipeline);
+        let coord = Some(TeamCoordination::Sequential {
+            stop_on_success: false,
+        });
         reg.create("pipe-team".into(), "pipeline team".into(), coord)
             .unwrap();
         let team = reg.get("pipe-team").unwrap();
         assert!(matches!(
             team.coordination,
-            Some(TeamCoordination::Pipeline)
+            Some(TeamCoordination::Sequential {
+                stop_on_success: false
+            })
         ));
     }
 
@@ -2633,9 +2638,16 @@ mod tests {
     fn explicit_coordination_wins_over_default_regardless_of_role_text() {
         use astra_services::team_persistence::TeamCoordination;
         let mut team = make_team(&["producer", "reviewer"]);
-        team.coordination = Some(TeamCoordination::Pipeline);
+        team.coordination = Some(TeamCoordination::Sequential {
+            stop_on_success: false,
+        });
         let def = cli_team_to_definition(&team, "u");
-        assert!(matches!(def.coordination, TeamCoordination::Pipeline));
+        assert!(matches!(
+            def.coordination,
+            TeamCoordination::Sequential {
+                stop_on_success: false
+            }
+        ));
     }
 
     #[test]
@@ -2651,7 +2663,9 @@ mod tests {
             user_id: "u".into(),
             name: "review".into(), // same name as builtin
             description: "foreign review".into(),
-            coordination: TeamCoordination::Pipeline,
+            coordination: TeamCoordination::Sequential {
+                stop_on_success: false,
+            },
             members: vec![],
             context: HashMap::new(),
             worktree_mode: WorktreeMode::Shared,

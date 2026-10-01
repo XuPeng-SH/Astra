@@ -42,21 +42,17 @@ fn canonical_agent_id(id: &str) -> String {
     id.to_lowercase().nfc().collect()
 }
 
+use astra_services::AdmittedModelExecution;
 use astra_services::coordination::{
     AGENT_RESULT_STATUS_FAILED, AGENT_RESULT_STATUS_TIMEOUT, AgentProfile, AgentProfileRegistry,
     AgentResult, AgentResultStatusKind, AggregationStrategy, CoordinationPattern,
     DelegationRequest, DelegationResult, DelegationResultStatusKind, agent_result_status_kind,
     agent_result_status_to_subrun_state, aggregate_results, delegation_result_status_kind,
 };
-use astra_services::delegated_findings::{
-    DelegatedFindingEnvelope, DelegatedFindingParse, MAX_DELEGATED_FINDING_SUMMARY_CHARS,
-    truncate_chars,
-};
 use astra_services::runs::{
     DurableRunStatusKind, RequestedTurnInteractionMode, durable_run_status_is_terminal,
     durable_run_status_kind, durable_run_status_to_subrun_state,
 };
-use astra_services::{AdmittedModelExecution, BubbleUpTarget, DatabaseStateProjectionStore};
 
 pub use astra_core::SubRunState;
 use astra_core::{
@@ -122,41 +118,7 @@ fn apply_model_slot_constraint(
         );
     }
     if let Some(reasoning) = &slot.reasoning {
-        use astra_turn_types::{DelegationReasoningEffort, DelegationReasoningRequirement};
-        *thinking = match reasoning {
-            DelegationReasoningRequirement::ModelDefault => {
-                astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
-            }
-            DelegationReasoningRequirement::On {} => {
-                astra_turn_core::thinking_config::ThinkingConfig::On {}
-            }
-            DelegationReasoningRequirement::Off => {
-                astra_turn_core::thinking_config::ThinkingConfig::Off
-            }
-            DelegationReasoningRequirement::Budget { tokens } => {
-                astra_turn_core::thinking_config::ThinkingConfig::Enabled {
-                    budget_tokens: *tokens,
-                }
-            }
-            DelegationReasoningRequirement::Effort { effort } => {
-                astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
-                    effort: match effort {
-                        DelegationReasoningEffort::Low => {
-                            astra_turn_core::thinking_config::ThinkingEffort::Low
-                        }
-                        DelegationReasoningEffort::Medium => {
-                            astra_turn_core::thinking_config::ThinkingEffort::Medium
-                        }
-                        DelegationReasoningEffort::High => {
-                            astra_turn_core::thinking_config::ThinkingEffort::High
-                        }
-                        DelegationReasoningEffort::Max => {
-                            astra_turn_core::thinking_config::ThinkingEffort::Max
-                        }
-                    },
-                }
-            }
-        };
+        *thinking = reasoning.into();
     }
 }
 
@@ -532,15 +494,10 @@ async fn abort_and_join_next_bounded<T: Send + 'static>(
 /// State projection is an observability aid, not a copy of the full run tree.
 /// Keep the source, its nearest ancestors, and the root within this write
 /// budget. The canonical transcript and durable run hierarchy remain complete.
-const MAX_FINDING_BUBBLE_TARGETS: usize = 8;
 
 /// Protect recovery from corrupt or externally imported parent maps while
 /// remaining far above the supported delegation depth of normal profiles.
 const MAX_ANCESTRY_TRAVERSAL: usize = 64;
-
-const VERIFICATION_RETRY_BASE_DELAY_MS: u64 = 200;
-const VERIFICATION_RETRY_MAX_DELAY_MS: u64 = 2_000;
-const VERIFICATION_RETRY_JITTER_MS: u64 = 100;
 
 const METRIC_DELEGATION_EXECUTIONS_TOTAL: &str = "astra_delegation_executions_total";
 const METRIC_DELEGATION_DURATION_MS_TOTAL: &str = "astra_delegation_duration_ms_total";
@@ -628,22 +585,6 @@ fn record_delegation_metrics(
             result.total_completion_tokens,
         );
     }
-}
-
-/// Bounded exponential delay for verification retries. The stable per-run
-/// jitter prevents a failed fanout from synchronizing its retries while
-/// keeping behavior deterministic enough to diagnose and test.
-fn verification_retry_delay(retry_attempt: u32, run_id: &str) -> std::time::Duration {
-    let exponent = retry_attempt.saturating_sub(2).min(4);
-    let exponential = VERIFICATION_RETRY_BASE_DELAY_MS
-        .saturating_mul(1_u64 << exponent)
-        .min(VERIFICATION_RETRY_MAX_DELAY_MS);
-    let hash = run_id.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
-    });
-    std::time::Duration::from_millis(
-        exponential.saturating_add(hash % (VERIFICATION_RETRY_JITTER_MS + 1)),
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1203,144 +1144,6 @@ fn parse_request_skill_sources_from_context(
     Ok(Some(parsed))
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct CriticalFindingExtraction {
-    summary: Option<String>,
-    contract_error: Option<String>,
-    used_legacy_review_format: bool,
-}
-
-/// Extract typed findings and operational child failures. Free-form success
-/// prose never becomes a cross-run signal. The one accepted prose shape is the
-/// exact previous review contract, isolated in `DelegatedFindingEnvelope` as a
-/// deployment-window migration.
-fn critical_finding_from_agent_result(result: &AgentResult) -> CriticalFindingExtraction {
-    let mut extraction = CriticalFindingExtraction::default();
-    if let Some(output) = result.output.as_deref() {
-        match DelegatedFindingEnvelope::parse(output) {
-            DelegatedFindingParse::Structured(envelope) => {
-                extraction.summary = envelope.critical_summary();
-            }
-            DelegatedFindingParse::LegacyReview(envelope) => {
-                extraction.used_legacy_review_format = true;
-                extraction.summary = envelope.critical_summary();
-            }
-            DelegatedFindingParse::Unstructured => {}
-            DelegatedFindingParse::MalformedJson(error) => {
-                extraction.contract_error = Some(error);
-            }
-            DelegatedFindingParse::ResourceLimitExceeded(error) => {
-                extraction.contract_error = Some(error);
-            }
-        }
-    }
-
-    // User/parent cancellation is already explicit lifecycle evidence and is
-    // not a critical defect. Failed, timed-out, or verification-failed work
-    // must remain visible even when no structured review envelope was emitted.
-    if result.is_failure() && result.status != STATUS_CANCELLED {
-        let failure = match result
-            .error
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(error) => {
-                let error = truncate_chars(error, MAX_DELEGATED_FINDING_SUMMARY_CHARS);
-                format!(
-                    "Delegated agent '{}' failed with status '{}': {error}",
-                    result.agent_id, result.status
-                )
-            }
-            None => format!(
-                "Delegated agent '{}' failed with status '{}'",
-                result.agent_id, result.status
-            ),
-        };
-        extraction.summary = Some(truncate_chars(
-            &match extraction.summary.take() {
-                Some(finding) => format!("{finding}\n\nOperational failure:\n{failure}"),
-                None => failure,
-            },
-            MAX_DELEGATED_FINDING_SUMMARY_CHARS,
-        ));
-    }
-    extraction
-}
-
-fn finding_bubble_targets(
-    session_id: &str,
-    run_id: &str,
-    source_depth: u32,
-    ancestry: &[String],
-) -> Vec<BubbleUpTarget> {
-    let mut targets = vec![BubbleUpTarget {
-        session_id: session_id.to_string(),
-        run_id: run_id.to_string(),
-        depth: source_depth,
-    }];
-    let ancestor_budget = MAX_FINDING_BUBBLE_TARGETS.saturating_sub(1);
-    let mut selected = (0..ancestry.len().min(ancestor_budget)).collect::<Vec<_>>();
-    if ancestry.len() > ancestor_budget && ancestor_budget > 0 {
-        selected.pop();
-        selected.push(ancestry.len() - 1);
-    }
-    for idx in selected {
-        targets.push(BubbleUpTarget {
-            session_id: session_id.to_string(),
-            run_id: ancestry[idx].clone(),
-            depth: source_depth.saturating_sub((idx as u32) + 1),
-        });
-    }
-    targets
-}
-
-async fn bubble_up_critical_finding_from_tracker(
-    projection_store: Arc<DatabaseStateProjectionStore>,
-    tracker: Arc<DelegationTracker>,
-    user_id: String,
-    session_id: String,
-    run_id: String,
-    summary: String,
-) {
-    let (source_depth, ancestry) = tracker.finding_lineage_snapshot(&run_id).await;
-    match &ancestry.termination {
-        AncestryTermination::RootReached => {}
-        AncestryTermination::Cycle { repeated_run_id } => tracing::warn!(
-            target: "astra_runtime::delegation",
-            run_id,
-            repeated_run_id,
-            "delegated finding ancestry is cyclic; publishing the complete acyclic prefix"
-        ),
-        AncestryTermination::TraversalLimit { next_run_id } => tracing::error!(
-            target: "astra_runtime::delegation",
-            run_id,
-            next_run_id,
-            traversal_limit = MAX_ANCESTRY_TRAVERSAL,
-            "delegated finding ancestry exceeded the corruption guard; root projection is incomplete"
-        ),
-    }
-    let targets = finding_bubble_targets(&session_id, &run_id, source_depth, &ancestry.ancestors);
-    if let Err(error) = projection_store
-        .bubble_up_finding(
-            &user_id,
-            &run_id,
-            &format!("finding-{run_id}"),
-            "critical",
-            &summary,
-            &targets,
-        )
-        .await
-    {
-        tracing::warn!(
-            target: "astra_runtime::delegation",
-            run_id,
-            error = %error,
-            "failed to bubble up critical delegated finding"
-        );
-    }
-}
-
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1657,49 +1460,6 @@ impl SubRunExecutor for StubSubRunExecutor {
     }
 }
 
-// ─── Verification Gate ──────────────────────────────────────────────────────
-
-/// Outcome of a verification gate check on a sub-run result.
-#[derive(Debug, Clone)]
-pub enum GateVerdict {
-    /// Sub-run passed verification — proceed with aggregation.
-    Pass,
-    /// Sub-run failed verification — retry if attempts remain.
-    Fail {
-        reason: String,
-        /// Verification details (criteria results, evidence, etc.)
-        details: Option<serde_json::Value>,
-    },
-    /// Skip verification for this result (e.g., already failed sub-run).
-    Skip,
-}
-
-impl GateVerdict {
-    pub fn is_pass(&self) -> bool {
-        matches!(self, Self::Pass | Self::Skip)
-    }
-}
-
-/// Post-completion verification gate for delegation sub-runs.
-///
-/// Injected into [`DelegationEngine`] to validate sub-run output before aggregation.
-/// When a gate returns [`GateVerdict::Fail`], the engine can retry the sub-run
-/// (up to `max_retries`) or mark it as failed.
-#[async_trait]
-pub trait VerificationGate: Send + Sync {
-    /// Verify a completed sub-run result.
-    ///
-    /// - `result`: the completed agent result
-    /// - `delegation_id`: which delegation this belongs to
-    /// - `attempt`: current attempt number (starts at 1)
-    async fn verify(&self, result: &AgentResult, delegation_id: &str, attempt: u32) -> GateVerdict;
-
-    /// Maximum retry attempts when verification fails. Default: 2.
-    fn max_retries(&self) -> u32 {
-        2
-    }
-}
-
 // ─── Sub-run Tracking ─────────────────────────────────────────────────────────────
 
 // SubRunRecord and DelegationProgress are now defined in astra-server-types.
@@ -1958,18 +1718,6 @@ impl DelegationTracker {
             .runs
             .get(run_id)
             .map(|record| record.depth)
-    }
-
-    /// Read depth and ancestry from one atomic hierarchy snapshot.
-    async fn finding_lineage_snapshot(&self, run_id: &str) -> (u32, AncestryWalk) {
-        let state = self.state.read().await;
-        let depth = state
-            .runs
-            .get(run_id)
-            .map(|record| record.depth)
-            .unwrap_or(0);
-        let ancestry = ancestry_from_parents(&state.parents, run_id);
-        (depth, ancestry)
     }
 
     /// Get all sub-run IDs for a given parent run across all delegations.
@@ -2641,8 +2389,6 @@ pub struct DelegationEngine {
     tracker: Arc<DelegationTracker>,
     /// Executor for actually running sub-agent loops.
     executor: Arc<dyn SubRunExecutor>,
-    /// Optional post-completion verification gate.
-    gate: Option<Arc<dyn VerificationGate>>,
     /// Optional mailbox router for inter-agent messaging.
     mailbox_router: Option<Arc<AgentMailboxRouter>>,
     /// Optional fork-prefix store shared with the spawner. When
@@ -2652,9 +2398,6 @@ pub struct DelegationEngine {
     /// behaves as pre-fork-prefix — `inherited_prefix` stays None
     /// and the child runs fresh.
     prefix_store: Option<Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
-    /// Durable state projection store used to surface delegated findings and
-    /// keep child run state queryable by the web agent.
-    projection_store: Option<Arc<DatabaseStateProjectionStore>>,
 }
 
 impl DelegationEngine {
@@ -2942,28 +2685,13 @@ impl DelegationEngine {
         pending
     }
 
-    pub fn new(
+    #[cfg(test)]
+    fn new(
         registry: Arc<RwLock<AgentProfileRegistry>>,
         run_engine: Arc<RunEngine>,
         tracker: Arc<DelegationTracker>,
     ) -> Self {
-        if let Some(metrics) = run_engine.metrics_registry() {
-            register_delegation_metrics(metrics);
-        }
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "  ⚠ DelegationEngine: using StubSubRunExecutor — call with_executor() for production"
-        );
-        Self {
-            registry,
-            run_engine,
-            tracker,
-            executor: Arc::new(StubSubRunExecutor),
-            gate: None,
-            mailbox_router: None,
-            prefix_store: None,
-            projection_store: None,
-        }
+        Self::with_executor(registry, run_engine, tracker, Arc::new(StubSubRunExecutor))
     }
 
     /// Create engine with a real sub-run executor.
@@ -2981,17 +2709,9 @@ impl DelegationEngine {
             run_engine,
             tracker,
             executor,
-            gate: None,
             mailbox_router: None,
             prefix_store: None,
-            projection_store: None,
         }
-    }
-
-    /// Attach a verification gate. Sub-run results will be checked before aggregation.
-    pub fn with_gate(mut self, gate: Arc<dyn VerificationGate>) -> Self {
-        self.gate = Some(gate);
-        self
     }
 
     /// Attach a mailbox router for inter-agent messaging within delegations.
@@ -3010,11 +2730,6 @@ impl DelegationEngine {
         store: Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>,
     ) -> Self {
         self.prefix_store = Some(store);
-        self
-    }
-
-    pub fn with_projection_store(mut self, store: Arc<DatabaseStateProjectionStore>) -> Self {
-        self.projection_store = Some(store);
         self
     }
 
@@ -3147,70 +2862,6 @@ impl DelegationEngine {
         self.tracker.progress_broadcaster()
     }
 
-    async fn bubble_up_critical_agent_results(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        results: &[AgentResult],
-    ) {
-        let Some(projection_store) = self.projection_store.clone() else {
-            return;
-        };
-        for result in results {
-            let extraction = critical_finding_from_agent_result(result);
-            if let Some(error) = extraction.contract_error.as_deref() {
-                tracing::warn!(
-                    target: "astra_runtime::delegation",
-                    run_id = %result.run_id,
-                    error,
-                    "delegated finding output violated the bounded JSON contract"
-                );
-            }
-            if extraction.used_legacy_review_format {
-                tracing::debug!(
-                    target: "astra_runtime::delegation",
-                    run_id = %result.run_id,
-                    "accepted previous delegated review format during deployment migration"
-                );
-            }
-            if let Some(summary) = extraction.summary {
-                bubble_up_critical_finding_from_tracker(
-                    projection_store.clone(),
-                    self.tracker.clone(),
-                    user_id.to_string(),
-                    session_id.to_string(),
-                    result.run_id.clone(),
-                    summary,
-                )
-                .await;
-            }
-        }
-    }
-
-    /// Dynamically set the verification gate (e.g., per-subtask criteria during plan execution).
-    ///
-    /// Unlike [`with_gate`] (builder pattern), this mutates the engine in place so callers
-    /// can swap gates between delegation calls without rebuilding the engine.
-    pub fn set_gate(&mut self, gate: Arc<dyn VerificationGate>) {
-        self.gate = Some(gate);
-    }
-    /// Create a new engine sharing the same components but with a different gate.
-    ///
-    /// All `Arc`-wrapped internals (registry, run_engine, tracker, executor) are
-    /// cheaply cloned (pointer bumps).  Use this when the engine is behind an
-    /// `Arc` and `set_gate` cannot be called because `&mut self` is unavailable.
-    pub fn clone_with_gate(&self, gate: Arc<dyn VerificationGate>) -> Self {
-        Self {
-            registry: self.registry.clone(),
-            run_engine: self.run_engine.clone(),
-            tracker: self.tracker.clone(),
-            executor: self.executor.clone(),
-            gate: Some(gate),
-            mailbox_router: self.mailbox_router.clone(),
-            prefix_store: self.prefix_store.clone(),
-            projection_store: self.projection_store.clone(),
-        }
-    }
     /// Validate a delegation request without executing it.
     pub async fn validate(
         &self,
@@ -3219,656 +2870,6 @@ impl DelegationEngine {
     ) -> Result<(), String> {
         let reg = self.registry.read().await;
         reg.validate_delegation(request, source_agent_id)
-    }
-
-    /// Apply the verification gate to a sub-run result with retry support.
-    ///
-    /// Returns the final result after gate checking (possibly retried).
-    /// If no gate is configured, returns the result as-is.
-    async fn apply_gate(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        result: AgentResult,
-        delegation_id: &str,
-        parent_run_id: &str,
-        parent_model_reasoning: Option<
-            &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
-        >,
-        expected_model: Option<&PreparedSubRunModel>,
-        cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
-        retry_deadline: Option<tokio::time::Instant>,
-        config_builder: impl Fn() -> Result<SubRunConfig, String>,
-    ) -> AgentResult {
-        let gate = match &self.gate {
-            Some(g) => g,
-            None => return result,
-        };
-
-        // Skip gate for already-failed results
-        if !result.is_success() {
-            return result;
-        }
-
-        let max_retries = gate.max_retries();
-        let mut current = result;
-        let mut attempt = 1u32;
-        let mut retry_reconciliation_deadline = None;
-
-        loop {
-            let verification = async {
-                if let Some(deadline) = retry_deadline {
-                    tokio::time::timeout_at(deadline, async {
-                        if tokio::time::Instant::now() >= deadline {
-                            None
-                        } else {
-                            Some(gate.verify(&current, delegation_id, attempt).await)
-                        }
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                } else {
-                    Some(gate.verify(&current, delegation_id, attempt).await)
-                }
-            };
-            let verdict = if let Some(token) = cancel_token {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => {
-                        return AgentResult {
-                            status: STATUS_CANCELLED.to_string(),
-                            error: Some("verification cancelled by parent".to_string()),
-                            ..current
-                        };
-                    }
-                    verdict = verification => verdict,
-                }
-            } else {
-                verification.await
-            };
-            let verdict = match verdict {
-                Some(verdict) => verdict,
-                None => {
-                    return AgentResult {
-                        status: AGENT_RESULT_STATUS_TIMEOUT.to_string(),
-                        error: Some(
-                            "verification gate timeout: child deadline exceeded".to_string(),
-                        ),
-                        ..current
-                    };
-                }
-            };
-            match verdict {
-                GateVerdict::Pass | GateVerdict::Skip => return current,
-                GateVerdict::Fail { reason, details } => {
-                    let retry_count = await_subrun_operation(
-                        self.run_engine.persist_retry_count(
-                            user_id,
-                            expected_session_id,
-                            &current.run_id,
-                            attempt,
-                        ),
-                        retry_deadline,
-                        cancel_token.map(Arc::as_ref),
-                    )
-                    .await;
-                    match retry_count {
-                        Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => {
-                            return AgentResult {
-                                status: STATUS_VERIFICATION_FAILED.to_string(),
-                                error: Some(format!(
-                                    "verification failed, but retry allowance could not be durably recorded for attempt {attempt}"
-                                )),
-                                ..current
-                            };
-                        }
-                        Ok(Err(error)) => {
-                            return AgentResult {
-                                status: STATUS_VERIFICATION_FAILED.to_string(),
-                                error: Some(format!(
-                                    "verification failed and retry allowance persistence failed: {error}"
-                                )),
-                                ..current
-                            };
-                        }
-                        Err(SubRunOperationStop::Cancelled) => {
-                            return AgentResult {
-                                status: STATUS_CANCELLED.to_string(),
-                                error: Some(
-                                    "verification retry bookkeeping cancelled by parent".into(),
-                                ),
-                                ..current
-                            };
-                        }
-                        Err(SubRunOperationStop::DeadlineExceeded) => {
-                            return AgentResult {
-                                status: AGENT_RESULT_STATUS_TIMEOUT.to_string(),
-                                error: Some(
-                                    "verification retry bookkeeping exceeded the child deadline"
-                                        .into(),
-                                ),
-                                ..current
-                            };
-                        }
-                    }
-
-                    // The durable retry count is authoritative. The event is
-                    // explanatory, so a storage error is logged, but it may
-                    // not extend the task deadline or delay parent cancel.
-                    let gate_event = self.run_engine.append_event(
-                        user_id,
-                        expected_session_id,
-                        &current.run_id,
-                        serde_json::json!({
-                            "event_type": "verification_gate_failed",
-                            "data": {
-                                "attempt": attempt,
-                                "reason": reason,
-                                "details": details,
-                            }
-                        }),
-                    );
-                    match await_subrun_operation(
-                        gate_event,
-                        retry_deadline,
-                        cancel_token.map(Arc::as_ref),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => tracing::warn!(
-                            target: "astra_runtime::delegation",
-                            run_id = %current.run_id,
-                            error = %error,
-                            "failed to persist verification failure event"
-                        ),
-                        Err(SubRunOperationStop::Cancelled) => {
-                            return AgentResult {
-                                status: STATUS_CANCELLED.to_string(),
-                                error: Some("verification retry cancelled by parent".into()),
-                                ..current
-                            };
-                        }
-                        Err(SubRunOperationStop::DeadlineExceeded) => {
-                            return AgentResult {
-                                status: AGENT_RESULT_STATUS_TIMEOUT.to_string(),
-                                error: Some(
-                                    "verification event persistence exceeded the child deadline"
-                                        .into(),
-                                ),
-                                ..current
-                            };
-                        }
-                    }
-
-                    if attempt >= max_retries {
-                        // Exhausted retries — mark as verification failure
-                        let verification_error =
-                            format!("verification gate failed after {attempt} attempts: {reason}");
-                        return AgentResult {
-                            status: STATUS_VERIFICATION_FAILED.to_string(),
-                            error: Some(verification_error),
-                            ..current
-                        };
-                    }
-
-                    // Retry: re-execute with the same config
-                    attempt += 1;
-                    let original_run_id = current.run_id.clone();
-                    let mut retry_config = match config_builder() {
-                        Ok(config) => config,
-                        Err(error) => {
-                            let retry_error =
-                                format!("verification retry template unavailable: {error}");
-                            return AgentResult {
-                                status: STATUS_FAILED.to_string(),
-                                error: Some(retry_error),
-                                ..current
-                            };
-                        }
-                    };
-                    let retry_run_id = retry_config.run_id.clone();
-                    let retry_depth = self.tracker.get_depth(&original_run_id).await.unwrap_or(0);
-
-                    let retry_delay = verification_retry_delay(attempt, &original_run_id);
-                    tracing::debug!(
-                        target: "astra_runtime::delegation",
-                        run_id = %original_run_id,
-                        retry_attempt = attempt,
-                        retry_delay_ms = retry_delay.as_millis(),
-                        "verification retry scheduled with bounded backoff"
-                    );
-                    let wait_for_retry = async {
-                        if retry_deadline
-                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                        {
-                            return Err(());
-                        }
-                        if let Some(token) = retry_config.cancel_token.as_ref() {
-                            Ok(tokio::select! {
-                                biased;
-                                _ = token.cancelled() => true,
-                                _ = tokio::time::sleep(retry_delay) => false,
-                            })
-                        } else {
-                            tokio::time::sleep(retry_delay).await;
-                            Ok(false)
-                        }
-                    };
-                    let cancelled_during_backoff = if let Some(deadline) = retry_deadline {
-                        match tokio::time::timeout_at(deadline, wait_for_retry).await {
-                            Ok(Ok(cancelled)) => cancelled,
-                            Ok(Err(())) | Err(_) => {
-                                return AgentResult {
-                                    status: AGENT_RESULT_STATUS_TIMEOUT.to_string(),
-                                    error: Some(
-                                        "verification retry timeout: child deadline exceeded"
-                                            .to_string(),
-                                    ),
-                                    ..current
-                                };
-                            }
-                        }
-                    } else {
-                        wait_for_retry.await.unwrap_or(false)
-                    };
-                    if cancelled_during_backoff {
-                        let cancellation = "cancelled during verification retry backoff";
-                        return AgentResult {
-                            status: STATUS_CANCELLED.to_string(),
-                            error: Some(cancellation.to_string()),
-                            ..current
-                        };
-                    }
-
-                    let retry_model_request = SubRunModelRequest {
-                        user_id: retry_config.user_id.clone(),
-                        selection: retry_config.agent_profile.model_selection.clone(),
-                        parent_model_reasoning: parent_model_reasoning.cloned(),
-                        inherited_execution: retry_config.admitted_model_execution.clone(),
-                        provider_scope_bound: retry_config
-                            .context
-                            .contains_key(Self::PROVIDER_RUN_OWNER_CONTEXT_KEY),
-                        thinking: retry_config.thinking.clone(),
-                        max_output_tokens: retry_config.max_output_tokens,
-                    };
-                    let prepared_retry = match self
-                        .prepare_subrun_models(
-                            &[retry_model_request],
-                            retry_config.cancel_token.as_ref(),
-                            model_admission_timeout(retry_deadline),
-                        )
-                        .await
-                    {
-                        Ok(mut prepared) => prepared.pop().flatten(),
-                        Err(error) => {
-                            let (status, reason) = match error {
-                                SubRunModelPreparationError::Cancelled => (
-                                    STATUS_CANCELLED,
-                                    "cancelled during verification retry model admission"
-                                        .to_string(),
-                                ),
-                                SubRunModelPreparationError::TimedOut => (
-                                    AGENT_RESULT_STATUS_TIMEOUT,
-                                    "verification retry model admission timed out".to_string(),
-                                ),
-                                SubRunModelPreparationError::Executor(error) => {
-                                    (STATUS_FAILED, error)
-                                }
-                            };
-                            return AgentResult {
-                                status: status.to_string(),
-                                error: Some(format!(
-                                    "failed to prepare verification retry model: {reason}"
-                                )),
-                                ..current
-                            };
-                        }
-                    };
-                    if let Some(expected) = expected_model
-                        && prepared_retry.as_ref().is_none_or(|prepared| {
-                            prepared.offering_id != expected.offering_id
-                                || prepared.model_name != expected.model_name
-                        })
-                    {
-                        return AgentResult {
-                            status: STATUS_FAILED.to_string(),
-                            error: Some(format!(
-                                "verification retry resolved a different model identity than the completed attempt (expected Offering '{}' / model '{}')",
-                                expected.offering_id, expected.model_name
-                            )),
-                            ..current
-                        };
-                    }
-                    retry_config.prepared_model = prepared_retry;
-
-                    if retry_config
-                        .cancel_token
-                        .as_ref()
-                        .is_some_and(|token| token.is_cancelled())
-                    {
-                        return AgentResult {
-                            status: STATUS_CANCELLED.to_string(),
-                            error: Some(
-                                "verification retry cancelled before durable admission".to_string(),
-                            ),
-                            ..current
-                        };
-                    }
-
-                    if retry_deadline
-                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                    {
-                        return AgentResult {
-                            status: AGENT_RESULT_STATUS_TIMEOUT.to_string(),
-                            error: Some(
-                                "verification retry expired before durable admission".to_string(),
-                            ),
-                            ..current
-                        };
-                    }
-
-                    let retry_authority = match self
-                        .start_delegated_run(
-                            &retry_run_id,
-                            &retry_config.user_id,
-                            &retry_config.session_id,
-                            parent_run_id,
-                            delegation_id,
-                            &retry_config.agent_profile.agent_id,
-                            Some(&original_run_id),
-                            retry_config.interaction_mode,
-                            &retry_config.request_constraints,
-                            &retry_config.thinking,
-                            retry_config.prepared_model.as_ref(),
-                            retry_config.cancel_token.as_ref(),
-                            retry_deadline,
-                        )
-                        .await
-                    {
-                        Ok(authority) => authority,
-                        Err(error) => {
-                            let status = if retry_config
-                                .cancel_token
-                                .as_ref()
-                                .is_some_and(|token| token.is_cancelled())
-                            {
-                                STATUS_CANCELLED
-                            } else {
-                                STATUS_FAILED
-                            };
-                            return AgentResult {
-                                status: status.to_string(),
-                                error: Some(format!(
-                                    "failed to establish durable verification retry: {error}"
-                                )),
-                                ..current
-                            };
-                        }
-                    };
-                    retry_config.execution_owner_generation =
-                        Some(retry_authority.owner_generation);
-
-                    if retry_config
-                        .cancel_token
-                        .as_ref()
-                        .is_some_and(|token| token.is_cancelled())
-                    {
-                        let retry_result = self
-                            .settle_unlaunched_child_with_shared_deadline(
-                                user_id,
-                                expected_session_id,
-                                &retry_config.agent_profile.agent_id,
-                                &retry_run_id,
-                                retry_authority.owner_generation,
-                                STATUS_CANCELLED,
-                                "verification retry cancelled before execution",
-                                None,
-                                &mut retry_reconciliation_deadline,
-                            )
-                            .await;
-                        return AgentResult {
-                            status: retry_result.status,
-                            error: retry_result.error,
-                            ..current
-                        };
-                    }
-
-                    if retry_deadline
-                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                    {
-                        let retry_result = self
-                            .settle_unlaunched_child_with_shared_deadline(
-                                user_id,
-                                expected_session_id,
-                                &retry_config.agent_profile.agent_id,
-                                &retry_run_id,
-                                retry_authority.owner_generation,
-                                AGENT_RESULT_STATUS_TIMEOUT,
-                                "verification retry expired before execution",
-                                None,
-                                &mut retry_reconciliation_deadline,
-                            )
-                            .await;
-                        return AgentResult {
-                            status: retry_result.status,
-                            error: retry_result.error,
-                            ..current
-                        };
-                    }
-
-                    // Record retry sub-run with linkage to original
-                    self.tracker
-                        .record_sub_run(SubRunRecord {
-                            run_id: retry_run_id.clone(),
-                            parent_run_id: parent_run_id.to_string(),
-                            delegation_id: delegation_id.to_string(),
-                            agent_id: retry_config.agent_profile.agent_id.clone(),
-                            depth: retry_depth,
-                            state: SubRunState::Created,
-                            retry_of: Some(original_run_id.clone()),
-                        })
-                        .await;
-
-                    let retry_pause_flag = self.tracker.register_pause_flag(&retry_run_id).await;
-                    retry_config.pause_flag = Some(retry_pause_flag);
-                    let retry_cancel_token = retry_config
-                        .cancel_token
-                        .as_ref()
-                        .map(|t| Arc::new(t.child_token()))
-                        .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
-                    self.tracker
-                        .register_cancel_token(&retry_run_id, retry_cancel_token.clone())
-                        .await;
-                    retry_config.cancel_token = Some(retry_cancel_token);
-
-                    if retry_config.mailbox.is_none() {
-                        if let Some(router) = &self.mailbox_router {
-                            let addr = astra_messaging::types::AgentAddress {
-                                run_id: retry_run_id.clone(),
-                                agent_id: retry_config.agent_profile.agent_id.clone(),
-                            };
-                            match router.register(addr, Some(delegation_id.to_string())).await {
-                                Ok(mailbox) => retry_config.mailbox = Some(mailbox),
-                                Err(e) => {
-                                    eprintln!(
-                                        "  ⚠ delegation: mailbox registration failed for retry {}: {}",
-                                        retry_config.agent_profile.agent_id, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let retry_mailbox_retirement = MailboxRetirement::from_mailbox(
-                        &self.mailbox_router,
-                        retry_config.mailbox.as_ref(),
-                    );
-
-                    Self::write_journal_event(
-                        user_id,
-                        &retry_config.session_id,
-                        astra_services::session_journal::JournalEvent::delegation_retry(
-                            Some(&retry_config.session_id),
-                            delegation_id,
-                            &original_run_id,
-                            &retry_run_id,
-                            &retry_config.agent_profile.agent_id,
-                            attempt,
-                            &reason,
-                        ),
-                    );
-
-                    // Verification is a parent-level evaluation fact. The
-                    // physical child execution may already be durably
-                    // completed, so the gate must not rewrite that lifecycle.
-                    let rejected = AgentResult {
-                        status: STATUS_VERIFICATION_FAILED.to_string(),
-                        error: Some(reason.clone()),
-                        ..current.clone()
-                    };
-                    let rejected_state = agent_result_status_to_subrun_state(&rejected.status);
-                    self.tracker
-                        .apply_sub_run_result_state(
-                            &original_run_id,
-                            rejected_state,
-                            rejected.error.as_deref(),
-                            rejected.output.as_deref(),
-                        )
-                        .await;
-
-                    // Transition retry to Running before execution
-                    if let Err(e) = self
-                        .tracker
-                        .transition_state(&retry_run_id, SubRunState::Running)
-                        .await
-                    {
-                        astra_core::agent_warn!(
-                            "delegation",
-                            "Retry transition to Running failed for {retry_run_id}: {e:?}"
-                        );
-                    }
-
-                    let retry_cancel = retry_config.cancel_token.clone();
-                    let retry_agent_id = retry_config.agent_profile.agent_id.clone();
-                    let retry_executor_entered = Arc::new(AtomicBool::new(false));
-                    let retry_executor_entered_for_task = retry_executor_entered.clone();
-                    let retry_exec = async {
-                        if retry_cancel
-                            .as_ref()
-                            .is_some_and(|token| token.is_cancelled())
-                        {
-                            return Err(format!(
-                                "agent {retry_agent_id} retry cancelled before dispatch"
-                            ));
-                        }
-                        if retry_deadline
-                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                        {
-                            return Err(format!(
-                                "agent {retry_agent_id} retry timeout: child deadline exceeded"
-                            ));
-                        }
-                        retry_executor_entered_for_task.store(true, Ordering::Release);
-                        let execution = self.executor.execute(retry_config);
-                        match retry_deadline {
-                            Some(deadline) => {
-                                match tokio::time::timeout_at(deadline, execution).await {
-                                    Ok(result) => result,
-                                    Err(_) => Err(format!(
-                                        "agent {retry_agent_id} retry timeout: child deadline exceeded"
-                                    )),
-                                }
-                            }
-                            None => execution.await,
-                        }
-                    };
-
-                    match if let Some(token) = retry_cancel.as_ref() {
-                        tokio::select! {
-                            biased;
-                            _ = token.cancelled() => Err("cancelled before verification retry dispatch".to_string()),
-                            r = retry_exec => r,
-                        }
-                    } else {
-                        retry_exec.await
-                    } {
-                        Ok(result) => {
-                            current = reconcile_agent_result_with_durable_authority(
-                                &self.run_engine,
-                                user_id,
-                                expected_session_id,
-                                durable_lifecycle_disposition(
-                                    self.executor.as_ref(),
-                                    retry_authority.owner_generation,
-                                ),
-                                result,
-                                retry_mailbox_retirement.as_ref(),
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            if !retry_executor_entered.load(Ordering::Acquire) {
-                                let status = if retry_cancel
-                                    .as_ref()
-                                    .is_some_and(|token| token.is_cancelled())
-                                {
-                                    STATUS_CANCELLED
-                                } else if retry_deadline
-                                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                                    || e.contains("timeout")
-                                {
-                                    AGENT_RESULT_STATUS_TIMEOUT
-                                } else {
-                                    STATUS_FAILED
-                                };
-                                let retry_result = self
-                                    .settle_unlaunched_child_with_shared_deadline(
-                                        user_id,
-                                        expected_session_id,
-                                        &retry_agent_id,
-                                        &retry_run_id,
-                                        retry_authority.owner_generation,
-                                        status,
-                                        &e,
-                                        retry_mailbox_retirement.as_ref(),
-                                        &mut retry_reconciliation_deadline,
-                                    )
-                                    .await;
-                                return AgentResult {
-                                    status: retry_result.status,
-                                    error: retry_result.error,
-                                    ..current
-                                };
-                            }
-                            let retry_result = reconcile_agent_result_with_durable_authority(
-                                &self.run_engine,
-                                user_id,
-                                expected_session_id,
-                                durable_lifecycle_disposition(
-                                    self.executor.as_ref(),
-                                    retry_authority.owner_generation,
-                                ),
-                                AgentResult {
-                                    agent_id: retry_agent_id,
-                                    run_id: retry_run_id,
-                                    status: STATUS_FAILED.to_string(),
-                                    error: Some(format!("retry execution failed: {e}")),
-                                    output: None,
-                                    prompt_tokens: 0,
-                                    completion_tokens: 0,
-                                    tool_calls: 0,
-                                },
-                                retry_mailbox_retirement.as_ref(),
-                            )
-                            .await;
-                            return retry_result;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Execute a delegation: spawn sub-runs according to the coordination pattern.
@@ -3926,14 +2927,6 @@ impl DelegationEngine {
         let agent_ids = match &request.pattern {
             CoordinationPattern::FanOut { agent_ids, .. }
             | CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
-            CoordinationPattern::Pipeline { stages, .. } => {
-                stages.iter().map(|stage| stage.agent_id.clone()).collect()
-            }
-            CoordinationPattern::AdversarialReview {
-                producer_id,
-                reviewer_id,
-                ..
-            } => vec![producer_id.clone(), reviewer_id.clone()],
             CoordinationPattern::Fork { .. } => {
                 return Err("direct Team model plans do not support fork patterns".into());
             }
@@ -4112,19 +3105,7 @@ impl DelegationEngine {
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
             CoordinationPattern::FanOut { agent_ids, .. } => ("fan_out", agent_ids.clone()),
-            CoordinationPattern::Pipeline { stages, .. } => (
-                "pipeline",
-                stages.iter().map(|s| s.agent_id.clone()).collect(),
-            ),
             CoordinationPattern::Sequential { agent_ids, .. } => ("sequential", agent_ids.clone()),
-            CoordinationPattern::AdversarialReview {
-                producer_id,
-                reviewer_id,
-                ..
-            } => (
-                "adversarial_review",
-                vec![producer_id.clone(), reviewer_id.clone()],
-            ),
             CoordinationPattern::Fork {
                 agent_id, tasks, ..
             } => ("fork", vec![format!("{}×{}", agent_id, tasks.len())]),
@@ -4172,28 +3153,6 @@ impl DelegationEngine {
                 )
                 .await
             }
-            CoordinationPattern::Pipeline {
-                stages,
-                timeout_sec,
-            } => {
-                let agent_ids: Vec<String> = stages.iter().map(|s| s.agent_id.clone()).collect();
-                self.execute_sequential(
-                    &request,
-                    &agent_ids,
-                    false,
-                    &forward_headers,
-                    admitted_model_execution.as_ref(),
-                    effective_parent_model_reasoning.as_ref(),
-                    &request_constraints,
-                    model_plan.as_ref(),
-                    child_recursion_depth,
-                    interaction_mode,
-                    *timeout_sec,
-                    cancel_token.as_ref(),
-                    live_event_sink.as_ref(),
-                )
-                .await
-            }
             CoordinationPattern::Sequential {
                 agent_ids,
                 stop_on_success,
@@ -4203,31 +3162,6 @@ impl DelegationEngine {
                     &request,
                     agent_ids,
                     *stop_on_success,
-                    &forward_headers,
-                    admitted_model_execution.as_ref(),
-                    effective_parent_model_reasoning.as_ref(),
-                    &request_constraints,
-                    model_plan.as_ref(),
-                    child_recursion_depth,
-                    interaction_mode,
-                    *timeout_sec,
-                    cancel_token.as_ref(),
-                    live_event_sink.as_ref(),
-                )
-                .await
-            }
-            CoordinationPattern::AdversarialReview {
-                producer_id,
-                reviewer_id,
-                max_rounds,
-                timeout_sec,
-                ..
-            } => {
-                self.execute_adversarial(
-                    &request,
-                    producer_id,
-                    reviewer_id,
-                    *max_rounds,
                     &forward_headers,
                     admitted_model_execution.as_ref(),
                     effective_parent_model_reasoning.as_ref(),
@@ -4268,8 +3202,6 @@ impl DelegationEngine {
 
         // Journal: delegation completed
         if let Ok(ref dr) = result {
-            self.bubble_up_critical_agent_results(&request.user_id, &session_id, &dr.agent_results)
-                .await;
             let succeeded = dr.agent_results.iter().filter(|r| r.is_success()).count();
             let failed = dr.agent_results.len() - succeeded;
             Self::write_journal_event(
@@ -4346,7 +3278,6 @@ impl DelegationEngine {
         }
         let execution_deadline = delegation_deadline(timeout_sec);
         let reg = self.registry.read().await;
-        let has_gate = self.gate.is_some();
 
         // Compute aggregation strategy name and budget info for team prompts
         let aggregation_name = match aggregation {
@@ -4549,12 +3480,7 @@ impl DelegationEngine {
             // Inject team coordination prompt into task
             let coordination_prompt = format!(
                 "{}{}",
-                team_prompts::fan_out_agent_prompt(
-                    &agent_id,
-                    &agent_id_strs,
-                    aggregation_name,
-                    has_gate,
-                ),
+                team_prompts::fan_out_agent_prompt(&agent_id, &agent_id_strs, aggregation_name),
                 budget_prompt,
             );
             let enhanced_task =
@@ -4666,46 +3592,6 @@ impl DelegationEngine {
         } else {
             None
         };
-
-        // Store config templates for fan-out gate retry support.
-        // Maps agent_id → frozen execution profile, task/context identity,
-        // thinking, request constraints, and prepared route for exact retries.
-        let mut retry_templates: HashMap<
-            String,
-            (
-                AgentProfile,
-                String,
-                String,
-                String,
-                HashMap<String, serde_json::Value>,
-                Vec<String>,
-                astra_turn_core::thinking_config::ThinkingConfig,
-                RequestConstraints,
-                Option<PreparedSubRunModel>,
-                Option<astra_turn_types::RequestedModelPolicy>,
-            ),
-        > = HashMap::new();
-        for config in &configs {
-            let retry_context = clone_delegation_context(
-                astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
-                &config.context,
-            );
-            retry_templates.insert(
-                config.agent_profile.agent_id.clone(),
-                (
-                    config.agent_profile.clone(),
-                    config.task.clone(),
-                    config.session_id.clone(),
-                    config.user_id.clone(),
-                    retry_context,
-                    config.delegation_chain.clone(),
-                    config.thinking.clone(),
-                    config.request_constraints.clone(),
-                    config.prepared_model.clone(),
-                    config.requested_model_policy.clone(),
-                ),
-            );
-        }
 
         // Use JoinSet for abort-on-drop semantics: if caller times out before
         // collecting all results, remaining tasks are aborted automatically.
@@ -4908,10 +3794,8 @@ impl DelegationEngine {
             }
         }
 
-        // Settle the physical execution lifecycle before applying the
-        // verification policy. Verification is a parent-level evaluation
-        // fact; it must not retroactively rewrite a child execution that has
-        // already committed its durable terminal state.
+        // Settle the physical execution lifecycle before aggregation. Durable
+        // authority determines each child outcome before it reaches the parent.
         let mut authoritative_results = Vec::with_capacity(results.len());
         for result in results {
             let disposition = owner_generations
@@ -4958,106 +3842,7 @@ impl DelegationEngine {
             };
             authoritative_results.push(result);
         }
-        let mut results = authoritative_results;
-
-        // ── Verification gate: check each result before aggregation ──
-        if self.gate.is_some() {
-            let delegation_id = request.delegation_id.clone();
-            let mut gated_results = Vec::with_capacity(results.len());
-            for result in results {
-                let did = delegation_id.clone();
-                let cancel_for_retry = cancel_token.cloned();
-                // Build retry config from stored template
-                let retry_agent_id = result.agent_id.clone();
-                let template = retry_templates.get(&retry_agent_id).map(|template| {
-                    astra_core::history_work::record_serialized_value(
-                        astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
-                        &template.4,
-                    );
-                    template.clone()
-                });
-                let expected_model = template.as_ref().and_then(|template| template.8.as_ref());
-                let gated = self
-                    .apply_gate(
-                        &request.user_id,
-                        &session_id,
-                        result,
-                        &did,
-                        &request.parent_run_id,
-                        parent_model_reasoning,
-                        expected_model,
-                        cancel_for_retry.as_ref(),
-                        execution_deadline,
-                        || {
-                            if let Some(template) = template.as_ref() {
-                                astra_core::history_work::record_serialized_value(
-                                    astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
-                                    &template.4,
-                                );
-                            }
-                            let Some((
-                                profile,
-                                task,
-                                sess,
-                                uid,
-                                ctx,
-                                delegation_chain,
-                                thinking,
-                                retry_constraints,
-                                _,
-                                requested_model_policy,
-                            )) = template.clone()
-                            else {
-                                return Err(format!(
-                                    "missing stored retry template for agent {retry_agent_id}"
-                                ));
-                            };
-                            let delegate_model = "";
-                            let inherited_prefix = self.resolve_inherited_prefix_for_delegate(
-                                &request.parent_run_id,
-                                delegate_model,
-                            );
-                            Ok(SubRunConfig {
-                                max_output_tokens: None,
-                                run_id: uuid::Uuid::new_v4().to_string(),
-                                parent_run_id: request.parent_run_id.clone(),
-                                agent_profile: profile,
-                                task,
-                                session_id: sess,
-                                user_id: uid,
-                                execution_owner_generation: None,
-                                execution_owner_generation_sink: None,
-                                previous_output: None,
-                                context: ctx,
-                                forward_headers: forward_headers.clone(),
-                                admitted_model_execution: admitted_model_execution.cloned(),
-                                prepared_model: None,
-                                requested_model_policy,
-                                thinking: thinking.clone(),
-                                interaction_mode,
-                                request_constraints: retry_constraints,
-                                recursion_depth: child_recursion_depth,
-                                max_turns: None,
-                                initial_turns: None,
-                                pause_flag: None,
-                                mailbox: None,
-                                progress_emitter: None,
-                                live_event_sink: live_event_sink.cloned(),
-                                cancel_token: cancel_for_retry.clone(),
-                                inherited_prefix,
-                                execution_metadata: request.execution_metadata.clone(),
-                                work_item: None,
-                                delegation_chain,
-                                #[cfg(feature = "harness")]
-                                harness_sink: None,
-                            })
-                        },
-                    )
-                    .await;
-                gated_results.push(gated);
-            }
-            results = gated_results;
-        }
+        let results = authoritative_results;
 
         let mut tracked_results = Vec::with_capacity(results.len());
         for result in results {
@@ -5082,8 +3867,8 @@ impl DelegationEngine {
         ))
     }
 
-    /// Sequential / Pipeline: execute agents one after another.
-    /// Pipeline feeds previous output to the next agent.
+    /// Sequential: execute agents one after another, feeding each output
+    /// to the next agent.
     async fn execute_sequential(
         &self,
         request: &DelegationRequest,
@@ -5104,7 +3889,6 @@ impl DelegationEngine {
     ) -> Result<DelegationResult, String> {
         let mut results = Vec::new();
         let mut previous_output: Option<String> = None;
-        let has_gate = self.gate.is_some();
         let total_stages = agent_ids.len();
         let budget_prompt = Self::extract_budget_prompt(&request.context);
         for (stage_index, agent_id) in agent_ids.iter().enumerate() {
@@ -5331,7 +4115,7 @@ impl DelegationEngine {
             let mailbox_retirement =
                 MailboxRetirement::from_mailbox(&self.mailbox_router, mailbox.as_ref());
 
-            // Inject sequential/pipeline coordination prompt
+            // Inject sequential coordination prompt
             let has_prev = previous_output.is_some();
             let coordination_prompt = format!(
                 "{}{}",
@@ -5341,14 +4125,11 @@ impl DelegationEngine {
                     agent_id,
                     has_prev,
                     stop_on_success,
-                    has_gate,
                 ),
                 budget_prompt,
             );
             let enhanced_task =
                 team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
-            let retry_task = enhanced_task.clone();
-            let profile_for_retry = has_gate.then(|| profile.clone());
 
             let config = SubRunConfig {
                 max_output_tokens: None,
@@ -5376,7 +4157,7 @@ impl DelegationEngine {
                 mailbox,
                 progress_emitter: None,
                 live_event_sink: live_event_sink.cloned(),
-                cancel_token: Some(child_cancel),
+                cancel_token: Some(child_cancel.clone()),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
                 work_item: None,
@@ -5392,12 +4173,33 @@ impl DelegationEngine {
                     self.executor.execute(config).await
                 }
             };
-            let exec_result = match stage_deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, execution).await {
-                    Ok(result) => result,
-                    Err(_) => Err(format!("agent {agent_id} stage timeout: deadline exceeded")),
-                },
-                None => execution.await,
+            tokio::pin!(execution);
+            let mut interrupted = None;
+            let exec_result = match await_subrun_operation(
+                &mut execution,
+                stage_deadline,
+                Some(child_cancel.as_ref()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(stop) => {
+                    interrupted = Some(stop);
+                    child_cancel.cancel();
+                    // Give the same cooperative publication window as parallel
+                    // children before dropping an unresponsive executor.
+                    match tokio::time::timeout(FANOUT_CANCELLATION_DRAIN_TIMEOUT, &mut execution)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(match stop {
+                            SubRunOperationStop::Cancelled => "cancelled by parent run".into(),
+                            SubRunOperationStop::DeadlineExceeded => {
+                                format!("agent {agent_id} stage timeout: deadline exceeded")
+                            }
+                        }),
+                    }
+                }
             };
 
             let result = match exec_result {
@@ -5405,7 +4207,12 @@ impl DelegationEngine {
                 Err(error) => AgentResult {
                     agent_id: agent_id.clone(),
                     run_id: sub_run_id.clone(),
-                    status: STATUS_FAILED.to_string(),
+                    status: match interrupted {
+                        Some(SubRunOperationStop::Cancelled) => STATUS_CANCELLED,
+                        Some(SubRunOperationStop::DeadlineExceeded) => AGENT_RESULT_STATUS_TIMEOUT,
+                        None => STATUS_FAILED,
+                    }
+                    .to_string(),
                     output: None,
                     error: Some(error),
                     prompt_tokens: 0,
@@ -5413,7 +4220,7 @@ impl DelegationEngine {
                     tool_calls: 0,
                 },
             };
-            let result = reconcile_agent_result_with_durable_authority(
+            let result = reconcile_agent_result_with_shared_deadline(
                 &self.run_engine,
                 &request.user_id,
                 &session_id,
@@ -5423,73 +4230,11 @@ impl DelegationEngine {
                 ),
                 result,
                 mailbox_retirement.as_ref(),
+                &mut cleanup_deadline,
+                "sequential",
+                "child outcome",
             )
             .await;
-            // ── Verification gate with retry for sequential sub-runs ──
-            let result = if self.gate.is_some() {
-                let delegation_id = request.delegation_id.clone();
-                let sess = Self::session_id_for(request);
-                let uid = request.user_id.clone();
-                let ctx = Self::child_task_context(request);
-                let prev = previous_output.clone();
-                let cancel_for_retry = cancel_token.cloned();
-                self.apply_gate(
-                    &request.user_id,
-                    &session_id,
-                    result,
-                    &delegation_id,
-                    &request.parent_run_id,
-                    parent_model_reasoning,
-                    prepared_model.as_ref(),
-                    cancel_for_retry.as_ref(),
-                    stage_deadline,
-                    || {
-                        let profile = profile_for_retry.clone().ok_or_else(|| {
-                            "verification retry profile snapshot is unavailable".to_string()
-                        })?;
-                        Ok(SubRunConfig {
-                            max_output_tokens: None,
-                            run_id: uuid::Uuid::new_v4().to_string(),
-                            parent_run_id: request.parent_run_id.clone(),
-                            agent_profile: profile,
-                            task: retry_task.clone(),
-                            session_id: sess.clone(),
-                            user_id: uid.clone(),
-                            execution_owner_generation: None,
-                            execution_owner_generation_sink: None,
-                            previous_output: prev.clone(),
-                            context: clone_delegation_context(
-                                astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
-                                &ctx,
-                            ),
-                            forward_headers: forward_headers.clone(),
-                            admitted_model_execution: admitted_model_execution.cloned(),
-                            prepared_model: None,
-                            requested_model_policy: requested_model_policy.clone(),
-                            thinking: thinking.clone(),
-                            interaction_mode,
-                                request_constraints: slot_constraints.clone(),
-                            recursion_depth: child_recursion_depth,
-                            max_turns: None,
-                            initial_turns: None,
-                            pause_flag: None,
-                            mailbox: None,
-                            progress_emitter: None,
-                            live_event_sink: live_event_sink.cloned(),
-                            cancel_token: cancel_for_retry.clone(),
-                            inherited_prefix: None,
-                            execution_metadata: request.execution_metadata.clone(),
-                            work_item: None,
-                            delegation_chain: delegation_chain.clone(),
-                            #[cfg(feature = "harness")]
-                            harness_sink: None,
-                        })
-                    },
-                )
-                .await
-            } else {
-                result
-            };
             let final_state = agent_result_status_to_subrun_state(&result.status);
             self.tracker
                 .apply_sub_run_result_state(
@@ -5500,765 +4245,15 @@ impl DelegationEngine {
                 )
                 .await;
 
-            // Feed output to the next stage (pipeline semantics).
+            // Feed output to the next stage.
             previous_output = result.output.clone();
             let is_success = result.is_success();
+            let is_unfinished = result.is_unfinished();
             results.push(result);
 
-            if stop_on_success && is_success {
+            if is_unfinished || (stop_on_success && is_success) {
                 break;
             }
-        }
-
-        Ok(DelegationResult::from_results(
-            &request.delegation_id,
-            results,
-            None,
-        ))
-    }
-
-    /// Adversarial review: producer creates, reviewer critiques, repeat.
-    async fn execute_adversarial(
-        &self,
-        request: &DelegationRequest,
-        producer_id: &str,
-        reviewer_id: &str,
-        max_rounds: u32,
-        forward_headers: &HashMap<String, String>,
-        admitted_model_execution: Option<&AdmittedModelExecution>,
-        parent_model_reasoning: Option<
-            &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
-        >,
-        request_constraints: &RequestConstraints,
-        model_plan: Option<&astra_turn_types::DirectDelegationModelPlan>,
-        child_recursion_depth: u8,
-        interaction_mode: RequestedTurnInteractionMode,
-        timeout_sec: u64,
-        cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
-        live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
-    ) -> Result<DelegationResult, String> {
-        let reg = self.registry.read().await;
-        let mut results = Vec::new();
-        let mut last_producer_output: Option<String> = None;
-        let budget_prompt = Self::extract_budget_prompt(&request.context);
-
-        let producer_profile = reg.get(producer_id).cloned().ok_or_else(|| {
-            Self::missing_agent_profile_error("adversarial producer", producer_id, &reg)
-        })?;
-        let reviewer_profile = reg.get(reviewer_id).cloned().ok_or_else(|| {
-            Self::missing_agent_profile_error("adversarial reviewer", reviewer_id, &reg)
-        })?;
-        let (producer_profile, producer_thinking, producer_constraints, producer_model_policy) =
-            planned_child_execution(
-                &producer_profile,
-                parent_model_reasoning,
-                model_plan,
-                0,
-                request_constraints,
-            )?;
-        let (reviewer_profile, reviewer_thinking, reviewer_constraints, reviewer_model_policy) =
-            planned_child_execution(
-                &reviewer_profile,
-                parent_model_reasoning,
-                model_plan,
-                1,
-                request_constraints,
-            )?;
-        let producer_delegation_chain = Self::delegation_chain_for_child(request, producer_id)?;
-        let reviewer_delegation_chain = Self::delegation_chain_for_child(request, reviewer_id)?;
-        drop(reg);
-        let first_round_deadline = delegation_deadline(timeout_sec);
-
-        let prepared_roles = self
-            .prepare_subrun_models(
-                &[
-                    SubRunModelRequest {
-                        user_id: request.user_id.clone(),
-                        selection: producer_profile.model_selection.clone(),
-                        parent_model_reasoning: parent_model_reasoning.cloned(),
-                        inherited_execution: admitted_model_execution.cloned(),
-                        provider_scope_bound: request
-                            .context
-                            .contains_key(Self::PROVIDER_RUN_OWNER_CONTEXT_KEY),
-                        thinking: producer_thinking.clone(),
-                        max_output_tokens: None,
-                    },
-                    SubRunModelRequest {
-                        user_id: request.user_id.clone(),
-                        selection: reviewer_profile.model_selection.clone(),
-                        parent_model_reasoning: parent_model_reasoning.cloned(),
-                        inherited_execution: admitted_model_execution.cloned(),
-                        provider_scope_bound: request
-                            .context
-                            .contains_key(Self::PROVIDER_RUN_OWNER_CONTEXT_KEY),
-                        thinking: reviewer_thinking.clone(),
-                        max_output_tokens: None,
-                    },
-                ],
-                cancel_token,
-                model_admission_timeout(first_round_deadline),
-            )
-            .await?;
-        let producer_model = prepared_roles[0].clone();
-        let reviewer_model = prepared_roles[1].clone();
-
-        for round in 0..max_rounds {
-            // Check cancellation before starting next adversarial round
-            if let Some(token) = cancel_token {
-                if token.is_cancelled() {
-                    break;
-                }
-            }
-            let round_deadline = if round == 0 {
-                first_round_deadline
-            } else {
-                delegation_deadline(timeout_sec)
-            };
-            let mut round_settlement_deadline = None;
-
-            // ── Producer sub-run ──
-            let prod_run_id = uuid::Uuid::new_v4().to_string();
-            let session_id = Self::session_id_for(request);
-            if round_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                results.push(AgentResult {
-                    agent_id: producer_id.to_string(),
-                    run_id: prod_run_id,
-                    status: AGENT_RESULT_STATUS_TIMEOUT.to_string(),
-                    output: None,
-                    error: Some(
-                        "adversarial round deadline expired before producer admission".to_string(),
-                    ),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                });
-                break;
-            }
-            let prod_execution_authority = match self
-                .start_delegated_run(
-                    &prod_run_id,
-                    &request.user_id,
-                    &session_id,
-                    &request.parent_run_id,
-                    &request.delegation_id,
-                    producer_id,
-                    None,
-                    interaction_mode,
-                    &producer_constraints,
-                    &producer_thinking,
-                    producer_model.as_ref(),
-                    cancel_token,
-                    round_deadline,
-                )
-                .await
-            {
-                Ok(authority) => authority,
-                Err(error) => {
-                    results.push(child_setup_failure_result(
-                        producer_id,
-                        &prod_run_id,
-                        error,
-                        round_deadline,
-                        cancel_token.map(Arc::as_ref),
-                    ));
-                    break;
-                }
-            };
-            if round_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                results.push(
-                    self.settle_unlaunched_child_with_shared_deadline(
-                        &request.user_id,
-                        &session_id,
-                        producer_id,
-                        &prod_run_id,
-                        prod_execution_authority.owner_generation,
-                        AGENT_RESULT_STATUS_TIMEOUT,
-                        "adversarial round deadline expired before producer execution",
-                        None,
-                        &mut round_settlement_deadline,
-                    )
-                    .await,
-                );
-                break;
-            }
-            self.tracker
-                .record_sub_run(SubRunRecord {
-                    run_id: prod_run_id.clone(),
-                    parent_run_id: request.parent_run_id.clone(),
-                    delegation_id: request.delegation_id.clone(),
-                    agent_id: producer_id.to_string(),
-                    depth: request.depth + 1,
-                    state: SubRunState::Created,
-                    retry_of: None,
-                })
-                .await;
-            if let Err(e) = self
-                .tracker
-                .transition_state(&prod_run_id, SubRunState::Running)
-                .await
-            {
-                astra_core::agent_warn!(
-                    "delegation",
-                    "Adversarial: transition to Running failed for producer {prod_run_id}: {e:?}"
-                );
-            }
-            if let Err(failure) = activate_delegated_child(
-                &self.run_engine,
-                &request.user_id,
-                &session_id,
-                &prod_run_id,
-                prod_execution_authority.owner_generation,
-                "produce",
-                round_deadline,
-                cancel_token.map(Arc::as_ref),
-            )
-            .await
-            {
-                let status = match &failure {
-                    ChildActivationFailure::Interrupted(SubRunOperationStop::Cancelled) => {
-                        STATUS_CANCELLED
-                    }
-                    ChildActivationFailure::Interrupted(SubRunOperationStop::DeadlineExceeded) => {
-                        AGENT_RESULT_STATUS_TIMEOUT
-                    }
-                    ChildActivationFailure::LostAuthority
-                    | ChildActivationFailure::Persistence(_) => STATUS_FAILED,
-                };
-                let error =
-                    format!("could not activate adversarial producer {prod_run_id}: {failure}");
-                let mut cleanup_deadline = None;
-                results.push(
-                    self.settle_unlaunched_child_with_shared_deadline(
-                        &request.user_id,
-                        &session_id,
-                        producer_id,
-                        &prod_run_id,
-                        prod_execution_authority.owner_generation,
-                        status,
-                        &error,
-                        None,
-                        &mut cleanup_deadline,
-                    )
-                    .await,
-                );
-                break;
-            }
-            let prod_pause = self.tracker.register_pause_flag(&prod_run_id).await;
-            let prod_cancel = cancel_token
-                .map(|token| Arc::new(token.child_token()))
-                .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
-            self.tracker
-                .register_cancel_token(&prod_run_id, prod_cancel.clone())
-                .await;
-            if let Err(error) = self
-                .run_engine
-                .append_event(
-                    &request.user_id,
-                    &session_id,
-                    &prod_run_id,
-                    serde_json::json!({"event_type": "adversarial_round", "data": {"round": round, "role": "producer"}}),
-                )
-                .await
-            {
-                let error = format!("could not persist adversarial producer round event: {error}");
-                let failure = child_setup_failure_result(
-                    producer_id,
-                    &prod_run_id,
-                    error,
-                    round_deadline,
-                    cancel_token.map(Arc::as_ref),
-                );
-                results.push(
-                    self.settle_unlaunched_child_with_shared_deadline(
-                        &request.user_id,
-                        &session_id,
-                        producer_id,
-                        &prod_run_id,
-                        prod_execution_authority.owner_generation,
-                        &failure.status,
-                        failure.error.as_deref().unwrap_or("producer round setup failed"),
-                        None,
-                        &mut round_settlement_deadline,
-                    )
-                    .await,
-                );
-                break;
-            }
-
-            let prod_mailbox = if let Some(router) = &self.mailbox_router {
-                let addr = astra_messaging::types::AgentAddress {
-                    run_id: prod_run_id.clone(),
-                    agent_id: producer_id.to_string(),
-                };
-                match router
-                    .register(addr, Some(request.delegation_id.clone()))
-                    .await
-                {
-                    Ok(mb) => Some(mb),
-                    Err(e) => {
-                        eprintln!(
-                            "  ⚠ delegation: mailbox registration failed for {producer_id}: {e}"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let prod_mailbox_retirement =
-                MailboxRetirement::from_mailbox(&self.mailbox_router, prod_mailbox.as_ref());
-
-            // Inject adversarial producer coordination prompt
-            let has_feedback = last_producer_output.is_some();
-            let has_gate = self.gate.is_some();
-            let prod_coordination = format!(
-                "{}{}",
-                team_prompts::adversarial_producer_prompt(
-                    reviewer_id,
-                    max_rounds,
-                    round,
-                    has_feedback,
-                    has_gate,
-                ),
-                budget_prompt,
-            );
-            let prod_enhanced_task =
-                team_prompts::wrap_task_with_coordination(&prod_coordination, &request.task);
-            let prod_retry_task = prod_enhanced_task.clone();
-
-            let prod_config = SubRunConfig {
-                max_output_tokens: None,
-                run_id: prod_run_id.clone(),
-                parent_run_id: request.parent_run_id.clone(),
-                agent_profile: producer_profile.clone(),
-                task: prod_enhanced_task,
-                session_id: Self::session_id_for(request),
-                user_id: request.user_id.clone(),
-                execution_owner_generation: Some(prod_execution_authority.owner_generation),
-                execution_owner_generation_sink: None,
-                previous_output: last_producer_output.clone(),
-                context: Self::child_task_context(request),
-                forward_headers: forward_headers.clone(),
-                admitted_model_execution: admitted_model_execution.cloned(),
-                prepared_model: producer_model.clone(),
-                requested_model_policy: producer_model_policy.clone(),
-                thinking: producer_thinking.clone(),
-                interaction_mode,
-                request_constraints: producer_constraints.clone(),
-                recursion_depth: child_recursion_depth,
-                max_turns: None,
-                initial_turns: None,
-                pause_flag: Some(prod_pause.clone()),
-                mailbox: prod_mailbox,
-                progress_emitter: None,
-                live_event_sink: live_event_sink.cloned(),
-                cancel_token: Some(prod_cancel),
-                inherited_prefix: None,
-                execution_metadata: request.execution_metadata.clone(),
-                work_item: None,
-                delegation_chain: producer_delegation_chain.clone(),
-                #[cfg(feature = "harness")]
-                harness_sink: None,
-            };
-            let prod_execution = async {
-                if round_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                    Err("adversarial producer timeout: round deadline exceeded".to_string())
-                } else {
-                    self.executor.execute(prod_config).await
-                }
-            };
-            let prod_exec = match round_deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, prod_execution).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        Err("adversarial producer timeout: round deadline exceeded".to_string())
-                    }
-                },
-                None => prod_execution.await,
-            };
-            let prod_result = match prod_exec {
-                Ok(result) => result,
-                Err(error) => AgentResult {
-                    agent_id: producer_id.to_string(),
-                    run_id: prod_run_id.clone(),
-                    status: STATUS_FAILED.to_string(),
-                    output: None,
-                    error: Some(error),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                },
-            };
-            let prod_result = reconcile_agent_result_with_durable_authority(
-                &self.run_engine,
-                &request.user_id,
-                &session_id,
-                durable_lifecycle_disposition(
-                    self.executor.as_ref(),
-                    prod_execution_authority.owner_generation,
-                ),
-                prod_result,
-                prod_mailbox_retirement.as_ref(),
-            )
-            .await;
-            // ── Gate on producer output before reviewer sees it ──
-            let prod_result = if self.gate.is_some() {
-                let did = request.delegation_id.clone();
-                let sess = Self::session_id_for(request);
-                let uid = request.user_id.clone();
-                let ctx = Self::child_task_context(request);
-                let prev = last_producer_output.clone();
-                let cancel_for_retry = cancel_token.cloned();
-                let pp = producer_profile.clone();
-                self.apply_gate(
-                    &request.user_id,
-                    &session_id,
-                    prod_result,
-                    &did,
-                    &request.parent_run_id,
-                    parent_model_reasoning,
-                    producer_model.as_ref(),
-                    cancel_for_retry.as_ref(),
-                    round_deadline,
-                    || {
-                        Ok(SubRunConfig {
-                            max_output_tokens: None,
-                            run_id: uuid::Uuid::new_v4().to_string(),
-                            parent_run_id: request.parent_run_id.clone(),
-                            agent_profile: pp.clone(),
-                            task: prod_retry_task.clone(),
-                            session_id: sess.clone(),
-                            user_id: uid.clone(),
-                            execution_owner_generation: None,
-                            execution_owner_generation_sink: None,
-                            previous_output: prev.clone(),
-                            context: clone_delegation_context(
-                                astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
-                                &ctx,
-                            ),
-                            forward_headers: forward_headers.clone(),
-                            admitted_model_execution: admitted_model_execution.cloned(),
-                            prepared_model: None,
-                            requested_model_policy: producer_model_policy.clone(),
-                            thinking: producer_thinking.clone(),
-                            interaction_mode,
-                            request_constraints: producer_constraints.clone(),
-                            recursion_depth: child_recursion_depth,
-                            max_turns: None,
-                            initial_turns: None,
-                            pause_flag: None,
-                            mailbox: None,
-                            progress_emitter: None,
-                            live_event_sink: live_event_sink.cloned(),
-                            cancel_token: cancel_for_retry.clone(),
-                            inherited_prefix: None,
-                            execution_metadata: request.execution_metadata.clone(),
-                            work_item: None,
-                            delegation_chain: producer_delegation_chain.clone(),
-                            #[cfg(feature = "harness")]
-                            harness_sink: None,
-                        })
-                    },
-                )
-                .await
-            } else {
-                prod_result
-            };
-            let final_state = agent_result_status_to_subrun_state(&prod_result.status);
-            self.tracker
-                .apply_sub_run_result_state(
-                    &prod_result.run_id,
-                    final_state,
-                    prod_result.error.as_deref(),
-                    prod_result.output.as_deref(),
-                )
-                .await;
-
-            last_producer_output = prod_result.output.clone();
-            results.push(prod_result);
-
-            // ── Reviewer sub-run ──
-            let rev_run_id = uuid::Uuid::new_v4().to_string();
-            if round_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                results.push(AgentResult {
-                    agent_id: reviewer_id.to_string(),
-                    run_id: rev_run_id,
-                    status: AGENT_RESULT_STATUS_TIMEOUT.to_string(),
-                    output: None,
-                    error: Some(
-                        "adversarial round deadline expired before reviewer admission".to_string(),
-                    ),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                });
-                break;
-            }
-            let rev_execution_authority = match self
-                .start_delegated_run(
-                    &rev_run_id,
-                    &request.user_id,
-                    &session_id,
-                    &request.parent_run_id,
-                    &request.delegation_id,
-                    reviewer_id,
-                    None,
-                    interaction_mode,
-                    &reviewer_constraints,
-                    &reviewer_thinking,
-                    reviewer_model.as_ref(),
-                    cancel_token,
-                    round_deadline,
-                )
-                .await
-            {
-                Ok(authority) => authority,
-                Err(error) => {
-                    results.push(child_setup_failure_result(
-                        reviewer_id,
-                        &rev_run_id,
-                        error,
-                        round_deadline,
-                        cancel_token.map(Arc::as_ref),
-                    ));
-                    break;
-                }
-            };
-            if round_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                results.push(
-                    self.settle_unlaunched_child_with_shared_deadline(
-                        &request.user_id,
-                        &session_id,
-                        reviewer_id,
-                        &rev_run_id,
-                        rev_execution_authority.owner_generation,
-                        AGENT_RESULT_STATUS_TIMEOUT,
-                        "adversarial round deadline expired before reviewer execution",
-                        None,
-                        &mut round_settlement_deadline,
-                    )
-                    .await,
-                );
-                break;
-            }
-            self.tracker
-                .record_sub_run(SubRunRecord {
-                    run_id: rev_run_id.clone(),
-                    parent_run_id: request.parent_run_id.clone(),
-                    delegation_id: request.delegation_id.clone(),
-                    agent_id: reviewer_id.to_string(),
-                    depth: request.depth + 1,
-                    state: SubRunState::Created,
-                    retry_of: None,
-                })
-                .await;
-            if let Err(e) = self
-                .tracker
-                .transition_state(&rev_run_id, SubRunState::Running)
-                .await
-            {
-                astra_core::agent_warn!(
-                    "delegation",
-                    "Adversarial: transition to Running failed for reviewer {rev_run_id}: {e:?}"
-                );
-            }
-            if let Err(failure) = activate_delegated_child(
-                &self.run_engine,
-                &request.user_id,
-                &session_id,
-                &rev_run_id,
-                rev_execution_authority.owner_generation,
-                "review",
-                round_deadline,
-                cancel_token.map(Arc::as_ref),
-            )
-            .await
-            {
-                let status = match &failure {
-                    ChildActivationFailure::Interrupted(SubRunOperationStop::Cancelled) => {
-                        STATUS_CANCELLED
-                    }
-                    ChildActivationFailure::Interrupted(SubRunOperationStop::DeadlineExceeded) => {
-                        AGENT_RESULT_STATUS_TIMEOUT
-                    }
-                    ChildActivationFailure::LostAuthority
-                    | ChildActivationFailure::Persistence(_) => STATUS_FAILED,
-                };
-                let error =
-                    format!("could not activate adversarial reviewer {rev_run_id}: {failure}");
-                let mut cleanup_deadline = None;
-                results.push(
-                    self.settle_unlaunched_child_with_shared_deadline(
-                        &request.user_id,
-                        &session_id,
-                        reviewer_id,
-                        &rev_run_id,
-                        rev_execution_authority.owner_generation,
-                        status,
-                        &error,
-                        None,
-                        &mut cleanup_deadline,
-                    )
-                    .await,
-                );
-                break;
-            }
-            let rev_pause = self.tracker.register_pause_flag(&rev_run_id).await;
-            let rev_cancel = cancel_token
-                .map(|token| Arc::new(token.child_token()))
-                .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
-            self.tracker
-                .register_cancel_token(&rev_run_id, rev_cancel.clone())
-                .await;
-            if let Err(error) = self
-                .run_engine
-                .append_event(
-                    &request.user_id,
-                    &session_id,
-                    &rev_run_id,
-                    serde_json::json!({"event_type": "adversarial_round", "data": {"round": round, "role": "reviewer"}}),
-                )
-                .await
-            {
-                let error = format!("could not persist adversarial reviewer round event: {error}");
-                let failure = child_setup_failure_result(
-                    reviewer_id,
-                    &rev_run_id,
-                    error,
-                    round_deadline,
-                    cancel_token.map(Arc::as_ref),
-                );
-                results.push(
-                    self.settle_unlaunched_child_with_shared_deadline(
-                        &request.user_id,
-                        &session_id,
-                        reviewer_id,
-                        &rev_run_id,
-                        rev_execution_authority.owner_generation,
-                        &failure.status,
-                        failure.error.as_deref().unwrap_or("reviewer round setup failed"),
-                        None,
-                        &mut round_settlement_deadline,
-                    )
-                    .await,
-                );
-                break;
-            }
-
-            let rev_mailbox = if let Some(router) = &self.mailbox_router {
-                let addr = astra_messaging::types::AgentAddress {
-                    run_id: rev_run_id.clone(),
-                    agent_id: reviewer_id.to_string(),
-                };
-                match router
-                    .register(addr, Some(request.delegation_id.clone()))
-                    .await
-                {
-                    Ok(mb) => Some(mb),
-                    Err(e) => {
-                        eprintln!(
-                            "  ⚠ delegation: mailbox registration failed for {reviewer_id}: {e}"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let rev_mailbox_retirement =
-                MailboxRetirement::from_mailbox(&self.mailbox_router, rev_mailbox.as_ref());
-
-            // Inject adversarial reviewer coordination prompt
-            let rev_coordination =
-                team_prompts::adversarial_reviewer_prompt(producer_id, max_rounds, round);
-            let rev_enhanced_task =
-                team_prompts::wrap_task_with_coordination(&rev_coordination, &request.task);
-
-            let rev_config = SubRunConfig {
-                max_output_tokens: None,
-                run_id: rev_run_id.clone(),
-                parent_run_id: request.parent_run_id.clone(),
-                agent_profile: reviewer_profile.clone(),
-                task: rev_enhanced_task,
-                session_id: Self::session_id_for(request),
-                user_id: request.user_id.clone(),
-                execution_owner_generation: Some(rev_execution_authority.owner_generation),
-                execution_owner_generation_sink: None,
-                previous_output: last_producer_output.clone(),
-                context: Self::child_task_context(request),
-                forward_headers: forward_headers.clone(),
-                admitted_model_execution: admitted_model_execution.cloned(),
-                prepared_model: reviewer_model.clone(),
-                requested_model_policy: reviewer_model_policy.clone(),
-                thinking: reviewer_thinking.clone(),
-                interaction_mode,
-                request_constraints: reviewer_constraints.clone(),
-                recursion_depth: child_recursion_depth,
-                max_turns: None,
-                initial_turns: None,
-                pause_flag: Some(rev_pause),
-                mailbox: rev_mailbox,
-                progress_emitter: None,
-                live_event_sink: live_event_sink.cloned(),
-                cancel_token: Some(rev_cancel),
-                inherited_prefix: None,
-                execution_metadata: request.execution_metadata.clone(),
-                work_item: None,
-                delegation_chain: reviewer_delegation_chain.clone(),
-                #[cfg(feature = "harness")]
-                harness_sink: None,
-            };
-            let rev_execution = async {
-                if round_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                    Err("adversarial reviewer timeout: round deadline exceeded".to_string())
-                } else {
-                    self.executor.execute(rev_config).await
-                }
-            };
-            let rev_exec = match round_deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, rev_execution).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        Err("adversarial reviewer timeout: round deadline exceeded".to_string())
-                    }
-                },
-                None => rev_execution.await,
-            };
-            let rev_result = match rev_exec {
-                Ok(result) => result,
-                Err(error) => AgentResult {
-                    agent_id: reviewer_id.to_string(),
-                    run_id: rev_run_id.clone(),
-                    status: STATUS_FAILED.to_string(),
-                    output: None,
-                    error: Some(error),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                },
-            };
-            let rev_result = reconcile_agent_result_with_durable_authority(
-                &self.run_engine,
-                &request.user_id,
-                &session_id,
-                durable_lifecycle_disposition(
-                    self.executor.as_ref(),
-                    rev_execution_authority.owner_generation,
-                ),
-                rev_result,
-                rev_mailbox_retirement.as_ref(),
-            )
-            .await;
-            let final_state = agent_result_status_to_subrun_state(&rev_result.status);
-            self.tracker
-                .apply_sub_run_result_state(
-                    &rev_run_id,
-                    final_state,
-                    rev_result.error.as_deref(),
-                    rev_result.output.as_deref(),
-                )
-                .await;
-            results.push(rev_result);
         }
 
         Ok(DelegationResult::from_results(
@@ -7198,10 +5193,8 @@ impl DelegationExecutor for DelegationEngine {
             run_engine: self.run_engine.clone(),
             tracker: self.tracker.clone(),
             executor: self.executor.clone(),
-            gate: self.gate.clone(),
             mailbox_router: self.mailbox_router.clone(),
             prefix_store: self.prefix_store.clone(),
-            projection_store: self.projection_store.clone(),
         };
         isolated
             .execute_with_forward_headers_and_live_events(
@@ -7249,7 +5242,7 @@ impl DelegationTracking for DelegationTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::coordination::{AgentProfile, AgentTier, PipelineStage};
+    use astra_services::coordination::{AgentProfile, AgentTier};
     use astra_services::runs::{InMemoryRunStateStore, RunStateStore};
 
     #[test]
@@ -7362,7 +5355,6 @@ mod tests {
     struct ModelAdmissionExecutor {
         rejected_offering: Option<String>,
         resolved_model_name: Option<String>,
-        drift_model_name_after_first_batch: bool,
         preparation_started: Option<Arc<tokio::sync::Notify>>,
         preparation_release: Option<Arc<tokio::sync::Notify>>,
         batches: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
@@ -7400,11 +5392,7 @@ mod tests {
                         })
                 })
                 .collect::<Vec<_>>();
-            let batch_number = {
-                let mut batches = self.batches.lock().unwrap();
-                batches.push(offerings.clone());
-                batches.len()
-            };
+            self.batches.lock().unwrap().push(offerings.clone());
             if let Some(rejected) = self.rejected_offering.as_ref()
                 && offerings.iter().any(|offering| offering == rejected)
             {
@@ -7433,12 +5421,6 @@ mod tests {
                             .resolved_model_name
                             .clone()
                             .unwrap_or_else(|| format!("resolved-{offering_id}"));
-                        let model_name =
-                            if self.drift_model_name_after_first_batch && batch_number > 1 {
-                                format!("{model_name}-retry")
-                            } else {
-                                model_name
-                            };
                         PreparedSubRunModel {
                             model_name,
                             offering_id,
@@ -7582,7 +5564,6 @@ mod tests {
             Arc::new(ModelAdmissionExecutor {
                 rejected_offering: None,
                 resolved_model_name: None,
-                drift_model_name_after_first_batch: false,
                 preparation_started: None,
                 preparation_release: None,
                 batches: batches.clone(),
@@ -7712,7 +5693,6 @@ mod tests {
         let executor = Arc::new(ModelAdmissionExecutor {
             rejected_offering: Some("offer-rejected".to_string()),
             resolved_model_name: None,
-            drift_model_name_after_first_batch: false,
             preparation_started: None,
             preparation_release: None,
             batches: batches.clone(),
@@ -7762,7 +5742,6 @@ mod tests {
             Arc::new(ModelAdmissionExecutor {
                 rejected_offering: None,
                 resolved_model_name: None,
-                drift_model_name_after_first_batch: false,
                 preparation_started: None,
                 preparation_release: None,
                 batches: batches.clone(),
@@ -7879,7 +5858,6 @@ mod tests {
             Arc::new(ModelAdmissionExecutor {
                 rejected_offering: Some("offer-rejected".into()),
                 resolved_model_name: None,
-                drift_model_name_after_first_batch: false,
                 preparation_started: None,
                 preparation_release: None,
                 batches,
@@ -7929,7 +5907,6 @@ mod tests {
             Arc::new(ModelAdmissionExecutor {
                 rejected_offering: None,
                 resolved_model_name: None,
-                drift_model_name_after_first_batch: false,
                 preparation_started: None,
                 preparation_release: None,
                 batches: batches.clone(),
@@ -7979,52 +5956,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verification_retry_rejects_same_offering_model_name_drift() {
-        let request = fan_out_request(vec!["coder"]);
-        let run_engine = Arc::new(RunEngine::new(Arc::new(InMemoryRunStateStore::new())));
-        start_model_parent(&run_engine, &request, "offer-parent").await;
-        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let engine = DelegationEngine::with_executor(
-            selected_model_registry(&[("coder", "offer-child")]),
-            run_engine.clone(),
-            Arc::new(DelegationTracker::new()),
-            Arc::new(ModelAdmissionExecutor {
-                rejected_offering: None,
-                resolved_model_name: None,
-                drift_model_name_after_first_batch: true,
-                preparation_started: None,
-                preparation_release: None,
-                batches: batches.clone(),
-                executions: executions.clone(),
-            }),
-        )
-        .with_gate(Arc::new(FailThenPassGate::new(1)));
-
-        let result = engine.execute(request.clone(), "orch", None).await.unwrap();
-
-        assert_eq!(batches.lock().unwrap().len(), 2);
-        assert_eq!(executions.lock().unwrap().len(), 1);
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, STATUS_FAILED);
-        assert!(
-            result.agent_results[0]
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("different model identity"))
-        );
-        assert_eq!(
-            run_engine
-                .find_sub_runs(&request.user_id, &request.delegation_id)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "a drifted retry must not create a durable child run"
-        );
-    }
-
-    #[tokio::test]
     async fn fanout_rejects_same_offering_model_name_drift_before_durable_creation() {
         let request = fan_out_request(vec!["coder"]);
         let run_engine = Arc::new(RunEngine::new(Arc::new(InMemoryRunStateStore::new())));
@@ -8038,7 +5969,6 @@ mod tests {
             Arc::new(ModelAdmissionExecutor {
                 rejected_offering: None,
                 resolved_model_name: Some("changed-parent-model".into()),
-                drift_model_name_after_first_batch: false,
                 preparation_started: None,
                 preparation_release: None,
                 batches,
@@ -8081,7 +6011,6 @@ mod tests {
             Arc::new(ModelAdmissionExecutor {
                 rejected_offering: None,
                 resolved_model_name: None,
-                drift_model_name_after_first_batch: false,
                 preparation_started: Some(admission_started.clone()),
                 preparation_release: Some(Arc::new(tokio::sync::Notify::new())),
                 batches,
@@ -8143,7 +6072,6 @@ mod tests {
             Arc::new(ModelAdmissionExecutor {
                 rejected_offering: None,
                 resolved_model_name: None,
-                drift_model_name_after_first_batch: false,
                 preparation_started: Some(admission_started.clone()),
                 preparation_release: Some(Arc::new(tokio::sync::Notify::new())),
                 batches,
@@ -8794,18 +6722,6 @@ mod tests {
     }
 
     #[test]
-    fn verification_retry_backoff_is_bounded_exponential_with_stable_jitter() {
-        let first = verification_retry_delay(2, "run-a");
-        let second = verification_retry_delay(3, "run-a");
-        let saturated = verification_retry_delay(20, "run-a");
-
-        assert!((200..=300).contains(&(first.as_millis() as u64)));
-        assert!((400..=500).contains(&(second.as_millis() as u64)));
-        assert!((2_000..=2_100).contains(&(saturated.as_millis() as u64)));
-        assert_eq!(first, verification_retry_delay(2, "run-a"));
-    }
-
-    #[test]
     fn delegation_metrics_expose_low_cardinality_outcomes_and_usage() {
         let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
         register_delegation_metrics(&registry);
@@ -9115,102 +7031,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delegated_critical_findings_are_typed_and_failures_remain_visible() {
-        let result = |output: Option<&str>, status: &str, error: Option<&str>| AgentResult {
-            agent_id: "reviewer".into(),
-            run_id: "run-review".into(),
-            status: status.into(),
-            output: output.map(str::to_string),
-            error: error.map(str::to_string),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            tool_calls: 0,
-        };
-
-        assert_eq!(
-            critical_finding_from_agent_result(&result(
-                Some("This prose mentions a critical blocker but carries no typed finding."),
-                STATUS_COMPLETED,
-                None,
-            )),
-            CriticalFindingExtraction::default()
-        );
-        assert_eq!(
-            critical_finding_from_agent_result(&result(
-                Some(r#"{"findings":[{"severity":"high","summary":"Not critical"}]}"#),
-                STATUS_COMPLETED,
-                None,
-            ))
-            .summary,
-            None
-        );
-
-        let summary = critical_finding_from_agent_result(&result(
-            Some(r#"{"findings":[{"severity":"Critical","summary":"Tenant boundary bypass","evidence":["events.rs:42","cross-user request accepted"]}]}"#),
-            STATUS_COMPLETED,
-            None,
-        ))
-        .summary
-        .expect("structured critical finding");
-        assert_eq!(
-            summary,
-            "Tenant boundary bypass\nEvidence:\n- events.rs:42\n- cross-user request accepted"
-        );
-
-        let failed = critical_finding_from_agent_result(&result(
-            None,
-            STATUS_FAILED,
-            Some("review process crashed"),
-        ));
-        assert_eq!(
-            failed.summary.as_deref(),
-            Some("Delegated agent 'reviewer' failed with status 'failed': review process crashed")
-        );
-
-        let cancelled = critical_finding_from_agent_result(&result(
-            None,
-            STATUS_CANCELLED,
-            Some("cancelled by user"),
-        ));
-        assert!(cancelled.summary.is_none());
-    }
-
-    #[test]
-    fn malformed_finding_json_is_observable_without_becoming_a_finding() {
-        let result = AgentResult {
-            agent_id: "reviewer".into(),
-            run_id: "run-review".into(),
-            status: STATUS_COMPLETED.into(),
-            output: Some(r#"{"findings":["#.into()),
-            error: None,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            tool_calls: 0,
-        };
-
-        let extraction = critical_finding_from_agent_result(&result);
-        assert!(extraction.summary.is_none());
-        assert!(extraction.contract_error.is_some());
-    }
-
-    #[test]
-    fn finding_projection_targets_are_bounded_and_keep_the_root() {
-        let ancestry = (0..32)
-            .map(|idx| format!("ancestor-{idx}"))
-            .collect::<Vec<_>>();
-        let targets = finding_bubble_targets("session", "source", 32, &ancestry);
-
-        assert_eq!(targets.len(), MAX_FINDING_BUBBLE_TARGETS);
-        assert_eq!(targets[0].run_id, "source");
-        assert_eq!(targets[1].run_id, "ancestor-0");
-        assert_eq!(
-            targets.last().map(|target| target.run_id.as_str()),
-            Some("ancestor-31")
-        );
-        assert_eq!(targets.last().map(|target| target.depth), Some(0));
-    }
-
     #[tokio::test]
     async fn fan_out_spawns_sub_runs() {
         let (reg, engine, tracker) = setup();
@@ -9299,92 +7119,6 @@ mod tests {
         assert_eq!(result.agent_results.len(), 2);
         assert_eq!(result.agent_results[0].agent_id, "coder");
         assert_eq!(result.agent_results[1].agent_id, "reviewer");
-        assert_terminal_mailboxes_retired(&transport).await;
-    }
-
-    #[tokio::test]
-    async fn pipeline_spawns_stage_runs() {
-        let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "del-pipe".into(),
-            parent_run_id: "parent-3".into(),
-            task: "pipeline test".into(),
-            pattern: CoordinationPattern::Pipeline {
-                stages: vec![
-                    PipelineStage {
-                        agent_id: "coder".into(),
-                        output_transform: None,
-                    },
-                    PipelineStage {
-                        agent_id: "reviewer".into(),
-                        output_transform: Some("extract_issues".into()),
-                    },
-                ],
-                timeout_sec: 0,
-            },
-            user_id: "user-1".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-        assert_eq!(result.agent_results.len(), 2);
-
-        let subs = tracker.get_sub_runs("del-pipe").await;
-        assert_eq!(subs.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn adversarial_spawns_producer_reviewer_pairs() {
-        let (reg, engine, tracker) = setup();
-        let transport = Arc::new(crate::messaging::InProcessTransport::new());
-        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
-            transport.clone(),
-            tracker.clone(),
-        ));
-        let de =
-            DelegationEngine::new(reg, engine.clone(), tracker.clone()).with_mailbox_router(router);
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "del-adv".into(),
-            parent_run_id: "parent-4".into(),
-            task: "adversarial test".into(),
-            pattern: CoordinationPattern::AdversarialReview {
-                producer_id: "coder".into(),
-                reviewer_id: "reviewer".into(),
-                max_rounds: 2,
-                acceptance_threshold: 0.8,
-                timeout_sec: 0,
-            },
-            user_id: "user-1".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-        // 2 rounds × 2 agents = 4 sub-runs
-        assert_eq!(result.agent_results.len(), 4);
-
-        let subs = tracker.get_sub_runs("del-adv").await;
-        assert_eq!(subs.len(), 4);
-
-        // Verify alternating producer/reviewer
-        assert_eq!(subs[0].agent_id, "coder");
-        assert_eq!(subs[1].agent_id, "reviewer");
-        assert_eq!(subs[2].agent_id, "coder");
-        assert_eq!(subs[3].agent_id, "reviewer");
         assert_terminal_mailboxes_retired(&transport).await;
     }
 
@@ -9677,7 +7411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adversarial_and_fork_children_receive_independent_cancel_tokens() {
+    async fn sequential_and_fork_children_receive_independent_cancel_tokens() {
         let (registry, run_engine, tracker) = setup();
         let bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine = DelegationEngine::with_executor(
@@ -9689,16 +7423,14 @@ mod tests {
             }),
         );
 
-        let adversarial_request = DelegationRequest {
+        let sequential_request = DelegationRequest {
             session_id: "test-session".into(),
-            delegation_id: "delegation-adversarial-cancel".into(),
-            parent_run_id: "run-root-adversarial".into(),
+            delegation_id: "delegation-sequential-cancel".into(),
+            parent_run_id: "run-root-sequential".into(),
             task: "review the implementation".into(),
-            pattern: CoordinationPattern::AdversarialReview {
-                producer_id: "coder".into(),
-                reviewer_id: "reviewer".into(),
-                max_rounds: 1,
-                acceptance_threshold: 1.0,
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                stop_on_success: false,
                 timeout_sec: 0,
             },
             user_id: "user-1".into(),
@@ -9707,11 +7439,11 @@ mod tests {
             context: HashMap::new(),
             execution_metadata: None,
         };
-        execute_with_durable_parent(&engine, adversarial_request, "orch", None)
+        execute_with_durable_parent(&engine, sequential_request, "orch", None)
             .await
             .unwrap();
         let mut fork_request = fork_request("delegation-fork-cancel", vec!["a", "b"], "writer");
-        fork_request.parent_run_id = "run-root-adversarial".into();
+        fork_request.parent_run_id = "run-root-sequential".into();
         execute_with_durable_parent(&engine, fork_request, "orch", None)
             .await
             .unwrap();
@@ -10211,17 +7943,9 @@ mod tests {
             delegation_id: "del-pipe".into(),
             parent_run_id: "p".into(),
             task: "build code".into(),
-            pattern: CoordinationPattern::Pipeline {
-                stages: vec![
-                    PipelineStage {
-                        agent_id: "coder".into(),
-                        output_transform: None,
-                    },
-                    PipelineStage {
-                        agent_id: "reviewer".into(),
-                        output_transform: None,
-                    },
-                ],
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                stop_on_success: false,
                 timeout_sec: 0,
             },
             user_id: "u".into(),
@@ -10278,6 +8002,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_does_not_launch_after_an_unfinished_stage() {
+        for status in [STATUS_PAUSED, STATUS_WAITING] {
+            let (_, run_engine, tracker, engine) = setup_with_executor(Arc::new(StatusExecutor {
+                status,
+                error: None,
+            }));
+            let mut request = fan_out_request(vec!["coder", "reviewer"]);
+            request.pattern = CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                stop_on_success: false,
+                timeout_sec: 0,
+            };
+            let delegation_id = request.delegation_id.clone();
+            let user_id = request.user_id.clone();
+            let result = execute_with_durable_parent(&engine, request, "orch", None)
+                .await
+                .unwrap();
+            assert_eq!(result.agent_results.len(), 1);
+            assert_eq!(result.agent_results[0].status, status);
+            assert_eq!(tracker.get_sub_runs(&delegation_id).await.len(), 1);
+            let durable = run_engine
+                .load_run(&user_id, &result.agent_results[0].run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.status, status);
+        }
+    }
+
+    #[tokio::test]
     async fn fan_out_partial_failure() {
         let executor = Arc::new(FailingExecutor {
             fail_agents: vec!["reviewer".to_string()],
@@ -10310,50 +8064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adversarial_executes_all_rounds() {
-        let (_, _, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "del-adv".into(),
-            parent_run_id: "p".into(),
-            task: "write code".into(),
-            pattern: CoordinationPattern::AdversarialReview {
-                producer_id: "coder".into(),
-                reviewer_id: "reviewer".into(),
-                max_rounds: 2,
-                acceptance_threshold: 0.8,
-                timeout_sec: 0,
-            },
-            user_id: "u".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-        // 2 rounds × (producer + reviewer) = 4
-        assert_eq!(result.agent_results.len(), 4);
-        assert_eq!(result.status, "completed");
-
-        // All agents produced output
-        for ar in &result.agent_results {
-            assert!(ar.output.is_some());
-        }
-
-        // Token aggregation across all sub-runs
-        assert_eq!(result.total_prompt_tokens, 40); // 4 × 10
-        assert_eq!(result.total_completion_tokens, 80); // 4 × 20
-
-        let subs = tracker.get_sub_runs("del-adv").await;
-        assert_eq!(subs.len(), 4);
-    }
-
-    #[tokio::test]
-    async fn adversarial_reviewer_admission_failure_preserves_producer_result() {
+    async fn sequential_parent_cancellation_preserves_completed_stage_result() {
         struct CancelAfterProducer {
             parent_cancel: Arc<tokio_util::sync::CancellationToken>,
             calls: std::sync::atomic::AtomicUsize,
@@ -10383,18 +8094,20 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let (registry, run_engine, tracker) = setup();
-        let engine =
-            DelegationEngine::with_executor(registry, run_engine, tracker, executor.clone());
+        let engine = DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker,
+            executor.clone(),
+        );
         let request = DelegationRequest {
             session_id: "test-session".into(),
-            delegation_id: "del-adv-reviewer-admission-cancel".into(),
-            parent_run_id: "parent-adv-reviewer-admission-cancel".into(),
+            delegation_id: "del-seq-stage-cancel".into(),
+            parent_run_id: "parent-seq-stage-cancel".into(),
             task: "produce then review".into(),
-            pattern: CoordinationPattern::AdversarialReview {
-                producer_id: "coder".into(),
-                reviewer_id: "reviewer".into(),
-                max_rounds: 1,
-                acceptance_threshold: 1.0,
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                stop_on_success: false,
                 timeout_sec: 0,
             },
             user_id: "user-1".into(),
@@ -10406,9 +8119,9 @@ mod tests {
 
         let result = execute_with_durable_parent(&engine, request, "orch", Some(parent_cancel))
             .await
-            .expect("cancellation during reviewer admission becomes a result");
+            .expect("cancellation preserves the completed stage result");
 
-        assert_eq!(result.agent_results.len(), 2);
+        assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].agent_id, "coder");
         assert_eq!(result.agent_results[0].status, STATUS_COMPLETED);
         assert_eq!(
@@ -10416,8 +8129,18 @@ mod tests {
             Some("producer result retained")
         );
         assert_eq!(result.agent_results[0].prompt_tokens, 7);
-        assert_eq!(result.agent_results[1].agent_id, "reviewer");
-        assert_eq!(result.agent_results[1].status, STATUS_CANCELLED);
+        assert_eq!(result.agent_results[0].completion_tokens, 3);
+        assert_eq!(result.agent_results[0].tool_calls, 1);
+        let children = run_engine
+            .find_sub_runs("user-1", "del-seq-stage-cancel")
+            .await
+            .unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "cancelled stages must not create child runs"
+        );
+        assert_eq!(children[0].status, STATUS_COMPLETED);
         assert_eq!(executor.calls.load(Ordering::Relaxed), 1);
     }
 
@@ -10739,8 +8462,7 @@ mod tests {
             Arc::new(ThinkingCheckExecutor {
                 observed: observed_attempts.clone(),
             }),
-        )
-        .with_gate(Arc::new(FailThenPassGate::new(1)));
+        );
         let request = DelegationRequest {
             session_id: "reasoning-session".into(),
             delegation_id: "reasoning-delegation".into(),
@@ -10793,7 +8515,7 @@ mod tests {
             expected
         );
         let attempts = observed_attempts.lock().unwrap();
-        assert_eq!(attempts.len(), 2, "one initial attempt and one retry");
+        assert_eq!(attempts.len(), 1, "one admitted child execution");
         assert!(attempts.iter().all(|(offering, thinking)| {
             offering.as_deref() == Some("offer-coder") && thinking == &expected
         }));
@@ -11056,49 +8778,6 @@ mod tests {
                 ar.agent_id
             );
         }
-    }
-
-    #[tokio::test]
-    async fn stub_executor_returns_completed() {
-        let executor = StubSubRunExecutor;
-        let config = SubRunConfig {
-            max_output_tokens: None,
-            execution_owner_generation: None,
-            execution_owner_generation_sink: None,
-            run_id: "r1".into(),
-            parent_run_id: "parent-r1".into(),
-            agent_profile: AgentProfile::new("test", "Test", AgentTier::User),
-            task: "hello world".into(),
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            previous_output: None,
-            context: HashMap::new(),
-            forward_headers: HashMap::new(),
-            admitted_model_execution: None,
-            prepared_model: None,
-            requested_model_policy: None,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-            interaction_mode: RequestedTurnInteractionMode::Headless,
-            request_constraints: Default::default(),
-            recursion_depth: 1,
-            max_turns: None,
-            initial_turns: None,
-            pause_flag: None,
-            mailbox: None,
-            progress_emitter: None,
-            live_event_sink: None,
-            cancel_token: None,
-            inherited_prefix: None,
-            execution_metadata: None,
-            work_item: None,
-            delegation_chain: Vec::new(),
-            #[cfg(feature = "harness")]
-            harness_sink: None,
-        };
-
-        let result = executor.execute(config).await.unwrap();
-        assert_eq!(result.status, "completed");
-        assert!(result.output.unwrap().contains("hello world"));
     }
 
     #[tokio::test]
@@ -11632,163 +9311,99 @@ mod tests {
         assert_eq!(replayed.output.as_deref(), Some("full answer"));
     }
 
-    // ─── Verification Gate Tests ────────────────────────────────────────────
-
-    /// Gate that always passes.
-    struct AlwaysPassGate;
-
-    #[async_trait]
-    impl VerificationGate for AlwaysPassGate {
-        async fn verify(
-            &self,
-            _result: &AgentResult,
-            _delegation_id: &str,
-            _attempt: u32,
-        ) -> GateVerdict {
-            GateVerdict::Pass
-        }
-    }
-
-    /// Gate that fails the first N attempts, then passes.
-    struct FailThenPassGate {
-        fail_count: std::sync::atomic::AtomicU32,
-        max_fails: u32,
-    }
-
-    impl FailThenPassGate {
-        fn new(max_fails: u32) -> Self {
-            Self {
-                fail_count: std::sync::atomic::AtomicU32::new(0),
-                max_fails,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl VerificationGate for FailThenPassGate {
-        async fn verify(
-            &self,
-            _result: &AgentResult,
-            _delegation_id: &str,
-            _attempt: u32,
-        ) -> GateVerdict {
-            let count = self.fail_count.fetch_add(1, Ordering::Relaxed);
-            if count < self.max_fails {
-                GateVerdict::Fail {
-                    reason: format!("fail #{}", count + 1),
-                    details: None,
-                }
-            } else {
-                GateVerdict::Pass
-            }
-        }
-
-        fn max_retries(&self) -> u32 {
-            3
-        }
-    }
-
-    /// Gate that always fails.
-    struct AlwaysFailGate;
-
-    #[async_trait]
-    impl VerificationGate for AlwaysFailGate {
-        async fn verify(
-            &self,
-            _result: &AgentResult,
-            _delegation_id: &str,
-            _attempt: u32,
-        ) -> GateVerdict {
-            GateVerdict::Fail {
-                reason: "quality too low".into(),
-                details: Some(serde_json::json!({"score": 0.3})),
-            }
-        }
-
-        fn max_retries(&self) -> u32 {
-            2
-        }
-    }
-
     #[tokio::test]
-    async fn parent_cancellation_interrupts_verification_without_rewriting_child_completion() {
-        struct BlockingGate {
-            started_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    async fn parent_cancellation_preserves_completed_child_authority() {
+        struct CancelAfterCompletion {
+            run_engine: Arc<RunEngine>,
+            parent_cancel: Arc<tokio_util::sync::CancellationToken>,
         }
 
         #[async_trait]
-        impl VerificationGate for BlockingGate {
-            async fn verify(
-                &self,
-                result: &AgentResult,
-                _delegation_id: &str,
-                _attempt: u32,
-            ) -> GateVerdict {
-                self.started_tx
-                    .send(result.run_id.clone())
-                    .expect("test receives verification start");
-                std::future::pending().await
+        impl SubRunExecutor for CancelAfterCompletion {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let committed = self
+                    .run_engine
+                    .persist_delegation_outcome_status_if_current_owner(
+                        &config.user_id,
+                        &config.session_id,
+                        &config.run_id,
+                        config
+                            .execution_owner_generation
+                            .expect("child owner generation"),
+                        STATUS_COMPLETED,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !committed {
+                    return Err("child completion lost durable authority".into());
+                }
+                self.parent_cancel.cancel();
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: STATUS_COMPLETED.into(),
+                    output: Some("completed before parent cancellation".into()),
+                    error: None,
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                    tool_calls: 1,
+                })
+            }
+
+            fn owns_durable_run_lifecycle(&self) -> bool {
+                true
             }
         }
 
         let (registry, run_engine, tracker) = setup();
-        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = Arc::new(
-            DelegationEngine::with_executor(
-                registry,
-                run_engine.clone(),
-                tracker,
-                Arc::new(EchoExecutor),
-            )
-            .with_gate(Arc::new(BlockingGate { started_tx })),
-        );
         let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let request = fan_out_request(vec!["coder"]);
-        let execution = {
-            let engine = engine.clone();
-            let parent_cancel = parent_cancel.clone();
-            tokio::spawn(async move {
-                execute_with_durable_parent(&engine, request, "orch", Some(parent_cancel)).await
-            })
-        };
-
-        let child_run_id =
-            tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
-                .await
-                .expect("verification should begin")
-                .expect("gate reports the physical child run");
-        parent_cancel.cancel();
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
-            .await
-            .expect("parent cancellation interrupts a blocked verification")
-            .expect("delegation task joins")
-            .expect("delegation returns a cancellation result");
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, STATUS_CANCELLED);
-        assert_eq!(result.agent_results[0].run_id, child_run_id);
-
-        let durable = run_engine
-            .load_run("user-1", &child_run_id)
-            .await
-            .expect("completed physical run loads")
-            .expect("completed physical run exists");
-        assert_eq!(
-            durable.status, STATUS_COMPLETED,
-            "cancelling parent-level verification must not rewrite completed child execution"
+        let engine = DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker,
+            Arc::new(CancelAfterCompletion {
+                run_engine: run_engine.clone(),
+                parent_cancel: parent_cancel.clone(),
+            }),
         );
+        let result = execute_with_durable_parent(
+            &engine,
+            fan_out_request(vec!["coder"]),
+            "orch",
+            Some(parent_cancel),
+        )
+        .await
+        .expect("cancellation preserves the durable completed winner");
+        assert_eq!(result.agent_results.len(), 1);
+        let child = &result.agent_results[0];
+        assert_eq!(child.status, STATUS_COMPLETED);
+        assert_eq!(
+            child.output.as_deref(),
+            Some("completed before parent cancellation")
+        );
+        assert_eq!(child.prompt_tokens, 7);
+        assert_eq!(child.completion_tokens, 3);
+        assert_eq!(child.tool_calls, 1);
+        let durable = run_engine
+            .load_run("user-1", &child.run_id)
+            .await
+            .expect("completed child loads")
+            .expect("completed child exists");
+        assert_eq!(durable.status, STATUS_COMPLETED);
     }
 
     #[tokio::test]
-    async fn cancellation_during_retry_admission_never_creates_or_dispatches_retry() {
-        struct CancelOnRetryAdmissionExecutor {
+    async fn cancellation_during_later_stage_admission_never_creates_or_dispatches_child() {
+        struct CancelOnLaterAdmissionExecutor {
             cancel: Arc<tokio_util::sync::CancellationToken>,
             admissions: std::sync::atomic::AtomicUsize,
             executions: std::sync::atomic::AtomicUsize,
         }
 
         #[async_trait]
-        impl SubRunExecutor for CancelOnRetryAdmissionExecutor {
+        impl SubRunExecutor for CancelOnLaterAdmissionExecutor {
             async fn prepare_model_batch(
                 &self,
                 requests: &[SubRunModelRequest],
@@ -11796,7 +9411,7 @@ mod tests {
                 if self.admissions.fetch_add(1, Ordering::Relaxed) == 1 {
                     // The admission future returns a result in the same poll
                     // that publishes cancellation. The caller must check the
-                    // token again before durably creating a retry.
+                    // token again before durably creating the next stage.
                     self.cancel.cancel();
                 }
                 Ok(vec![None; requests.len()])
@@ -11818,7 +9433,7 @@ mod tests {
         }
 
         let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let executor = Arc::new(CancelOnRetryAdmissionExecutor {
+        let executor = Arc::new(CancelOnLaterAdmissionExecutor {
             cancel: parent_cancel.clone(),
             admissions: std::sync::atomic::AtomicUsize::new(0),
             executions: std::sync::atomic::AtomicUsize::new(0),
@@ -11829,27 +9444,32 @@ mod tests {
             run_engine.clone(),
             tracker.clone(),
             executor.clone(),
-        )
-        .with_gate(Arc::new(FailThenPassGate::new(1)));
-        let mut request = fan_out_request(vec!["coder"]);
-        request.delegation_id = "retry-cancel-admission".into();
-        request.parent_run_id = "parent-retry-cancel-admission".into();
+        );
+        let mut request = fan_out_request(vec!["coder", "reviewer"]);
+        request.pattern = CoordinationPattern::Sequential {
+            agent_ids: vec!["coder".into(), "reviewer".into()],
+            stop_on_success: false,
+            timeout_sec: 0,
+        };
+        request.delegation_id = "stage-cancel-admission".into();
+        request.parent_run_id = "parent-stage-cancel-admission".into();
 
         let result = execute_with_durable_parent(&engine, request, "orch", Some(parent_cancel))
             .await
             .expect("cancellation returns the completed physical result projection");
 
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, STATUS_CANCELLED);
+        assert_eq!(result.agent_results.len(), 2);
+        assert_eq!(result.agent_results[0].status, STATUS_COMPLETED);
+        assert_eq!(result.agent_results[1].status, STATUS_CANCELLED);
         assert_eq!(
             executor.executions.load(Ordering::Relaxed),
             1,
-            "cancellation during retry admission must not dispatch another provider call"
+            "cancellation during stage admission must not dispatch another provider call"
         );
         assert_eq!(
-            tracker.get_sub_runs("retry-cancel-admission").await.len(),
+            tracker.get_sub_runs("stage-cancel-admission").await.len(),
             1,
-            "cancellation before retry durable admission must not create a retry row"
+            "cancellation before stage durable admission must not create a child row"
         );
         let durable = run_engine
             .load_run("user-1", &result.agent_results[0].run_id)
@@ -11858,100 +9478,25 @@ mod tests {
             .expect("initial durable run exists");
         assert_eq!(
             durable.status, STATUS_COMPLETED,
-            "retry cancellation must not overwrite the completed first attempt"
+            "stage cancellation must not overwrite the completed first child"
         );
     }
 
     #[tokio::test]
-    async fn gate_pass_does_not_alter_results() {
-        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
-            .with_gate(Arc::new(AlwaysPassGate));
-
-        let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.agent_results.len(), 2);
-        for ar in &result.agent_results {
-            assert_eq!(ar.status, "completed");
-        }
-    }
-
-    #[tokio::test]
-    async fn gate_fail_marks_verification_failed() {
-        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
-            .with_gate(Arc::new(AlwaysFailGate));
-
-        let req = fan_out_request(vec!["coder"]);
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        // Fan-out with always-fail gate: result should be verification_failed
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, "verification_failed");
-        assert!(
-            result.agent_results[0]
-                .error
-                .as_ref()
-                .unwrap()
-                .contains("quality too low")
-        );
-    }
-
-    #[tokio::test]
-    async fn gate_retry_then_pass_sequential() {
-        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        // Fail once, then pass on second attempt
-        let gate = Arc::new(FailThenPassGate::new(1));
-        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
-            .with_gate(gate);
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "del-seq-gate".into(),
-            parent_run_id: "parent-1".into(),
-            task: "sequential gate test".into(),
-            pattern: CoordinationPattern::Sequential {
-                agent_ids: vec!["coder".into()],
-                stop_on_success: false,
-                timeout_sec: 0,
-            },
-            user_id: "user-1".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        // Should eventually pass after retry
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, "completed");
-    }
-
-    #[tokio::test]
-    async fn gate_retry_carries_the_exact_durable_execution_authority() {
+    async fn sequential_children_carry_exact_durable_execution_authority() {
         let (registry, run_engine, tracker) = setup();
         let bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
         let executor = Arc::new(CaptureRunBindingExecutor {
             bindings: bindings.clone(),
         });
-        let engine = DelegationEngine::with_executor(registry, run_engine, tracker, executor)
-            .with_gate(Arc::new(FailThenPassGate::new(1)));
+        let engine = DelegationEngine::with_executor(registry, run_engine, tracker, executor);
         let request = DelegationRequest {
             session_id: "test-session".into(),
-            delegation_id: "gate-retry-authority".into(),
-            parent_run_id: "gate-retry-parent".into(),
-            task: "verify retry authority".into(),
+            delegation_id: "sequential-authority".into(),
+            parent_run_id: "sequential-parent".into(),
+            task: "verify child authority".into(),
             pattern: CoordinationPattern::Sequential {
-                agent_ids: vec!["coder".into()],
+                agent_ids: vec!["coder".into(), "reviewer".into()],
                 stop_on_success: false,
                 timeout_sec: 0,
             },
@@ -11964,30 +9509,34 @@ mod tests {
 
         let result = execute_with_durable_parent(&engine, request, "orch", None)
             .await
-            .expect("retry completes");
-        assert_eq!(result.agent_results[0].status, STATUS_COMPLETED);
+            .expect("sequential children complete");
+        assert_eq!(result.agent_results.len(), 2);
+        assert!(
+            result
+                .agent_results
+                .iter()
+                .all(|child| child.status == STATUS_COMPLETED)
+        );
         let bindings = bindings.lock().unwrap();
         assert_eq!(bindings.len(), 2);
         assert!(
             bindings
                 .iter()
                 .all(|binding| binding.execution_owner_generation == Some(0)),
-            "both the initial execution and the pre-started retry must carry their exact generation"
+            "every admitted sequential child must carry its exact owner generation"
         );
     }
 
     #[tokio::test]
-    async fn gate_retry_preserves_sequential_coordination_prompt() {
+    async fn sequential_preserves_coordination_prompt() {
         let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let gate = Arc::new(FailThenPassGate::new(1));
-        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
-            .with_gate(gate);
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor));
 
         let req = DelegationRequest {
             session_id: "test-session".into(),
-            delegation_id: "del-seq-gate-prompt".into(),
+            delegation_id: "del-seq-prompt".into(),
             parent_run_id: "parent-1".into(),
-            task: "sequential gate test".into(),
+            task: "sequential prompt test".into(),
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into()],
                 stop_on_success: false,
@@ -12004,150 +9553,51 @@ mod tests {
             .unwrap();
 
         let output = result.agent_results[0].output.as_deref().unwrap_or("");
-        assert!(output.contains("## Team Coordination: Pipeline"));
-        assert!(output.contains("Quality gate active"));
+        assert!(output.contains("## Team Coordination: Sequential Execution"));
     }
 
     #[tokio::test]
-    async fn gate_retry_preserves_adversarial_coordination_prompt() {
+    async fn fan_out_registers_pause_flags_without_pausing_completed_children() {
         let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let gate = Arc::new(FailThenPassGate::new(1));
-        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
-            .with_gate(gate);
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "del-adv-gate-prompt".into(),
-            parent_run_id: "parent-1".into(),
-            task: "adversarial gate test".into(),
-            pattern: CoordinationPattern::AdversarialReview {
-                producer_id: "coder".into(),
-                reviewer_id: "reviewer".into(),
-                max_rounds: 1,
-                timeout_sec: 0,
-                acceptance_threshold: 0.8,
-            },
-            user_id: "user-1".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        let producer_output = result.agent_results[0].output.as_deref().unwrap_or("");
-        assert!(producer_output.contains("## Team Coordination: Adversarial Review (Producer)"));
-        assert!(producer_output.contains("Quality gate active"));
-    }
-
-    #[tokio::test]
-    async fn gate_retry_registers_pause_flag() {
-        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let gate = Arc::new(FailThenPassGate::new(1));
         let de =
-            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
-                .with_gate(gate);
-
-        let result = execute_with_durable_parent(&de, fan_out_request(vec!["coder"]), "orch", None)
-            .await
-            .unwrap();
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, "completed");
-
-        let chain = tracker
-            .get_retry_chain(&result.agent_results[0].run_id)
-            .await;
-        assert_eq!(chain.len(), 2);
-        assert!(tracker.get_pause_flag(&chain[0]).await.is_some());
-        assert!(tracker.get_pause_flag(&chain[1]).await.is_some());
+            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor));
+        let result = execute_with_durable_parent(
+            &de,
+            fan_out_request(vec!["coder", "reviewer"]),
+            "orch",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.agent_results.len(), 2);
+        for child in &result.agent_results {
+            assert_eq!(child.status, STATUS_COMPLETED);
+            assert!(tracker.get_pause_flag(&child.run_id).await.is_some());
+        }
         assert_eq!(
             de.pause_delegation("user-1", "test-session", "del-1").await,
             0,
-            "completed retry attempts must not be advertised as cooperatively paused"
+            "completed children must not be advertised as cooperatively paused"
         );
     }
 
     #[tokio::test]
-    async fn gate_retry_preserves_depth_metadata() {
+    async fn fan_out_preserves_depth_metadata() {
         let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let gate = Arc::new(FailThenPassGate::new(1));
         let de =
-            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
-                .with_gate(gate);
-
-        let result = execute_with_durable_parent(&de, fan_out_request(vec!["coder"]), "orch", None)
-            .await
-            .unwrap();
-        let chain = tracker
-            .get_retry_chain(&result.agent_results[0].run_id)
-            .await;
-
-        assert_eq!(chain.len(), 2);
-        assert_eq!(tracker.get_depth(&chain[0]).await, Some(1));
-        assert_eq!(tracker.get_depth(&chain[1]).await, Some(1));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(session_journal_dir)]
-    async fn gate_retry_writes_journal_linkage_event() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "delegation-engine-journal-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_dir);
-
-        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let gate = Arc::new(FailThenPassGate::new(1));
-        let de =
-            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
-                .with_gate(gate);
-
-        let mut req = fan_out_request(vec!["coder"]);
-        req.delegation_id = "del-journal-retry".into();
-        req.parent_run_id = "parent-journal-retry".into();
-        req.session_id = "sess-journal-retry".into();
-
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, "completed");
-
-        let chain = tracker
-            .get_retry_chain(&result.agent_results[0].run_id)
-            .await;
-        assert_eq!(chain.len(), 2);
-
-        let journal_path = astra_services::session_journal::journal_file_path_for_user(
-            "user-1",
-            "sess-journal-retry",
+            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor));
+        let result = execute_with_durable_parent(
+            &de,
+            fan_out_request(vec!["coder", "reviewer"]),
+            "orch",
+            None,
         )
+        .await
         .unwrap();
-        let content = std::fs::read_to_string(&journal_path).unwrap();
-        let retry_events: Vec<astra_services::session_journal::JournalEvent> = content
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<astra_services::session_journal::JournalEvent>(line).unwrap()
-            })
-            .filter(|evt| {
-                evt.event_type == astra_services::session_journal::JournalEventType::DelegationRetry
-            })
-            .collect();
-
-        assert_eq!(retry_events.len(), 1);
-        let meta = retry_events[0].metadata.as_ref().unwrap();
-        assert_eq!(meta["delegation_id"], "del-journal-retry");
-        assert_eq!(meta["original_run_id"], chain[0]);
-        assert_eq!(meta["retry_run_id"], chain[1]);
-        assert_eq!(meta["agent_id"], "coder");
-        assert_eq!(meta["attempt"], 2);
-        assert_eq!(meta["reason"], "fail #1");
-
-        let _ = std::fs::remove_file(journal_path);
-        let _ = std::fs::remove_dir_all(sessions_dir);
+        assert_eq!(result.agent_results.len(), 2);
+        for child in &result.agent_results {
+            assert_eq!(tracker.get_depth(&child.run_id).await, Some(1));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12267,90 +9717,6 @@ mod tests {
 
         let _ = std::fs::remove_file(journal_path);
         let _ = std::fs::remove_dir_all(sessions_dir);
-    }
-
-    #[tokio::test]
-    async fn gate_exhausted_retries_sequential() {
-        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
-        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
-            .with_gate(Arc::new(AlwaysFailGate));
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "del-seq-fail".into(),
-            parent_run_id: "parent-1".into(),
-            task: "will fail".into(),
-            pattern: CoordinationPattern::Sequential {
-                agent_ids: vec!["coder".into()],
-                stop_on_success: false,
-                timeout_sec: 0,
-            },
-            user_id: "user-1".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, "verification_failed");
-    }
-
-    #[tokio::test]
-    async fn no_gate_executes_without_verification_step() {
-        let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
-
-        let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.agent_results.len(), 2);
-        for ar in &result.agent_results {
-            assert_eq!(ar.status, "completed");
-        }
-    }
-
-    #[tokio::test]
-    async fn gate_skips_failed_subrun() {
-        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(FailingExecutor {
-            fail_agents: vec!["coder".into()],
-        }));
-        // AlwaysFailGate should NOT apply to already-failed results
-        let de = DelegationEngine::with_executor(
-            reg,
-            engine,
-            tracker,
-            Arc::new(FailingExecutor {
-                fail_agents: vec!["coder".into()],
-            }),
-        )
-        .with_gate(Arc::new(AlwaysFailGate));
-
-        let req = fan_out_request(vec!["coder"]);
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        // Should be "failed" (from executor), NOT "verification_failed"
-        assert_eq!(result.agent_results[0].status, "failed");
-    }
-
-    #[tokio::test]
-    async fn gate_verdict_variants() {
-        assert!(GateVerdict::Pass.is_pass());
-        assert!(GateVerdict::Skip.is_pass());
-        assert!(
-            !GateVerdict::Fail {
-                reason: "x".into(),
-                details: None
-            }
-            .is_pass()
-        );
     }
 
     // ── Persistence tests ────────────────────────────────────────────────
@@ -12688,37 +10054,6 @@ mod tests {
 
         // Completed sub-run has no pause flag
         assert!(tracker.get_pause_flag("sub-1").await.is_none());
-    }
-
-    // ─── clone_with_gate ─────────────────────────────────────────────────
-
-    #[test]
-    fn clone_with_gate_shares_components() {
-        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-        let registry = Arc::new(tokio::sync::RwLock::new(AgentProfileRegistry::new()));
-        let run_engine = Arc::new(crate::server::run::engine::RunEngine::new(run_store));
-        let tracker = Arc::new(DelegationTracker::new());
-        let executor: Arc<dyn SubRunExecutor> = Arc::new(StubSubRunExecutor);
-
-        let engine = DelegationEngine::with_executor(
-            registry.clone(),
-            run_engine.clone(),
-            tracker.clone(),
-            executor.clone(),
-        );
-        assert!(engine.gate.is_none());
-
-        // Clone with a gate — the new engine shares the same Arc components.
-        struct PassGate;
-        #[async_trait::async_trait]
-        impl VerificationGate for PassGate {
-            async fn verify(&self, _: &AgentResult, _: &str, _: u32) -> GateVerdict {
-                GateVerdict::Pass
-            }
-        }
-
-        let gated = engine.clone_with_gate(Arc::new(PassGate));
-        assert!(gated.gate.is_some());
     }
 
     // ─── Fork Pattern Tests ─────────────────────────────────────────────
@@ -13526,33 +10861,6 @@ mod tests {
         }
     }
 
-    /// Executor that succeeds immediately on the first call, then sleeps on retry.
-    #[derive(Clone)]
-    struct RetrySlowExecutor {
-        retry_delay: std::time::Duration,
-        calls: Arc<std::sync::atomic::AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl SubRunExecutor for RetrySlowExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-            let call = self.calls.fetch_add(1, Ordering::Relaxed);
-            if call > 0 {
-                tokio::time::sleep(self.retry_delay).await;
-            }
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id.clone(),
-                status: "completed".into(),
-                output: Some(format!("retry-slow output for {}", config.task)),
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
-        }
-    }
-
     /// Executor that reports whether a mailbox was attached to the sub-run config.
     #[derive(Clone)]
     struct MailboxEchoExecutor;
@@ -13743,55 +11051,9 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn gate_retry_timeout_enforced() {
-        let retry_slow = Arc::new(RetrySlowExecutor {
-            retry_delay: std::time::Duration::from_secs(5),
-            calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        });
-        let (reg, engine, tracker, _) = setup_with_executor(retry_slow.clone());
-        let de = DelegationEngine::with_executor(reg, engine, tracker, retry_slow.clone())
-            .with_gate(Arc::new(FailThenPassGate::new(1)));
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "gate-timeout".into(),
-            parent_run_id: "p".into(),
-            task: "gated slow retry".into(),
-            pattern: CoordinationPattern::Sequential {
-                agent_ids: vec!["coder".into()],
-                stop_on_success: false,
-                timeout_sec: 1,
-            },
-            user_id: "u".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        assert_eq!(result.agent_results.len(), 1);
-        assert_eq!(result.agent_results[0].status, "failed");
-        assert!(
-            result.agent_results[0]
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("timeout"),
-            "expected retry timeout error, got: {:?}",
-            result.agent_results[0].error
-        );
-        assert_eq!(retry_slow.calls.load(Ordering::Relaxed), 2);
-    }
-
     #[tokio::test]
-    async fn gate_retry_registers_mailbox_when_router_present() {
+    async fn fan_out_registers_and_retires_child_mailboxes() {
         let (reg, engine, tracker) = setup();
-        let gate = Arc::new(FailThenPassGate::new(1));
         let transport = Arc::new(crate::messaging::InProcessTransport::new());
         let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
             transport.clone(),
@@ -13799,16 +11061,20 @@ mod tests {
         ));
         let de =
             DelegationEngine::with_executor(reg, engine, tracker, Arc::new(MailboxEchoExecutor))
-                .with_gate(gate)
                 .with_mailbox_router(router);
 
-        let result = execute_with_durable_parent(&de, fan_out_request(vec!["coder"]), "orch", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            result.agent_results[0].output.as_deref(),
-            Some("mailbox=true")
-        );
+        let result = execute_with_durable_parent(
+            &de,
+            fan_out_request(vec!["coder", "reviewer"]),
+            "orch",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.agent_results.len(), 2);
+        for child in &result.agent_results {
+            assert_eq!(child.output.as_deref(), Some("mailbox=true"));
+        }
         assert_terminal_mailboxes_retired(&transport).await;
     }
 
@@ -14016,10 +11282,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Both agents should fail due to timeout
+        // Both agents should surface their stage timeout.
         assert_eq!(result.agent_results.len(), 2);
         for ar in &result.agent_results {
-            assert_eq!(ar.status, "failed");
+            assert_eq!(ar.status, AGENT_RESULT_STATUS_TIMEOUT);
             assert!(
                 ar.error.as_deref().unwrap_or("").contains("timeout"),
                 "expected timeout error for {}, got: {:?}",

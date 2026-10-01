@@ -12,6 +12,26 @@ Orchestration owns multi-agent coordination, delegation, fanout/fanin, model cho
 - Fanout should be explicit, bounded, and observable.
 - Delegation failure should degrade the relevant branch, not corrupt the parent run.
 
+Agent profiles are explicitly selected; they do not expose keyword-based
+auto-activation triggers. Team coordination has two execution strategies:
+`Sequential` passes each output to the next agent with optional early exit;
+`FanOut` runs independent agents with explicit aggregation. A context-sharing
+`Fork` additionally has its own bounded child contract. There is no separate
+pipeline strategy or producer/reviewer revision loop. Reviewing, producing and
+revising are ordinary tasks, not runtime roles or acceptance heuristics.
+Default topology uses agent count and explicit dependency facts; neither task
+prose nor scenario labels choose an execution strategy. Production delegation
+requires an explicitly wired executor; a stub is a test fixture, not a default
+execution mode.
+
+Child results and failures remain in the canonical lifecycle and journal.
+The scheduler does not parse task output into a second findings store or copy
+it into ancestor state rows. Sequential execution stops at a paused or waiting
+stage instead of launching a successor without a settled predecessor. Active
+stages observe cancellation and deadlines even if an executor ignores its token;
+the existing short publication grace and bounded, owner-fenced reconciliation
+preserve actual terminal outcomes or explicitly unfinished recovery state.
+
 ## Delegation model
 
 The agent executing an objective owns its relevant skill selection, evidence

@@ -1065,80 +1065,36 @@ pub(crate) fn register_default_agents(
     registry: &mut astra_services::coordination::AgentProfileRegistry,
 ) {
     use astra_services::coordination::{AgentProfile, AgentTier};
-    use std::collections::HashMap;
 
     let profiles = [
         // Root orchestrator for main REPL session — can delegate to all agents.
+        AgentProfile::new("main", "Main", AgentTier::Orchestrator),
         AgentProfile {
-            agent_id: "main".into(),
-            name: "Main".into(),
-            tier: AgentTier::Orchestrator,
-            system_prompt: None,
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: true,
-            delegate_to: Vec::new(), // empty = all
-            max_delegation_depth: 3,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
-        },
-        AgentProfile {
-            agent_id: "coder".into(),
-            name: "Coder".into(),
-            tier: AgentTier::User,
             system_prompt: Some(
                 "You are a code implementation agent. Write clean, correct code. \
                  Use tools to read files, understand context, then make precise changes. \
                  Always verify your changes compile/pass before finishing."
                     .into(),
             ),
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: false,
-            delegate_to: Vec::new(),
-            max_delegation_depth: 0,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
+            ..AgentProfile::new("coder", "Coder", AgentTier::User)
         },
         AgentProfile {
-            agent_id: "reviewer".into(),
-            name: "Reviewer".into(),
-            tier: AgentTier::User,
             system_prompt: Some(
                 "You are a code review agent. Analyze code changes with high signal-to-noise. \
                  Only surface issues that genuinely matter — bugs, security vulnerabilities, \
                  logic errors. Never comment on style or formatting."
                     .into(),
             ),
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: false,
-            delegate_to: Vec::new(),
-            max_delegation_depth: 0,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
+            ..AgentProfile::new("reviewer", "Reviewer", AgentTier::User)
         },
         AgentProfile {
-            agent_id: "writer".into(),
-            name: "Writer".into(),
-            tier: AgentTier::User,
             system_prompt: Some(
                 "You are a documentation agent. Write clear, concise documentation. \
                  Read existing docs and code to understand conventions, then produce \
                  consistent, helpful documentation."
                     .into(),
             ),
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: false,
-            delegate_to: Vec::new(),
-            max_delegation_depth: 0,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
+            ..AgentProfile::new("writer", "Writer", AgentTier::User)
         },
     ];
 

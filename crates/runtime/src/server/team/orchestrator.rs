@@ -1400,7 +1400,9 @@ mod tests {
                 user_id: "test-user".to_string(),
                 name: "cancel-isolated".to_string(),
                 description: "cancellation merge guard".to_string(),
-                coordination: TeamCoordination::Pipeline,
+                coordination: TeamCoordination::Sequential {
+                    stop_on_success: false,
+                },
                 members: vec![TeamMemberDef {
                     role: "worker".to_string(),
                     agent_id: Some("cancel-worker".to_string()),
@@ -1586,7 +1588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_team_adversarial_with_stub() {
+    async fn execute_builtin_review_team_with_stub() {
         let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
         let orch = setup_orchestrator(store).await;
 
@@ -2084,7 +2086,9 @@ mod tests {
             user_id: "test-user".to_string(),
             name: "bad".to_string(),
             description: "Invalid team".to_string(),
-            coordination: astra_services::team_persistence::TeamCoordination::Pipeline,
+            coordination: astra_services::team_persistence::TeamCoordination::Sequential {
+                stop_on_success: false,
+            },
             members: vec![],
             context: std::collections::HashMap::new(),
             worktree_mode: WorktreeMode::Shared,
@@ -2195,7 +2199,9 @@ mod tests {
             user_id: "u1".into(),
             name: "budget-test".into(),
             description: "test".into(),
-            coordination: astra_services::team_persistence::TeamCoordination::Pipeline,
+            coordination: astra_services::team_persistence::TeamCoordination::Sequential {
+                stop_on_success: false,
+            },
             members: vec![astra_services::team_persistence::TeamMemberDef {
                 role: "worker".into(),
                 agent_id: None,
@@ -2321,7 +2327,9 @@ mod tests {
             user_id: "u1".into(),
             name: "enforce-test".into(),
             description: "test".into(),
-            coordination: astra_services::team_persistence::TeamCoordination::Pipeline,
+            coordination: astra_services::team_persistence::TeamCoordination::Sequential {
+                stop_on_success: false,
+            },
             members: vec![astra_services::team_persistence::TeamMemberDef {
                 role: "worker".into(),
                 agent_id: None,

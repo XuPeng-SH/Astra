@@ -4792,7 +4792,7 @@ async fn ensure_core_schema_while_leased(
             request_id VARCHAR(128) NULL,
             trace_id VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'bubble_up', 'apply_suggestion', 'activate')),
+            CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'apply_suggestion', 'activate')),
             PRIMARY KEY (user_id, event_id),
             INDEX idx_state_events_item_created (item_id, created_at, event_id),
             INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id),

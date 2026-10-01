@@ -7770,29 +7770,10 @@ impl ServerAgenticLoopHost {
             return Err("Delegation scope ledger has no scoped requirements.".into());
         }
 
-        let expected_ids = scoped
-            .iter()
-            .map(|item| item.requirement_id.as_str())
-            .collect::<BTreeSet<_>>();
-        if !cache.binding.unresolved.is_empty() {
-            return Err("Delegation scope ledger contains unresolved requirements.".into());
-        }
-        let mut previous_assignments = BTreeMap::new();
-        for assignment in &cache.binding.assignments {
-            if !expected_ids.contains(assignment.requirement_id.as_str())
-                || previous_assignments
-                    .insert(
-                        assignment.requirement_id.clone(),
-                        assignment.slot_indices.clone(),
-                    )
-                    .is_some()
-            {
-                return Err("Delegation scope ledger has invalid requirement identities.".into());
-            }
-        }
-        if previous_assignments.len() != expected_ids.len() {
-            return Err("Delegation scope ledger is missing requirement identities.".into());
-        }
+        let previous_assignments = cache.binding.validated_assignments(
+            scoped.iter().map(|item| item.requirement_id.as_str()),
+            cache.slots.len(),
+        )?;
 
         let current_slots = pending
             .iter()
@@ -7826,11 +7807,8 @@ impl ServerAgenticLoopHost {
 
         let mut consumed = cache.consumed_requirement_ids.clone();
         for (requirement_id, slot_indices) in &previous_assignments {
-            if consumed.contains(requirement_id) || slot_indices.is_empty() {
+            if consumed.contains(*requirement_id) || slot_indices.is_empty() {
                 continue;
-            }
-            if slot_indices.iter().any(|&index| index >= cache.slots.len()) {
-                return Err("Delegation scope ledger has invalid slot indices.".into());
             }
             let fully_executed = slot_indices.iter().all(|&index| {
                 cache
@@ -7839,7 +7817,7 @@ impl ServerAgenticLoopHost {
                     .is_some_and(|slot| delegation_scope_slot_succeeded(state, slot))
             });
             if fully_executed {
-                consumed.insert(requirement_id.clone());
+                consumed.insert((*requirement_id).to_owned());
             }
         }
 
@@ -7851,16 +7829,14 @@ impl ServerAgenticLoopHost {
             if consumed.contains(&requirement.requirement_id) {
                 continue;
             }
-            let Some(previous) = previous_assignments.get(&requirement.requirement_id) else {
+            let Some(previous) = previous_assignments.get(requirement.requirement_id.as_str())
+            else {
                 return Err("Delegation scope ledger is missing a requirement assignment.".into());
             };
             let current = assignments
                 .get_mut(&requirement.requirement_id)
                 .expect("assignment initialized from scoped requirements");
             for &old_index in previous {
-                if old_index >= old_to_current.len() {
-                    return Err("Delegation scope ledger has invalid slot indices.".into());
-                }
                 if let Some(current_index) = old_to_current[old_index] {
                     current.push(current_index);
                 }
@@ -8146,15 +8122,11 @@ impl ServerAgenticLoopHost {
         // Validate the fused indices before partitioning. Filtering an invalid
         // global index into local scopes would otherwise hide a malformed
         // judgment instead of rejecting it.
-        if binding.as_ref().is_some_and(|binding| {
-            binding.assignments.iter().any(|assignment| {
-                assignment
-                    .slot_indices
-                    .iter()
-                    .any(|&index| index >= slots.len())
-            })
-        }) {
-            return Err("delegation task scope assignment has invalid slots".into());
+        if let Some(binding) = &binding {
+            binding.validated_assignments(
+                scoped.iter().map(|item| item.requirement_id.as_str()),
+                slots.len(),
+            )?;
         }
         let mut admissions = std::collections::HashMap::new();
         let mut blocked = Vec::new();

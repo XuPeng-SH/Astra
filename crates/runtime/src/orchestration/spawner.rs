@@ -1536,7 +1536,6 @@ pub(crate) fn durable_agent_status(run: &astra_services::runs::DurableRunRecord)
         astra_core::STATUS_FAILED
             if astra_services::coordination::durable_agent_result_is_partial(
                 run.error_code.as_deref(),
-                run.error_message.as_deref(),
             ) =>
         {
             AgentStatus::Interrupted {
@@ -1805,9 +1804,7 @@ pub(crate) fn apply_delegation_model_admission(
     parent_run_id: &str,
     tool_call_id: Option<&str>,
 ) -> Result<(), SpawnError> {
-    use astra_turn_types::{
-        DelegationModelAdmissionOutcome, DelegationReasoningEffort, DelegationReasoningRequirement,
-    };
+    use astra_turn_types::DelegationModelAdmissionOutcome;
     let invalid =
         |reason: &str| SpawnError::InvalidInput(format!("delegation model admission: {reason}"));
     if admission.source.run_id != parent_run_id
@@ -1962,40 +1959,9 @@ pub(crate) fn apply_delegation_model_admission(
     if let Some(required) = &slot.reasoning {
         let hard =
             slot.reasoning_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard);
-        let required = match required {
-            DelegationReasoningRequirement::ModelDefault => {
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault
-            }
-            DelegationReasoningRequirement::On {} => {
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::On {}
-            }
-            DelegationReasoningRequirement::Off => {
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off
-            }
-            DelegationReasoningRequirement::Budget { tokens } => {
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Enabled {
-                    budget_tokens: *tokens,
-                }
-            }
-            DelegationReasoningRequirement::Effort { effort } => {
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Adaptive {
-                    effort: match effort {
-                        DelegationReasoningEffort::Low => {
-                            astra_turn_core::thinking_config::ThinkingEffort::Low
-                        }
-                        DelegationReasoningEffort::Medium => {
-                            astra_turn_core::thinking_config::ThinkingEffort::Medium
-                        }
-                        DelegationReasoningEffort::High => {
-                            astra_turn_core::thinking_config::ThinkingEffort::High
-                        }
-                        DelegationReasoningEffort::Max => {
-                            astra_turn_core::thinking_config::ThinkingEffort::Max
-                        }
-                    },
-                }
-            }
-        };
+        let required = astra_turn_core::orchestration_spawn_tool::ReasoningSelection::from(
+            astra_turn_core::thinking_config::ThinkingConfig::from(required),
+        );
         if input
             .reasoning
             .as_ref()

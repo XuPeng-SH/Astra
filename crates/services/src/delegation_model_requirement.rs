@@ -825,14 +825,6 @@ pub fn canonical_team_delegation_slot_plan(
     let agent_ids = match &request.pattern {
         CoordinationPattern::FanOut { agent_ids, .. }
         | CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
-        CoordinationPattern::Pipeline { stages, .. } => {
-            stages.iter().map(|stage| stage.agent_id.clone()).collect()
-        }
-        CoordinationPattern::AdversarialReview {
-            producer_id,
-            reviewer_id,
-            ..
-        } => vec![producer_id.clone(), reviewer_id.clone()],
         CoordinationPattern::Fork { .. } => {
             return Err("direct Team model plans do not support fork patterns".into());
         }
@@ -1099,6 +1091,50 @@ pub struct DelegationScopeBinding {
     pub unresolved: Vec<String>,
 }
 
+impl DelegationScopeBinding {
+    /// Validate identities and global indices before any caller partitions or
+    /// remaps the binding; projection must not hide malformed evidence.
+    pub fn validated_assignments<'a>(
+        &'a self,
+        expected_ids: impl IntoIterator<Item = &'a str>,
+        slot_count: usize,
+    ) -> Result<std::collections::BTreeMap<&'a str, std::collections::BTreeSet<usize>>, String>
+    {
+        if slot_count > MAX_SLOTS || !self.unresolved.is_empty() {
+            return Err("delegation task scope is unresolved or exceeds the slot limit".into());
+        }
+        let expected = expected_ids
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut assignments = std::collections::BTreeMap::new();
+        for assignment in &self.assignments {
+            let indices = assignment
+                .slot_indices
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            if indices.len() != assignment.slot_indices.len()
+                || indices.iter().any(|&index| index >= slot_count)
+            {
+                return Err("delegation scope assignment has duplicate or invalid slots".into());
+            }
+            if !expected.contains(assignment.requirement_id.as_str())
+                || assignments
+                    .insert(assignment.requirement_id.as_str(), indices)
+                    .is_some()
+            {
+                return Err(
+                    "delegation scope assignments have missing or duplicate identities".into(),
+                );
+            }
+        }
+        if assignments.len() != expected.len() {
+            return Err("delegation scope assignments have missing or duplicate identities".into());
+        }
+        Ok(assignments)
+    }
+}
+
 /// Later child batches (or inherited requirements) already have frozen user
 /// intent. Only their new slot relationship needs judgment; the first batch
 /// uses the fused candidate-aware response and never calls this serially.
@@ -1151,33 +1187,10 @@ pub fn parse_delegation_scope_binding(
         .map_err(|_| "delegation scope response is not valid JSON")?;
     let binding: DelegationScopeBinding = serde_json::from_value(value)
         .map_err(|_| "delegation scope response has an invalid schema")?;
-    if !binding.unresolved.is_empty() || binding.assignments.len() != scoped.len() {
-        return Err("delegation task scope is unresolved".into());
-    }
-    let expected = scoped
-        .iter()
-        .map(|item| item.requirement_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let actual = binding
-        .assignments
-        .iter()
-        .map(|item| item.requirement_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    if expected != actual || actual.len() != binding.assignments.len() {
-        return Err("delegation scope assignments have missing or duplicate identities".into());
-    }
-    for assignment in &binding.assignments {
-        let indices = assignment
-            .slot_indices
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        if indices.len() != assignment.slot_indices.len()
-            || indices.iter().any(|&index| index >= slot_count)
-        {
-            return Err("delegation scope assignment has duplicate or invalid slots".into());
-        }
-    }
+    binding.validated_assignments(
+        scoped.iter().map(|item| item.requirement_id.as_str()),
+        slot_count,
+    )?;
     Ok(binding)
 }
 
@@ -1305,45 +1318,17 @@ pub fn bind_delegation_requirements_to_slots(
         .filter(|requirement| requirement.task_scope_quote.is_some())
         .collect::<Vec<_>>();
     let assignments = match (scoped.is_empty(), binding) {
-        (true, None) => std::collections::HashMap::<&str, std::collections::BTreeSet<usize>>::new(),
+        (true, None) => {
+            std::collections::BTreeMap::<&str, std::collections::BTreeSet<usize>>::new()
+        }
         (true, Some(_)) => return Err("unexpected delegation task scope binding".into()),
         (false, None) => return Err("delegation task scopes have not been bound".into()),
-        (false, Some(binding)) => {
-            if slot_count > MAX_SLOTS || !binding.unresolved.is_empty() {
-                return Err("delegation task scope is unresolved or exceeds the slot limit".into());
-            }
-            let expected = scoped
+        (false, Some(binding)) => binding.validated_assignments(
+            scoped
                 .iter()
-                .map(|requirement| requirement.requirement_id.as_str())
-                .collect::<std::collections::BTreeSet<_>>();
-            let actual = binding
-                .assignments
-                .iter()
-                .map(|assignment| assignment.requirement_id.as_str())
-                .collect::<std::collections::BTreeSet<_>>();
-            if expected != actual || actual.len() != binding.assignments.len() {
-                return Err(
-                    "delegation task scope assignments have missing or duplicate identities".into(),
-                );
-            }
-            let mut assignments = std::collections::HashMap::new();
-            for assignment in &binding.assignments {
-                let indices = assignment
-                    .slot_indices
-                    .iter()
-                    .copied()
-                    .collect::<std::collections::BTreeSet<_>>();
-                if indices.len() != assignment.slot_indices.len()
-                    || indices.iter().any(|&index| index >= slot_count)
-                {
-                    return Err(
-                        "delegation task scope assignment has duplicate or invalid slots".into(),
-                    );
-                }
-                assignments.insert(assignment.requirement_id.as_str(), indices);
-            }
-            assignments
-        }
+                .map(|requirement| requirement.requirement_id.as_str()),
+            slot_count,
+        )?,
     };
 
     let mut slot_constraints = Vec::with_capacity(slot_count);

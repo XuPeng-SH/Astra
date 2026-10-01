@@ -619,7 +619,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
- "unicode-segmentation",
  "uuid",
  "webpki-roots 1.0.7",
 ]

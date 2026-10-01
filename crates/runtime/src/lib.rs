@@ -235,9 +235,7 @@ pub use introspection::{
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
 pub use server::build_test_router;
-pub use server::delegation::engine::{
-    DelegationEngine, DelegationTracker, GateVerdict, VerificationGate,
-};
+pub use server::delegation::engine::{DelegationEngine, DelegationTracker};
 pub use server::run::engine::RunEngine;
 pub use server::run::lifecycle::AgenticRunLifecycleService;
 pub use server::{build_app, build_server_state, serve};

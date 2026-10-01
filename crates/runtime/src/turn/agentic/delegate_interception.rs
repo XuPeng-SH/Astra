@@ -268,8 +268,10 @@ pub(crate) fn parse_delegation_request(
     let args: Value =
         serde_json::from_str(args_str).map_err(|e| format!("invalid delegation JSON: {e}"))?;
 
-    if args.get("max_turns").is_some() {
-        return Err("delegate field 'max_turns' is not supported".to_string());
+    for field in ["max_turns", "needs_review", "max_rounds"] {
+        if args.get(field).is_some() {
+            return Err(format!("delegate field '{field}' is not supported"));
+        }
     }
 
     let task = args
@@ -352,58 +354,20 @@ pub(crate) fn select_default_coordination_pattern(
 ) -> Result<(astra_services::coordination::CoordinationPattern, Value), String> {
     let agents = parse_delegate_agents(args)?;
     let scenario = adaptive_context.and_then(|ctx| ctx.scenario);
-    let explicit_needs_review = optional_bool_arg(args, "needs_review")?.unwrap_or(false);
     let explicit_has_dependencies = optional_bool_arg(args, "has_dependencies")?.unwrap_or(false);
     let timeout = optional_u64_arg(args, "timeout")?.unwrap_or(0);
 
     let hints = astra_services::coordination::CoordinationHints {
         agent_ids: agents,
-        needs_review: explicit_needs_review
-            || matches!(
-                scenario,
-                Some(astra_config::user_profile::Scenario::CodeReview)
-            ),
-        has_dependencies: explicit_has_dependencies
-            || matches!(
-                scenario,
-                Some(astra_config::user_profile::Scenario::Debugging)
-            ),
+        has_dependencies: explicit_has_dependencies,
         timeout_sec: timeout,
     };
     let pattern = astra_services::coordination::suggest_pattern(&hints);
     let selected_pattern = coordination_pattern_name(&pattern);
-    let reason = if explicit_needs_review && selected_pattern == "adversarial" {
-        "typed_request_requires_review"
-    } else if explicit_has_dependencies && selected_pattern == "sequential" {
+    let reason = if explicit_has_dependencies && selected_pattern == "sequential" {
         "typed_request_has_dependencies"
-    } else if matches!(
-        scenario,
-        Some(astra_config::user_profile::Scenario::CodeReview)
-    ) && selected_pattern == "adversarial"
-    {
-        "code_review_scenario_prefers_review_loop"
-    } else if matches!(
-        scenario,
-        Some(astra_config::user_profile::Scenario::Exploration)
-    ) && selected_pattern == "fan_out"
-    {
-        "exploration_scenario_prefers_parallel_scouting"
-    } else if matches!(
-        scenario,
-        Some(astra_config::user_profile::Scenario::Debugging)
-    ) && selected_pattern == "sequential"
-    {
-        "debugging_scenario_prefers_sequential_with_stop"
-    } else if matches!(
-        scenario,
-        Some(astra_config::user_profile::Scenario::Testing)
-    ) && selected_pattern == "fan_out"
-    {
-        "testing_scenario_prefers_parallel_execution"
-    } else if scenario.is_some() {
-        "typed_scenario_fallback_for_available_agents"
     } else {
-        "adaptive_default"
+        "available_agents_default"
     };
 
     Ok((
@@ -466,10 +430,6 @@ pub(crate) fn coordination_pattern_name(
 ) -> &'static str {
     match pattern {
         astra_services::coordination::CoordinationPattern::FanOut { .. } => "fan_out",
-        astra_services::coordination::CoordinationPattern::Pipeline { .. } => "pipeline",
-        astra_services::coordination::CoordinationPattern::AdversarialReview { .. } => {
-            "adversarial"
-        }
         astra_services::coordination::CoordinationPattern::Sequential { .. } => "sequential",
         astra_services::coordination::CoordinationPattern::Fork { .. } => "fork",
     }
@@ -495,44 +455,6 @@ pub(crate) fn parse_coordination_pattern(
             })
         }
         "fan_out" => Err("delegate pattern 'fan_out' requires at least two agents".to_string()),
-        "pipeline" if agents.len() >= 2 => {
-            let stages = agents
-                .into_iter()
-                .map(|id| astra_services::coordination::PipelineStage {
-                    agent_id: id,
-                    output_transform: None,
-                })
-                .collect();
-            Ok(
-                astra_services::coordination::CoordinationPattern::Pipeline {
-                    stages,
-                    timeout_sec: timeout,
-                },
-            )
-        }
-        "pipeline" => Err("delegate pattern 'pipeline' requires at least two agents".to_string()),
-        "adversarial" if agents.len() == 2 => {
-            let producer = agents[0].clone();
-            let reviewer = agents[1].clone();
-            let max_rounds = optional_u64_arg(args, "max_rounds")?.unwrap_or(2);
-            if max_rounds == 0 {
-                return Err("delegate max_rounds must be greater than zero".to_string());
-            }
-            let max_rounds = u32::try_from(max_rounds)
-                .map_err(|_| "delegate max_rounds exceeds the supported range".to_string())?;
-            Ok(
-                astra_services::coordination::CoordinationPattern::AdversarialReview {
-                    producer_id: producer,
-                    reviewer_id: reviewer,
-                    max_rounds,
-                    acceptance_threshold: 0.8,
-                    timeout_sec: timeout,
-                },
-            )
-        }
-        "adversarial" => {
-            Err("delegate pattern 'adversarial' requires exactly two agents".to_string())
-        }
         "fork" if agents.len() == 1 => {
             let tasks = args
                 .get("tasks")
@@ -565,7 +487,6 @@ pub(crate) fn parse_coordination_pattern(
         "auto" => {
             let hints = astra_services::coordination::CoordinationHints {
                 agent_ids: agents,
-                needs_review: optional_bool_arg(args, "needs_review")?.unwrap_or(false),
                 has_dependencies: optional_bool_arg(args, "has_dependencies")?.unwrap_or(false),
                 timeout_sec: timeout,
             };
@@ -579,7 +500,7 @@ pub(crate) fn parse_coordination_pattern(
             },
         ),
         unknown => Err(format!(
-            "unknown delegate pattern '{unknown}'; expected sequential, fan_out, pipeline, adversarial, fork, or auto"
+            "unknown delegate pattern '{unknown}'; expected sequential, fan_out, fork, or auto"
         )),
     }
 }
@@ -1121,36 +1042,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_coordination_pattern_pipeline() {
-        let args = json!({"pattern": "pipeline", "agents": ["coder", "reviewer"]});
-        let pattern = parse_coordination_pattern(&args).unwrap();
-        match pattern {
-            astra_services::coordination::CoordinationPattern::Pipeline { stages, .. } => {
-                assert_eq!(stages.len(), 2);
-                assert_eq!(stages[0].agent_id, "coder");
-                assert_eq!(stages[1].agent_id, "reviewer");
-            }
-            _ => panic!("expected Pipeline"),
-        }
-    }
-
-    #[test]
-    fn parse_coordination_pattern_adversarial() {
-        let args =
-            json!({"pattern": "adversarial", "agents": ["coder", "reviewer"], "max_rounds": 3});
-        let pattern = parse_coordination_pattern(&args).unwrap();
-        match pattern {
-            astra_services::coordination::CoordinationPattern::AdversarialReview {
-                producer_id,
-                reviewer_id,
-                max_rounds,
-                ..
-            } => {
-                assert_eq!(producer_id, "coder");
-                assert_eq!(reviewer_id, "reviewer");
-                assert_eq!(max_rounds, 3);
-            }
-            _ => panic!("expected AdversarialReview"),
+    fn retired_coordination_patterns_are_rejected() {
+        for pattern in ["pipeline", "adversarial"] {
+            let args = json!({"pattern": pattern, "agents": ["coder", "reviewer"]});
+            assert_eq!(
+                parse_coordination_pattern(&args).unwrap_err(),
+                format!(
+                    "unknown delegate pattern '{pattern}'; expected sequential, fan_out, fork, or auto"
+                )
+            );
         }
     }
 
@@ -1159,7 +1059,7 @@ mod tests {
         for (args, expected) in [
             (
                 json!({"pattern": "adversarial", "agents": ["coder"]}),
-                "requires exactly two agents",
+                "unknown delegate pattern",
             ),
             (
                 json!({"pattern": "fan_out", "agents": ["coder"]}),
@@ -1352,8 +1252,12 @@ mod tests {
                 "field 'context' must be an object",
             ),
             (
-                r#"{"task":"work","agents":["coder"],"needs_review":"yes"}"#,
-                "field 'needs_review' must be a boolean",
+                r#"{"task":"work","agents":["coder"],"needs_review":true}"#,
+                "field 'needs_review' is not supported",
+            ),
+            (
+                r#"{"task":"work","agents":["coder"],"max_rounds":2}"#,
+                "field 'max_rounds' is not supported",
             ),
         ] {
             let tool_call = json!({
@@ -1424,38 +1328,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_delegation_request_without_pattern_uses_code_review_adversarial() {
-        let tool_call = json!({
-            "type": "function",
-            "function": {
-                "name": "delegate",
-                "arguments": "{\"task\": \"review this patch\", \"agents\": [\"coder\", \"reviewer\"]}"
-            }
-        });
-        let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(astra_config::user_profile::Scenario::CodeReview),
-        };
-
-        let req = parse_delegation_request(
-            &tool_call,
-            "run-123",
-            "session-456",
-            0,
-            Some(&adaptive_context),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            req.pattern,
-            astra_services::coordination::CoordinationPattern::AdversarialReview { .. }
-        ));
-        assert_eq!(
-            req.context["adaptive_coordination"]["reason"],
-            json!("code_review_scenario_prefers_review_loop")
-        );
-    }
-
-    #[test]
     fn parse_delegation_request_uses_typed_default_without_task_prose_matching() {
         let tool_call = json!({
             "type": "function",
@@ -1474,76 +1346,6 @@ mod tests {
         assert_eq!(
             req.context["adaptive_coordination"]["selection_source"],
             json!("typed_hints")
-        );
-    }
-
-    #[test]
-    fn parse_delegation_request_accepts_typed_review_signal() {
-        let tool_call = json!({
-            "type": "function",
-            "function": {
-                "name": "delegate",
-                "arguments": "{\"task\": \"inspect this patch\", \"agents\": [\"coder\", \"reviewer\"], \"needs_review\": true}"
-            }
-        });
-
-        let req = parse_delegation_request(&tool_call, "run-123", "session-456", 0, None).unwrap();
-
-        assert!(matches!(
-            req.pattern,
-            astra_services::coordination::CoordinationPattern::AdversarialReview { .. }
-        ));
-        assert_eq!(
-            req.context["adaptive_coordination"]["reason"],
-            json!("typed_request_requires_review")
-        );
-    }
-
-    #[test]
-    fn select_default_debugging_scenario() {
-        let args = json!({"agents": ["coder"]});
-        let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(astra_config::user_profile::Scenario::Debugging),
-        };
-        let (_pattern, policy) =
-            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
-        assert_eq!(policy["selection_source"], "typed_hints");
-        assert_eq!(
-            policy["reason"],
-            "debugging_scenario_prefers_sequential_with_stop"
-        );
-    }
-
-    #[test]
-    fn select_default_testing_scenario() {
-        let args = json!({"agents": ["coder", "tester"]});
-        let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(astra_config::user_profile::Scenario::Testing),
-        };
-        let (_pattern, policy) =
-            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
-        assert_eq!(policy["selection_source"], "typed_hints");
-        assert_eq!(
-            policy["reason"],
-            "testing_scenario_prefers_parallel_execution"
-        );
-    }
-
-    #[test]
-    fn select_default_explains_single_agent_scenario_fallback() {
-        let args = json!({"agents": ["tester"]});
-        let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(astra_config::user_profile::Scenario::Testing),
-        };
-        let (pattern, policy) =
-            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
-        assert!(matches!(
-            pattern,
-            astra_services::coordination::CoordinationPattern::Sequential { .. }
-        ));
-        assert_eq!(
-            policy["reason"],
-            "typed_scenario_fallback_for_available_agents"
         );
     }
 
