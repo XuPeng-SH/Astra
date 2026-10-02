@@ -118,6 +118,9 @@ export type RunResumedEvent = {
 export type RunFinishedEvent = {
   type: "run_finished";
   run_id?: string;
+  owner_generation?: number;
+  /** Original Server journal fact; clients must not re-evaluate partial tool events. */
+  turn_evaluation?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
   interrupted?: boolean;

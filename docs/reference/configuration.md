@@ -33,6 +33,9 @@ Use these files as the canonical configuration references:
 ### API server
 
 - `ASTRA_API_HOST`, `ASTRA_API_PORT`, `ASTRA_CORS_ORIGINS`
+- `ASTRA_POD_ID` — unique durable execution identity for this Server instance. Set a stable identity when its managed workspace directory survives restarts; never share one identity between concurrently running instances. Without it, the process uses a fresh UUID and cannot adopt a previous instance's local workspace.
+- `ASTRA_SERVER_WORKSPACES` — base directory for the selected Server sandbox provider, captured when the lifecycle is constructed; defaults to the system temporary directory's `astra-workspaces` child. A persisted Server sandbox belongs to its recorded executor and exact session directory, not to any instance that can read the same database row.
+
 
 `ASTRA_API_HOST` defaults to `127.0.0.1`. Container deployments set
 `0.0.0.0` explicitly inside the container and control external exposure at the

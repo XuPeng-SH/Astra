@@ -90,6 +90,24 @@ pub trait RunLifecycleService: Send + Sync {
         None
     }
 
+    /// Identity of the explicitly selected local workspace provider. This is
+    /// only an exclusion check; callers must still authorize the Work binding.
+    fn workspace_executor_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Resolve an existing provider-owned workspace without provisioning or
+    /// adopting a database path on this instance.
+    fn resolve_server_workspace(
+        &self,
+        record: &astra_runtime_env::WorkspaceRecord,
+    ) -> Result<std::path::PathBuf, astra_runtime_env::WorkspaceProvisionError> {
+        Err(astra_runtime_env::WorkspaceProvisionError::unavailable(
+            &record.workspace_id,
+            "No local workspace provider is selected",
+        ))
+    }
+
     async fn create_run(
         &self,
         user_id: String,
@@ -26733,7 +26751,10 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             if let Some(obj) = out.as_object_mut() {
                 for key in [
                     "run_id",
+                    "owner_generation",
+                    "turn_evaluation",
                     "status",
+                    "cancellation_origin",
                     "outcome",
                     "finish_reason",
                     "error",

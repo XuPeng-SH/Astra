@@ -173,6 +173,7 @@ async fn active_stream_closed_after_run_binding_cancels_exact_server_run() {
     let chat_count_for_route = chat_count.clone();
 
     let app = Router::new()
+        .route("/agents/edge", post(|| async { axum::Json(serde_json::json!({"ok": true})) }))
         // One-shot pipeline construction always discovers the authenticated
         // remote skill catalog before opening /chat/stream. An empty page is
         // the generic valid contract for a user with no published skills.
@@ -335,10 +336,21 @@ async fn active_stream_closed_after_run_binding_cancels_exact_server_run() {
                 chat_count.load(Ordering::SeqCst),
             )
         })
-        .expect("read Astra stdout")
-        .unwrap_or_else(|| {
-            panic!("Astra exited before binding the streamed run; stdout: {stdout}")
-        });
+        .expect("read Astra stdout");
+        let Some(line) = line else {
+            use tokio::io::AsyncReadExt;
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .expect("piped stderr")
+                .read_to_string(&mut stderr)
+                .await
+                .expect("read early-exit stderr");
+            panic!(
+                "Astra exited before binding the streamed run; stdout: {stdout}; stderr: {stderr}"
+            );
+        };
         stdout.push_str(&line);
         stdout.push('\n');
         let bound = serde_json::from_str::<serde_json::Value>(&line)

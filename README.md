@@ -537,7 +537,7 @@ astra chat -m "Run tests and fix failures" --permission-mode auto
 ```
 
 Inside the TUI, type `/` to discover commands. Common entries include
-`/model`, `/session`, `/skill`, `/memory`, `/plan`, `/checkpoint`, `/review`,
+`/model`, `/session`, `/skill`, `/memory`, `/plan`, `/review`,
 `/team`, `/explain`, and `/help`.
 
 ### Durable Work and inspection

@@ -1,9 +1,9 @@
-use std::{path::PathBuf, time::Duration};
+use super::work_patch_workspace::{WorkspaceResolutionError, resolve_workspace};
+use std::{sync::Arc, time::Duration};
 
 use astra_core::SharedPool;
-use astra_runtime_env::{WorkspaceAuthority, WorkspaceBindingKind, WorkspacePersistence};
 use astra_services::{
-    DatabaseWorkspaceRecordStore, WorkspaceRecordStore, WorkspaceRecordStoreError,
+    runs::RunLifecycleService,
     work::{
         DatabaseWorkPatchMaterializationService, DatabaseWorkRepository,
         SERVER_GIT_WORKTREE_MATERIALIZATION_PROVIDER_REF, WorkMaterializationProviderRef,
@@ -28,6 +28,7 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(crate) fn spawn_work_patch_materialization_recovery(
     pool: SharedPool,
+    lifecycle: Arc<dyn RunLifecycleService>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -74,9 +75,12 @@ pub(crate) fn spawn_work_patch_materialization_recovery(
             stream::iter(pending)
                 .for_each_concurrent(RECOVERY_CONCURRENCY, |item| {
                     let pool = pool.clone();
+                    let lifecycle = lifecycle.clone();
                     let cancel = cancel.clone();
                     async move {
-                        if let Err(error) = drive_materialization(pool, item.clone(), &cancel).await
+                        if let Err(error) =
+                            drive_materialization(pool, lifecycle.as_ref(), item.clone(), &cancel)
+                                .await
                             && !matches!(
                                 error,
                                 WorkPatchMaterializationError::ExecutorConflict
@@ -104,22 +108,32 @@ pub(crate) fn spawn_work_patch_materialization_recovery(
 
 async fn drive_materialization(
     pool: SharedPool,
+    lifecycle: &dyn RunLifecycleService,
     item: WorkPatchMaterializationRecoveryItem,
     cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
     if cancel.is_cancelled() {
         return Ok(());
     }
+    if lifecycle.workspace_executor_id().is_none()
+        || item.operation.provider_ref
+            != WorkMaterializationProviderRef::parse(
+                SERVER_GIT_WORKTREE_MATERIALIZATION_PROVIDER_REF,
+            )
+            .expect("static provider ref")
+    {
+        return Ok(());
+    }
     let service = DatabaseWorkPatchMaterializationService::new(pool.clone());
     match item.operation.phase {
         WorkPatchMaterializationPhase::AwaitingDispatch => {
-            drive_awaiting_dispatch(&service, &pool, &item, cancel).await
+            drive_awaiting_dispatch(&service, &pool, lifecycle, &item, cancel).await
         }
         WorkPatchMaterializationPhase::Applying | WorkPatchMaterializationPhase::Reconciling => {
-            drive_reconciliation(&service, &pool, &item, cancel).await
+            drive_reconciliation(&service, &pool, lifecycle, &item, cancel).await
         }
         WorkPatchMaterializationPhase::Verifying => {
-            drive_verification(&service, &pool, &item, cancel).await
+            drive_verification(&service, &pool, lifecycle, &item, cancel).await
         }
         WorkPatchMaterializationPhase::Complete => Ok(()),
     }
@@ -128,18 +142,26 @@ async fn drive_materialization(
 async fn drive_verification(
     service: &DatabaseWorkPatchMaterializationService,
     pool: &SharedPool,
+    lifecycle: &dyn RunLifecycleService,
     item: &WorkPatchMaterializationRecoveryItem,
     cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
     if cancel.is_cancelled() {
         return Ok(());
     }
-    let workspace = match resolve_workspace(pool, item).await {
+    let workspace = match resolve_workspace(
+        pool,
+        lifecycle,
+        &item.owner_id,
+        &item.operation.work_id,
+        &item.operation.target_branch_id,
+    )
+    .await
+    {
         Ok(workspace) => workspace,
-        Err(_) => {
-            if !cancel.is_cancelled() {
-                defer_recovery(service, item).await?;
-            }
+        Err(WorkspaceResolutionError::NotThisExecutor) => return Ok(()),
+        Err(WorkspaceResolutionError::UnverifiedUnavailable(error)) => {
+            tracing::warn!(%error, "Work workspace ownership could not be established");
             return Ok(());
         }
     };
@@ -156,6 +178,11 @@ async fn drive_verification(
         defer_recovery(service, item).await?;
         return Ok(());
     };
+    if !matches!(resolve_workspace(pool, lifecycle, &item.owner_id, &item.operation.work_id, &item.operation.target_branch_id).await, Ok(current) if current == workspace)
+    {
+        return Ok(());
+    }
+
     let Ok(observed_revision) =
         observe_git_worktree_revision_with_workspace_lease(&workspace, &workspace_lease).await
     else {
@@ -204,6 +231,7 @@ async fn drive_verification(
 async fn drive_awaiting_dispatch(
     service: &DatabaseWorkPatchMaterializationService,
     pool: &SharedPool,
+    lifecycle: &dyn RunLifecycleService,
     item: &WorkPatchMaterializationRecoveryItem,
     cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
@@ -212,37 +240,42 @@ async fn drive_awaiting_dispatch(
     }
     let executor_token = format!("server-materializer-{}", Uuid::now_v7());
     let invocation = provider_invocation_ref(item);
-    let workspace = match resolve_workspace(pool, item).await {
+    let workspace = match resolve_workspace(
+        pool,
+        lifecycle,
+        &item.owner_id,
+        &item.operation.work_id,
+        &item.operation.target_branch_id,
+    )
+    .await
+    {
         Ok(workspace) => workspace,
-        Err(WorkspaceResolutionError::Definitive(code)) => {
-            if cancel.is_cancelled() {
-                return Ok(());
-            }
-            service
-                .claim_applying(
-                    &item.owner_id,
-                    &item.operation.work_id,
-                    &item.operation.operation_id,
-                    &executor_token,
-                    &invocation,
-                )
-                .await?;
-            record_not_applied(service, item, executor_token, invocation, code).await?;
-            return Ok(());
-        }
-        Err(WorkspaceResolutionError::Retry(error)) => {
-            tracing::warn!(
-                operation_id = item.operation.operation_id.as_str(),
-                %error,
-                "Work patch workspace resolution will be retried before dispatch"
-            );
-            if !cancel.is_cancelled() {
-                defer_recovery(service, item).await?;
-            }
+        Err(WorkspaceResolutionError::NotThisExecutor) => return Ok(()),
+        Err(WorkspaceResolutionError::UnverifiedUnavailable(error)) => {
+            tracing::warn!(%error, "Work workspace ownership could not be established");
             return Ok(());
         }
     };
     if cancel.is_cancelled() {
+        return Ok(());
+    }
+    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+        &workspace,
+        Some(cancel),
+        Duration::from_secs(120),
+    )
+    .await
+    else {
+        // No provider invocation has started. Keep the durable operation in
+        // its dispatch phase; the recovery scanner will retry without
+        // fabricating a terminal no-op result.
+        if !cancel.is_cancelled() {
+            defer_recovery(service, item).await?;
+        }
+        return Ok(());
+    };
+    if !matches!(resolve_workspace(pool, lifecycle, &item.owner_id, &item.operation.work_id, &item.operation.target_branch_id).await, Ok(current) if current == workspace)
+    {
         return Ok(());
     }
     let patch = match service
@@ -294,21 +327,7 @@ async fn drive_awaiting_dispatch(
             return Ok(());
         }
     };
-    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
-        &workspace,
-        Some(cancel),
-        Duration::from_secs(120),
-    )
-    .await
-    else {
-        // No provider invocation has started. Keep the durable operation in
-        // its dispatch phase; the recovery scanner will retry without
-        // fabricating a terminal no-op result.
-        if !cancel.is_cancelled() {
-            defer_recovery(service, item).await?;
-        }
-        return Ok(());
-    };
+
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -371,6 +390,7 @@ async fn drive_awaiting_dispatch(
 async fn drive_reconciliation(
     service: &DatabaseWorkPatchMaterializationService,
     pool: &SharedPool,
+    lifecycle: &dyn RunLifecycleService,
     item: &WorkPatchMaterializationRecoveryItem,
     cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
@@ -382,7 +402,15 @@ async fn drive_reconciliation(
             WorkPatchMaterializationError::NeedsRepair("missing invocation".into())
         })?;
     let executor_token = format!("server-reconciler-{}", Uuid::now_v7());
-    let workspace = match resolve_workspace(pool, item).await {
+    let workspace = match resolve_workspace(
+        pool,
+        lifecycle,
+        &item.owner_id,
+        &item.operation.work_id,
+        &item.operation.target_branch_id,
+    )
+    .await
+    {
         Ok(workspace) => workspace,
         Err(_) => return Ok(()),
     };
@@ -395,6 +423,11 @@ async fn drive_reconciliation(
     else {
         return Ok(());
     };
+    if !matches!(resolve_workspace(pool, lifecycle, &item.owner_id, &item.operation.work_id, &item.operation.target_branch_id).await, Ok(current) if current == workspace)
+    {
+        return Ok(());
+    }
+
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -445,66 +478,6 @@ async fn drive_reconciliation(
         record_observed(service, item, executor_token, invocation, observed_revision).await?;
     }
     Ok(())
-}
-
-async fn resolve_workspace(
-    pool: &SharedPool,
-    item: &WorkPatchMaterializationRecoveryItem,
-) -> Result<PathBuf, WorkspaceResolutionError> {
-    if item.operation.provider_ref
-        != WorkMaterializationProviderRef::parse(SERVER_GIT_WORKTREE_MATERIALIZATION_PROVIDER_REF)
-            .expect("static provider ref")
-    {
-        return Err(WorkspaceResolutionError::Definitive(
-            WorkPatchMaterializationFailureCode::AuthorizationDenied,
-        ));
-    }
-    let repository = DatabaseWorkRepository::new(pool.clone());
-    let binding = repository
-        .load_branch_runtime_binding(
-            &item.owner_id,
-            &item.operation.work_id,
-            &item.operation.target_branch_id,
-        )
-        .await
-        .map_err(|error| match error {
-            astra_services::work::WorkRepositoryError::Persistence { .. } => {
-                WorkspaceResolutionError::Retry(error.to_string())
-            }
-            _ => WorkspaceResolutionError::Definitive(
-                WorkPatchMaterializationFailureCode::WorkspaceUnavailable,
-            ),
-        })?;
-    let store = DatabaseWorkspaceRecordStore::new(pool.clone());
-    let entry = store
-        .load_workspace_record(item.owner_id.as_str(), binding.session_id.as_str())
-        .await
-        .map_err(|error| match error {
-            WorkspaceRecordStoreError::Database(_) | WorkspaceRecordStoreError::Unavailable(_) => {
-                WorkspaceResolutionError::Retry(error.to_string())
-            }
-            _ => WorkspaceResolutionError::Definitive(
-                WorkPatchMaterializationFailureCode::WorkspaceUnavailable,
-            ),
-        })?
-        .filter(|entry| entry.session_id.as_deref() == Some(binding.session_id.as_str()))
-        .ok_or(WorkspaceResolutionError::Definitive(
-            WorkPatchMaterializationFailureCode::WorkspaceUnavailable,
-        ))?;
-    if entry.record.kind != WorkspaceBindingKind::ServerSandbox
-        || entry.record.authority != WorkspaceAuthority::ReadWrite
-        || entry.record.persistence != WorkspacePersistence::Session
-    {
-        return Err(WorkspaceResolutionError::Definitive(
-            WorkPatchMaterializationFailureCode::AuthorizationDenied,
-        ));
-    }
-    Ok(PathBuf::from(entry.record.root_or_volume_ref))
-}
-
-enum WorkspaceResolutionError {
-    Definitive(WorkPatchMaterializationFailureCode),
-    Retry(String),
 }
 
 async fn record_observed(
@@ -595,5 +568,303 @@ fn map_not_applied(code: GitPatchNotAppliedCode) -> WorkPatchMaterializationFail
             WorkPatchMaterializationFailureCode::InvalidWorkspace
         }
         GitPatchNotAppliedCode::PatchRejected => WorkPatchMaterializationFailureCode::PatchRejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::server::work_test_support::{
+        PatchRuntimeFixture, cleanup_work_owner, patch_operation_ownership,
+    };
+
+    #[tokio::test]
+    #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+    async fn recovery_applies_real_git_only_on_selected_executor_and_waits_for_verification() {
+        use astra_services::work::*;
+        let fixture = PatchRuntimeFixture::new().await;
+        fixture.reset_to_patch_base().await;
+        let repository = DatabaseWorkRepository::new(fixture.pool.clone());
+        let binding = repository
+            .load_branch_runtime_binding(&fixture.owner, &fixture.work, &fixture.branch)
+            .await
+            .unwrap();
+        let service = DatabaseWorkPatchMaterializationService::new(fixture.pool.clone());
+        let operation = service
+            .admit(&WorkPatchMaterializationRequest {
+                owner_id: fixture.owner.clone(),
+                work_id: fixture.work.clone(),
+                target_branch_id: fixture.branch.clone(),
+                request_id: WorkChangeRef::parse("materialize-real-patch").unwrap(),
+                patch_artifact_id: fixture.patch.patch_artifact_id.clone(),
+                expected_target_branch_revision: binding.branch_revision,
+                expected_target_graph_revision: binding.graph_revision,
+                provider_ref: WorkMaterializationProviderRef::parse(
+                    SERVER_GIT_WORKTREE_MATERIALIZATION_PROVIDER_REF,
+                )
+                .unwrap(),
+                policy_decision_ref: WorkChangeRef::parse("fixture-approved").unwrap(),
+            })
+            .await
+            .unwrap();
+        let item = WorkPatchMaterializationRecoveryItem {
+            owner_id: fixture.owner.clone(),
+            operation: operation.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let physical_lease = acquire_workspace_mutation_lease_with_options(
+            &fixture.workspace,
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let before_wait = patch_operation_ownership(
+            &fixture.pool,
+            "work_patch_materialization_operations",
+            operation.operation_id.as_str(),
+        )
+        .await;
+        {
+            let waiting_cancel = CancellationToken::new();
+            let attempt = drive_materialization(
+                fixture.pool.clone(),
+                &fixture.lifecycle,
+                item.clone(),
+                &waiting_cancel,
+            );
+            tokio::pin!(attempt);
+            tokio::select! {
+                result = &mut attempt => panic!("execution bypassed physical lease: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+            }
+            assert_eq!(
+                patch_operation_ownership(
+                    &fixture.pool,
+                    "work_patch_materialization_operations",
+                    operation.operation_id.as_str()
+                )
+                .await,
+                before_wait
+            );
+            waiting_cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(2), &mut attempt)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                patch_operation_ownership(
+                    &fixture.pool,
+                    "work_patch_materialization_operations",
+                    operation.operation_id.as_str()
+                )
+                .await,
+                before_wait
+            );
+        }
+        drop(physical_lease);
+
+        let ownership = patch_operation_ownership(
+            &fixture.pool,
+            "work_patch_materialization_operations",
+            operation.operation_id.as_str(),
+        )
+        .await;
+        drive_materialization(
+            fixture.pool.clone(),
+            &fixture.foreign,
+            item.clone(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("file.txt")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(
+            patch_operation_ownership(
+                &fixture.pool,
+                "work_patch_materialization_operations",
+                operation.operation_id.as_str()
+            )
+            .await,
+            ownership
+        );
+        drive_materialization(
+            fixture.pool.clone(),
+            &fixture.lifecycle,
+            item.clone(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let applied = service
+            .load(
+                &fixture.owner,
+                &fixture.work,
+                &fixture.branch,
+                &operation.operation_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied.phase, WorkPatchMaterializationPhase::Verifying);
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("file.txt")).unwrap(),
+            "after\n"
+        );
+        let subject = repository
+            .load_branch_subject(&fixture.owner, &fixture.work, &fixture.branch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            subject.subject_revision,
+            fixture.patch.result_subject_revision
+        );
+        let ownership = patch_operation_ownership(
+            &fixture.pool,
+            "work_patch_materialization_operations",
+            operation.operation_id.as_str(),
+        )
+        .await;
+        drive_materialization(
+            fixture.pool.clone(),
+            &fixture.foreign,
+            WorkPatchMaterializationRecoveryItem {
+                owner_id: fixture.owner.clone(),
+                operation: applied.clone(),
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            patch_operation_ownership(
+                &fixture.pool,
+                "work_patch_materialization_operations",
+                operation.operation_id.as_str()
+            )
+            .await,
+            ownership
+        );
+        assert!(matches!(
+            drive_materialization(fixture.pool.clone(), &fixture.lifecycle, item, &cancel).await,
+            Err(WorkPatchMaterializationError::ExecutorConflict)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("file.txt")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
+        cleanup_work_owner(&fixture.pool, fixture.owner.as_str()).await;
+    }
+    #[tokio::test]
+    #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+    async fn expired_invocation_reconciles_real_effect_without_repeating_mutation() {
+        use astra_services::work::*;
+        let fixture = PatchRuntimeFixture::new().await;
+        fixture.reset_to_patch_base().await;
+        let repository = DatabaseWorkRepository::new(fixture.pool.clone());
+        let binding = repository
+            .load_branch_runtime_binding(&fixture.owner, &fixture.work, &fixture.branch)
+            .await
+            .unwrap();
+        let service = DatabaseWorkPatchMaterializationService::new(fixture.pool.clone());
+        let operation = service
+            .admit(&WorkPatchMaterializationRequest {
+                owner_id: fixture.owner.clone(),
+                work_id: fixture.work.clone(),
+                target_branch_id: fixture.branch.clone(),
+                request_id: WorkChangeRef::parse("materialize-real-patch").unwrap(),
+                patch_artifact_id: fixture.patch.patch_artifact_id.clone(),
+                expected_target_branch_revision: binding.branch_revision,
+                expected_target_graph_revision: binding.graph_revision,
+                provider_ref: WorkMaterializationProviderRef::parse(
+                    SERVER_GIT_WORKTREE_MATERIALIZATION_PROVIDER_REF,
+                )
+                .unwrap(),
+                policy_decision_ref: WorkChangeRef::parse("fixture-approved").unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let invocation = WorkProviderInvocationRef::parse("effect-before-crash").unwrap();
+        let operation = service
+            .claim_applying(
+                &fixture.owner,
+                &fixture.work,
+                &operation.operation_id,
+                "lost-executor",
+                &invocation,
+            )
+            .await
+            .unwrap();
+        let patch = service
+            .load_patch_payload(&fixture.owner, &fixture.work, &operation.operation_id)
+            .await
+            .unwrap();
+        let effect = astra_tools::patch_materialization::materialize_git_patch(
+            &fixture.workspace,
+            &operation.base_subject_revision,
+            &patch,
+        )
+        .await;
+        assert!(matches!(
+            effect,
+            GitPatchMaterializationOutcome::Applied { .. }
+        ));
+        sqlx::query("UPDATE work_patch_materialization_operations SET executor_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE operation_id = ?")
+            .bind(operation.operation_id.as_str()).execute(fixture.pool.get()).await.unwrap();
+        let item = WorkPatchMaterializationRecoveryItem {
+            owner_id: fixture.owner.clone(),
+            operation: operation.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let before = patch_operation_ownership(
+            &fixture.pool,
+            "work_patch_materialization_operations",
+            operation.operation_id.as_str(),
+        )
+        .await;
+        let head = fixture.git(&["rev-parse", "HEAD"]);
+        drive_materialization(
+            fixture.pool.clone(),
+            &fixture.foreign,
+            item.clone(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            patch_operation_ownership(
+                &fixture.pool,
+                "work_patch_materialization_operations",
+                operation.operation_id.as_str()
+            )
+            .await,
+            before
+        );
+        drive_materialization(fixture.pool.clone(), &fixture.lifecycle, item, &cancel)
+            .await
+            .unwrap();
+        let reconciled = service
+            .load(
+                &fixture.owner,
+                &fixture.work,
+                &fixture.branch,
+                &operation.operation_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("file.txt")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(reconciled.phase, WorkPatchMaterializationPhase::Verifying);
+        assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
+        cleanup_work_owner(&fixture.pool, fixture.owner.as_str()).await;
     }
 }

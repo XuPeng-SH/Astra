@@ -257,7 +257,6 @@ mod tests {
             ended_at,
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
-            run_in_background: false,
             spawn_tool_call_id: None,
             fanout_slot: None,
         }

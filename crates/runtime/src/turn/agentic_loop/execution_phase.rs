@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::turn::cloud::compaction::adjust_spill_boundary_for_tool_pairs;
+use crate::turn::cloud::compaction::build_spill_summary;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1823,6 +1826,7 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
         finish_unavailable_verification(state, error);
         return;
     }
+    let validation = WorkValidationEvidence::collect(state, active_work_attempt);
     let current_round_records = state
         .stall
         .tool_call_records
@@ -1831,10 +1835,14 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
     let rejected_validation_state = current_round_records
         .iter()
         .find_map(record_rejected_work_validation_state);
-    let validation_state = current_work_validation_state(state);
+    let validation_state = validation.state;
     let failed_validation_requiring_revalidation = (validation_state
         == WorkValidationState::Failed)
-        .then(|| failed_work_validation_operation_requiring_revalidation(state))
+        .then(|| {
+            validation
+                .failed_operation_requiring_revalidation()
+                .map(str::to_owned)
+        })
         .flatten();
     let concurrent_mutation_risk = current_round_records.iter().any(|record| {
         tool_record_may_have_mutated_bound_workspace(
@@ -1895,7 +1903,7 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
         (CompletionAction::CanonicalWorkValidation, Some(operation)) => Some(operation),
         _ => None,
     }
-    .or_else(|| work_validation_operation_for_recovery(state));
+    .or_else(|| validation.recovery_operation().map(str::to_owned));
     // An attempt-only success has no proof-eligible exact operation to reuse.
     // Its server-owned stale rejection still authorizes one bounded direct
     // validator; the action matcher below requires positive-proof eligibility.
@@ -1988,20 +1996,44 @@ fn advance_completion_action_window_after_tool_round_for_work_state(
     );
 }
 
+/// Reopen the selected typed action without replenishing its mismatch or
+/// recovery budget. The caller explicitly owns any one-shot budget change.
+fn restart_completion_action_window(state: &mut AgenticLoopState, action: &CompletionAction) {
+    if let Some(window) = state
+        .hooks
+        .completion_settlement
+        .completion_action_window
+        .as_mut()
+    {
+        window.action = action.clone();
+        window.attempts_remaining = 1;
+        window.consumed = false;
+        window.matched = false;
+    }
+}
+
+fn reserve_completion_round(state: &mut AgenticLoopState) {
+    state.max_turns = state.max_turns.saturating_add(1);
+    state.remaining_turns = state.remaining_turns.saturating_add(1);
+}
+
 fn advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
     state: &mut AgenticLoopState,
     active_work_attempt: bool,
     new_records_start: usize,
     current_reconciliation_boundary: Option<&str>,
 ) {
-    let pending_action = match pending_completion_action_for_work_state(state, active_work_attempt)
-    {
-        Ok(action) => action,
-        Err(error) => {
-            finish_unavailable_verification(state, error);
-            return;
-        }
-    };
+    let validation = WorkValidationEvidence::collect(state, active_work_attempt);
+    let pending_action =
+        match pending_completion_action_with_validation(state, active_work_attempt, || {
+            validation.state
+        }) {
+            Ok(action) => action,
+            Err(error) => {
+                finish_unavailable_verification(state, error);
+                return;
+            }
+        };
     // Repair authority is per canonical Work attempt. A new structured
     // assignment, or a successful typed settlement that closes the prior
     // attempt, must not inherit either the one-shot budget or its validation
@@ -2073,18 +2105,8 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             .hooks
             .completion_settlement
             .outcome_reconciliation_schema_corrections_remaining = 0;
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.consumed = false;
-            window.matched = false;
-            window.attempts_remaining = 1;
-        }
-        state.max_turns = state.max_turns.saturating_add(1);
-        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        restart_completion_action_window(state, &window.action);
+        reserve_completion_round(state);
         state.final_text_model_item_id = None;
         state.final_text.clear();
         state.final_text_streamed = false;
@@ -2184,18 +2206,8 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             .hooks
             .completion_settlement
             .post_mutation_observation_failed_action_retries = 1;
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.attempts_remaining = 1;
-            window.consumed = false;
-            window.matched = false;
-        }
-        state.max_turns = state.max_turns.saturating_add(1);
-        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        restart_completion_action_window(state, &window.action);
+        reserve_completion_round(state);
         state.hooks.completion_settlement.text_only = false;
         state.budget_wrapup_injected = false;
         state.push_volatile_payload(
@@ -2240,19 +2252,8 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 .completion_settlement
                 .canonical_validation_recovery_retries = 1;
         }
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.action = CompletionAction::PostMutationRepair;
-            window.attempts_remaining = 1;
-            window.consumed = false;
-            window.matched = false;
-        }
-        state.max_turns = state.max_turns.saturating_add(1);
-        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        restart_completion_action_window(state, &CompletionAction::PostMutationRepair);
+        reserve_completion_round(state);
         state.hooks.completion_settlement.text_only = false;
         state.budget_wrapup_injected = false;
         state.push_volatile_payload(
@@ -2312,22 +2313,12 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             .canonical_validation_recovery_failed_action_retries
             == 0
     {
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.consumed = false;
-            window.matched = false;
-            window.attempts_remaining = 1;
-        }
+        restart_completion_action_window(state, &window.action);
         state
             .hooks
             .completion_settlement
             .canonical_validation_recovery_failed_action_retries = 1;
-        state.max_turns = state.max_turns.saturating_add(1);
-        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        reserve_completion_round(state);
         state.hooks.completion_settlement.text_only = false;
         state.hooks.completion_settlement.work_settlement_only = false;
         state.budget_wrapup_injected = false;
@@ -2375,7 +2366,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             || (matches!(window.action, CompletionAction::CanonicalWorkRepair)
                 && matches!(next_action, CompletionAction::CanonicalWorkValidation)
                 && matches!(
-                    current_work_validation_state(state),
+                    validation.state,
                     WorkValidationState::Stale | WorkValidationState::Failed
                 ))
             || (post_mutation_repair_next
@@ -2435,17 +2426,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             state.max_turns = state.max_turns.saturating_add(1);
             state.remaining_turns = state.remaining_turns.saturating_add(1);
         }
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.action = next_action.clone();
-            window.attempts_remaining = 1;
-            window.consumed = false;
-            window.matched = false;
-        }
+        restart_completion_action_window(state, &next_action);
         if matches!(next_action, CompletionAction::PostMutationObservation) {
             state
                 .hooks
@@ -2492,8 +2473,8 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
         && window.matched
         && matches!(window.action, CompletionAction::CanonicalWorkValidation)
         && !workspace_observation_is_quarantined(state)
-        && current_work_validation_state(state) == WorkValidationState::Stale
-        && failed_work_validation_operation(state).is_none()
+        && validation.state == WorkValidationState::Stale
+        && validation.failed_operation().is_none()
         && round_records.is_some_and(|records| {
             records.iter().any(|record| {
                 record.was_executed()
@@ -2520,18 +2501,8 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             .hooks
             .completion_settlement
             .canonical_validation_recovery_operation = None;
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.consumed = false;
-            window.matched = false;
-            window.attempts_remaining = 1;
-        }
-        state.max_turns = state.max_turns.saturating_add(1);
-        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        restart_completion_action_window(state, &window.action);
+        reserve_completion_round(state);
         state.hooks.completion_settlement.text_only = false;
         state.budget_wrapup_injected = false;
         state.push_volatile_payload(
@@ -2553,17 +2524,22 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
         && window.matched
         && matches!(window.action, CompletionAction::CanonicalWorkValidation)
         && !workspace_observation_is_quarantined(state)
-        && matches!(
-            current_work_validation_state(state),
-            WorkValidationState::Failed
-        )
+        && matches!(validation.state, WorkValidationState::Failed)
         && state
             .hooks
             .completion_settlement
             .canonical_validation_recovery_retries
             == 0
-        && let Some(failed_operation) = round_records
-            .and_then(|records| failed_work_validation_operation_in_records(state, records))
+        && let Some(failed_operation) = validation
+            .failed_operation_since(
+                new_records_start,
+                state
+                    .hooks
+                    .completion_settlement
+                    .canonical_validation_recovery_operation
+                    .as_deref(),
+            )
+            .map(str::to_owned)
     {
         // A failed final validation is decisive new evidence, not proof that
         // the task cannot be repaired. Reuse the reserved settlement boundary
@@ -2581,20 +2557,16 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             .hooks
             .completion_settlement
             .canonical_validation_recovery_operation = Some(failed_operation.clone());
-        state.max_turns = state.max_turns.saturating_add(1);
-        state.remaining_turns = state.remaining_turns.saturating_add(1);
+        reserve_completion_round(state);
         if let Some(window) = state
             .hooks
             .completion_settlement
             .completion_action_window
             .as_mut()
         {
-            window.action = CompletionAction::CanonicalWorkRepair;
-            window.attempts_remaining = 1;
             window.mismatch_corrections_remaining = 1;
-            window.consumed = false;
-            window.matched = false;
         }
+        restart_completion_action_window(state, &CompletionAction::CanonicalWorkRepair);
         state.hooks.completion_settlement.text_only = false;
         state.hooks.completion_settlement.work_settlement_only = false;
         state.budget_wrapup_injected = false;
@@ -2619,7 +2591,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
         && (pending_action.is_none()
             || (matches!(window.action, CompletionAction::CanonicalWorkValidation)
                 && matches!(
-                    current_work_validation_state(state),
+                    validation.state,
                     WorkValidationState::Failed | WorkValidationState::Stale
                 )))
     {
@@ -5307,7 +5279,7 @@ async fn persist_context_manifest_for_llm_call(
     state: &AgenticLoopState,
     turn_index: usize,
     llm_attempt_index: u32,
-    pre_llm_messages: &[serde_json::Value],
+    message_tokens: crate::turn::llm::context::ContextManifestMessageTokens,
     turn_result: Option<&HostTurnResult>,
     identity: Option<(String, String)>,
 ) {
@@ -5353,7 +5325,7 @@ async fn persist_context_manifest_for_llm_call(
             run_id: run_id.as_str(),
             turn_index,
             llm_attempt_index,
-            pre_llm_messages,
+            message_tokens,
             tool_results: &state.tool_results,
             schema_tokens,
             result_prompt_tokens,
@@ -5833,17 +5805,22 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state
     );
 
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::AgenticRequestSnapshot,
-        &state.messages,
-    );
-    let pre_llm_messages = state.messages.clone();
+    let request_message_count = state.messages.len();
+    // Remote hosts learn the authoritative session/run pair from the response.
+    // Capture only zone totals when this attempt can persist diagnostics; the
+    // host still authorizes the identity after the provider returns.
+    let manifest_message_tokens = (context_manifest_db_persistence_enabled()
+        && state.context_manifest_pool.is_some()
+        && state.context_manifest_user_id.is_some())
+    .then(|| {
+        crate::turn::llm::context::ContextManifestMessageTokens::from_messages(&state.messages)
+    });
     let llm_attempt_index = state.llm_rounds_completed;
     state.last_llm_context_manifest_trace = None;
     // Protect the exact request prefix we are about to send even if the LLM
     // call fails; the next retry/compaction pass must not clear tool results
     // that were already part of this attempted request.
-    state.last_request_message_count = Some(pre_llm_messages.len());
+    state.last_request_message_count = Some(request_message_count);
     // Increment the LLM-round counter regardless of outcome so retry/error
     // paths don't see a stale count (the counter tracks *attempted* LLM
     // calls for guidance-threshold purposes, not just successful ones).
@@ -5861,7 +5838,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     tracing::debug!(
         target: "astra_timing",
         llm_round = llm_attempt_index,
-        messages = pre_llm_messages.len(),
+        messages = request_message_count,
         "LLM call started"
     );
     if let Some(ref emitter) = state.messaging.progress_emitter {
@@ -5990,13 +5967,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         state.last_llm_context_manifest_trace = Some(trace);
     }
-    if !providerless_control_plane_turn {
+    if !providerless_control_plane_turn && let Some(message_tokens) = manifest_message_tokens {
         let manifest_identity = host.context_manifest_identity(state, turn_result.as_ref().ok());
         persist_context_manifest_for_llm_call(
             state,
             turn_index,
             llm_attempt_index,
-            &pre_llm_messages,
+            message_tokens,
             turn_result.as_ref().ok(),
             manifest_identity,
         )
@@ -8524,243 +8501,146 @@ fn record_starts_fresh_work_attempt(
             .is_some_and(|attempt_id| !attempt_id.trim().is_empty())
 }
 
-/// Latest canonical validation state in the current Work attempt's stable
-/// evidence epoch. Fresh typed assignments and successful settlements bound
-/// the scan; later bound-workspace mutations invalidate earlier validation.
-pub(crate) fn current_work_validation_state(state: &AgenticLoopState) -> WorkValidationState {
-    let records = &state.stall.tool_call_records;
-    let attempt_start = records
-        .iter()
-        .rposition(record_starts_fresh_work_attempt)
-        .map_or(0, |index| index.saturating_add(1));
+/// Ephemeral evidence for one completion/admission boundary. Operation debts
+/// retain their last failure index; no new persisted validation state is needed.
+struct WorkValidationEvidence {
+    state: WorkValidationState,
+    unresolved_operations: Vec<(String, usize)>,
+    latest_validation_operation: Option<String>,
+    last_workspace_mutation_index: Option<usize>,
+}
 
-    // A passing validator only clears a failure for the *same canonical
-    // operation*.  Treating every recognized build/test command as
-    // interchangeable lets an agent hide a failing suite by narrowing its
-    // selection, changing flags, or substituting a cheaper command.  We do
-    // not infer containment from task prose or command text: exact normalized
-    // operation identity is the only evidence that a failed receipt has been
-    // re-run successfully.  This is intentionally stricter than ordinary
-    // validation freshness, where any later canonical validation can supply a
-    // current positive receipt after a workspace mutation.
-    let unresolved_operations = unresolved_work_validation_operations(&records[attempt_start..]);
-    let mut saw_validation = false;
-    let mut saw_current_positive_validation = false;
-    let mut saw_unverified_validation_success = false;
-    let mut validation_is_stale = false;
-    for record in &records[attempt_start..] {
-        if record.effective_disposition()
-            != astra_services::session_journal::ToolCallDisposition::Executed
-        {
-            continue;
-        }
-        if saw_validation
-            && tool_record_may_have_mutated_bound_workspace(
-                state.hooks.workspace_root_hint.as_deref(),
-                record,
-            )
-        {
-            validation_is_stale = true;
-            saw_current_positive_validation = false;
-            saw_unverified_validation_success = false;
-        }
-        let Some(args) = record.authoritative_args_full() else {
-            continue;
+impl WorkValidationEvidence {
+    fn collect(state: &AgenticLoopState, active_work_attempt: bool) -> Self {
+        let mut evidence = Self {
+            state: WorkValidationState::None,
+            unresolved_operations: Vec::new(),
+            latest_validation_operation: None,
+            last_workspace_mutation_index: None,
         };
-        if astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
-            .is_some()
-        {
-            saw_validation = true;
-            // A canonical validator is fresh evidence about the current
-            // workspace even when it fails.  Keeping an older pre-mutation
-            // receipt marked stale after a newer failed validator hides the
-            // failure debt and prevents the bounded repair/revalidation path
-            // from opening.  Its outcome below still decides whether the
-            // current state is Passed or Failed.
-            if !astra_turn_core::evaluation::tool_outcome_is_positive_success(record) {
-                validation_is_stale = false;
-            }
-            // Delivery requires affirmative validation, not merely a shell
-            // invocation that completed. With `pipefail`, a compound
-            // validator/filter pipeline can otherwise surface as an empty or
-            // domain-negative final-stage result even though no passing
-            // validation receipt exists. Keep that ambiguity fail-closed and
-            // let a later canonical success clear it.
-            if astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
-                && astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args)
-                    .is_some()
-            {
-                validation_is_stale = false;
-                saw_current_positive_validation = true;
-            } else if astra_turn_core::evaluation::tool_outcome_is_positive_success(record) {
-                saw_unverified_validation_success = true;
-            }
+        if !active_work_attempt {
+            return evidence;
         }
-    }
-    if validation_is_stale {
-        WorkValidationState::Stale
-    } else if !unresolved_operations.is_empty() {
-        WorkValidationState::Failed
-    } else if saw_current_positive_validation {
-        WorkValidationState::Passed
-    } else if saw_unverified_validation_success {
-        WorkValidationState::Stale
-    } else {
-        WorkValidationState::None
-    }
-}
-
-/// Canonical validation operations whose latest terminal outcome remains a
-/// failure in the current Work attempt.  A success resolves only its exact
-/// normalized operation identity; different commands remain independent
-/// evidence rather than an implicit waiver of a prior failure.
-fn unresolved_work_validation_operations(
-    records: &[astra_services::session_journal::ToolCallRecord],
-) -> Vec<String> {
-    let mut unresolved = Vec::new();
-    for record in records {
-        if record.effective_disposition()
-            != astra_services::session_journal::ToolCallDisposition::Executed
-        {
-            continue;
-        }
-        let Some(args) = record.authoritative_args_full() else {
-            continue;
-        };
-        let Some(operation) =
-            astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
-        else {
-            continue;
-        };
-        if astra_turn_core::evaluation::tool_outcome_is_positive_success(record) {
-            unresolved.retain(|candidate| candidate != &operation);
-        } else {
-            // Repeating a still-failing operation must retain one debt, and a
-            // new failure becomes the most recent bounded repair target.
-            unresolved.retain(|candidate| candidate != &operation);
-            unresolved.push(operation);
-        }
-    }
-    unresolved
-}
-
-/// The exact normalized validation operation that produced the current
-/// failure. This is kept only for the bounded repair/revalidation transition;
-/// it is not inferred from model prose or result text.
-fn failed_work_validation_operation(state: &AgenticLoopState) -> Option<String> {
-    let records = &state.stall.tool_call_records;
-    let attempt_start = records
-        .iter()
-        .rposition(record_starts_fresh_work_attempt)
-        .map_or(0, |index| index.saturating_add(1));
-    unresolved_work_validation_operations(&records[attempt_start..])
-        .into_iter()
-        .next_back()
-}
-
-/// Return the latest unresolved validation operation when its failed receipt
-/// predates a bound-workspace mutation. That failure still blocks settlement,
-/// but the next useful action is to repeat its exact operation, not mutate the
-/// workspace again.
-fn failed_work_validation_operation_requiring_revalidation(
-    state: &AgenticLoopState,
-) -> Option<String> {
-    let operation = failed_work_validation_operation(state)?;
-    let records = &state.stall.tool_call_records;
-    let attempt_start = records
-        .iter()
-        .rposition(record_starts_fresh_work_attempt)
-        .map_or(0, |index| index.saturating_add(1));
-    let attempt_records = &records[attempt_start..];
-    let failure_index = attempt_records
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, record)| {
-            if record.effective_disposition()
-                != astra_services::session_journal::ToolCallDisposition::Executed
-                || astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
-            {
-                return None;
-            }
-            let args = record.authoritative_args_full()?;
-            (astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
-                .as_deref()
-                == Some(operation.as_str()))
-            .then_some(index)
-        })?;
-    attempt_records
-        .iter()
-        .skip(failure_index.saturating_add(1))
-        .any(|record| {
-            tool_record_may_have_mutated_bound_workspace(
-                state.hooks.workspace_root_hint.as_deref(),
-                record,
-            )
-        })
-        .then_some(operation)
-}
-
-/// A failed validation authorizes a repair only when this action window's
-/// exact operation has a new executed failure receipt and remains unresolved.
-/// Historical failures may keep Work blocked, but cannot by themselves open a
-/// new mutation window.
-fn failed_work_validation_operation_in_records(
-    state: &AgenticLoopState,
-    records: &[astra_services::session_journal::ToolCallRecord],
-) -> Option<String> {
-    let all_records = &state.stall.tool_call_records;
-    let attempt_start = all_records
-        .iter()
-        .rposition(record_starts_fresh_work_attempt)
-        .map_or(0, |index| index.saturating_add(1));
-    let unresolved = unresolved_work_validation_operations(&all_records[attempt_start..]);
-    let expected_operation = state
-        .hooks
-        .completion_settlement
-        .canonical_validation_recovery_operation
-        .as_deref();
-
-    records
-        .iter()
-        .filter_map(|record| {
-            if record.effective_disposition()
-                != astra_services::session_journal::ToolCallDisposition::Executed
-                || astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
-            {
-                return None;
-            }
-            let args = record.authoritative_args_full()?;
-            astra_turn_core::evaluation::normalize_validation_attempt_prefix(&record.name, args)
-        })
-        .rfind(|operation| {
-            expected_operation.is_none_or(|expected| expected == operation)
-                && unresolved.contains(operation)
-        })
-}
-
-/// The exact canonical command to repeat after a stale or failed Work
-/// validation. A current failure keeps its own operation identity; otherwise
-/// staleness is revalidated with the most recently recognized canonical
-/// validation from the same Work attempt. Neither task prose nor arbitrary
-/// successful tool output supplies this identity.
-fn work_validation_operation_for_recovery(state: &AgenticLoopState) -> Option<String> {
-    failed_work_validation_operation(state).or_else(|| {
+        let mut saw_validation = false;
+        let mut saw_current_positive_validation = false;
+        let mut saw_unverified_validation_success = false;
+        let mut validation_is_stale = false;
         let records = &state.stall.tool_call_records;
         let attempt_start = records
             .iter()
             .rposition(record_starts_fresh_work_attempt)
             .map_or(0, |index| index.saturating_add(1));
-        records[attempt_start..].iter().rev().find_map(|record| {
-            (record.effective_disposition()
-                == astra_services::session_journal::ToolCallDisposition::Executed)
-                .then(|| record.authoritative_args_full())
-                .flatten()
-                .and_then(|args| {
-                    astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args)
-                })
-        })
-    })
+        for (index, record) in records.iter().enumerate().skip(attempt_start) {
+            if !record.was_executed() {
+                continue;
+            }
+            if tool_record_may_have_mutated_bound_workspace(
+                state.hooks.workspace_root_hint.as_deref(),
+                record,
+            ) {
+                evidence.last_workspace_mutation_index = Some(index);
+                if saw_validation {
+                    validation_is_stale = true;
+                    saw_current_positive_validation = false;
+                    saw_unverified_validation_success = false;
+                }
+            }
+            let Some(args) = record.authoritative_args_full() else {
+                continue;
+            };
+            let Some(operation) = astra_turn_core::evaluation::normalize_validation_attempt_prefix(
+                &record.name,
+                args,
+            ) else {
+                continue;
+            };
+            saw_validation = true;
+            let positive = astra_turn_core::evaluation::tool_outcome_is_positive_success(record);
+            let proof_operation =
+                astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args);
+            if let Some(proof_operation) = proof_operation.as_ref() {
+                evidence.latest_validation_operation = Some(proof_operation.clone());
+            }
+            // Only the same canonical operation discharges a failure. A
+            // narrowed or differently flagged command supplies independent evidence.
+            evidence
+                .unresolved_operations
+                .retain(|(candidate, _)| candidate != &operation);
+            if !positive {
+                evidence.unresolved_operations.push((operation, index));
+                // A fresh failed validator exposes debt even after a mutation.
+                validation_is_stale = false;
+            } else if proof_operation.is_some() {
+                validation_is_stale = false;
+                saw_current_positive_validation = true;
+            } else {
+                // Invocation success without proof-eligible arguments cannot
+                // authorize delivery, even when its exact failure is cleared.
+                saw_unverified_validation_success = true;
+            }
+        }
+        evidence.state = if validation_is_stale {
+            WorkValidationState::Stale
+        } else if !evidence.unresolved_operations.is_empty() {
+            WorkValidationState::Failed
+        } else if saw_current_positive_validation {
+            WorkValidationState::Passed
+        } else if saw_unverified_validation_success {
+            WorkValidationState::Stale
+        } else {
+            WorkValidationState::None
+        };
+        evidence
+    }
+
+    fn failed_operation(&self) -> Option<&str> {
+        self.unresolved_operations
+            .last()
+            .map(|(operation, _)| operation.as_str())
+    }
+
+    fn failed_operation_requiring_revalidation(&self) -> Option<&str> {
+        let (operation, failure_index) = self.unresolved_operations.last()?;
+        self.last_workspace_mutation_index
+            .is_some_and(|mutation_index| mutation_index > *failure_index)
+            .then_some(operation.as_str())
+    }
+
+    fn recovery_operation(&self) -> Option<&str> {
+        self.failed_operation()
+            .or(self.latest_validation_operation.as_deref())
+    }
+
+    fn failed_operation_since(&self, start: usize, expected: Option<&str>) -> Option<&str> {
+        self.unresolved_operations
+            .iter()
+            .rev()
+            .find_map(|(operation, index)| {
+                (*index >= start && expected.is_none_or(|expected| expected == operation))
+                    .then_some(operation.as_str())
+            })
+    }
+}
+
+/// Current Work validation derived at the caller's boundary, without a cache
+/// whose lifetime could outlive permissions, execution or a new Work attempt.
+pub(crate) fn current_work_validation_state(state: &AgenticLoopState) -> WorkValidationState {
+    WorkValidationEvidence::collect(state, true).state
+}
+
+fn failed_work_validation_operation(state: &AgenticLoopState) -> Option<String> {
+    WorkValidationEvidence::collect(state, true)
+        .failed_operation()
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+fn failed_work_validation_operation_requiring_revalidation(
+    state: &AgenticLoopState,
+) -> Option<String> {
+    WorkValidationEvidence::collect(state, true)
+        .failed_operation_requiring_revalidation()
+        .map(str::to_owned)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8836,6 +8716,16 @@ pub(crate) fn pending_completion_action_for_work_state(
     state: &AgenticLoopState,
     active_work_attempt: bool,
 ) -> Result<Option<CompletionAction>, VerificationRecoveryError> {
+    pending_completion_action_with_validation(state, active_work_attempt, || {
+        current_work_validation_state(state)
+    })
+}
+
+fn pending_completion_action_with_validation(
+    state: &AgenticLoopState,
+    active_work_attempt: bool,
+    validation_state: impl FnOnce() -> WorkValidationState,
+) -> Result<Option<CompletionAction>, VerificationRecoveryError> {
     let (verification, observed) = checked_completion_evidence(state)?;
     if workspace_observation_is_quarantined(state) {
         return Ok(None);
@@ -8857,7 +8747,7 @@ pub(crate) fn pending_completion_action_for_work_state(
     }
     if active_work_attempt
         && matches!(
-            current_work_validation_state(state),
+            validation_state(),
             WorkValidationState::Failed | WorkValidationState::Stale
         )
     {
@@ -10000,10 +9890,10 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     // First attempt: compact-and-continue instead of hard-stopping.
     // Two-tier strategy:
     //   1. Aggressive compression pipeline (clear tool results)
-    //   2. If still over: spill old messages to disk, keep reference in context
+    //   2. If still over: persist old messages as a session artifact, keep an introspect reference
     // Only if both fail do we inject the stop directive.
     // Skip tier-1 mechanical compression if pre-turn LLM compact already ran,
-    // but still allow tier-2 spill-to-disk as an independent recovery path.
+    // but still allow tier-2 artifact spill as an independent recovery path.
     if !state.budget_wrapup_injected
         && state.compaction_effectiveness.attempt_count < MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS
     {
@@ -10036,23 +9926,12 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 .collect();
         }
 
-        // Tier 2: Spill old messages to disk if compression wasn't enough.
-        // Serialize the oldest 60% of messages to a session-local file.
-        // Leave a system message referencing the file path so the agent
-        // can read_file it if needed. This is the SpillBackend pattern
-        // applied to conversation history — content isn't lost, just
-        // moved out of the live context window.
+        // Commit an artifact-backed rewrite only after durable storage succeeds.
         if measured.saturating_sub(total_freed) > state.max_turn_input_tokens {
-            if let Some(sid) = state.current_session_id.as_deref() {
-                let spill_freed = spill_old_messages_to_disk(
-                    &mut state.messages,
-                    sid,
-                    state.llm_rounds_completed,
-                );
-                total_freed += spill_freed;
-                if spill_freed > 0 {
-                    layer_descriptions.push(format!("spill_to_disk: ~{} tokens", spill_freed));
-                }
+            if let Some((freed, removed)) = spill_old_messages_to_artifact(host, state).await {
+                total_freed += freed;
+                total_messages_removed += removed;
+                layer_descriptions.push(format!("history_artifact: ~{freed} tokens"));
             }
         }
 
@@ -18898,9 +18777,14 @@ mod tests {
         assert!(state.hooks.completion_settlement.work_settlement_only);
     }
 
-    #[test]
-    fn successful_bounded_work_revalidation_clears_debt_before_settlement() {
+    fn successful_bounded_revalidation_state(stop_hook: Option<&str>) -> AgenticLoopState {
         let mut state = make_state();
+        if let Some(command) = stop_hook {
+            state
+                .hooks
+                .stop_hooks
+                .push(explicit_verification_hook("quality", command));
+        }
         state.stall.tool_call_records = vec![
             ToolCallRecord {
                 name: "run_next_work_item".into(),
@@ -18928,6 +18812,13 @@ mod tests {
                 consumed: true,
                 matched: true,
             });
+
+        state
+    }
+
+    #[test]
+    fn successful_bounded_work_revalidation_clears_debt_before_settlement() {
+        let mut state = successful_bounded_revalidation_state(None);
 
         assert_eq!(
             current_work_validation_state(&state),
@@ -18951,38 +18842,7 @@ mod tests {
 
     #[test]
     fn successful_work_revalidation_cannot_skip_an_independent_verification_hook() {
-        let mut state = make_state();
-        state
-            .hooks
-            .stop_hooks
-            .push(explicit_verification_hook("quality", "./quality-gate"));
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            executed_record("write_file", true, None),
-            validation_record("cargo test", "test_failure"),
-            validation_record("cargo test", "success"),
-        ];
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
+        let mut state = successful_bounded_revalidation_state(Some("./quality-gate"));
 
         assert!(matches!(
             pending_completion_action_for_work_state(&state, true).unwrap(),
@@ -19003,38 +18863,7 @@ mod tests {
 
     #[test]
     fn canonical_revalidation_may_also_satisfy_the_exact_declared_hook() {
-        let mut state = make_state();
-        state
-            .hooks
-            .stop_hooks
-            .push(explicit_verification_hook("quality", "cargo test"));
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            executed_record("write_file", true, None),
-            validation_record("cargo test", "test_failure"),
-            validation_record("cargo test", "success"),
-        ];
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
+        let mut state = successful_bounded_revalidation_state(Some("cargo test"));
 
         assert_eq!(
             pending_completion_action_for_work_state(&state, true).unwrap(),
@@ -23025,24 +22854,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_persistence_called_after_execute_turn() {
-        // Verify that persist_context_manifest_for_llm_call exists and is
-        // callable. The actual ordering invariant (execute_turn → trace
-        // capture → persist) is enforced by the compiler through async
-        // await semantics and the function signature requiring a
-        // HostTurnResult reference.
-        use std::ptr;
-        let fn_ptr = persist_context_manifest_for_llm_call as *const ();
-        assert!(
-            !fn_ptr.is_null(),
-            "persist_context_manifest_for_llm_call must be defined"
-        );
-        // The function signature enforces ordering: it takes a
-        // turn_result: Option<&HostTurnResult>, which only exists after
-        // execute_turn returns.
-    }
-
-    #[test]
     fn context_manifest_requires_server_owned_session_and_run_identity() {
         let rejected = HostTurnResult {
             accum: ChatTurnSseAccum::default(),
@@ -25866,6 +25677,52 @@ mod tests {
             "a transport recovery requires typed text, reasoning, and tool-call evidence"
         );
         assert!(!state.provider_adaptation.force_next_thinking_off);
+    }
+
+    #[tokio::test]
+    async fn artifact_spill_failure_cancellation_and_small_summary_preserve_history() {
+        for condition in ["failure", "cancel", "late-cancel", "no-benefit", "success"] {
+            let mut host = MockHost::new(Vec::new());
+            host.history_artifact_enabled = true;
+            host.history_artifact_error = condition == "failure";
+            let mut state = make_state();
+            state.max_turn_input_tokens = 10_000;
+            state.current_session_id = Some("session".into());
+            state.current_run_id = Some("run".into());
+            for index in 0..14 {
+                state.messages.push(serde_json::json!({"role":"assistant",
+                    "content": format!("decision {index}: {}", "evidence ".repeat(if condition == "no-benefit" { 1 } else { 500 }))}));
+            }
+            state
+                .messages
+                .push(serde_json::json!({"role":"user","content":"current request"}));
+            let original = state.messages.clone();
+            if condition == "cancel" || condition == "late-cancel" {
+                let token = Arc::new(tokio_util::sync::CancellationToken::new());
+                if condition == "cancel" {
+                    token.cancel();
+                } else {
+                    host.history_artifact_cancel = Some(token.clone());
+                }
+                state.cancellation.token = Some(token);
+            }
+            let result = spill_old_messages_to_artifact(&mut host, &mut state).await;
+            if condition == "success" {
+                let (freed, removed) = result.unwrap();
+                assert!(freed > 0 && removed > 0);
+                assert_eq!(state.messages.last(), original.last());
+                let stored: Vec<serde_json::Value> =
+                    serde_json::from_str(&host.history_artifacts[0].transcript_json).unwrap();
+                assert_eq!(stored, original[..stored.len()]);
+            } else {
+                assert!(result.is_none(), "{condition}");
+                assert_eq!(state.messages, original, "{condition}");
+                assert_eq!(
+                    host.history_artifacts.len(),
+                    usize::from(condition == "late-cancel")
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -29135,21 +28992,6 @@ mod tests {
     }
 }
 
-/// Spill old messages to disk with a structural summary retained in context.
-///
-/// Strategy (SpillBackend pattern for conversation history):
-/// 1. Extract a compact structural summary from the messages being spilled
-///    (user intents, tool calls made, files touched, errors hit)
-/// 2. Serialize the full messages to a session-local file (backup)
-/// 3. Replace the spilled messages with ONE system message containing:
-///    - The structural summary (so the agent retains awareness)
-///    - The spill file path (so it can read_file for full details)
-///
-/// This is NOT just raw dump — the summary gives the agent enough context
-/// to continue working without re-reading the full history. But if it needs
-/// specifics, the full transcript is one read_file away.
-///
-/// Returns estimated tokens freed.
 // Spill policy tunables — keep ~40% of the tail, shed ~60%. Chosen to
 // meaningfully relieve pressure in a single pass while preserving enough
 // recent turns that the agent doesn't lose working context.
@@ -29159,325 +29001,86 @@ const SPILL_MIN_KEEP: usize = 6;
 const SPILL_MIN_TOTAL: usize = 10;
 const SPILL_MIN_SPILL: usize = 4;
 
-/// Adjust `spill_count` so the drain boundary lands on a clean role boundary.
-///
-/// Provider APIs require assistant messages with `tool_calls` / `tool_use`
-/// blocks to be followed by matching tool-result messages with the same ids.
-/// If we spill through the middle of such a pair we'll get 400s on the next
-/// provider call. This walks the boundary *backward* (spilling fewer messages)
-/// until we land in a safe spot:
-///   - the retained prefix does not start with a `tool` / `tool_result` role, and
-///   - the last spilled message is not an assistant with unanswered tool calls.
-pub(crate) fn adjust_spill_boundary_for_tool_pairs(
-    messages: &[serde_json::Value],
-    mut spill_count: usize,
-) -> usize {
-    let is_tool_role = |m: &serde_json::Value| -> bool {
-        let role = m.get("role").and_then(|r| r.as_str());
-        // OpenAI-shape: role is "tool"; Anthropic-shape: role is "tool_result".
-        if matches!(role, Some("tool") | Some("tool_result")) {
-            return true;
-        }
-        // Anthropic tool-result messages arrive as role="user" with a content
-        // array containing {type:"tool_result"} blocks.  The current-role check
-        // above misses these, which would leave an orphaned tool_use assistant
-        // message in the retained window.
-        if role == Some("user") {
-            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
-                return arr
-                    .iter()
-                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+async fn spill_old_messages_to_artifact(
+    host: &mut dyn AgenticLoopHost,
+    state: &mut AgenticLoopState,
+) -> Option<(u64, usize)> {
+    use crate::turn::cloud::compaction::{prepare_prefix_summary, protected_history_spill_count};
+    if state.messages.len() < SPILL_MIN_TOTAL || !host.context_history_artifacts_available(state) {
+        return None;
+    }
+    let keep =
+        (state.messages.len() * SPILL_KEEP_NUMERATOR / SPILL_KEEP_DENOMINATOR).max(SPILL_MIN_KEEP);
+    let count =
+        protected_history_spill_count(&state.messages, state.messages.len().saturating_sub(keep));
+    if count < SPILL_MIN_SPILL {
+        return None;
+    }
+    let session_id = state.current_session_id.as_deref()?;
+    let run_id = state.current_run_id.as_deref()?;
+    let transcript = serde_json::to_string(&state.messages[..count]).ok()?;
+    let history =
+        astra_turn_types::ContextHistoryArtifactV1::new(session_id, run_id, count, transcript)
+            .ok()?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let handle = format!(
+        "{}{id}",
+        astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX
+    );
+    let summary = build_spill_summary(&state.messages[..count]);
+    let reference = serde_json::json!({"role":"system", "content": format!(
+        "[Context compressed — {count} earlier messages]
+
+{summary}
+
+Exact transcript: {handle}
+Use introspect(artifact=\"{handle}\") for earlier details."
+    )});
+    let candidate = prepare_prefix_summary(
+        &state.messages,
+        count,
+        reference,
+        state.pinned_tool_schema_tokens as usize,
+        state.max_turn_input_tokens,
+        crate::prompts::measured_prompt_tokens_from_manifest(
+            state.last_llm_context_manifest_trace.as_ref(),
+        ),
+    )?;
+    tokio::select! {
+        biased;
+        _ = direct_child_parent_cancelled(&state.cancellation) => return None,
+        result = host.persist_context_history(state, &id, history) => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "context history artifact persistence failed");
+                return None;
             }
         }
-        false
-    };
-    let has_tool_calls = |m: &serde_json::Value| -> bool {
-        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-            return false;
-        }
-        // OpenAI-shape: top-level `tool_calls` array.
-        if m.get("tool_calls")
-            .and_then(|t| t.as_array())
-            .map(|a| !a.is_empty())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        // Anthropic-shape: `content` is an array with `tool_use` blocks.
-        if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
-            return arr
-                .iter()
-                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
-        }
-        false
-    };
-
-    // Walk backward while the boundary is unsafe. Bail if we'd spill nothing.
-    while spill_count > 0 {
-        let last_spilled = &messages[spill_count - 1];
-        let first_retained = messages.get(spill_count);
-        let retained_starts_with_tool = first_retained.map(is_tool_role).unwrap_or(false);
-        let last_is_pending_assistant = has_tool_calls(last_spilled);
-        if !retained_starts_with_tool && !last_is_pending_assistant {
-            break;
-        }
-        spill_count -= 1;
     }
-    spill_count
-}
-
-fn spill_old_messages_to_disk(
-    messages: &mut Vec<serde_json::Value>,
-    session_id: &str,
-    round: u32,
-) -> u64 {
-    let total = messages.len();
-    if total < SPILL_MIN_TOTAL {
-        return 0;
+    // Cancellation may race a successful commit. The captured transcript remains
+    // session-owned evidence, but must not authorize a live-history rewrite.
+    if state
+        .cancellation
+        .token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+        || state
+            .cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        || state
+            .cancellation
+            .execution_lease_lost
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    {
+        return None;
     }
-    let keep_count = (total * SPILL_KEEP_NUMERATOR / SPILL_KEEP_DENOMINATOR).max(SPILL_MIN_KEEP);
-    let mut spill_count = total.saturating_sub(keep_count);
-    // Snap to a safe role boundary so we never split an assistant/tool pair.
-    spill_count = adjust_spill_boundary_for_tool_pairs(messages, spill_count);
-    if spill_count < SPILL_MIN_SPILL {
-        return 0;
+    if !host.context_history_artifacts_available(state) {
+        return None;
     }
-
-    let to_spill: Vec<_> = messages.drain(..spill_count).collect();
-
-    // Build structural summary from the spilled messages.
-    let summary = build_spill_summary(&to_spill);
-
-    let spill_json = match serde_json::to_string_pretty(&to_spill) {
-        Ok(json) => json,
-        Err(_) => {
-            // Put messages back in their original position (prefix).
-            let mut restored = to_spill;
-            restored.append(messages);
-            *messages = restored;
-            return 0;
-        }
-    };
-    let tokens_freed = u64::from(astra_turn_core::section_types::estimate_text_tokens(
-        &spill_json,
-    ));
-
-    // Write full transcript to session dir.
-    let spill_dir = match astra_services::local_session_artifact_store().session_dir(session_id) {
-        Ok(path) => path,
-        Err(_) => {
-            let mut restored = to_spill;
-            restored.append(messages);
-            *messages = restored;
-            return 0;
-        }
-    };
-    if std::fs::create_dir_all(&spill_dir).is_err() {
-        let mut restored = to_spill;
-        restored.append(messages);
-        *messages = restored;
-        return 0;
-    }
-    let spill_path = spill_dir.join(format!("spill-round{round}.json"));
-    if std::fs::write(&spill_path, &spill_json).is_err() {
-        let mut restored = to_spill;
-        restored.append(messages);
-        *messages = restored;
-        return 0;
-    }
-
-    // Insert summary + reference as first message.
-    let reference_msg = serde_json::json!({
-        "role": "system",
-        "content": format!(
-            "[Context compressed — {spill_count} earlier messages spilled to disk]\n\n\
-             ## Summary of spilled context\n{summary}\n\n\
-             ## Full transcript\n\
-             Path: {path}\n\
-             Use `read_file` on this path if you need exact details from \
-             the earlier conversation.",
-            path = spill_path.display(),
-        )
-    });
-    messages.insert(0, reference_msg);
-
-    tokens_freed
-}
-
-/// Extract a structural summary from messages without LLM — pure string extraction.
-/// Captures: user requests, tools called, files modified, errors encountered.
-fn build_spill_summary(messages: &[serde_json::Value]) -> String {
-    let mut user_messages = Vec::new();
-    let mut tools_used = Vec::new();
-    let mut files_modified = Vec::new();
-    let mut errors = Vec::new();
-
-    // Synthetic/system-injected user messages that shouldn't count as "requests".
-    const SYNTHETIC_USER_PREFIXES: &[&str] = &[
-        "[attention:",
-        "[session-anchor]",
-        "[working-set:",
-        "[session-memory:",
-        "(cached",
-    ];
-    let is_synthetic_user = |s: &str| {
-        SYNTHETIC_USER_PREFIXES
-            .iter()
-            .any(|p| s.trim_start().starts_with(p))
-    };
-
-    // Extract plain text from a `content` field that may be a string or an
-    // array of content blocks (Anthropic shape).
-    let content_text = |v: &serde_json::Value| -> Option<String> {
-        if let Some(s) = v.as_str() {
-            return Some(s.to_string());
-        }
-        if let Some(arr) = v.as_array() {
-            let mut out = String::new();
-            for b in arr {
-                let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if ty == "text" {
-                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str(t);
-                    }
-                }
-            }
-            if !out.is_empty() {
-                return Some(out);
-            }
-        }
-        None
-    };
-
-    // Record a tool invocation. Paths from read/search tools are deliberately
-    // not persisted into the prompt-facing spill summary: failed exploratory
-    // reads often contain stale or deleted paths, and promoting those into a
-    // system summary makes the next turn treat them as current workspace facts.
-    let mut record_tool = |name: &str, args: &serde_json::Value| {
-        let path = args.get("path").and_then(|p| p.as_str());
-        if let Some(p) = path {
-            if matches!(name, "str_replace" | "write_file" | "multi_edit") {
-                let ps = p.to_string();
-                if !files_modified.contains(&ps) {
-                    files_modified.push(ps);
-                }
-            }
-        }
-        tools_used.push(name.to_string());
-    };
-
-    for msg in messages {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        match role {
-            "user" => {
-                if let Some(content) = msg.get("content").and_then(content_text) {
-                    if !is_synthetic_user(&content) {
-                        let preview: String = content.chars().take(150).collect();
-                        user_messages.push(preview);
-                    }
-                }
-            }
-            "assistant" => {
-                // OpenAI-shape: top-level `tool_calls`.
-                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-                    for tc in tool_calls {
-                        let name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("?");
-                        let args_str = tc
-                            .get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("");
-                        let parsed: serde_json::Value =
-                            serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
-                        record_tool(name, &parsed);
-                    }
-                }
-                // Anthropic-shape: content array with `tool_use` blocks.
-                if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
-                    for block in arr {
-                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                            let input = block
-                                .get("input")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            record_tool(name, &input);
-                        }
-                    }
-                }
-                // Error mentions in assistant text — require word boundaries
-                // to avoid false positives like "no errors" or "won't fail".
-                if let Some(text) = msg.get("content").and_then(content_text) {
-                    let looks_like_error = text.contains(": error")
-                        || text.contains("Error:")
-                        || text.contains("panicked")
-                        || text.contains("traceback")
-                        || text.contains("Traceback");
-                    if looks_like_error && errors.len() < 5 {
-                        let preview: String = text.chars().take(100).collect();
-                        errors.push(preview);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut summary = String::new();
-
-    if !user_messages.is_empty() {
-        summary.push_str("**User requests:**\n");
-        for (i, msg) in user_messages.iter().take(10).enumerate() {
-            summary.push_str(&format!("{}. {}\n", i + 1, msg));
-        }
-        summary.push('\n');
-    }
-
-    if !files_modified.is_empty() {
-        summary.push_str("**Files modified:**\n");
-        for f in files_modified.iter().take(20) {
-            summary.push_str(&format!("- {f}\n"));
-        }
-        summary.push('\n');
-    }
-
-    if !tools_used.is_empty() {
-        // Deduplicate and count
-        let mut tool_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for t in &tools_used {
-            *tool_counts.entry(t.as_str()).or_default() += 1;
-        }
-        let mut sorted: Vec<_> = tool_counts.into_iter().collect();
-        sorted.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-        summary.push_str(&format!("**Tools used ({} calls):**\n", tools_used.len()));
-        for (tool, count) in sorted.iter().take(15) {
-            if *count > 1 {
-                summary.push_str(&format!("- {tool} ×{count}\n"));
-            } else {
-                summary.push_str(&format!("- {tool}\n"));
-            }
-        }
-        summary.push('\n');
-    }
-
-    if !errors.is_empty() {
-        summary.push_str("**Errors encountered:**\n");
-        for e in &errors {
-            summary.push_str(&format!("- {e}\n"));
-        }
-    }
-
-    if summary.is_empty() {
-        summary.push_str("(no structured content extracted from spilled messages)");
-    }
-
-    summary
+    let freed = candidate.tokens_freed();
+    let removed = candidate.messages_removed;
+    state.messages = candidate.messages;
+    Some((freed, removed))
 }

@@ -419,6 +419,7 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Latest immutable physical SSE owner, retained through the runtime's
     /// later final-output hook where the full AgenticLoopState is unavailable.
     pub last_physical_run_id: Option<String>,
+    pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Structured admission failure metadata retained after the accumulator is
     /// moved into the shared loop.  These facts drive user-facing recovery and
     /// must not be reconstructed from the rendered error string.
@@ -1257,7 +1258,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     pinned_tool_schema_tokens: &mut state.pinned_tool_schema_tokens,
                     turn_guard: &state.turn_guard,
                     restricted_tools: &mut state.restricted_tools,
-                    widen_selection_pending: &mut state.widen_selection_pending,
                     step_recorder: &mut state.step_recorder,
                     assembly_start,
                     telem: PrepareTurnTelemetry {
@@ -1513,6 +1513,12 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // to the admission adapter. Preserve observed facts and existing errors
         // so ordinary ingest and physical-owner cleanup remain authoritative.
         turn_result.core.require_server_terminal_evidence();
+        self.turn_evaluation =
+            if turn_result.core.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+                None
+            } else {
+                turn_result.core.turn_evaluation.take()
+            };
         self.last_physical_run_id = turn_result.core.run_id.clone();
         self.last_error_code = turn_result.core.error_code.clone();
         self.last_error_metadata = turn_result.core.error_metadata.clone();

@@ -6905,9 +6905,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         .get("name")
                         .and_then(Value::as_str)
                         .unwrap_or("_unknown");
+                    // Anthropic starts streamed tool input with an empty
+                    // object placeholder; the JSON deltas carry its actual bytes.
                     let arguments = block
                         .get("input")
-                        .filter(|input| input.is_object())
+                        .filter(|input| input.as_object().is_some_and(|input| !input.is_empty()))
                         .map(Value::to_string)
                         .unwrap_or_default();
                     let initial_arguments_advanced = block
@@ -10744,6 +10746,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_provider_fixture_stream_preserves_multiple_calls_and_response_identity() {
+        use crate::server::provider_test_support::{
+            ProviderGateway, ProviderResponse, ProviderScript,
+        };
+        let calls = json!([
+            {"id":"call-one","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"one.rs\"}"}},
+            {"id":"call-two","type":"function","function":{"name":"list_files","arguments":"{\"path\":\"src\"}"}}
+        ]);
+        let response_calls = calls.clone();
+        let gateway = ProviderGateway::start(vec![ProviderScript::new("two tool calls", |r| r.path == "/v1/chat/completions", vec![ProviderResponse::OpenAi(json!({
+            "id":"response-two-calls","model":"test-model","created":42,
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":response_calls},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
+        }))])]).await;
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", gateway.base_url))
+            .json(&json!({"stream":true}))
+            .send()
+            .await
+            .unwrap();
+        let result = collect_llm_stream(
+            response.bytes_stream(),
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.response_id.as_deref(), Some("response-two-calls"));
+        assert_eq!(result.tool_calls, calls.as_array().unwrap().clone());
+        assert_eq!(result.finish_reason.as_deref(), Some("tool_calls"));
+        gateway.assert_complete();
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_surfaces_transport_error() {
         let err = sample_reqwest_stream_error().await;
         let byte_stream = stream::iter(vec![Err(err)]);
@@ -13216,7 +13256,7 @@ mod tests {
             json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"calling tool"}}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}),
             json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"com"}}),
             json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"mand\":\"ls\"}"}}),
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}),

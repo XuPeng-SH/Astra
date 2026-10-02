@@ -6177,6 +6177,7 @@ mod tests {
         assert_eq!(fields["recovery_evidence"]["cause"], "scope_too_broad");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn overlarge_non_git_verify_returns_typed_observer_recovery() {
         let dir = tempfile::tempdir().expect("workspace");
@@ -7115,26 +7116,44 @@ mod tests {
             outcome.is_error,
             "timeout must remain an error: {outcome:?}"
         );
-        let fields = outcome
-            .tool_result_fields
-            .expect("error projection must retain executor receipt");
-        assert_eq!(
-            fields[astra_tools::workspace_observation::OBSERVED_FIELD],
-            serde_json::Value::Bool(true)
-        );
         #[cfg(target_os = "linux")]
-        assert!(matches!(
-            fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
-            Some(
-                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP
-                    | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
-            )
-        ));
+        {
+            let fields = outcome
+                .tool_result_fields
+                .as_ref()
+                .expect("error projection must retain executor receipt");
+            assert_eq!(
+                fields[astra_tools::workspace_observation::OBSERVED_FIELD],
+                serde_json::Value::Bool(true)
+            );
+            assert!(matches!(
+                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
+                Some(
+                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP
+                        | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
+                )
+            ));
+        }
         #[cfg(all(unix, not(target_os = "linux")))]
         {
+            assert!(
+                outcome.tool_result_fields.as_ref().is_none_or(|fields| {
+                    !fields.contains_key(astra_tools::workspace_observation::RECEIPT_FIELD)
+                        && !fields.contains_key(
+                            astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD,
+                        )
+                }),
+                "weak asynchronous ownership must not certify a receipt: {outcome:?}"
+            );
             assert_eq!(
-                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
-                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+                astra_tools::workspace_observation::workspace_observation_is_quarantined(
+                    dir.path()
+                ),
+                Some(true)
+            );
+            assert_eq!(
+                astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
+                Some(false)
             );
             let lease =
                 astra_tools::workspace_observation::acquire_workspace_observation_lease_sync(

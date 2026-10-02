@@ -369,15 +369,21 @@ the only physical-operation serialization boundary.
   Workspace manifest validates the capture declaration shape, matching
   fingerprints, canonical paths, content aggregates, file/blob digests,
   symlink boundaries, and MatrixOne Git4Data source references. The Work
-  repository records owner-scoped, idempotent
-  `preparing` captures and removes them with branch cleanup. A canonical
-  same-transaction verifier can now publish `captured` after it confirms the
-  current Work/branch revisions, immutable graph basis, Session context head,
-  quiescent invocation state, and execution binding. `captured` is a logical
-  boundary for observation only: it does not claim that a Workspace, Artifact,
-  or unfinished Run can be restored. No caller-supplied manifest is published
-  as `ready`; that state remains reserved for a future verifier that resolves
-  those durable payloads and effect receipts. The first user-facing capture
+  repository captures owner-scoped, idempotent boundaries in one transaction
+  after verifying Work/branch revisions, immutable graph basis, Session context
+  head, quiescent invocation state and execution binding. `captured` is logical
+  progress for observation; it does not promise file or unfinished Run restoration.
+  Sealed workspace publication reads only manifest/descriptor metadata at the
+  HTTP boundary, then verifies the full package and current Session/Work basis
+  and attaches its Artifact retention reference in the canonical transaction.
+  The HTTP read does not authorize content integrity; corruption after seal or
+  a changed basis rejects publication without leaving a recovery point. This
+  avoids loading the full package twice for one publication while retaining
+  the transaction's integrity boundary; the point remains `captured`. An exact
+  retry replays the original committed publication receipt; it does not certify
+  the current bytes again. The verified artifact GET remains the current-content
+  integrity boundary, including for corruption after a successful publication.
+  The retired two-commit preparing/mark-captured write API is removed. The logical capture
   path is `POST /v1/works/{work}/branches/{branch}/recovery-points`; TUI exposes
   it as `/work save` (with `/work checkpoint` as an alias), and Web lists the
   resulting boundaries under **Saved progress**. The action is intentionally
@@ -393,8 +399,11 @@ the only physical-operation serialization boundary.
   upload admission, and rejects a changed Session/Work head instead of
   relabelling an old filesystem snapshot. A verified Work artifact read returns
   the typed manifest and deterministic blob layout, so a second Web/TUI/Edge
-  client can discover, download, and hash the package before handing it to the
-  target materializer, without the uploader's in-memory state. Session
+  client can discover, download, and hash the package through the HTTP/SDK
+  boundary, without the uploader's in-memory state. Local capture and installation
+  are not wired into CLI, Web, or Rust Thin Client product flows; their unused Rust
+  implementations are retired. The shared package verifier remains responsible
+  for content integrity and symlink boundaries, hashing each unique blob once. Session
   hard-delete refuses while a
   preparing/captured/ready Work recovery point still depends on the Session
   provenance; the canonical Work branch-deletion operation releases those

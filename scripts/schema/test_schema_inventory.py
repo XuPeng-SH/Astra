@@ -698,7 +698,6 @@ fn char_literal() { let slash = '/'; }
             "edge_agent_registry",
             "plans",
             "plan_step_runs",
-            "wf_triggers",
             "infra_sandbox_metadata",
             "team_definitions",
             "team_execution_history",
@@ -751,10 +750,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "append-only attempt history",
             self.tables["plan_step_runs"]["merge_guidance"],
-        )
-        self.assertIn(
-            "separate activation lifecycle",
-            self.tables["wf_triggers"]["merge_guidance"],
         )
         self.assertIn(
             "workspace_records track reusable workspaces",

@@ -321,7 +321,7 @@ pub async fn materialize_git_patch_with_workspace_lease(
 pub async fn export_git_worktree_patch(
     workspace_root: &Path,
 ) -> Result<GitWorktreePatchExport, GitWorktreePatchExportError> {
-    let _workspace_lease =
+    let workspace_lease =
         crate::workspace_observation::acquire_workspace_observation_lease_with_options(
             workspace_root,
             None,
@@ -331,6 +331,15 @@ pub async fn export_git_worktree_patch(
         .ok_or(GitWorktreePatchExportError::Observation(
             GitWorkspaceObservationError::WorkspaceUnavailable,
         ))?;
+    export_git_worktree_patch_with_workspace_lease(workspace_root, &workspace_lease).await
+}
+
+/// Export under the caller's physical workspace lease so provider ownership
+/// can be rechecked after waiting and before reading Git.
+pub async fn export_git_worktree_patch_with_workspace_lease(
+    workspace_root: &Path,
+    _workspace_lease: &crate::workspace_observation::WorkspaceObservationLease,
+) -> Result<GitWorktreePatchExport, GitWorktreePatchExportError> {
     let root = canonical_git_worktree_root(workspace_root).await?;
     let _workspace_lock = acquire_workspace_lock(&root).await?;
     let result_subject_revision = observe_git_worktree_revision_locked(&root).await?;

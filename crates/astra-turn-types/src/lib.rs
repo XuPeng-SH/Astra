@@ -3,6 +3,12 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
+mod context_history_artifact;
+pub use context_history_artifact::{
+    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
+    MAX_CONTEXT_HISTORY_BYTES,
+};
+
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;

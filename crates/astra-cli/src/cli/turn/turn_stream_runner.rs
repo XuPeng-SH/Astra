@@ -140,7 +140,11 @@ fn build_turn_stream_params<'a>(
         semantic_query_override: input.semantic_query_override,
         session_id: Some(input.session_id),
         explain_analyze_terminal_degraded: input.explain_analyze_terminal_degraded,
-        offering_id: crate::cli::session::session_runtime::active_offering_id_for_request(),
+        offering_id: state
+            .model
+            .as_ref()
+            .and_then(|model| model.offering_id())
+            .map(str::to_string),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
         explain: state.explain,
@@ -159,7 +163,7 @@ fn build_turn_stream_params<'a>(
         resume_restricted_tools: &state.resume_restricted_tools,
         session_lessons: &state.session_lessons,
         memory_selection_reports: &state.memory_selection_reports,
-        latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
+
         latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
         unified_skill_registry: &state.unified_skill_registry,
         is_plan_subtask: false,
@@ -556,26 +560,22 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_turn_stream_state_captures_canonical_active_fanout_truth() {
-        let transport = Arc::new(astra_messaging::InProcessTransport::new());
-        let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
-        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        use astra_core::work_unit::{
+            WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+        };
         let active_work_registry = Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
-        let spawner = Arc::new(
-            astra_runtime::orchestration::DynamicAgentSpawner::new(router)
-                .with_active_work_registry(active_work_registry.clone()),
-        );
-        spawner
-            .declare_fanout_group(
+        active_work_registry.observe(
+            &WorkUnitObservation::new(
                 "review-group",
-                "Three-angle review",
-                3,
-                Some("tool-fanout"),
-                "prior-root-run",
+                "agent_fanout",
+                WorkUnitStatus::Pending,
+                1,
+                WorkUnitObservationMode::Transition,
             )
-            .await
-            .unwrap();
+            .unwrap()
+            .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal),
+        );
         let state = SessionState {
-            agent_spawner: Some(spawner),
             active_work_registry,
             ..SessionState::default()
         };

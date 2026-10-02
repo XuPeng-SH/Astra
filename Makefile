@@ -266,7 +266,7 @@ dev-deps-down:
 .PHONY: dev-deps-clean
 dev-deps-clean:
 	@echo "⚠️  WARNING: This will delete all dependency data!"
-	@printf "Are you sure? [y/N] " && read REPLY && \
+	@set -e; printf "Are you sure? [y/N] " && read REPLY && \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
 		($(DEPS_COMPOSE) down -v); \
 		if [ -d deployment/all-in-one/data ]; then \
@@ -1202,9 +1202,10 @@ test-mcp-fixture:
 	@CARGO_INCREMENTAL=0 $(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin mock_mcp_server
 
 .PHONY: test-workspace
+# Feature unification includes the deep futures exercised by the e2e-hooks lane.
 test-workspace: sweep test-mcp-fixture
 	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
@@ -1665,7 +1666,7 @@ test-harness-capabilities: validate-capability-matrix ## Audit typed anchors, th
 #   ASTRA_WORK_LIVE_RUN_DIR    — retain state, PTY, Web, and Playwright evidence
 # ----------------------------------------------------------------------------
 .PHONY: test-work-live
-test-work-live: dev-web-deps ## Run the real TUI → Web Work journey (opt-in; not offline/CI)
+test-work-live: dev-web-deps ## Run the real TUI → Web Work journey (Linux opt-in; not offline/CI)
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin astra
 	@run_dir="$${ASTRA_WORK_LIVE_RUN_DIR:-$$(mktemp -d -t astra-work-live.XXXXXX)}"; \
 	ASTRA_HARNESS_ACCESS_TOKEN="$${ASTRA_HARNESS_ACCESS_TOKEN:-}" \

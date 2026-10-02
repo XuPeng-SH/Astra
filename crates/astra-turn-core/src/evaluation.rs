@@ -135,7 +135,8 @@ const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
 /// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
 /// time constants above, but runtime callers may override them from config so
 /// passive eval signals can be tuned without a rebuild.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationThresholds {
     pub redundant_overlapping_reads: usize,
     pub search_fanout: usize,
@@ -3915,6 +3916,131 @@ pub fn eval_signals_to_json_with_thresholds(
         .iter()
         .map(|signal| eval_signal_to_json_with_thresholds(signal, thresholds))
         .collect()
+}
+
+/// Project only the feedback signals the runtime currently consumes. The
+/// canonical journal retains every signal, including kinds this consumer does
+/// not act on; malformed known signals never acquire invented counts or names.
+pub fn turn_evaluation_feedback_signals(metadata: &Value) -> Result<Vec<EvalSignal>, &'static str> {
+    let signals = metadata
+        .get("signals")
+        .and_then(Value::as_array)
+        .ok_or("missing evaluation signals")?;
+    let text = |value: &Value, key| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or("invalid evaluation signal text")
+    };
+    let count = |value: &Value, key| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("invalid evaluation signal count")
+    };
+    signals
+        .iter()
+        .filter_map(|signal| {
+            let kind = match signal.get("kind").and_then(Value::as_str) {
+                Some(kind) => kind,
+                None => return Some(Err("missing evaluation signal kind")),
+            };
+            Some(match kind {
+                "repeat_tool_call" => text(signal, "tool").map(EvalSignal::RepeatToolCall),
+                "stall_detected" => Ok(EvalSignal::StallDetected),
+                "verdict_warning" => Ok(EvalSignal::VerdictWarning),
+                "tool_outcome_failure" => text(signal, "class").and_then(|class| {
+                    count(signal, "count")
+                        .map(|count| EvalSignal::ToolOutcomeFailure { class, count })
+                }),
+                "blocked_tool_call" => {
+                    count(signal, "count").map(|count| EvalSignal::BlockedToolCall { count })
+                }
+                "exploration_family_churn" => text(signal, "family").and_then(|family| {
+                    count(signal, "streak")
+                        .map(|streak| EvalSignal::ExplorationFamilyChurn { family, streak })
+                }),
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+/// Accept an evaluation only as an exact root terminal's immutable fact. This
+/// validates the existing JournalEvent wire format, without evaluating partial
+/// client observations or constructing another representation of the outcome.
+pub fn turn_evaluation_from_terminal(
+    value: &Value,
+    session_id: Option<&str>,
+    run_id: &str,
+    owner_generation: Option<u64>,
+    status: &str,
+) -> Result<JournalEvent, &'static str> {
+    let event: JournalEvent =
+        serde_json::from_value(value.clone()).map_err(|_| "malformed evaluation journal event")?;
+    let session_id = session_id
+        .filter(|id| !id.is_empty())
+        .ok_or("evaluation has no stream session identity")?;
+    let generation = owner_generation.ok_or("evaluation has no terminal execution generation")?;
+    if event.event_type != astra_services::session_journal::JournalEventType::TurnEvaluation
+        || event.session_id.as_deref() != Some(session_id)
+        || event
+            .producer_scope
+            .as_ref()
+            .map(|scope| scope.run_id.as_str())
+            != Some(run_id)
+        || event.turn.is_none()
+        || event.ts.is_empty()
+    {
+        return Err("evaluation identity does not match the root terminal");
+    }
+    let metadata = event
+        .metadata
+        .as_ref()
+        .ok_or("missing evaluation metadata")?;
+    if metadata
+        .get("execution_owner_generation")
+        .and_then(Value::as_u64)
+        != Some(generation)
+        || metadata.get("run_status").and_then(Value::as_str) != Some(status)
+        || !matches!(
+            metadata.get("source").and_then(Value::as_str),
+            Some("server_runtime" | "server_subrun")
+        )
+    {
+        return Err("evaluation authority does not match the root terminal");
+    }
+    let success = metadata
+        .get("success")
+        .and_then(Value::as_bool)
+        .ok_or("missing evaluation success")?;
+    let tool_success = metadata
+        .get("tool_evaluation_success")
+        .and_then(Value::as_bool)
+        .ok_or("missing tool evaluation success")?;
+    if success != (tool_success && matches!(status, "completed" | "delegated")) {
+        return Err("evaluation contradicts terminal outcome");
+    }
+    for key in ["quality", "confidence"] {
+        if !metadata
+            .get(key)
+            .and_then(Value::as_f64)
+            .is_some_and(|value| (0.0..=1.0).contains(&value))
+        {
+            return Err("invalid evaluation quality or confidence");
+        }
+    }
+    if metadata
+        .get("status_notice")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err("invalid evaluation status notice");
+    }
+    turn_evaluation_feedback_signals(metadata)?;
+    Ok(event)
 }
 
 #[allow(clippy::too_many_arguments)]

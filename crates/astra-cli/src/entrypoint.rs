@@ -467,7 +467,6 @@ async fn run_async() -> i32 {
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
-    cli::session::session_runtime::set_active_offering_id_for_request(None);
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {

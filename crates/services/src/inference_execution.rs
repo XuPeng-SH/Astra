@@ -133,6 +133,18 @@ pub struct InferenceProviderWireIdentity {
 }
 
 impl InferenceInvocationPlan {
+    /// Offline verification observes the exact admitted run authority without
+    /// exposing opaque admission or owner tokens.
+    #[cfg(feature = "e2e-hooks")]
+    pub fn e2e_admission_coordinates(
+        &self,
+    ) -> (
+        astra_turn_types::InferenceInvocationScope,
+        Option<InferenceRunAdmissionAuthority>,
+    ) {
+        (self.input.scope.clone(), self.input.run_authority.clone())
+    }
+
     pub fn with_price_snapshot(
         mut self,
         snapshot: Option<&crate::models::InferencePriceSnapshot>,

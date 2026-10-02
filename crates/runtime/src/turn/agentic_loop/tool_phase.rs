@@ -3198,7 +3198,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         policy_subject,
         &state.stall.tool_call_records,
         state.llm_rounds_completed,
-        crate::turn::runtime_policy::configured_evaluation_thresholds(),
+        state.evaluation_thresholds,
         state.turn_guard.recovery_evidence(),
     );
     state.stall.runtime_policy_evaluation = policy_state;

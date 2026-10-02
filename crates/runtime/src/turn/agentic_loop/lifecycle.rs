@@ -3455,8 +3455,6 @@ fn apply_structured_user_reanchor(
     // Hard capability/permission restrictions are owned by their boundary and
     // must survive a semantic re-anchor. Behavioral state can reset here, but
     // user intent must not broaden the executable capability surface.
-    state.boosted_tools.clear();
-    state.widen_selection_pending = true;
 
     if let Some(session) = state.pipeline_session.as_mut() {
         match relation {
@@ -9181,7 +9179,6 @@ mod tests {
         assert!(state.turn_guard.errors.recent_error_pressure() > 0);
 
         state.restricted_tools.insert("bash".into());
-        state.boosted_tools.insert("grep".into());
 
         assert!(apply_structured_user_reanchor(
             &mut state,
@@ -9199,14 +9196,6 @@ mod tests {
             state.restricted_tools,
             HashSet::from(["bash".to_string()]),
             "semantic re-anchoring must not broaden the hard capability surface"
-        );
-        assert!(
-            state.boosted_tools.is_empty(),
-            "stale auto-reflection boosts belong to the previous episode"
-        );
-        assert!(
-            state.widen_selection_pending,
-            "the next assembly should expose the full tool catalogue once"
         );
     }
 
@@ -9275,7 +9264,6 @@ mod tests {
 
         state.turn_guard.nudge_count = 2;
         state.restricted_tools.insert("bash".into());
-        state.boosted_tools.insert("grep".into());
         state
             .pipeline_session
             .as_mut()
@@ -9294,8 +9282,6 @@ mod tests {
         assert!(matches!(repeated, PreparedTurnIteration::Ready(_)));
         assert_eq!(state.turn_guard.nudge_count, 0);
         assert_eq!(state.restricted_tools, HashSet::from(["bash".to_string()]));
-        assert!(state.boosted_tools.is_empty());
-        assert!(state.widen_selection_pending);
         let signals = hub.recent_feedback_signals();
         let correction = signals
             .iter()

@@ -5,7 +5,7 @@ description: |
   **Pass means**: The parent rejects admission before child execution and reports the unavailable name accurately.
   **Fail means**: A child executes with an unregistered capability or the parent invents a child response.
 prompt: |
-  Spawn exactly one foreground child with:
+  Spawn exactly one child with:
     action: "spawn"
     name: "unregistered-tool-boundary-child"
     description: "Probe child tool availability boundary"

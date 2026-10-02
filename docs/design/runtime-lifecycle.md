@@ -34,6 +34,16 @@ A session is the continuity boundary for user-visible conversation, context, mem
 
 A session may span Web, CLI, Edge, and multiple devices. Surface changes do not create a new backbone.
 
+CLI session exit commits the local journal end and workspace boundary before
+optional remote maintenance. A failed local write remains observable and
+retryable; an ambiguous sync result is retried against the journal rather than
+an independent process-wide completion flag. Remote governance and lesson
+maintenance share one bounded deadline, including authentication transitions.
+Canonical continuation, owner/cursor/root checks and the execution lease remain
+the recovery authority. The CLI has no manual history-edit/checkpoint frontend.
+Startup retention maintenance runs on a blocking worker with a captured owner
+path and protects the explicit resume target, including compressed journals.
+
 ## Run
 
 A run is a durable execution attempt inside a session. It owns status, owner lease, checkpoint lineage, current stage, and terminal outcome.
@@ -55,9 +65,19 @@ archived
 
 A run may be resumed when its state and checkpoint indicate resumability. Resume must not guess from UI state.
 
+Server recovery preserves the opaque execution handoff checkpoint and fences
+its custody to the adopted owner generation. It does not reconstruct execution
+of the original run. Continuing a session in a new run consumes canonical
+conversation history under that new run's admission and ownership; retaining or
+adopting a checkpoint alone does not authorize executing its saved tool calls.
+
 ## Turn
 
 A turn is the user/agent interaction unit used for context, prompt, trace, and tool sequencing. Tool calls inside a turn inherit provider decisions from the capability system.
+
+When a current request supplies an empty `message` and a nonempty `user_intent`,
+the intent is its human prompt. Initial conversation history and the task profile
+use that same effective input. A nonempty `message` remains the prompt text.
 
 ### Bounded continuation and completion
 
@@ -199,6 +219,11 @@ without proving a successful validation when its arguments have ambiguous
 execution semantics. An ambiguous success clears only its own failure debt;
 Work delivery still requires a proof-eligible validation, with one bounded
 direct revalidation opportunity or a truthful failed/blocked settlement.
+At each completion boundary, the current Work attempt's validation projection
+collects operation debts, freshness and recovery targets together. It is
+short-lived evidence rather than another persisted state or global cache.
+Reopening an action window does not itself replenish its mismatch or repair
+budget; only the corresponding typed transition may reserve a dependent round.
 Argument proof follows the tool's option/operand boundary: a TypeScript `@file`
 is opaque only when parsed as a top-level response-file argument, not when a
 known value-taking option consumes it as an ordinary path or package name.
@@ -553,3 +578,5 @@ Runtime lifecycle migration should proceed in stages:
 | Deleted task in old UI cache | Durable projection wins; task remains hidden. |
 | Owner lease expired | New owner may recover without double-executing non-idempotent side effects. |
 | Buffered completion exists | Finalize without resuming execution when safe. |
+
+The legacy webhook and schedule trigger APIs are retired. They did not admit a Run: webhook firing only returned `fired: true`, and stored cron expressions had no scheduler consumer. Executed work uses the existing Run admission and lifecycle boundaries.

@@ -2,6 +2,321 @@ use crate::prompts::{CompactConfig, CompactionTier};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Shared prefix boundary for mechanical and model-generated history summaries.
+pub(crate) fn protected_history_spill_count(messages: &[Value], proposed: usize) -> usize {
+    let mut boundary = proposed.min(messages.len());
+    if let Some(anchor) = messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)
+    {
+        boundary = boundary.min(anchor);
+    }
+    if let Some(authority) =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+    {
+        boundary = boundary.min(authority);
+    }
+    adjust_spill_boundary_for_tool_pairs(messages, boundary)
+}
+
+pub(crate) struct PrefixSummaryCompaction {
+    pub messages: Vec<Value>,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub messages_removed: usize,
+}
+
+impl PrefixSummaryCompaction {
+    pub fn tokens_freed(&self) -> u64 {
+        self.tokens_before - self.tokens_after
+    }
+}
+
+/// Prepare a canonical rewrite without touching the admitted history. A durable
+/// artifact writer, when needed, must succeed before the caller commits it.
+pub(crate) fn prepare_prefix_summary(
+    messages: &[Value],
+    spill_count: usize,
+    summary: Value,
+    schema_tokens: usize,
+    max_tokens: u64,
+    system_prompt_tokens: Option<usize>,
+) -> Option<PrefixSummaryCompaction> {
+    if spill_count == 0 || protected_history_spill_count(messages, spill_count) != spill_count {
+        return None;
+    }
+    let estimate = |history: &[Value]| {
+        crate::turn::agentic_loop::lifecycle::estimate_context_pressure_with_system_prompt_tokens(
+            history,
+            schema_tokens,
+            max_tokens,
+            system_prompt_tokens,
+        )
+        .1
+    };
+    let tokens_before = estimate(messages);
+    let mut compacted = Vec::with_capacity(messages.len() - spill_count + 1);
+    compacted.push(summary);
+    compacted.extend(messages[spill_count..].iter().cloned());
+    let tokens_after = estimate(&compacted);
+    (tokens_after < tokens_before).then(|| PrefixSummaryCompaction {
+        messages_removed: messages.len() - compacted.len(),
+        messages: compacted,
+        tokens_before,
+        tokens_after,
+    })
+}
+
+pub(crate) fn adjust_spill_boundary_for_tool_pairs(
+    messages: &[serde_json::Value],
+    mut spill_count: usize,
+) -> usize {
+    let is_tool_role = |m: &serde_json::Value| -> bool {
+        let role = m.get("role").and_then(|r| r.as_str());
+        // OpenAI-shape: role is "tool"; Anthropic-shape: role is "tool_result".
+        if matches!(role, Some("tool") | Some("tool_result")) {
+            return true;
+        }
+        // Anthropic tool-result messages arrive as role="user" with a content
+        // array containing {type:"tool_result"} blocks.  The current-role check
+        // above misses these, which would leave an orphaned tool_use assistant
+        // message in the retained window.
+        if role == Some("user") {
+            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                return arr
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+            }
+        }
+        false
+    };
+    let has_tool_calls = |m: &serde_json::Value| -> bool {
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            return false;
+        }
+        // OpenAI-shape: top-level `tool_calls` array.
+        if m.get("tool_calls")
+            .and_then(|t| t.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Anthropic-shape: `content` is an array with `tool_use` blocks.
+        if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+            return arr
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+        }
+        false
+    };
+
+    // Walk backward while the boundary is unsafe. Bail if we'd spill nothing.
+    while spill_count > 0 {
+        let last_spilled = &messages[spill_count - 1];
+        let first_retained = messages.get(spill_count);
+        let retained_starts_with_tool = first_retained.map(is_tool_role).unwrap_or(false);
+        let last_is_pending_assistant = has_tool_calls(last_spilled);
+        if !retained_starts_with_tool && !last_is_pending_assistant {
+            break;
+        }
+        spill_count -= 1;
+    }
+    spill_count
+}
+
+pub(crate) fn build_spill_summary(messages: &[serde_json::Value]) -> String {
+    let mut user_messages = Vec::new();
+    let mut tools_used = Vec::new();
+    let mut files_modified = Vec::new();
+    let mut errors = Vec::new();
+    let mut assistant_updates = Vec::new();
+
+    // Synthetic/system-injected user messages that shouldn't count as "requests".
+    const SYNTHETIC_USER_PREFIXES: &[&str] = &[
+        "[attention:",
+        "[session-anchor]",
+        "[working-set:",
+        "[session-memory:",
+        "(cached",
+    ];
+    let is_synthetic_user = |s: &str| {
+        SYNTHETIC_USER_PREFIXES
+            .iter()
+            .any(|p| s.trim_start().starts_with(p))
+    };
+
+    // Extract plain text from a `content` field that may be a string or an
+    // array of content blocks (Anthropic shape).
+    let content_text = |v: &serde_json::Value| -> Option<String> {
+        if let Some(s) = v.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(arr) = v.as_array() {
+            let mut out = String::new();
+            for b in arr {
+                let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if ty == "text" {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(t);
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+        }
+        None
+    };
+
+    // Record a tool invocation. Paths from read/search tools are deliberately
+    // not persisted into the prompt-facing spill summary: failed exploratory
+    // reads often contain stale or deleted paths, and promoting those into a
+    // system summary makes the next turn treat them as current workspace facts.
+    let mut record_tool = |name: &str, args: &serde_json::Value| {
+        let path = args.get("path").and_then(|p| p.as_str());
+        if let Some(p) = path {
+            if matches!(name, "str_replace" | "write_file" | "multi_edit") {
+                let ps = p.to_string();
+                if !files_modified.contains(&ps) {
+                    files_modified.push(ps);
+                }
+            }
+        }
+        tools_used.push(name.to_string());
+    };
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "user" => {
+                if let Some(content) = msg.get("content").and_then(content_text) {
+                    if !is_synthetic_user(&content) {
+                        let preview: String = content.chars().take(150).collect();
+                        user_messages.push(preview);
+                    }
+                }
+            }
+            "assistant" => {
+                // OpenAI-shape: top-level `tool_calls`.
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("?");
+                        let args_str = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("");
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+                        record_tool(name, &parsed);
+                    }
+                }
+                // Anthropic-shape: content array with `tool_use` blocks.
+                if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                    for block in arr {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let input = block
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            record_tool(name, &input);
+                        }
+                    }
+                }
+                // Preserve bounded visible decisions and progress; never copy
+                // provider-private reasoning blocks into a model summary.
+                if let Some(text) = msg.get("content").and_then(content_text) {
+                    if !text.trim().is_empty() {
+                        assistant_updates.push(text.chars().take(200).collect::<String>());
+                    }
+                }
+                // Error mentions in assistant text — require word boundaries
+                // to avoid false positives like "no errors" or "won't fail".
+                if let Some(text) = msg.get("content").and_then(content_text) {
+                    let looks_like_error = text.contains(": error")
+                        || text.contains("Error:")
+                        || text.contains("panicked")
+                        || text.contains("traceback")
+                        || text.contains("Traceback");
+                    if looks_like_error && errors.len() < 5 {
+                        let preview: String = text.chars().take(100).collect();
+                        errors.push(preview);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut summary = String::new();
+
+    if !user_messages.is_empty() {
+        summary.push_str("**User requests:**\n");
+        for (i, msg) in user_messages.iter().take(10).enumerate() {
+            summary.push_str(&format!("{}. {}\n", i + 1, msg));
+        }
+        summary.push('\n');
+    }
+
+    if !assistant_updates.is_empty() {
+        summary.push_str("**Assistant updates:**\n");
+        for update in assistant_updates.iter().rev().take(5).rev() {
+            summary.push_str(&format!("- {update}\n"));
+        }
+        summary.push('\n');
+    }
+
+    if !files_modified.is_empty() {
+        summary.push_str("**Files modified:**\n");
+        for f in files_modified.iter().take(20) {
+            summary.push_str(&format!("- {f}\n"));
+        }
+        summary.push('\n');
+    }
+
+    if !tools_used.is_empty() {
+        // Deduplicate and count
+        let mut tool_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for t in &tools_used {
+            *tool_counts.entry(t.as_str()).or_default() += 1;
+        }
+        let mut sorted: Vec<_> = tool_counts.into_iter().collect();
+        sorted.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        summary.push_str(&format!("**Tools used ({} calls):**\n", tools_used.len()));
+        for (tool, count) in sorted.iter().take(15) {
+            if *count > 1 {
+                summary.push_str(&format!("- {tool} ×{count}\n"));
+            } else {
+                summary.push_str(&format!("- {tool}\n"));
+            }
+        }
+        summary.push('\n');
+    }
+
+    if !errors.is_empty() {
+        summary.push_str("**Errors encountered:**\n");
+        for e in &errors {
+            summary.push_str(&format!("- {e}\n"));
+        }
+    }
+
+    if summary.is_empty() {
+        summary.push_str("(no structured content extracted from spilled messages)");
+    }
+
+    summary
+}
+
 // ---------------------------------------------------------------------------
 // Budget-based truncation. Exact-output deduplication belongs to the pipeline's
 // DuplicateToolOutputElimination layer, never to path/name heuristics here.
@@ -1749,5 +2064,54 @@ mod tests {
         let back: CompactBoundary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.pre_tokens, 0);
         assert_eq!(back.messages_before, 0);
+    }
+}
+
+#[cfg(test)]
+mod prefix_summary_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn prefix_summary_preserves_latest_request_and_requires_net_gain() {
+        let history = vec![
+            json!({"role":"user","content":"old request"}),
+            json!({"role":"assistant","content":"evidence ".repeat(1000)}),
+            json!({"role":"user","content":"current request"}),
+            json!({"role":"assistant","content":"current work"}),
+        ];
+        assert_eq!(protected_history_spill_count(&history, 4), 2);
+        let candidate = prepare_prefix_summary(
+            &history,
+            2,
+            json!({"role":"system","content":"summary"}),
+            0,
+            10000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(&candidate.messages[1..], &history[2..]);
+        assert!(candidate.tokens_freed() > 0);
+        assert!(
+            prepare_prefix_summary(
+                &history,
+                2,
+                json!({"role":"system","content":"larger summary ".repeat(2000)}),
+                0,
+                10000,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            prepare_prefix_summary(
+                &history,
+                3,
+                json!({"role":"system","content":"summary"}),
+                0,
+                10000,
+                None
+            )
+            .is_none()
+        );
     }
 }

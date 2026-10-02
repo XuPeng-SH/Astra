@@ -5,7 +5,6 @@ pub mod agent_lessons;
 pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
-pub mod branches;
 pub mod byok_endpoint;
 mod cancellation_safe_db;
 pub(crate) use cancellation_safe_db::CancellationSafeTransaction;
@@ -75,7 +74,6 @@ pub mod sync_outbox;
 pub mod team_persistence;
 pub mod tool_invocation_ledger;
 pub mod tool_result_selection_observation;
-pub mod triggers;
 pub mod tuning;
 pub mod turn_intent_judge;
 pub mod verification;
@@ -161,7 +159,6 @@ pub use auth::{
     SessionCreationResult, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
     SessionUpdateRequestData,
 };
-pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
     SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
@@ -378,10 +375,6 @@ pub use sync_outbox::{
     SyncOutboxPoisonKind, SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport,
     SyncOutboxSkipKind, SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore,
     sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id,
-};
-pub use triggers::{
-    DatabaseTriggerService, TriggerCreateRequestData, TriggerRecord, TriggerService,
-    UnconfiguredTriggerService, WebhookFireData,
 };
 pub use turn_intent_judge::{
     TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,

@@ -38,11 +38,10 @@ published only after schema validation succeeds.
 
 ## Transcript persistence
 
-Fresh schema contract `2026-09-29-v91` stores transcript items and their
+Fresh schema contract `2026-10-03-v93` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
-The retired session-level physical-workspace claim table is not part of this
-contract. There is no migration, replacement table, page cache, or rebuild job;
+The retired session-level physical-workspace claim and unexecuted workflow-trigger tables are not part of this contract. There is no migration, replacement table, page cache, or rebuild job;
 an older database must be recreated from the current schema.
 
 One append implementation requires canonical session admission in the same
@@ -168,3 +167,9 @@ one transaction. Routing decisions and reviewed outcomes continue to use
 `agent_run_events`; dashboard queries are bounded projections of that ledger.
 As with the canonical bootstrap policy above, older schema markers are rejected;
 this change does not implement an in-place migration or backfill.
+
+Compressed conversation history is an immutable `context_history_v1` session
+artifact, referenced by `session_transcript` with the owning session ID. It
+remains reachable until the existing owned-session deletion releases its
+references. Server introspect reads bounded UTF-8 windows from the authenticated
+artifact store; client-local file paths are not recovery authority.

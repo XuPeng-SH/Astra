@@ -268,7 +268,6 @@ struct PrepareChatTurnRequest<'a> {
     valid_tool_names: &'a mut HashSet<String>,
     turn_guard: &'a TurnGuard,
     restricted_tools: &'a mut HashSet<String>,
-    widen_selection_pending: &'a mut bool,
     step_recorder: &'a mut StepRecorder,
     assembly_start: Instant,
     telem: PrepareTurnTelemetry<'a>,
@@ -775,9 +774,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         .and_then(|intent| intent.domain)
         .map(|domain| vec![domain.as_str().to_string()])
         .unwrap_or_default();
-    // Consume the one-shot strategy/correction reset marker. Tool health is
-    // advisory only and never mutates the hard schema restriction set.
-    let _ = std::mem::take(ctx.widen_selection_pending);
     ctx.step_recorder
         .record_perceive(semantic_query_str, &[], &judged_domain_hints);
 
@@ -1397,7 +1393,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub pinned_tool_schema_tokens: &'a mut u64,
     pub turn_guard: &'a astra_turn_core::turn_guard::TurnGuard,
     pub restricted_tools: &'a mut HashSet<String>,
-    pub widen_selection_pending: &'a mut bool,
     pub step_recorder: &'a mut StepRecorder,
     pub assembly_start: Instant,
     pub telem: PrepareTurnTelemetry<'a>,
@@ -1669,7 +1664,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         pinned_tool_schema_tokens,
         turn_guard,
         restricted_tools,
-        widen_selection_pending,
         step_recorder,
         assembly_start,
         telem,
@@ -1765,7 +1759,6 @@ pub(crate) async fn fetch_chat_turn_sse(
                 valid_tool_names,
                 turn_guard,
                 restricted_tools,
-                widen_selection_pending,
                 step_recorder,
                 assembly_start,
                 telem,
@@ -2274,7 +2267,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -2310,7 +2302,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -2508,7 +2499,6 @@ mod tests {
             let recent_tools: Vec<String> = Vec::new();
             let mut restricted_tools = HashSet::new();
             let mut valid_tool_names = HashSet::new();
-            let mut widen_selection_pending = false;
             let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
             let turn_guard = TurnGuard::default();
             let mut turn_policy = TurnInteractionPolicy::default();
@@ -2544,7 +2534,6 @@ mod tests {
                 valid_tool_names: &mut valid_tool_names,
                 turn_guard: &turn_guard,
                 restricted_tools: &mut restricted_tools,
-                widen_selection_pending: &mut widen_selection_pending,
                 step_recorder: &mut step_recorder,
                 assembly_start: Instant::now(),
                 telem: PrepareTurnTelemetry {
@@ -3226,7 +3215,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3262,7 +3250,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -3402,7 +3389,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3438,7 +3424,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -3545,7 +3530,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder =
             StepRecorder::new("test-user", "session-empty-selector", "task-empty-selector");
         let turn_guard = TurnGuard::default();
@@ -3582,7 +3566,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -3666,7 +3649,6 @@ mod tests {
 
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new(
             "test-user",
             "session-pending-activation",
@@ -3705,7 +3687,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -3761,7 +3742,6 @@ mod tests {
         let messages = vec![json!({"role": "user", "content": "inspect the repository"})];
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-empty", "task-empty");
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
@@ -3796,7 +3776,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -3877,7 +3856,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -3913,7 +3891,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -4015,7 +3992,6 @@ mod tests {
         let tool_results = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -4060,7 +4036,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -4186,7 +4161,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -4222,7 +4196,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -4312,7 +4285,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -4348,7 +4320,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -4434,7 +4405,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -4470,7 +4440,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -4539,7 +4508,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -4575,7 +4543,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -4652,7 +4619,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -4688,7 +4654,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
@@ -4738,179 +4703,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_consumes_widen_selection_pending_once() {
-        use crate::edge_tools::ToolExecutor;
-        use astra_pipeline::step_recorder::StepRecorder;
-        use astra_runtime::{
-            tool_registry::ToolRegistry,
-            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
-        };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
-        use std::{collections::HashSet, sync::Arc, time::Instant};
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let all_schemas = vec![schema("read_file"), schema("write_file")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
-        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-        let messages = vec![json!({"role": "user", "content": "update the file"})];
-        let tool_results = Vec::new();
-        let history: Vec<(String, String)> = Vec::new();
-        let recent_tools: Vec<String> = Vec::new();
-        let mut restricted_tools = HashSet::new();
-        let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = true;
-        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let mut turn_guard = TurnGuard::default();
-        turn_guard.health.record_failure("write_file");
-        turn_guard.health.record_failure("write_file");
-        turn_guard.health.record_failure("write_file");
-        let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_selection_report = None;
-        let mut first_budget_pressure = 0.0;
-        let mut first_context_assembly_ms = None;
-        let mut all_selected_skills = Vec::new();
-
-        let first_payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            messages: &messages,
-            runtime_required_texts: &[],
-            active_system_skills: &[],
-            runtime_volatile_texts: &[],
-            runtime_volatile_injections: &[],
-            ephemeral_prefix: None,
-            current_session_id: Some("session-1"),
-            offering_id: None,
-            model: None,
-            context_window_tokens: 200_000,
-            effective_input_budget_tokens: 200_000,
-            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
-            project_root: temp_dir.path(),
-            message: "update the file",
-            user_intent: "update the file",
-            semantic_query_override: None,
-            turn_intent: None,
-            history: &history,
-            recent_tools: &recent_tools,
-            executor: executor.clone(),
-            registry: &registry,
-            tool_results: &tool_results,
-            all_schemas: &all_schemas,
-            valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
-            restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
-            step_recorder: &mut step_recorder,
-            assembly_start: Instant::now(),
-            telem: PrepareTurnTelemetry {
-                first_selection_report: &mut first_selection_report,
-                first_budget_pressure: &mut first_budget_pressure,
-                first_context_assembly_ms: &mut first_context_assembly_ms,
-                all_selected_skills: &mut all_selected_skills,
-                trace_collector: None,
-            },
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            timing_phases: false,
-            prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            interaction_mode: TurnInteractionMode::NonInteractive,
-            turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
-            session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            denial_pressure: (0, 0),
-            recent_rejections: Vec::new(),
-            observability_hub: None,
-            append_system_prompt: None,
-            plan_mode_active: false,
-            lessons_text: None,
-        })
-        .await;
-
-        let first_tool_names: Vec<&str> = first_payload["edge_tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|schema| schema["function"]["name"].as_str())
-            .collect();
-        assert!(first_tool_names.contains(&"write_file"));
-        assert!(!widen_selection_pending);
-
-        let second_payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            messages: &messages,
-            runtime_required_texts: &[],
-            active_system_skills: &[],
-            runtime_volatile_texts: &[],
-            runtime_volatile_injections: &[],
-            ephemeral_prefix: None,
-            current_session_id: Some("session-1"),
-            offering_id: None,
-            model: None,
-            context_window_tokens: 200_000,
-            effective_input_budget_tokens: 200_000,
-            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
-            project_root: temp_dir.path(),
-            message: "update the file",
-            user_intent: "update the file",
-            semantic_query_override: None,
-            turn_intent: None,
-            history: &history,
-            recent_tools: &recent_tools,
-            executor,
-            registry: &registry,
-            tool_results: &tool_results,
-            all_schemas: &all_schemas,
-            valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
-            restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
-            step_recorder: &mut step_recorder,
-            assembly_start: Instant::now(),
-            telem: PrepareTurnTelemetry {
-                first_selection_report: &mut first_selection_report,
-                first_budget_pressure: &mut first_budget_pressure,
-                first_context_assembly_ms: &mut first_context_assembly_ms,
-                all_selected_skills: &mut all_selected_skills,
-                trace_collector: None,
-            },
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            timing_phases: false,
-            prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            interaction_mode: TurnInteractionMode::NonInteractive,
-            turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 1,
-            session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            denial_pressure: (0, 0),
-            recent_rejections: Vec::new(),
-            observability_hub: None,
-            append_system_prompt: None,
-            plan_mode_active: false,
-            lessons_text: None,
-        })
-        .await;
-
-        let second_tool_names: Vec<&str> = second_payload["edge_tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|schema| schema["function"]["name"].as_str())
-            .collect();
-        assert!(second_tool_names.contains(&"write_file"));
-        assert!(
-            restricted_tools.is_empty(),
-            "soft health signals must not remove visible tool schemas"
-        );
-    }
-
-    #[tokio::test]
     async fn prepare_chat_turn_payload_excludes_legacy_task_context() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
@@ -4931,7 +4723,6 @@ mod tests {
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
@@ -4967,7 +4758,6 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {

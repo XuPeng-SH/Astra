@@ -57,7 +57,6 @@ pub(crate) use data_layer::storage::{
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
 mod app_state;
-pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod capabilities;
 pub(crate) mod capability_endpoint_pool;
@@ -141,7 +140,6 @@ pub use astra_services::{
         SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
         SessionRecord, SessionService, SessionUpdateRequestData,
     },
-    branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{
         ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
         SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
@@ -191,7 +189,6 @@ pub use astra_services::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
     },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
-    triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
 };
 
 pub(crate) use astra_services::runs::UnconfiguredRunLifecycleService;

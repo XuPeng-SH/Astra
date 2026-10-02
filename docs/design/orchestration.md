@@ -62,6 +62,27 @@ Ordinary `agent.spawn` creates one independent child. A parent may propose sever
 spawns in one model response when the admitted execution topology permits
 parallel children; each call retains its own identity, admission result, and
 terminal state. A failed sibling does not roll back an already accepted child.
+Both entrypoints return launch receipts; child results arrive through the
+existing result query and completion barrier. Agent runs do not have a
+synchronous spawn mode or a foreground-to-background promotion operation.
+
+Restricted built-in read-only profiles retain the default `tool_search` discovery
+backbone. Persona defaults, explicit child requests and parent permissions still
+intersect; discovery cannot grant execution of a target outside that admitted
+scope. An explicit empty allowlist or a parent prohibition remains authoritative.
+Shell process detachment remains owned by the shell execution boundary.
+Every production launch consumes a one-use `PreparedSpawn`; model admission
+and static slot selection do not have an alternate execution path. Launch
+registers cancellation controls synchronously without starting I/O. The child
+supervisor starts the returned future, and rechecks mutable generation,
+cancellation, and deadline authority at execution boundaries.
+
+An isolated child workspace belongs to the explicitly selected CLI workspace
+boundary, which provisions tracked sources through Git and retains cleanup
+ownership until its workers actually finish. Unsupported boundaries, missing
+HEAD, and Git failures reject isolation explicitly. Cleanup failure leaves the
+child unsettled and observable; an abort request or observer timeout does not
+prove that the local worker stopped or that its workspace was removed.
 Use `agent_fanout.start` when the parent needs a fixed group with all-slot
 preflight and group-level control. Preflight prevents launching a group with
 an invalid slot, but provider or child execution can still fail after launch.
@@ -229,11 +250,21 @@ hard requirement; applicable hard requirements are resolved before defaults,
 independent of extraction order. A CLI child without a trusted task binder
 rejects new nested delegation when it inherits unresolved or constrained
 descendant requirements rather than silently dropping them.
-`max_output_tokens` is a ceiling for the first child model round, including its
-retries. CLI carries it as validated `context.max_output_tokens`; internal
+`max_output_tokens` is exposed by the resident `agent.spawn` schema and is a
+ceiling for the first child model round, including its retries. CLI carries it as validated `context.max_output_tokens`; internal
 delegation carries the same typed cap. Catalog output limits remain separate.
 Final request assembly cannot enlarge that cap or replace an exact reasoning
 control through route defaults, convergence, or settlement heuristics.
+
+Server fanout prepares every slot before launching any child and admits distinct
+non-inherited Offerings in one bounded user-scoped batch. CLI uses one
+`/model-access/admit` request for model or reasoning selections that require
+Server validation. Each response binds the selected display name, context
+window, reasoning, and output ceiling to its requested slot; it conveys no
+reusable authorization token. An inherited-only batch reuses the parent's exact
+Offering and model snapshot without a catalog lookup. Mixed batches require
+the exact parent Offering identity for inherited slots and fail before remote
+I/O if it is missing. Preparation failure never authorizes a partial launch.
 
 ## Failure handling
 

@@ -12,7 +12,11 @@ coarse projection budgets; context assembly owns actual request budgeting.
 The `post_compaction` reason describes a call after compaction state was recorded;
 multiple subsequent calls can carry it. Trace-gated, best-effort manifests are
 not one-per-compaction certificates, and their count does not prove preservation.
-Preservation belongs at acceptance of a canonical rewrite. Retrieval-stage
+Preservation belongs at acceptance of a canonical rewrite. Request-time manifest
+diagnostics retain only message/tool-result token totals across provider inference;
+they do not retain another transcript copy. These estimates are skipped unless
+context-assembly persistence has an owner and database, and the host must still
+confirm the authoritative session/run identity after inference. Retrieval-stage
 metadata describes runtime facts, but does not itself execute retrieval. Synthetic
 confidence, expiry, seven-child rendering, and 10GB retrieval assertions are not
 evidence that those policies or execution paths are implemented.
@@ -178,3 +182,10 @@ The prompt should not re-describe all tools every time a provider state changes.
 - Provider offline changes compact provider state, not the whole prompt contract.
 - Compaction preserves active tasks and pending blocked reasons.
 - Memory conflict is represented explicitly.
+
+History summaries and artifact-backed spills share prefix-boundary selection: the
+latest human request, active append-only authority suffix, and paired tool calls
+remain live. A replacement must reduce the full estimated context, including its
+summary and reference. Artifact storage must succeed before the canonical rewrite;
+a failure or cancellation preserves the original history. The selected host must
+provide a durable session artifact writer and an admitted introspect reader.

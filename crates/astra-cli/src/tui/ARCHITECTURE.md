@@ -230,7 +230,7 @@ not an interactive fallback dispatcher.
 | `Enter` | Composer | Submit text / dispatch slash command |
 | `Shift+Enter` | Composer | Insert newline (multi-line input) |
 | `Ctrl+C` | Turn active | Cancel/interrupt turn |
-| `Ctrl+B` | Turn active with foreground bash/agent | Promote active bash to a background shell task; otherwise promote a foreground sync agent |
+| `Ctrl+B` | Foreground bash, or task navigation | Detach active bash to a background shell task; otherwise open the task panel. Agents already run asynchronously |
 | `Ctrl+C` | Composer non-empty | Clear draft |
 | `Ctrl+C` | Idle | Quit |
 | `Ctrl+D` | Composer empty | Quit |

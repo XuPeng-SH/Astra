@@ -74,8 +74,6 @@ pub enum WorkRecoveryPointBlocker {
     UnresolvedInvocation,
     #[error("the Work execution environment is changing or needs attention")]
     ExecutionChanging,
-    #[error("Run frontier verification is not available yet")]
-    RunFrontierUnavailable,
     #[error("the Session context head changed since capture began")]
     ContextChanged,
     #[error("the Session execution binding changed since capture began")]
@@ -88,6 +86,8 @@ pub enum WorkRecoveryPointBlocker {
     ContextUnavailable,
     #[error("the workspace recovery package is missing or not sealed")]
     WorkspaceArtifactUnavailable,
+    #[error("the sealed workspace recovery package failed integrity verification")]
+    WorkspaceArtifactInvalid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

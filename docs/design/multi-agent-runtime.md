@@ -38,9 +38,9 @@ request/runtime limits and inherited wall-clock deadlines remain authoritative.
 The child must retain a path from a successful action to a truthful terminal
 answer while it is still making progress.
 
-## Foreground deadline ownership
+## Child deadline ownership
 
-A foreground child must not consume the parent's final-answer reserve. The
+A delegated child must not consume the parent's final-answer reserve. The
 parent retains the runtime's existing text-only final-convergence window after
 the child settles. Optional parent verification can use time left when a child
 finishes early; it is not reserved by shortening every child's deadline. The
@@ -128,22 +128,15 @@ execution and effect boundaries. When the parent
 has an explicit enabled-capability set, a child allowlist may include registered
 core tools or capabilities explicitly enabled by the parent; unknown names are
 rejected before dispatch. Dynamic capabilities must be present in that explicit
-parent set. A legacy unrestricted parent context retains its existing behavior.
+parent set. Parents without an explicit enabled-capability set still use their
+execution binding and authorization.
 
-For a Server fanout with explicit child models, the runtime validates every
-slot before launching any child, admits the distinct non-inherited Offerings as
-one bounded user-scoped batch, and binds each admitted execution to its slot.
-An inherited parent Offering reuses the parent's admission without another
-catalog read. Any invalid or revoked slot fails preparation for the entire
-fanout; admission does not authorize a partial launch.
-CLI fanout uses the same Server-owned check through one `/model-access/admit`
-request when slots explicitly select a model or reasoning control. The response
-contains only display name and context-window metadata; it is not a reusable
-authorization token, and inference still revalidates the Offering. An
-inherited-only CLI batch keeps its existing single catalog lookup. A mixed
-batch with inherited slots requires the parent's exact Offering identity;
-without it, preparation fails before remote I/O instead of guessing from a
-display name.
+Before launch, preparation binds each slot's model selection to its parent,
+Offering, reasoning, and slot identity. It grants no reusable inference
+authorization; each inference revalidates current authorization. Invalid
+preparation rejects the batch before any child starts. Provider and CLI batching
+rules and the catalog-read contract belong to
+[orchestration model selection](orchestration.md#model-selection).
 
 ## Result integration
 
@@ -178,7 +171,9 @@ rendered result cache.
 This preserves failed/unstarted slots and result addresses without reopening
 completed groups. Parent ownership expires with execution; historical cancellations
 must not permanently disable unrelated future parents. The session index is weak,
-and the live projection and persistence backlog remain bounded. No additional
+and the live projection and persistence backlog remain bounded. Subtree cancellation
+uses a shared insertion fence but retains no historical run-ID table; closure
+lives in the same execution-owned admission used by outstanding preparations. No additional
 database operation is required for admission or reading an evicted receipt.
 Result observation may use another turn in the same session while the group is
 live or its owner receipt survives. Spawn/replay and stop actions still require

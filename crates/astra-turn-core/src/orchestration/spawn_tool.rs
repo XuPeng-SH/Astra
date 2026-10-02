@@ -144,12 +144,6 @@ pub struct SpawnAgentInput {
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
 
-    /// Run in background (async). Default false — synchronous mode
-    /// ensures the parent receives the child's result in the tool-call
-    /// response before its turn budget is consumed.
-    #[serde(default)]
-    pub run_in_background: bool,
-
     /// Name for agent-to-agent messaging.
     pub name: Option<String>,
 
@@ -334,7 +328,6 @@ impl Default for SpawnAgentInput {
             description: String::new(),
             prompt: String::new(),
             agent_type: default_agent_type(),
-            run_in_background: false,
             name: None,
             initial_turns: None,
             max_output_tokens: None,
@@ -466,63 +459,11 @@ fn default_agent_type() -> String {
 ///
 /// Marked `#[must_use]`: every variant carries information the
 /// caller MUST act on. Forgetting `Launched` leaks a background
-/// agent (no one will ever call `get_result`); ignoring
-/// `Completed`/`Failed` discards the agent's actual output. The
-/// attribute makes the compiler nag if a spawn() return value is
-/// dropped without inspection.
-#[must_use = "spawning an agent without inspecting the result leaks the run \
-              (Launched: caller must follow up with get_result; \
-              Completed/Interrupted/Failed/Cancelled: caller must surface the agent's output)"]
+/// agent whose result must be received through the query/completion barrier.
+#[must_use = "inspect the launch receipt and receive the child result through get_result"]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SpawnAgentOutput {
-    /// Agent completed synchronously.
-    Completed {
-        agent_id: String,
-        /// Immutable execution identity for the canonical child transcript.
-        run_id: String,
-        result: String,
-        tool_calls: u32,
-        duration_ms: u64,
-    },
-    /// Agent produced partial output but stopped before normal completion.
-    Interrupted {
-        agent_id: String,
-        /// Immutable execution identity for the canonical child transcript.
-        run_id: String,
-        result: String,
-        finish_reason: String,
-        tool_calls: u32,
-        duration_ms: u64,
-    },
-    /// Agent was cancelled synchronously.
-    Cancelled {
-        agent_id: String,
-        /// Immutable execution identity for the canonical child transcript.
-        run_id: String,
-        reason: String,
-        finish_reason: String,
-        cancelled_by_user: bool,
-        tool_calls: u32,
-        duration_ms: u64,
-    },
-    /// Agent is waiting for external input synchronously.
-    Waiting {
-        agent_id: String,
-        /// Immutable execution identity for the canonical child transcript.
-        run_id: String,
-        reason: String,
-        tool_calls: u32,
-        duration_ms: u64,
-    },
-    /// Agent has a committed, resumable execution block.
-    Paused {
-        agent_id: String,
-        run_id: String,
-        reason: String,
-        tool_calls: u32,
-        duration_ms: u64,
-    },
     /// Agent launched in background.
     Launched {
         agent_id: String,
@@ -530,15 +471,6 @@ pub enum SpawnAgentOutput {
         run_id: String,
         description: String,
         messaging_address: Option<String>,
-    },
-    /// Failed to spawn.
-    Failed {
-        agent_id: String,
-        /// Immutable execution identity for the canonical child transcript.
-        run_id: String,
-        error: String,
-        finish_reason: String,
-        duration_ms: u64,
     },
 }
 
@@ -561,7 +493,6 @@ impl SpawnAgentOutput {
 mod tests {
     use super::*;
     use astra_turn_types::ModelSelector;
-    use serde_json::json;
 
     #[test]
     fn test_deserialize_input() {
@@ -569,9 +500,6 @@ mod tests {
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.description, "Test");
         assert_eq!(input.agent_type, "explore");
-        // Default is synchronous (run_in_background=false) so the parent
-        // receives the child's result in the tool-call response.
-        assert!(!input.run_in_background);
         // Inheritance defaults to None — existing clients get no
         // behavior change when they don't set inherit_prefix.
         assert!(input.inherit_prefix.is_none());
@@ -773,52 +701,10 @@ mod tests {
     }
 
     #[test]
-    fn run_in_background_default_is_false() {
-        let input = SpawnAgentInput::default();
-        assert!(
-            !input.run_in_background,
-            "run_in_background must default to false — synchronous spawn \
-             ensures the parent receives the child's result before \
-             its turn budget is consumed"
-        );
-    }
-
-    #[test]
-    fn run_in_background_true_requires_explicit_opt_in() {
-        let json = r#"{"description": "D", "prompt": "P", "run_in_background": true}"#;
-        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
-        assert!(
-            input.run_in_background,
-            "explicit run_in_background: true must be honored"
-        );
-    }
-
-    #[test]
-    fn run_in_background_populates_canonical_field() {
-        let json = r#"{"description": "D", "prompt": "P", "run_in_background": true}"#;
-        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
-        assert!(
-            input.run_in_background,
-            "run_in_background must populate the canonical field"
-        );
-    }
-
-    #[test]
-    fn run_in_background_false_matches_sync_default() {
-        let json = r#"{"description": "D", "prompt": "P", "run_in_background": false}"#;
-        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
-        assert!(
-            !input.run_in_background,
-            "run_in_background: false must produce the sync-default spawn"
-        );
-    }
-
-    #[test]
     fn fanout_metadata_round_trips_explicit_slot_identity() {
         let json = r#"{
             "description": "Review storage",
             "prompt": "Review storage layer",
-            "run_in_background": true,
             "fanout_group_id": "review-1",
             "fanout_group_title": "Review fanout",
             "fanout_target_count": 3,
@@ -1053,32 +939,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn interrupted_spawn_output_serializes_as_distinct_wire_status() {
-        let value = serde_json::to_value(SpawnAgentOutput::Interrupted {
-            agent_id: "reviewer@abc123".to_string(),
-            run_id: "run-reviewer".to_string(),
-            result: "partial findings".to_string(),
-            finish_reason: "budget_exhausted".to_string(),
-            tool_calls: 3,
-            duration_ms: 1250,
-        })
-        .unwrap();
-
-        assert_eq!(
-            value,
-            json!({
-                "status": "interrupted",
-                "agent_id": "reviewer@abc123",
-                "run_id": "run-reviewer",
-                "result": "partial findings",
-                "finish_reason": "budget_exhausted",
-                "tool_calls": 3,
-                "duration_ms": 1250
-            })
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1086,71 +946,11 @@ mod strict_type_tests {
     use super::SpawnAgentInput;
 
     #[test]
-    fn run_in_background_rejects_string_true() {
-        let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","run_in_background":"true"}"#,
-        )
-        .expect_err("string true must not deserialize");
-        assert!(err.to_string().contains("expected a boolean"), "{err}");
-    }
-
-    #[test]
-    fn run_in_background_accepts_bool_true() {
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","run_in_background":true}"#)
-                .expect("bool true must deserialize");
-        assert!(input.run_in_background);
-    }
-
-    #[test]
-    fn run_in_background_defaults_false_on_absence() {
-        let input: SpawnAgentInput = serde_json::from_str(r#"{"description":"test","prompt":"p"}"#)
-            .expect("absent run_in_background must default to false");
-        assert!(!input.run_in_background);
-    }
-
-    #[test]
     fn isolated_rejects_string_false() {
         let err = serde_json::from_str::<SpawnAgentInput>(
             r#"{"description":"test","prompt":"p","isolated":"false"}"#,
         )
         .expect_err("string false must not deserialize");
-        assert!(err.to_string().contains("expected a boolean"), "{err}");
-    }
-
-    #[test]
-    fn run_in_background_rejects_unknown_string() {
-        let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","run_in_background":"maybe"}"#,
-        )
-        .expect_err("unknown string must be rejected");
-        assert!(err.to_string().contains("expected a boolean"), "{err}");
-    }
-
-    #[test]
-    fn run_in_background_rejects_empty_string() {
-        let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","run_in_background":""}"#,
-        )
-        .expect_err("empty string must be rejected");
-        assert!(err.to_string().contains("expected a boolean"), "{err}");
-    }
-
-    #[test]
-    fn run_in_background_rejects_arbitrary_integer() {
-        let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","run_in_background":42}"#,
-        )
-        .expect_err("arbitrary integer must be rejected");
-        assert!(err.to_string().contains("expected a boolean"), "{err}");
-    }
-
-    #[test]
-    fn run_in_background_rejects_integer_one() {
-        let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","run_in_background":1}"#,
-        )
-        .expect_err("integer 1 must not deserialize");
         assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 

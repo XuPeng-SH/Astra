@@ -178,9 +178,7 @@ pub struct AppState {
     pub(crate) context_service: Arc<dyn ContextService>,
     pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
-    pub(crate) trigger_service: Arc<dyn TriggerService>,
     pub(crate) sandbox_service: Arc<dyn SandboxService>,
-    pub(crate) branch_service: Arc<dyn BranchService>,
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
     pub(crate) marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
@@ -291,9 +289,7 @@ impl AppState {
             context_service: Arc::new(UnconfiguredContextService),
             decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
-            trigger_service: Arc::new(UnconfiguredTriggerService),
             sandbox_service: Arc::new(UnconfiguredSandboxService),
-            branch_service: Arc::new(UnconfiguredBranchService),
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
             marketplace_stats_service: Arc::new(NoopMarketplaceStatsService),
@@ -530,18 +526,8 @@ impl AppState {
         self
     }
 
-    pub fn with_trigger_service(mut self, trigger_service: Arc<dyn TriggerService>) -> Self {
-        self.trigger_service = trigger_service;
-        self
-    }
-
     pub fn with_sandbox_service(mut self, sandbox_service: Arc<dyn SandboxService>) -> Self {
         self.sandbox_service = sandbox_service;
-        self
-    }
-
-    pub fn with_branch_service(mut self, branch_service: Arc<dyn BranchService>) -> Self {
-        self.branch_service = branch_service;
         self
     }
 

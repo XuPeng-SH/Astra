@@ -3334,7 +3334,8 @@ mod tests {
         }
         for blocked in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
-            let shim = tmp.path().join("astra-delete-shim");
+            let root = tmp.path().canonicalize().unwrap();
+            let shim = root.as_path().join("astra-delete-shim");
             crate::test_support::write_executable_shim(&shim, concat!(
                 "#!/bin/sh\n",
                 "[ -s \"${0%/*}/artifacts/archive/m/0/stream-events.json\" ] || exit 88\n",
@@ -3367,7 +3368,7 @@ mod tests {
             };
             let mut cfg = RunnerConfig::new(shim).with_fallback_models(vec!["m".into()]);
             cfg.cleanup_created_sessions = true;
-            cfg.artifacts_dir = Some(tmp.path().join("artifacts"));
+            cfg.artifacts_dir = Some(root.as_path().join("artifacts"));
             if blocked {
                 std::fs::write(cfg.artifacts_dir.as_ref().unwrap(), "blocked").unwrap();
             }
@@ -3392,7 +3393,7 @@ mod tests {
             });
             let report = runner.run_all(&[case]).await;
             let run = &report.runs[0];
-            assert_eq!(tmp.path().join("deleted").exists(), !blocked);
+            assert_eq!(root.as_path().join("deleted").exists(), !blocked);
             assert_eq!(run.is_passed(), !blocked);
             assert!(
                 run.outcome.stream_capture.is_none(),
@@ -3408,8 +3409,11 @@ mod tests {
                 assert!(run.criteria.iter().all(|criterion| criterion.passed));
             } else {
                 let saved: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(tmp.path().join("artifacts/archive/m/0/stream-events.json"))
-                        .unwrap(),
+                    &std::fs::read(
+                        root.as_path()
+                            .join("artifacts/archive/m/0/stream-events.json"),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
                 assert_eq!(saved[0]["capture"]["root_run_id"], "root");

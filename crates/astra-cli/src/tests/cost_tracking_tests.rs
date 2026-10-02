@@ -1,4 +1,4 @@
-use crate::cli::session::{session_runtime, session_stats_scan};
+use crate::cli::session::session_stats_scan;
 
 #[test]
 fn unavailable_cost_is_not_formatted_as_free() {
@@ -23,12 +23,22 @@ fn current_rate_scenario_preserves_unknown_prices_and_observed_counts() {
     state.total_cache_read_tokens = 900;
     state.total_cache_creation_tokens = 30;
     state.turn = 2;
-    state.cached_pricing = astra_services::models::PricingData {
+    let pricing = astra_services::models::PricingData {
         prompt: 0.01,
         completion: 0.02,
         cache_read: None,
         cache_write: None,
     };
+    state.model = Some(
+        crate::cli::session::session_state::SessionModelChoice::Selected(
+            crate::cli::session::session_runtime::ServerModelSelection {
+                name: "priced".into(),
+                offering_id: "priced-offering".into(),
+                context_window: None,
+                pricing: Some(pricing),
+            },
+        ),
+    );
     let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("billing", "not a session bill".into())));
     assert!(rows.contains(&("coverage", "unknown".into())));
@@ -39,19 +49,43 @@ fn current_rate_scenario_preserves_unknown_prices_and_observed_counts() {
     assert!(!rows.iter().any(|(label, value)| label.contains("avg")
         || value.contains("saved")
         || value.contains("%")));
-    state.cached_pricing.cache_read = Some(0.001);
-    state.cached_pricing.cache_write = Some(0.01);
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection)) =
+        state.model.as_mut()
+    {
+        selection.pricing.as_mut().unwrap().cache_read = Some(0.001);
+    }
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection)) =
+        state.model.as_mut()
+    {
+        selection.pricing.as_mut().unwrap().cache_write = Some(0.01);
+    }
     let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("scenario sum", "$2.60".into())));
-    state.cached_pricing.cache_read = Some(0.0);
-    state.cached_pricing.cache_write = Some(0.0);
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection)) =
+        state.model.as_mut()
+    {
+        selection.pricing.as_mut().unwrap().cache_read = Some(0.0);
+    }
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection)) =
+        state.model.as_mut()
+    {
+        selection.pricing.as_mut().unwrap().cache_write = Some(0.0);
+    }
     let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("cache read", "900 ($0.0000)".into())));
     assert!(rows.contains(&("scenario sum", "$1.40".into())));
     state.total_cache_read_tokens = 0;
     state.total_cache_creation_tokens = 0;
-    state.cached_pricing.cache_read = None;
-    state.cached_pricing.cache_write = None;
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection)) =
+        state.model.as_mut()
+    {
+        selection.pricing.as_mut().unwrap().cache_read = None;
+    }
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection)) =
+        state.model.as_mut()
+    {
+        selection.pricing.as_mut().unwrap().cache_write = None;
+    }
     let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("scenario sum", "$1.40".into())));
 }
@@ -124,55 +158,5 @@ fn format_cost() {
         (0.0, "$0.0000"),
     ] {
         assert_eq!(session_stats_scan::format_cost(input), expected);
-    }
-}
-
-// ── fallback_pricing ────────────────────────────────────────────────
-
-#[test]
-fn fallback_pricing_by_model() {
-    let cases: &[(&str, f64, Option<f64>)] = &[
-        ("claude-sonnet-4-20250514", 0.000_003, Some(0.000_000_3)),
-        ("claude-opus-4-20250514", 0.000_015, None),
-        ("claude-opus-4.5-20250415", 0.000_005, None),
-        ("claude-haiku-4.5-20250514", 0.000_001, None),
-        ("gpt-4o-2024-08-06", 0.000_002_5, None),
-        ("deepseek-chat", 0.000_000_27, None),
-        ("some-unknown-model", 0.000_003, None), // defaults to sonnet
-    ];
-    for (model, expected_prompt, expected_cache_read) in cases {
-        let p = session_runtime::fallback_pricing(model);
-        assert!(
-            (p.prompt - expected_prompt).abs() < 1e-12,
-            "{model}: prompt"
-        );
-        if let Some(cr) = expected_cache_read {
-            assert!(
-                (p.cache_read.unwrap() - cr).abs() < 1e-12,
-                "{model}: cache_read"
-            );
-        }
-    }
-}
-
-#[test]
-fn fallback_cost_calculation_with_cache() {
-    let p = session_runtime::fallback_pricing("claude-sonnet-4-20250514");
-    let cost = p.estimated_cost_usd(1000, 500, 2000, 100).unwrap();
-    let expected = 0.003 + 0.0075 + 0.0006 + 0.000375;
-    assert!((cost - expected).abs() < 1e-8);
-}
-
-#[test]
-fn fallback_no_cache_write_premium_for_non_anthropic() {
-    for model in ["qwen-plus", "MiniMax-M2.5", "glm-5.1"] {
-        let p = session_runtime::fallback_pricing(model);
-        assert_eq!(
-            p.cache_write, None,
-            "{model}: must not inherit Anthropic cache_write"
-        );
-        if model == "qwen-plus" {
-            assert!(p.cache_read.is_some(), "qwen should define cache_read");
-        }
     }
 }

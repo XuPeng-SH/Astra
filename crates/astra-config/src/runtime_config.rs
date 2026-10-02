@@ -64,14 +64,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub context_window: ContextWindowConfig,
 
-    /// Adaptive tuning engine parameters (cooldowns, cycle intervals).
-    #[serde(default)]
-    pub adaptive_tuning: AdaptiveTuningConfig,
-
-    /// Adaptive runtime dampening parameters.
-    #[serde(default)]
-    pub adaptive_runtime: AdaptiveRuntimeConfig,
-
     /// Safety-guard configuration.
     ///
     /// Controls shell-obfuscation guard relaxation for trusted local
@@ -426,8 +418,6 @@ impl Default for RuntimeConfig {
             verification: VerificationConfig::default(),
             memory_pressure: MemoryPressureConfig::default(),
             context_window: ContextWindowConfig::default(),
-            adaptive_tuning: AdaptiveTuningConfig::default(),
-            adaptive_runtime: AdaptiveRuntimeConfig::default(),
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
@@ -1889,21 +1879,6 @@ pub struct ContextWindowConfig {
     /// Tokens reserved for error recovery retries.
     #[serde(default = "default_error_recovery_reserve")]
     pub error_recovery_reserve: u32,
-
-    /// Enables the "at 85% usage, lower `max_turn_input_tokens` by ~10%"
-    /// path in `agentic_adaptive_tuning`. Default: OFF.
-    ///
-    /// Why off by default: the logic is a self-defeating shrink spiral. At
-    /// high pressure it LOWERS the ceiling the next turn must fit under,
-    /// which raises the probability of another high-pressure event, which
-    /// lowers the ceiling again. Session 0e37eb46 hit 36968 tokens via this
-    /// path and the model gave up with a progress summary. The compaction
-    /// pipeline is the right tool for pressure; the budget should stay put.
-    ///
-    /// Leave reachable via config for environments that explicitly want
-    /// quota-style protection over per-turn headroom.
-    #[serde(default)]
-    pub adaptive_budget_reduction: bool,
 }
 
 fn default_compression_threshold_min() -> f64 {
@@ -1928,68 +1903,6 @@ impl Default for ContextWindowConfig {
             compression_threshold_max: default_compression_threshold_max(),
             remaining_turn_factor: default_remaining_turn_factor(),
             error_recovery_reserve: default_error_recovery_reserve(),
-            adaptive_budget_reduction: false,
-        }
-    }
-}
-
-// ─── Adaptive Tuning Configuration ──────────────────────────────────────────
-
-/// Parameters controlling the adaptive tuning engine's timing and dampening.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AdaptiveTuningConfig {
-    /// Minimum turns between scenario changes (anti-flap).
-    #[serde(default = "default_scenario_cooldown_turns")]
-    pub scenario_cooldown_turns: u32,
-
-    /// Minimum turns between token-budget direction reversals (anti-oscillation).
-    #[serde(default = "default_budget_cooldown_turns")]
-    pub budget_cooldown_turns: u32,
-
-    /// Number of completed turns between tuning cycle evaluations.
-    #[serde(default = "default_tuning_cycle_interval")]
-    pub tuning_cycle_interval: u32,
-}
-
-fn default_scenario_cooldown_turns() -> u32 {
-    5
-}
-fn default_budget_cooldown_turns() -> u32 {
-    3
-}
-fn default_tuning_cycle_interval() -> u32 {
-    5
-}
-
-impl Default for AdaptiveTuningConfig {
-    fn default() -> Self {
-        Self {
-            scenario_cooldown_turns: default_scenario_cooldown_turns(),
-            budget_cooldown_turns: default_budget_cooldown_turns(),
-            tuning_cycle_interval: default_tuning_cycle_interval(),
-        }
-    }
-}
-
-// ─── Adaptive Runtime Dampening Configuration ───────────────────────────────
-
-/// Parameters controlling adaptive runtime dampening.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AdaptiveRuntimeConfig {
-    /// Minimum turns between scenario changes (anti-flap).
-    #[serde(default = "default_scenario_cooldown_turns")]
-    pub scenario_cooldown_turns: u32,
-
-    /// Minimum turns between token-budget direction reversals (anti-oscillation).
-    #[serde(default = "default_budget_cooldown_turns")]
-    pub budget_cooldown_turns: u32,
-}
-
-impl Default for AdaptiveRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            scenario_cooldown_turns: default_scenario_cooldown_turns(),
-            budget_cooldown_turns: default_budget_cooldown_turns(),
         }
     }
 }
@@ -2165,8 +2078,6 @@ impl RuntimeConfig {
             verification,
             memory_pressure,
             context_window,
-            adaptive_tuning,
-            adaptive_runtime,
             safety,
             fork_prefix,
             tool_surface,
@@ -2636,7 +2547,6 @@ impl RuntimeConfig {
             compression_threshold_max,
             remaining_turn_factor,
             error_recovery_reserve,
-            adaptive_budget_reduction,
         } = context_window;
         merge_if_non_default(&mut self.context_window.adaptive, adaptive, default_true());
         merge_if_non_default(
@@ -2663,48 +2573,6 @@ impl RuntimeConfig {
             &mut self.context_window.error_recovery_reserve,
             error_recovery_reserve,
             default_error_recovery_reserve(),
-        );
-        merge_if_non_default(
-            &mut self.context_window.adaptive_budget_reduction,
-            adaptive_budget_reduction,
-            false,
-        );
-
-        // ── Adaptive Tuning ──
-        let AdaptiveTuningConfig {
-            scenario_cooldown_turns,
-            budget_cooldown_turns,
-            tuning_cycle_interval,
-        } = adaptive_tuning;
-        merge_if_non_default(
-            &mut self.adaptive_tuning.scenario_cooldown_turns,
-            scenario_cooldown_turns,
-            default_scenario_cooldown_turns(),
-        );
-        merge_if_non_default(
-            &mut self.adaptive_tuning.budget_cooldown_turns,
-            budget_cooldown_turns,
-            default_budget_cooldown_turns(),
-        );
-        merge_if_non_default(
-            &mut self.adaptive_tuning.tuning_cycle_interval,
-            tuning_cycle_interval,
-            default_tuning_cycle_interval(),
-        );
-
-        let AdaptiveRuntimeConfig {
-            scenario_cooldown_turns,
-            budget_cooldown_turns,
-        } = adaptive_runtime;
-        merge_if_non_default(
-            &mut self.adaptive_runtime.scenario_cooldown_turns,
-            scenario_cooldown_turns,
-            default_scenario_cooldown_turns(),
-        );
-        merge_if_non_default(
-            &mut self.adaptive_runtime.budget_cooldown_turns,
-            budget_cooldown_turns,
-            default_budget_cooldown_turns(),
         );
 
         // SafetyConfig: last layer with an explicit trust_mode wins.
@@ -3109,16 +2977,6 @@ mod tests {
                 compression_threshold_max: 0.98,
                 remaining_turn_factor: 0.5,
                 error_recovery_reserve: 12000,
-                adaptive_budget_reduction: true,
-            },
-            adaptive_tuning: AdaptiveTuningConfig {
-                scenario_cooldown_turns: 10,
-                budget_cooldown_turns: 6,
-                tuning_cycle_interval: 8,
-            },
-            adaptive_runtime: AdaptiveRuntimeConfig {
-                scenario_cooldown_turns: 11,
-                budget_cooldown_turns: 7,
             },
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
@@ -3205,12 +3063,6 @@ mod tests {
         assert!((merged.context_window.remaining_turn_factor - 0.5).abs() < 0.001);
         assert_eq!(merged.context_window.error_recovery_reserve, 12000);
 
-        // Adaptive tuning
-        assert_eq!(merged.adaptive_tuning.scenario_cooldown_turns, 10);
-        assert_eq!(merged.adaptive_tuning.budget_cooldown_turns, 6);
-        assert_eq!(merged.adaptive_tuning.tuning_cycle_interval, 8);
-        assert_eq!(merged.adaptive_runtime.scenario_cooldown_turns, 11);
-        assert_eq!(merged.adaptive_runtime.budget_cooldown_turns, 7);
         assert_eq!(merged.agent_binding_registry.max_agent_md_bytes, 4096);
         let budget_policy = merged.budget_policy.expect("budget policy should merge");
         assert_eq!(budget_policy.expand_after_consecutive_outcomes, 4);

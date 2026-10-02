@@ -164,6 +164,7 @@ mod tests {
     #[test]
     fn persist_creates_directory_structure() {
         let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
 
         let mut report = CaseRunReport {
             case_name: "test/case".into(),
@@ -188,8 +189,8 @@ mod tests {
             has_warnings: false,
         };
 
-        persist_artifacts(tmp.path(), &report).unwrap();
-        let dir = tmp.path().join("test%2Fcase/my%2Emodel/0");
+        persist_artifacts(root.as_path(), &report).unwrap();
+        let dir = root.as_path().join("test%2Fcase/my%2Emodel/0");
         assert!(dir.join("stdout.txt").exists());
         assert!(dir.join("report.json").exists());
         assert!(!dir.join("stream-events.json").exists());
@@ -217,7 +218,7 @@ mod tests {
             passed: true,
         });
         persist_stream_capture(
-            tmp.path(),
+            root.as_path(),
             &report.case_name,
             &report.model,
             0,
@@ -225,7 +226,7 @@ mod tests {
             &report.steps,
         )
         .unwrap();
-        persist_artifacts(tmp.path(), &report).unwrap();
+        persist_artifacts(root.as_path(), &report).unwrap();
         let bytes = std::fs::read(dir.join("stream-events.json")).unwrap();
         let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(saved[0]["kind"], "attempt");
@@ -247,7 +248,7 @@ mod tests {
                 .contains("private child")
         );
         persist_stream_capture(
-            tmp.path(),
+            root.as_path(),
             &report.case_name,
             &report.model,
             1,
@@ -256,7 +257,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            tmp.path()
+            root.as_path()
                 .join("test%2Fcase/my%2Emodel/1/stream-events.json")
                 .exists()
         );
@@ -313,6 +314,7 @@ mod tests {
     #[test]
     fn stream_sidecars_preserve_colliding_case_names() {
         let tmp = tempfile::tempdir().unwrap();
+        let artifacts_root = tmp.path().canonicalize().unwrap();
         let names = [
             ("case@natural", "first-root"),
             ("case_natural", "second-root"),
@@ -323,7 +325,7 @@ mod tests {
             let mut outcome = RunOutcome::new("m");
             outcome.stream_capture = Some(capture);
             persist_stream_capture(
-                tmp.path(),
+                artifacts_root.as_path(),
                 name,
                 "m",
                 0,
@@ -340,7 +342,13 @@ mod tests {
             ("case_natural", "second-root"),
         ] {
             let saved: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(tmp.path().join(component).join("m/0/stream-events.json")).unwrap(),
+                &std::fs::read(
+                    artifacts_root
+                        .as_path()
+                        .join(component)
+                        .join("m/0/stream-events.json"),
+                )
+                .unwrap(),
             )
             .unwrap();
             assert_eq!(saved[0]["capture"]["root_run_id"], root);

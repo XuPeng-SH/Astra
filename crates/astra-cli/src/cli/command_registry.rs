@@ -390,12 +390,6 @@ const MESSAGING_SUBCOMMANDS: &[(&str, &str)] = &[
     ("metrics", "Show metrics snapshot"),
 ];
 
-const COMPACT_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("no-memoria", "Compact without Memoria"),
-    ("quick", "Fast compaction without summary"),
-    ("summary-only", "Summarize without trimming"),
-];
-
 const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[("edit", "Open the runtime configuration editor")];
 
 const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
@@ -460,27 +454,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
-    CommandMeta::new(
-        "/undo",
-        "Undo last turn(s): /undo [N]",
-        CommandGroup::Sessions,
-    )
-    .with_arg_hint("[N]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
-    CommandMeta::new(
-        "/redo",
-        "Redo undone turn(s): /redo [N]",
-        CommandGroup::Sessions,
-    )
-    .with_arg_hint("[N]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
-    CommandMeta::new(
-        "/checkpoint",
-        "Manual save: /checkpoint [label] — JSON + session md + journal",
-        CommandGroup::Sessions,
-    )
-    .with_arg_hint("[label]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/history",
         "Open the complete conversation transcript",
@@ -604,14 +577,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_arg_hint("[on|verbose|off]")
     .with_usage_examples(&["explain", "explain verbose", "explain off"])
     .with_tui_route(TuiCommandRoute::Native),
-    CommandMeta::new(
-        "/compact",
-        "Summarize & trim history (quick | no-memoria, …)",
-        CommandGroup::Inspect,
-    )
-    .with_subcommands(COMPACT_SUBCOMMANDS)
-    .with_arg_hint("[quick|no-memoria|summary-only]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/reflect",
         "Review session evidence with a read-only reflection",
@@ -1218,7 +1183,6 @@ mod tests {
     fn get_arg_hint_from_registry() {
         // Commands with arg_hint defined in registry
         assert_eq!(get_arg_hint("/model"), Some("[info | clear | <name>]"));
-        assert_eq!(get_arg_hint("/undo"), Some("[N]"));
         assert_eq!(get_arg_hint("/resume"), Some("[session_id]"));
 
         // Commands with subcommands should also have arg hints
@@ -1257,10 +1221,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_meta_marks_non_native_action_unavailable_in_tui() {
-        let meta = resolve_command_meta("/undo").expect("should resolve /undo");
-        assert_eq!(meta.tui_route, TuiCommandRoute::Unavailable);
-        assert!(!meta.is_available_in_tui());
+    fn retired_history_edit_commands_are_not_registered() {
+        for command in ["/undo", "/redo", "/checkpoint", "/compact"] {
+            assert!(resolve_command_meta(command).is_none(), "{command}");
+        }
     }
 
     #[test]

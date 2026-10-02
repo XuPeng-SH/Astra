@@ -1022,7 +1022,7 @@ pub(crate) async fn handle_team_command(
             let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
                 effective_api,
                 token,
-                state.model.clone(),
+                state.model.as_deref().map(str::to_string),
                 project_root.clone(),
                 state.perm_manager.inherited_permissions_for_child(true),
                 Some(cancel_token.clone()),

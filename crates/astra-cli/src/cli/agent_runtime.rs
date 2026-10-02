@@ -178,7 +178,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
     let mut delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
         api.clone(),
         token.clone(),
-        state.model.clone(),
+        state.model.as_deref().map(str::to_string),
         project_root.clone(),
         state.perm_manager.inherited_permissions_for_child(true),
         None,
@@ -210,7 +210,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
 
     let mut spawn_executor =
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
-            .with_default_model(state.model.clone())
+            .with_default_model(state.model.as_deref().map(str::to_string))
             .with_skill_resolver(skill_resolver)
             .with_bg_task_commands(state.bg_task_commands.clone())
             .with_bg_task_list_cache(state.bg_task_list_cache.clone());

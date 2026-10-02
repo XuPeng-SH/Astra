@@ -92,16 +92,10 @@ impl ObservabilitySession {
             last_query_at: None,
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
-            last_scenario_change_turn: None,
-            last_token_budget_direction: 0,
-            last_token_budget_change_turn: None,
-            last_strategy_application: None,
-            last_guardrail_view: None,
             last_denial_pressure: None,
             recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
-            stall_event_count: 0,
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
             active_scenario: None,
@@ -134,16 +128,10 @@ impl ObservabilitySession {
             last_query_at: None,
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
-            last_scenario_change_turn: None,
-            last_token_budget_direction: 0,
-            last_token_budget_change_turn: None,
-            last_strategy_application: None,
-            last_guardrail_view: None,
             last_denial_pressure: None,
             recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
-            stall_event_count: 0,
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
             active_scenario: None,
@@ -441,13 +429,6 @@ impl ObservabilitySession {
             let drop = self.recent_correction_excerpts.len() - MAX_EXCERPTS;
             self.recent_correction_excerpts.drain(0..drop);
         }
-    }
-
-    /// Increment the cumulative stall counter. Call once per pipeline-
-    /// detected stall; saturates at `u32::MAX` (any sane session tops
-    /// out in single digits, so the cap is paranoia, not a constraint).
-    pub fn record_stall_event(&mut self) {
-        self.stall_event_count = self.stall_event_count.saturating_add(1);
     }
 
     /// Gap 2: publish names of tests that failed in a recent tool outcome.

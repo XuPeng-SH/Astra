@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::{StreamResult, UsageAttribution};
 use astra_services::session_journal;
-use astra_turn_core::evaluation::TurnEvaluation;
 use crossterm::style::Stylize;
 
 /// Build a compact tool-call summary for cross-turn context continuity.
@@ -76,7 +75,6 @@ pub(crate) fn build_history_text(
 pub(crate) fn print_turn_status_line(
     state: &SessionState,
     result: &StreamResult,
-    evaluation: Option<&TurnEvaluation>,
     turn_start: Instant,
 ) {
     if state.tui_render_policy.is_some() {
@@ -99,9 +97,7 @@ pub(crate) fn print_turn_status_line(
     if let Some(notice) = interruption_status_notice(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
-    if let Some(notice) =
-        evaluation.and_then(|evaluation| evaluation_status_notice_for_result(result, evaluation))
-    {
+    if let Some(notice) = evaluation_status_notice_for_result(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
     print_context_window_warning(result.budget_pressure);
@@ -316,17 +312,17 @@ fn format_token_count(tokens: u64) -> String {
 /// assessment after runtime reconciliation has already accepted it.  When a
 /// turn is interrupted or explicitly marked unverified, use the semantic
 /// record-aware evaluator to explain the remaining obligation.
-fn evaluation_status_notice_for_result(
-    result: &StreamResult,
-    evaluation: &TurnEvaluation,
-) -> Option<String> {
+fn evaluation_status_notice_for_result(result: &StreamResult) -> Option<&str> {
     if result.final_state == "completed" && !result.server_terminal_unverified {
         return None;
     }
-    astra_turn_core::evaluation::turn_evaluation_status_notice_for_records(
-        evaluation,
-        &result.tool_call_records,
-    )
+    result
+        .turn_evaluation
+        .as_ref()?
+        .metadata
+        .as_ref()?
+        .get("status_notice")?
+        .as_str()
 }
 
 pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String> {
@@ -393,9 +389,6 @@ mod tests {
         evaluation_status_notice_for_result, interruption_status_notice,
     };
     use astra_services::session_journal;
-    use astra_turn_core::evaluation::{
-        EvalSignal, EvaluationThresholds, TurnEvaluation, turn_evaluation_status_notice,
-    };
     use std::time::Duration;
 
     fn make_record(
@@ -412,86 +405,30 @@ mod tests {
     }
 
     #[test]
-    fn turn_evaluation_notice_reports_unresolved_outcome_failure() {
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "test_failure".to_string(),
-                count: 1,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        let notice = turn_evaluation_status_notice(&eval).expect("notice");
-        assert!(notice.contains("test_failure x1"));
-        assert!(notice.contains("incomplete"));
-    }
-
-    #[test]
-    fn turn_evaluation_notice_ignores_successful_turn() {
-        let eval = TurnEvaluation {
-            success: true,
-            quality: 0.8,
-            confidence: 0.7,
-            signals: vec![EvalSignal::AllToolsHealthy],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        assert!(turn_evaluation_status_notice(&eval).is_none());
-    }
-
-    #[test]
-    fn completed_typed_terminal_does_not_reopen_assessment_failure() {
-        let mut result = crate::tests::stub_stream_result("");
-        result.final_state = "completed".into();
-        result.server_terminal_unverified = false;
-        let mut failed = make_record("bash", false, None);
-        failed.args_full =
-            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
-        failed.result_class = Some("test_failure".into());
-        result.tool_call_records = vec![failed];
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "test_failure".to_string(),
-                count: 1,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        assert!(
-            evaluation_status_notice_for_result(&result, &eval).is_none(),
-            "accepted runtime settlement must not be reclassified from raw evidence"
-        );
-    }
-
-    #[test]
-    fn interrupted_unverified_terminal_keeps_validation_failure_visible() {
+    fn status_notice_consumes_server_fact_without_reinterpreting_partial_records() {
         let mut result = crate::tests::stub_stream_result("");
         result.final_state = "interrupted".into();
         result.server_terminal_unverified = true;
-        let mut failed = make_record("bash", false, None);
-        failed.args_full =
-            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
-        failed.result_class = Some("test_failure".into());
-        result.tool_call_records = vec![failed];
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "test_failure".to_string(),
-                count: 1,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        let notice = evaluation_status_notice_for_result(&result, &eval).expect("notice");
-        assert!(notice.contains("test_failure x1"));
+        assert!(evaluation_status_notice_for_result(&result).is_none());
+        let mut event = session_journal::JournalEvent::base_public(
+            session_journal::JournalEventType::TurnEvaluation,
+            Some("session"),
+        );
+        event.metadata =
+            Some(serde_json::json!({"status_notice":"Server validation remains incomplete"}));
+        result.turn_evaluation = Some(event);
+        assert_eq!(
+            evaluation_status_notice_for_result(&result),
+            Some("Server validation remains incomplete")
+        );
+        result.tool_call_records = vec![make_record("bash", true, None)];
+        assert_eq!(
+            evaluation_status_notice_for_result(&result),
+            Some("Server validation remains incomplete")
+        );
+        result.final_state = "completed".into();
+        result.server_terminal_unverified = false;
+        assert!(evaluation_status_notice_for_result(&result).is_none());
     }
 
     #[test]

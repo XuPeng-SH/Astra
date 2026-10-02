@@ -12,9 +12,7 @@ use crate::cli::edge_lifecycle::register_and_start_heartbeat;
 use crate::cli::permission_manager;
 use crate::cli::project_instructions::discover_project_instructions;
 use crate::cli::session::{
-    session_guard::{
-        self, install_session_panic_hook, install_sigterm_handler, subscribe_shutdown_signal,
-    },
+    session_guard::{self, install_sigterm_handler, subscribe_shutdown_signal},
     session_recovery,
     session_runtime::{self, PipelineModules, print_session_banner, resolved_session_project_root},
     session_state::SessionState,
@@ -38,8 +36,6 @@ pub(crate) struct GoalSteeringChange {
     pub previous_goal: Option<String>,
     pub turn: u32,
 }
-
-type SessionMemoryEventSink = dyn Fn(&session_journal::JournalEvent, &str) + Send + Sync + 'static;
 
 pub(crate) fn steer_observability_goal(
     _state: &mut SessionState,
@@ -70,9 +66,6 @@ pub(crate) fn apply_pending_adaptive_state(state: &mut SessionState) {
             return;
         }
     };
-    guard.last_scenario_change_turn = adaptive.last_scenario_change_turn;
-    guard.last_token_budget_direction = adaptive.last_token_budget_direction;
-    guard.last_token_budget_change_turn = adaptive.last_token_budget_change_turn;
     if let Some(json) = &adaptive.tuned_config_json {
         if let Ok(saved_config) =
             serde_json::from_str::<astra_config::runtime_config::RuntimeConfig>(json)
@@ -307,59 +300,6 @@ async fn prune_stale_pending_recovery(
 }
 
 #[derive(Debug)]
-struct CliSessionMemoryInferenceResolver {
-    api: astra_thin_client::ThinClient,
-    profile: Option<String>,
-}
-
-#[async_trait::async_trait]
-impl astra_runtime::session_memory::MemoryInferenceResolver for CliSessionMemoryInferenceResolver {
-    async fn resolve_candidates(
-        &self,
-        _user_id: &str,
-    ) -> Vec<astra_runtime::memory_hooks::MemoryInferenceClient> {
-        let Some(token) =
-            session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await
-        else {
-            tracing::debug!(
-                target: "astra_cli::session_memory",
-                "memory inference resolution skipped because no access token is available"
-            );
-            return Vec::new();
-        };
-        let offerings =
-            match crate::cli::session::session_memory_inference::fetch_memory_inference_offerings(
-                &self.api, &token,
-            )
-            .await
-            {
-                Ok(offerings) => offerings,
-                Err(error) => {
-                    tracing::debug!(
-                        target: "astra_cli::session_memory",
-                        %error,
-                        "memory inference model resolution is unavailable"
-                    );
-                    return Vec::new();
-                }
-            };
-        offerings
-            .into_iter()
-            .map(|offering| {
-                std::sync::Arc::new(
-                    crate::cli::session::session_memory_inference::CliServerMemoryInferenceClient::new(
-                        self.api.clone(),
-                        token.clone(),
-                        offering.offering_id,
-                        offering.model_name,
-                    ),
-                ) as astra_runtime::memory_hooks::MemoryInferenceClient
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug)]
 struct CliSessionMemoryMemoriaPort {
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
@@ -580,61 +520,10 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
     }
 }
 
-fn build_cli_session_memory_event_sink() -> std::sync::Arc<SessionMemoryEventSink> {
-    let writers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-        String,
-        session_journal::JournalWriter,
-    >::new()));
-    std::sync::Arc::new(
-        move |event: &session_journal::JournalEvent, _user_id: &str| {
-            let Some(session_id) = event.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
-                return;
-            };
-            let mut guard = match writers.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::warn!(
-                        session_id,
-                        event_type = ?event.event_type,
-                        "session-memory journal writer cache poisoned; recovering"
-                    );
-                    poisoned.into_inner()
-                }
-            };
-            let writer = match guard.entry(session_id.to_string()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let writer = match session_journal::JournalWriter::new(session_id) {
-                        Ok(writer) => writer,
-                        Err(error) => {
-                            tracing::warn!(
-                                session_id,
-                                event_type = ?event.event_type,
-                                ?error,
-                                "failed to open local journal for session-memory event"
-                            );
-                            return;
-                        }
-                    };
-                    entry.insert(writer)
-                }
-            };
-            if let Err(error) = writer.append(event) {
-                tracing::warn!(
-                    session_id,
-                    event_type = ?event.event_type,
-                    ?error,
-                    "failed to append session-memory event to local journal"
-                );
-            }
-        },
-    )
-}
-
-pub(crate) async fn build_cli_session_memory_extractor(
+pub(crate) async fn build_cli_session_memory_port(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-) -> Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>> {
+) -> Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>> {
     #[derive(serde::Deserialize)]
     struct AuthMeWire {
         user_id: String,
@@ -643,29 +532,13 @@ pub(crate) async fn build_cli_session_memory_extractor(
     let token = session_runtime::fresh_access_token(api, profile).await?;
     let me_body = api.get_auth_me_text(&token).await.ok()?;
     let me = serde_json::from_str::<AuthMeWire>(&me_body).ok()?;
-    let inference_resolver = std::sync::Arc::new(CliSessionMemoryInferenceResolver {
-        api: api.clone(),
-        profile: profile.map(str::to_string),
-    });
     let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(
         api.clone(),
         profile,
         me.user_id.clone(),
     ))
         as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>;
-    let ingestion = astra_services::event_ingestion::IngestionSender::disconnected();
-    let broker =
-        std::sync::Arc::new(astra_runtime::session_memory::BackgroundActivityBroker::new());
-    let service = astra_runtime::session_memory::MemoryExtractionService::new(
-        inference_resolver,
-        memoria,
-        ingestion,
-        me.user_id,
-        broker,
-    )
-    .with_local_current_snapshot()
-    .with_local_event_sink(build_cli_session_memory_event_sink());
-    Some(std::sync::Arc::new(service))
+    Some(memoria)
 }
 
 pub(crate) async fn complete_session_startup(
@@ -677,8 +550,6 @@ pub(crate) async fn complete_session_startup(
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<SessionStartupArtifacts, String> {
-    // Install panic hook to write session_end on unexpected crashes.
-    install_session_panic_hook();
     // Install signal handlers so SIGTERM/SIGHUP can drain through normal REPL shutdown.
     install_sigterm_handler();
     let shutdown_signal_rx = subscribe_shutdown_signal();
@@ -737,14 +608,27 @@ pub(crate) async fn complete_session_startup(
         }
     }
 
-    // Session lifecycle maintenance: compress old journals and delete expired sessions.
-    // Non-blocking, best-effort — errors are silently ignored.
-    {
-        const SESSION_TTL_DAYS: u64 = 30;
-        const JOURNAL_COMPRESS_DAYS: u64 = 7;
-        let _maint =
-            session_journal::run_session_maintenance(SESSION_TTL_DAYS, JOURNAL_COMPRESS_DAYS);
-    }
+    // Capture ownership and the restore target before dispatch: authentication
+    // changes must not redirect maintenance into a different account's files.
+    let owner = astra_services::local_owner_scope();
+    let protected_session_id = resume_session_id
+        .map(str::to_string)
+        .or_else(|| state.session_id.clone());
+    tokio::task::spawn_blocking(move || {
+        match session_journal::run_session_maintenance_for_owner(
+            &owner,
+            protected_session_id.as_deref(),
+            30,
+            7,
+        ) {
+            Ok(report) => {
+                for error in report.errors {
+                    tracing::warn!(%error, "session maintenance failed");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "session maintenance owner path failed"),
+        }
+    });
     // The canonical journal may contain events appended immediately before a
     // previous process stopped, before its asynchronous outbox projector got
     // CPU time. Reconcile every local source by durable watermark in the
@@ -796,10 +680,10 @@ pub(crate) async fn complete_session_startup(
         state.synced_tool_health_entries = cross_session_health_entries;
     }
 
-    state.session_memory_extractor = if native_auth_unavailable {
+    state.session_memory_port = if native_auth_unavailable {
         None
     } else {
-        build_cli_session_memory_extractor(api, profile).await
+        build_cli_session_memory_port(api, profile).await
     };
     state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
         api.api_origin(),
@@ -905,8 +789,8 @@ pub(crate) async fn complete_session_startup(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliSessionMemoryMemoriaPort, apply_pending_adaptive_state,
-        build_cli_session_memory_extractor, initialize_journal, prune_stale_pending_recovery,
+        CliSessionMemoryMemoriaPort, apply_pending_adaptive_state, build_cli_session_memory_port,
+        initialize_journal, prune_stale_pending_recovery,
     };
     use crate::cli::session::session_state::SessionState;
     use astra_runtime::turn::cloud::memoria_compact::MemoriaPort;
@@ -1132,7 +1016,7 @@ mod tests {
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
         let mut state = SessionState {
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             ..Default::default()
         };
         initialize_journal(&mut state, &sid);
@@ -1178,7 +1062,7 @@ mod tests {
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
         let mut state = SessionState {
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             ..Default::default()
         };
         initialize_journal(&mut state, &sid);
@@ -1250,7 +1134,7 @@ mod tests {
             .unwrap();
 
         let mut state = SessionState {
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             ..Default::default()
         };
         initialize_journal(&mut state, &sid);
@@ -1276,23 +1160,13 @@ mod tests {
         let mut state = SessionState::default();
         state.pending_adaptive_state =
             Some(crate::cli::session::session_state::PersistedAdaptiveState {
-                last_scenario_change_turn: Some(3),
-                last_token_budget_direction: 1,
-                last_token_budget_change_turn: Some(2),
-                active_experiment_id: Some("exp-1".to_string()),
-                active_variant: Some("variant-a".to_string()),
                 tuned_config_json: None,
             });
         state.observability_session = Some(poisoned_observability_session("sid-adaptive"));
 
         apply_pending_adaptive_state(&mut state);
 
-        let adaptive = state
-            .pending_adaptive_state
-            .as_ref()
-            .expect("adaptive state should remain pending");
-        assert_eq!(adaptive.last_token_budget_direction, 1);
-        assert_eq!(adaptive.active_experiment_id.as_deref(), Some("exp-1"));
+        assert!(state.pending_adaptive_state.is_some());
     }
 
     #[test]
@@ -1415,7 +1289,7 @@ mod tests {
         std::fs::write(&workspace_path, &corrupt_bytes).unwrap();
 
         let mut state = SessionState {
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             turn: 2,
             total_prompt_tokens: 20,
             total_completion_tokens: 10,
@@ -1453,7 +1327,7 @@ mod tests {
         }
 
         let mut state = SessionState {
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             ..Default::default()
         };
         initialize_journal(&mut state, &sid);
@@ -1494,7 +1368,7 @@ mod tests {
         }
 
         let mut state = SessionState {
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             ..Default::default()
         };
         initialize_journal(&mut state, &sid);
@@ -1514,7 +1388,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn build_cli_session_memory_extractor_initializes_when_authenticated() {
+    async fn build_cli_session_memory_port_initializes_when_authenticated() {
         let _creds_guard = crate::tests::isolate_credentials();
         write_profile_with_token("sess-memory");
 
@@ -1529,7 +1403,7 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let svc = build_cli_session_memory_extractor(&api, None).await;
+        let svc = build_cli_session_memory_port(&api, None).await;
         assert!(
             svc.is_some(),
             "authenticated CLI should build session memory extractor"
@@ -1538,7 +1412,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn build_cli_session_memory_extractor_skips_when_auth_me_fails() {
+    async fn build_cli_session_memory_port_skips_when_auth_me_fails() {
         let _creds_guard = crate::tests::isolate_credentials();
         write_profile_with_token("sess-memory");
 
@@ -1553,7 +1427,7 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let svc = build_cli_session_memory_extractor(&api, None).await;
+        let svc = build_cli_session_memory_port(&api, None).await;
         assert!(
             svc.is_none(),
             "missing auth identity should disable session memory extractor"

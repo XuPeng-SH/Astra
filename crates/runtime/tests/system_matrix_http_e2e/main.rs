@@ -25,7 +25,6 @@
 
 mod harness;
 mod journey_admin_smoke_matrix;
-mod journey_branches_matrix;
 mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
 mod journey_extended;
@@ -289,11 +288,6 @@ matrix_test! {
     journey_session_artifacts_matrix::run_session_artifact_latest_and_download_routes
 }
 matrix_test! {
-    e2e_matrix_failed_session_artifact_latest_and_download, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_session_artifacts_matrix::run_failed_session_artifact_latest_and_download_routes
-}
-matrix_test! {
     e2e_matrix_server_loop_block_parse_preserves_partial_without_replay, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_session_artifacts_matrix::run_server_loop_block_parse_preserves_partial_without_replay_routes
@@ -333,11 +327,7 @@ matrix_test! {
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_models_matrix::run_models_smoke
 }
-matrix_test! {
-    e2e_matrix_branches_cost_estimate_http, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_branches_matrix::run_branches_cost_estimate_http
-}
+
 matrix_test! {
     e2e_matrix_delegate_http_boundaries, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",

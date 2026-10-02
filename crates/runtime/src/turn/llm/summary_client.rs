@@ -877,7 +877,7 @@ mod tests {
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     if provider == "bedrock" {
-                        use crate::turn::bedrock::transport::tests::eventstream_frame;
+                        use crate::server::provider_test_support::eventstream_frame;
                         let mut frames = eventstream_frame("messageStart", br#"{"role":"assistant"}"#);
                         frames.extend(eventstream_frame("contentBlockDelta", serde_json::json!({"contentBlockIndex":0,"delta":{"text":raw}}).to_string().as_bytes()));
                         frames.extend(eventstream_frame("messageStop", br#"{"stopReason":"end_turn"}"#));

@@ -25,8 +25,10 @@ use astra_turn_core::context_feedback::{
     RuntimePolicySignal, RuntimePolicyStage, RuntimePolicySubject, RuntimeRecoveryEvidence,
 };
 
-pub fn configured_evaluation_thresholds() -> astra_turn_core::evaluation::EvaluationThresholds {
-    let policy = astra_config::RuntimeConfig::load().tool_policy;
+/// Resolve once at execution admission; tool boundaries consume the frozen value.
+pub fn evaluation_thresholds_from_policy(
+    policy: &astra_config::runtime_config::ToolPolicyConfig,
+) -> astra_turn_core::evaluation::EvaluationThresholds {
     astra_turn_core::evaluation::EvaluationThresholds {
         redundant_overlapping_reads: policy.effective_redundant_reads_eval_threshold() as usize,
         search_fanout: policy.effective_search_fanout_eval_threshold() as usize,

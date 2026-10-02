@@ -234,16 +234,54 @@ impl std::fmt::Display for ContinuationAnchor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SessionModelChoice {
+    Requested(String),
+    Selected(super::session_runtime::ServerModelSelection),
+}
+
+impl From<&str> for SessionModelChoice {
+    fn from(name: &str) -> Self {
+        Self::Requested(name.to_string())
+    }
+}
+
+impl From<String> for SessionModelChoice {
+    fn from(name: String) -> Self {
+        Self::Requested(name)
+    }
+}
+
+impl std::ops::Deref for SessionModelChoice {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Requested(name) => name,
+            Self::Selected(selection) => &selection.name,
+        }
+    }
+}
+
+impl SessionModelChoice {
+    pub(crate) fn offering_id(&self) -> Option<&str> {
+        match self {
+            Self::Selected(selection) => Some(&selection.offering_id),
+            Self::Requested(_) => None,
+        }
+    }
+    pub(crate) fn pricing(&self) -> Option<&astra_services::models::PricingData> {
+        match self {
+            Self::Selected(selection) => selection.pricing.as_ref(),
+            Self::Requested(_) => None,
+        }
+    }
+}
+
 /// Adaptive engine state persisted between sessions.
 /// Holds anti-flap dampening, experiment enrollment, and tuned config so the
 /// adaptive engine doesn't oscillate or lose progress on session restart.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PersistedAdaptiveState {
-    pub last_scenario_change_turn: Option<u32>,
-    pub last_token_budget_direction: i8,
-    pub last_token_budget_change_turn: Option<u32>,
-    pub active_experiment_id: Option<String>,
-    pub active_variant: Option<String>,
     pub tuned_config_json: Option<String>,
 }
 
@@ -259,7 +297,7 @@ pub(crate) struct SessionState {
     /// Display name for this session (set via --name flag).
     pub session_name: Option<String>,
     pub cli_context: CliContext,
-    pub model: Option<String>,
+    pub model: Option<SessionModelChoice>,
     pub turn: u32,
     pub last_response: Option<String>,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
@@ -324,7 +362,6 @@ pub(crate) struct SessionState {
     /// Complete attributed estimate, or unknown. Current-rate scenarios are separate.
     pub total_session_cost: Option<f64>,
     /// Cached pricing data for the active model (used by /cost).
-    pub cached_pricing: astra_services::models::PricingData,
     pub skill_dev: Option<SkillDevState>,
     pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
@@ -437,9 +474,6 @@ pub(crate) struct SessionState {
     /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
 
     // ── Drift tracking ──
-    /// Redo stack — stores undone turns for `/redo` recovery.
-    /// Each entry is (user_msg, assistant_msg, turn_number).
-    pub redo_stack: Vec<(String, String, u32)>,
 
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
@@ -448,10 +482,6 @@ pub(crate) struct SessionState {
     /// cannot immediately repeat the exploratory path that just tripped a guard.
     pub resume_restricted_tools: Vec<String>,
 
-    /// Turns where history compaction occurred (for drift detection).
-    pub drift_compressed_turns: Vec<u32>,
-    /// Turns where user provided correction/redirection (for drift detection).
-    pub drift_user_corrections: Vec<u32>,
     /// Original user query at session start (for drift baseline comparison).
     pub drift_original_query: Option<String>,
 
@@ -475,38 +505,13 @@ pub(crate) struct SessionState {
     pub memory_inference_offering: super::session_memory_inference::MemoryJudgmentOffering,
     /// Background session-memory.md extraction coordinator. `None` means
     /// the current CLI path has no API-backed extraction service.
-    pub session_memory_extractor:
-        Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
-
-    /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
-    /// across turns of this session. Created lazily on first turn so
-    /// sessions that never trigger anything pay no cost. The REPL is
-    /// single-threaded per session so no Arc/Mutex needed.
-    pub auto_invoke_handler: Option<astra_runtime::auto_invoke_handler::AutoInvokeHandler>,
-
-    /// P8: most recent auto-invoke diagnosis, produced at the end of the
-    /// previous turn. Passed through to the next turn's ToolExecutor so
-    /// the LLM sees "the system already noticed X" in the prompt.
-    /// Cleared when no diagnosis is produced.
-    pub latest_skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    pub session_memory_port:
+        Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
 
     /// P3/P4: evaluator-derived feedback from the previous turn. Passed to
     /// the next turn's ToolExecutor so the prompt can correct tool behavior
     /// such as sequential read churn, repeated calls, and stalls.
     pub latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
-
-    /// R1: tracks active diagnosis postconditions across turns. When a
-    /// diagnosis fires, its success_criteria are registered here. On each
-    /// subsequent turn, evaluate_turn checks whether the criteria are met.
-    /// Session cleanup reads the accumulated met/failed counts for the
-    /// DiagnosisOutcomeTracker.
-    pub diagnosis_outcome_tracker: astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker,
-
-    /// R1: cumulative met/failed diagnosis criteria for the session.
-    /// Incremented by `maybe_run_auto_invoke` when tracker completes a
-    /// diagnosis evaluation. Written to DiagnosisOutcomeTracker for observability.
-    pub diagnosis_criteria_met: u32,
-    pub diagnosis_criteria_failed: u32,
 
     // ── Observability ──
     /// Global observability hub for profiles, traces, and feedback signals.
@@ -631,7 +636,6 @@ impl Default for SessionState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             total_session_cost: Some(0.0),
-            cached_pricing: Default::default(),
             skill_dev: None,
             active_system_skills: Vec::new(),
             // Load RuntimeConfig from config files + env vars, then create
@@ -686,11 +690,8 @@ impl Default for SessionState {
                 astra_core::work_unit::ActiveWorkRegistry::default(),
             ),
             root_mailbox: None,
-            redo_stack: Vec::new(),
             resume_guidance: None,
             resume_restricted_tools: Vec::new(),
-            drift_compressed_turns: Vec::new(),
-            drift_user_corrections: Vec::new(),
             drift_original_query: None,
             session_lessons: Vec::new(),
             memory_selection_reports: Vec::new(),
@@ -698,14 +699,9 @@ impl Default for SessionState {
             lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
             memory_inference_offering:
                 super::session_memory_inference::MemoryJudgmentOffering::Unresolved,
-            session_memory_extractor: None,
-            auto_invoke_handler: None,
-            latest_skill_diagnosis: None,
+            session_memory_port: None,
+
             latest_turn_quality_feedback: None,
-            diagnosis_outcome_tracker:
-                astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker::new(),
-            diagnosis_criteria_met: 0,
-            diagnosis_criteria_failed: 0,
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
@@ -860,10 +856,7 @@ impl SessionState {
         self.session_persistence_error = None;
         self.latest_context_assembly_trace = None;
         self.clear_runtime_recovery_state();
-        self.redo_stack.clear();
         self.clear_resume_recovery_state();
-        self.drift_compressed_turns.clear();
-        self.drift_user_corrections.clear();
         self.drift_original_query = None;
         self.session_lessons.clear();
         self.memory_selection_reports.clear();
@@ -871,7 +864,6 @@ impl SessionState {
         self.lesson_checkpointer = Default::default();
         self.memory_inference_offering =
             super::session_memory_inference::MemoryJudgmentOffering::Unresolved;
-        self.latest_skill_diagnosis = None;
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
@@ -1078,20 +1070,10 @@ mod default_tests {
                 schema_digest: "sha256:write-file".into(),
                 descriptor: None,
             }],
-            redo_stack: vec![("u".into(), "a".into(), 1)],
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
-            drift_compressed_turns: vec![2],
-            drift_user_corrections: vec![3],
             drift_original_query: Some("orig".into()),
             session_lessons_loaded: true,
-            latest_skill_diagnosis: Some(astra_skills::auto_invoke::SkillDiagnosis::new(
-                "diag",
-                &astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 5 },
-                "headline",
-                vec!["finding".to_string()],
-                None,
-            )),
             latest_turn_quality_feedback: Some(astra_runtime::self_model::TurnQualityFeedback {
                 turn: 1,
                 findings: vec!["finding".into()],
@@ -1122,15 +1104,11 @@ mod default_tests {
         assert_eq!(state.total_session_cost, Some(0.0));
         assert!(state.recent_tools.is_empty());
         assert!(state.deferred_tool_activations.is_empty());
-        assert!(state.redo_stack.is_empty());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
-        assert!(state.drift_compressed_turns.is_empty());
-        assert!(state.drift_user_corrections.is_empty());
         assert!(state.drift_original_query.is_none());
         assert!(state.session_lessons.is_empty());
         assert!(!state.session_lessons_loaded);
-        assert!(state.latest_skill_diagnosis.is_none());
         assert!(state.latest_turn_quality_feedback.is_none());
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());
@@ -1294,13 +1272,6 @@ mod default_tests {
         assert_eq!(state.total_session_cost, Some(0.0));
         state.set_session_id("new-attached-session");
         assert_eq!(state.total_session_cost, None);
-    }
-
-    #[test]
-    fn state_default_values() {
-        let state = SessionState::default();
-        assert_eq!(state.diagnosis_criteria_met, 0);
-        assert_eq!(state.diagnosis_criteria_failed, 0);
     }
 
     #[test]

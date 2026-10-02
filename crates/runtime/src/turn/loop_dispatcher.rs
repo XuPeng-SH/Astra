@@ -269,6 +269,7 @@ mod tests {
 
     fn test_state(message: &str) -> AgenticLoopState {
         AgenticLoopState {
+            evaluation_thresholds: Default::default(),
             messages: vec![json!({"role": "user", "content": message})],
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
@@ -311,8 +312,6 @@ mod tests {
             last_request_message_count: None,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-user", "test", "run"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),

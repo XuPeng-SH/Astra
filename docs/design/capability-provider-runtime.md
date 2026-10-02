@@ -100,6 +100,11 @@ parallel execution: serial admission permits only an exact one-slot fanout,
 and an authoritative parallel admission rejects a direct single-agent substitute.
 Capability and provider restrictions continue to apply independently.
 
+Each synchronous tool-admission boundary shares one local catalog/policy/provider
+projection across its batch. It is discarded before approval waits. Durable
+dispatch re-reads current policy and offer identity under the existing policy
+read leases; request visibility or approval never authorizes a stale offer.
+
 
 ### One fact source
 

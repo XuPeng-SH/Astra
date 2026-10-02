@@ -30,10 +30,6 @@ pub use agent_trace_status::{
     agent_trace_requires_result_collection, agent_trace_status_from_event,
     agent_trace_terminal_event_type, is_agent_trace_settled_event,
 };
-pub use astra_turn_core::orchestration_context_cache::{
-    CacheStats, CachedFile, Knowledge, SharedContextCache, query_context_schema,
-    share_context_schema,
-};
 pub use astra_turn_core::orchestration_progress::{
     AgentProgressEmitter, AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
 };
@@ -69,8 +65,9 @@ pub use spawner::{
     DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
     FANOUT_GROUP_CANCELLED_EVENT_TYPE, FanoutGroupCancellation, FanoutParentAdmission,
     InheritedChildPrefix, PermissionSummary, PreparedSpawn, PreparedSpawnModelIdentity,
-    ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunCancellationDurability,
-    SpawnRunConfig, SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
-    SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
-    selector_for_admitted_spawn_input, spawn_completion_status_from_finish_reason,
+    ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError, SpawnExecution,
+    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult, SpawnStatusProjection,
+    SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState, WaitForAgentOutcome,
+    project_subrun_status_to_spawn, selector_for_admitted_spawn_input,
+    spawn_completion_status_from_finish_reason,
 };

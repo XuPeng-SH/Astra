@@ -16,6 +16,55 @@ use super::tool_execution_binding::{
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 
+/// One authorization boundary's provider projection, shared by all tool decisions.
+/// Callers must build a fresh snapshot after approval or another await boundary.
+pub(crate) struct ToolBindingAdmissionSnapshot<'a> {
+    schemas: &'a [Value],
+    workspace: &'a WorkspaceBinding,
+    executor: &'a ExecutorBinding,
+    runtime: Option<&'a astra_runtime_env::RuntimeBinding>,
+    registry: &'a astra_runtime_env::ToolRegistry,
+    context: ToolAdmissionContext,
+    providers: Vec<astra_runtime_env::CapacityProviderDeclaration>,
+}
+
+impl<'a> ToolBindingAdmissionSnapshot<'a> {
+    pub(crate) fn new(
+        schemas: &'a [Value],
+        workspace: &'a WorkspaceBinding,
+        executor: &'a ExecutorBinding,
+        runtime: Option<&'a astra_runtime_env::RuntimeBinding>,
+        registry: &'a astra_runtime_env::ToolRegistry,
+        context: ToolAdmissionContext,
+    ) -> Self {
+        let providers = active_provider_declarations_for_binding(
+            schemas, workspace, executor, runtime, registry, &context,
+        );
+        Self {
+            schemas,
+            workspace,
+            executor,
+            runtime,
+            registry,
+            context,
+            providers,
+        }
+    }
+
+    pub(crate) fn decision(&self, tool_name: &str) -> ToolAdmissionDecision {
+        resolve_tool_visibility_for_providers_with_context_and_schemas(
+            tool_name,
+            self.schemas,
+            self.workspace,
+            self.executor,
+            self.runtime,
+            &self.providers,
+            self.registry,
+            &self.context,
+        )
+    }
+}
+
 const EDGE_CLIENT_WORKSPACE_SENTINEL_CWD: &str = "__edge_client_provided_workspace__";
 
 pub fn capability_filter_tool_schemas_for_binding(
@@ -41,13 +90,13 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
     admission_context: ToolAdmissionContext,
 ) -> Vec<Value> {
     let registry = astra_runtime_env::ToolRegistry::builtins();
-    let providers = active_provider_declarations_for_binding(
+    let snapshot = ToolBindingAdmissionSnapshot::new(
         &schemas,
         workspace,
         executor,
         runtime,
         &registry,
-        &admission_context,
+        admission_context,
     );
     let prompt_schema_conflicts =
         astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
@@ -66,22 +115,14 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
                     return false;
                 }
             }
-            if !providers
+            if !snapshot
+                .providers
                 .iter()
                 .any(|provider| provider.declares_tool(tool_name))
             {
                 return false;
             }
-            let admission = resolve_tool_visibility_for_providers_with_context_and_schemas(
-                tool_name,
-                &schemas,
-                workspace,
-                executor,
-                runtime,
-                &providers,
-                &registry,
-                &admission_context,
-            );
+            let admission = snapshot.decision(tool_name);
             admission.visible
         })
         .cloned()
@@ -97,24 +138,15 @@ pub(crate) fn resolve_tool_visibility_for_binding_with_context(
     registry: &astra_runtime_env::ToolRegistry,
     admission_context: ToolAdmissionContext,
 ) -> ToolAdmissionDecision {
-    let providers = active_provider_declarations_for_binding(
+    ToolBindingAdmissionSnapshot::new(
         schemas,
         workspace,
         executor,
         runtime,
         registry,
-        &admission_context,
-    );
-    resolve_tool_visibility_for_providers_with_context_and_schemas(
-        tool_name,
-        schemas,
-        workspace,
-        executor,
-        runtime,
-        &providers,
-        registry,
-        &admission_context,
+        admission_context,
     )
+    .decision(tool_name)
 }
 
 fn resolve_tool_visibility_for_providers_with_context_and_schemas(

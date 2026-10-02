@@ -242,9 +242,10 @@ already identifies its committed base and parent result; these are not duplicate
 in another log. Its pending suffix includes the last settled tool results. Writing
 this payload neither invents an inference attempt nor commits a completed user
 turn. In particular, an absent committed conversation cursor must not be replaced
-with a fabricated cursor. Recovery validates and replays the existing WAL plus
-this continuation, and compares the reconstructed durable history with the heavy
-snapshot. The old reservation is identity evidence, not renewed authority.
+with a fabricated cursor. The payload retains the existing WAL continuation
+and heavy snapshot for checkpoint custody. Original-run execution reconstruction
+is not implemented. The old reservation is identity evidence, not renewed
+authority.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import
@@ -304,9 +305,10 @@ pending/unconfirmed asynchronous effects or an applied hook environment preserve
 custody but is explicitly unavailable for execution. A process-global environment
 overlay is not an authorized reconstruction source for another user or session.
 Actual recovery activation must restore these facts before starting the executor;
-the production recovery activation path remains unfinished. The runtime replay
-entrypoint is currently exercised only by contract tests, including real
-database adoption across owner generations. The atomic adoption API returns the
+the production recovery activation path remains unfinished. Contract tests
+exercise real checkpoint persistence and database custody adoption across owner
+generations; they do not implement a separate execution replay entrypoint.
+The atomic adoption API returns the
 locked checkpoint with its committed receipt, binding both producer and current
 owner generations; a serialized receipt alone is not fresh execution authority.
 
@@ -387,19 +389,22 @@ the checkpoint payload.
 Implementation boundary: owner-fenced storage, fresh snapshot construction and
 cooperative Server shutdown are connected. The recovery scanner preserves valid
 handoff material through the atomic recovery-association path; it does
-not launch an executor. Full replay currently has deterministic test coverage,
-not a production recovery consumer. It requires the original generation,
-reservation, committed history and real WAL receipts. Automatic execution takeover
-and restoration of all execution obligations remain unimplemented. After shutdown
+not launch an executor. Contract tests exercise checkpoint persistence,
+cross-generation custody adoption, cancellation and fencing through these
+production entries. There is no original-run execution reconstruction consumer.
+Automatic execution takeover and restoration of all execution obligations remain
+unimplemented. After shutdown
 begins, the shared request preparation entry rejects new chat admission with a
 structured `server_shutting_down` response instead of creating a run that would
 immediately freeze.
 
 Custody and execution decoding are separate: an owner-fenced handoff whose
 inner control schema is unsupported still retains its original bytes and the
-explicit continuation path. Recovery reports whether the runtime can decode
-that state, without claiming it reconstructed execution. Cancellation still
-wins. Control V3 is not yet a complete reconstruction contract: ledger-verified
+explicit continuation path. Recovery preserves that opaque checkpoint and
+reports custody without claiming it decoded or reconstructed execution.
+Cancellation still wins. A new run may continue canonical session history under
+its own admission; custody adoption does not authorize saved execution. Control
+V3 is not yet a complete reconstruction contract: ledger-verified
 tool evidence, intent and remaining execution obligations must be restored
 before an automatic executor may run.
 

@@ -194,24 +194,3 @@ Recommended fix:
 Unknowns:
 - <only if evidence is missing>
 ```
-
-```skill-diagnosis
-{
-  "schema_version": 2,
-  "skill": "analyze_session",
-  "cause": "session_stalls",
-  "headline": "agent stalled on repeated tool calls with no new progress",
-  "findings": ["turn 4-7 repeated identical grep with no new matches"],
-  "recommended_action": "narrow scope to src/ or switch to rg",
-  "success_criteria": [
-    {
-      "metric": "session_stalls_delta",
-      "operator": "lte",
-      "threshold": 0.0,
-      "window_turns": 3,
-      "description": "session stalls stop increasing"
-    }
-  ],
-  "source": "real_skill"
-}
-```

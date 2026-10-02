@@ -759,6 +759,7 @@ pub(crate) struct StreamResult {
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
     /// Collected turn observability events (llm_round, tool timing) for batch flush.
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
+    pub(crate) turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
     /// Provider-reported token usage coverage. Token totals are lower bounds
@@ -1582,6 +1583,7 @@ mod usage_attribution_tests {
 impl Default for StreamResult {
     fn default() -> Self {
         Self {
+            turn_evaluation: None,
             session_id: None,
             run_id: None,
             session_persistence_error: None,

@@ -259,7 +259,7 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
     astra_services::SessionArtifactStore::session_path(&store, session_id, "file_checkpoints").ok()
 }
 #[path = "edge_tools/worktree.rs"]
-mod worktree;
+pub(crate) mod worktree;
 use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
@@ -1456,15 +1456,7 @@ pub struct ToolExecutor {
     /// every `build_self_model_snapshot` for the session's lifetime.
     session_lessons: std::sync::Mutex<Vec<astra_services::LessonHint>>,
     memory_selection_reports: std::sync::Mutex<Vec<astra_turn_types::MemorySelectionReport>>,
-    /// P3.3 seam: latest auto-invoked diagnostic skill output.
-    /// `AutoInvokeHandler::maybe_fire` writes each successful parse here;
-    /// the next `build_self_model_snapshot` injects it into the prompt and
-    /// `set_latest_skill_diagnosis(None)` clears it once the triggering
-    /// condition has resolved.
-    latest_skill_diagnosis: std::sync::Mutex<Option<astra_skills::auto_invoke::SkillDiagnosis>>,
-    /// Latest passive evaluator feedback from the previous turn. Kept separate
-    /// from auto-invoked skill diagnoses so evaluator hints are not lost to
-    /// diagnosis cooldown/clear behavior.
+    /// Evaluator feedback from the previous turn.
     latest_turn_quality_feedback:
         std::sync::Mutex<Option<astra_runtime::self_model::TurnQualityFeedback>>,
     /// Per-turn mutation accounting for adjust_config governor.
@@ -1598,7 +1590,6 @@ impl ToolExecutor {
             current_context_window_tokens: std::sync::RwLock::new(None),
             session_lessons: std::sync::Mutex::new(Vec::new()),
             memory_selection_reports: std::sync::Mutex::new(Vec::new()),
-            latest_skill_diagnosis: std::sync::Mutex::new(None),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
             default_executor: astra_tools::executor::DefaultToolExecutor::new(
@@ -2407,9 +2398,6 @@ impl ToolExecutor {
             if let Ok(mut lessons) = self.session_lessons.lock() {
                 lessons.clear();
             }
-            if let Ok(mut diag) = self.latest_skill_diagnosis.lock() {
-                *diag = None;
-            }
             if let Ok(mut feedback) = self.latest_turn_quality_feedback.lock() {
                 *feedback = None;
             }
@@ -2520,18 +2508,6 @@ impl ToolExecutor {
             .ok()
             .map(|slot| slot.clone())
             .unwrap_or_default()
-    }
-
-    /// P3.3 seam: stash the latest auto-invoke diagnosis. Pass `None` to
-    /// clear a stale diagnosis once the triggering condition resolves.
-    /// The next `build_self_model_snapshot` picks it up.
-    pub fn set_latest_skill_diagnosis(
-        &self,
-        diag: Option<astra_skills::auto_invoke::SkillDiagnosis>,
-    ) {
-        if let Ok(mut g) = self.latest_skill_diagnosis.lock() {
-            *g = diag;
-        }
     }
 
     pub fn set_latest_turn_quality_feedback(
@@ -6064,7 +6040,7 @@ impl ToolExecutor {
         let stale_runtime_signals =
             astra_turn_core::injection_tracking::stale_channel_advisories(&injection_freshness);
 
-        let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
+        let mut snapshot = astra_runtime::self_model::SelfModel::snapshot(
             &tool_name_refs,
             skills_slice,
             tool_health_tracker.as_ref(),
@@ -6078,11 +6054,7 @@ impl ToolExecutor {
             None,
             signals_slice,
             &session.config,
-            session.last_strategy_application.as_ref(),
         );
-        if let Some(g) = session.last_guardrail_view.clone() {
-            snapshot = snapshot.with_guardrail(g);
-        }
         if let Some(dp) = session.last_denial_pressure {
             snapshot = snapshot.with_denial_pressure(dp);
         }
@@ -6124,15 +6096,6 @@ impl ToolExecutor {
             && !lessons.is_empty()
         {
             snapshot = snapshot.with_lessons(lessons.clone());
-        }
-
-        // P3.3 seam: attach the latest auto-invoke diagnosis (if any).
-        // `with_skill_diagnosis(None)` is a no-op — we only call it when
-        // something is stashed.
-        if let Ok(diag_guard) = self.latest_skill_diagnosis.lock()
-            && let Some(ref diag) = *diag_guard
-        {
-            snapshot = snapshot.with_skill_diagnosis(Some(diag.clone()));
         }
 
         if let Ok(feedback_guard) = self.latest_turn_quality_feedback.lock()
@@ -6190,7 +6153,7 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::{Value, json};
     #[tokio::test]
     async fn removed_repository_tools_are_not_executable_or_discoverable() {
@@ -6385,6 +6348,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl astra_runtime::orchestration::SpawnAgentExecutor for ImmediateSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: astra_runtime::orchestration::CancellationOrigin,
+        ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(
             &self,
             config: astra_runtime::orchestration::SpawnRunConfig,
@@ -6412,6 +6387,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl astra_runtime::orchestration::SpawnAgentExecutor for GatedSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: astra_runtime::orchestration::CancellationOrigin,
+        ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(
             &self,
             config: astra_runtime::orchestration::SpawnRunConfig,
@@ -10969,7 +10956,7 @@ mod tests {
     mod sleep_tests;
     mod tool_search_tests;
     mod utf16_tests;
-    mod worktree_tests;
+    pub(crate) mod worktree_tests;
 
     #[test]
     fn introspect_rejects_server_explain_selectors_locally() {

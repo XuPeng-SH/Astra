@@ -488,8 +488,6 @@ pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
     let external = ExternalSources {
         memory_entries: memory_entries.to_vec(),
         session_memory_entry: session_memory_entry.cloned(),
-        spill_dir: None,
-        spill_backend: None,
 
         effort_hint: None,
         system_override,

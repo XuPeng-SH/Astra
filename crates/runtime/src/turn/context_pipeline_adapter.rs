@@ -95,18 +95,6 @@ pub(crate) fn build_external_sources(
     // ── Memory entries (structured, non-section) ──
     let memory_entries = build_memory_entries_from_edge_profile(edge_profile);
 
-    let spill_backend: Option<std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>> =
-        edge_profile
-            .get("spill_dir")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                std::sync::Arc::new(astra_turn_core::spill_backend::FileSystemSpillBackend::new(
-                    s,
-                ))
-                    as std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>
-            });
-
     // ── Framework+Policy: ContextChannelProvider assembly ──
     // Every prompt section is produced by a typed provider. The assembler
     // walks the registered providers in deterministic registration order,
@@ -233,8 +221,6 @@ pub(crate) fn build_external_sources(
     ExternalSources {
         memory_entries,
         session_memory_entry: None,
-        spill_dir: None,
-        spill_backend,
         effort_hint,
         system_override,
         plan_context,

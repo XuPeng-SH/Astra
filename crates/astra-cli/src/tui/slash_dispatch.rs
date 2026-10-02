@@ -931,7 +931,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             snap.session = Some(SessionSummary {
                 session_id: ctx.state.session_id.clone().unwrap_or_default(),
                 turn: ctx.state.turn,
-                model: ctx.state.model.clone(),
+                model: ctx.state.model.as_deref().map(str::to_string),
                 total_cost: ctx.state.total_session_cost,
                 prompt_tokens: ctx.state.total_prompt_tokens,
                 completion_tokens: ctx.state.total_completion_tokens,
@@ -1706,7 +1706,11 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ("session", short_sid.to_string()),
                 (
                     "model",
-                    state.model.clone().unwrap_or_else(|| "<unset>".into()),
+                    state
+                        .model
+                        .as_deref()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "<unset>".into()),
                 ),
                 ("turns", state.turn.to_string()),
                 (
@@ -1855,18 +1859,6 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 "skills tracked",
                 state.skill_quality_tracker.all_entries().len().to_string(),
             ));
-            if !state.drift_user_corrections.is_empty() {
-                pairs.push((
-                    "corrections",
-                    state.drift_user_corrections.len().to_string(),
-                ));
-            }
-            if !state.drift_compressed_turns.is_empty() {
-                pairs.push((
-                    "compactions",
-                    state.drift_compressed_turns.len().to_string(),
-                ));
-            }
             if let Some(ref q) = state.drift_original_query {
                 let short: String = q.chars().take(50).collect();
                 pairs.push(("original query", short));
@@ -3018,7 +3010,11 @@ pub(crate) fn push_model_picker(
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
     // and the suffix is re-applied by the thinking stage.
-    let current_raw = state.model.clone().unwrap_or_default();
+    let current_raw = state
+        .model
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_default();
     let current_base = current_raw
         .split_once("-thinking:")
         .map(|(b, _)| b.to_string())
@@ -3133,13 +3129,11 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     }
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
         ctx.state.model = None;
-        crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
-    ctx.state.model = Some(name.to_string());
-    crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
+    ctx.state.model = Some((name.to_string()).into());
     ctx.bottom_pane.footer.model = Some(name.to_string());
     ctx.show_response(format!("Set model to {name}"));
 }
@@ -3148,7 +3142,6 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 /// scrollback so the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
-    crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled
@@ -3161,7 +3154,7 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
     use crate::tui::bottom_pane::info_view::InfoView;
 
     let target = if arg.is_empty() {
-        ctx.state.model.clone()
+        ctx.state.model.as_deref().map(str::to_string)
     } else {
         Some(arg.trim().to_string())
     };
@@ -3173,23 +3166,48 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
     // Prefer the cached pricing the session already carries so
     // `/model info` is instant — live refetch happens when the user
     // explicitly opens the `/model` picker.
-    let pricing = &ctx.state.cached_pricing;
-    let prompt_usd = if pricing.prompt > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
+    let selection = if ctx.state.model.as_deref() == Some(name.as_str()) {
+        ctx.state.model.as_ref().and_then(|model| match model {
+            crate::cli::session::session_state::SessionModelChoice::Selected(selection) => {
+                Some(selection.clone())
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let selection = match selection {
+        Some(selection) => Some(selection),
+        None => load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_string))
+            .await
+            .ok()
+            .and_then(|models| {
+                crate::cli::session::session_runtime::find_model_entry_by_name(
+                    &models,
+                    astra_turn_core::thinking_config::resolve_model_thinking(&name).0,
+                )
+                .and_then(crate::cli::session::session_runtime::model_selection_from_list_entry)
+            }),
+    };
+    let pricing = selection
+        .as_ref()
+        .and_then(|selection| selection.pricing.as_ref());
+    let prompt_usd = if let Some(price) = pricing {
+        format!("${:.3} / 1M tokens", price.prompt * 1_000_000.0)
     } else {
         "— (not cached)".into()
     };
-    let completion_usd = if pricing.completion > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.completion * 1_000_000.0)
+    let completion_usd = if let Some(price) = pricing {
+        format!("${:.3} / 1M tokens", price.completion * 1_000_000.0)
     } else {
         "— (not cached)".into()
     };
     let cache_read = pricing
-        .cache_read
+        .and_then(|price| price.cache_read)
         .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
         .unwrap_or_else(|| "—".into());
     let cache_write = pricing
-        .cache_write
+        .and_then(|price| price.cache_write)
         .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
         .unwrap_or_else(|| "—".into());
 
@@ -3295,7 +3313,11 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
         session_id: state.session_id.clone().unwrap_or_default(),
         pending_recovery: state.pending_recovery.clone(),
         turn: state.turn,
-        model: state.model.clone().unwrap_or_else(|| "—".into()),
+        model: state
+            .model
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| "—".into()),
         total_cost: state.total_session_cost,
         prompt_tokens: state.total_prompt_tokens,
         completion_tokens: state.total_completion_tokens,
@@ -4480,7 +4502,7 @@ mod view_result_tests {
     #[test]
     fn memory_selection_opens_the_observed_record_without_mutating_model() {
         let mut state = SessionState::default();
-        state.model = Some("deepseek-v4-pro".to_string());
+        state.model = Some(("deepseek-v4-pro".to_string()).into());
         let mut bottom_pane = BottomPane::new();
         bottom_pane.footer.model = Some("deepseek-v4-pro".to_string());
         let mut chat_widget = ChatWidget::new("");

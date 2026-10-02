@@ -2937,6 +2937,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
         let first = project.join("a.rs");
         let alias = project.join("z.rs");
         std::fs::write(&first, "fn target() {}\n").unwrap();

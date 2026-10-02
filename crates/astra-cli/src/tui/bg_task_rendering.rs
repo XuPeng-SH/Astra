@@ -301,8 +301,7 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     )
     .with_output_stats(None, total_lines)
     .with_terminal(None, terminal_reason)
-    .with_timing(started_at_ms, ended_at_ms)
-    .with_run_in_background(agent.run_in_background);
+    .with_timing(started_at_ms, ended_at_ms);
 
     Some(if let Some(slot) = agent.fanout_slot.as_ref() {
         row.with_fanout(background_task_fanout_membership(
@@ -707,9 +706,6 @@ pub(crate) async fn stop_background_task_with_agents(
                     return Ok(BackgroundTaskStopTarget::LocalAgent);
                 }
                 match spawner.get_agent_state_any(task_id).await {
-                    Some(state) if !state.run_in_background => {
-                        return Err(BackgroundTaskError::not_found(task_id));
-                    }
                     Some(state) if state.status.is_terminal() => {
                         return Err(BackgroundTaskError::AlreadyTerminated {
                             task_id: task_id.to_string(),

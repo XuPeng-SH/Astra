@@ -525,6 +525,21 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// The selected host must expose both a durable session writer and a
+    /// model-visible reader before shared execution can spill history.
+    fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
+        false
+    }
+
+    async fn persist_context_history(
+        &mut self,
+        _state: &AgenticLoopState,
+        _artifact_id: &str,
+        _history: astra_turn_types::ContextHistoryArtifactV1,
+    ) -> Result<(), String> {
+        Err("selected host has no context history artifact writer".into())
+    }
+
     /// Parking on external input must not occupy a scarce execution slot.
     /// Hosts without run admission (CLI and scripted tests) are no-ops.
     fn release_execution_capacity_for_wait(&mut self) {}
@@ -2014,16 +2029,6 @@ pub struct StallTrackingState {
     /// Anomaly-based circuit breaker for the agentic loop.
     /// Replaces the old countdown-based round budget phase1/phase2 logic.
     pub circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
-    /// Rolling-stats guardrail auto-tuner for the auto-reflection signal
-    /// threshold. Observes per-turn outcomes and adjusts the threshold by
-    /// ±1 (bounded to `[MIN, MAX]`) so Astra reacts faster when failures
-    /// cluster and backs off when things are stable.
-    pub guardrail_tuner: crate::config_admin::guardrail::GuardrailTuner,
-    /// Cursor into `tool_call_records` marking the boundary already
-    /// observed by the guardrail tuner. Turn N sees records
-    /// `tool_call_records[cursor..]`; after observation the cursor is
-    /// advanced to `len()`.
-    pub guardrail_tuner_records_cursor: usize,
 }
 
 impl StallTrackingState {
@@ -2456,6 +2461,7 @@ impl LoopEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OriginalLoopExecutionFacts {
+    pub evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
     pub loop_entry: LoopEntry,
     pub context_compression_triggered: bool,
     #[serde(
@@ -2543,6 +2549,7 @@ impl OriginalLoopExecutionFacts {
             .collect::<Vec<_>>();
         validate_pending_context(&pending_context)?;
         Ok(Self {
+            evaluation_thresholds: state.evaluation_thresholds,
             loop_entry: state.loop_entry.clone(),
             context_compression_triggered: state.context_compression_triggered,
             pending_context,
@@ -3463,6 +3470,8 @@ impl ToolLedgerReceiptAccumulator {
 }
 
 pub struct AgenticLoopState {
+    /// Fixed for this execution, including cooperative owner handoff.
+    pub evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
     // ── Message context ──
     pub messages: Vec<Value>,
     /// Optional append-only capture for a child run's durable transcript.
@@ -3571,17 +3580,6 @@ pub struct AgenticLoopState {
     pub last_request_message_count: Option<usize>,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
-    /// Positive allowlist bias populated by pipeline `add_tools` strategy.
-    /// Tools listed here are guaranteed NOT to be filtered out by the effective
-    /// restriction set on the current turn (they still have to be advertised
-    /// by the edge catalogue). This is additive and persists until manually
-    /// cleared; the bridge prunes it naturally when a later diagnosis drops the
-    /// tool from its recommendation.
-    pub boosted_tools: HashSet<String>,
-    /// One-shot flag set by pipeline `widen_selection` strategy. The flag is
-    /// consumed (reset to false) on the next authoritative tool-visibility
-    /// assembly; soft health diagnostics no longer hide tools from the schema.
-    pub widen_selection_pending: bool,
     pub step_recorder: StepRecorder,
 
     // ── Dedup + caching ──
@@ -3975,8 +3973,10 @@ impl AgenticLoopState {
         agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
         policy: &astra_config::runtime_config::EffectiveToolPolicy,
         inference_purpose: astra_turn_types::InferencePurpose,
+        evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
     ) -> Self {
         Self {
+            evaluation_thresholds,
             messages: Vec::new(),
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
@@ -4019,8 +4019,6 @@ impl AgenticLoopState {
             last_request_message_count: None,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -5740,6 +5738,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
             TaskExecutionProfile::default().agentic_turn_budget,
             &policy,
             astra_turn_types::InferencePurpose::PrimaryAgent,
+            Default::default(),
         )
     }
 }
@@ -6494,26 +6493,6 @@ pub(crate) mod tests {
         assert!(!state.owns_provider_canonical_transition_wal());
     }
 
-    /// Unwind-safe cleanup guard for tests that write under
-    /// `session_journal::local_sessions_dir()`. Removes the provided directory
-    /// on drop — including during panic unwinds from failed assertions — so
-    /// repeated runs don't leak `tier-gate-*` / `precompact-spill-*` siblings.
-    struct SpillDirGuard(std::path::PathBuf);
-
-    impl Drop for SpillDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn local_spill_session_dir(session_id: &str) -> std::path::PathBuf {
-        use astra_services::SessionArtifactStore as _;
-
-        astra_services::local_session_artifact_store()
-            .session_dir(session_id)
-            .expect("test session id must resolve an owner-scoped spill directory")
-    }
-
     fn structured_task_profile(
         mutates_workspace: bool,
         exploratory_task: bool,
@@ -6539,6 +6518,10 @@ pub(crate) mod tests {
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
         pub(crate) compaction_events: Vec<CompactionEvent>,
+        pub(crate) history_artifacts: Vec<astra_turn_types::ContextHistoryArtifactV1>,
+        pub(crate) history_artifact_error: bool,
+        pub(crate) history_artifact_enabled: bool,
+        pub(crate) history_artifact_cancel: Option<Arc<CancellationToken>>,
         pub(crate) rendered_compaction_summaries: Vec<String>,
         quiet: bool,
         interaction_mode: TurnInteractionMode,
@@ -6597,6 +6580,10 @@ pub(crate) mod tests {
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
                 compaction_events: Vec::new(),
+                history_artifacts: Vec::new(),
+                history_artifact_error: false,
+                history_artifact_enabled: false,
+                history_artifact_cancel: None,
                 rendered_compaction_summaries: Vec::new(),
                 quiet: true,
                 interaction_mode: TurnInteractionMode::NonInteractive,
@@ -6751,6 +6738,25 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
+            self.history_artifact_enabled
+        }
+        async fn persist_context_history(
+            &mut self,
+            _state: &AgenticLoopState,
+            _id: &str,
+            history: astra_turn_types::ContextHistoryArtifactV1,
+        ) -> Result<(), String> {
+            if self.history_artifact_error {
+                return Err("injected storage failure".into());
+            }
+            self.history_artifacts.push(history);
+            if let Some(token) = &self.history_artifact_cancel {
+                token.cancel();
+            }
+            Ok(())
+        }
+
         fn release_execution_capacity_for_wait(&mut self) {
             self.execution_capacity_releases += 1;
         }
@@ -11326,6 +11332,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn original_execution_facts_keep_admitted_evaluation_thresholds() {
+        use crate::turn::runtime_policy::evaluation_thresholds_from_policy;
+        let mut policy = astra_config::runtime_config::ToolPolicyConfig {
+            redundant_reads_eval_threshold: 7,
+            search_fanout_eval_threshold: 19,
+            redundant_validation_retries_eval_threshold: 5,
+            ..Default::default()
+        };
+        let mut state = make_state();
+        state.evaluation_thresholds = evaluation_thresholds_from_policy(&policy);
+        let admitted = state.evaluation_thresholds;
+        let wire =
+            serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+        policy.search_fanout_eval_threshold = 2;
+        assert_ne!(evaluation_thresholds_from_policy(&policy), admitted);
+        let restored: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored.evaluation_thresholds, admitted);
+        assert_eq!(state.evaluation_thresholds, admitted);
+        let mut missing = wire;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("evaluation_thresholds");
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(missing).is_err());
+    }
+
+    #[test]
     fn original_execution_facts_preserve_required_usage_evidence() {
         use astra_turn_types::CanonicalTokenUsage;
         for usage in [
@@ -12389,7 +12422,6 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard = SpillDirGuard(local_spill_session_dir(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -12403,6 +12435,7 @@ pub(crate) mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 80_000;
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
         // Make sure tier-1 compression path fires (not tier-2 spill-only):
         state.compact_tier_applied = CompactionTier::Normal;
         state
@@ -12462,7 +12495,6 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard = SpillDirGuard(local_spill_session_dir(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -12473,9 +12505,11 @@ pub(crate) mod tests {
             ),
             text_result("Done after spill.", 40_000, 500, None),
         ]);
+        host.history_artifact_enabled = true;
         let mut state = make_state();
         state.max_turn_input_tokens = 80_000;
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
         state.compact_tier_applied = CompactionTier::CompactHistory;
         state
             .messages
@@ -12483,7 +12517,7 @@ pub(crate) mod tests {
         for i in 0..12 {
             state
                 .messages
-                .push(json!({"role": "assistant", "content": format!("analysis step {i}")}));
+                .push(json!({"role": "assistant", "content": format!("analysis step {i}: {}", "investigation evidence ".repeat(100))}));
             state
                 .messages
                 .push(json!({"role": "user", "content": format!("follow-up {i}")}));
@@ -12493,6 +12527,8 @@ pub(crate) mod tests {
 
         assert!(outcome.is_ok());
         assert_eq!(state.final_text, "Done after spill.");
+        assert_eq!(host.history_artifacts.len(), 1);
+        host.history_artifacts[0].validate(&session_id).unwrap();
         let has_spill_msg = state.messages.iter().any(|m| {
             m.get("content")
                 .and_then(|c| c.as_str())
@@ -12500,7 +12536,7 @@ pub(crate) mod tests {
         });
         assert!(
             has_spill_msg,
-            "expected spill-to-disk system message after budget recovery"
+            "expected durable history artifact after budget recovery"
         );
         let has_budget_wrapup_msg = state.messages.iter().any(|m| {
             m.get("content")
@@ -12521,7 +12557,7 @@ pub(crate) mod tests {
         // with otherwise-compressible tool_result payloads: if the guard is
         // broken, CompactionEngine would rewrite them to `[Cleared]` and the
         // original text would disappear. With the guard honoured the messages
-        // stay intact and spill-to-disk (an independent tier-2 recovery) runs.
+        // stay intact and artifact spill (an independent tier-2 recovery) runs.
         let session_id = format!(
             "tier-gate-{}",
             std::time::SystemTime::now()
@@ -12529,7 +12565,6 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard = SpillDirGuard(local_spill_session_dir(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -12543,6 +12578,7 @@ pub(crate) mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 80_000;
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
         // Simulate a pre-turn LLM compact having already run.
         state.compact_tier_applied = CompactionTier::CompactHistory;
         let distinctive_tool_payload = "SENTINEL_RESULT_PAYLOAD_DO_NOT_CLEAR_".repeat(200);
@@ -12566,7 +12602,7 @@ pub(crate) mod tests {
         assert_eq!(state.final_text, "Compacted result.");
 
         // Either the payload still appears verbatim in live messages, OR it was
-        // moved to disk via tier-2 spill (whose system marker shows up instead).
+        // moved to a durable artifact via tier-2 spill (whose system marker shows up instead).
         // What must NOT happen: the mechanical pipeline rewriting it to
         // `[Cleared]` in place — that would mean the tier guard failed.
         let has_cleared_tombstone = state.messages.iter().any(|m| {
@@ -13905,6 +13941,7 @@ mod observability_e2e_tests {
 
         let mut state = make_state();
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
         // Two turns: first returns 3 tool_calls, second returns text.
         let mut host = MockHost::new(vec![
             turn_with_tools(&["read_file", "grep", "glob"], ""),
@@ -13970,6 +14007,7 @@ mod observability_e2e_tests {
 
         let mut state = make_state();
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
         // Three turns: round 0 (1 tool), round 1 (1 tool), round 2 (text).
         let mut host = MockHost::new(vec![
             turn_with_tools(&["read_file"], ""),
@@ -14022,6 +14060,7 @@ mod observability_e2e_tests {
 
         let mut state = make_state();
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
         // First turn returns tools, second turn the host will error (simulating cancel).
         let mut host = MockHost::new(vec![
             turn_with_tools(&["read_file"], ""),
@@ -14153,6 +14192,7 @@ mod parallel_execution_tests {
 
         let mut state = make_state();
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
 
         let tools = vec![
             ("read_file", "c1"),
@@ -14215,6 +14255,7 @@ mod parallel_execution_tests {
 
         let mut state = make_state();
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("budget-recovery-run".into());
 
         let tools = vec![
             ("read_file", "c1"),

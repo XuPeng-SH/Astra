@@ -29,6 +29,7 @@ mod capability_handlers;
 mod chat_handlers;
 mod cleanup_retry;
 pub mod conflict_resolver;
+pub(crate) mod context_history_artifact;
 pub mod delegation;
 pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
@@ -46,6 +47,8 @@ pub(crate) mod model_execution_admission;
 mod platform_handlers;
 mod preferences_handlers;
 mod provider_runtime_context;
+#[cfg(any(test, feature = "e2e-hooks"))]
+pub mod provider_test_support;
 mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
@@ -91,6 +94,7 @@ mod work_handlers;
 mod work_patch_commit_runtime;
 mod work_patch_export_runtime;
 mod work_patch_materialization_runtime;
+mod work_patch_workspace;
 
 fn external_request_descriptor(
     method: &Method,
@@ -323,11 +327,13 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_handles.push(
             work_patch_materialization_runtime::spawn_work_patch_materialization_recovery(
                 pool.clone(),
+                state.execution.run_lifecycle_service.clone(),
                 bg_cancel.clone(),
             ),
         );
         bg_handles.push(work_patch_commit_runtime::spawn_work_patch_commit_recovery(
             pool.clone(),
+            state.execution.run_lifecycle_service.clone(),
             bg_cancel.clone(),
         ));
         // Spawn background cleanup-debt retry task

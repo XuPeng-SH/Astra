@@ -7,7 +7,8 @@ use axum::http::StatusCode;
 use serde_json::json;
 
 use super::harness::{
-    self, bootstrap, delete_json, get_json, post_empty, post_json, seeded_model_selection,
+    self, ProviderResponse, ProviderScript, bootstrap, delete_json, get_json, post_empty,
+    post_json, seeded_model_selection,
 };
 
 async fn seed_orphan_cancel_race_run(
@@ -326,21 +327,30 @@ pub async fn run_chat_run_pause_resume_http() {
     let app = &ctx.app;
     let session_id = ctx.session_id.clone();
 
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let entered_provider = entered.clone();
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("paused native provider request",move |request| {
+        let matched=request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true;
+        if matched { entered_provider.notify_one(); }
+        matched
+    },vec![ProviderResponse::Stream{content_type:"text/event-stream",chunks:vec![
+        format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{"content":"matrix e2e pause/resume completed"}}]})).into_bytes(),
+        format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})).into_bytes(),
+        b"data: [DONE]\n\n".to_vec()
+    ],release_before_chunk:Some((0,release.clone()))}])]).await;
     let (st_chat, chat_j) = post_json(
         app,
         "/chat",
         Some(auth.as_str()),
         json!({
             "message": "matrix e2e background run",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "session_id": session_id,
             "model_selection": seeded_model_selection(ctx),
             "context": {
-                "test_llm_rounds": [
-                    {
-                        "full_text": "matrix e2e pause/resume completed",
-                        "delay_ms": 1500
-                    }
-                ]
+
             },
             "execution_budget": {
                 "initial_turns": 10,
@@ -353,6 +363,9 @@ pub async fn run_chat_run_pause_resume_http() {
     let run_id = chat_j["run_id"].as_str().expect("run_id").to_string();
     assert!(!run_id.is_empty(), "run_id from ChatResponse");
 
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+        .await
+        .expect("actual provider request must enter before pause");
     let observed_status = harness::wait_for_run_status(
         app,
         &run_id,
@@ -392,6 +405,7 @@ pub async fn run_chat_run_pause_resume_http() {
     .await;
     assert_eq!(st_resume, StatusCode::OK, "resume run: {resume_j}");
 
+    release.notify_one();
     match resume_j["disposition"].as_str() {
         // The local executor is still able to continue the existing run.
         Some("applied") => {
@@ -440,18 +454,19 @@ pub async fn run_chat_run_pause_resume_http() {
                 "a session-continuation directive must release the durable execution slot; owner={durable_slot_owner:?}"
             );
 
+            let fixture_model = format!("mock-{}", ctx.suffix);
+            ctx.install_native_provider(auth,vec![ProviderScript::new("typed session continuation",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true,vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"matrix e2e session continuation completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
             let (st_continuation, continuation_j) = post_json(
                 app,
                 "/chat",
                 Some(auth.as_str()),
                 json!({
                     "message": "matrix e2e continuation after paused run",
+                "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
                     "session_id": session_id,
                     "model_selection": seeded_model_selection(ctx),
                     "context": {
-                        "test_llm_rounds": [
-                            { "full_text": "matrix e2e session continuation completed" }
-                        ]
+
                     },
                     "execution_budget": {
                         "initial_turns": 10,
@@ -664,28 +679,26 @@ pub async fn run_live_pause_wins_post_loop_settlement_accounting() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let session_id = ctx.session_id.clone();
-    let (status, chat) = post_json(
-        &ctx.app,
-        "/chat",
-        Some(&b.auth_header),
-        json!({
-            "message": "pause after the provider response but before settlement",
-            "session_id": session_id,
-            "model_selection": seeded_model_selection(ctx),
-            "context": {
-                "test_post_loop_settlement_delay_ms": 500,
-                "test_llm_rounds": [{
-                    "full_text": "provider work completed before pause",
-                    "usage": {
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("settlement accounting through actual provider",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="pause after the provider response but before settlement")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"provider work completed before pause","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{
                         "prompt_tokens": 606,
                         "completion_tokens": 404,
                         "prompt_tokens_details": {
                             "cached_tokens": 202,
                             "cache_creation_input_tokens": 303
                         }
-                    }
-                }]
-            }
+                    }}))])]).await;
+    let (status, chat) = post_json(
+        &ctx.app,
+        "/chat",
+        Some(&b.auth_header),
+        json!({
+            "message": "pause after the provider response but before settlement",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+            "session_id": session_id,
+            "model_selection": seeded_model_selection(ctx),
+            "context": {
+                "test_post_loop_settlement_delay_ms": 500}
         }),
     )
     .await;
@@ -771,16 +784,19 @@ pub async fn run_live_pause_wins_post_loop_settlement_accounting() {
     .expect("count live paused accounting facts");
     assert_eq!(finalized_count, 1);
 
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("settlement accounting through actual provider",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="start a follow-up after promoting the paused completion")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"continuation completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let (continuation_status, continuation) = post_json(
         &ctx.app,
         "/chat",
         Some(&b.auth_header),
         json!({
             "message": "start a follow-up after promoting the paused completion",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "session_id": session_id,
             "model_selection": seeded_model_selection(ctx),
             "context": {
-                "test_llm_rounds": [{"full_text": "continuation completed"}]
+
             }
         }),
     )
