@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use astra_core::SharedPool;
 use astra_core::config::AppSettings;
-use astra_runtime::{DatabaseEvaluationService, MemoriaForwarder, build_app, build_server_state};
+use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
 use astra_services::runs::{
     AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
     DurableRunInteractionKind, DurableRunInteractionWaitOutcome,
@@ -36,6 +36,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
+
+use crate::test_support::DelegationJudgmentProvider;
 
 const INTERRUPTED_MATRIX_E2E_MIN_AGE_MINUTES: u64 = 15;
 const MATRIX_E2E_HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
@@ -802,6 +804,22 @@ pub struct BootstrapResult {
     pub ctx: MatrixE2eCtx,
     pub auth_header: String,
     pub refresh_token: String,
+    pub delegation_judgment: Option<DelegationJudgmentProvider>,
+}
+
+impl BootstrapResult {
+    pub fn assert_delegation_judgment(&self, user_text: &str, slots: &[(&str, &str)]) {
+        self.delegation_judgment
+            .as_ref()
+            .expect("journey opted into HTTP judgment provider")
+            .assert_request(
+                user_text,
+                &self.ctx.model_offering_id,
+                &format!("mock-{}", self.ctx.suffix),
+                slots,
+                true,
+            );
+    }
 }
 
 /// Seed the durable precondition for `/approval/respond` through the same run
@@ -983,6 +1001,18 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
 
 /// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
+    bootstrap_with_judgment_provider(None).await
+}
+
+/// Only delegation journeys opt into real HTTP/SSE candidate assessment.
+/// Other cases retain the deliberately unserved default model.
+pub async fn bootstrap_with_delegation_judgment() -> BootstrapResult {
+    bootstrap_with_judgment_provider(Some(DelegationJudgmentProvider::start().await)).await
+}
+
+async fn bootstrap_with_judgment_provider(
+    delegation_judgment: Option<DelegationJudgmentProvider>,
+) -> BootstrapResult {
     let memoria = Arc::new(E2eMemoriaStub::default());
     let memoria_base_url = start_mock_memoria().await;
     let (state, matrixone_database, url) =
@@ -996,23 +1026,12 @@ pub async fn bootstrap() -> BootstrapResult {
 
     cleanup_interrupted_matrix_e2e_sessions(&state).await;
 
-    // Reuse the server's database pool. A separate 80-connection evaluation
-    // pool per in-process app made a serial journey suite reserve twice the
-    // production capacity and obscured genuine leaks behind the global cap.
+    // Reuse the server's database pool for session lifecycle assertions.
     let session_lifecycle_pool = state
         .shared_pool
         .as_ref()
         .expect("build_server_state wires a shared MatrixOne pool")
         .clone();
-    let matrixone_settings = session_lifecycle_pool.settings().clone();
-    let state = state.with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(matrixone_settings)
-            .with_pool(session_lifecycle_pool.clone())
-            .with_memoria_config(
-                memoria_base_url,
-                Some("system-e2e-mock-master-key".to_string()),
-            ),
-    ));
 
     // `build_app` is used in-process here, so the real server startup hook that
     // primes capability health does not run. Mirror that production boundary
@@ -1103,7 +1122,9 @@ pub async fn bootstrap() -> BootstrapResult {
         &app,
         "/sessions",
         Some(&auth_header),
-        json!({ "title": "product matrix session", "metadata": { "suite": "matrix" } }),
+        json!({ "title": "product matrix session", "metadata": {
+            "suite": "matrix", "full_llm_capture": delegation_judgment.is_some()
+        } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
@@ -1149,7 +1170,7 @@ pub async fn bootstrap() -> BootstrapResult {
         "Matrix E2E Edge registration must have one materialized row"
     );
 
-    // Register a mock model so run-lifecycle tests don't need a real LLM.
+    // No live LLM: opt-in delegation fixtures use the loopback judgment provider.
     grant_astra_admin_role(&pool, &user_id).await;
     let mock_model = format!("mock-{suffix}");
     let (st_mdl, model) = post_json(
@@ -1158,10 +1179,10 @@ pub async fn bootstrap() -> BootstrapResult {
         Some(&auth_header),
         json!({
             "name": mock_model,
-            "provider": "mock",
+            "provider": if delegation_judgment.is_some() { "openai" } else { "mock" },
             "context_window": 200000,
             "api_key": "unused",
-            "base_url": "http://127.0.0.1:1",
+            "base_url": delegation_judgment.as_ref().map_or("http://127.0.0.1:1", DelegationJudgmentProvider::base_url),
             "context_window": 200000
         }),
     )
@@ -1223,6 +1244,7 @@ pub async fn bootstrap() -> BootstrapResult {
         },
         auth_header,
         refresh_token,
+        delegation_judgment,
     }
 }
 

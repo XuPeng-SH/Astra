@@ -34,6 +34,9 @@ failure-output = "immediate"
 # parallelism, so keep each runner's test process fan-out bounded.
 test-threads = 2
 
+[profile.ci.junit]
+path = "junit.xml"
+
 [profile.strict]
 fail-fast = false
 failure-output = "immediate"

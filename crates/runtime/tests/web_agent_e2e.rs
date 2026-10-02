@@ -49,7 +49,8 @@ use serde_json::{Map, Value, json};
 use tower::util::ServiceExt;
 
 use crate::test_support::{
-    parse_sse_events, test_fernet_encryptor, test_run_lifecycle, tool_call, tool_schema,
+    DelegationJudgmentProvider, parse_sse_events, test_fernet_encryptor, test_run_lifecycle,
+    tool_call, tool_schema,
 };
 
 // ── Env setup ────────────────────────────────────────────────────────────────
@@ -479,7 +480,21 @@ impl SkillService for TestSkillService {
     }
 }
 
-struct TestModelService;
+#[derive(Default)]
+struct TestModelService {
+    judgment_base_url: Option<String>,
+}
+
+impl TestModelService {
+    fn model_record(&self, name: String) -> ModelRecord {
+        let mut model = test_model_record(name);
+        if let Some(url) = &self.judgment_base_url {
+            model.provider = "openai".to_string();
+            model.base_url = Some(url.clone());
+        }
+        model
+    }
+}
 
 fn test_model_record(name: String) -> ModelRecord {
     ModelRecord {
@@ -519,14 +534,31 @@ impl ModelService for TestModelService {
         _: String,
         _: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        let model = self.model_record("test-model".to_string());
+        Ok(vec![ModelListItem {
+            thinking_protocol: None,
+            offering_id: DEFAULT_MODEL_OFFERING_ID.to_string(),
+            access_id: "web-e2e-model-access".to_string(),
+            access_kind: astra_services::models::ModelAccessKind::CloudByok,
+            access_label: "test".to_string(),
+            execution_placement: astra_services::models::ModelExecutionPlacement::Server,
+            name: model.name,
+            provider: model.provider,
+            description: model.description,
+            is_active: model.is_active,
+            context_window: model.context_window,
+            max_completion_tokens: model.max_completion_tokens,
+            architecture: model.architecture,
+            thinking_capability: model.thinking_capability,
+            pricing: None,
+        }])
     }
 
     async fn get_model(
         &self,
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(test_model_record(model_name))
+        Ok(self.model_record(model_name))
     }
 
     async fn resolve_model_offering(
@@ -548,8 +580,16 @@ impl ModelService for TestModelService {
                 model_name,
                 wire_model_name: None,
                 api_key: "test-provider-secret".to_string(),
-                base_url: "http://127.0.0.1:1".to_string(),
-                provider: "mock".to_string(),
+                base_url: self
+                    .judgment_base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:1".to_string()),
+                provider: if self.judgment_base_url.is_some() {
+                    "openai"
+                } else {
+                    "mock"
+                }
+                .to_string(),
                 fallback_chain: Vec::new(),
                 tags: Vec::new(),
                 request_body_overrides: None,
@@ -560,6 +600,7 @@ impl ModelService for TestModelService {
                 context_window: Some(128_000),
                 max_completion_tokens: Some(16_384),
                 request_headers: None,
+                price_snapshot: None,
             },
         })
     }
@@ -580,15 +621,23 @@ impl ModelService for TestModelService {
         &self,
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(test_model_record(model_name))
+        Ok(self.model_record(model_name))
     }
 }
 
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
+    build_test_app_with_models(Arc::new(TestModelService::default()), false)
+}
+
+fn build_test_app_with_models(
+    models: Arc<TestModelService>,
+    enable_inference_ledger: bool,
+) -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
+        .with_model_service(models.clone())
         .with_session_service(Arc::new(StubSession));
 
     let ledger = base.edge_callback_ledger();
@@ -597,8 +646,13 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger.clone(),
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(models)
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
+    let lifecycle = if enable_inference_ledger {
+        lifecycle.with_e2e_inference_ledger()
+    } else {
+        lifecycle
+    };
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (build_app(state), ledger)
@@ -622,7 +676,7 @@ fn build_test_app_with_hooks() -> (
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(Arc::new(TestModelService::default()))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
@@ -648,7 +702,7 @@ fn build_test_app_with_hooks_and_skills() -> (
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(Arc::new(TestModelService::default()))
     .with_skill_service(Arc::new(TestSkillService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
@@ -672,7 +726,7 @@ fn build_test_app_with_agent_bindings(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(Arc::new(TestModelService::default()))
     .with_agent_binding_service(binding_service)
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
@@ -682,6 +736,60 @@ fn build_test_app_with_agent_bindings(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+async fn build_test_app_with_delegation_judgment() -> (Router, DelegationJudgmentProvider) {
+    let judgment = DelegationJudgmentProvider::start().await;
+    let (app, _) = build_test_app_with_models(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(judgment.base_url().to_owned()),
+        }),
+        true,
+    );
+    (app, judgment)
+}
+
+fn assert_delegation_judgment(
+    judgment: &DelegationJudgmentProvider,
+    user_text: &str,
+    slots: &[(&str, &str)],
+) {
+    judgment.assert_request_count(1);
+    assert_eq!(
+        judgment.assert_request(
+            user_text,
+            DEFAULT_MODEL_OFFERING_ID,
+            "test-model",
+            slots,
+            true
+        ),
+        1,
+        "single-model fixture authorized catalog"
+    );
+}
+
+fn assert_child_joined_before_parent(
+    events: &[Value],
+    agent_id: &Value,
+    result: &str,
+    parent_text: &str,
+) {
+    let child_terminal = events
+        .iter()
+        .position(|event| {
+            event["agent_id"] == *agent_id
+                && (event["type"] == "agent_completed" || event["event_type"] == "agent_completed")
+                && event["result_summary"] == result
+        })
+        .expect("exact child completed result");
+    let parent_final = events
+        .iter()
+        .position(|event| event["type"] == "text_delta" && event["content"] == parent_text)
+        .expect("parent synthesis");
+    assert!(
+        child_terminal < parent_final,
+        "child must join before parent synthesis"
+    );
+}
 
 fn normalize_chat_stream_payload(mut payload: Value) -> Value {
     let Some(object) = payload.as_object_mut() else {
@@ -1390,12 +1498,13 @@ fn find_event_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> 
 #[tokio::test]
 async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis() {
     init_env();
-    let (app, _ledger) = build_test_app();
+    let (app, judgment) = build_test_app_with_delegation_judgment().await;
 
     let events = chat_stream_collect(
         &app,
         json!({
             "message": "Use a child agent to review the code.",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
             "context": {
                 "test_llm_rounds": [
                     {
@@ -1425,6 +1534,9 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
                         ]
                     },
                     {
+                        "tool_calls": [tool_call("call-join-reviewer", "agent", json!({"action":"wait", "timeout_ms":10000}))]
+                    },
+                    {
                         "full_text": "parent synthesis grounded in child review"
                     }
                 ],
@@ -1437,6 +1549,14 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
         }),
     )
     .await;
+    assert_delegation_judgment(
+        &judgment,
+        "Use a child agent to review the code.",
+        &[(
+            "structured child review",
+            "Review src/lib.rs and summarize one issue.",
+        )],
+    );
 
     assert!(
         find_events(&events, "text_delta")
@@ -1456,13 +1576,15 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
         .find(|event| event["call_id"].as_str() == Some("call-spawn-reviewer"))
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .unwrap_or_else(|| {
-            panic!("spawn should return a structured terminal result: {serialized}")
-        });
-    assert_eq!(launch_receipt["status"], "completed", "{serialized}");
-    assert_eq!(
-        launch_receipt["result"], "child review result: no critical issues",
-        "{serialized}"
+        .unwrap_or_else(|| panic!("spawn should return a canonical launch receipt: {serialized}"));
+    assert_eq!(launch_receipt["status"], "launched", "{serialized}");
+    assert_eq!(launch_receipt["result_family"], "control_receipt");
+    assert_eq!(launch_receipt["success"], true);
+    assert_child_joined_before_parent(
+        &events,
+        &launch_receipt["agent_id"],
+        "child review result: no critical issues",
+        "parent synthesis grounded in child review",
     );
     assert!(
         launch_receipt["agent_id"].as_str().is_some(),
@@ -1556,12 +1678,13 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
 #[tokio::test]
 async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrier() {
     init_env();
-    let (app, _ledger) = build_test_app();
+    let (app, judgment) = build_test_app_with_delegation_judgment().await;
 
     let events = chat_stream_collect(
         &app,
         json!({
             "message": "Use two independent child agents and combine their findings.",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
             "context": {
                 "test_llm_rounds": [
                     {
@@ -1598,6 +1721,7 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
                             }))
                         ]
                     },
+                    {"tool_calls": [tool_call("call-join-fanout", "agent", json!({"action":"wait", "timeout_ms":10000}))]},
                     {"full_text": "combined findings from both children"}
                 ],
                 "test_spawn_child_llm_rounds": [
@@ -1607,16 +1731,33 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
         }),
     )
     .await;
+    assert_delegation_judgment(
+        &judgment,
+        "Use two independent child agents and combine their findings.",
+        &[
+            ("parallel child A", "Review one independent concern."),
+            ("parallel child B", "Review another independent concern."),
+        ],
+    );
 
     let result = find_events(&events, "tool_call_end")
         .into_iter()
         .find(|event| event["call_id"].as_str() == Some("call-fanout"))
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .expect("fanout must return a terminal structured result");
-    // Auxiliary absence is not a negative topology decision. The fixed typed
-    // carrier still passes through canonical runtime delegation admission.
-    assert_eq!(result["status"], "completed");
+        .expect("fanout must return structured launch receipts");
+    // No separate auxiliary Offering is configured. The admitted primary
+    // route still performs the canonical candidate judgment through HTTP.
+    assert_eq!(result["status"], "started");
+    let agents = result["agents"]
+        .as_array()
+        .expect("per-child launch receipts");
+    assert_eq!(agents.len(), 2);
+    for agent in agents {
+        assert_eq!(agent["status"], "launched");
+        assert!(agent["agent_id"].as_str().is_some());
+        assert!(agent["run_id"].as_str().is_some());
+    }
     assert!(
         find_events(&events, "text_delta")
             .iter()
@@ -1627,6 +1768,12 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
     assert_eq!(spawned.len(), 2);
     assert_eq!(find_event_type(&events, "agent_completed").len(), 2);
     for child in spawned {
+        assert_child_joined_before_parent(
+            &events,
+            &child["agent_id"],
+            "child review completed",
+            "combined findings from both children",
+        );
         assert_eq!(child["workspace"]["kind"], "none");
         assert_eq!(child["executor"]["kind"], "server_local");
     }
@@ -1646,6 +1793,7 @@ async fn web_agent_parallel_direct_spawns_without_auxiliary_admission_fail_close
                     "name": "agent",
                     "arguments": {
                         "action": "spawn",
+                        "description": format!("Independent review {id}"),
                         "agent_type": "code-review",
                         "prompt": "Review one independent concern."
                     }
@@ -1671,25 +1819,34 @@ async fn web_agent_parallel_direct_spawns_without_auxiliary_admission_fail_close
             .and_then(|event| event["result"].as_str())
             .and_then(|result| serde_json::from_str::<Value>(result).ok())
             .expect("direct spawn must return a structured rejection");
-        assert_eq!(result["status"], "rejected");
+        assert_eq!(result["status"], "failed");
         assert_eq!(
             result["error_kind"],
-            "parallel_topology_admission_unavailable"
+            "delegation_model_assessment_unavailable"
         );
+        assert_eq!(result["advisory"]["executed"], false);
     }
     assert!(find_event_type(&events, "agent_spawned").is_empty());
     assert!(find_event_type(&events, "agent_completed").is_empty());
+    assert!(find_events(&events, "agent_live_event").is_empty());
+    assert!(find_events(&events, "text_delta").iter().all(|event| {
+        !event["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must not execute")
+    }));
 }
 
 #[tokio::test]
 async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     init_env();
-    let (app, _ledger) = build_test_app();
+    let (app, judgment) = build_test_app_with_delegation_judgment().await;
 
     let response = chat_stream_start(
         &app,
         json!({
             "message": "Use a child agent to review the edge workspace.",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
@@ -1730,6 +1887,9 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                                 }
                             }))
                         ]
+                    },
+                    {
+                        "tool_calls": [tool_call("call-join-edge-reviewer", "agent", json!({"action":"wait", "timeout_ms":10000}))]
                     },
                     {
                         "full_text": "parent synthesis after edge child review"
@@ -1775,6 +1935,14 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .await
         .expect("edge child stream timed out")
         .expect("edge child stream reader failed");
+    assert_delegation_judgment(
+        &judgment,
+        "Use a child agent to review the edge workspace.",
+        &[(
+            "edge child review",
+            "Review src/lib.rs in the inherited edge workspace.",
+        )],
+    );
 
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(
@@ -1793,10 +1961,14 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("edge spawn must return a canonical result: {serialized}"));
-    assert_eq!(spawn_result["status"], "completed", "{serialized}");
-    assert_eq!(
-        spawn_result["result"], "edge child reviewed concrete file evidence: pub fn run()",
-        "{serialized}"
+    assert_eq!(spawn_result["status"], "launched", "{serialized}");
+    assert_eq!(spawn_result["result_family"], "control_receipt");
+    assert_eq!(spawn_result["success"], true);
+    assert_child_joined_before_parent(
+        &events,
+        &spawn_result["agent_id"],
+        "edge child reviewed concrete file evidence: pub fn run()",
+        "parent synthesis after edge child review",
     );
 
     let workspace = find_event(&events, "workspace_bound")
@@ -2404,12 +2576,14 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
 #[tokio::test]
 async fn edge_executor_offline_child_returns_actionable_wait_to_structured_parent() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, judgment) = build_test_app_with_delegation_judgment().await;
 
-    let events = chat_stream_collect(
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let response = tokio::time::timeout_at(deadline, chat_stream_start(
         &app,
         json!({
             "message": "Use a child agent in my edge workspace",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
@@ -2451,6 +2625,7 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
                             }))
                         ]
                     },
+                    { "tool_calls": [tool_call("call-join-offline-child", "agent", json!({"action":"wait", "timeout_ms":10000}))] },
                     { "full_text": "The child is waiting for edge-macbook-1 to reconnect." }
                 ],
                 "test_spawn_child_llm_rounds": [
@@ -2467,8 +2642,64 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
                 ]
             }
         }),
-    )
-    .await;
+    ))
+    .await
+    .expect("offline-child stream did not start within the observation deadline");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (mut rx, mut reader) = spawn_sse_reader(response.into_body()).await;
+    let mut metadata = Vec::new();
+    let mut launched = false;
+    let mut child_waiting = false;
+    let mut wait_receipt = false;
+    let mut root_paused = false;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(event)) => {
+                let event_type = event["type"].as_str().unwrap_or_default();
+                let call_id = event["call_id"].as_str().unwrap_or_default();
+                launched |= event_type == "tool_call_end" && call_id == "call-spawn-offline-child";
+                child_waiting |= event_type == "agent_waiting"
+                    || (event_type == "agent_live_event"
+                        && event["signal"]["signal"] == "execution_waiting");
+                wait_receipt |=
+                    event_type == "tool_call_end" && call_id == "call-join-offline-child";
+                root_paused |= event_type == "run_finished" && event["status"] == "paused";
+                // Retain only bounded routing metadata, never prompts, tool
+                // results, or model output, even when the stream stalls.
+                let reason = event["reason"]
+                    .as_str()
+                    .or_else(|| event["signal"]["reason"].as_str());
+                if metadata.len() == 64 {
+                    metadata.remove(0);
+                }
+                metadata.push(json!({
+                    "type": event_type.chars().take(64).collect::<String>(),
+                    "call_id": call_id.chars().take(96).collect::<String>(),
+                    "status": event["status"].as_str().map(|s| s.chars().take(32).collect::<String>()),
+                    "reason": reason.map(|s| if s.contains("executor_offline") { "executor_offline" } else { "other" }),
+                }));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                reader.abort();
+                panic!(
+                    "offline-child observation deadline: launched={launched}, child_waiting={child_waiting}, wait_receipt={wait_receipt}, root_paused={root_paused}; metadata={metadata:?}"
+                );
+            }
+        }
+    }
+    let events = tokio::time::timeout_at(deadline, &mut reader)
+        .await
+        .expect("offline-child reader did not finish within the observation deadline")
+        .expect("offline-child stream reader failed");
+    assert_delegation_judgment(
+        &judgment,
+        "Use a child agent in my edge workspace",
+        &[(
+            "edge child command",
+            "Run a command in the inherited edge workspace.",
+        )],
+    );
 
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(
@@ -2481,24 +2712,26 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
             }),
         "child spawn should inherit edge binding metadata: {serialized}"
     );
+    let launch = find_events(&events, "tool_call_end")
+        .into_iter()
+        .find(|event| event["call_id"] == "call-spawn-offline-child")
+        .and_then(|event| event["result"].as_str())
+        .and_then(|result| serde_json::from_str::<Value>(result).ok())
+        .expect("offline child launch receipt");
+    assert_eq!(launch["status"], "launched");
+    assert_eq!(launch["result_family"], "control_receipt");
+    assert_eq!(launch["success"], true);
+    assert!(launch["agent_id"].as_str().is_some());
+    let child_run_id = launch["run_id"].as_str().expect("exact child execution");
+    let (child_status, child) = get_run_status(&app, child_run_id).await;
+    assert_eq!(child_status, StatusCode::OK);
+    assert_eq!(
+        child["status"], "paused",
+        "child must retain resumable custody: {child}"
+    );
     assert!(
-        find_events(&events, "tool_call_end").iter().any(|event| {
-            event["call_id"].as_str() == Some("call-spawn-offline-child")
-                && event["success"].as_bool() == Some(false)
-                && event["blocked"].as_bool() == Some(true)
-                && event["agent_status"].as_str() == Some("waiting")
-                && event["error_kind"].as_str() == Some("executor_offline")
-                && event["result"]
-                    .as_str()
-                    .and_then(|result| serde_json::from_str::<Value>(result).ok())
-                    .is_some_and(|receipt| {
-                        receipt["status"].as_str() == Some("waiting")
-                            && receipt["reason"].as_str() == Some("executor_offline")
-                            && receipt["agent_id"].as_str().is_some()
-                            && receipt["run_id"].as_str().is_some()
-                    })
-        }),
-        "foreground spawn should return the child's exact actionable wait: {serialized}"
+        find_events(&events, "tool_request").is_empty(),
+        "offline child must execute no workspace effect"
     );
     assert!(
         find_events(&events, "agent_live_event")

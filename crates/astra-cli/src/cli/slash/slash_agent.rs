@@ -951,7 +951,7 @@ fn status_icon(status: &AgentStatus) -> &'static str {
         AgentStatus::Completed { .. } => "✅",
         AgentStatus::Interrupted { .. } => "⚠️",
         AgentStatus::Failed { .. } => "❌",
-        AgentStatus::Waiting { .. } => "⏸",
+        AgentStatus::Waiting { .. } | AgentStatus::Paused { .. } => "⏸",
         AgentStatus::Cancelled { .. } => "🛑",
     }
 }
@@ -986,6 +986,7 @@ fn format_status(status: &AgentStatus) -> String {
         }
         AgentStatus::Failed { error, .. } => format!("failed: {error}"),
         AgentStatus::Waiting { reason } => format!("waiting: {reason}"),
+        AgentStatus::Paused { reason } => format!("paused: {reason}"),
         AgentStatus::Cancelled { by_user, reason } => {
             if reason.is_empty() {
                 if *by_user {
@@ -2552,6 +2553,8 @@ mod tests {
             parent_run_id: "root-run".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(

@@ -273,6 +273,48 @@ pub(crate) fn cli_user_id() -> String {
         .unwrap_or_else(astra_services::local_owner_user_id)
 }
 
+/// The two local journal owners attached to the current CLI identity. The
+/// profile owner isolates local state; the authenticated account owns Server
+/// execution facts. A journal cursor is never authority to read another owner.
+pub(crate) fn attached_journal_owners() -> Result<
+    (
+        astra_services::OwnerScope,
+        Option<astra_services::OwnerScope>,
+    ),
+    String,
+> {
+    attached_journal_owners_for_profile(None)
+}
+
+pub(crate) fn attached_journal_owners_for_profile(
+    profile: Option<&str>,
+) -> Result<
+    (
+        astra_services::OwnerScope,
+        Option<astra_services::OwnerScope>,
+    ),
+    String,
+> {
+    let local = astra_services::local_owner_scope();
+    let Some(identity) = current_cli_profile_identity() else {
+        return Ok((local, None));
+    };
+    if profile.is_some_and(|requested| requested != identity.profile_name.as_str()) {
+        return Err("requested CLI profile is not the attached journal identity".into());
+    }
+    if identity.local_owner_id != local.id() {
+        return Err("CLI profile identity changed while selecting journal sources".into());
+    }
+    let account = identity
+        .account_id
+        .as_deref()
+        .map(astra_services::OwnerScope::user)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .filter(|owner| owner != &local);
+    Ok((local, account))
+}
+
 pub(crate) fn get_profile_and_token(
     cli_profile: Option<&str>,
 ) -> Result<(CredentialsFile, String, Profile, String), String> {
@@ -2200,6 +2242,8 @@ mod tests {
     #[test]
     fn git_snapshot_with_non_git_dir_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
+        // TMPDIR may be inside the checkout: stop Git's ancestor discovery.
+        std::fs::write(tmp.path().join(".git"), "gitdir: absent-repository\n").unwrap();
         let (head, branch) = git_snapshot(Some(tmp.path().to_str().unwrap()));
         assert!(
             head.is_none(),

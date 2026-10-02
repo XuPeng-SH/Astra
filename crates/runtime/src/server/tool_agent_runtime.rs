@@ -13,16 +13,24 @@ pub(crate) async fn execute_agent_tool(
     agent_tool_context: Option<&AgentToolContext>,
     args: &Value,
     tool_call_id: Option<&str>,
+    delegation_model_admission: Option<&astra_turn_types::DelegationModelAdmission>,
 ) -> astra_tools::ToolResult {
+    let scoped_context = agent_tool_context.map(|context| {
+        let mut context = context.clone();
+        context.delegation_model_admission = delegation_model_admission.cloned();
+        context
+    });
+    let agent_tool_context = scoped_context.as_ref();
     let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(
+            "agent",
             crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
         );
     }
     let action = match agent_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return agent_tool_result_from_output(render_agent_error(error)),
+        Err(error) => return agent_tool_result_from_output("agent", render_agent_error(error)),
     };
     if agent_tool_context.is_none()
         && !astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
@@ -31,16 +39,20 @@ pub(crate) async fn execute_agent_tool(
         )
     {
         return agent_tool_result_from_output(
+            "agent",
             crate::orchestration::render_agent_runtime_binding_error("agent", action.as_str()),
         );
     }
     match action {
         AgentAction::RunChain => server_agent_run_chain_unavailable_result(),
-        AgentAction::Spawn | AgentAction::GetResult | AgentAction::SendMessage => {
-            agent_tool_result_from_output(
-                crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
-            )
-        }
+        AgentAction::Spawn
+        | AgentAction::List
+        | AgentAction::GetResult
+        | AgentAction::Wait
+        | AgentAction::SendMessage => agent_tool_result_from_output(
+            "agent",
+            crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
+        ),
     }
 }
 
@@ -58,7 +70,7 @@ fn server_agent_run_chain_unavailable_result() -> astra_tools::ToolResult {
         ("action".to_string(), Value::String("run_chain".to_string())),
         (
             "available_actions".to_string(),
-            serde_json::json!(["spawn", "get_result", "send_message"]),
+            serde_json::json!(["spawn", "list", "get_result", "send_message"]),
         ),
     ]));
     result
@@ -68,20 +80,31 @@ pub(crate) async fn execute_agent_fanout_tool(
     agent_tool_context: Option<&AgentToolContext>,
     args: &Value,
     tool_call_id: Option<&str>,
+    delegation_model_admission: Option<&astra_turn_types::DelegationModelAdmission>,
 ) -> astra_tools::ToolResult {
+    let scoped_context = agent_tool_context.map(|context| {
+        let mut context = context.clone();
+        context.delegation_model_admission = delegation_model_admission.cloned();
+        context
+    });
+    let agent_tool_context = scoped_context.as_ref();
     let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(
+            "agent_fanout",
             crate::orchestration::handle_agent_fanout_tool(&correlated_args, agent_tool_context)
                 .await,
         );
     }
     let action = match agent_fanout_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return agent_tool_result_from_output(render_agent_error(error)),
+        Err(error) => {
+            return agent_tool_result_from_output("agent_fanout", render_agent_error(error));
+        }
     };
     if agent_tool_context.is_none() {
         return agent_tool_result_from_output(
+            "agent_fanout",
             crate::orchestration::render_agent_runtime_binding_error(
                 "agent_fanout",
                 action.as_str(),
@@ -89,6 +112,7 @@ pub(crate) async fn execute_agent_fanout_tool(
         );
     }
     agent_tool_result_from_output(
+        "agent_fanout",
         crate::orchestration::handle_agent_fanout_tool(&correlated_args, agent_tool_context).await,
     )
     .with_source_bounded_model_projection()
@@ -132,7 +156,7 @@ mod tests {
         assert_eq!(metadata["action"], "run_chain");
         assert_eq!(
             metadata["available_actions"],
-            serde_json::json!(["spawn", "get_result", "send_message"])
+            serde_json::json!(["spawn", "list", "get_result", "send_message"])
         );
     }
 }

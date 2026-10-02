@@ -2916,7 +2916,7 @@ mod context_cache_contract_tests {
                 .to_string(),
             json!(["## Volatile\nmust be suppressed"]),
         );
-        let visible_tools = vec![tool("bash")];
+        let visible_tools = vec![tool("bash"), tool("agent")];
         let restricted_tools = HashSet::new();
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -3085,6 +3085,16 @@ mod context_cache_contract_tests {
                     .is_some_and(|content| content.contains(runtime_policy))
             }),
             "required control policy must reach the strict-history provider wire: {wire:#?}"
+        );
+        assert!(
+            wire.iter().any(
+                |message| message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text
+                        .contains("the first native call is `agent(action=\"spawn\", ...)`"))
+            ),
+            "ordinary delegation guidance must survive strict-history wire assembly"
         );
         assert_eq!(
             wire.last(),

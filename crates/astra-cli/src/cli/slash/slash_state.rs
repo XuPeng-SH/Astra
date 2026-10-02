@@ -1756,6 +1756,7 @@ mod state_command_tests {
                 "decisions": 0
             },
             "summary": summary,
+            "model_requests": astra_services::reflect::ModelRequestCapture::default(),
             "observations": [],
             "evidence": [],
             "action_hints": [],
@@ -1947,9 +1948,15 @@ mod state_command_tests {
         {
             let mut journal = state.file_journal.lock_recover();
             std::fs::write(&file_path, b"before").unwrap();
-            journal.record_before(&file_path, "tool-1", 1);
             std::fs::write(&file_path, b"after").unwrap();
-            journal.record_after(&file_path, "tool-1", b"after");
+            journal.record_committed(
+                &file_path,
+                "tool-1",
+                1,
+                Some(b"before"),
+                b"after",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         let error = handle_state_command(
@@ -2307,6 +2314,7 @@ mod tests {
                 "decisions": 2
             },
             "summary": "One repeated failure is supported by local evidence.",
+            "model_requests": astra_services::reflect::ModelRequestCapture::default(),
             "observations": [{
                 "ref_id": "urn:astra:observation:local:reflect:session:diagnosis:0",
                 "topic": "execution",

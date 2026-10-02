@@ -2,7 +2,9 @@
 """Exercise CI gates and the real Makefile's online shard dispatch offline."""
 
 import json
+from itertools import product
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -20,18 +22,73 @@ SHARDS = {
 }
 
 
+class CliSharedTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        self.producer = self.workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
+        self.consumer = self.workflow.split("\n  shard-a:\n", 1)[1].split("\n  shard-b:\n", 1)[0]
+
+    def test_required_labels_share_the_complete_inventory(self):
+        matrix = self.consumer.split("      matrix:\n", 1)[1].split("    steps:\n", 1)[0]
+        labels = re.search(r"segment: \[([^\]]+)\]", matrix).group(1).split(", ")
+        self.assertEqual(len(labels), 5)
+        self.assertEqual(set(labels), {
+            "non-edge", "edge-shell", "edge-fs-tools", "edge-git-gix", "edge-rest",
+        })
+        self.assertIn('name: "Test: astra-cli (${{ matrix.segment }})"', self.consumer)
+        command = re.search(r"- name: Test complete CLI inventory\n\s+run: ([^\n]+)", self.producer).group(1)
+        self.assertEqual(command,
+                         "cargo nextest run --locked -p astra-cli --lib --bins --profile ci")
+
+    def test_required_labels_reject_failed_cancelled_or_missing_test_result(self):
+        gate = self.consumer.split("      - name: Require complete CLI test result\n", 1)[1].split("      - ", 1)[0]
+        self.assertIn("if: env.RUN_TESTS == 'true'", gate)
+        self.assertIn("TEST_RESULT: ${{ needs.cli-test-build.result }}", gate)
+        script = gate.split("        run: ", 1)[1].strip()
+        for status in ("success", "failure", "cancelled", "skipped", ""):
+            with self.subTest(status=status):
+                result = subprocess.run(["bash", "-c", script],
+                    env={**os.environ, "TEST_RESULT": status}, capture_output=True)
+                self.assertEqual(result.returncode == 0, status == "success")
+        self.assertIn("needs: [scope, cli-test-build]", self.consumer)
+        self.assertIn("if: ${{ !cancelled() }}", self.consumer)
+        for section in (self.producer, self.consumer):
+            self.assertIn("needs.scope.result != 'success'", section)
+            self.assertIn("needs.scope.outputs.test_cli == 'true'", section)
+        for job in ("shard-b", "shard-c", "shard-d"):
+            header = self.workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertIn("needs: scope", header)
+            self.assertNotIn("cli-test-build", header)
+
+    def test_status_labels_do_not_repeat_setup_builds_or_artifact_transfers(self):
+        self.assertNotIn("uses:", self.consumer)
+        self.assertNotRegex(self.consumer, r"\bcargo(?:-nextest)?\b")
+        self.assertNotIn("continue-on-error", self.consumer)
+        self.assertNotIn("archive", self.producer)
+        timings = self.producer.split("      - name: Retain CLI test timings\n", 1)[1]
+        self.assertIn("if: ${{ !cancelled() }}", timings)
+        self.assertIn("path: target/nextest/ci/junit.xml", timings)
+        self.assertEqual(self.producer.count("actions/upload-artifact@"), 1)
+        self.assertIn("save-cache: ${{ github.event_name == 'push' }}", self.producer)
+        self.assertIn("cancel-in-progress: true", self.workflow)
+
+
 class ParallelGateTests(unittest.TestCase):
-    def test_terminal_gate_rejects_failure_cancellation_and_unexpected_skip(self):
-        script = workflow_run_script(".github/workflows/test.yml", "Require terminal PTY shards")
-        for required in (True, False):
-            for status in ("success", "failure", "cancelled", "skipped", ""):
-                with self.subTest(required=required, status=status):
-                    result = subprocess.run(["bash", "-c", script], env={
-                        **os.environ, "SHARDS_REQUIRED": str(required).lower(),
-                        "SHARDS_RESULT": status,
-                    }, capture_output=True, text=True)
-                    expected = status == "success" or (not required and status == "skipped")
-                    self.assertEqual(result.returncode == 0, expected)
+    def test_shard_gates_reject_failure_cancellation_and_unexpected_skip(self):
+        for step, variables in (
+            ("Require terminal PTY shards", ("SHARDS_RESULT",)),
+            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT")),
+        ):
+            script = workflow_run_script(".github/workflows/test.yml", step)
+            for required in (True, False):
+                for statuses in product(("success", "failure", "cancelled", "skipped", ""), repeat=len(variables)):
+                    with self.subTest(step=step, required=required, statuses=statuses):
+                        result = subprocess.run(["bash", "-c", script], env={
+                            **os.environ, "SHARDS_REQUIRED": str(required).lower(),
+                            **dict(zip(variables, statuses)),
+                        }, capture_output=True, text=True)
+                        expected = all(status == "success" or (not required and status == "skipped") for status in statuses)
+                        self.assertEqual(result.returncode == 0, expected)
 
     def test_online_gate_requires_all_matrix_jobs_to_succeed(self):
         script = workflow_run_script(".github/workflows/test.yml", "Require online shards")
@@ -56,6 +113,14 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("needs.scope.outputs.test_core == 'true'", terminal)
         self.assertIn("needs.terminal-pty-shards.result", terminal)
         self.assertIn("if: ${{ !cancelled() }}", terminal)
+        coordination = workflow.split("\n  macos-workspace-coordination:\n", 1)[1].split("\n  macos-workspace-coordination-tests:", 1)[0]
+        self.assertIn('name: "Test: macOS workspace coordination"', coordination)
+        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards]", coordination)
+        self.assertIn("needs.scope.result != 'success'", coordination)
+        self.assertIn("if: ${{ !cancelled() }}", coordination)
+        contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertIn("needs: scope", contracts)
+        self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
         online = workflow.split("\n  test-online:\n", 1)[1]
         self.assertIn("lane: [core-runtime, core-turn-core, core-services, integration]", online)
         self.assertIn("matrix.lane != 'integration' && needs.scope.outputs.online_core == 'true'", online)

@@ -34,6 +34,12 @@ fn bash_preparation_rejection(message: String) -> super::ToolExecutionOutcome {
     outcome
 }
 
+const READ_ONLY_SHELL_UNAVAILABLE: &str = "Error: shell execution is unavailable in a read-only child; use typed read tools instead. No process was started.";
+
+fn read_only_shell_rejection() -> super::ToolExecutionOutcome {
+    bash_preparation_rejection(READ_ONLY_SHELL_UNAVAILABLE.to_string())
+}
+
 fn source_preimage_scope(
     executor: &super::ToolExecutor,
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
@@ -2960,81 +2966,12 @@ fn destructive_powershell_warning(command: &str) -> Option<&'static str> {
     None
 }
 
-/// Execute a command with process group isolation and timeout.
-///
-/// This ensures child processes are properly cleaned up even if:
-/// - The parent process receives SIGINT (Ctrl+C)
-/// - The command times out
-/// - The tokio runtime shuts down mid-execution
-///
-/// Returns the Output on success, or an error message on failure/timeout.
-fn run_command_with_cleanup(
-    cmd: &mut Command,
-    timeout_secs: f64,
-) -> Result<std::process::Output, String> {
-    // Create a new process group so we can kill the entire tree on timeout/signal.
-    // This prevents orphaned child processes from becoming zombies.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let process_scope = astra_sandbox::apply_process_scope();
-    process_scope.attach_std_child(cmd);
-    let mut child = cmd.spawn().map_err(|e| format!("Error: {e}"))?;
-    let child_pid = child.id();
-    if let Err(error) = process_scope.join_child(child_pid) {
-        sync_sigkill_process_group(&mut child);
-        let _ = child.wait();
-        return Err(format!(
-            "Error: failed to join search process scope: {error}"
-        ));
-    }
-
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
-    loop {
-        let leader_pid = child.id();
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                process_scope.terminate_all();
-                sync_sigkill_process_group_id(leader_pid);
-                break;
-            }
-            Ok(None) => {
-                if std::time::Instant::now() > deadline {
-                    // Kill entire process group (command + all children)
-                    process_scope.terminate_all();
-                    sync_sigkill_process_group(&mut child);
-                    // Reap the zombie process to prevent resource leak
-                    let _ = child.wait();
-                    return Err(format!("Error: command timed out after {timeout_secs}s"));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                process_scope.terminate_all();
-                sync_sigkill_process_group(&mut child);
-                let _ = child.wait();
-                return Err(format!("Error: {e}"));
-            }
-        }
-    }
-
-    child.wait_with_output().map_err(|e| format!("Error: {e}"))
-}
-
 // ---------------------------------------------------------------------------
 // Streaming output support
 // ---------------------------------------------------------------------------
 
 /// Maximum output size before truncation (30K chars).
 const MAX_OUTPUT_CHARS: usize = 30_000;
-
-/// Size watchdog poll interval for backgrounded tasks.
-const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Production default for bash's post-exit pipe read timeout. After bash
 /// exits, we wait this long to drain stdout/stderr before giving up on
@@ -3142,6 +3079,16 @@ struct ShellRunConfig {
     supervisor_test_helper: Option<(PathBuf, Vec<String>)>,
 }
 
+/// A blocking shell worker outlives a dropped async join handle. Cancel its
+/// invocation-local token before releasing the caller's ownership.
+struct CancelShellOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelShellOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 enum DetachableShellOutput {
     Completed(std::process::Output),
     Detached {
@@ -3176,6 +3123,42 @@ struct ShellRunError {
     /// proven empty. Pre-spawn failures deliberately leave this false.
     ownership_unsettled: bool,
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
+}
+
+fn finalize_shell_scope_before_lease_transfer(
+    result: &Result<ScopedShellOutput, ShellRunError>,
+    command: &str,
+    workspace_root: &std::path::Path,
+) {
+    let ownership = match result {
+        Ok(output) => {
+            if output.scope_ownership.is_none()
+                && !astra_tools::workspace_observation::bash_command_is_detachable_safe(command)
+            {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    workspace_root,
+                );
+                return;
+            }
+            output.scope_ownership
+        }
+        Err(error) if error.execution_started => {
+            if error.ownership_unsettled {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    workspace_root,
+                );
+                return;
+            }
+            error.scope_ownership
+        }
+        Err(_) => return,
+    };
+    if astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(ownership) {
+        astra_tools::workspace_observation::quarantine_after_weak_receipt(
+            workspace_root,
+            ownership.map(|value| value.as_str()),
+        );
+    }
 }
 
 impl ShellRunError {
@@ -3217,9 +3200,9 @@ fn run_shell_output_with_config(
     target_args.push(effective_command);
 
     #[cfg(all(test, target_os = "linux"))]
-    let prepared = if let Some((program, args)) = &config.supervisor_test_helper {
+    let prepared = if let Some((supervisor, args)) = &config.supervisor_test_helper {
         astra_sandbox::BashInvocationOwner::prepare_with_supervisor_helper(
-            program.clone(),
+            supervisor.clone(),
             args.clone(),
             &config.program,
             &target_args,
@@ -3937,152 +3920,6 @@ fn final_drain_stderr(
     }
 }
 
-/// Execute a command with streaming output and optional auto-backgrounding on timeout.
-///
-/// - Streams stdout/stderr incrementally via `on_output` callback
-/// - On timeout: backgrounds the process instead of killing it (if `allow_background` is true)
-/// - Watchdog kills backgrounded processes after 30 minutes
-///
-/// Returns (output_text, exit_code, was_backgrounded).
-fn run_command_streaming(
-    cmd: &mut Command,
-    timeout_secs: f64,
-    allow_background: bool,
-    on_output: Option<&dyn Fn(&str)>,
-) -> Result<StreamingResult, String> {
-    use std::io::Read;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| format!("Error: {e}"))?;
-
-    let mut stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-    let mut stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
-
-    // Read output in a separate thread to avoid blocking.
-    let (tx, rx) = std::sync::mpsc::channel::<OutputChunk>();
-    let tx2 = tx.clone();
-
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let _ = tx.send(OutputChunk::Stdout(s));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let _ = tx2.send(OutputChunk::Stderr(s));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let mut output = String::new();
-    let mut truncated = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
-
-    loop {
-        // Drain available output chunks.
-        while let Ok(chunk) = rx.try_recv() {
-            let text = match &chunk {
-                OutputChunk::Stdout(s) | OutputChunk::Stderr(s) => s.as_str(),
-            };
-            if !truncated {
-                append_capped_output(&mut output, text, MAX_OUTPUT_CHARS, &mut truncated);
-            }
-            if let Some(cb) = on_output {
-                cb(text);
-            }
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited — drain remaining output.
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                while let Ok(chunk) = rx.try_recv() {
-                    let text = match &chunk {
-                        OutputChunk::Stdout(s) | OutputChunk::Stderr(s) => s.as_str(),
-                    };
-                    append_capped_output(&mut output, text, MAX_OUTPUT_CHARS, &mut truncated);
-                    if let Some(cb) = on_output {
-                        cb(text);
-                    }
-                }
-                finalize_raw_streaming_capture(&mut output, false, truncated);
-                return Ok(StreamingResult {
-                    output,
-                    exit_code: status.code().unwrap_or(-1),
-                    backgrounded: false,
-                });
-            }
-            Ok(None) => {
-                if std::time::Instant::now() > deadline {
-                    if allow_background {
-                        // Auto-background: detach and start size watchdog.
-                        let pid = child.id();
-                        finalize_raw_streaming_capture(&mut output, true, truncated);
-                        output.push_str(&format!(
-                            "\n[Command timed out after {timeout_secs}s — backgrounded as PID {pid}]"
-                        ));
-                        // Spawn watchdog thread to kill if output grows too large.
-                        std::thread::spawn(move || {
-                            size_watchdog(child, stdout_thread, stderr_thread);
-                        });
-                        return Ok(StreamingResult {
-                            output,
-                            exit_code: -1,
-                            backgrounded: true,
-                        });
-                    } else {
-                        // Hard kill.
-                        sync_sigkill_process_group(&mut child);
-                        let _ = child.wait();
-                        let _ = stdout_thread.join();
-                        let _ = stderr_thread.join();
-                        finalize_raw_streaming_capture(&mut output, true, truncated);
-                        output
-                            .push_str(&format!("\nError: command timed out after {timeout_secs}s"));
-                        return Ok(StreamingResult {
-                            output,
-                            exit_code: 143, // SIGTERM
-                            backgrounded: false,
-                        });
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                sync_sigkill_process_group(&mut child);
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(format!("Error: {e}"));
-            }
-        }
-    }
-}
-
 /// Finalize a raw stream before credential redaction. A cap or an interrupted
 /// process can leave an incomplete line; a credential split at that boundary
 /// may no longer match any redaction pattern, so discard that line first.
@@ -4118,63 +3955,13 @@ fn append_capped_output(output: &mut String, text: &str, cap: usize, capped: &mu
     *capped = true;
 }
 
-/// Result from streaming command execution.
-struct StreamingResult {
-    output: String,
-    exit_code: i32,
-    backgrounded: bool,
-}
-
-enum OutputChunk {
-    Stdout(String),
-    Stderr(String),
-}
-
-/// Time-limit watchdog for backgrounded processes.
-/// Kills the process after 30 minutes to prevent indefinite resource consumption.
-fn size_watchdog(
-    mut child: std::process::Child,
-    stdout_thread: std::thread::JoinHandle<()>,
-    stderr_thread: std::thread::JoinHandle<()>,
-) {
-    let start = std::time::Instant::now();
-    // Give backgrounded process up to 30 minutes.
-    let max_duration = Duration::from_secs(30 * 60);
-
-    loop {
-        std::thread::sleep(SIZE_WATCHDOG_INTERVAL);
-
-        // Check if process has exited.
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(_) => {
-                sync_sigkill_process_group(&mut child);
-                let _ = child.wait();
-                break;
-            }
-        }
-
-        // Kill if running too long.
-        if start.elapsed() > max_duration {
-            sync_sigkill_process_group(&mut child);
-            let _ = child.wait();
-            break;
-        }
-    }
-
-    // Clean up threads.
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
-}
-
 /// Default cap on grep result lines when no explicit limit is given.
 /// Prevents unbounded output from broad patterns on large repos.
 /// The LLM can pass `head_limit=0` to override.
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 
 /// Run a read-only command (grep/glob) with timeout, capturing only stdout.
-/// Unlike `run_command_streaming`, stderr is captured separately and not mixed
+/// Stderr is captured separately and not mixed
 /// into the output — the caller gets clean stdout content plus stderr for errors.
 /// Returns `(stdout, stderr, exit_code, timed_out)`.
 fn run_readonly_command_with_partial(
@@ -4317,66 +4104,6 @@ fn append_default_grep_excludes(cmd: &mut Command) {
     }
 }
 
-/// SSRF protection: check if a URL targets internal/private networks.
-/// Returns Some(reason) if blocked, None if safe.
-fn is_ssrf_target(url: &str) -> Option<&'static str> {
-    // Extract host from URL (simple parsing, handles http://host:port/path)
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = after_scheme.split('/').next()?;
-    // Handle userinfo@ prefix
-    let host_port = authority.split('@').next_back()?;
-    // Handle IPv6 brackets: [::1]:port → extract [::1]
-    let host = if host_port.starts_with('[') {
-        // IPv6: take everything up to and including the closing bracket
-        host_port
-            .split(']')
-            .next()
-            .map(|s| format!("{s}]"))
-            .unwrap_or_default()
-    } else {
-        host_port.split(':').next().unwrap_or("").to_string()
-    };
-    let lower = host.to_ascii_lowercase();
-
-    // Block localhost variants
-    if lower == "localhost"
-        || lower == "127.0.0.1"
-        || lower == "0.0.0.0"
-        || lower == "::1"
-        || lower == "[::1]"
-        || lower.ends_with(".localhost")
-    {
-        return Some("localhost access blocked");
-    }
-    // Block AWS/cloud metadata endpoints
-    if lower == "169.254.169.254" || lower == "metadata.google.internal" {
-        return Some("cloud metadata endpoint blocked");
-    }
-    // Block private IP ranges (RFC 1918 + link-local)
-    if lower.starts_with("10.")
-        || lower.starts_with("192.168.")
-        || lower.starts_with("172.") && is_private_172(&lower)
-        || lower.starts_with("169.254.")
-        || lower.starts_with("fc")
-        || lower.starts_with("fd")
-    {
-        return Some("private network access blocked");
-    }
-    None
-}
-
-/// Check if a 172.x.x.x address is in the private range 172.16-31.x.x
-fn is_private_172(host: &str) -> bool {
-    if let Some(second) = host.strip_prefix("172.").and_then(|r| r.split('.').next())
-        && let Ok(n) = second.parse::<u8>()
-    {
-        return (16..=31).contains(&n);
-    }
-    false
-}
-
 impl ToolExecutor {
     fn shell_run_config(
         &self,
@@ -4442,6 +4169,9 @@ impl ToolExecutor {
         command: &str,
         timeout_secs: f64,
     ) -> Result<std::process::Output, String> {
+        if self.read_only_execution {
+            return Err(READ_ONLY_SHELL_UNAVAILABLE.to_string());
+        }
         self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true, None)
     }
 
@@ -4451,6 +4181,9 @@ impl ToolExecutor {
         timeout_secs: f64,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<std::process::Output, String> {
+        if self.read_only_execution {
+            return Err(READ_ONLY_SHELL_UNAVAILABLE.to_string());
+        }
         self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true, cancel_token)
     }
 
@@ -4461,6 +4194,9 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
         explicit_verification: bool,
     ) -> Result<ScopedShellOutput, ShellRunError> {
+        if self.read_only_execution {
+            return Err(ShellRunError::new(READ_ONLY_SHELL_UNAVAILABLE));
+        }
         let mut config =
             self.shell_run_config("bash", "-c", command, timeout_secs, true, cancel_token);
         config.explicit_verification = explicit_verification;
@@ -4521,25 +4257,6 @@ impl ToolExecutor {
         };
         astra_tools::shell_ops::validate_bash_background_task_contract(command)?;
 
-        // Block pure sleep commands — they waste time with no useful output.
-        // Only when no explicit timeout is set (explicit timeout = intentional test usage).
-        // Matches: "sleep N", "sleep 3.5", but not "sleep 1 && echo done" (has useful work).
-        if args.get("timeout").is_none() {
-            let trimmed = command.trim();
-            if trimmed.starts_with("sleep ")
-                && !trimmed.contains("&&")
-                && !trimmed.contains("||")
-                && !trimmed.contains(';')
-                && !trimmed.contains('|')
-            {
-                return Err(
-                    "⚠ sleep commands are not useful — they waste time without producing output. \
-                     Remove the sleep and proceed with your next action."
-                        .to_string(),
-                );
-            }
-        }
-
         // P4: Bash security layer — detect dangerous commands.
         // In restrictive sandbox: hard-block. In permissive: prepend warning
         // to output so the model sees it and can self-correct.
@@ -4562,10 +4279,8 @@ impl ToolExecutor {
         let command = command.to_string();
 
         // The server may attach a separate authoritative command cap. It
-        // is intentionally not the model-visible `timeout` field: callers
-        // that omit timeout retain their explicitness-sensitive semantics
-        // (notably pure `sleep` remains rejected), while execution cannot
-        // exceed the policy cap behind a longer edge callback deadline.
+        // is intentionally not the model-visible `timeout` field: execution
+        // cannot exceed the policy cap behind a longer edge callback deadline.
         let server_command_timeout_cap_secs = args
             .get("_astra_command_timeout_cap_ms")
             .and_then(Value::as_u64)
@@ -4882,13 +4597,9 @@ impl ToolExecutor {
 
     fn quarantine_after_weak_bash_scope(
         &self,
-        command: &str,
         scope_ownership: Option<astra_sandbox::ScopeOwnership>,
     ) {
-        if astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(
-            command,
-            scope_ownership,
-        ) {
+        if astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(scope_ownership) {
             astra_tools::workspace_observation::quarantine_after_weak_receipt(
                 &self.effective_project_root(),
                 scope_ownership.map(|ownership| ownership.as_str()),
@@ -4898,7 +4609,7 @@ impl ToolExecutor {
 
     fn attach_bash_workspace_observation(
         &self,
-        mut outcome: super::ToolExecutionOutcome,
+        outcome: super::ToolExecutionOutcome,
         before: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
         ownership_unsettled: bool,
         scope_ownership: Option<astra_sandbox::ScopeOwnership>,
@@ -4926,6 +4637,75 @@ impl ToolExecutor {
             );
         };
         let after = astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root);
+        Self::finish_bash_workspace_observation(
+            &root,
+            outcome,
+            before,
+            after,
+            scope_ownership,
+            explicit_verification,
+            observation_lease,
+        )
+    }
+
+    async fn attach_bash_workspace_observation_async(
+        &self,
+        outcome: super::ToolExecutionOutcome,
+        before: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
+        ownership_unsettled: bool,
+        scope_ownership: Option<astra_sandbox::ScopeOwnership>,
+        explicit_verification: bool,
+        observation_lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
+    ) -> super::ToolExecutionOutcome {
+        let root = self.effective_project_root();
+        let quarantine_root = root.clone();
+        if ownership_unsettled
+            || observation_lease.is_some_and(|lease| {
+                !astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid(lease)
+            })
+        {
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                &quarantine_root,
+            );
+            return require_explicit_workspace_verification_receipt(
+                outcome,
+                explicit_verification,
+                false,
+            );
+        }
+        let Some(before) = before else {
+            return require_explicit_workspace_verification_receipt(
+                outcome,
+                explicit_verification,
+                true,
+            );
+        };
+        let after = tokio::task::spawn_blocking(move || {
+            astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
+        })
+        .await
+        .ok()
+        .flatten();
+        Self::finish_bash_workspace_observation(
+            &quarantine_root,
+            outcome,
+            before,
+            after,
+            scope_ownership,
+            explicit_verification,
+            observation_lease,
+        )
+    }
+
+    fn finish_bash_workspace_observation(
+        root: &std::path::Path,
+        mut outcome: super::ToolExecutionOutcome,
+        before: astra_tools::workspace_observation::WorkspaceFingerprint,
+        after: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
+        scope_ownership: Option<astra_sandbox::ScopeOwnership>,
+        explicit_verification: bool,
+        observation_lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
+    ) -> super::ToolExecutionOutcome {
         let after_captured = after.is_some();
         let workspace_comparison = before.compare_with(after.as_ref());
         let workspace_changed = matches!(
@@ -4988,24 +4768,15 @@ impl ToolExecutor {
         }
         if workspace_changed {
             if let Some(ownership) = scope_ownership {
-                if ownership.is_authoritative() {
-                    outcome
-                        .tool_result_fields
-                        .get_or_insert_with(serde_json::Map::new)
-                        .extend(
-                            astra_tools::workspace_observation::changed_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                        );
-                } else {
-                    outcome
-                        .tool_result_fields
-                        .get_or_insert_with(serde_json::Map::new)
-                        .extend(
-                            astra_tools::workspace_observation::changed_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                        );
+                outcome
+                    .tool_result_fields
+                    .get_or_insert_with(serde_json::Map::new)
+                    .extend(
+                        astra_tools::workspace_observation::changed_receipt_with_ownership(
+                            ownership.as_str(),
+                        ),
+                    );
+                if !ownership.is_authoritative() {
                     astra_tools::workspace_observation::quarantine_after_weak_receipt(
                         &root,
                         Some(ownership.as_str()),
@@ -5018,146 +4789,6 @@ impl ToolExecutor {
         outcome
     }
 
-    async fn attach_bash_workspace_observation_async(
-        &self,
-        mut outcome: super::ToolExecutionOutcome,
-        before: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
-        ownership_unsettled: bool,
-        scope_ownership: Option<astra_sandbox::ScopeOwnership>,
-        explicit_verification: bool,
-        observation_lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
-    ) -> super::ToolExecutionOutcome {
-        let root = self.effective_project_root();
-        let quarantine_root = root.clone();
-        if ownership_unsettled
-            || observation_lease.is_some_and(|lease| {
-                !astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid(lease)
-            })
-        {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &quarantine_root,
-            );
-            return require_explicit_workspace_verification_receipt(
-                outcome,
-                explicit_verification,
-                false,
-            );
-        }
-        let Some(before) = before else {
-            return require_explicit_workspace_verification_receipt(
-                outcome,
-                explicit_verification,
-                true,
-            );
-        };
-        let after = tokio::task::spawn_blocking(move || {
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten();
-        let after_captured = after.is_some();
-        let workspace_comparison = before.compare_with(after.as_ref());
-        let workspace_changed = matches!(
-            workspace_comparison,
-            astra_tools::workspace_observation::WorkspaceFingerprintComparison::Changed
-        );
-        let workspace_unchanged = matches!(
-            workspace_comparison,
-            astra_tools::workspace_observation::WorkspaceFingerprintComparison::Unchanged
-        );
-        if workspace_unchanged
-            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
-            && observation_lease.is_none_or(
-                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
-            )
-        {
-            if let Some(ownership) = scope_ownership {
-                outcome
-                    .tool_result_fields
-                    .get_or_insert_with(serde_json::Map::new)
-                    .extend(
-                        astra_tools::workspace_observation::
-                            unchanged_bash_observation_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                    );
-            }
-        }
-        if explicit_verification
-            && !outcome.is_error
-            && outcome
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("exit_code"))
-                .and_then(Value::as_i64)
-                == Some(0)
-            && workspace_unchanged
-            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
-            && observation_lease.is_none_or(
-                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
-            )
-        {
-            outcome
-                .tool_result_fields
-                .get_or_insert_with(serde_json::Map::new)
-                .extend(
-                    astra_tools::workspace_observation::explicit_workspace_verification_receipt(),
-                );
-        } else {
-            outcome = require_explicit_workspace_verification_receipt(
-                outcome,
-                explicit_verification,
-                !after_captured,
-            );
-        }
-        if workspace_changed {
-            if let Some(ownership) = scope_ownership {
-                if ownership.is_authoritative() {
-                    outcome
-                        .tool_result_fields
-                        .get_or_insert_with(serde_json::Map::new)
-                        .extend(
-                            astra_tools::workspace_observation::changed_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                        );
-                } else {
-                    outcome
-                        .tool_result_fields
-                        .get_or_insert_with(serde_json::Map::new)
-                        .extend(
-                            astra_tools::workspace_observation::changed_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                        );
-                    astra_tools::workspace_observation::quarantine_after_weak_receipt(
-                        &quarantine_root,
-                        Some(ownership.as_str()),
-                    );
-                }
-            } else {
-                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                    &quarantine_root,
-                );
-            }
-        }
-        outcome
-    }
-
-    pub(crate) async fn bash_async(&self, args: &Value) -> String {
-        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
-            Ok(invocation) => invocation,
-            Err(message) => return message,
-        };
-        let config = self.shell_run_config("bash", "-c", &command, timeout_secs, true, None);
-        match tokio::task::spawn_blocking(move || run_shell_output_with_config(config)).await {
-            Ok(Ok(out)) => self.render_bash_output(&command, out.output),
-            Ok(Err(error)) => error.message,
-            Err(error) => format!("Error: bash worker failed: {error}"),
-        }
-    }
-
     #[cfg(unix)]
     async fn start_environment_background_task(
         &self,
@@ -5165,6 +4796,9 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> super::ToolExecutionOutcome {
+        if self.read_only_execution {
+            return read_only_shell_rejection();
+        }
         if std::env::var(ENVIRONMENT_BACKGROUND_TASK_AUTH).as_deref() != Ok("1") {
             return super::ToolExecutionOutcome::error(
                 "Error: environment-lifetime background tasks are not authorized by this execution environment; no process was started".to_string(),
@@ -5422,6 +5056,9 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> super::ToolExecutionOutcome {
+        if self.read_only_execution {
+            return read_only_shell_rejection();
+        }
         let explicit_verification =
             astra_tools::workspace_observation::is_explicit_workspace_verification_request(
                 "bash", args,
@@ -5470,8 +5107,9 @@ impl ToolExecutor {
                     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                         return super::cancelled_tool_execution_outcome("bash", false);
                     }
-                    return super::ToolExecutionOutcome::error(
-                        "Error: workspace coordination lock is unavailable, contended past the command deadline, or the host temporary lock namespace is not trustworthy; no bash command was run. Retry after the active workspace writer finishes or repair the host temporary-directory ownership and sticky-bit permissions.".to_string(),
+                    return super::workspace_lease_unavailable_tool_execution_outcome(
+                        "bash",
+                        &self.effective_project_root(),
                     );
                 }
             }
@@ -5509,11 +5147,41 @@ impl ToolExecutor {
         if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return super::cancelled_tool_execution_outcome("bash", false);
         }
-        let mut config =
-            self.shell_run_config("bash", "-c", &command, timeout_secs, true, cancel_token);
+        let tool_cancel = cancel_token
+            .map(tokio_util::sync::CancellationToken::child_token)
+            .unwrap_or_default();
+        let _cancel_on_drop = CancelShellOnDrop(tool_cancel.clone());
+        let mut config = self.shell_run_config(
+            "bash",
+            "-c",
+            &command,
+            timeout_secs,
+            true,
+            Some(&tool_cancel),
+        );
         config.explicit_verification = explicit_verification;
-        let shell_result =
-            tokio::task::spawn_blocking(move || run_shell_output_with_config(config)).await;
+        let quarantine_root = self.effective_project_root();
+        let command_for_settlement = command.clone();
+        // The worker owns observation leases until its process group settles,
+        // including when the caller is cancelled while awaiting the join.
+        let shell_result = tokio::task::spawn_blocking(move || {
+            let result = run_shell_output_with_config(config);
+            // The worker owns process settlement and the leases. Fence weak or
+            // failed scope here, before any async receipt await can be dropped.
+            finalize_shell_scope_before_lease_transfer(
+                &result,
+                &command_for_settlement,
+                &quarantine_root,
+            );
+            (result, _observation_lease, external_lease)
+        })
+        .await;
+        let (shell_result, _observation_lease, external_lease) = match shell_result {
+            Ok((result, observation_lease, external_lease)) => {
+                (Ok(result), observation_lease, external_lease)
+            }
+            Err(error) => (Err(error), None, None),
+        };
         let coordination_unsettled = _observation_lease
             .as_ref()
             .is_some_and(|lease| !lease.coordination_integrity_valid());
@@ -5547,7 +5215,7 @@ impl ToolExecutor {
                         external_lease.as_ref(),
                     )
                     .await;
-                self.quarantine_after_weak_bash_scope(&command, scope_ownership);
+                self.quarantine_after_weak_bash_scope(scope_ownership);
                 outcome
             }
             Ok(Err(error)) => {
@@ -5579,7 +5247,7 @@ impl ToolExecutor {
                         external_lease.as_ref(),
                     )
                     .await;
-                self.quarantine_after_weak_bash_scope(&command, error.scope_ownership);
+                self.quarantine_after_weak_bash_scope(error.scope_ownership);
                 outcome
             }
             Err(error) => {
@@ -5627,6 +5295,9 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Option<super::ToolExecutionOutcome> {
+        if self.read_only_execution {
+            return Some(read_only_shell_rejection());
+        }
         let slot = self.bash_detach_slot.as_ref()?.clone();
         let handle = slot.lock().await.take()?;
 
@@ -5800,6 +5471,9 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> super::ToolExecutionOutcome {
+        if self.read_only_execution {
+            return read_only_shell_rejection();
+        }
         let explicit_verification =
             astra_tools::workspace_observation::is_explicit_workspace_verification_request(
                 "bash", args,
@@ -5826,8 +5500,9 @@ impl ToolExecutor {
                     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                         return super::cancelled_tool_execution_outcome("bash", false);
                     }
-                    return super::ToolExecutionOutcome::error(
-                        "Error: workspace coordination lock is unavailable, contended past the command deadline, or the host temporary lock namespace is not trustworthy; no bash command was run. Retry after the active workspace writer finishes or repair the host temporary-directory ownership and sticky-bit permissions.".to_string(),
+                    return super::workspace_lease_unavailable_tool_execution_outcome(
+                        "bash",
+                        &self.effective_project_root(),
                     );
                 }
             }
@@ -5910,7 +5585,7 @@ impl ToolExecutor {
                 } else {
                     outcome
                 };
-                self.quarantine_after_weak_bash_scope(&command, scope_ownership);
+                self.quarantine_after_weak_bash_scope(scope_ownership);
                 attach_source_preimage_outcome(outcome, source_preimages)
             }
             Err(error) => {
@@ -5944,7 +5619,7 @@ impl ToolExecutor {
                 } else {
                     outcome
                 };
-                self.quarantine_after_weak_bash_scope(&command, error.scope_ownership);
+                self.quarantine_after_weak_bash_scope(error.scope_ownership);
                 attach_source_preimage_outcome(outcome, source_preimages)
             }
         }
@@ -5959,6 +5634,9 @@ impl ToolExecutor {
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> String {
+        if self.read_only_execution {
+            return READ_ONLY_SHELL_UNAVAILABLE.to_string();
+        }
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) if !c.trim().is_empty() => c,
             _ => {
@@ -6282,142 +5960,6 @@ fn annotate_grep_with_scope(grep_output: &str, project_root: &std::path::Path) -
     result
 }
 
-/// Detect HTML content by checking for common HTML markers.
-fn looks_like_html(s: &str) -> bool {
-    let trimmed = s.trim_start();
-    trimmed.starts_with("<!DOCTYPE")
-        || trimmed.starts_with("<!doctype")
-        || trimmed.starts_with("<html")
-        || trimmed.starts_with("<HTML")
-        // Partial HTML without doctype (common in API error pages)
-        || (trimmed.starts_with('<')
-            && (trimmed.contains("</head>") || trimmed.contains("</body>")))
-}
-
-/// Lightweight HTML → text conversion without external dependencies.
-/// Strips tags, decodes common entities, collapses whitespace.
-fn html_to_text(html: &str) -> String {
-    let mut s = html.to_string();
-
-    // 1. Remove <script> and <style> blocks (case-insensitive via manual lowering)
-    for tag in &["script", "style", "noscript", "svg"] {
-        loop {
-            let lower = s.to_lowercase();
-            let open = format!("<{}", tag);
-            let close = format!("</{}>", tag);
-            if let Some(start) = lower.find(&open)
-                && let Some(end_rel) = lower[start..].find(&close)
-            {
-                let end = start + end_rel + close.len();
-                s.replace_range(start..end, " ");
-                continue;
-            }
-            break;
-        }
-    }
-
-    // 2. Insert newlines for block elements
-    for tag in &[
-        "<br>", "<br/>", "<br />", "<BR>", "</p>", "</P>", "</div>", "</DIV>", "</li>", "</LI>",
-        "</tr>", "</TR>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</H1>", "</H2>",
-        "</H3>", "</H4>", "</H5>", "</H6>",
-    ] {
-        s = s.replace(tag, &format!("\n{}", tag));
-    }
-
-    // 3. Strip all remaining HTML tags
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => {
-                in_tag = false;
-                out.push(' ');
-            }
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-
-    // 4. Decode common HTML entities
-    out = out
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&#x27;", "'")
-        .replace("&#x2F;", "/");
-
-    // Decode numeric character references &#NNN;
-    let mut decoded = String::with_capacity(out.len());
-    let mut chars = out.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '&' && chars.peek() == Some(&'#') {
-            chars.next(); // consume '#'
-            let mut num_str = String::new();
-            while let Some(&d) = chars.peek() {
-                if d == ';' {
-                    chars.next();
-                    break;
-                }
-                if d.is_ascii_digit() && num_str.len() < 7 {
-                    num_str.push(d);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if let Ok(code) = num_str.parse::<u32>()
-                && let Some(decoded_char) = char::from_u32(code)
-            {
-                decoded.push(decoded_char);
-                continue;
-            }
-            decoded.push('&');
-            decoded.push('#');
-            decoded.push_str(&num_str);
-        } else {
-            decoded.push(ch);
-        }
-    }
-
-    // 5. Collapse whitespace: runs of spaces/tabs → single space, 3+ newlines → 2
-    let mut result = String::with_capacity(decoded.len());
-    let mut last_was_newline = false;
-    let mut consecutive_newlines = 0u32;
-    let mut last_was_space = false;
-
-    for ch in decoded.chars() {
-        if ch == '\n' || ch == '\r' {
-            if ch == '\r' {
-                continue;
-            }
-            consecutive_newlines += 1;
-            last_was_space = false;
-            if consecutive_newlines <= 2 {
-                result.push('\n');
-            }
-            last_was_newline = true;
-        } else if ch == ' ' || ch == '\t' {
-            if !last_was_space && !last_was_newline {
-                result.push(' ');
-            }
-            last_was_space = true;
-        } else {
-            result.push(ch);
-            last_was_newline = false;
-            last_was_space = false;
-            consecutive_newlines = 0;
-        }
-    }
-
-    result.trim().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::ToolExecutor;
@@ -6426,9 +5968,7 @@ mod tests {
         check_bash_path_boundary_with_oldpwd, check_dangerous_command,
         check_powershell_path_boundary, default_bash_timeout_secs, destructive_command_warning,
         destructive_powershell_warning, find_powershell_program, forbidden_name_based_process_kill,
-        html_to_text, is_ssrf_target, looks_like_html, run_command_with_cleanup,
     };
-    use std::process::Command;
     use std::time::Duration;
 
     static ENVIRONMENT_BACKGROUND_TEST_LOCK: tokio::sync::Mutex<()> =
@@ -6456,6 +5996,119 @@ mod tests {
         assert_eq!(fields["disposition"], "rejected");
         assert_eq!(fields["execution_started"], false);
         assert_eq!(fields["side_effects_maybe"], false);
+    }
+
+    #[tokio::test]
+    async fn read_only_child_rejects_shell_before_any_process_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = test_executor_in(dir.path());
+        executor.set_read_only_execution();
+
+        let args = serde_json::json!({"command": "touch marker", "timeout": 1});
+        assert_preparation_rejected(executor.bash_outcome_with_cancel(
+            &args,
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
+            None,
+        ));
+        assert_preparation_rejected(
+            executor
+                .bash_outcome_with_cancel_async(
+                    &args,
+                    astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                    None,
+                )
+                .await,
+        );
+        assert!(executor.run_shell_output("touch marker", 1.0).is_err());
+        assert!(
+            executor
+                .lsp(&serde_json::json!({"operation": "rename"}))
+                .contains("unavailable")
+        );
+        assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    async fn dropping_async_bash_cancels_worker_without_cancelling_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let late = dir.path().join("late");
+        let executor = test_executor_in(dir.path());
+        let parent_cancel = tokio_util::sync::CancellationToken::new();
+        let child_cancel = parent_cancel.clone();
+        let run = tokio::spawn(async move {
+            executor
+                .bash_outcome_with_cancel_async(
+                    &serde_json::json!({
+                        "command": "printf started > started; sleep 1; printf late > late",
+                        "timeout": 5,
+                    }),
+                    astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                    Some(&child_cancel),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("shell must start before caller is dropped");
+        run.abort();
+        assert!(run.await.is_err());
+        assert!(!parent_cancel.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
+                    dir.path(),
+                    None,
+                    Duration::from_millis(100),
+                )
+                .await
+                .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled worker must release lease after verified process settlement");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !late.exists(),
+            "cancelled shell must not resume a late write"
+        );
+    }
+
+    #[test]
+    fn failed_shell_settlement_is_fenced_before_caller_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = Err(super::ShellRunError::after_process_started(
+            "descendants not settled",
+            None,
+        ));
+        super::finalize_shell_scope_before_lease_transfer(&result, "touch marker", dir.path());
+        assert_eq!(
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn completed_shell_without_ownership_is_fenced_before_caller_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = Ok(super::ScopedShellOutput {
+            output: std::process::Command::new("true").output().unwrap(),
+            scope_ownership: None,
+            descendants_terminated: true,
+        });
+        super::finalize_shell_scope_before_lease_transfer(&result, "touch marker", dir.path());
+        assert_eq!(
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -6585,6 +6238,7 @@ mod tests {
                     tool_call_id: Some("call"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )
@@ -6643,6 +6297,7 @@ mod tests {
                     tool_call_id: Some("wrapper-exit"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )
@@ -6722,6 +6377,7 @@ mod tests {
                     tool_call_id: Some("timeout"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )
@@ -6798,6 +6454,7 @@ mod tests {
                     tool_call_id: Some("cancel"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 Some(&cancel),
             )
@@ -7292,19 +6949,18 @@ mod tests {
     }
 
     #[test]
-    fn weak_scope_quarantines_risky_late_attribution_but_not_safe_command() {
+    fn scope_authority_controls_late_attribution() {
         let safe_dir = tempfile::tempdir().unwrap();
         let safe_executor = test_executor_in(safe_dir.path());
-        safe_executor.quarantine_after_weak_bash_scope(
-            "true",
-            Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
-        );
+        safe_executor.quarantine_after_weak_bash_scope(Some(
+            astra_sandbox::ScopeOwnership::InvocationCgroup,
+        ));
         assert_eq!(
             astra_tools::workspace_observation::workspace_observation_is_quarantined(
                 safe_dir.path()
             ),
             Some(false),
-            "a proven mutation-free detach shape must preserve future attribution"
+            "authoritative process settlement preserves future attribution"
         );
 
         let risky_dir = tempfile::tempdir().unwrap();
@@ -7312,16 +6968,15 @@ mod tests {
         let _before =
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(risky_dir.path())
                 .expect("clean pre-state");
-        risky_executor.quarantine_after_weak_bash_scope(
-            "python3 worker.py",
-            Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
-        );
+        risky_executor.quarantine_after_weak_bash_scope(Some(
+            astra_sandbox::ScopeOwnership::ForegroundProcessGroup,
+        ));
         assert_eq!(
             astra_tools::workspace_observation::workspace_observation_is_quarantined(
                 risky_dir.path()
             ),
             Some(true),
-            "weak ownership plus mutation potential must fail closed even without an immediate delta"
+            "weak ownership must fail closed even without an immediate delta"
         );
         std::fs::write(risky_dir.path().join("late.txt"), "late").unwrap();
         assert!(
@@ -7368,12 +7023,15 @@ mod tests {
         );
 
         assert!(outcome.is_error, "{outcome:?}");
-        assert!(
-            outcome.output.contains("workspace coordination lock")
-                && outcome.output.contains("no bash command was run")
-                && outcome.output.contains("permissions"),
-            "failure must be explicit and actionable: {outcome:?}"
-        );
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("typed admission denial");
+        assert_eq!(fields["error_kind"], "workspace_unavailable");
+        assert_eq!(fields["disposition"], "rejected");
+        assert_eq!(fields["execution_fact"], "not_executed");
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["retryable"], true);
         assert!(!marker.exists(), "shell must not run without coordination");
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
@@ -7696,27 +7354,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_pure_sleep_blocked() {
-        let executor = test_executor();
-        // Pure sleep without timeout should be blocked
-        let result = executor.bash(&serde_json::json!({"command": "sleep 5"}));
-        assert!(result.contains("not useful"), "got: {result}");
-        // A server-authored command budget is not model explicitness. It must
-        // not turn a pure sleep into an allowed timeout-bearing command.
-        let result = executor.bash(&serde_json::json!({
-            "command": "sleep 5",
-            "_astra_command_timeout_cap_ms": 100,
-        }));
-        assert!(result.contains("not useful"), "got: {result}");
-        // sleep with pipeline work should NOT be blocked
-        let result = executor.bash(&serde_json::json!({"command": "sleep 0.01 && echo done"}));
-        assert!(result.contains("done"), "got: {result}");
-        // sleep with explicit timeout should NOT be blocked (test usage)
-        let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
-        assert!(result.contains("timed out"), "got: {result}");
-    }
-
-    #[test]
     fn server_command_cap_preserves_adaptive_timeout_when_omitted() {
         let executor = test_executor();
         for (args, expected) in [
@@ -7749,6 +7386,13 @@ mod tests {
                     "_astra_command_timeout_cap_ms": 120_000,
                 }),
                 5.0,
+            ),
+            (
+                serde_json::json!({
+                    "command": "sleep 5",
+                    "_astra_command_timeout_cap_ms": 100,
+                }),
+                0.1,
             ),
         ] {
             let (_, timeout) = executor
@@ -9697,78 +9341,6 @@ mod tests {
         );
     }
 
-    // ── SSRF protection ─────────────────────────────────────────────────────
-
-    #[test]
-    fn ssrf_blocks_localhost() {
-        assert!(is_ssrf_target("http://127.0.0.1:8080/secret").is_some());
-        assert!(is_ssrf_target("http://localhost/admin").is_some());
-        assert!(is_ssrf_target("http://0.0.0.0:3000").is_some());
-        assert!(is_ssrf_target("http://[::1]/api").is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_private_networks() {
-        assert!(is_ssrf_target("http://10.0.0.1/internal").is_some());
-        assert!(is_ssrf_target("http://192.168.1.1/router").is_some());
-        assert!(is_ssrf_target("http://172.16.0.1/service").is_some());
-        assert!(is_ssrf_target("http://172.31.255.1/db").is_some());
-        // 172.15 and 172.32 are NOT private
-        assert!(is_ssrf_target("http://172.15.0.1/ok").is_none());
-        assert!(is_ssrf_target("http://172.32.0.1/ok").is_none());
-    }
-
-    #[test]
-    fn ssrf_blocks_cloud_metadata() {
-        assert!(is_ssrf_target("http://169.254.169.254/latest/meta-data/").is_some());
-        assert!(is_ssrf_target("http://metadata.google.internal/computeMetadata/v1/").is_some());
-    }
-
-    #[test]
-    fn ssrf_allows_public_urls() {
-        assert!(is_ssrf_target("https://github.com/matrixorigin/matrixone").is_none());
-        assert!(is_ssrf_target("https://api.github.com/repos").is_none());
-        assert!(is_ssrf_target("http://example.com").is_none());
-        assert!(is_ssrf_target("https://docs.rs/tokio/latest").is_none());
-    }
-
-    // ── Process group cleanup tests ──────────────────────────────────────────
-    // These tests verify that child processes spawned by grep/glob/curl are
-    // properly killed when timing out, preventing zombie process leaks.
-
-    #[test]
-    fn run_command_with_cleanup_timeout_kills_process_group() {
-        // Test that run_command_with_cleanup properly kills the entire process group
-        let marker = format!("/tmp/mo_test_cleanup_{}", std::process::id());
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(format!("sleep 10 && touch {marker}"));
-
-        let result = run_command_with_cleanup(&mut cmd, 0.2);
-        assert!(result.is_err(), "should timeout");
-        assert!(
-            result.unwrap_err().contains("timed out"),
-            "should indicate timeout"
-        );
-
-        // Give a moment for any surviving child to act
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            !std::path::Path::new(&marker).exists(),
-            "child process survived timeout — process group kill failed"
-        );
-    }
-
-    #[test]
-    fn run_command_with_cleanup_success_returns_output() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("hello");
-        let result = run_command_with_cleanup(&mut cmd, 5.0);
-        assert!(result.is_ok());
-        let output = result.unwrap();
-        assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
-    }
-
     // ── grep extended regex ──────────────────────────────────────────────────
 
     #[test]
@@ -9800,81 +9372,6 @@ mod tests {
         }));
         // Simple non-regex pattern should still work
         assert!(!result.is_empty());
-    }
-
-    // ── HTML detection ──────────────────────────────────────────────────────
-
-    #[test]
-    fn looks_like_html_classification() {
-        let positive: &[&str] = &[
-            "<!DOCTYPE html><html><body>hello</body></html>",
-            "<!doctype html>\n<html>",
-            "<html lang=\"en\"><head></head></html>",
-            "<HTML><BODY>hi</BODY></HTML>",
-        ];
-        let negative: &[&str] = &[
-            "Hello world, this is plain text.",
-            "{\"key\": \"value\"}",
-            "# Markdown heading\n\nSome text.",
-            "<root><item>data</item></root>",
-            r#"{"name": "test", "value": 42}"#,
-            "This is just plain text\nwith some newlines.",
-        ];
-        for s in positive {
-            assert!(looks_like_html(s), "should detect HTML: {s}");
-        }
-        for s in negative {
-            assert!(!looks_like_html(s), "should reject non-HTML: {s}");
-        }
-    }
-
-    // ── HTML-to-text conversion ─────────────────────────────────────────────
-
-    #[test]
-    fn html_to_text_handles_real_page() {
-        let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Example</title>
-  <style>body { margin: 0; }</style>
-  <script>window.ga=function(){}</script>
-</head>
-<body>
-  <div id="main">
-    <h1>Welcome</h1>
-    <p>This is a <a href="/about">test page</a> with links &amp; entities &lt;&gt;.</p>
-    <p>&#65;&#66;&#67; numeric</p>
-    <ul>
-      <li>Item 1 &quot;quoted&quot;</li>
-      <li>Item 2&apos;s</li>
-    </ul>
-  </div>
-  <script src="analytics.js"></script>
-</body>
-</html>"#;
-        let text = html_to_text(html);
-        // tag stripping
-        assert!(text.contains("Welcome"), "missing heading: {text}");
-        assert!(text.contains("test page"), "missing link text: {text}");
-        assert!(text.contains("Item 1"), "missing list item: {text}");
-        assert!(!text.contains("<p>"), "HTML tags not stripped: {text}");
-        assert!(!text.contains("<h1>"), "HTML tags not stripped: {text}");
-        assert!(!text.contains("<div"), "HTML tags not stripped: {text}");
-        // script/style removal
-        assert!(!text.contains("window.ga"), "script not removed: {text}");
-        assert!(!text.contains("margin: 0"), "style not removed: {text}");
-        // entity decoding (named and numeric)
-        assert!(text.contains("&"), "named entity not decoded: {text}");
-        assert!(text.contains("<"), "lt entity not decoded: {text}");
-        assert!(text.contains("ABC"), "numeric entity not decoded: {text}");
-        assert!(
-            text.contains("\"quoted\""),
-            "quot entity not decoded: {text}"
-        );
-        assert!(text.contains("Item 2's"), "apos entity not decoded: {text}");
-        // whitespace collapse: no triple newlines
-        assert!(!text.contains("\n\n\n"), "excessive newlines: {text}");
     }
 
     // ── grep context_lines and max_matches ───────────────────────────────────
@@ -10098,14 +9595,29 @@ mod tests {
 
     #[test]
     fn grep_head_limit_zero_means_unlimited() {
-        let dir = tempfile::tempdir().unwrap();
+        // Keep filename bytes below the independent output budget so this
+        // fixture exercises the line limit, not an arbitrary TMPDIR length.
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        std::fs::create_dir_all(&target).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("grep-")
+            .tempdir_in(&target)
+            .unwrap();
         let executor = super::ToolExecutor::new(dir.path());
-        let content: String = (0..150).map(|i| format!("needle line {i}\n")).collect();
-        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+        let match_count = super::GREP_DEFAULT_HEAD_LIMIT + 1;
+        let file = dir.path().join("big.txt");
+        let expected_output_bytes: usize = (1..=match_count)
+            .map(|line| format!("{}:{line}:needle\n", file.display()).len())
+            .sum();
+        assert!(
+            expected_output_bytes < super::super::per_tool_output_limit("grep"),
+            "line-limit fixture must fit the independent byte budget"
+        );
+        std::fs::write(&file, "needle\n".repeat(match_count)).unwrap();
 
         let result = executor.grep(&serde_json::json!({
             "pattern": "needle",
-            "path": ".",
+            "path": "big.txt",
             "head_limit": 0
         }));
         // Should NOT have the "Results limited" message
@@ -10114,24 +9626,29 @@ mod tests {
             "head_limit=0 should be unlimited, got: {result}"
         );
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
-        assert!(
-            match_lines.len() > 100,
-            "should have all lines, got {}",
-            match_lines.len()
+        assert_eq!(
+            match_lines.len(),
+            match_count,
+            "all matching lines must be retained"
         );
     }
 
     #[test]
     fn grep_default_head_limit_applies() {
-        let dir = tempfile::tempdir().unwrap();
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        std::fs::create_dir_all(&target).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("grep-")
+            .tempdir_in(&target)
+            .unwrap();
         let executor = super::ToolExecutor::new(dir.path());
         // Create more than GREP_DEFAULT_HEAD_LIMIT (100) matching lines
-        let content: String = (0..150).map(|i| format!("needle line {i}\n")).collect();
+        let content = "needle\n".repeat(150);
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let result = executor.grep(&serde_json::json!({
             "pattern": "needle",
-            "path": "."
+            "path": "big.txt"
         }));
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
         assert_eq!(
