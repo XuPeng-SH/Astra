@@ -7606,6 +7606,58 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn resume_restores_full_configuration_including_explicit_defaults() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _top_k = EnvGuard::set("ASTRA_RETRIEVAL_TOP_K", "7");
+        assert_eq!(
+            astra_config::RuntimeConfig::load().memory.retrieval_top_k,
+            7
+        );
+        let session_id = format!("resume-default-config-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let saved = astra_config::RuntimeConfig::default();
+        assert_eq!(saved.memory.retrieval_top_k, 5);
+        let saved_json = serde_json::to_string(&saved).unwrap();
+        session_workspace::update_existing_workspace_config(
+            &session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some(saved_json.clone());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.set_session_id("current-session");
+        switch_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+        assert!(state.pending_runtime_config.is_none());
+        assert_eq!(
+            serde_json::to_value(
+                &state
+                    .observability_session
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .unwrap()
+                    .config
+            )
+            .unwrap(),
+            serde_json::to_value(saved).unwrap(),
+        );
+        assert_eq!(
+            session_workspace::read_workspace(&session_id)
+                .unwrap()
+                .tuned_config_json
+                .as_deref(),
+            Some(saved_json.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn switch_session_into_state_restores_workspace_scoped_state() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());

@@ -44,7 +44,7 @@ pub(crate) fn steer_observability_goal(
     None
 }
 
-/// Install the configuration validated at the workspace restore boundary.
+/// Replace the live configuration with the complete snapshot validated at restore.
 pub(crate) fn apply_pending_runtime_config(state: &mut SessionState) {
     let Some(obs) = &state.observability_session else {
         return;
@@ -55,8 +55,7 @@ pub(crate) fn apply_pending_runtime_config(state: &mut SessionState) {
     let Some(saved) = state.pending_runtime_config.take() else {
         return;
     };
-    let current = std::mem::take(&mut guard.config);
-    guard.config = current.merge(saved);
+    guard.config = saved;
 }
 
 pub(crate) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
@@ -1140,44 +1139,33 @@ mod tests {
 
     #[test]
     fn restored_configuration_waits_for_observability_then_applies_once() {
-        let mut config = astra_config::RuntimeConfig::default();
-        config.memory.retrieval_top_k = 7;
-        let mut state = SessionState {
-            pending_runtime_config: Some(config),
-            ..Default::default()
-        };
-        apply_pending_runtime_config(&mut state);
-        assert!(state.pending_runtime_config.is_some());
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability::ObservabilitySession::new_simple("config-restore"),
-        )));
-        apply_pending_runtime_config(&mut state);
-        assert!(state.pending_runtime_config.is_none());
-        assert_eq!(
-            state
-                .observability_session
-                .as_ref()
-                .unwrap()
-                .read()
-                .unwrap()
-                .config
-                .memory
-                .retrieval_top_k,
-            7
-        );
-        apply_pending_runtime_config(&mut state);
-        assert_eq!(
-            state
-                .observability_session
-                .as_ref()
-                .unwrap()
-                .read()
-                .unwrap()
-                .config
-                .memory
-                .retrieval_top_k,
-            7
-        );
+        let defaults = astra_config::RuntimeConfig::default();
+        for saved_top_k in [defaults.memory.retrieval_top_k, 7] {
+            let mut saved = defaults.clone();
+            saved.memory.retrieval_top_k = saved_top_k;
+            let expected = serde_json::to_value(&saved).unwrap();
+            let mut state = SessionState {
+                pending_runtime_config: Some(saved),
+                ..Default::default()
+            };
+            apply_pending_runtime_config(&mut state);
+            assert!(state.pending_runtime_config.is_some());
+            let mut obs =
+                astra_runtime::observability::ObservabilitySession::new_simple("config-restore");
+            obs.config.memory.retrieval_top_k = 9;
+            obs.config.token_budget.tools_reserve += 1;
+            state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
+            apply_pending_runtime_config(&mut state);
+            assert!(state.pending_runtime_config.is_none());
+            let obs = state.observability_session.as_ref().unwrap().clone();
+            assert_eq!(
+                serde_json::to_value(&obs.read().unwrap().config).unwrap(),
+                expected
+            );
+            obs.write().unwrap().config.memory.retrieval_top_k = 9;
+            apply_pending_runtime_config(&mut state);
+            assert_eq!(obs.read().unwrap().config.memory.retrieval_top_k, 9);
+        }
     }
 
     #[test]
