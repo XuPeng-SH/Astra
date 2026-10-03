@@ -154,10 +154,9 @@ async fn restore_login_identity_services(
     >,
     discovery_pending: &mut bool,
 ) {
-    if state.session_memory_extractor.is_none() {
-        state.session_memory_extractor =
-            crate::cli::session::session_startup::build_cli_session_memory_extractor(api, profile)
-                .await;
+    if state.session_memory_port.is_none() {
+        state.session_memory_port =
+            crate::cli::session::session_startup::build_cli_session_memory_port(api, profile).await;
     }
     if !*discovery_pending {
         *discovery = tokio::spawn(
@@ -2421,38 +2420,6 @@ async fn retire_local_agent_spawner_with_reason(
     active_agent_count
 }
 
-fn ctrl_b_promoted_agent_message(
-    agents: &[astra_turn_core::orchestration_types::SpawnedAgentInfo],
-) -> String {
-    let Some(first) = agents.first() else {
-        return "Nothing was moved to background · Shift+↓ inspect tasks.".to_string();
-    };
-    if agents.len() > 1 {
-        let (group_id, target_count) = first
-            .fanout_slot
-            .as_ref()
-            .map_or(("agent group", agents.len()), |slot| {
-                (slot.group_id.as_str(), slot.target_count)
-            });
-        return format!(
-            "Backgrounded {group_id} ({} agents) · one update after the group settles · Shift+↓ inspect.",
-            target_count
-        );
-    }
-    let description = first.description.trim();
-    if description.is_empty() {
-        format!(
-            "Backgrounded agent {} · Astra will update when it needs attention or finishes · Shift+↓ inspect.",
-            first.agent_id
-        )
-    } else {
-        format!(
-            "Backgrounded agent {} ({description}) · Astra will update when it needs attention or finishes · Shift+↓ inspect.",
-            first.agent_id
-        )
-    }
-}
-
 fn should_show_ctrl_b_background_hint(detach_ready: bool) -> bool {
     detach_ready
 }
@@ -2486,7 +2453,7 @@ async fn sync_default_model_after_auth(
                 return None;
             }
         };
-    bottom_pane.footer.model = Some(model.clone());
+    bottom_pane.footer.model = Some(model.to_string());
     Some(model)
 }
 
@@ -6916,7 +6883,7 @@ fn refresh_footer_from_state(
     bottom_pane: &mut BottomPane,
     state: &crate::cli::session::session_state::SessionState,
 ) {
-    bottom_pane.footer.model = state.model.clone();
+    bottom_pane.footer.model = state.model.as_deref().map(str::to_string);
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     if let Some(trace) = latest_context_trace(state)
         && let Some(usage) = context_window_from_trace(&trace)
@@ -7094,7 +7061,11 @@ pub(crate) async fn run_tui_session(
                 task.abort();
                 let _ = task.await;
             }
-            crate::cli::session::session_cleanup::finalize_session_durable_boundary(&mut state);
+            if let Err(commit_error) =
+                crate::cli::session::session_cleanup::finalize_session_durable_boundary(&mut state)
+            {
+                tracing::error!(%commit_error, "session end failed after TUI initialization failure");
+            }
             crate::cli::session::session_cleanup::finalize_session_process_boundary(&mut state);
             drop(pipeline_modules);
             return Err(format!("TUI init failed: {error}"));
@@ -7250,7 +7221,7 @@ pub(crate) async fn run_tui_session(
         spawn_turn_post_commit_worker(turn_post_commit_rx, turn_post_commit_completion_tx.clone());
 
     if let Some(ref model) = state.model {
-        bottom_pane.footer.model = Some(model.clone());
+        bottom_pane.footer.model = Some(model.to_string());
     }
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     // Lock-free observer of `perm_manager.mode()` so the inner-tick
@@ -7507,7 +7478,7 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
-                        auth_flow::begin_browser_session_login(&mut state).await;
+                        auth_flow::begin_browser_session_login(&mut state).await?;
                         if external_skill_discovery_pending {
                             external_skill_discovery.abort();
                             let _ = (&mut external_skill_discovery).await;
@@ -8749,10 +8720,6 @@ pub(crate) async fn run_tui_session(
                                     let mut bash_detach_request_pending = false;
                                     let mut active_bash_tool_use_id: Option<String> = None;
                                     let mut active_bash_description: Option<String> = None;
-                                    let mut active_agent_tools =
-                                        std::collections::BTreeMap::<String, (String, String)>::new();
-                                    let mut background_handoff_tool_ids =
-                                        std::collections::HashSet::<String>::new();
                                     // Once Ctrl+B transfers lifecycle ownership away from
                                     // the foreground parent, that parent is no longer a valid
                                     // guidance target. Composer input after the handoff belongs
@@ -8826,7 +8793,7 @@ pub(crate) async fn run_tui_session(
                                             state.bash_detach_slot.clone();
                                         let background_registry_turn_session_id =
                                             state.session_id.clone();
-                                        let background_registry_turn_model = state.model.clone();
+                                        let background_registry_turn_model = state.model.as_deref().map(str::to_string);
                                         let bg_task_commands_for_turn =
                                             state.bg_task_commands.clone();
                                         let bg_task_list_cache_for_turn =
@@ -9155,66 +9122,6 @@ pub(crate) async fn run_tui_session(
                                                                     false
                                                                 };
 
-                                                                let mut promoted_agent_id: Option<String> = None;
-                                                                if !detach_fired
-                                                                    && let Some(spawner) =
-                                                                        agent_spawner_for_cancel.as_ref()
-                                                                    && let promoted = spawner
-                                                                        .promote_foreground_work_to_background(None)
-                                                                        .await
-                                                                    && !promoted.is_empty()
-                                                                {
-                                                                    let handoff_message =
-                                                                        ctrl_b_promoted_agent_message(&promoted);
-                                                                    promoted_agent_id = promoted
-                                                                        .first()
-                                                                        .map(|agent| agent.agent_id.clone());
-                                                                    // Backgrounding is a runtime-owned lifecycle
-                                                                    // transition, so settle the visible tool cell
-                                                                    // from that authoritative transition and cancel
-                                                                    // the old parent model boundary immediately. A
-                                                                    // later transport completion for this tool id is
-                                                                    // suppressed below; otherwise cancellation paints
-                                                                    // a false failure followed by a duplicate success.
-                                                                    for (tool_use_id, (name, description)) in
-                                                                        std::mem::take(&mut active_agent_tools)
-                                                                    {
-                                                                        let handoff_event = TuiAppEvent::ToolCompleted {
-                                                                            name,
-                                                                            description,
-                                                                            status: "completed".into(),
-                                                                            duration_ms: 0,
-                                                                            output_summary: Some(
-                                                                                "Lifecycle ownership moved to the background."
-                                                                                    .into(),
-                                                                            ),
-                                                                            output: None,
-                                                                            tool_use_id: tool_use_id.clone(),
-                                                                            parent_tool_use_id: None,
-                                                                        };
-                                                                        if let Some(event) = chat_widget::translate(
-                                                                            handoff_event.clone(),
-                                                                            chat_widget::TurnContext::default(),
-                                                                        ) {
-                                                                            chat_widget.handle_event(event);
-                                                                        }
-                                                                        handle_app_event(
-                                                                            &handoff_event,
-                                                                            &mut bottom_pane,
-                                                                            &mut status_indicator,
-                                                                            &frame_requester,
-                                                                        );
-                                                                        background_handoff_tool_ids.insert(tool_use_id);
-                                                                    }
-                                                                    chat_widget.commit_concurrent_system(
-                                                                        history_cell::system::SystemCell::background_task(
-                                                                            &handoff_message,
-                                                                        ),
-                                                                    );
-                                                                    foreground_lifecycle_transferred = true;
-                                                                    tui_cancel_token.cancel();
-                                                                }
-
                                                                 if detach_fired {
                                                                     let pending_title = active_bash_description
                                                                         .as_deref()
@@ -9224,7 +9131,7 @@ pub(crate) async fn run_tui_session(
                                                                             format!("Moving {pending_title} to the background…"),
                                                                         ),
                                                                     );
-                                                                } else if promoted_agent_id.is_none() {
+                                                                } else {
                                                                     chat_widget.commit_system(
                                                                         history_cell::system::SystemCell::info(
                                                                             "Ctrl+B: Nothing to background. Opening task panel.",
@@ -9999,13 +9906,6 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                     if matches!(
                                                         &ae,
-                                                        TuiAppEvent::ToolCompleted { tool_use_id, .. }
-                                                            if background_handoff_tool_ids.contains(tool_use_id)
-                                                    ) {
-                                                        continue;
-                                                    }
-                                                    if matches!(
-                                                        &ae,
                                                         TuiAppEvent::TurnProjectionDrained
                                                     ) {
                                                         // The bridge closed producer admission and
@@ -10060,27 +9960,6 @@ pub(crate) async fn run_tui_session(
                                                     match &ae {
                                                         TuiAppEvent::ToolStarted { .. } => {
                                                             turn_tool_count += 1;
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                    match &ae {
-                                                        TuiAppEvent::ToolStarted {
-                                                            name,
-                                                            description,
-                                                            tool_use_id,
-                                                            parent_tool_use_id,
-                                                        } if parent_tool_use_id.is_none()
-                                                            && matches!(name.as_str(), "agent" | "agent_fanout") =>
-                                                        {
-                                                            active_agent_tools.insert(
-                                                                tool_use_id.clone(),
-                                                                (name.clone(), description.clone()),
-                                                            );
-                                                        }
-                                                        TuiAppEvent::ToolCompleted { tool_use_id, .. }
-                                                            if active_agent_tools.contains_key(tool_use_id) =>
-                                                        {
-                                                            active_agent_tools.remove(tool_use_id);
                                                         }
                                                         _ => {}
                                                     }
@@ -10683,7 +10562,7 @@ pub(crate) async fn run_tui_session(
                                     }
 
                                     // Update footer
-                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
+                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.to_string()); }
                                     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // The live stream has already updated the footer from the
                                     // current request's assembly and provider usage. A trace is
@@ -11118,19 +10997,17 @@ pub(crate) async fn run_tui_session(
                                             let provider = model.provider.trim();
                                             (!provider.is_empty()).then_some(provider)
                                         });
-                                        let offering_id = entry
-                                            .map(|model| model.offering_id.as_str())
-                                            .map(ToOwned::to_owned);
                                         let opts = astra_turn_core::thinking_config::thinking_options(
                                             provider,
                                             thinking_cap,
                                             entry.and_then(|model| model.thinking_protocol).unwrap_or_default(),
                                         );
                                         if opts.is_empty() {
-                                            state.model = Some(base_model.clone());
-                                            crate::cli::session::session_runtime::set_active_offering_id_for_request(
-                                                offering_id,
-                                            );
+                                            state.model = Some((base_model.clone()).into());
+                                            if let Some(mut selection) = entry.and_then(crate::cli::session::session_runtime::model_selection_from_list_entry) {
+                                                selection.name = state.model.as_deref().unwrap().to_string();
+                                                state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
+                                            }
                                             bottom_pane.footer.model = Some(base_model.clone());
                                             chat_widget.commit_system(
                                                 history_cell::system::SystemCell::response(
@@ -11195,15 +11072,13 @@ pub(crate) async fn run_tui_session(
                                             &raw,
                                             &base_model,
                                         );
-                                        let offering_id = entry
-                                            .map(|model| model.offering_id.as_str())
-                                            .map(ToOwned::to_owned);
                                         let suffix = astra_turn_core::thinking_config::thinking_suffix_for(config);
                                         let composed = format!("{base_model}{suffix}");
-                                        state.model = Some(composed.clone());
-                                        crate::cli::session::session_runtime::set_active_offering_id_for_request(
-                                            offering_id,
-                                        );
+                                        state.model = Some((composed.clone()).into());
+                                        if let Some(mut selection) = entry.and_then(crate::cli::session::session_runtime::model_selection_from_list_entry) {
+                                                selection.name = state.model.as_deref().unwrap().to_string();
+                                                state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
+                                            }
                                         bottom_pane.footer.model = Some(composed.clone());
                                         chat_widget.commit_system(
                                             history_cell::system::SystemCell::response(format!(
@@ -11464,7 +11339,7 @@ pub(crate) async fn run_tui_session(
                                     flush_chat_widget(&mut guard, &mut chat_widget, _w);
                                     bottom_pane.sync_popups();
                                     // Update footer after view actions (model/permission may change)
-                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
+                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.to_string()); }
                                     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // Clear the deferred-flush flag for every
                                     // semantic view completion that reaches
@@ -12289,33 +12164,25 @@ pub(crate) async fn run_tui_session(
     } else {
         Duration::from_secs(8)
     };
-    let finalization_completed = tokio::time::timeout(
+    let finalization = crate::cli::session::session_cleanup::finalize_session_with_budget(
+        &mut state,
         finalization_budget,
-        crate::cli::session::session_cleanup::finalize_session(&mut state),
     )
-    .await
-    .is_ok();
-    if !finalization_completed {
-        tracing::warn!(
-            budget_ms = finalization_budget.as_millis(),
-            "optional session finalization exceeded TUI shutdown budget"
-        );
-        // These two idempotent boundaries are mandatory even when optional
-        // memory governance timed out: the canonical session is resumable,
-        // cloud ingest is notified, and process-local lifecycle state is
-        // released.
-        crate::cli::session::session_cleanup::finalize_session_durable_boundary(&mut state);
-        crate::cli::session::session_cleanup::finalize_session_process_boundary(&mut state);
+    .await;
+    if let Err(error) = &finalization {
+        tracing::error!(%error, "session finalization failed");
     }
     // The pipeline bundle owns the skill watcher. Drop it only after all
     // turn/agent work has stopped so no consumer outlives its provider.
     drop(pipeline_modules);
     drop(guard);
-    if let Some((label, command)) = resume_hint {
+    if finalization.is_ok()
+        && let Some((label, command)) = resume_hint
+    {
         stdout_println!("{}", label.dim());
         stdout_println!("  {}", command.cyan());
     }
-    result
+    result.and(finalization)
 }
 
 /// Handle a TUI app event for BOTTOM-PANE state only.
@@ -12586,12 +12453,13 @@ mod tests {
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.unified_skill_registry = modules.unified_skill_registry.clone();
         state.mcp_manager = modules.mcp_manager.clone();
-        state.session_memory_extractor =
-            crate::cli::session::session_startup::build_cli_session_memory_extractor(&api, None)
-                .await;
-        assert!(state.session_memory_extractor.is_some());
-        auth_flow::begin_browser_session_login(&mut state).await;
-        assert!(state.session_memory_extractor.is_none());
+        state.session_memory_port =
+            crate::cli::session::session_startup::build_cli_session_memory_port(&api, None).await;
+        assert!(state.session_memory_port.is_some());
+        auth_flow::begin_browser_session_login(&mut state)
+            .await
+            .unwrap();
+        assert!(state.session_memory_port.is_none());
         let mut discovery = tokio::spawn(std::future::pending());
         discovery.abort();
         let _ = (&mut discovery).await;
@@ -12650,12 +12518,14 @@ mod tests {
         let report = discovery.await.unwrap();
         assert!(report.skills.unwrap().failures.is_empty());
         assert!(report.mcp_failures.is_empty());
-        let memory = state.session_memory_extractor.as_ref().unwrap();
-        assert_eq!(memory.owner_user_id(), Some("old-owner"));
-        memory
-            .run_session_end_governance(&Default::default(), "cancelled-login-session")
-            .await
-            .unwrap();
+        let memory = state.session_memory_port.as_ref().unwrap();
+        astra_runtime::turn::cloud::session_end_governance::run_session_end_governance(
+            &Default::default(),
+            "cancelled-login-session",
+            memory.as_ref(),
+        )
+        .await
+        .unwrap();
         assert!(phase.begin_exchange().is_err());
     }
 
@@ -15743,7 +15613,6 @@ mod tests {
                     description: "long review".into(),
                     prompt: "long review".into(),
                     agent_type: "task".into(),
-                    run_in_background: true,
                     ..Default::default()
                 },
                 &test_spawn_context(),
@@ -15752,7 +15621,6 @@ mod tests {
             .expect("background agent launch");
         let agent_id = match output {
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected launched agent, got {other:?}"),
         };
 
         assert_eq!(retire_local_agent_spawner(spawner.clone()).await, 1);
@@ -15805,7 +15673,6 @@ mod tests {
                     result: "authoritative final result".into(),
                     finish_reason: Some("normal".into()),
                 },
-                false,
             )],
             fanout_groups: Vec::new(),
         };
@@ -16053,11 +15920,7 @@ mod tests {
         assert_eq!(context_window_from_trace(&trace), None);
     }
 
-    fn agent_info(
-        agent_id: &str,
-        status: AgentStatus,
-        run_in_background: bool,
-    ) -> SpawnedAgentInfo {
+    fn agent_info(agent_id: &str, status: AgentStatus) -> SpawnedAgentInfo {
         let ended_at = status.is_terminal().then(std::time::SystemTime::now);
         SpawnedAgentInfo {
             agent_id: agent_id.to_string(),
@@ -16070,7 +15933,6 @@ mod tests {
             ended_at,
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
-            run_in_background,
             spawn_tool_call_id: None,
             fanout_slot: None,
         }
@@ -16114,6 +15976,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl astra_runtime::orchestration::SpawnAgentExecutor for PendingAgentExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: astra_runtime::orchestration::CancellationOrigin,
+        ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(
             &self,
             _config: astra_runtime::orchestration::SpawnRunConfig,
@@ -16143,77 +16017,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_promoted_agent_message_is_user_facing() {
-        let agent = agent_info(
-            "reviewer@run-1",
-            AgentStatus::Running {
-                activity: "reviewing".into(),
-            },
-            true,
-        );
-        let message = ctrl_b_promoted_agent_message(&[agent]);
-
-        assert!(message.contains("Backgrounded agent reviewer@run-1"));
-        assert!(message.contains("review auth flow"));
-        assert!(message.contains("Astra will update"));
-        assert!(message.contains("Shift+↓ inspect"));
-        assert!(!message.contains("agent(action="), "{message}");
-        assert!(!message.contains("task_output"), "{message}");
-        assert!(!message.contains("job("), "{message}");
-    }
-
-    #[test]
-    fn ctrl_b_fanout_message_names_the_atomic_group() {
-        let agents = (0..2)
-            .map(|slot_index| {
-                let mut agent = agent_info(
-                    &format!("reviewer-{slot_index}"),
-                    AgentStatus::Running {
-                        activity: "reviewing".into(),
-                    },
-                    true,
-                );
-                agent.fanout_slot = Some(
-                    astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity::new(
-                        "review-group",
-                        3,
-                        slot_index,
-                        None,
-                    )
-                    .unwrap(),
-                );
-                agent
-            })
-            .collect::<Vec<_>>();
-
-        let message = ctrl_b_promoted_agent_message(&agents);
-        assert!(
-            message.contains("Backgrounded review-group (3 agents)"),
-            "a partially settled group still has its original target count: {message}"
-        );
-        assert!(message.contains("one update after the group settles"));
-        assert!(message.contains("Shift+↓ inspect"));
-    }
-
-    #[test]
-    fn task_row_projects_foreground_agents_without_changing_lifecycle_ownership() {
-        let foreground = agent_info(
-            "agent-foreground",
-            AgentStatus::Running {
-                activity: "reviewing".into(),
-            },
-            false,
-        );
-        let foreground_row = background_task_row_for_local_agent(&foreground)
-            .expect("foreground fan-in must remain observable from Shift+Down");
-        assert!(!foreground_row.run_in_background);
-
+    fn task_row_projects_launched_agents_as_background_work() {
         let background = agent_info(
             "agent-background",
             AgentStatus::Running {
                 activity: "reviewing".into(),
             },
-            true,
         );
         let row = background_task_row_for_local_agent(&background)
             .expect("background agent should project to a task row");
@@ -16241,7 +16050,6 @@ mod tests {
                 error: "review failed".into(),
                 finish_reason: Some("failed".into()),
             },
-            true,
         );
         let row = background_task_row_for_local_agent(&failed)
             .expect("failed background agent should remain reachable");
@@ -16264,7 +16072,6 @@ mod tests {
             AgentStatus::Running {
                 activity: "reviewing auth middleware".into(),
             },
-            true,
         );
         let row = background_task_row_for_local_agent(&agent)
             .expect("background agent should project to a task row");
@@ -16290,7 +16097,6 @@ mod tests {
             AgentStatus::Running {
                 activity: "reviewing auth middleware".into(),
             },
-            true,
         );
         agent.fanout_slot = Some(
             astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity::new(
@@ -16389,7 +16195,6 @@ mod tests {
             AgentStatus::Running {
                 activity: "reviewing auth middleware".into(),
             },
-            true,
         );
 
         let snapshot = background_task_output_snapshot_for_local_agent(&agent, 0, 8192);
@@ -16701,7 +16506,6 @@ mod tests {
             description: "review auth flow".to_string(),
             prompt: "review auth flow".to_string(),
             agent_type: "explore".to_string(),
-            run_in_background: true,
             ..Default::default()
         };
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
@@ -16732,13 +16536,11 @@ mod tests {
             description: "review auth flow".to_string(),
             prompt: "review auth flow".to_string(),
             agent_type: "explore".to_string(),
-            run_in_background: true,
             ..Default::default()
         };
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         let agent_id = match spawned {
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected launched background agent, got {other:?}"),
         };
 
         let temp = crate::tests::test_temp_dir();
@@ -16768,13 +16570,11 @@ mod tests {
             description: "review auth flow".to_string(),
             prompt: "review auth flow".to_string(),
             agent_type: "explore".to_string(),
-            run_in_background: true,
             ..Default::default()
         };
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         let agent_id = match spawned {
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected launched background agent, got {other:?}"),
         };
 
         let temp = crate::tests::test_temp_dir();
@@ -16808,13 +16608,11 @@ mod tests {
             description: "review auth flow".to_string(),
             prompt: "review auth flow".to_string(),
             agent_type: "explore".to_string(),
-            run_in_background: true,
             ..Default::default()
         };
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         let agent_id = match spawned {
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected launched background agent, got {other:?}"),
         };
 
         let temp = crate::tests::test_temp_dir();
@@ -16850,7 +16648,6 @@ mod tests {
             description: "review auth flow".to_string(),
             prompt: "review auth flow".to_string(),
             agent_type: "explore".to_string(),
-            run_in_background: true,
             ..Default::default()
         };
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
@@ -17819,13 +17616,11 @@ mod tests {
             description: "review auth flow".to_string(),
             prompt: "review auth flow".to_string(),
             agent_type: "explore".to_string(),
-            run_in_background: true,
             ..Default::default()
         };
         let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
         let agent_id = match spawned {
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected launched background agent, got {other:?}"),
         };
 
         let mut cache = Vec::new();
@@ -17861,7 +17656,6 @@ mod tests {
             AgentStatus::Running {
                 activity: "checking session ownership".into(),
             },
-            true,
         );
         let snapshot = crate::tui::local_agent_snapshot::LocalAgentSnapshot {
             available: true,
@@ -17896,7 +17690,6 @@ mod tests {
                 result: "done".into(),
                 finish_reason: Some("normal".into()),
             },
-            true,
         );
         agent.started_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
         agent.ended_at = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(103));

@@ -745,6 +745,11 @@ durable ownership before provider I/O. Producers must never invent a run ID to
 make auxiliary work billable, and consumers must never infer ownership from an
 operation label or prompt text.
 
+A forked skill retains its parent run/session and execution authority. Its
+inference operation identity derives from the canonical child turn chain,
+which includes the outer invocation identity. Distinct forks cannot alias the
+same inference invocation; replay of one outer invocation retains its identity.
+
 Server persists route, admitted invocation, and first provider-attempt identity before contacting the provider.
 
 Retries reuse the logical invocation but create a new provider attempt. The invocation ID is sent upstream as an idempotency key only when the final provider explicitly supports that contract. If delivery may have occurred and the provider cannot answer idempotently, the result is `DeliveryUnknown`; Astra does not blindly retry or claim zero usage.

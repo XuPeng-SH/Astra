@@ -61,11 +61,6 @@ pub struct SandboxCheckpointData {
     pub checkpoint_name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct StatusResponse {
-    pub status: String,
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 pub fn validate_checkpoint_name(name: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -310,13 +305,6 @@ pub trait DataVersioningService: Send + Sync {
         sandbox_name: String,
         request: SandboxCheckpointData,
     ) -> Result<CheckpointResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn sandbox_restore(
-        &self,
-        user_id: String,
-        sandbox_name: String,
-        request: SandboxCheckpointData,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -707,32 +695,6 @@ impl DataVersioningService for DatabaseDataVersioningService {
         .map_err(internal_error)?;
         checkpoint_response_from_row(row)
     }
-
-    async fn sandbox_restore(
-        &self,
-        _user_id: String,
-        sandbox_name: String,
-        request: SandboxCheckpointData,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        validate_checkpoint_name(&request.checkpoint_name)?;
-
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let full_name = format!("{}__{}", sandbox_name, request.checkpoint_name);
-        let account = crate::snapshot_sql::resolve_account_name(&pool)
-            .await
-            .map_err(internal_error)?;
-        let sql = crate::snapshot_sql::restore_snapshot_db_sql(
-            &full_name,
-            &account,
-            &self.matrixone.database,
-        );
-        query(&sql).execute(&pool).await.map_err(internal_error)?;
-
-        Ok(StatusResponse {
-            status: "restored".into(),
-        })
-    }
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -781,14 +743,6 @@ impl DataVersioningService for UnconfiguredDataVersioningService {
         _: String,
         _: SandboxCheckpointData,
     ) -> Result<CheckpointResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("data versioning service not configured"))
-    }
-    async fn sandbox_restore(
-        &self,
-        _: String,
-        _: String,
-        _: SandboxCheckpointData,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("data versioning service not configured"))
     }
 }
@@ -986,15 +940,6 @@ mod tests {
         assert_eq!(parsed["session_id"], "s1");
     }
 
-    #[test]
-    fn status_response_serialization() {
-        let r = StatusResponse {
-            status: "restored".into(),
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert_eq!(json, r#"{"status":"restored"}"#);
-    }
-
     // ── Request deserialization ──
 
     #[test]
@@ -1049,17 +994,6 @@ mod tests {
         assert!(svc.trace_upstream("u1".into(), "e1".into()).await.is_err());
         assert!(
             svc.sandbox_checkpoint(
-                "u1".into(),
-                "sb".into(),
-                SandboxCheckpointData {
-                    checkpoint_name: "cp".into()
-                }
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            svc.sandbox_restore(
                 "u1".into(),
                 "sb".into(),
                 SandboxCheckpointData {

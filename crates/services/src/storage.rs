@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-29-v91";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-03-v93";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -5806,7 +5806,7 @@ async fn ensure_core_schema_while_leased(
             reference_id VARCHAR(128) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_artifact_reference_kind CHECK (
-                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation', 'recovery_point')
+                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation', 'recovery_point', 'session_transcript')
             ),
             PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id),
             INDEX idx_artifact_references_owner_reference
@@ -6048,29 +6048,6 @@ async fn ensure_core_schema_while_leased(
             created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_suc_user_skill_cred (user_id, skill_name, credential_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "wf_triggers",
-        "CREATE TABLE IF NOT EXISTS wf_triggers (
-            trigger_id   VARCHAR(36) PRIMARY KEY,
-            user_id      VARCHAR(128) NOT NULL,
-            agent_id     VARCHAR(255) NOT NULL,
-            trigger_type VARCHAR(32) NOT NULL,
-            name         VARCHAR(128) NOT NULL,
-            user_input   TEXT NOT NULL,
-            context      LONGTEXT,
-            cron_expr    VARCHAR(64),
-            secret       VARCHAR(128),
-            session_id   VARCHAR(36),
-            is_active    SMALLINT NOT NULL DEFAULT 1,
-            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_wft_user (user_id),
-            INDEX idx_wft_type (trigger_type),
-            INDEX idx_wft_active (is_active)
         )",
     )
     .execute(&pool)

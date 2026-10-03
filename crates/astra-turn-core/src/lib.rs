@@ -79,7 +79,6 @@ pub mod safety_middleware;
 pub mod section_types;
 pub mod semantic_read_cache;
 pub mod session_latches;
-pub mod spill_backend;
 pub mod sse;
 pub mod stall;
 pub mod state;
@@ -102,7 +101,6 @@ pub mod xml_tool_call_fallback;
 
 pub mod circuit_breaker;
 pub mod contracts;
-pub mod e2e_hooks;
 pub mod rate_limit_cooldown;
 pub mod sse_events;
 pub mod stream_events;
@@ -197,7 +195,6 @@ pub use permission::types as permission_types;
 
 // Re-exports: orchestration_* → orchestration::*
 pub use orchestration::builtin_agents as orchestration_builtin_agents;
-pub use orchestration::context_cache as orchestration_context_cache;
 pub use orchestration::fanout_group as orchestration_fanout_group;
 pub use orchestration::progress as orchestration_progress;
 pub use orchestration::spawn_tool as orchestration_spawn_tool;

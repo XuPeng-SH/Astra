@@ -135,7 +135,7 @@ fn backspace_preserves_selected_item_when_still_visible() {
 #[test]
 fn enter_on_bool_item_opens_bool_editor() {
     let mut v = make_view();
-    v.select_by_id("context_window.adaptive_budget_reduction");
+    v.select_by_id("trace.llm_exchanges");
     v.handle_key(key(KeyCode::Enter));
     assert!(v.has_inner_editor(), "Enter must push a child editor");
     assert_eq!(v.inner_editor_kind(), Some("bool"));
@@ -155,9 +155,9 @@ fn enter_on_number_item_opens_number_editor() {
 #[test]
 fn bool_edit_round_trips_and_marks_dirty() {
     let mut v = make_view();
-    // Default is false for adaptive_budget_reduction — flipping it
+    // Default is false for trace.llm_exchanges — flipping it
     // through the child editor must land in the working config.
-    v.select_by_id("context_window.adaptive_budget_reduction");
+    v.select_by_id("trace.llm_exchanges");
     v.handle_key(key(KeyCode::Enter)); // open bool editor
     v.handle_key(ch(' ')); // space toggles
     v.handle_key(key(KeyCode::Enter)); // accept
@@ -165,7 +165,9 @@ fn bool_edit_round_trips_and_marks_dirty() {
     assert!(v.is_dirty(), "accepted edit must mark the view dirty");
     let working = v.working_config_for_test();
     assert!(
-        working.context_window.adaptive_budget_reduction,
+        working
+            .trace
+            .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
         "the toggled value must land in working config"
     );
 }
@@ -179,7 +181,7 @@ fn bool_edit_round_trips_and_marks_dirty() {
 #[test]
 fn bool_editor_renders_both_options_with_marker_on_current() {
     let mut v = make_view();
-    v.select_by_id("context_window.adaptive_budget_reduction"); // default false
+    v.select_by_id("trace.llm_exchanges"); // default false
     v.handle_key(key(KeyCode::Enter));
     let width = 80u16;
     let h = 10u16;
@@ -211,7 +213,7 @@ fn bool_editor_renders_both_options_with_marker_on_current() {
 #[test]
 fn bool_editor_arrow_key_moves_selection_between_options() {
     let mut v = make_view();
-    v.select_by_id("context_window.adaptive_budget_reduction"); // current false
+    v.select_by_id("trace.llm_exchanges"); // current false
     v.handle_key(key(KeyCode::Enter));
     // ↓ moves from false to true.
     v.handle_key(key(KeyCode::Down));
@@ -219,8 +221,8 @@ fn bool_editor_arrow_key_moves_selection_between_options() {
     assert!(!v.has_inner_editor());
     assert!(
         v.working_config_for_test()
-            .context_window
-            .adaptive_budget_reduction,
+            .trace
+            .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
         "Down + Enter must commit the other option (true)"
     );
 }
@@ -228,7 +230,7 @@ fn bool_editor_arrow_key_moves_selection_between_options() {
 // ─── Save prompt: navigation + preview ──────────────────────────────────
 
 fn enter_dirty_state(v: &mut ConfigEditView) {
-    v.select_by_id("context_window.adaptive_budget_reduction");
+    v.select_by_id("trace.llm_exchanges");
     v.handle_key(key(KeyCode::Enter));
     v.handle_key(ch(' '));
     v.handle_key(key(KeyCode::Enter));
@@ -356,7 +358,7 @@ fn save_prompt_has_a_preview_option_that_shows_diff() {
         }
     }
     assert!(
-        text.contains("adaptive_budget_reduction"),
+        text.contains("llm_exchanges"),
         "preview must list the changed field id: {text}"
     );
     assert!(
@@ -423,14 +425,14 @@ fn bool_editor_space_still_toggles_for_muscle_memory() {
     // Space has been "flip" forever; keep it working so users who
     // trained on the old editor aren't stranded.
     let mut v = make_view();
-    v.select_by_id("context_window.adaptive_budget_reduction"); // current false
+    v.select_by_id("trace.llm_exchanges"); // current false
     v.handle_key(key(KeyCode::Enter));
     v.handle_key(ch(' '));
     v.handle_key(key(KeyCode::Enter));
     assert!(
         v.working_config_for_test()
-            .context_window
-            .adaptive_budget_reduction,
+            .trace
+            .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
         "space still toggles"
     );
 }
@@ -555,7 +557,7 @@ fn fractional_number_editor_clears_lone_decimal_guidance_when_value_becomes_vali
 #[test]
 fn esc_while_child_editor_open_cancels_child_only() {
     let mut v = make_view();
-    v.select_by_id("context_window.adaptive_budget_reduction");
+    v.select_by_id("trace.llm_exchanges");
     v.handle_key(key(KeyCode::Enter));
     assert!(v.has_inner_editor());
     v.handle_key(key(KeyCode::Esc));
@@ -581,7 +583,7 @@ fn esc_on_clean_outer_view_exits_with_no_action() {
 #[test]
 fn esc_on_dirty_outer_view_surfaces_save_prompt() {
     let mut v = make_view();
-    v.select_by_id("context_window.adaptive_budget_reduction");
+    v.select_by_id("trace.llm_exchanges");
     v.handle_key(key(KeyCode::Enter));
     v.handle_key(ch(' '));
     v.handle_key(key(KeyCode::Enter));

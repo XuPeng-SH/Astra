@@ -3827,7 +3827,7 @@ async fn fanout_parent_receipts_are_isolated_by_user_and_session() {
     assert!(Arc::ptr_eq(&first.spawner, &same.spawner));
     first
         .spawner
-        .declare_fanout_group("review", "first", 1, None, "parent")
+        .publish_fanout_fixture("review", "first", 1, None, "parent", None)
         .await
         .unwrap();
     first
@@ -3858,7 +3858,7 @@ async fn fanout_parent_receipts_are_isolated_by_user_and_session() {
         );
         other
             .spawner
-            .declare_fanout_group("review", "other", 1, None, "parent")
+            .publish_fanout_fixture("review", "other", 1, None, "parent", None)
             .await
             .unwrap();
         assert!(
@@ -3883,6 +3883,18 @@ struct ImmediateLifecycleExecutor;
 
 #[async_trait]
 impl SpawnAgentExecutor for ImmediateLifecycleExecutor {
+    async fn cancel_spawned_run_durably(
+        &self,
+        run: &str,
+        binding: Option<&str>,
+        user: Option<&str>,
+        reason: &str,
+        origin: crate::orchestration::CancellationOrigin,
+    ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+        let _ = (run, binding, user, reason, origin);
+        Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+    }
+
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         Ok(SpawnRunResult {
             agent_id: config.agent_id,
@@ -3909,6 +3921,18 @@ struct WaitingLifecycleExecutor;
 
 #[async_trait]
 impl SpawnAgentExecutor for WaitingLifecycleExecutor {
+    async fn cancel_spawned_run_durably(
+        &self,
+        run: &str,
+        binding: Option<&str>,
+        user: Option<&str>,
+        reason: &str,
+        origin: crate::orchestration::CancellationOrigin,
+    ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+        let _ = (run, binding, user, reason, origin);
+        Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+    }
+
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         Ok(SpawnRunResult {
             agent_id: config.agent_id,
@@ -3935,6 +3959,18 @@ struct PendingLifecycleExecutor;
 
 #[async_trait]
 impl SpawnAgentExecutor for PendingLifecycleExecutor {
+    async fn cancel_spawned_run_durably(
+        &self,
+        run: &str,
+        binding: Option<&str>,
+        user: Option<&str>,
+        reason: &str,
+        origin: crate::orchestration::CancellationOrigin,
+    ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+        let _ = (run, binding, user, reason, origin);
+        Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+    }
+
     async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         std::future::pending().await
     }
@@ -3947,6 +3983,19 @@ struct PendingCancellationLifecycleExecutor {
 
 #[async_trait]
 impl SpawnAgentExecutor for PendingCancellationLifecycleExecutor {
+    async fn cancel_spawned_run_durably(
+        &self,
+        run: &str,
+        binding: Option<&str>,
+        user: Option<&str>,
+        reason: &str,
+        origin: crate::orchestration::CancellationOrigin,
+    ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+        self.cancel_spawned_run(run, binding, user, reason, origin)
+            .await?;
+        Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+    }
+
     async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         std::future::pending().await
     }
@@ -4055,7 +4104,6 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
                 description: "pending cancellation during prune".to_string(),
                 prompt: "wait".to_string(),
                 agent_type: "explore".to_string(),
-                run_in_background: true,
                 ..Default::default()
             },
             &context,
@@ -4066,7 +4114,6 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
         astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Launched {
             agent_id, ..
         } => agent_id,
-        other => panic!("expected launched child, got {other:?}"),
     };
 
     // Hold cancellation after its entry epoch changed and active state was
@@ -4184,7 +4231,6 @@ async fn shutdown_fence_reports_pending_session_child_reconciliation_after_root_
                 description: "pending shutdown child".to_string(),
                 prompt: "wait".to_string(),
                 agent_type: "explore".to_string(),
-                run_in_background: true,
                 ..Default::default()
             },
             &context,
@@ -4272,7 +4318,6 @@ async fn shutdown_stays_bounded_while_stalled_child_control_remains_pending() {
                 description: "pending durable cancellation".to_string(),
                 prompt: "wait".to_string(),
                 agent_type: "explore".to_string(),
-                run_in_background: true,
                 ..Default::default()
             },
             &context,
@@ -4283,7 +4328,6 @@ async fn shutdown_stays_bounded_while_stalled_child_control_remains_pending() {
         astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Launched {
             agent_id, ..
         } => agent_id,
-        other => panic!("expected launched child, got {other:?}"),
     };
 
     let stop = {
@@ -4353,16 +4397,20 @@ async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
         description: "review code".to_string(),
         prompt: "review".to_string(),
         agent_type: "explore".to_string(),
-        run_in_background: false,
         ..Default::default()
     };
     let spawn_output = spawner.spawn(input, &context).await.unwrap();
+    let astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Launched { agent_id, .. } =
+        spawn_output;
+    let status = spawner
+        .wait_for_agent(&agent_id, std::time::Duration::from_secs(2))
+        .await;
     assert!(
         matches!(
-            spawn_output,
-            astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Completed { .. }
+            status,
+            Some(crate::orchestration::spawner::AgentStatus::Completed { .. })
         ),
-        "test setup must archive a synchronous completed child: {spawn_output:?}"
+        "{status:?}"
     );
 
     let sent_lifecycle_events = Arc::new(std::sync::Mutex::new(HashSet::new()));
@@ -4441,16 +4489,20 @@ async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
         description: "review code".to_string(),
         prompt: "review".to_string(),
         agent_type: "explore".to_string(),
-        run_in_background: false,
         ..Default::default()
     };
     let spawn_output = spawner.spawn(input, &context).await.unwrap();
+    let astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Launched { agent_id, .. } =
+        spawn_output;
+    let status = spawner
+        .wait_for_agent(&agent_id, std::time::Duration::from_secs(2))
+        .await;
     assert!(
         matches!(
-            spawn_output,
-            astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Waiting { .. }
+            status,
+            Some(crate::orchestration::spawner::AgentStatus::Waiting { .. })
         ),
-        "test setup must archive a synchronous waiting child: {spawn_output:?}"
+        "{status:?}"
     );
 
     let sent_lifecycle_events = Arc::new(std::sync::Mutex::new(HashSet::new()));
@@ -4994,10 +5046,10 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         } else {
             astra_config::user_profile::WorkspaceMutationIntent::Unknown
         },
+        isolated: false,
         working_dir: std::path::PathBuf::from("/tmp"),
         mailbox: None,
         progress_emitter: None,
-        context_cache: None,
         inherited_permissions,
         parent_address: None,
         permission_context,
@@ -5065,8 +5117,6 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
         cancel_token: None,
         execution_owner_generation,
         trace_context: server_trace_context(user_id, "session-1", parent_run_id, 1),
-        #[cfg(feature = "e2e-hooks")]
-        test_child_llm_rounds: Vec::new(),
         #[cfg(feature = "harness")]
         harness_sink: None,
     }
@@ -5137,7 +5187,17 @@ async fn server_spawn_runtime_context_is_keyed_by_parent_run() {
         "root-agent",
     ));
 
-    let context = executor.runtime_context_for_config(&config).await.unwrap();
+    let context = executor
+        .runtime_context_for_parent_run(
+            config
+                .parent_address
+                .as_ref()
+                .expect("test parent lineage")
+                .run_id
+                .as_str(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(context.parent_run_id, "parent-run-b");
     assert_eq!(context.user_id, "user-b");
@@ -5169,13 +5229,30 @@ async fn auto_spawn_context_reauthorizes_service_backed_genesis_offering() {
         "auto-parent",
         "root-agent",
     ));
-    let inherited = executor.runtime_context_for_config(&config).await.unwrap();
+    let inherited = executor
+        .runtime_context_for_parent_run(
+            config
+                .parent_address
+                .as_ref()
+                .expect("test parent lineage")
+                .run_id
+                .as_str(),
+        )
+        .await
+        .unwrap();
     assert_eq!(inherited.admitted_model_execution, Some(execution));
     assert_eq!(service.calls(), vec![(USER_ID.into(), OFFERING_ID.into())]);
 
     service.revoke();
     let error = executor
-        .runtime_context_for_config(&config)
+        .runtime_context_for_parent_run(
+            config
+                .parent_address
+                .as_ref()
+                .expect("test parent lineage")
+                .run_id
+                .as_str(),
+        )
         .await
         .err()
         .unwrap();
@@ -6941,7 +7018,17 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
         "root-run",
         "root-agent",
     ));
-    let root = executor.runtime_context_for_config(&child).await.unwrap();
+    let root = executor
+        .runtime_context_for_parent_run(
+            child
+                .parent_address
+                .as_ref()
+                .expect("test parent lineage")
+                .run_id
+                .as_str(),
+        )
+        .await
+        .unwrap();
     let child_constraints =
         spawn_child_request_constraints(&root.request_constraints, &child).unwrap();
     executor
@@ -6963,7 +7050,14 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
         "child-agent",
     ));
     let context = executor
-        .runtime_context_for_config(&grandchild)
+        .runtime_context_for_parent_run(
+            grandchild
+                .parent_address
+                .as_ref()
+                .expect("test parent lineage")
+                .run_id
+                .as_str(),
+        )
         .await
         .unwrap();
 
@@ -6989,47 +7083,6 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
     assert!(
         context.spawner.upgrade().is_some(),
         "the live child must retain the session-owned spawner capability"
-    );
-}
-
-#[tokio::test]
-async fn server_spawn_inheritance_reuses_parent_model_admission_without_lookup() {
-    use astra_turn_core::thinking_config::ThinkingConfig;
-
-    let executor = ServerSpawnAgentExecutor::new(
-        test_settings(),
-        test_encryptor(),
-        Arc::new(TokioMutex::new(HashMap::new())),
-    );
-    let parent = test_spawn_runtime_context("root-run", "user-a");
-    let expected = parent
-        .admitted_model_execution
-        .clone()
-        .expect("parent model admission");
-
-    let inherited = executor
-        .prepare_spawn_model(&parent, None, &ThinkingConfig::ModelDefault)
-        .await
-        .expect("omitted selection inherits");
-    let explicit_same = executor
-        .prepare_spawn_model(
-            &parent,
-            Some(&ModelSelection {
-                offering_id: expected.offering_id.clone(),
-            }),
-            &ThinkingConfig::ModelDefault,
-        )
-        .await
-        .expect("same Offering reuses admission");
-
-    assert_eq!(inherited, expected);
-    assert_eq!(explicit_same, expected);
-    assert!(
-        executor
-            .prepare_spawn_model(&parent, None, &ThinkingConfig::Off)
-            .await
-            .is_err(),
-        "batch preparation must reject unsupported reasoning before child creation"
     );
 }
 
@@ -7127,6 +7180,18 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .prepare_batch(&inputs, &context, None)
         .await
         .expect("inherited slots do not query the model service");
+    let mut explicit_parent = inputs.clone();
+    for input in &mut explicit_parent {
+        input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: test_admitted_model_execution().offering_id,
+            },
+        });
+    }
+    Arc::clone(&batch_executor)
+        .prepare_batch(&explicit_parent, &context, None)
+        .await
+        .expect("explicit parent Offering also reuses admission");
     assert!(model_service.batch_requests.lock().unwrap().is_empty());
     assert_eq!(*model_service.catalog_requests.lock().unwrap(), 0);
     let mut heterogeneous = inputs.clone();
@@ -7177,7 +7242,8 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .into_iter()
         .nth(1)
         .unwrap()
-        .execute(mismatched)
+        .launch(mismatched)
+        .expect("freeze prepared child")
         .await
         .expect_err("a prepared slot must not execute another slot");
     assert!(error.contains("does not match"), "{error}");
@@ -7385,20 +7451,22 @@ async fn server_subrun_batch_admits_distinct_offerings_once_and_reuses_parent() 
 
 #[tokio::test]
 async fn server_spawn_cannot_inherit_when_parent_has_no_model_admission() {
-    let executor = ServerSpawnAgentExecutor::new(
+    let executor = Arc::new(ServerSpawnAgentExecutor::new(
         test_settings(),
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
-    );
+    ));
     let mut parent = test_spawn_runtime_context("root-run", "user-a");
     parent.admitted_model_execution = None;
-
-    let error = executor
-        .select_spawn_model_execution(&parent, None)
-        .await
-        .expect_err("missing parent admission must fail closed");
-
-    assert!(error.contains("missing parent model admission"), "{error}");
+    executor.set_runtime_context(parent).await;
+    let result = executor
+        .prepare_batch(
+            &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput::default()],
+            &test_spawn_context("root-run"),
+            None,
+        )
+        .await;
+    assert!(matches!(result, Err(error) if error.contains("missing parent model admission")));
 }
 
 #[test]
@@ -7629,20 +7697,17 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         "root-run",
         "root-agent",
     ));
-    let parent = executor.runtime_context_for_config(&child).await.unwrap();
-    let unprepared_edge_switch = executor
-        .select_spawn_model_execution(
-            &parent,
-            Some(&ModelSelection {
-                offering_id: "owner-only-model".into(),
-            }),
+    let parent = executor
+        .runtime_context_for_parent_run(
+            child
+                .parent_address
+                .as_ref()
+                .expect("test parent lineage")
+                .run_id
+                .as_str(),
         )
-        .await;
-    assert!(matches!(
-        unprepared_edge_switch,
-        Err(error) if error.contains("provider-scoped child model selection")
-    ));
-
+        .await
+        .unwrap();
     // Provider scope remains fail-closed when request catalog discovery is
     // unavailable (for example after recovery). Cache presence must never be
     // the authorization boundary.
@@ -7651,20 +7716,24 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         provider_id: "provider".into(),
         provider_scope_id: "restricted".into(),
     });
-    let provider_parent = readerless_provider.clone();
     executor.set_runtime_context(readerless_provider).await;
-    let readerless_edge_switch = executor
-        .select_spawn_model_execution(
-            &provider_parent,
-            Some(&ModelSelection {
-                offering_id: "owner-only-model".into(),
-            }),
+    let readerless_edge_switch = Arc::clone(&executor)
+        .prepare_batch(
+            &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput {
+                requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                    selector: astra_turn_types::ModelSelector::OfferingId {
+                        offering_id: "owner-only-model".into(),
+                    },
+                }),
+                ..Default::default()
+            }],
+            &test_spawn_context("provider-root"),
+            None,
         )
         .await;
-    assert!(matches!(
-        readerless_edge_switch,
-        Err(error) if error.contains("provider-scoped child model selection")
-    ));
+    assert!(
+        matches!(readerless_edge_switch, Err(error) if error.contains("provider-scoped child model selection"))
+    );
 
     let (child_context, _child_generation_guard) = executor
         .register_child_runtime_context(
@@ -7727,7 +7796,14 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         "direct child cancellation must not cancel the root"
     );
     let child_context = executor
-        .runtime_context_for_config(&child)
+        .runtime_context_for_parent_run(
+            child
+                .parent_address
+                .as_ref()
+                .expect("test parent lineage")
+                .run_id
+                .as_str(),
+        )
         .await
         .expect("registered child context");
     let inherited_child_token = child_context.cancel_token.expect("stored child token");
@@ -7749,17 +7825,19 @@ async fn two_fresh_server_children_fail_closed_without_durable_owner_pod_capabil
         .start_run("root-fanout-run", "user-a", "session-1")
         .await
         .expect("durable fanout parent");
-    let executor = ServerSpawnAgentExecutor::new(
-        test_settings(),
-        test_encryptor(),
-        Arc::new(TokioMutex::new(HashMap::new())),
-    )
-    .with_run_engine(run_engine.clone())
-    .with_invocation_ledger(
-        crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
-            run_engine.clone(),
+    let executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
         )
-        .expect("process-local invocation ledger"),
+        .with_run_engine(run_engine.clone())
+        .with_invocation_ledger(
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+                run_engine.clone(),
+            )
+            .expect("process-local invocation ledger"),
+        ),
     );
     let spawner = test_dynamic_agent_spawner();
     let mut context = test_spawn_runtime_context("root-fanout-run", "user-a");
@@ -7777,6 +7855,9 @@ async fn two_fresh_server_children_fail_closed_without_durable_owner_pod_capabil
 
     let child = |slot: usize| {
         let mut config = test_spawn_run_config(Vec::new(), true);
+        config.resolved_model_selection = Some(ModelSelection {
+            offering_id: "model-test-model".into(),
+        });
         config.run_id = format!("fanout-child-{slot}");
         config.agent_id = format!("fanout-agent-{slot}");
         config.task = format!("Return the result for fanout slot {slot}.");
@@ -7794,7 +7875,23 @@ async fn two_fresh_server_children_fail_closed_without_durable_owner_pod_capabil
         ));
         config
     };
-    let (first, second) = tokio::join!(executor.execute(child(0)), executor.execute(child(1)));
+    let inputs = vec![astra_turn_core::orchestration_spawn_tool::SpawnAgentInput::default(); 2];
+    let mut prepared = Arc::clone(&executor)
+        .prepare_batch(&inputs, &test_spawn_context("root-fanout-run"), None)
+        .await
+        .expect("prepare both inherited children")
+        .into_iter();
+    let first = prepared
+        .next()
+        .unwrap()
+        .launch(child(0))
+        .expect("launch first child");
+    let second = prepared
+        .next()
+        .unwrap()
+        .launch(child(1))
+        .expect("launch second child");
+    let (first, second) = tokio::join!(first, second);
 
     for (slot, result) in [first, second].into_iter().enumerate() {
         let result = result.unwrap_or_else(|error| panic!("fanout slot {slot} failed: {error}"));
@@ -7849,22 +7946,22 @@ async fn two_fresh_server_children_fail_closed_without_durable_owner_pod_capabil
 
 #[tokio::test]
 async fn server_spawn_runtime_context_requires_parent_lineage() {
-    let executor = ServerSpawnAgentExecutor::new(
+    let executor = Arc::new(ServerSpawnAgentExecutor::new(
         test_settings(),
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
-    );
+    ));
     executor
         .set_runtime_context(test_spawn_runtime_context("parent-run-a", "user-a"))
         .await;
-
-    let config = test_spawn_run_config(vec!["*"], false);
-    let err = match executor.runtime_context_for_config(&config).await {
-        Ok(_) => panic!("server dynamic spawn must not run without parent lineage"),
-        Err(err) => err,
-    };
-
-    assert!(err.contains("parent run lineage"), "{err}");
+    let result = executor
+        .prepare_batch(
+            &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput::default()],
+            &test_spawn_context(""),
+            None,
+        )
+        .await;
+    assert!(matches!(result, Err(error) if error.contains("no runtime context for parent run")));
 }
 
 #[test]
@@ -8187,6 +8284,7 @@ async fn durable_subrun_cancel_fallback_preserves_typed_origin_without_cross_lin
                 None,
                 Some(origin),
                 None,
+                None,
             )
             .await
             .unwrap_or_else(|error| panic!("{origin:?} typed terminal: {error}"));
@@ -8230,6 +8328,7 @@ async fn durable_subrun_cancel_fallback_preserves_typed_origin_without_cross_lin
             "missing-origin-child",
             Some(authority.owner_generation),
             STATUS_CANCELLED,
+            None,
             None,
             None,
             None,
@@ -8588,6 +8687,15 @@ fn spawn_child_constraints_intersect_parent_and_agent_allowlists() {
             .into_iter()
             .collect(),
         ),
+    );
+    let discovery_only = test_spawn_run_config(vec!["tool_search"], true);
+    assert!(
+        spawn_child_request_constraints(&parent, &discovery_only)
+            .unwrap()
+            .allowed_tools
+            .unwrap()
+            .is_empty(),
+        "a profile default cannot restore discovery denied by the parent"
     );
     let config = test_spawn_run_config(vec!["bash", "read_file"], true);
 
@@ -9156,6 +9264,32 @@ impl FaultInjectedRunStateStore {
 
 #[async_trait]
 impl RunStateStore for FaultInjectedRunStateStore {
+    async fn authorize_execution_boundary(
+        &self,
+        request: astra_services::runs::RunExecutionBoundaryAuthorizationRequest<'_>,
+    ) -> Result<astra_services::runs::RunExecutionBoundaryAuthorization, String> {
+        self.inner.authorize_execution_boundary(request).await
+    }
+
+    async fn load_user_intent_control_delta(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+        limit: usize,
+    ) -> Result<Option<astra_services::runs::DurableRunUserIntentControlDelta>, String> {
+        self.inner
+            .load_user_intent_control_delta(user_id, run_id, after_event_idx, limit)
+            .await
+    }
+
+    async fn transition_user_intent_admission(
+        &self,
+        request: astra_services::runs::AtomicRunUserIntentAdmissionTransitionRequest<'_>,
+    ) -> Result<astra_services::runs::AtomicRunUserIntentAdmissionTransition, String> {
+        self.inner.transition_user_intent_admission(request).await
+    }
+
     async fn reconcile_execution_handoff(
         &self,
         claim: &astra_services::runs::RecoveryClaim,
@@ -9963,6 +10097,10 @@ fn test_service() -> AgenticRunLifecycleService {
         Arc::new(TokioMutex::new(HashMap::new())),
         engine,
     )
+    .with_fixture_workspace_provider(
+        Arc::new(tempfile::tempdir().expect("fixture workspace")),
+        "lifecycle-fixture-executor",
+    )
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
@@ -10235,6 +10373,10 @@ async fn terminal_test_service() -> (AgenticRunLifecycleService, TerminalTestLlm
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
         RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
+    )
+    .with_fixture_workspace_provider(
+        Arc::new(tempfile::tempdir().unwrap()),
+        "terminal-fixture-executor",
     )
     .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
     service.test_inference_ledger = Some(Default::default());
@@ -11405,6 +11547,10 @@ fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycle
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
         engine,
+    )
+    .with_fixture_workspace_provider(
+        Arc::new(tempfile::tempdir().unwrap()),
+        "store-fixture-executor",
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
@@ -14391,6 +14537,7 @@ async fn server_subrun_pause_receipt_is_acknowledged_generation_not_invented_fro
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("fenced pause succeeds")
@@ -14448,6 +14595,7 @@ async fn server_subrun_partial_status_persists_typed_error_code() {
             Some("budget_exhausted: adaptive hard turn limit reached"),
             None,
             Some("Partial architecture findings."),
+            None,
         )
         .await
         .unwrap();
@@ -14504,6 +14652,7 @@ async fn server_subrun_completion_commits_result_with_terminal_status() {
             None,
             None,
             Some("Complete child evidence."),
+            None,
         )
         .await
         .unwrap();
@@ -14681,6 +14830,7 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
             None,
             None,
             Some("Partial child evidence."),
+            None,
         )
         .await
         .expect("idempotently settle the existing wait");
@@ -16621,6 +16771,7 @@ async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message
         .await
         .expect("non-empty user_intent is valid effective input");
 
+    assert_eq!(prepared.message, "continue the approved plan");
     assert_eq!(prepared.model.as_deref(), Some("test-model"));
     let material = prepared
         .admitted_model_execution
@@ -16631,6 +16782,44 @@ async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message
     assert_eq!(
         prepared.user_intent.as_deref(),
         Some("continue the approved plan")
+    );
+    let state = service.build_initial_state(
+        "u1",
+        &prepared,
+        "intent-session",
+        "intent-run",
+        None,
+        None,
+        None,
+    );
+    assert_eq!(state.message, "continue the approved plan");
+    assert_eq!(state.user_intent, "continue the approved plan");
+    assert_eq!(
+        state.messages,
+        vec![json!({"role":"user", "content":"continue the approved plan"})]
+    );
+    let mut request = test_request("  complete prompt preserved  ");
+    request.user_intent = Some("distinct structured planning guidance".into());
+    let prepared = service.prepare_chat_request("u1", request).await.unwrap();
+    assert_eq!(prepared.message, "  complete prompt preserved  ");
+    assert_eq!(
+        prepared.user_intent.as_deref(),
+        Some("distinct structured planning guidance")
+    );
+    let state = service.build_initial_state(
+        "u1",
+        &prepared,
+        "prompt-session",
+        "prompt-run",
+        None,
+        None,
+        None,
+    );
+    assert_eq!(state.message, "complete prompt preserved");
+    assert_eq!(state.user_intent, "distinct structured planning guidance");
+    assert_eq!(
+        state.messages,
+        vec![json!({"role":"user", "content":"complete prompt preserved"})]
     );
 }
 
@@ -20642,13 +20831,18 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
         FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(Duration::from_millis(40)),
     );
     let engine = RunEngine::new(store.clone());
-    let owner = AgenticRunLifecycleService::new(
+    let mut owner = AgenticRunLifecycleService::new(
         test_settings(),
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
         engine.clone(),
     )
+    .with_fixture_workspace_provider(
+        Arc::new(tempfile::tempdir().expect("fanout fixture workspace")),
+        "fanout-fixture-executor",
+    )
     .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
+    owner.test_inference_ledger = Some(Default::default());
     let observer = AgenticRunLifecycleService::new(
         test_settings(),
         test_encryptor(),
@@ -20657,21 +20851,11 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
 
-    let mut request = prepared_test_request("slow live run");
-    request.provider_runtime_authorized = true;
-    request.admitted_model_execution = None;
-    request.runtime_auth = Some(RuntimeAuthRequest {
-        authorization: "Bearer runtime-grant".to_string(),
-    });
-    request.capability_descriptors =
-        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
-            model_gateway: Some(test_runtime_descriptor(
-                "incremental-test-gateway",
-                "model_gateway",
-                &format!("{}/chat/completions", llm.base_url),
-            )),
-            ..Default::default()
-        });
+    let mut request = test_request("slow live run");
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
     let mut owner_stream = ok(owner.stream_chat("user-1".to_string(), request).await);
     let mut owner_event_rx = owner_stream.event_rx.take().expect("owner live stream");
     let owner_drain = tokio::spawn(async move { while owner_event_rx.recv().await.is_some() {} });
@@ -20754,6 +20938,23 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
         "live durability batches must remain bounded"
     );
     owner_drain.await.expect("owner stream drain");
+    let durable = owner
+        .run_engine
+        .load_run("user-1", &owner_stream.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.status, STATUS_COMPLETED,
+        "error_code={:?}, error_message={:?}",
+        durable.error_code, durable.error_message,
+    );
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 1);
+    owner
+        .test_inference_ledger
+        .as_ref()
+        .unwrap()
+        .assert_quiescent();
 }
 
 #[test]
@@ -24707,6 +24908,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
                 user_intent_digest: "original-digest".into(),
             },
         };
+    facts.original.evaluation_thresholds.search_fanout = 37;
     facts.original.session_turn = 7;
     facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
     facts.original.root_user_query_event_id = Some("original-query".to_string());
@@ -24821,6 +25023,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         environment,
         facts,
     );
+    assert_eq!(state.evaluation_thresholds.search_fanout, 37);
     assert_eq!(state.messages, messages);
     assert_eq!(state.message, "original task");
     assert_eq!(state.user_intent, "original structured intent");
@@ -26885,7 +27088,7 @@ async fn db_explain_publication_is_discoverable_and_readable() {
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
     let pool = setup_lifecycle_run_db_it().await;
-    let user = "explain-discovery-perf-it";
+    let user = crate::server::model_execution_admission::inheritance_test_support::USER_ID;
     let session = format!("explain-discovery-perf-{}", Uuid::new_v4());
     let run = Uuid::new_v4().to_string();
     let svc = db_backed_test_service(&pool, "explain-discovery-perf-it");
@@ -27002,7 +27205,24 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
             .start_run_ext(&parent, user, &session, Some(&current), None, None, None)
             .await
             .expect("start delegated parent under the current Explain root");
-        let mut config = test_executable_subrun_config(&child, test_admitted_model_execution());
+        use crate::server::provider_test_support::{
+            ProviderGateway, ProviderResponse, ProviderScript,
+        };
+        let native_gateway=ProviderGateway::start(vec![ProviderScript::new("delegated Explain actual provider",|request|request.path=="/v1/chat/completions" && request.body["model"]=="genesis-wire-model" && request.body["stream"]==true,vec![
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[
+                {"id":"explain-0","type":"function","function":{"name":"introspect","arguments":json!({"explain":{"target":"previous"}}).to_string()}},
+                {"id":"explain-1","type":"function","function":{"name":"introspect","arguments":json!({"explain":{"target":"run","run_id":run}}).to_string()}}
+            ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Observed both reports."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))
+        ])]).await;
+        let native_base = format!("{}/v1", native_gateway.base_url);
+        use crate::server::model_execution_admission::inheritance_test_support::{
+            OFFERING_ID, ServiceBackedOffering, genesis_execution,
+        };
+        let mut admitted = genesis_execution();
+        admitted.base_url = native_base;
+        let model_service = Arc::new(ServiceBackedOffering::new(admitted.clone()));
+        let mut config = test_executable_subrun_config(&child, admitted);
         config.user_id = user.into();
         config.session_id = session.clone();
         config.parent_run_id = parent.clone();
@@ -27013,19 +27233,6 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
         config
             .context
             .insert("root_run_id".into(), json!("untrusted-prompt-root"));
-        let calls: Vec<_> = [
-            json!({"explain": {"target": "previous"}}),
-            json!({"explain": {"target": "run", "run_id": run}}),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, args)| {
-            json!({
-                "id": format!("explain-{index}"), "type": "function",
-                "function": {"name": "introspect", "arguments": args.to_string()}
-            })
-        })
-        .collect();
         let delegated = ServerSubRunExecutor::new(
             pool.settings().clone(),
             test_encryptor(),
@@ -27038,10 +27245,7 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
                 .clone()
                 .expect("database invocation ledger"),
         )
-        .with_test_llm_rounds(vec![
-            json!({"tool_calls": calls}),
-            json!({"full_text": "Observed both reports."}),
-        ]);
+        .with_model_service(Some(model_service.clone()));
         let result = tokio::time::timeout(Duration::from_secs(15), delegated.execute(config))
             .await
             .expect("bounded delegated Explain execution")
@@ -27067,6 +27271,14 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
             assert!(output.contains(&handle), "{output}");
             assert!(!output.contains("requires a server root execution context"));
         }
+        native_gateway.assert_complete();
+        assert!(
+            model_service
+                .calls()
+                .iter()
+                .any(|(owner, offering)| owner == user && offering == OFFERING_ID),
+            "child reauthorizes the Server Offering"
+        );
         cleanup_lifecycle_run_fixture(&pool, user, &child).await;
         cleanup_lifecycle_run_fixture(&pool, user, &parent).await;
     }
@@ -32110,4 +32322,125 @@ fn child_edge_ws_uses_runtime_dispatch_while_thin_client_uses_callback_lane() {
         !child_uses_client_tool_delivery(false, Some(&thin_client)),
         "a callback transport is not executable when the parent has no delivery lane"
     );
+}
+
+#[tokio::test]
+async fn ownerless_lifecycle_does_not_select_workspace_provider_implicitly() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let service = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine,
+    );
+    assert!(service.execution_owner_pod_id().is_none());
+    assert!(service.workspace_executor_id().is_none());
+    assert_eq!(
+        service
+            .provision_server_workspace("no-implicit-provider")
+            .unwrap_err()
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn persisted_workspace_on_foreign_executor_is_not_provisioned_or_rebound() {
+    let store = Arc::new(InMemoryWorkspaceRecordStore::new());
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let service = test_service()
+        .with_fixture_workspace_provider(directory.clone(), "executor-a")
+        .with_workspace_record_store(store.clone());
+    let root = service
+        .provision_persisted_server_workspace("owner-a", "session-a", "run-a")
+        .await
+        .unwrap();
+    let foreign_directory = Arc::new(tempfile::tempdir().unwrap());
+    let foreign = test_service()
+        .with_fixture_workspace_provider(foreign_directory.clone(), "executor-b")
+        .with_workspace_record_store(store.clone());
+    assert!(
+        foreign
+            .provision_persisted_server_workspace("owner-a", "session-a", "run-b")
+            .await
+            .is_err()
+    );
+    assert!(!foreign_directory.path().join("session-a").exists());
+    assert!(root.is_dir());
+    assert_eq!(
+        store
+            .load_workspace_record("owner-a", "session-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .run_id
+            .as_deref(),
+        Some("run-a")
+    );
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn first_workspace_provisioning_race_selects_one_executor_without_loser_cleanup() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let store = Arc::new(astra_services::DatabaseWorkspaceRecordStore::new(
+        pool.clone(),
+    ));
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let a = test_service()
+        .with_fixture_workspace_provider(directory.clone(), "executor-a")
+        .with_workspace_record_store(store.clone());
+    let b = test_service()
+        .with_fixture_workspace_provider(directory.clone(), "executor-b")
+        .with_workspace_record_store(store.clone());
+    let owner = format!("workspace-race-owner-{}", Uuid::new_v4());
+    let session = format!("workspace-race-session-{}", Uuid::new_v4());
+    let (first, second) = tokio::join!(
+        a.provision_persisted_server_workspace(&owner, &session, "run-a"),
+        b.provision_persisted_server_workspace(&owner, &session, "run-b")
+    );
+    assert_ne!(
+        first.is_ok(),
+        second.is_ok(),
+        "exactly one executor must acquire physical ownership"
+    );
+    let (winner, loser, root) = if let Ok(root) = first {
+        (&a, &b, root)
+    } else {
+        (&b, &a, second.unwrap())
+    };
+    let stored = store
+        .load_workspace_record(&owner, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        winner.resolve_server_workspace(&stored.record).unwrap(),
+        root
+    );
+    assert!(loser.resolve_server_workspace(&stored.record).is_err());
+    std::fs::write(root.join("winner.txt"), "retained").unwrap();
+    assert!(
+        loser
+            .provision_persisted_server_workspace(&owner, &session, "run-loser")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("winner.txt")).unwrap(),
+        "retained"
+    );
+    assert_eq!(
+        store
+            .load_workspace_record(&owner, &session)
+            .await
+            .unwrap()
+            .unwrap(),
+        stored
+    );
+    sqlx::query("DELETE FROM workspace_records WHERE owner_id = ?")
+        .bind(owner)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }

@@ -1244,9 +1244,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::default();
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_policy
-            .resolve_for_model(effective_model.as_deref());
+        let tool_policy_config = astra_config::RuntimeConfig::load().tool_policy;
+        let resolved_tool_policy = tool_policy_config.resolve_for_model(effective_model.as_deref());
         let child_cancel_token = child_cancellation_scope(self.cancel_token.as_ref());
 
         let all_schemas = edge_tools::local_tool_schemas();
@@ -1363,6 +1362,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         );
 
         let mut state = AgenticLoopState {
+            evaluation_thresholds:
+                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
+                    &tool_policy_config,
+                ),
             observation_journal: Default::default(),
             tool_ledger_receipt: Default::default(),
             messages,
@@ -1412,8 +1415,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             budget_policy: None,
             restricted_tools,
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -2023,7 +2024,7 @@ mod tests {
                 0_usize,
             ),
             (
-                crate::cli::mock_llm::MockScenario::ToolThenComplete,
+                crate::cli::mock_llm::MockScenario::ToolThenMissingTerminal,
                 "write the requested file",
                 150_u64,
                 50_u64,

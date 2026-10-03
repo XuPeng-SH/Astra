@@ -213,7 +213,7 @@ pub use proposal::{
 };
 pub use proposal_identity::WorkProposalInvocationIdentity;
 pub use recovery_point::{
-    DatabaseWorkRecoveryPointRepository, NewWorkRecoveryPoint, WORK_RECOVERY_POINT_SCHEMA_VERSION,
+    DatabaseWorkRecoveryPointRepository, WORK_RECOVERY_POINT_SCHEMA_VERSION,
     WorkRecoveryPointCaptureRequest, WorkRecoveryPointCursor, WorkRecoveryPointPage,
     WorkRecoveryPointQuery, WorkRecoveryPointRecord, WorkRecoveryPointStatus,
     WorkWorkspaceRecoveryPointCaptureRequest,

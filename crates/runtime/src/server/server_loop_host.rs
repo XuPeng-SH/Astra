@@ -1231,12 +1231,10 @@ fn runtime_control_tool_call_admission(
 
 fn pre_turn_summary_spill_count(messages: &[Value]) -> usize {
     let keep_recent = (messages.len() / 4).max(4);
-    let proposed = crate::turn::agentic_loop::execution_phase::adjust_spill_boundary_for_tool_pairs(
+    crate::turn::cloud::compaction::protected_history_spill_count(
         messages,
         messages.len().saturating_sub(keep_recent),
-    );
-    astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
-        .map_or(proposed, |protected_start| proposed.min(protected_start))
+    )
 }
 
 fn apply_pre_turn_summary(
@@ -1245,54 +1243,29 @@ fn apply_pre_turn_summary(
     summary_text: String,
     spill_count: usize,
 ) -> Option<CompactionEvent> {
-    if spill_count == 0 || spill_count > state.messages.len() {
-        return None;
-    }
     let max_tokens = state.max_turn_input_tokens;
-    let (tokens_before, old_count) = (
-        crate::turn::agentic_loop::lifecycle::estimate_context_pressure_with_system_prompt_tokens(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            max_tokens,
-            crate::prompts::measured_prompt_tokens_from_manifest(
-                state.last_llm_context_manifest_trace.as_ref(),
-            ),
-        )
-        .1,
-        state.messages.len(),
-    );
-    let mut compacted = Vec::with_capacity(old_count.saturating_sub(spill_count) + 1);
-    compacted.push(serde_json::json!({
-        "role": "system",
-        "content": format!(
-            "[Conversation compacted — {} messages summarized]\n\n{}",
-            spill_count,
-            summary_text,
-        )
-    }));
-    compacted.extend(state.messages[spill_count..].iter().cloned());
-    let tokens_after =
-        crate::turn::agentic_loop::lifecycle::estimate_context_pressure_with_system_prompt_tokens(
-            &compacted,
-            state.pinned_tool_schema_tokens as usize,
-            max_tokens,
-            crate::prompts::measured_prompt_tokens_from_manifest(
-                state.last_llm_context_manifest_trace.as_ref(),
-            ),
-        )
-        .1;
-    if tokens_after >= tokens_before {
-        return None;
-    }
-
+    let candidate = crate::turn::cloud::compaction::prepare_prefix_summary(
+        &state.messages,
+        spill_count,
+        serde_json::json!({
+            "role": "system",
+            "content": format!("[Conversation compacted — {} messages summarized]\n\n{}", spill_count, summary_text),
+        }),
+        state.pinned_tool_schema_tokens as usize,
+        max_tokens,
+        crate::prompts::measured_prompt_tokens_from_manifest(
+            state.last_llm_context_manifest_trace.as_ref(),
+        ),
+    )?;
+    let tokens_freed = candidate.tokens_freed();
+    let tokens_before = candidate.tokens_before;
+    let messages_removed = candidate.messages_removed;
     let rewrite_permit = state.begin_canonical_rewrite();
-    state.messages = compacted;
+    state.messages = candidate.messages;
     state.finish_canonical_rewrite(rewrite_permit);
     state.compact_tier_applied = CompactionTier::CompactHistory;
     state.context_compression_triggered = true;
 
-    let tokens_freed = tokens_before.saturating_sub(tokens_after);
-    let messages_removed = old_count.saturating_sub(state.messages.len());
     Some(CompactionEvent::new(
         CompactionKind::PreTurnSummary,
         pressure,
@@ -2057,53 +2030,6 @@ fn record_full_llm_response_event(
     buf.record(evt);
 }
 
-#[cfg(feature = "e2e-hooks")]
-fn mock_error_kind_from_str(kind: &str) -> astra_core::ErrorKind {
-    astra_core::ErrorKind::parse_tag(kind).unwrap_or(astra_core::ErrorKind::Unknown)
-}
-
-#[cfg(feature = "e2e-hooks")]
-fn mock_round_error(round: &Value) -> Option<astra_core::ClassifiedError> {
-    let error = round.get("error")?.as_object()?;
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or("mock LLM round failed");
-    let kind = error
-        .get("kind")
-        .and_then(Value::as_str)
-        .map(mock_error_kind_from_str)
-        .unwrap_or(astra_core::ErrorKind::Unknown);
-    let classified = astra_core::ClassifiedError::new(kind, message.to_string());
-    if let Some(details) = error.get("details").filter(|details| details.is_object()) {
-        Some(classified.with_details_json(details.to_string()))
-    } else {
-        Some(classified)
-    }
-}
-
-#[cfg(feature = "e2e-hooks")]
-fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String> {
-    let details = error.details_json.as_deref()?;
-    let value: Value = match serde_json::from_str(details) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(
-                target: "astra_runtime::server_loop",
-                error = %e,
-                "failed to parse error details_json; partial_text unavailable"
-            );
-            return None;
-        }
-    };
-    value
-        .get("partial_full_text")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(ToString::to_string)
-}
-
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
     model_name: String,
@@ -2728,12 +2654,12 @@ fn delegation_requirement_source(
     }
 }
 
-fn delegation_judgment_operation_id(stage: &str, identity: &str) -> String {
+fn scoped_inference_operation_id(stage: &str, identity: &str) -> String {
     use sha2::{Digest, Sha256};
 
     // Inference operation IDs are limited to 64 characters. Hash the stage
-    // together with its stable identity so intent and scope judgments cannot
-    // collide while retaining the full 256-bit identity for replay.
+    // together with its stable identity so judgments and child executions
+    // cannot alias while retaining the full 256-bit identity for replay.
     format!(
         "{:x}",
         Sha256::digest(format!("{stage}:{identity}").as_bytes())
@@ -2745,7 +2671,7 @@ fn delegation_intent_assessment_operation_id(
     input_digest: &str,
     candidate_snapshot_digest: &str,
 ) -> String {
-    delegation_judgment_operation_id(
+    scoped_inference_operation_id(
         "intent",
         &format!("{source_digest}|{input_digest}|{candidate_snapshot_digest}"),
     )
@@ -3322,63 +3248,6 @@ async fn resolve_llm_model_for_turn(
     })
 }
 
-/// Test-only snapshot of the materials a single turn of the mock LLM path
-/// assembles before it would call a real provider. Captures enough to
-/// assert on prompt-cache annotations, schema changes, and stable prefix
-/// byte-equality across turns without involving the network.
-#[cfg(feature = "e2e-hooks")]
-#[derive(Debug, Clone)]
-pub struct CapturedLlmRequest {
-    /// 0-based turn index (counts mock-LLM rounds actually executed).
-    pub turn_index: usize,
-    /// Provider id used for cache config (e.g. `"anthropic"` or `"openai"`).
-    pub provider: String,
-    /// Model id used for cache config (e.g. `"claude-sonnet-4"`).
-    pub model: String,
-    /// Whether `PromptCacheConfig` was computing annotations on this turn.
-    pub cache_enabled: bool,
-    /// Whether Anthropic-style cache_control blocks were emitted.
-    pub is_anthropic: bool,
-    /// The primary structured system message (with cache_control blocks for
-    /// Anthropic, or just the stable prefix text for OpenAI-compatible).
-    pub system_primary: Value,
-    /// The optional per-turn dynamic system message (OpenAI split only).
-    pub system_dynamic: Option<Value>,
-    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching`.
-    pub tools: Vec<Value>,
-    /// Conversation messages after provider-specific cache metadata was applied
-    /// (for Anthropic) or a clone of `state.messages` (otherwise).
-    pub messages: Vec<Value>,
-    /// Exact message array after provider-specific system consolidation and
-    /// internal-marker stripping. This is the shape handed to the request-body
-    /// builder; cache regressions must assert on this field rather than the
-    /// earlier assembly representation.
-    pub provider_messages: Vec<Value>,
-    /// Number of `cache_control` blocks present in `system_primary` content.
-    pub system_cache_control_count: usize,
-    /// Whether the last tool schema carries a `cache_control` marker.
-    pub last_tool_has_cache_control: bool,
-    /// Whether the last non-system message carries a `cache_control` marker.
-    pub last_message_has_cache_control: bool,
-    /// SHA256 hex of the cacheable prefix (for OpenAI: `system_primary.content`
-    /// as text; for Anthropic: the concatenated text of all blocks up to and
-    /// including the last cache_control breakpoint).
-    pub cacheable_prefix_sha256: String,
-    /// Indices of messages (in the captured `messages` array) that carry a
-    /// `cache_control` marker anywhere in their content. Order matches the
-    /// message order. Empty for non-Anthropic providers.
-    ///
-    /// Used by tests to assert Claude Code-style message-marker behavior:
-    /// exactly one marker on the last non-system message for
-    /// Anthropic/Bedrock-compatible requests.
-    pub message_cache_control_indices: Vec<usize>,
-    /// For each message in `messages`, the SHA-256 hex of that message's
-    /// canonical JSON serialization (sort_keys). Tests compare slices of
-    /// this vector across rounds to prove the cacheable message prefix is
-    /// byte-stable (a prerequisite for Anthropic cache hits beyond tools).
-    pub message_sha256: Vec<String>,
-}
-
 #[derive(Debug)]
 struct ProviderCanonicalHydrationOutcome {
     reconciled_transitions: usize,
@@ -3590,257 +3459,6 @@ fn hydrate_provider_canonical_transition_receipts(
     recovered.extend(fresh_suffix);
     *messages = recovered;
     Ok(outcome)
-}
-
-#[cfg(feature = "e2e-hooks")]
-fn value_has_cache_control(v: &Value) -> bool {
-    v.get("cache_control")
-        .map(|cc| !cc.is_null())
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "e2e-hooks")]
-fn count_system_cache_control(primary: &Value) -> usize {
-    let Some(content) = primary.get("content") else {
-        return 0;
-    };
-    match content {
-        Value::Array(blocks) => blocks.iter().filter(|b| value_has_cache_control(b)).count(),
-        _ => 0,
-    }
-}
-
-#[cfg(feature = "e2e-hooks")]
-fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
-    let Some(content) = system_primary.get("content") else {
-        return String::new();
-    };
-    if let Some(s) = content.as_str() {
-        return s.to_string();
-    }
-    let Some(blocks) = content.as_array() else {
-        return String::new();
-    };
-    if is_anthropic {
-        // Concatenate text up to and including the last block carrying
-        // `cache_control` (the full cacheable prefix per Anthropic semantics).
-        let last_break = blocks
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, b)| value_has_cache_control(b))
-            .map(|(i, _)| i);
-        match last_break {
-            Some(idx) => blocks
-                .iter()
-                .take(idx + 1)
-                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(""),
-            None => String::new(),
-        }
-    } else {
-        blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("")
-    }
-}
-
-/// Normalize a message to the shape Anthropic uses for cache-key
-/// derivation. Removes `cache_control` attributes everywhere (they are
-/// request-layer directives, not tokens) and upgrades `content: "text"`
-/// strings to the canonical `content: [{type:"text", text:"..."}]`
-/// array form. Tool-role messages are also canonicalized to the same
-/// `tool_result` block shape the Anthropic adapter sends on the wire, so
-/// "tail marker moved from old tool_result to new tool_result" does not
-/// spuriously look like historical-byte churn in the capture hashes.
-#[cfg(feature = "e2e-hooks")]
-fn normalize_message_for_cache_hash(m: &Value) -> Value {
-    let mut out = m.clone();
-    if let Some(obj) = out.as_object_mut() {
-        let role = obj.get("role").and_then(Value::as_str);
-        match role {
-            Some("tool") => {
-                let tool_use_id = obj
-                    .get("tool_call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let normalized = match obj.get("content").cloned() {
-                    Some(Value::Array(mut blocks))
-                        if blocks.iter().any(|b| {
-                            b.get("type").and_then(Value::as_str) == Some("tool_result")
-                        }) =>
-                    {
-                        for block in blocks.iter_mut() {
-                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                                continue;
-                            }
-                            if let Some(map) = block.as_object_mut()
-                                && !map.contains_key("tool_use_id")
-                                && !tool_use_id.is_empty()
-                            {
-                                map.insert(
-                                    "tool_use_id".into(),
-                                    Value::String(tool_use_id.clone()),
-                                );
-                            }
-                        }
-                        Value::Array(blocks)
-                    }
-                    Some(Value::String(text)) => serde_json::json!([{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": text,
-                    }]),
-                    Some(Value::Null) | None => serde_json::json!([{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": "",
-                    }]),
-                    Some(other) => serde_json::json!([{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": other.to_string(),
-                    }]),
-                };
-                obj.insert("content".into(), normalized);
-            }
-            _ => {
-                if let Some(content) = obj.get("content").cloned()
-                    && let Some(s) = content.as_str()
-                {
-                    obj.insert(
-                        "content".into(),
-                        serde_json::json!([{ "type": "text", "text": s }]),
-                    );
-                }
-            }
-        }
-    }
-    strip_cache_control(&mut out);
-    out
-}
-
-#[cfg(feature = "e2e-hooks")]
-fn strip_cache_control(v: &mut Value) {
-    match v {
-        Value::Object(map) => {
-            map.remove("cache_control");
-            for (_, child) in map.iter_mut() {
-                strip_cache_control(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items.iter_mut() {
-                strip_cache_control(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-#[cfg(feature = "e2e-hooks")]
-fn sha256_hex(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
-}
-
-#[cfg(feature = "e2e-hooks")]
-#[allow(clippy::too_many_arguments)]
-fn build_captured_llm_request(
-    turn_index: usize,
-    provider: String,
-    model: String,
-    cache_cfg: &PromptCacheConfig,
-    system_msgs: &[Value],
-    tools: &[Value],
-    messages: &[Value],
-    provider_messages: &[Value],
-    breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
-) -> CapturedLlmRequest {
-    let _ = breakdown; // retained in case future assertions want it
-    // Identify primary + dynamic system slots.
-    let primary = system_msgs.first().cloned().unwrap_or_else(|| json!({}));
-    let dynamic = system_msgs.get(1).cloned();
-    let system_cache_control_count = count_system_cache_control(&primary);
-    let last_tool_has_cache_control = tools
-        .last()
-        .map(|t| {
-            value_has_cache_control(t)
-                || t.get("cache_control").is_some()
-                || t.get("function")
-                    .map(|f| value_has_cache_control(f))
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    let last_message_has_cache_control = messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))
-        .map(|m| {
-            if value_has_cache_control(m) {
-                return true;
-            }
-            if let Some(arr) = m.get("content").and_then(Value::as_array) {
-                return arr.iter().any(value_has_cache_control);
-            }
-            false
-        })
-        .unwrap_or(false);
-    let prefix = cacheable_prefix_text(&primary, cache_cfg.is_anthropic);
-    let cacheable_prefix_sha256 = sha256_hex(&prefix);
-    let message_cache_control_indices: Vec<usize> = if cache_cfg.is_anthropic {
-        messages
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| {
-                let at_msg = value_has_cache_control(m);
-                let in_content = m
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|arr| arr.iter().any(value_has_cache_control));
-                (at_msg || in_content).then_some(i)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    // Hash each message AFTER normalizing to the shape Anthropic uses for
-    // cache-key derivation (see `normalize_message_for_cache_hash`). This
-    // lets prefix-stability tests prove "same tokens, different marker
-    // placement" is still a cache hit.
-    let message_sha256: Vec<String> = messages
-        .iter()
-        .map(|m| {
-            let normalized = normalize_message_for_cache_hash(m);
-            let canonical =
-                serde_json::to_string(&normalized).unwrap_or_else(|_| "<unserializable>".into());
-            sha256_hex(&canonical)
-        })
-        .collect();
-    CapturedLlmRequest {
-        turn_index,
-        provider,
-        model,
-        cache_enabled: cache_cfg.cache_enabled,
-        is_anthropic: cache_cfg.is_anthropic,
-        system_primary: primary,
-        system_dynamic: dynamic,
-        tools: tools.to_vec(),
-        messages: messages.to_vec(),
-        provider_messages: provider_messages.to_vec(),
-        system_cache_control_count,
-        last_tool_has_cache_control,
-        last_message_has_cache_control,
-        cacheable_prefix_sha256,
-        message_cache_control_indices,
-        message_sha256,
-    }
 }
 
 /// Server-side host for the runtime agentic loop.
@@ -4417,8 +4035,6 @@ pub struct ServerAgenticLoopHost {
     /// requests use that lane; ordinary child output stays on the typed live
     /// mirror.
     prefer_client_tool_delivery: bool,
-    /// Explicit run cancellation flag. Observer disconnects never mutate it.
-    client_cancel_flag: Option<Arc<AtomicBool>>,
     /// Low-latency explicit run cancellation token.
     client_cancel_token: Option<Arc<CancellationToken>>,
 
@@ -4457,16 +4073,6 @@ pub struct ServerAgenticLoopHost {
     /// the parent Work Surface agent card instead of the parent chat transcript.
     agent_live_mirror: Option<AgentLiveMirror>,
 
-    // ── Test hooks ──
-    #[cfg(feature = "e2e-hooks")]
-    test_llm_rounds: std::collections::VecDeque<Value>,
-    #[cfg(feature = "e2e-hooks")]
-    test_llm_rounds_wired: bool,
-    /// One typed semantic-admission result for a mock-LLM HTTP E2E turn.
-    /// Production never accepts this value; it exists so the test path can
-    /// exercise both the primary model and the auxiliary topology authority.
-    #[cfg(feature = "e2e-hooks")]
-    test_work_admission: Option<astra_services::WorkAdmissionDecision>,
     /// Test-only explicit semantic-admission clients. Production admission
     /// resolves these clients from the configured judgment Offering; tests
     /// can provide the same boundary without coupling a unit test to a live
@@ -4474,28 +4080,6 @@ pub struct ServerAgenticLoopHost {
     #[cfg(test)]
     test_judgment_clients:
         std::collections::VecDeque<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
-    /// Optional provider hint for the mock path, so cache_control annotations
-    /// are exercised as if talking to anthropic/openai/etc. Default (None)
-    /// leaves `PromptCacheConfig::default()` behavior (annotations off).
-    #[cfg(feature = "e2e-hooks")]
-    mock_provider: Option<(String, String)>,
-    #[cfg(feature = "e2e-hooks")]
-    mock_cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    /// Per-turn captured payloads for assertion in tests.
-    #[cfg(feature = "e2e-hooks")]
-    llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
-    /// Per-turn set of already-emitted tool_call id-keys (dedup across multiple
-    /// `execute_mock_turn` invocations within the same chat turn). Cleared at
-    /// the start of each user-turn in `run_one_mock_turn_for_test` and in
-    /// `execute_turn`'s test-hook path.
-    #[cfg(feature = "e2e-hooks")]
-    /// Shared across host instances within the same chat turn so that
-    /// skill subruns (which construct a second `ServerAgenticLoopHost` via
-    /// `run_lifecycle.rs:3465`) reuse the parent host's dedup state instead
-    /// of starting with an empty HashSet. Without this sharing, the same
-    /// `tool_call` id would be emitted once per host instance. See
-    /// `web_agent_e2e::skill_invocation_costs_exactly_two_llm_rounds_today`.
-    emitted_tool_call_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 
     // ── Fork-prefix parent capture (G2) ──
     /// Optional fork-prefix store. When wired, `on_turn_completed`
@@ -4572,238 +4156,6 @@ fn validate_handoff_heavy(
         unreachable!("constructed a heavy checkpoint above");
     };
     Ok(*heavy)
-}
-
-/// Validate internal custody facts only, not the current WAL or authority.
-/// Full historical verification belongs to `replay_execution_handoff`.
-#[cfg(test)]
-pub(crate) fn decode_execution_handoff(
-    checkpoint_json: &str,
-    run: &astra_services::runs::DurableRunRecord,
-) -> Result<(u64, RuntimeExecutionHandoff), astra_core::ClassifiedError> {
-    let invalid = |message: String| {
-        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
-    };
-    let wire: Value =
-        serde_json::from_str(checkpoint_json).map_err(|error| invalid(error.to_string()))?;
-    let original_wire = wire["heavy"]["original_facts"].clone();
-    let astra_services::runs::DurableExecutionHandoff::V1 {
-        producer_run_id,
-        producer_owner_generation,
-        heavy: mut payload,
-    } = serde_json::from_value::<
-        astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
-    >(wire)
-    .map_err(|error| invalid(error.to_string()))?;
-    // Internal checkpoints use producer-canonical JSON. Public configuration
-    // defaults remain unchanged, but must not silently fill lost checkpoint
-    // fields. Intent fields canonically omitted when empty remain valid.
-    if serde_json::to_value(&payload.original_facts).map_err(|error| invalid(error.to_string()))?
-        != original_wire
-    {
-        return Err(invalid("non-canonical original execution facts".into()));
-    }
-    if producer_run_id != run.run_id
-        || payload.reservation.key.owner_user_id != run.user_id
-        || payload.reservation.key.session_id != run.session_id
-        || payload.original_facts.session_turn != payload.reservation.reserved_turn
-    {
-        return Err(invalid(
-            "execution handoff ownership or reservation mismatch".into(),
-        ));
-    }
-    if payload.original_facts.turn_guard.task_profile() != &payload.original_facts.task_profile {
-        return Err(invalid("execution handoff task profile mismatch".into()));
-    }
-    if let ToolLedgerContinuation::Bound { snapshot } = &payload.tool_ledger {
-        snapshot
-            .restore(&producer_run_id, producer_owner_generation)
-            .map_err(|error| invalid(error.to_string()))?;
-    }
-    payload.heavy = validate_handoff_heavy(payload.heavy)?;
-    payload.primary_work.validate().map_err(&invalid)?;
-    if let astra_turn_types::VerificationHandoff::Bound { snapshot } = &payload.verification {
-        snapshot.validate().map_err(&invalid)?;
-        if payload.original_facts.canonical_turn_chain_id.as_deref()
-            != Some(snapshot.canonical_turn_chain_id.as_str())
-        {
-            return Err(invalid("execution handoff turn chain mismatch".into()));
-        }
-        let Some(astra_pipeline::step_protocol::RunExecutionControl::V3 {
-            hook_obligations, ..
-        }) = &payload.heavy.run_execution_control
-        else {
-            return Err(invalid("verification handoff has no hook contract".into()));
-        };
-        if !snapshot.contract.iter().eq(hook_obligations
-            .stop_hooks
-            .iter()
-            .filter(|hook| hook.authoritative))
-            || snapshot.evidence().any(|evidence| {
-                let identity = &evidence.invocation.identity;
-                identity.user_id != run.user_id
-                    || identity.session_id != run.session_id
-                    || identity.run_id != run.run_id
-            })
-        {
-            return Err(invalid(
-                "verification handoff contract or invocation owner mismatch".into(),
-            ));
-        }
-    }
-    let Some(astra_pipeline::step_protocol::RunExecutionBudget::V1 {
-        run_id,
-        producer_owner_generation: budget_generation,
-        effective_hard_turn_limit,
-        ..
-    }) = &payload.heavy.run_execution_budget
-    else {
-        return Err(invalid("execution handoff has no run budget".into()));
-    };
-    if run_id != &producer_run_id
-        || *budget_generation != producer_owner_generation
-        || effective_hard_turn_limit.map(|limit| limit.get())
-            != payload
-                .original_facts
-                .agentic_turn_budget
-                .hard_turn_limit
-                .map(|limit| limit.get() as u64)
-        || payload.heavy.run_execution_control.is_none()
-        || !payload.heavy.light.cursor.all_slots_done()
-    {
-        return Err(invalid(
-            "execution handoff budget, control or tool frontier is invalid".into(),
-        ));
-    }
-    payload
-        .continuation
-        .validate()
-        .map_err(|error| invalid(error.to_string()))?;
-    let durable = crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-        &payload.continuation.durable_base,
-        &payload.heavy.messages,
-    );
-    if astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(&durable)
-        .map_err(|error| invalid(error.to_string()))?
-        != payload.continuation.result
-    {
-        return Err(invalid(
-            "execution handoff snapshot and WAL result differ".into(),
-        ));
-    }
-    Ok((producer_owner_generation, payload))
-}
-
-/// Bind replay to the checkpoint returned by the atomic adoption transaction.
-/// Dynamic cancellation and lease fencing still apply before executor effects.
-#[cfg(test)]
-pub(crate) fn replay_adopted_execution_handoff(
-    adopted: &astra_services::session_context_coordinator::AdoptedExecutionHandoff,
-    run: &astra_services::runs::DurableRunRecord,
-    committed_history: &[Value],
-    receipts: Vec<astra_services::InferenceCanonicalTransitionReceipt>,
-) -> Result<RuntimeExecutionHandoff, astra_core::ClassifiedError> {
-    let authority = adopted.receipt();
-    let checkpoint = adopted.checkpoint();
-    if run.run_id != authority.run_id
-        || run.run_generation != authority.run_generation
-        || run.status != astra_core::STATUS_RUNNING
-        || run.waiting_for.is_some()
-        || checkpoint.checkpoint_id != authority.checkpoint_id
-        || checkpoint.run_id != run.run_id
-        || checkpoint.user_id != run.user_id
-        || checkpoint.session_id != run.session_id
-        || authority.source.key.owner_user_id != run.user_id
-        || authority.source.key.session_id != run.session_id
-        || authority.writer_lease.key != authority.source.key
-        || authority.turn_reservation.key != authority.source.key
-        || authority.turn_reservation.reserved_turn != authority.source.reserved_turn
-        || authority.turn_reservation.expected_cursor != authority.source.expected_cursor
-        || authority.turn_reservation.lease_id != authority.writer_lease.lease_id
-        || authority.turn_reservation.writer_epoch != authority.writer_lease.writer_epoch
-    {
-        return Err(astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            "adopted checkpoint, run and canonical authority differ",
-        ));
-    }
-    replay_execution_handoff(
-        &checkpoint.checkpoint_json,
-        run,
-        authority.producer_generation,
-        &authority.source,
-        committed_history,
-        receipts,
-    )
-}
-
-/// Structural/WAL replay is not execution authority. Production callers bind
-/// it through the committed adoption result above, never a fabricated old run.
-#[cfg(test)]
-fn replay_execution_handoff(
-    checkpoint_json: &str,
-    run: &astra_services::runs::DurableRunRecord,
-    expected_producer_generation: u64,
-    reservation: &astra_turn_types::TurnReservationV1,
-    committed_history: &[Value],
-    receipts: Vec<astra_services::InferenceCanonicalTransitionReceipt>,
-) -> Result<RuntimeExecutionHandoff, astra_core::ClassifiedError> {
-    let invalid = |message: String| {
-        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
-    };
-    let (producer_generation, payload) = decode_execution_handoff(checkpoint_json, run)?;
-    if producer_generation != expected_producer_generation || &payload.reservation != reservation {
-        return Err(invalid(
-            "execution handoff generation or reservation mismatch".into(),
-        ));
-    }
-    let base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(committed_history)
-        .map_err(|error| invalid(error.to_string()))?;
-    if base != payload.continuation.durable_base {
-        return Err(invalid("execution handoff committed base differs".into()));
-    }
-    let mut recovered = committed_history.to_vec();
-    if receipts
-        .iter()
-        .any(|receipt| receipt.turn != reservation.reserved_turn)
-    {
-        return Err(invalid(
-            "execution handoff WAL receipt belongs to another turn".into(),
-        ));
-    }
-    let hydration =
-        hydrate_provider_canonical_transition_receipts(&mut recovered, &base, receipts)?;
-    if payload.continuation.parent_transition_id.as_deref()
-        != hydration
-            .head
-            .as_ref()
-            .map(|head| head.transition_id.as_str())
-        || payload.continuation.parent_result.as_ref()
-            != hydration.head.as_ref().map(|head| &head.result)
-    {
-        return Err(invalid("execution handoff WAL parent differs".into()));
-    }
-    if payload.continuation.recovery_mode
-        != astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
-    {
-        // Existing replacement/checkpoint transitions replay from their
-        // committed base; the actual parent was verified above.
-        recovered = committed_history.to_vec();
-    }
-    payload
-        .continuation
-        .apply_to(&mut recovered)
-        .map_err(|error| invalid(error.to_string()))?;
-    let expected = crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-        &base,
-        &payload.heavy.messages,
-    );
-    if recovered != expected {
-        return Err(invalid(
-            "execution handoff replay differs from snapshot".into(),
-        ));
-    }
-    Ok(payload)
 }
 
 struct PromptMemoryRecall {
@@ -5805,12 +5157,6 @@ pub struct ServerAgenticLoopHostBuilder {
     memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     server_service_tool_catalog_enabled: bool,
     control_plane_tool_catalog_enabled: bool,
-    #[cfg(feature = "e2e-hooks")]
-    test_llm_rounds: Vec<Value>,
-    #[cfg(feature = "e2e-hooks")]
-    test_llm_rounds_wired: bool,
-    #[cfg(feature = "e2e-hooks")]
-    test_work_admission: Option<astra_services::WorkAdmissionDecision>,
     /// Test-only explicit semantic-admission clients. Production admission
     /// resolves these clients from the configured judgment Offering; tests
     /// can provide the same boundary without coupling a unit test to a live
@@ -5818,12 +5164,6 @@ pub struct ServerAgenticLoopHostBuilder {
     #[cfg(test)]
     test_judgment_clients:
         std::collections::VecDeque<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
-    #[cfg(feature = "e2e-hooks")]
-    mock_provider: Option<(String, String)>,
-    #[cfg(feature = "e2e-hooks")]
-    mock_cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    #[cfg(feature = "e2e-hooks")]
-    llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     work_planning_bound: bool,
     canonical_work_context_binding:
@@ -5831,12 +5171,6 @@ pub struct ServerAgenticLoopHostBuilder {
     /// Whether this exact durable run owns a canonical WorkItem attempt.
     /// Session-level Work existence is insufficient authority to settle it.
     work_item_attempt_bound: bool,
-    /// Shared tool_call dedup state. When set (via `with_dedup_state`), the
-    /// built host shares the same `emitted_tool_call_ids` Arc as the parent
-    /// host, preventing duplicate `tool_call` events across host instances
-    /// within the same chat turn (e.g. parent + skill subrun).
-    #[cfg(feature = "e2e-hooks")]
-    shared_dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Optional fork-prefix store for parent-turn capture (G2).
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     /// Shared handle to the runtime-disabled tool offers (admin API).
@@ -5917,26 +5251,12 @@ impl ServerAgenticLoopHostBuilder {
             memoria_client: None,
             server_service_tool_catalog_enabled: true,
             control_plane_tool_catalog_enabled: true,
-            #[cfg(feature = "e2e-hooks")]
-            test_llm_rounds: Vec::new(),
-            #[cfg(feature = "e2e-hooks")]
-            test_llm_rounds_wired: false,
-            #[cfg(feature = "e2e-hooks")]
-            test_work_admission: None,
             #[cfg(test)]
             test_judgment_clients: std::collections::VecDeque::new(),
-            #[cfg(feature = "e2e-hooks")]
-            mock_provider: None,
-            #[cfg(feature = "e2e-hooks")]
-            mock_cache_capability: None,
-            #[cfg(feature = "e2e-hooks")]
-            llm_request_capture: None,
             capabilities: crate::capabilities::full_server_capabilities_for_tests(),
             work_planning_bound: false,
             canonical_work_context_binding: None,
             work_item_attempt_bound: false,
-            #[cfg(feature = "e2e-hooks")]
-            shared_dedup_state: None,
             prefix_store: None,
             disabled_tool_offers: None,
             provider_capabilities: None,
@@ -5954,19 +5274,6 @@ impl ServerAgenticLoopHostBuilder {
         store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     ) -> Self {
         self.prefix_store = store;
-        self
-    }
-
-    /// Share a parent host's `emitted_tool_call_ids` HashSet with the host
-    /// being built, so that skill subruns deduplicate `tool_call` events
-    /// against the parent's already-emitted ids. Call this when constructing
-    /// a subrun host from `ServerSkillSubRunExecutor`.
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_dedup_state(
-        mut self,
-        shared: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    ) -> Self {
-        self.shared_dedup_state = Some(shared);
         self
     }
 
@@ -5993,8 +5300,17 @@ impl ServerAgenticLoopHostBuilder {
         persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
     ) -> Self {
         self.inference_ledger_persistence = Some(Arc::new(persistence));
-        self.inference_owner_pod_id = Some("test-inference-owner".to_string());
+        self.inference_owner_pod_id
+            .get_or_insert_with(|| "test-inference-owner".to_string());
         self
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    pub fn with_e2e_inference_ledger(
+        self,
+        fixture: &super::provider_test_support::InferenceLedgerFixture,
+    ) -> Self {
+        self.with_test_inference_ledger(fixture.persistence.clone())
     }
 
     /// Inject a pre-computed system-prompt section that reminds the LLM a
@@ -6070,14 +5386,6 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    /// Supply provider-native identities for dynamic edge aliases. The map is
-    /// an adapter contract, not a model hint; aliases without an entry remain
-    /// hidden at runtime admission.
-    pub fn with_edge_tool_native_ids(mut self, native_ids: HashMap<String, String>) -> Self {
-        self.edge_provider_tool_native_ids = native_ids;
-        self
-    }
-
     pub fn with_server_service_tool_catalog_enabled(mut self, enabled: bool) -> Self {
         self.server_service_tool_catalog_enabled = enabled;
         self
@@ -6094,25 +5402,8 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    pub fn with_execution_bindings(
-        mut self,
-        workspace: WorkspaceBinding,
-        executor: ExecutorBinding,
-    ) -> Self {
-        self.execution_bindings = Some(ExecutionBindingSnapshot::inferred(workspace, executor));
-        self
-    }
-
     pub fn with_execution_binding_snapshot(mut self, snapshot: ExecutionBindingSnapshot) -> Self {
         self.execution_bindings = Some(snapshot);
-        self
-    }
-
-    pub fn with_server_sandbox_workspace(mut self, root: impl AsRef<Path>) -> Self {
-        self.execution_bindings = Some(ExecutionBindingSnapshot::inferred(
-            WorkspaceBinding::server_sandbox(root),
-            ExecutorBinding::server_local(),
-        ));
         self
     }
 
@@ -6172,64 +5463,6 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_static_tool_catalog_admissible(mut self, admissible: bool) -> Self {
         self.static_tool_catalog_admissible = admissible;
-        self
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
-        self.test_llm_rounds_wired = true;
-        self.test_llm_rounds = rounds;
-        self
-    }
-
-    /// **Test-only.** Supply the auxiliary semantic-admission decision that
-    /// authorizes the scripted primary mock response for this one user turn.
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_test_work_admission(
-        mut self,
-        decision: astra_services::WorkAdmissionDecision,
-    ) -> Self {
-        self.test_work_admission = Some(decision);
-        self
-    }
-
-    /// **Test-only.** Override the provider/model seen by the mock LLM path so
-    /// that `PromptCacheConfig::latch` produces the same annotations as real
-    /// calls. Use e.g. `("anthropic", "claude-sonnet-4")` to exercise
-    /// `cache_control` blocks end-to-end, or `("openai", "gpt-4o")` for the
-    /// stable-prefix / dynamic-system-message split.
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_mock_provider(
-        mut self,
-        provider: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
-        self.mock_provider = Some((provider.into(), model.into()));
-        self
-    }
-
-    /// **Test-only.** Declare the cache/request shape independently from the
-    /// provider and model labels, matching production model metadata.
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_mock_cache_capability(
-        mut self,
-        capability: astra_turn_core::cache_placement::CacheCapability,
-    ) -> Self {
-        self.mock_cache_capability = Some(capability);
-        self
-    }
-
-    /// **Test-only.** Attach an `Arc<Mutex<Vec<CapturedLlmRequest>>>`; every
-    /// invocation of `execute_mock_turn` appends a snapshot of the materials
-    /// that would be sent to a real LLM (system messages with cache_control
-    /// annotations, annotated tool schemas, message cache breakpoint if any,
-    /// cache config and a stable hash of the cacheable prefix).
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_llm_request_capture(
-        mut self,
-        capture: Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>,
-    ) -> Self {
-        self.llm_request_capture = Some(capture);
         self
     }
 
@@ -6695,7 +5928,6 @@ impl ServerAgenticLoopHostBuilder {
             streaming_turn_started: false,
             interaction_sink: None,
             prefer_client_tool_delivery: false,
-            client_cancel_flag: None,
             client_cancel_token: None,
             progress_rx,
             progress_filter,
@@ -6713,24 +5945,8 @@ impl ServerAgenticLoopHostBuilder {
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             plan_authoring_active: Arc::new(std::sync::RwLock::new(self.plan_authoring_active)),
             memoria_client: self.memoria_client,
-            #[cfg(feature = "e2e-hooks")]
-            test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
-            #[cfg(feature = "e2e-hooks")]
-            test_llm_rounds_wired: self.test_llm_rounds_wired,
-            #[cfg(feature = "e2e-hooks")]
-            test_work_admission: self.test_work_admission,
             #[cfg(test)]
             test_judgment_clients: self.test_judgment_clients,
-            #[cfg(feature = "e2e-hooks")]
-            mock_provider: self.mock_provider,
-            #[cfg(feature = "e2e-hooks")]
-            mock_cache_capability: self.mock_cache_capability,
-            #[cfg(feature = "e2e-hooks")]
-            llm_request_capture: self.llm_request_capture,
-            #[cfg(feature = "e2e-hooks")]
-            emitted_tool_call_ids: self.shared_dedup_state.unwrap_or_else(|| {
-                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
-            }),
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
             disabled_tool_offers: self
@@ -6951,6 +6167,14 @@ fn append_server_owned_tool_schemas_unique(
     runtime_declared_tool_names: &HashSet<String>,
 ) {
     let registry = astra_runtime_env::ToolRegistry::builtins();
+    let snapshot = crate::server::tool_binding_projection::ToolBindingAdmissionSnapshot::new(
+        &candidates,
+        workspace,
+        executor,
+        runtime,
+        &registry,
+        admission_context,
+    );
     let mut seen: HashSet<String> = surface
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
@@ -6971,16 +6195,7 @@ fn append_server_owned_tool_schemas_unique(
             }
             _ => {}
         }
-        let admission =
-            crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
-            name,
-            &candidates,
-            workspace,
-            executor,
-            runtime,
-            &registry,
-            admission_context.clone(),
-        );
+        let admission = snapshot.decision(name);
         if !admission.visible {
             tracing::debug!(
                 tool_name = %name,
@@ -7765,7 +6980,7 @@ impl ServerAgenticLoopHost {
             astra_services::delegation_model_requirement::delegation_scope_binding_messages(
                 user_text, scoped, slots,
             )?;
-        let operation_id = delegation_judgment_operation_id(
+        let operation_id = scoped_inference_operation_id(
             "scope",
             &format!("{}|{identity}", source.user_intent_digest),
         );
@@ -8335,16 +7550,12 @@ impl ServerAgenticLoopHost {
     }
 
     fn deferred_activation_descriptor_is_current(
-        &self,
         activation: &astra_turn_types::DeferredToolActivation,
+        decision: &crate::server::tool_admission::ToolAdmissionDecision,
     ) -> bool {
         let Some(descriptor) = activation.descriptor.as_ref() else {
             return false;
         };
-        let decision = self.admission_for_current_binding(
-            &activation.name,
-            &astra_runtime_env::ToolRegistry::builtins(),
-        );
         decision.visible
             && decision.selected_offer.as_ref().is_some_and(|offer| {
                 descriptor.identity.provider_binding.as_str() == offer.provider_id
@@ -8403,14 +7614,21 @@ impl ServerAgenticLoopHost {
             digest
         };
         let registry = astra_runtime_env::ToolRegistry::builtins();
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
         crate::turn::agentic::tool_interception::resolve_carrier_tool_admission_with_identity(
             admission,
             &activations,
             schema_digest,
-            |activation| self.deferred_activation_descriptor_is_current(activation),
+            |activation| {
+                Self::deferred_activation_descriptor_is_current(
+                    activation,
+                    &snapshot.decision(&activation.name),
+                )
+            },
             |name, arguments| {
                 self.valid_tools.contains(name)
-                    && self.admission_for_current_binding(name, &registry).visible
+                    && snapshot.decision(name).visible
                     && state
                         .runtime_tool_executor
                         .as_deref()
@@ -14433,510 +13651,8 @@ impl ServerAgenticLoopHost {
     }
 
     /// Set the handles used by explicit run cancellation and runtime boundaries.
-    pub fn set_client_cancel(&mut self, flag: Arc<AtomicBool>, token: Arc<CancellationToken>) {
-        self.client_cancel_flag = Some(flag);
+    pub fn set_client_cancel(&mut self, token: Arc<CancellationToken>) {
         self.client_cancel_token = Some(token);
-    }
-
-    /// **Test-only.** Drive a single mock-LLM turn end-to-end without the
-    /// surrounding `run_agentic_loop_with_host` orchestration. Pops the next
-    /// scripted round from `test_llm_rounds`, runs the full system-prompt +
-    /// tool-schema + cache annotation pipeline, and appends a
-    /// [`CapturedLlmRequest`] if a capture hook was attached via
-    /// [`ServerAgenticLoopHostBuilder::with_llm_request_capture`].
-    ///
-    /// Returns the resulting [`HostTurnResult`]. Increments
-    /// `state.llm_rounds_completed` to mirror the real dispatch path so the
-    /// next turn observes the correct round index.
-    #[cfg(feature = "e2e-hooks")]
-    pub async fn run_one_mock_turn_for_test(
-        &mut self,
-        state: &mut AgenticLoopState,
-    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-        // Clear dedup state ONLY at the true user-turn boundary.
-        // NOTE: Do NOT clear emitted_tool_call_ids here. The HashSet's
-        // lifetime equals the ServerAgenticLoopHost instance lifetime, which
-        // equals one user-turn (build_host is called per HTTP request in
-        // chat_handler_inner). Skill subruns re-enter execute_turn with a
-        // fresh AgenticLoopState but the SAME host instance, so the HashSet
-        // persists across rounds within a user-turn — exactly what we need
-        // to dedupe tool_call events emitted by both Round 1 and Round 2
-        // of the agentic loop for the same skill invocation.
-        //
-        // Previous versions cleared here (and/or in execute_turn's test-hook
-        // path) which wiped ids inserted by earlier rounds and caused
-        // duplicate events. See skill_invocation_costs_exactly_two_llm_rounds_today.
-        //
-        // Legacy comment (kept for history):
-        // `run_one_mock_turn_for_test` can be called in addition to
-        // `execute_turn` within the same user-turn (both drive mock emits
-        // through `execute_mock_turn`). Clearing unconditionally here
-        // would wipe ids inserted by a prior `execute_turn` pass in the
-        // same turn, allowing duplicate tool_call events to escape.
-        // `state.llm_rounds_completed == 0` is the unambiguous signal
-        // that this is the first mock drive for a fresh user-turn.
-        // Contract locked by:
-        //   `skill_invocation_costs_exactly_two_llm_rounds_today`
-        // Dedup state is intentionally NOT cleared here — the host instance
-        // itself is the user-turn boundary (one build_host() per HTTP request).
-        // See the NOTE block above for full rationale.
-        let round = self.test_llm_rounds.pop_front().unwrap_or_else(
-            || json!({ "full_text": "[mock rounds exhausted]", "tool_calls": [], "usage": {} }),
-        );
-        let started = Instant::now();
-        let result = self.execute_mock_turn(state, &round, started).await;
-        match result {
-            Ok(result) => {
-                // `run_one_mock_turn_for_test` bypasses the production
-                // execution-phase owner, so it must close the same volatile
-                // attempt transaction at this boundary.  Keeping the lease
-                // semantics identical prevents tests from silently weakening
-                // failed-attempt replay or successful-attempt consumption.
-                if result.accum.error_message.is_some() {
-                    state.restore_volatile_attempt_lease();
-                } else {
-                    state.commit_volatile_attempt_lease();
-                }
-                state.llm_rounds_completed = state.llm_rounds_completed.saturating_add(1);
-                Ok(result)
-            }
-            Err(error) => {
-                state.restore_volatile_attempt_lease();
-                Err(error)
-            }
-        }
-    }
-
-    /// Execute a mock LLM turn from `test_llm_rounds` (e2e-hooks only).
-    ///
-    /// Parses the round JSON (same shape as bridge e2e hooks), emits SSE events,
-    /// and returns a `HostTurnResult` as if a real LLM responded.
-    /// Execute a mock LLM turn from `test_llm_rounds` (e2e-hooks only).
-    ///
-    /// Parses the round JSON (same shape as bridge e2e hooks), builds the same
-    /// cache-annotated system messages, tool schemas and message list that a
-    /// real LLM call would receive, emits SSE events, optionally records a
-    /// [`CapturedLlmRequest`] for test assertion, and returns a [`HostTurnResult`]
-    /// as if a real LLM responded. Test rounds may also inject failures with
-    /// `{ "error": { "message": "...", "kind": "...", "details": { ... } } }`
-    /// so HTTP E2E can validate error-path artifact publication without a flaky
-    /// real-provider dependency.
-    #[cfg(feature = "e2e-hooks")]
-    async fn execute_mock_turn(
-        &mut self,
-        state: &mut AgenticLoopState,
-        round: &Value,
-        turn_started: Instant,
-    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-        if let Some(decision) = self.test_work_admission.take() {
-            self.work_admission_attempted = true;
-            self.apply_work_admission_decision(decision);
-        }
-        // Latch a cache config from the (optional) mock provider so that
-        // annotations exercised here mirror the real pipeline at the server
-        // loop host level — including Anthropic cache_control blocks and the
-        // OpenAI stable-prefix / dynamic split.
-        let cache_cfg = match &self.mock_provider {
-            Some((provider, model)) => {
-                self.resolved_model_name = Some(model.clone());
-                PromptCacheConfig::from_cache_capability(self.mock_cache_capability, provider)
-            }
-            None => PromptCacheConfig::default(),
-        };
-
-        let tool_schemas_snapshot = self.tool_schemas.clone();
-        // Use the same pipeline path as `execute_turn` so mock-replay exercises
-        // exactly what a real turn would send. The previous implementation had
-        let (provider_name, model_name_for_pipeline) = match &self.mock_provider {
-            Some((p, m)) => (p.clone(), m.clone()),
-            None => ("openai".to_string(), "server-loop-mock".to_string()),
-        };
-        let user_content = state.message.clone();
-        let mock_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
-            state,
-            &tool_schemas_snapshot,
-            &provider_name,
-            &model_name_for_pipeline,
-            None,
-            self.mock_cache_capability,
-            None,
-            &[],
-            &user_content,
-        )?;
-        state.last_llm_context_manifest_trace = Some(mock_pipeline.manifest_trace.to_json());
-        let system_msgs = mock_pipeline.system_messages;
-        let volatile_preamble = mock_pipeline.volatile_preamble;
-        let pipeline_messages = mock_pipeline.messages;
-
-        // Replicate the real-path tool + message annotations so captured
-        // payloads reflect what a real provider would see. Start from the
-        // pipeline-pruned tool schemas so mock replay mirrors the real
-        // wire. Route the history through the same `assemble_llm_messages`
-        // stitcher the real path uses so matrix tests see typed volatile-tail
-        // placement rather than a mock-only message shape.
-        let mut annotated_tools = mock_pipeline.tool_schemas;
-        crate::turn::llm::context::annotate_tool_schemas_for_cache(
-            &mut annotated_tools,
-            &cache_cfg,
-            &self.always_load_tool_names,
-        );
-        self.prepare_tool_surface_for_request(&annotated_tools, state);
-        self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&annotated_tools);
-        let (provider, model) = self
-            .mock_provider
-            .clone()
-            .unwrap_or_else(|| ("openai".to_string(), "server-loop-mock".to_string()));
-        let mock_llm_cfg = ResolvedTurnLlmConfig {
-            provider: provider.clone(),
-            model_name: model.clone(),
-            wire_model_name: None,
-            api_key: String::new(),
-            base_url: String::new(),
-            fallback_chain: Vec::new(),
-            cache_capability: self.mock_cache_capability,
-            thinking_capability: None,
-            fixed_temperature: None,
-            thinking_protocol: None,
-            header_overrides: HashMap::new(),
-            request_body_overrides: None,
-            completions_url_override: None,
-            request_timeout: None,
-            context_window: None,
-            max_completion_tokens: None,
-        };
-        let wire_messages = self.assemble_llm_messages(
-            system_msgs.clone(),
-            volatile_preamble.clone(),
-            pipeline_messages,
-            state,
-            &mock_llm_cfg,
-            &cache_cfg,
-        )?;
-        let provider_wire_messages =
-            crate::turn::llm::client::consolidate_system_messages_for_provider(
-                &wire_messages,
-                &provider,
-                mock_llm_cfg.cache_capability,
-            );
-        if let Some(pipeline_session) = state.pipeline_session.as_mut() {
-            pipeline_session.replace_pending_planned_wire_prompt_with_cache_capability(
-                &provider_wire_messages,
-                &annotated_tools,
-                mock_llm_cfg.cache_capability,
-            );
-        }
-        if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
-                trace,
-                &provider_wire_messages,
-                &annotated_tools,
-                &wire_messages,
-                if self.full_llm_capture {
-                    crate::turn::llm::context::WireTraceDetail::Debug
-                } else {
-                    crate::turn::llm::context::WireTraceDetail::MetricsOnly
-                },
-            );
-        }
-        if let Some(buffer) = state.turn_event_buffer.as_mut() {
-            buffer.set_visible_tool_actions(
-                crate::turn::llm::context::visible_tool_action_surface(&annotated_tools),
-            );
-            buffer.set_visible_tool_names(
-                annotated_tools
-                    .iter()
-                    .filter_map(tool_schema_name)
-                    .map(str::to_string)
-                    .collect(),
-            );
-        }
-        self.emit_context_meta(
-            &mock_pipeline.breakdown,
-            state.last_llm_context_manifest_trace.as_ref(),
-            &[],
-            &annotated_tools,
-        );
-        // `assemble_llm_messages` produces `[system(s), …, compacted msgs,
-        // post-compact attachments]`. For the capture's downstream
-        // assertions we want just the message portion (post the canonical
-        // system messages). Extract.
-        let sys_count = system_msgs.len();
-        let annotated_messages: Vec<Value> =
-            wire_messages.iter().skip(sys_count).cloned().collect();
-        let mut capture_messages = system_msgs.clone();
-        capture_messages.extend(annotated_messages.clone());
-
-        // Record the captured request before tool delivery (so assertions see
-        // a deterministic view even if tool ledger introduces delays).
-        if let Some(cap) = &self.llm_request_capture {
-            let turn_index = state.llm_rounds_completed as usize;
-            let captured = build_captured_llm_request(
-                turn_index,
-                provider.clone(),
-                model.clone(),
-                &cache_cfg,
-                &system_msgs,
-                &annotated_tools,
-                &annotated_messages,
-                &provider_wire_messages,
-                &mock_pipeline.breakdown,
-            );
-            if let Ok(mut guard) = cap.lock() {
-                guard.push(captured);
-            }
-        }
-
-        if let Some(error) = mock_round_error(round) {
-            if let Some(partial_text) = mock_round_partial_text(&error) {
-                self.emit_progress_event(json!({ "type": "text_delta", "content": partial_text }));
-            }
-            if !self.session_id.is_empty() {
-                let mut artifact_store =
-                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
-                if let Some(pool) = self.shared_pool.clone() {
-                    artifact_store = artifact_store.with_pool(pool);
-                }
-                let outcome = if error.kind == astra_core::ErrorKind::ContextWindow {
-                    "context_window_error"
-                } else {
-                    "error"
-                };
-                crate::turn::llm::exchange_capture::persist_configured_capture_or_log(
-                    "server_loop_host mock error capture",
-                    self.full_llm_capture,
-                    Some(&artifact_store),
-                    &self.session_id,
-                    &self.user_id,
-                    state.session_turn,
-                    state.llm_rounds_completed,
-                    None,
-                    "server_loop_host",
-                    &model,
-                    &provider,
-                    &capture_messages,
-                    &annotated_tools,
-                    None,
-                    outcome,
-                    llm_capture_error_response(&error),
-                    Some(crate::turn::llm::exchange_capture::CaptureTrace {
-                        session_turn_source: Some("state"),
-                        turn_chain_id: None,
-                        user_query_event_id: None,
-                        cache_capability: Some(
-                            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
-                                mock_llm_cfg.cache_capability,
-                                &provider,
-                            ),
-                        ),
-                    }),
-                )
-                .await;
-            }
-            if error.kind == astra_core::ErrorKind::ContextWindow {
-                let accum = ChatTurnSseAccum {
-                    error_message: Some(error.message.clone()),
-                    system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
-                    system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
-                    context_manifest_trace: clone_server_context_trace(
-                        state.last_llm_context_manifest_trace.as_ref(),
-                    ),
-                    ..Default::default()
-                };
-                return Ok(HostTurnResult {
-                    accum,
-                    ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
-                    edge_tool_round: Vec::new(),
-                    error_kind: Some(astra_core::ErrorKind::ContextWindow),
-                });
-            }
-            return Err(error);
-        }
-
-        let (full_text, reasoning, provider_tool_calls, usage, delay_ms) =
-            astra_turn_core::e2e_hooks::parse_llm_round(round);
-        if delay_ms > 0 {
-            sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
-        }
-
-        // A provider response is evidence about what the model said, not
-        // authority to strand a ready durable task.  Keep that raw evidence
-        // separate for capture, then add the scheduler-owned call to the
-        // canonical execution batch when needed.
-        let mut tool_calls = provider_tool_calls.clone();
-        let scheduler_dispatched = self
-            .canonical_work_scheduler_call(state, &provider_tool_calls)
-            .await;
-        if let Some(call) = scheduler_dispatched.as_ref() {
-            tool_calls.push(call.clone());
-        }
-
-        let admitted_terminal_tool_calls = self.admit_terminal_tool_calls_with_completion(
-            state,
-            &tool_calls,
-            if tool_calls.is_empty() {
-                Some("stop")
-            } else {
-                Some("tool_calls")
-            },
-        );
-        let terminal_control_outcome =
-            crate::turn::terminal_control::evaluate_terminal_control_actions(
-                &mut self.terminal_handoff_window,
-                &self.runtime_control_tools,
-                &full_text,
-                &admitted_terminal_tool_calls,
-            );
-        let terminal_handoff_requested = matches!(
-            terminal_control_outcome,
-            crate::turn::terminal_control::TerminalControlOutcome::Requested(_)
-        );
-        let hold_action_window_projection = self.terminal_handoff_window.is_open();
-        let suppress_source_projection = terminal_handoff_requested
-            || hold_action_window_projection
-            || scheduler_dispatched.is_some()
-            || self
-                .direct_child_completion_owner(state)
-                .is_some_and(|owner| owner.has_pending_direct_children());
-        let suppress_tool_execution = !matches!(
-            terminal_control_outcome,
-            crate::turn::terminal_control::TerminalControlOutcome::Passthrough
-        );
-        self.admitted_tool_side_effects_enabled = !suppress_tool_execution;
-        self.record_terminal_control_outcome(&terminal_control_outcome);
-
-        if !suppress_source_projection && !reasoning.is_empty() {
-            self.emit_progress_event(json!({
-                "type": "reasoning_delta",
-                "content": reasoning,
-            }));
-            self.emit_progress_event(json!({ "type": "reasoning_done" }));
-        }
-        if !suppress_source_projection && !full_text.is_empty() {
-            self.emit_progress_event(json!({ "type": "text_delta", "content": &full_text }));
-        }
-        // Mock fixtures use upstream OpenAI-native keys (`prompt_tokens` /
-        // `completion_tokens` / `prompt_tokens_details.cached_tokens`), plus
-        // direct Anthropic-style aliases. Normalize through the shared
-        // [`TokenUsage`] extractor so the emitted SSE uses canonical keys
-        // regardless of fixture provenance.
-        let measured = crate::turn::token_usage::parse_usage(
-            crate::turn::token_usage::UsageDialect::OpenAi,
-            &usage,
-        );
-        let qualified_usage = measured.and_then(|(tokens, presence)| {
-            astra_turn_types::CanonicalTokenUsage::from_json(&Value::Object(
-                tokens.to_qualified_json_map(presence),
-            ))
-            .ok()
-        });
-        let current_request_usage = qualified_usage.and_then(|tokens| {
-            astra_turn_types::RequestTokenUsage::try_new(
-                tokens.input_tokens()?,
-                tokens.cached_input_tokens()?,
-                tokens.cache_creation_tokens()?,
-                tokens.output_tokens()?,
-            )
-            .ok()
-        });
-        let current_request_input_tokens =
-            measured.and_then(|(_, presence)| presence.measured_input_tokens);
-        let u =
-            measured
-                .map(|(tokens, _)| tokens)
-                .unwrap_or(crate::turn::token_usage::TokenUsage {
-                    input_tokens: 10,
-                    cached_input_tokens: 0,
-                    cache_creation_tokens: 0,
-                    output_tokens: 5,
-                });
-        self.emit_progress_event(json!({
-            "type": "usage",
-            "input_tokens": u.input_tokens,
-            "cached_input_tokens": u.cached_input_tokens,
-            "cache_creation_tokens": u.cache_creation_tokens,
-            "output_tokens": u.output_tokens,
-            "total_tokens": u.total_tokens(),
-        }));
-
-        let accum = ChatTurnSseAccum {
-            full_text: full_text.clone(),
-            reasoning_content: reasoning,
-            tool_calls: tool_calls.clone(),
-            has_tool_calls: !tool_calls.is_empty(),
-            prompt_tokens: u.input_tokens,
-            completion_tokens: u.output_tokens,
-            cache_read_tokens: u.cached_input_tokens,
-            cache_creation_tokens: u.cache_creation_tokens,
-            has_usage: true,
-            qualified_usage,
-            current_request_usage,
-            current_request_input_tokens,
-            system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
-            system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
-            context_manifest_trace: clone_server_context_trace(
-                state.last_llm_context_manifest_trace.as_ref(),
-            ),
-            ..Default::default()
-        };
-
-        if !self.session_id.is_empty() {
-            let mut artifact_store =
-                astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
-            if let Some(pool) = self.shared_pool.clone() {
-                artifact_store = artifact_store.with_pool(pool);
-            }
-            crate::turn::llm::exchange_capture::persist_configured_capture_or_log(
-                "server_loop_host mock success capture",
-                self.full_llm_capture,
-                Some(&artifact_store),
-                &self.session_id,
-                &self.user_id,
-                state.session_turn,
-                state.llm_rounds_completed,
-                None,
-                "server_loop_host",
-                &model,
-                &provider,
-                &capture_messages,
-                &annotated_tools,
-                None,
-                "success",
-                json!({
-                    "finish_reason": if provider_tool_calls.is_empty() { "stop" } else { "tool_calls" },
-                    "full_text": full_text.clone(),
-                    "reasoning": accum.reasoning_content.clone(),
-                    "tool_calls": provider_tool_calls,
-                    "usage": {
-                        "input_tokens": u.input_tokens,
-                        "cached_input_tokens": u.cached_input_tokens,
-                        "cache_creation_tokens": u.cache_creation_tokens,
-                        "output_tokens": u.output_tokens,
-                        "total_tokens": u.total_tokens(),
-                    },
-                }),
-                Some(crate::turn::llm::exchange_capture::CaptureTrace {
-                    session_turn_source: Some("state"),
-                    turn_chain_id: None,
-                    user_query_event_id: None,
-                    cache_capability: Some(
-                        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
-                            mock_llm_cfg.cache_capability,
-                            &provider,
-                        ),
-                    ),
-                }),
-            )
-            .await;
-        }
-
-        state.final_text_streamed = !suppress_source_projection && !full_text.is_empty();
-
-        Ok(HostTurnResult {
-            accum,
-            ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
-            edge_tool_round: Vec::new(),
-            error_kind: None,
-        })
     }
 
     fn edge_executor_offline_blocks_tool(&self, tool_name: &str) -> bool {
@@ -15083,12 +13799,6 @@ impl ServerAgenticLoopHost {
                 continue;
             }
             self.start_explain_analyze_tool_admission(tool_call, round_index);
-            #[cfg(feature = "e2e-hooks")]
-            {
-                let mut shared =
-                    astra_core::sync_poison::recover_mutex_lock(&self.emitted_tool_call_ids);
-                shared.insert(key);
-            }
             self.emit_progress_event(json!({
                 "type": "tool_call",
                 "tool_call": tool_call,
@@ -15450,11 +14160,6 @@ impl ServerAgenticLoopHost {
             .collect()
     }
 
-    #[allow(dead_code)]
-    fn edge_ledger_tool_calls_for_delivery(&self, tool_calls: &[Value]) -> Vec<Value> {
-        self.edge_ledger_tool_calls_for_delivery_with_activations(tool_calls, &HashMap::new())
-    }
-
     fn deferred_activation_matches_edge_offer(
         activation: &astra_turn_types::DeferredToolActivation,
         tool_name: &str,
@@ -15474,6 +14179,8 @@ impl ServerAgenticLoopHost {
         resolved_deferred_activations: &HashMap<String, astra_turn_types::DeferredToolActivation>,
     ) -> Vec<Value> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
         tool_calls
             .iter()
             .filter_map(|tool_call| {
@@ -15490,7 +14197,7 @@ impl ServerAgenticLoopHost {
                     .unwrap_or_default();
                 let (_, tool_name, _) =
                     astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(tool_call);
-                let decision = self.admission_for_current_binding(&tool_name, &registry);
+                let decision = snapshot.decision(&tool_name);
                 let selected_edge = decision.visible
                     && decision.selected_offer.as_ref().is_some_and(|offer| {
                         matches!(offer.route, ToolExecutionRouteKind::EdgeBound)
@@ -16257,6 +14964,21 @@ impl ServerAgenticLoopHost {
         // descriptor, route, and policy immediately before dispatch.
         let mut admitted_edge_offers = HashMap::new();
 
+        // Initial batch admission shares one immutable projection. Approval
+        // below is followed by a fresh policy/offer check before durable dispatch.
+        let initial_decisions = {
+            let schemas = self.current_admission_schemas();
+            let snapshot = self.admission_snapshot(&schemas, &registry);
+            ordered_tool_calls
+                .iter()
+                .map(|call| {
+                    let (_, name, _) = parse_flat_tool_call_event(call);
+                    let decision = snapshot.decision(&name);
+                    (name, decision)
+                })
+                .collect::<HashMap<_, _>>()
+        };
+
         for tc in ordered_tool_calls.iter() {
             let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
             if self.edge_executor_offline_blocks_tool(&tool_name) {
@@ -16289,7 +15011,7 @@ impl ServerAgenticLoopHost {
                 continue;
             }
 
-            let current_decision = self.admission_for_current_binding(&tool_name, &registry);
+            let current_decision = &initial_decisions[&tool_name];
             let edge_bound_current = matches!(
                 current_decision.selected_route(),
                 ToolExecutionRouteKind::EdgeBound
@@ -17388,15 +16110,8 @@ impl ServerAgenticLoopHost {
                 started_call_ids.insert(request_id.to_string());
                 if committed_event.is_some() {
                     for event in progress_events {
-                        // L1094 (execute_mock_turn mock-LLM-response path) is the
-                        // SINGLE owner of `tool_call` events per skill invocation.
-                        // `sse_maps_through_tool_request` re-wraps the same tc as
-                        // a `tool_call` map for the tool-dispatch stream, but that
-                        // would produce a duplicate event (same id) downstream.
-                        // Skip any `tool_call` map here — other map types
-                        // (tool_request, etc.) still flow through normally.
-                        // Contract locked by:
-                        //   `skill_invocation_costs_exactly_two_llm_rounds_today`
+                        // Admission projects the tool-call event once; transport
+                        // progress must not duplicate that committed identity.
                         if event.get("type").and_then(|v| v.as_str()) == Some("tool_call") {
                             continue;
                         }
@@ -17956,12 +16671,35 @@ impl ServerAgenticLoopHost {
         tool_name: &str,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> crate::server::tool_admission::ToolAdmissionDecision {
-        let mut admission_schemas = self.admission_tool_schemas.clone();
-        append_tool_schemas_unique(&mut admission_schemas, self.tool_schemas.clone());
-        append_tool_schemas_unique(&mut admission_schemas, self.deferred_tool_schemas.clone());
-        crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
-            tool_name,
-            &admission_schemas,
+        let schemas = self.current_admission_schemas();
+        self.admission_snapshot(&schemas, registry)
+            .decision(tool_name)
+    }
+
+    fn current_admission_schemas(&self) -> Vec<Value> {
+        for schemas in [
+            &self.admission_tool_schemas,
+            &self.tool_schemas,
+            &self.deferred_tool_schemas,
+        ] {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::ServerToolAdmissionSnapshotClone,
+                schemas,
+            );
+        }
+        let mut schemas = self.admission_tool_schemas.clone();
+        append_tool_schemas_unique(&mut schemas, self.tool_schemas.clone());
+        append_tool_schemas_unique(&mut schemas, self.deferred_tool_schemas.clone());
+        schemas
+    }
+
+    fn admission_snapshot<'a>(
+        &'a self,
+        schemas: &'a [Value],
+        registry: &'a astra_runtime_env::ToolRegistry,
+    ) -> crate::server::tool_binding_projection::ToolBindingAdmissionSnapshot<'a> {
+        crate::server::tool_binding_projection::ToolBindingAdmissionSnapshot::new(
+            schemas,
             &self.workspace_binding,
             &self.executor_binding,
             self.runtime_binding.as_ref(),
@@ -18016,34 +16754,25 @@ impl ServerAgenticLoopHost {
         &self,
     ) -> Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::ServerToolAdmissionSnapshotClone,
-            &self.admission_tool_schemas,
-        );
-        let mut snapshot_schemas = self.admission_tool_schemas.clone();
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::ServerToolAdmissionSnapshotClone,
-            &self.tool_schemas,
-        );
-        append_tool_schemas_unique(&mut snapshot_schemas, self.tool_schemas.clone());
-        append_tool_schemas_unique(
-            &mut snapshot_schemas,
-            clone_server_fork_tool_schemas(&self.last_turn_tool_schemas),
-        );
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
         let provider_visible_names = self
             .last_turn_tool_schemas
             .iter()
             .filter_map(tool_schema_name)
             .collect::<HashSet<_>>();
-        let tool_names = snapshot_schemas
+        let tool_names = self
+            .admission_tool_schemas
             .iter()
+            .chain(self.tool_schemas.iter())
+            .chain(self.last_turn_tool_schemas.iter())
             .filter_map(tool_schema_name)
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
         tool_names
             .into_iter()
             .map(|name| {
-                let decision = self.admission_for_current_binding(&name, &registry);
+                let decision = snapshot.decision(&name);
                 astra_turn_core::introspect::ToolAdmissionSnapshotEntry {
                     tool_name: decision.tool_name.clone(),
                     provider_visible: (!self.last_turn_tool_schemas.is_empty())
@@ -18080,13 +16809,15 @@ impl ServerAgenticLoopHost {
     fn runtime_ready_turn_tools(&self, tools: Vec<Value>, state: &AgenticLoopState) -> Vec<Value> {
         let executor = state.runtime_tool_executor.as_deref();
         let registry = astra_runtime_env::ToolRegistry::builtins();
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
         tools
             .into_iter()
             .filter(|tool| {
                 let Some(name) = tool_schema_name(tool) else {
                     return false;
                 };
-                let admission = self.admission_for_current_binding(name, &registry);
+                let admission = snapshot.decision(name);
                 if !admission.visible {
                     return false;
                 }
@@ -18247,10 +16978,10 @@ impl ServerAgenticLoopHost {
 
     fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        self.tool_schemas
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
+        admission_schemas
             .iter()
-            .chain(self.deferred_tool_schemas.iter())
-            .chain(self.admission_tool_schemas.iter())
             .filter_map(|tool| {
                 tool.get("function")
                     .and_then(|f| f.get("name"))
@@ -18258,7 +16989,7 @@ impl ServerAgenticLoopHost {
                     .map(String::from)
             })
             .filter(|name| {
-                let admission = self.admission_for_current_binding(name, &registry);
+                let admission = snapshot.decision(name);
                 !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
                     || !admission.visible
             })
@@ -18355,6 +17086,8 @@ impl ServerAgenticLoopHost {
                 .collect();
             append_tool_schemas_unique(&mut selected_offer_schemas, activated_deferred_schemas);
             let registry = astra_runtime_env::ToolRegistry::builtins();
+            let admission_schemas = self.current_admission_schemas();
+            let snapshot = self.admission_snapshot(&admission_schemas, &registry);
             let selected_offers = selected_offer_schemas
                 .iter()
                 .filter_map(tool_schema_name)
@@ -18363,9 +17096,7 @@ impl ServerAgenticLoopHost {
                         || *name == "settle_work_item"
                 })
                 .filter_map(|name| {
-                    let offer = self
-                        .admission_for_current_binding(name, &registry)
-                        .selected_offer?;
+                    let offer = snapshot.decision(name).selected_offer?;
                     Some((
                         name.to_string(),
                         SelectedToolOfferSnapshot::new_with_route_digest_and_native(
@@ -18406,6 +17137,8 @@ impl ServerAgenticLoopHost {
             return;
         }
         let registry = astra_runtime_env::ToolRegistry::builtins();
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
         for activation in &mut state.deferred_tool_activations {
             let Some(selected) = activation.descriptor.as_mut() else {
                 continue;
@@ -18420,7 +17153,7 @@ impl ServerAgenticLoopHost {
             if digest.as_deref() != Some(activation.schema_digest.as_str()) {
                 continue;
             }
-            let decision = self.admission_for_current_binding(&activation.name, &registry);
+            let decision = snapshot.decision(&activation.name);
             let Some(current) = decision
                 .selected_offer
                 .as_ref()
@@ -18575,8 +17308,9 @@ impl ServerAgenticLoopHost {
             deferred_tool_names = executor.runtime_bound_tool_names(deferred_tool_names);
         }
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        deferred_tool_names
-            .retain(|name| self.admission_for_current_binding(name, &registry).visible);
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
+        deferred_tool_names.retain(|name| snapshot.decision(name).visible);
 
         crate::prompts::build_deferred_tool_names_prompt_block_with_budget(
             deferred_tool_names.iter().map(String::as_str),
@@ -18648,44 +17382,13 @@ impl ServerAgenticLoopHost {
         resolved_text
     }
 
-    /// Set the extras list (runtime-injected names + plugin names) so
-    /// the validator admits them after deferred activation. Should be
-    /// called once at session start, before the first tool round.
-    pub fn set_admissible_extras(&mut self, extras: Vec<String>) {
-        self.admissible_extras = extras;
-    }
-
-    /// Compute the effective restricted-tool set for a turn by running the
-    /// full restriction pipeline:
-    ///
-    /// 1. widen check
-    /// 2. runtime allowlist restrictions
-    /// 3. interaction choices are enforced at call admission, preserving schema bytes
-    /// 4. boost rescue
-    /// 5. activated-deferred-tool rescue
-    ///
-    /// `consume_widen` controls whether the `widen_selection_pending` flag is
-    /// consumed (authoritative path: main turn / test helper) or merely
-    /// peeked (preview path: pre-turn summary, which must not steal the flag
-    /// from the main turn that follows it). This is the only legitimate
-    /// caller-policy divergence; every other step is identical across sites.
-    ///
-    /// Single source of truth shared by `visible_turn_tools`, `execute_turn`,
-    /// and the summary path so the recipe cannot drift between call sites.
+    /// Apply hard capability restrictions and deferred-tool activation at this
+    /// admission boundary. Interaction choices are enforced at call admission.
     fn compute_effective_restricted(
         &self,
         state: &mut AgenticLoopState,
-        consume_widen: bool,
         retain_text_only_wire_surface: bool,
     ) -> HashSet<String> {
-        // 1. Consume or peek the widen flag. Soft health diagnostics are not
-        // promoted into the hard restricted-tool set.
-        if consume_widen {
-            let _ = std::mem::take(&mut state.widen_selection_pending);
-        }
-        // 2-3. Layer hard capability restrictions from the merged base.
-        // Interaction-mode changes are enforced on resolved tool calls, so
-        // the provider's schema declaration stays stable across rounds.
         let mut effective = state.restricted_tools.clone();
         effective.extend(self.runtime_allowlist_restrictions(state));
         if state.hooks.completion_settlement.text_only && !retain_text_only_wire_surface {
@@ -18717,25 +17420,13 @@ impl ServerAgenticLoopHost {
     /// hard runtime restrictions.
     #[cfg(test)]
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
-        let effective_restricted = self.compute_effective_restricted(state, true, false);
+        let effective_restricted = self.compute_effective_restricted(state, false);
         let visible = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
         self.prepare_tool_surface_for_request(&visible, state);
         visible
     }
 
-    /// Build the turn's system messages via the context pipeline.
-    ///
-    /// Single source of truth for both the real `execute_turn` path and the
-    /// `e2e-hooks`-gated `execute_mock_turn` path. Previously the mock
-    /// that duplicated section assembly AND drifted from production behaviour —
-    /// deleted in the same change that introduced this helper.
-    ///
-    /// Returns `(structured_system_messages, plain_text_for_estimates, breakdown)`.
-    /// Run the full context pipeline for this turn and return everything the
-    /// wire payload needs: rendered system message(s), the plain-text form for
-    /// tracing, the breakdown, the selected compaction tier, and the tier-pruned
-    /// tool schemas. Callers that only want the system text can discard the
-    /// extra fields.
+    /// Recall owner-scoped memory for this turn's context pipeline.
     async fn prompt_memory_entries_for_turn(
         &mut self,
         session_turn: u32,
@@ -18860,42 +17551,16 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
-        self.run_turn_pipeline_with_cache_capability_and_session_memory(
-            state,
-            visible_tools,
-            provider,
-            model_name,
-            None,
-            None,
-            None,
-            &[],
-            user_content,
-        )
-    }
-
-    #[cfg(any(test, feature = "e2e-hooks"))]
-    fn run_turn_pipeline_with_cache_capability_and_session_memory(
-        &mut self,
-        state: &mut AgenticLoopState,
-        visible_tools: &[Value],
-        provider: &str,
-        model_name: &str,
-        model_context_window: Option<u32>,
-        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
-        memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
-        user_content: &str,
-    ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             visible_tools,
             provider,
             model_name,
-            model_context_window,
             None,
-            cache_capability,
-            session_memory_entry,
-            memory_entries,
+            None,
+            None,
+            None,
+            &[],
             user_content,
         )
     }
@@ -19045,48 +17710,6 @@ impl ServerAgenticLoopHost {
             session_facts: None,
         };
         ctx.compact(messages, system_messages, visible_tools).await
-    }
-
-    /// Thin wrapper around [`wire_assembly::assemble_llm_messages_with_cache_capability`] that
-    /// extracts the server-path-specific attachments from `AgenticLoopState`
-    /// (invoked skills) and delegates the rest. The
-    /// shared module handles `strip_stale_reasoning_with_policy`, continuation-prompt
-    /// insertion, attachment ordering, and cache annotations.
-    #[cfg(any(test, feature = "e2e-hooks"))]
-    fn assemble_llm_messages(
-        &self,
-        system_messages: Vec<Value>,
-        volatile_preamble: Vec<Value>,
-        compacted_messages: Vec<Value>,
-        state: &mut AgenticLoopState,
-        llm_cfg: &ResolvedTurnLlmConfig,
-        cache_cfg: &PromptCacheConfig,
-    ) -> Result<Vec<Value>, astra_core::ClassifiedError> {
-        // Per-turn skill listing (ranked shortlist) now flows through the
-        // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
-        // None scope). See `context_pipeline_adapter` — post-hoc injection
-        // here would double up the content on the wire.
-        let thinking = state.thinking.clone();
-        crate::turn::llm::context::assemble_wire_messages(
-            crate::turn::llm::context::LlmWireAssemblyInput {
-                artifact_recovery_route: self.artifact_recovery_route(
-                    &self.last_turn_tool_schemas,
-                    state,
-                    llm_cfg,
-                ),
-                system_messages,
-                volatile_preamble,
-                compacted_messages,
-                state,
-                compaction_boundary_hit: false,
-                thinking: &thinking,
-                session_id: &self.session_id,
-                provider: &llm_cfg.provider,
-                model_name: &llm_cfg.model_name,
-                cache_capability: llm_cfg.cache_capability,
-                cache_cfg,
-            },
-        )
     }
 
     /// Assemble the final provider wire once, then perform at most one pure
@@ -20210,6 +18833,61 @@ impl ServerAgenticLoopHost {
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn context_history_artifacts_available(&self, state: &AgenticLoopState) -> bool {
+        let Some(executor) = state.runtime_tool_executor.as_deref() else {
+            return false;
+        };
+        if executor.context_history_artifact_store().is_none() {
+            return false;
+        }
+        let admission = self.admission_for_current_binding(
+            "introspect",
+            &astra_runtime_env::ToolRegistry::builtins(),
+        );
+        admission.visible
+            && matches!(
+                admission.selected_route(),
+                ToolExecutionRouteKind::ServerControlPlane
+            )
+            && self.resolved_llm_config.as_ref().is_some_and(|config| {
+                self.artifact_recovery_route(&self.last_turn_tool_schemas, state, config)
+                    != crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable
+            })
+    }
+
+    async fn persist_context_history(
+        &mut self,
+        state: &AgenticLoopState,
+        artifact_id: &str,
+        history: astra_turn_types::ContextHistoryArtifactV1,
+    ) -> Result<(), String> {
+        if history.session_id != self.session_id
+            || state.current_session_id.as_deref() != Some(self.session_id.as_str())
+        {
+            return Err("context history session ownership changed".into());
+        }
+        let store = state
+            .runtime_tool_executor
+            .as_deref()
+            .and_then(|executor| executor.context_history_artifact_store())
+            .ok_or("context history artifact writer is unavailable")?;
+        let persist = crate::server::context_history_artifact::persist(
+            store,
+            &self.user_id,
+            artifact_id,
+            history,
+        );
+        if let Some(budget) = self.execution_time_budget {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(budget.deadline) => Err("context history persistence reached the admitted execution deadline".into()),
+                result = persist => result,
+            }
+        } else {
+            persist.await
+        }
+    }
+
     fn release_execution_capacity_for_wait(&mut self) {
         if let Some(capacity) = self.execution_capacity.as_mut() {
             capacity.release();
@@ -20538,8 +19216,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         activations: &[astra_turn_types::DeferredToolActivation],
     ) {
         let registry = astra_runtime_env::ToolRegistry::builtins();
+        let admission_schemas = self.current_admission_schemas();
+        let snapshot = self.admission_snapshot(&admission_schemas, &registry);
         for activation in activations {
-            let decision = self.admission_for_current_binding(&activation.name, &registry);
+            let decision = snapshot.decision(&activation.name);
             let Some(offer) = decision.selected_offer.as_ref().filter(|offer| {
                 decision.visible && !matches!(offer.route, ToolExecutionRouteKind::Unsupported)
             }) else {
@@ -21484,12 +20164,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<(), astra_core::ClassifiedError> {
-        // Mock rounds previously returned before the provider recovery gate.
-        // They do not own durable provider attempts, including after exhaustion.
-        #[cfg(feature = "e2e-hooks")]
-        if self.test_llm_rounds_wired {
-            return Ok(());
-        }
         self.hydrate_provider_canonical_transitions(state).await
     }
 
@@ -21519,41 +20193,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             0,
             turn_started,
         );
-
-        // ── Test hook: mock LLM rounds ──────────────────────────────────
-        #[cfg(feature = "e2e-hooks")]
-        {
-            if let Some(round) = self.test_llm_rounds.pop_front() {
-                // Clear per-*user-turn* dedup state only at the first LLM round
-                // NOTE: Do NOT clear emitted_tool_call_ids here.
-                // The single authoritative clear point is run_one_mock_turn_for_test
-                // (the true user-turn boundary). Skill subruns create a fresh
-                // AgenticLoopState with llm_rounds_completed==0 and re-enter
-                // execute_turn — clearing here would wipe the parent turn's dedup
-                // state and allow duplicate tool_call events to escape the HashSet.
-                // Contract: emitted_tool_call_ids is cleared ONLY in
-                // run_one_mock_turn_for_test at the start of each new user message.
-                return self.execute_mock_turn(state, &round, turn_started).await;
-            }
-            if self.test_llm_rounds_wired {
-                // All mock rounds consumed — return a no-op text result so the
-                // agentic loop terminates cleanly (no real LLM fallback).
-                self.emit_progress_event(
-                    json!({ "type": "text_delta", "content": "[mock rounds exhausted]" }),
-                );
-                state.final_text = "[mock rounds exhausted]".to_string();
-                state.final_text_streamed = true;
-                return Ok(HostTurnResult {
-                    accum: ChatTurnSseAccum {
-                        full_text: "[mock rounds exhausted]".to_string(),
-                        ..Default::default()
-                    },
-                    ttft_ms: Some(0),
-                    edge_tool_round: Vec::new(),
-                    error_kind: None,
-                });
-            }
-        }
 
         // Reconcile a fast semantic preflight before the primary request so
         // its typed optional capabilities (for example `agent_fanout`) are
@@ -21735,7 +20374,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             || preserve_text_only_tool_surface
             || preserve_final_synthesis_wire_surface;
         let effective_restricted =
-            self.compute_effective_restricted(state, true, preserve_text_only_tool_surface);
+            self.compute_effective_restricted(state, preserve_text_only_tool_surface);
         tracing::debug!(
             target: "astra::tool_surface",
             run_id = state.current_run_id.as_deref().unwrap_or_default(),
@@ -22485,6 +21124,31 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let request_context =
                 self.model_request_context_seed(state.last_llm_context_manifest_trace.as_ref());
             let requested_logical_attempt = attempt_in_round;
+            let operation_id = match (
+                state.inference_purpose, state.canonical_turn_chain_id.as_deref(),
+            ) {
+                (astra_turn_types::InferencePurpose::SubAgent, Some(chain))
+                    if !chain.is_empty() && chain.trim() == chain =>
+                {
+                    scoped_inference_operation_id("agent_turn", chain)
+                }
+                (astra_turn_types::InferencePurpose::SubAgent, Some(_)) => {
+                    let error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "subagent inference has an invalid canonical child turn identity",
+                    );
+                    self.complete_request_preparation_phase_with_context(
+                        state, request_attempt_started_at, attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed, attempt_context_metrics.clone(),
+                    );
+                    return Err(error);
+                }
+                // Delegated children have their own durable run identity;
+                // skill forks share the parent run and supply a child chain.
+                (astra_turn_types::InferencePurpose::SubAgent, None) => "agent_turn".to_string(),
+                _ => "agent_turn".to_string(),
+            };
             let durable_invocation = match durable_ledger
                 .admit_with_request_context(
                     astra_turn_types::InferenceInvocationScope::Run {
@@ -22492,7 +21156,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         run_id,
                         turn: state.session_turn,
                         round: prompt_round,
-                        operation_id: "agent_turn".to_string(),
+                        operation_id,
                         logical_attempt: attempt_in_round,
                     },
                     state.inference_purpose,
@@ -24320,7 +22984,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        let effective_restricted = self.compute_effective_restricted(state, false, false);
+        let effective_restricted = self.compute_effective_restricted(state, false);
         let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
         // Rebuild the matching stable system projection. The tool projection
         // comes from the preceding provider-final request when available.
@@ -25244,6 +23908,115 @@ mod tests {
             user_id.into(),
             session_id.into(),
         )
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn test_inference_ledger_preserves_execution_owner_in_both_builder_orders() {
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
+            server_host_builder,
+        };
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "actual root owner requests", |request| request.path == "/v1/chat/completions"
+                && request.body["model"] == "owner-model",
+            (0..2).map(|index| ProviderResponse::OpenAi(json!({
+                "id":format!("root-owner-{index}"),"model":"owner-model",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"The explanation is complete."},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
+            }))).collect(),
+        )]).await;
+        let engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new()
+                .with_execution_owner("actual-parent-owner", std::time::Duration::from_secs(60)),
+        ));
+        for ledger_first in [false, true] {
+            let session = format!("root-owner-{}", uuid::Uuid::new_v4());
+            let mut state =
+                loop_state(&session, Vec::new(), "Explain this without making changes.");
+            let run = state.current_run_id.clone().unwrap();
+            let claim = engine
+                .start_run(&run, "provider-fixture-user", &session)
+                .await
+                .unwrap();
+            engine
+                .append_events_batch(
+                    "provider-fixture-user",
+                    &session,
+                    &run,
+                    &[json!({"event_type":"agent_progress","data":{"stage":"owner probe"}})],
+                )
+                .await
+                .unwrap();
+            let record = engine
+                .load_run("provider-fixture-user", &run)
+                .await
+                .unwrap()
+                .unwrap();
+            let owner = engine.execution_owner_pod_id().unwrap().to_owned();
+            assert_eq!(record.owner_pod_id.as_deref(), Some(owner.as_str()));
+            assert_eq!(record.run_generation, claim.owner_generation);
+            state.current_run_owner_generation = Some(claim.owner_generation);
+            state
+                .user_intents
+                .commit_observed_cursor(usize::try_from(record.last_event_idx).unwrap());
+            let ledger = InferenceLedgerFixture::default();
+            let builder =
+                server_host_builder(&gateway, &ledger, &session, "openai", "owner-model", None);
+            let mut host = if ledger_first {
+                builder
+                    .with_test_inference_ledger(ledger.persistence.clone())
+                    .with_inference_owner_pod_id(Some(owner.clone()))
+            } else {
+                builder
+                    .with_inference_owner_pod_id(Some(owner.clone()))
+                    .with_test_inference_ledger(ledger.persistence.clone())
+            }
+            .build();
+            host.prepare_model_selection(&mut state).await.unwrap();
+            let request_count = gateway.requests.lock().await.len();
+            state.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
+            for chain in ["", " ", " child-chain"] {
+                state.canonical_turn_chain_id = Some(chain.into());
+                let error = host
+                    .execute_turn(&mut state)
+                    .await
+                    .err()
+                    .expect("malformed child identity must fail before inference admission");
+                assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("invalid canonical child turn identity"),
+                    "{error:?}"
+                );
+                state.restore_volatile_attempt_lease();
+            }
+            assert_eq!(gateway.requests.lock().await.len(), request_count);
+            assert!(ledger.admissions().is_empty());
+            assert_eq!(ledger.attempt_count(), 0);
+            state.inference_purpose = astra_turn_types::InferencePurpose::PrimaryAgent;
+            state.canonical_turn_chain_id = None;
+            crate::turn::agentic_loop::finalization::run_agentic_loop_with_host(
+                &mut host, &mut state,
+            )
+            .await
+            .unwrap();
+            assert_eq!(state.final_text, "The explanation is complete.");
+            assert_eq!(ledger.attempt_count(), 1);
+            ledger.assert_quiescent();
+            let admissions = ledger.admissions();
+            assert_eq!(admissions.len(), 1);
+            let (scope, authority) = &admissions[0];
+            assert_eq!(scope.run_id(), Some(run.as_str()));
+            assert_eq!(scope.operation_id(), "agent_turn");
+            let authority = authority.as_ref().unwrap();
+            assert_eq!(authority.expected_owner_pod_id, owner);
+            assert_eq!(authority.expected_owner_generation, claim.owner_generation);
+            assert_eq!(authority.expected_control_epoch, record.last_event_idx);
+        }
+        gateway.assert_complete();
+        assert_eq!(gateway.requests.lock().await.len(), 2);
     }
 
     #[test]
@@ -26286,7 +25059,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated MatrixOne: run with ASTRA_TEST_DB_IT=1"]
-    async fn adopted_execution_handoff_replays_across_owner_generations() {
+    async fn execution_handoff_adoption_preserves_checkpoint_across_owner_generations() {
         use astra_services::runs::RunStateStore;
         use astra_services::session_context_coordinator::{
             AcquireWriterAndReserveTurnOutcome, AdoptExecutionTurnRequest,
@@ -26382,7 +25155,6 @@ mod tests {
             .unwrap()
             .unwrap();
         coordinator.release_writer(&lease).await.unwrap();
-        let mut previous_adoption = None;
         for generation in 1..=3 {
             let mut claims = store.claim_recoverable_active_runs(1).await.unwrap();
             assert_eq!(claims.len(), 1);
@@ -26400,45 +25172,19 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(adopted.receipt().producer_generation, 0);
-            let restored =
-                replay_adopted_execution_handoff(&adopted, &claim.run, &[], Vec::new()).unwrap();
-            assert_eq!(restored.heavy.messages, state.messages);
-            assert_eq!(restored.original_facts.total_prompt, 123);
             assert_eq!(
-                restored.original_facts.session_turn,
+                adopted.checkpoint().checkpoint_json,
+                checkpoint.checkpoint_json
+            );
+            assert_eq!(
+                adopted.receipt().turn_reservation.reserved_turn,
                 reservation.reserved_turn
             );
-            restored
-                .hooks
-                .restore(Default::default(), Default::default())
-                .unwrap();
-            if let Some(previous) = previous_adoption.as_ref() {
-                assert!(
-                    replay_adopted_execution_handoff(previous, &claim.run, &[], Vec::new())
-                        .is_err(),
-                    "a prior adoption cannot authorize the newly claimed generation"
-                );
-            }
-            for mutation in ["user", "session", "run", "generation", "status"] {
-                let mut other = claim.run.clone();
-                match mutation {
-                    "user" => other.user_id = "another-user".into(),
-                    "session" => other.session_id = "another-session".into(),
-                    "run" => other.run_id = "another-run".into(),
-                    "generation" => other.run_generation += 1,
-                    "status" => other.status = astra_core::STATUS_PAUSED.into(),
-                    _ => unreachable!(),
-                }
-                assert!(
-                    replay_adopted_execution_handoff(&adopted, &other, &[], Vec::new()).is_err(),
-                    "{mutation}"
-                );
-            }
+            assert!(adopted.receipt().writer_lease.writer_epoch > lease.writer_epoch);
             coordinator
                 .release_writer(&adopted.receipt().writer_lease)
                 .await
                 .unwrap();
-            previous_adoption = Some(adopted);
         }
         let final_run = store.load_run(user, run_id).await.unwrap().unwrap();
         assert_eq!(
@@ -26460,7 +25206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_handoff_preserves_last_tool_result_once() {
+    async fn execution_handoff_preserves_settled_checkpoint_without_reconstructing_execution() {
         for (cancelled, chain, accounting_available) in [
             (false, Some("handoff-chain"), true),
             (true, Some("handoff-chain"), true),
@@ -26598,249 +25344,6 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            replay_execution_handoff(
-                &saved.checkpoint_json,
-                &run,
-                run.run_generation,
-                &reservation,
-                &[],
-                Vec::new(),
-            )
-            .unwrap();
-            let mut missing_verification: Value =
-                serde_json::from_str(&saved.checkpoint_json).unwrap();
-            let mut missing_primary = missing_verification.clone();
-            for (field, replacement) in [
-                ("session_turn", json!(2)),
-                ("canonical_turn_chain_id", json!("another-chain")),
-            ] {
-                if field == "canonical_turn_chain_id" && chain.is_none() {
-                    continue;
-                }
-                let mut mismatch = missing_verification.clone();
-                mismatch["heavy"]["original_facts"][field] = replacement;
-                assert!(decode_execution_handoff(&mismatch.to_string(), &run).is_err());
-            }
-            let mut mismatched_cap = missing_verification.clone();
-            let mut mismatched_profile = missing_verification.clone();
-            mismatched_profile["heavy"]["original_facts"]["turn_guard"]["task_profile"]["stall_window"] =
-                json!(37);
-            assert!(decode_execution_handoff(&mismatched_profile.to_string(), &run).is_err());
-            let cap = &mut mismatched_cap["heavy"]["original_facts"]["agentic_turn_budget"]["hard_turn_limit"];
-            *cap = if cap.is_null() {
-                json!(73)
-            } else {
-                Value::Null
-            };
-            assert!(decode_execution_handoff(&mismatched_cap.to_string(), &run).is_err());
-            let mut missing_original = missing_verification.clone();
-            missing_original["heavy"]
-                .as_object_mut()
-                .unwrap()
-                .remove("original_facts");
-            assert!(decode_execution_handoff(&missing_original.to_string(), &run).is_err());
-            let mut policy_wire = missing_verification.clone();
-            policy_wire["heavy"]["original_facts"]["budget_policy"] =
-                serde_json::to_value(crate::turn::runtime_policy::RuntimePolicy::default())
-                    .unwrap();
-            decode_execution_handoff(&policy_wire.to_string(), &run).unwrap();
-            policy_wire["heavy"]["original_facts"]["budget_policy"]
-                .as_object_mut()
-                .unwrap()
-                .remove("context_pressure");
-            assert!(decode_execution_handoff(&policy_wire.to_string(), &run).is_err());
-            let mut missing_accounting = missing_verification.clone();
-            missing_accounting["heavy"]
-                .as_object_mut()
-                .unwrap()
-                .remove("tool_ledger");
-            assert!(decode_execution_handoff(&missing_accounting.to_string(), &run).is_err());
-            let mut missing_user_intents: Value =
-                serde_json::from_str(&saved.checkpoint_json).unwrap();
-            missing_user_intents["heavy"]
-                .as_object_mut()
-                .unwrap()
-                .remove("user_intents");
-            assert!(decode_execution_handoff(&missing_user_intents.to_string(), &run).is_err());
-            missing_primary["heavy"]
-                .as_object_mut()
-                .unwrap()
-                .remove("primary_work");
-            assert!(decode_execution_handoff(&missing_primary.to_string(), &run).is_err());
-            missing_verification["heavy"]
-                .as_object_mut()
-                .unwrap()
-                .remove("verification");
-            assert!(decode_execution_handoff(&missing_verification.to_string(), &run).is_err());
-            if !cancelled {
-                // The only difference from the valid complete fixture is the
-                // old control schema. Preserve custody, never invent the
-                // missing obligations or classify this as a missing snapshot.
-                let old_engine = crate::server::run::engine::RunEngine::new(Arc::new(
-                    astra_services::runs::InMemoryRunStateStore::new(),
-                ));
-                old_engine
-                    .start_run("handoff-run", "handoff-user", "handoff-session")
-                    .await
-                    .unwrap();
-                let mut old_payload: Value = serde_json::from_str(&saved.checkpoint_json).unwrap();
-                let control = old_payload["heavy"]["heavy"]["run_execution_control"]
-                    .as_object_mut()
-                    .unwrap();
-                assert_eq!(control["version"], json!("3"));
-                control.insert("version".into(), json!("1"));
-                assert!(control.remove("hook_obligations").is_some());
-                let old_wire = old_payload.to_string();
-                assert!(
-                    old_engine
-                        .persist_owned_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
-                            user_id: "handoff-user",
-                            expected_session_id: "handoff-session",
-                            run_id: "handoff-run",
-                            checkpoint_json: &old_wire,
-                            authority:
-                                astra_services::runs::CheckpointWriteAuthority::ExecutionOwner {
-                                    expected_owner_generation: 0
-                                },
-                        })
-                        .await
-                        .unwrap()
-                        .is_some()
-                );
-                let old_recovered = old_engine.recover_active_runs().await.unwrap();
-                let old_run = old_recovered
-                    .iter()
-                    .find(|run| run.run_id == "handoff-run")
-                    .unwrap();
-                assert_eq!(old_run.status, "paused");
-                assert_eq!(old_run.run_generation, 1);
-                assert_eq!(old_run.checkpoint_json.as_deref(), Some(old_wire.as_str()));
-                assert!(decode_execution_handoff(&old_wire, old_run).is_err());
-                let persisted_old_run = old_engine
-                    .load_run("handoff-user", "handoff-run")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(persisted_old_run.events.iter().any(|event| {
-                    event["data"]["execution_handoff_preserved"] == json!(true)
-                        && event["data"]["automatic_execution_reconstructed"] == json!(false)
-                        && event["data"]["execution_handoff_recovery"]["recovered_generation"]
-                            == json!(old_run.run_generation)
-                }));
-            }
-            for mutation in [
-                "turn",
-                "parent",
-                "history",
-                "control",
-                "generation",
-                "act_without_slots",
-                "unknown_quarantine",
-            ] {
-                let mut invalid: Value = serde_json::from_str(&saved.checkpoint_json).unwrap();
-                match mutation {
-                    "turn" => invalid["heavy"]["reservation"]["reserved_turn"] = json!(2),
-                    "parent" => {
-                        invalid["heavy"]["continuation"]["parent_transition_id"] =
-                            json!("not-the-parent")
-                    }
-                    "history" => {
-                        invalid["heavy"]["heavy"]["messages"][2]["content"] =
-                            json!("different result")
-                    }
-                    "control" => {
-                        invalid["heavy"]["heavy"]
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("run_execution_control");
-                    }
-                    "generation" => invalid["producer_owner_generation"] = json!(1),
-                    "act_without_slots" => {
-                        invalid["heavy"]["heavy"]["light"]["cursor"]["phase"] = json!("Act")
-                    }
-                    "unknown_quarantine" => {
-                        invalid["heavy"]["heavy"]["workspace_observation_quarantine"] =
-                            json!({"reason":"unknown", "scope":"bound_workspace"})
-                    }
-                    _ => unreachable!(),
-                }
-                assert!(
-                    replay_execution_handoff(
-                        &invalid.to_string(),
-                        &run,
-                        run.run_generation,
-                        &reservation,
-                        &[],
-                        Vec::new()
-                    )
-                    .is_err(),
-                    "{mutation}"
-                );
-            }
-            // A real per-turn WAL parent must be loaded before the final tool
-            // suffix is replayed; equivalent message content is not parent custody.
-            let base = state.provider_canonical_wal_base.as_ref().unwrap();
-            let parent = plan_provider_canonical_wal_transition(
-                base,
-                None,
-                &state.messages[..1],
-                Vec::new(),
-                None,
-                ProviderCanonicalWalLimits::PRODUCTION,
-            )
-            .unwrap();
-            let linked = plan_provider_canonical_wal_transition(
-                base,
-                Some(&parent.head),
-                &state.messages,
-                Vec::new(),
-                None,
-                ProviderCanonicalWalLimits::PRODUCTION,
-            )
-            .unwrap();
-            let mut linked_payload: Value = serde_json::from_str(&saved.checkpoint_json).unwrap();
-            linked_payload["heavy"]["continuation"] =
-                serde_json::to_value(linked.transition).unwrap();
-            let receipts = |turn| {
-                vec![astra_services::InferenceCanonicalTransitionReceipt {
-                    turn,
-                    round: 0,
-                    logical_attempt: 0,
-                    physical_attempt: 0,
-                    transitions: vec![parent.transition.clone()],
-                }]
-            };
-            replay_execution_handoff(
-                &linked_payload.to_string(),
-                &run,
-                run.run_generation,
-                &reservation,
-                &[],
-                receipts(1),
-            )
-            .unwrap();
-            assert!(
-                replay_execution_handoff(
-                    &linked_payload.to_string(),
-                    &run,
-                    run.run_generation,
-                    &reservation,
-                    &[],
-                    receipts(2)
-                )
-                .is_err()
-            );
-            assert!(
-                replay_execution_handoff(
-                    &linked_payload.to_string(),
-                    &run,
-                    run.run_generation,
-                    &reservation,
-                    &[],
-                    Vec::new()
-                )
-                .is_err()
-            );
             if cancelled {
                 assert!(
                     engine
@@ -26883,9 +25386,8 @@ mod tests {
     #[tokio::test]
     async fn pending_edge_approval_is_cancel_responsive() {
         let mut host = test_host_builder("u-cancel-approval", "s-cancel-approval").build();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_token = Arc::new(CancellationToken::new());
-        host.set_client_cancel(cancel_flag, cancel_token.clone());
+        host.set_client_cancel(cancel_token.clone());
         let context = test_edge_action_context("u-cancel-approval", "run-cancel-approval").await;
         let tool_call = json!({
             "id": "write-after-cancel",
@@ -26915,9 +25417,8 @@ mod tests {
             "s-half-open-approval",
         ));
         host.set_interaction_sink(Arc::new(PendingApprovalInteractionSink));
-        let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_token = Arc::new(CancellationToken::new());
-        host.set_client_cancel(cancel_flag, cancel_token.clone());
+        host.set_client_cancel(cancel_token.clone());
         let context =
             test_edge_action_context("u-half-open-approval", "run-half-open-approval").await;
         let tool_call = json!({
@@ -29454,23 +27955,6 @@ mod tests {
         assert!(admission.rejected.is_empty());
     }
 
-    #[cfg(feature = "e2e-hooks")]
-    #[test]
-    fn mock_error_kind_uses_the_canonical_tag_parser() {
-        assert_eq!(
-            mock_error_kind_from_str("policy_denied"),
-            astra_core::ErrorKind::PolicyDenied
-        );
-        assert_eq!(
-            mock_error_kind_from_str("tool_binding"),
-            astra_core::ErrorKind::ToolBinding
-        );
-        assert_eq!(
-            mock_error_kind_from_str("not_a_real_kind"),
-            astra_core::ErrorKind::Unknown
-        );
-    }
-
     #[test]
     fn ttft_prefers_the_first_stream_update_including_reasoning() {
         assert_eq!(observed_ttft_ms(Some(240), Some(900), 1_600), 240);
@@ -29767,7 +28251,7 @@ mod tests {
         .expect("restored JSON");
         assert_eq!(restored_payload["schema"], "active_work_attempt_start.v1");
         state.hooks.completion_settlement.work_settlement_only = true;
-        let restricted = host.compute_effective_restricted(&mut state, true, false);
+        let restricted = host.compute_effective_restricted(&mut state, false);
         assert!(
             host.tool_schemas
                 .iter()
@@ -30144,6 +28628,7 @@ mod tests {
 
     #[derive(Default)]
     struct ImmediatelyResolvedApprovalDeliverySink {
+        revoke_provider_tools: Option<Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>>,
         projected_tool_requests: std::sync::atomic::AtomicUsize,
         approval_releases: std::sync::atomic::AtomicUsize,
     }
@@ -30286,6 +28771,9 @@ mod tests {
             &self,
             request_id: &str,
         ) -> Result<Option<Value>, String> {
+            if let Some(policy) = &self.revoke_provider_tools {
+                policy.write().await.insert("edge-1".into(), HashSet::new());
+            }
             Ok(Some(json!({
                 "event_type": "approval_resolved",
                 "data": {
@@ -30961,6 +29449,7 @@ mod tests {
     }
 
     struct RecordingProjectionInteractionSink {
+        callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
         durable_delivery: Option<(
             Arc<RecordingHostEdgeDispatch>,
@@ -30991,6 +29480,19 @@ mod tests {
                 dispatch
                     .deliver_result(identity, edge_agent_id, result_json)
                     .await?;
+                // Model the HTTP callback's durable write followed by its
+                // exact local result projection. Durable fallback has separate tests.
+                let (body, execution_completion) =
+                    canonical_edge_dispatch_result(identity, edge_agent_id, result_json)?;
+                self.callback_ledger.lock().await.insert(
+                    astra_turn_core::edge_ledger::tool_callback_key(identity),
+                    json!({
+                        "kind": "tool_result", "user_id": identity.user_id,
+                        "session_id": identity.session_id, "run_id": identity.run_id,
+                        "turn_chain_id": identity.turn_chain_id,
+                        "body": body, "execution_completion": execution_completion,
+                    }),
+                );
             }
             Ok(())
         }
@@ -31649,7 +30151,12 @@ mod tests {
     async fn typed_reflect_requires_selected_carrier_and_retains_validation() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut host = test_host_builder("u-reflect", "s-reflect")
-            .with_server_sandbox_workspace(dir.path())
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    crate::server::tool_transport::WorkspaceBinding::server_sandbox(dir.path()),
+                    crate::server::tool_transport::ExecutorBinding::server_local(),
+                ),
+            )
             .build();
         let mut state = create_test_state();
         state.runtime_tool_executor = Some(Arc::new(runtime_tool_executor_with_agent_context(
@@ -33613,11 +32120,14 @@ mod tests {
         );
 
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
-        let selected = host.edge_ledger_tool_calls_for_delivery(&[json!({
-            "id": "mcp-1",
-            "type": "function",
-            "function": {"name": "mcp__tools__query", "arguments": r#"{"query":"docs"}"#}
-        })]);
+        let selected = host.edge_ledger_tool_calls_for_delivery_with_activations(
+            &[json!({
+                "id": "mcp-1",
+                "type": "function",
+                "function": {"name": "mcp__tools__query", "arguments": r#"{"query":"docs"}"#}
+            })],
+            &HashMap::new(),
+        );
         assert!(
             selected.is_empty(),
             "request-scoped MCP tools must not be delivered to the edge ledger"
@@ -33771,18 +32281,21 @@ mod tests {
         );
 
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
-        let selected = host.edge_ledger_tool_calls_for_delivery(&[
-            json!({
-                "id": "read-1",
-                "type": "function",
-                "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
-            }),
-            json!({
-                "id": "mcp-1",
-                "type": "function",
-                "function": {"name": "mcp__tools__query", "arguments": r#"{"query":"docs"}"#}
-            }),
-        ]);
+        let selected = host.edge_ledger_tool_calls_for_delivery_with_activations(
+            &[
+                json!({
+                    "id": "read-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
+                }),
+                json!({
+                    "id": "mcp-1",
+                    "type": "function",
+                    "function": {"name": "mcp__tools__query", "arguments": r#"{"query":"docs"}"#}
+                }),
+            ],
+            &HashMap::new(),
+        );
         let selected_names = selected
             .iter()
             .map(|tool_call| {
@@ -33827,7 +32340,8 @@ mod tests {
             }),
         ];
 
-        let selected = host.edge_ledger_tool_calls_for_delivery(&tool_calls);
+        let selected =
+            host.edge_ledger_tool_calls_for_delivery_with_activations(&tool_calls, &HashMap::new());
         let names = selected
             .iter()
             .map(|tool_call| {
@@ -33850,11 +32364,14 @@ mod tests {
             "edge-bound runtime tools should be visible when the edge provider is explicitly bound"
         );
 
-        let selected = host.edge_ledger_tool_calls_for_delivery(&[json!({
-            "id": "read-1",
-            "type": "function",
-            "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
-        })]);
+        let selected = host.edge_ledger_tool_calls_for_delivery_with_activations(
+            &[json!({
+                "id": "read-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
+            })],
+            &HashMap::new(),
+        );
 
         assert_eq!(selected.len(), 1);
     }
@@ -33873,7 +32390,11 @@ mod tests {
             "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
         });
         assert_eq!(
-            host.edge_ledger_tool_calls_for_delivery(&[tool_call]).len(),
+            host.edge_ledger_tool_calls_for_delivery_with_activations(
+                &[tool_call],
+                &HashMap::new()
+            )
+            .len(),
             1,
             "read_file remains an edge-bound runtime tool"
         );
@@ -34231,7 +32752,14 @@ mod tests {
     #[test]
     fn model_request_topology_follows_the_authoritative_execution_binding() {
         let server = test_host_builder("u-server-topology", "s-server-topology")
-            .with_server_sandbox_workspace("/tmp/astra-server-topology")
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    crate::server::tool_transport::WorkspaceBinding::server_sandbox(
+                        "/tmp/astra-server-topology",
+                    ),
+                    crate::server::tool_transport::ExecutorBinding::server_local(),
+                ),
+            )
             .build();
         assert_eq!(
             server.model_request_topology(),
@@ -35210,9 +33738,11 @@ mod tests {
     #[test]
     fn builder_runtime_surface_follows_server_sandbox_binding() {
         let host = test_host_builder("user1", "sess1")
-            .with_execution_bindings(
-                WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
-                ExecutorBinding::server_local(),
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+                    ExecutorBinding::server_local(),
+                ),
             )
             .build();
 
@@ -35237,17 +33767,19 @@ mod tests {
     #[test]
     fn builder_runtime_surface_hides_project_tools_when_edge_offline() {
         let host = test_host_builder("user1", "sess1")
-            .with_execution_bindings(
-                WorkspaceBinding::edge_workspace(
-                    "MacBook Pro",
-                    "/Users/test/project",
-                    WorkspaceAuthority::ReadWrite,
-                ),
-                ExecutorBinding::edge_agent(
-                    "edge-1",
-                    "MacBook Pro",
-                    crate::server::tool_transport::ToolTransportKind::EdgeWs,
-                    crate::server::tool_transport::ExecutorStatus::Offline,
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-1",
+                        "MacBook Pro",
+                        crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                        crate::server::tool_transport::ExecutorStatus::Offline,
+                    ),
                 ),
             )
             .build();
@@ -35291,17 +33823,19 @@ mod tests {
     #[test]
     fn runtime_surface_rejects_activated_background_controls_when_edge_is_offline() {
         let host = test_host_builder("user1", "sess1")
-            .with_execution_bindings(
-                WorkspaceBinding::edge_workspace(
-                    "MacBook Pro",
-                    "/Users/test/project",
-                    WorkspaceAuthority::ReadWrite,
-                ),
-                ExecutorBinding::edge_agent(
-                    "edge-1",
-                    "MacBook Pro",
-                    crate::server::tool_transport::ToolTransportKind::EdgeWs,
-                    crate::server::tool_transport::ExecutorStatus::Offline,
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-1",
+                        "MacBook Pro",
+                        crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                        crate::server::tool_transport::ExecutorStatus::Offline,
+                    ),
                 ),
             )
             .build();
@@ -35329,17 +33863,19 @@ mod tests {
     #[tokio::test]
     async fn offline_edge_blocking_does_not_require_sse_event_channel() {
         let mut host = test_host_builder("user1", "sess1")
-            .with_execution_bindings(
-                WorkspaceBinding::edge_workspace(
-                    "MacBook Pro",
-                    "/Users/test/project",
-                    WorkspaceAuthority::ReadWrite,
-                ),
-                ExecutorBinding::edge_agent(
-                    "edge-1",
-                    "MacBook Pro",
-                    crate::server::tool_transport::ToolTransportKind::EdgeWs,
-                    crate::server::tool_transport::ExecutorStatus::Offline,
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-1",
+                        "MacBook Pro",
+                        crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                        crate::server::tool_transport::ExecutorStatus::Offline,
+                    ),
                 ),
             )
             .build();
@@ -35417,17 +33953,19 @@ mod tests {
     #[tokio::test]
     async fn offline_client_declaration_cannot_turn_server_agent_tool_into_edge_result() {
         let mut host = test_host_builder("user1", "sess1")
-            .with_execution_bindings(
-                WorkspaceBinding::edge_workspace(
-                    "client workspace",
-                    "/project",
-                    WorkspaceAuthority::ReadWrite,
-                ),
-                ExecutorBinding::edge_agent(
-                    "edge-1",
-                    "client",
-                    crate::server::tool_transport::ToolTransportKind::EdgeWs,
-                    crate::server::tool_transport::ExecutorStatus::Offline,
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    WorkspaceBinding::edge_workspace(
+                        "client workspace",
+                        "/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-1",
+                        "client",
+                        crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                        crate::server::tool_transport::ExecutorStatus::Offline,
+                    ),
                 ),
             )
             .build();
@@ -35458,17 +33996,19 @@ mod tests {
     #[test]
     fn builder_runtime_surface_exposes_project_tools_for_online_edge_binding_without_edge_tools() {
         let host = test_host_builder("user1", "sess1")
-            .with_execution_bindings(
-                WorkspaceBinding::edge_workspace(
-                    "MacBook Pro",
-                    "/Users/test/project",
-                    WorkspaceAuthority::ReadWrite,
-                ),
-                ExecutorBinding::edge_agent(
-                    "edge-1",
-                    "MacBook Pro",
-                    crate::server::tool_transport::ToolTransportKind::EdgeWs,
-                    crate::server::tool_transport::ExecutorStatus::Online,
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-1",
+                        "MacBook Pro",
+                        crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                        crate::server::tool_transport::ExecutorStatus::Online,
+                    ),
                 ),
             )
             .build();
@@ -38500,89 +37040,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assemble_llm_messages_includes_system_and_user() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .build();
-
-        let mut state = create_test_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-
-        // `assemble_llm_messages` is the pure stitching step after Phase 3 —
-        // no Memoria I/O. With Normal tier Memoria passes messages through
-        // unchanged, so feeding `state.messages` directly as the compacted
-        // list is equivalent to the real runtime path here.
-        let llm_cfg = ResolvedTurnLlmConfig {
-            model_name: "gpt-4".into(),
-            wire_model_name: None,
-            api_key: String::new(),
-            base_url: String::new(),
-            provider: "openai".into(),
-            fallback_chain: Vec::new(),
-            cache_capability: None,
-            thinking_capability: None,
-            fixed_temperature: None,
-            thinking_protocol: None,
-            header_overrides: HashMap::new(),
-            request_body_overrides: None,
-            completions_url_override: None,
-            request_timeout: None,
-            context_window: None,
-            max_completion_tokens: None,
-        };
-        let msgs = host
-            .assemble_llm_messages(
-                vec![json!({"role": "system", "content": "system prompt text"})],
-                Vec::new(),
-                state.messages.clone(),
-                &mut state,
-                &llm_cfg,
-                &PromptCacheConfig::latch("openai"),
-            )
-            .unwrap();
-        assert!(msgs.len() >= 2, "should have system + user messages");
-        assert_eq!(msgs[0]["role"], "system");
-        assert!(
-            msgs[0]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("system prompt text")
-        );
-        assert!(
-            msgs[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("active_turn_focus_policy.v1")
-        );
-        let body = crate::turn::llm::client::build_provider_request_body(
-            &msgs,
-            &[],
-            "test-model",
-            "openai",
-            Some(1024),
-            None,
-            false,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-        );
-        let wire = body["messages"].as_array().unwrap();
-        assert_eq!(
-            wire.iter()
-                .filter(|message| message["role"] == "system")
-                .count(),
-            1
-        );
-        assert_eq!(wire.last(), state.messages.last());
-    }
-
-    #[tokio::test]
     async fn run_turn_pipeline_returns_tier_and_pruned_tool_schemas() {
         // Phase 1 contract: the pipeline is the sole authority for
         // (a) compaction tier selection and
@@ -39239,11 +37696,12 @@ mod tests {
         for round in [0u32, 1, 5] {
             state.current_round_index = round;
             let out = host
-                .run_turn_pipeline_with_cache_capability_and_session_memory(
+                .run_turn_pipeline_with_model_limits_and_session_memory(
                     &mut state,
                     &tools,
                     "openai",
                     "arbitrary-current-user-deployment",
+                    None,
                     None,
                     Some(capability),
                     None,
@@ -39299,11 +37757,12 @@ mod tests {
         for round in [0u32, 1, 5] {
             state.current_round_index = round;
             let out = host
-                .run_turn_pipeline_with_cache_capability_and_session_memory(
+                .run_turn_pipeline_with_model_limits_and_session_memory(
                     &mut state,
                     &tools,
                     "openai",
                     "arbitrary-append-only-deployment",
+                    None,
                     None,
                     Some(capability),
                     None,
@@ -39695,6 +38154,7 @@ mod tests {
             Default::default(),
         );
         host.set_interaction_sink(Arc::new(RecordingProjectionInteractionSink {
+            callback_ledger: host.edge_callback_ledger.clone(),
             events: events.clone(),
             durable_delivery: Some((
                 dispatch,
@@ -39762,6 +38222,7 @@ mod tests {
                 Default::default(),
             );
             host.set_interaction_sink(Arc::new(RecordingProjectionInteractionSink {
+                callback_ledger: host.edge_callback_ledger.clone(),
                 events: events.clone(),
                 durable_delivery: None,
             }));
@@ -40193,85 +38654,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn immediate_durable_approval_still_commits_and_projects_the_tool_request() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-immediate-approval".to_string(),
-            "s-immediate-approval".to_string(),
-        )
-        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
-        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
-        .build();
-        host.set_approval_audit_context(test_approval_audit_context(
-            "u-immediate-approval",
-            "s-immediate-approval",
-        ));
-        host.install_runtime_tool_schemas(
-            vec![json!({
+    async fn immediate_durable_approval_requires_current_provider_policy_before_dispatch() {
+        for revoked in [false, true] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-immediate-approval".to_string(),
+                "s-immediate-approval".to_string(),
+            )
+            .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+            .build();
+            host.set_approval_audit_context(test_approval_audit_context(
+                "u-immediate-approval",
+                "s-immediate-approval",
+            ));
+            host.install_runtime_tool_schemas(
+                vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "description": "Write file contents",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })],
+                Default::default(),
+            );
+            let sink = Arc::new(ImmediatelyResolvedApprovalDeliverySink {
+                revoke_provider_tools: revoked.then(|| host.provider_allowed_tools.clone()),
+                ..Default::default()
+            });
+            host.set_interaction_sink(sink.clone());
+            let call = json!({
+                "id": "write-after-immediate-approval",
                 "type": "function",
                 "function": {
                     "name": "write_file",
-                    "description": "Write file contents",
-                    "parameters": {"type": "object", "properties": {}}
+                    "arguments": r#"{"path":"immediate.txt","content":"ok"}"#,
                 }
-            })],
-            Default::default(),
-        );
-        let sink = Arc::new(ImmediatelyResolvedApprovalDeliverySink::default());
-        host.set_interaction_sink(sink.clone());
-        let call = json!({
-            "id": "write-after-immediate-approval",
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "arguments": r#"{"path":"immediate.txt","content":"ok"}"#,
-            }
-        });
-        let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
-            &astra_services::multi_agent::EdgeDispatchIdentity::new(
-                "u-immediate-approval",
-                "s-immediate-approval",
-                "run-immediate",
-                "chain-immediate",
-                "write-after-immediate-approval",
-            ),
-        );
-        let ledger = host.edge_callback_ledger.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            ledger.lock().await.insert(
-                callback_key,
-                json!({
-                    "body": {
-                        "request_id": "write-after-immediate-approval",
-                        "edge_agent_id": "edge-1",
-                        "status": "ok",
-                        "output": "wrote-immediate"
-                    }
-                }),
+            });
+            let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
+                &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                    "u-immediate-approval",
+                    "s-immediate-approval",
+                    "run-immediate",
+                    "chain-immediate",
+                    "write-after-immediate-approval",
+                ),
             );
-        });
-        let context = test_edge_action_context("u-immediate-approval", "run-immediate").await;
+            let ledger = host.edge_callback_ledger.clone();
+            if !revoked {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ledger.lock().await.insert(
+                        callback_key,
+                        json!({
+                            "body": {
+                                "request_id": "write-after-immediate-approval",
+                                "edge_agent_id": "edge-1",
+                                "status": "ok",
+                                "output": "wrote-immediate"
+                            }
+                        }),
+                    );
+                });
+            }
+            let context = test_edge_action_context("u-immediate-approval", "run-immediate").await;
 
-        let outcome = host
-            .deliver_edge_tools_via_ledger("run-immediate", "chain-immediate", &[call], &context)
-            .await;
+            let outcome = host
+                .deliver_edge_tools_via_ledger(
+                    "run-immediate",
+                    "chain-immediate",
+                    &[call],
+                    &context,
+                )
+                .await;
 
-        assert_eq!(
-            outcome.control,
-            AdmittedToolCallControl::Continue,
-            "immediate durable approval must not block guarded delivery: {outcome:?}"
-        );
-        assert_eq!(outcome.results.len(), 1);
-        assert_eq!(outcome.results[0].status, "ok");
-        assert_eq!(sink.approval_releases.load(Ordering::SeqCst), 1);
-        assert_eq!(sink.projected_tool_requests.load(Ordering::SeqCst), 1);
-        assert!(
-            host.emitted_events
-                .iter()
-                .any(|event| { event.get("type").and_then(Value::as_str) == Some("tool_request") })
-        );
+            if revoked {
+                assert_eq!(outcome.control, AdmittedToolCallControl::FailedClosed);
+                assert_eq!(outcome.results.len(), 1);
+                assert_ne!(outcome.results[0].status, "ok");
+                assert!(
+                    outcome.results[0].output.contains("policy changed"),
+                    "{outcome:?}"
+                );
+                assert_eq!(sink.projected_tool_requests.load(Ordering::SeqCst), 0);
+                assert!(
+                    !host
+                        .emitted_events
+                        .iter()
+                        .any(|event| event["type"] == "tool_request")
+                );
+                continue;
+            }
+            assert_eq!(
+                outcome.control,
+                AdmittedToolCallControl::Continue,
+                "immediate durable approval must not block guarded delivery: {outcome:?}"
+            );
+            assert_eq!(outcome.results.len(), 1);
+            assert_eq!(outcome.results[0].status, "ok");
+            assert_eq!(sink.approval_releases.load(Ordering::SeqCst), 1);
+            assert_eq!(sink.projected_tool_requests.load(Ordering::SeqCst), 1);
+            assert!(host.emitted_events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_request")
+            }));
+        }
     }
 
     #[tokio::test]
@@ -41907,15 +40395,15 @@ mod tests {
     #[test]
     fn delegation_judgment_ids_fit_durable_inference_identity_and_separate_stages() {
         let digest = "a".repeat(64);
-        let intent = delegation_judgment_operation_id("intent", &digest);
-        let scope = delegation_judgment_operation_id("scope", &digest);
+        let intent = scoped_inference_operation_id("intent", &digest);
+        let scope = scoped_inference_operation_id("scope", &digest);
         assert_eq!(intent.len(), 64);
         assert_eq!(scope.len(), 64);
         assert_ne!(intent, scope);
-        assert_eq!(intent, delegation_judgment_operation_id("intent", &digest));
+        assert_eq!(intent, scoped_inference_operation_id("intent", &digest));
         assert_ne!(
             intent,
-            delegation_judgment_operation_id("intent", &"b".repeat(64))
+            scoped_inference_operation_id("intent", &"b".repeat(64))
         );
         let snapshot_a = delegation_intent_assessment_operation_id(
             &digest,
@@ -46638,12 +45126,6 @@ mod tests {
                 !schema_names(&host.current_discovery_deferred_tool_contract_schemas(&state))
                     .contains(name),
             );
-            assert!(
-                !host.deferred_activation_descriptor_is_current(
-                    &state.deferred_tool_activations[0],
-                ),
-                "legacy descriptor must not become a current provider offer",
-            );
             let carrier = json!({
                 "id": format!("restored-{name}"),
                 "type": "function",
@@ -46784,7 +45266,7 @@ mod tests {
             .expect("process-local invocation ledger");
 
         let mut first_host = test_host_builder(USER_ID.to_string(), SESSION_ID.to_string())
-        .with_server_sandbox_workspace(workspace.path())
+        .with_execution_binding_snapshot(crate::server::tool_transport::ExecutionBindingSnapshot::inferred(crate::server::tool_transport::WorkspaceBinding::server_sandbox(workspace.path()), crate::server::tool_transport::ExecutorBinding::server_local()))
         .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
         .with_test_inference_ledger(inference_ledger.clone())
         .with_admitted_model_execution(Some(admitted_execution(gateway_url.clone())))
@@ -46964,7 +45446,7 @@ mod tests {
         restored_state.user_intent = restored_user_text;
 
         let mut restored_host = test_host_builder(USER_ID.to_string(), SESSION_ID.to_string())
-        .with_server_sandbox_workspace(workspace.path())
+        .with_execution_binding_snapshot(crate::server::tool_transport::ExecutionBindingSnapshot::inferred(crate::server::tool_transport::WorkspaceBinding::server_sandbox(workspace.path()), crate::server::tool_transport::ExecutorBinding::server_local()))
         .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
         .with_test_inference_ledger(inference_ledger.clone())
         .with_admitted_model_execution(Some(admitted_execution(gateway_url)))
@@ -47065,7 +45547,6 @@ mod tests {
 
         let mut state = create_test_state();
         state.restricted_tools.insert("read_file".to_string());
-        state.boosted_tools.insert("read_file".to_string());
         state
             .turn_guard
             .health
@@ -47083,10 +45564,6 @@ mod tests {
 
         assert!(visible_names.contains("bash"));
         assert!(!visible_names.contains("read_file"));
-        assert!(
-            state.boosted_tools.contains("read_file"),
-            "the advisory boost can remain observable without overriding the hard restriction"
-        );
         assert!(
             !state.restricted_tools.contains("bash"),
             "soft health must not mutate hard restricted_tools"
@@ -47125,7 +45602,7 @@ mod tests {
         let mut state = create_test_state();
         state.hooks.completion_settlement.text_only = true;
 
-        let restricted = host.compute_effective_restricted(&mut state, true, true);
+        let restricted = host.compute_effective_restricted(&mut state, true);
         let wire_tools = host.filtered_runtime_ready_turn_tools(&restricted, &state);
         assert!(
             !wire_tools.is_empty(),
@@ -48579,7 +47056,12 @@ mod tests {
     fn visible_turn_tools_filters_executor_service_unready_tools() {
         let dir = tempfile::TempDir::new().expect("temp workspace");
         let mut host = test_host_builder("u", "s")
-            .with_server_sandbox_workspace(dir.path())
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    crate::server::tool_transport::WorkspaceBinding::server_sandbox(dir.path()),
+                    crate::server::tool_transport::ExecutorBinding::server_local(),
+                ),
+            )
             .build();
         let raw_names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.tool_schemas);
         assert!(
@@ -48618,7 +47100,12 @@ mod tests {
     fn visible_turn_tools_hide_unowned_turn_pipeline_tools() {
         let dir = tempfile::TempDir::new().expect("temp workspace");
         let mut host = test_host_builder("u", "s")
-            .with_server_sandbox_workspace(dir.path())
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    crate::server::tool_transport::WorkspaceBinding::server_sandbox(dir.path()),
+                    crate::server::tool_transport::ExecutorBinding::server_local(),
+                ),
+            )
             .build();
         host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
 
@@ -48645,7 +47132,12 @@ mod tests {
     fn visible_turn_tools_hide_skill_until_server_catalog_is_ready() {
         let dir = tempfile::TempDir::new().expect("temp workspace");
         let mut host = test_host_builder("u", "s")
-            .with_server_sandbox_workspace(dir.path())
+            .with_execution_binding_snapshot(
+                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+                    crate::server::tool_transport::WorkspaceBinding::server_sandbox(dir.path()),
+                    crate::server::tool_transport::ExecutorBinding::server_local(),
+                ),
+            )
             .build();
         host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
 
@@ -49465,21 +47957,6 @@ mod tests {
         assert_eq!(state.total_completion, 50);
     }
 
-    #[cfg(feature = "e2e-hooks")]
-    #[tokio::test]
-    async fn mock_llm_history_hydration_never_enters_provider_wal_gate() {
-        for rounds in [Vec::new(), vec![json!({"text": "mock"})]] {
-            let mut host = test_host_builder("u", "s")
-                .with_test_llm_rounds(rounds)
-                .build();
-            let mut state = create_test_state();
-            host.hydrate_restored_history(&mut state).await.unwrap();
-            // Even the no-pool branch of the real WAL gate sets this flag.
-            assert!(!host.canonical_transition_hydrated);
-            assert!(state.provider_canonical_wal_base.is_none());
-        }
-    }
-
     #[tokio::test]
     async fn server_host_mock_tool_response() {
         let tools = vec![EdgeToolExecResult {
@@ -49515,29 +47992,31 @@ mod tests {
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
-    async fn bridge_mock_usage_is_counted_once_by_the_agentic_loop() {
-        let mut host = test_host_builder("usage-user", String::new())
-            .with_test_llm_rounds(vec![json!({
-                "full_text": "usage accounted once",
-                "usage": {
-                    "prompt_tokens": 606,
-                    "completion_tokens": 404,
-                    "prompt_tokens_details": {
-                        "cached_tokens": 202,
-                        "cache_creation_input_tokens": 303
-                    }
-                }
-            })])
-            .build();
-        let mut state = create_test_state();
-
+    async fn provider_usage_is_counted_once_by_the_agentic_loop() {
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
+            server_host_builder,
+        };
+        let gateway = ProviderGateway::start(vec![ProviderScript::new("usage measured once", |request| request.path == "/v1/chat/completions" && request.body["model"] == "usage-model", vec![ProviderResponse::OpenAi(json!({
+            "id":"usage-response", "model":"usage-model", "choices":[{"index":0,"message":{"role":"assistant","content":"usage accounted once"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":606,"completion_tokens":404,"total_tokens":1010,"prompt_tokens_details":{"cached_tokens":202,"cache_creation_input_tokens":303}}
+        }))])]).await;
+        let ledger = InferenceLedgerFixture::default();
+        let session = "session-native-usage";
+        let mut host =
+            server_host_builder(&gateway, &ledger, session, "openai", "usage-model", None).build();
+        let mut state = loop_state(
+            session,
+            Vec::new(),
+            "Explain the facts without making changes.",
+        );
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "mock turn failed: {outcome:?}");
+        assert!(outcome.is_ok(), "native turn failed: {outcome:?}");
         assert_eq!(state.total_prompt, 101);
         assert_eq!(state.total_cache_read, 202);
         assert_eq!(state.total_cache_creation, 303);
         assert_eq!(state.total_completion, 404);
-        let qualified = state.qualified_usage.expect("mock usage evidence");
+        let qualified = state.qualified_usage.expect("native usage evidence");
         assert_eq!(qualified.input_tokens(), Some(101));
         assert_eq!(qualified.cached_input_tokens(), Some(202));
         assert_eq!(qualified.cache_creation_tokens(), Some(303));
@@ -49545,57 +48024,46 @@ mod tests {
         assert_eq!(
             state
                 .last_request_usage
-                .expect("physical mock usage")
+                .expect("physical provider usage")
                 .fresh_input_tokens,
             101
         );
-        let last = state.recent_rounds.last().expect("physical mock round");
+        let last = state.recent_rounds.last().expect("physical provider round");
         assert_eq!(last.prompt_tokens, 101);
         assert_eq!(last.cache_read_tokens, 202);
         assert_eq!(last.cache_creation_tokens, 303);
         assert_eq!(last.completion_tokens, 404);
+        assert_eq!(state.final_text, "usage accounted once");
+        assert_eq!(state.llm_rounds_completed, 1);
+        gateway.assert_complete();
+        ledger.assert_quiescent();
+        assert_eq!(ledger.attempt_count(), 1);
+        assert_eq!(gateway.requests.lock().await.len(), 1);
     }
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
     async fn server_host_strict_admission_blocks_every_pre_execution_side_effect() {
-        let mut host = test_host_builder("strict-user", "strict-session")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_llm_rounds(vec![
-                json!({
-                    "tool_calls": [
-                        {
-                            "id": "truncated",
-                            "type": "function",
-                            "function": {
-                                "name": "bash",
-                                "arguments": "{\"command\":\"echo incomplete"
-                            }
-                        },
-                        {
-                            "id": "conflicting",
-                            "type": "function",
-                            "name": "read_file",
-                            "function": {
-                                "name": "bash",
-                                "arguments": "{\"command\":\"echo conflict\"}"
-                            }
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-                }),
-                json!({
-                    "full_text": "Recovered after strict admission.",
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-                }),
-            ])
-            .build();
-        let mut state = create_test_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "run malformed calls"}));
-
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
+            server_host_builder,
+        };
+        let gateway = ProviderGateway::start(vec![ProviderScript::new("invalid arguments then recovery", |request| request.path == "/v1/chat/completions" && request.body["model"] == "strict-model", vec![
+            ProviderResponse::OpenAi(json!({"id":"invalid-response","model":"strict-model","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"truncated","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo incomplete"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
+            ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"strict-model","choices":[{"index":0,"message":{"role":"assistant","content":"Recovered after strict admission."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
+        ])]).await;
+        let ledger = InferenceLedgerFixture::default();
+        let session = "session-native-strict-admission";
+        let mut host =
+            server_host_builder(&gateway, &ledger, session, "openai", "strict-model", None)
+                .with_edge_tools(sample_edge_tools())
+                .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+                .build();
+        let mut state = loop_state(
+            session,
+            Vec::new(),
+            "Explain why the malformed call cannot run without making changes.",
+        );
         run_agentic_loop_with_host(&mut host, &mut state)
             .await
             .expect("strict admission should return retryable tool errors");
@@ -49610,70 +48078,35 @@ mod tests {
                 )
             )
         }));
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[tokio::test]
-    async fn server_host_rejects_flat_calls_and_emits_only_nested_canonical_shape() {
-        async fn emitted_calls(tool_call: Value) -> Vec<Value> {
-            let mut host = test_host_builder("shape-user", "shape-session")
-                .with_edge_tools(sample_edge_tools())
-                .with_execution_binding_snapshot(edge_runtime_snapshot())
-                .with_test_llm_rounds(vec![
-                    json!({
-                        "tool_calls": [tool_call],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-                    }),
-                    json!({
-                        "full_text": "Canonical call handled.",
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-                    }),
-                ])
-                .build();
-            let mut state = create_test_state();
-            state
-                .messages
-                .push(json!({"role": "user", "content": "inspect a file"}));
-
-            run_agentic_loop_with_host(&mut host, &mut state)
-                .await
-                .expect("canonical call should complete the loop");
-
-            let calls = host
-                .take_emitted_events()
-                .into_iter()
-                .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_call"))
-                .collect::<Vec<_>>();
-            calls
-                .into_iter()
-                .map(|event| event["tool_call"].clone())
-                .collect()
-        }
-
-        let flat = emitted_calls(json!({
-            "id": "shape-call",
-            "type": "function",
-            "name": "read_file",
-            "arguments": {"path": "README.md"}
-        }))
-        .await;
-        let nested = emitted_calls(json!({
-            "id": "shape-call",
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            }
-        }))
-        .await;
-
-        assert!(flat.is_empty(), "flat calls must fail strict admission");
-        assert_eq!(nested.len(), 1, "one admitted call must emit exactly once");
-        let nested = &nested[0];
-        assert_eq!(nested["function"]["name"], "read_file");
-        assert_eq!(nested["function"]["arguments"], "{\"path\":\"README.md\"}");
-        assert!(nested.get("name").is_none());
-        assert!(nested.get("arguments").is_none());
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        let record = serde_json::to_value(&state.stall.tool_call_records[0]).unwrap();
+        assert_eq!(record["disposition"], "rejected");
+        assert_eq!(record["ok"], false);
+        let rejection: Value =
+            serde_json::from_str(record["result_full"].as_str().unwrap()).unwrap();
+        assert_eq!(rejection["error_kind"], "tool_call_arguments_invalid");
+        gateway.assert_complete();
+        ledger.assert_quiescent();
+        assert_eq!(ledger.attempt_count(), 2);
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|schema| tool_schema_name(schema) == Some("bash"))
+        );
+        let results: Vec<_> = requests[1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool" && message["tool_call_id"] == "truncated")
+            .collect();
+        assert_eq!(results.len(), 1);
+        let wire_rejection: Value =
+            serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(wire_rejection["error_kind"], "tool_call_arguments_invalid");
     }
 
     #[tokio::test]
@@ -50232,177 +48665,46 @@ mod tests {
     }
 
     #[cfg(feature = "e2e-hooks")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn mock_turn_persists_local_llm_capture_when_session_capture_enabled() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let session_id = "00000000-0000-0000-0000-000000000125";
-
-        let mut host = test_host_builder("user-capture", session_id.to_string())
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_full_llm_capture(true)
-            .with_test_llm_rounds(vec![json!({
-                "full_text": "captured reply",
-                "usage": { "prompt_tokens": 7, "completion_tokens": 9 }
-            })])
-            .build();
-        let mut state = create_test_state();
-        state.message = "capture this turn".to_string();
-        state.user_intent = state.message.clone();
-
-        host.run_one_mock_turn_for_test(&mut state)
-            .await
-            .expect("mock turn");
-
-        let owner = astra_services::OwnerScope::user("user-capture").expect("capture owner");
-        let session_dir = astra_services::local_session_artifact_store()
-            .session_dir_for_owner(&owner, session_id)
-            .expect("session dir");
-        let files: Vec<_> = std::fs::read_dir(session_dir)
-            .expect("capture dir")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
-        assert!(
-            files
-                .iter()
-                .any(|name| name.contains("llm_capture_t0_r0_server_loop_host_success")),
-            "expected local llm capture file, got {files:?}"
-        );
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn mock_terminal_handoff_keeps_reasoning_private_and_skips_tool_delivery() {
-        let public_name = "mcp__provider__arbitrary_control_name";
-        let metadata = json!({
-            "control": {
-                "kind": "moi.control.handoff.v1",
-                "target": "agent_authoring",
-                "terminal": true,
-                "policy_id": "authoring.handoff.v1",
-                "ui_visibility": "hidden"
-            }
-        });
-        let descriptor =
-            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
-                public_name,
-                Some(&metadata),
-            )
-            .expect("valid control metadata")
-            .expect("control descriptor");
-        let snapshot =
-            crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]);
-        let mut host = test_host_builder("user-handoff", "")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_llm_rounds(vec![json!({
-                "reasoning": "private routing analysis",
-                "tool_calls": [{
-                    "id": "call-handoff",
-                    "type": "function",
-                    "function": {
-                        "name": public_name,
-                        "arguments": r#"{"action":"revise_current_agent"}"#
-                    }
-                }],
-                "usage": {"prompt_tokens": 13, "completion_tokens": 3}
-            })])
-            .build();
-        host.install_runtime_tool_schemas(
-            vec![json!({
-                "type": "function",
-                "function": {
-                    "name": public_name,
-                    "description": "Transfer runtime control",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"action": {"type": "string"}},
-                        "required": ["action"]
-                    }
-                }
-            })],
-            snapshot,
-        );
-        let mut state = create_test_state();
-        state.message = "revise the current agent".to_string();
-        state.user_intent = state.message.clone();
-
-        let result = host
-            .run_one_mock_turn_for_test(&mut state)
-            .await
-            .expect("mock terminal handoff turn");
-        let events = host.take_emitted_events();
-
-        assert!(result.edge_tool_round.is_empty());
-        assert!(events.iter().any(|event| {
-            event.get("type").and_then(Value::as_str) == Some("runtime.control.handoff.requested")
-        }));
-        assert!(events.iter().all(|event| {
-            !matches!(
-                event.get("type").and_then(Value::as_str),
-                Some("reasoning_delta" | "reasoning_done" | "text_delta" | "tool_call")
-            )
-        }));
-        assert!(matches!(
-            host.take_terminal_control_outcome(),
-            Some(crate::turn::terminal_control::TerminalControlOutcome::Requested(_))
-        ));
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn idless_terminal_handoff_is_rejected_before_control_or_delivery() {
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
+            server_host_builder,
+        };
         let public_name = "mcp__provider__runtime_control";
-        let descriptor =
-            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
-                public_name,
-                Some(&json!({
-                    "control": {
-                        "kind": "moi.control.handoff.v1",
-                        "target": "agent_authoring",
-                        "terminal": true,
-                        "policy_id": "authoring.handoff.v1"
-                    }
-                })),
-            )
-            .expect("valid control metadata")
-            .expect("control descriptor");
-        let mut host = test_host_builder("user-idless-handoff", "")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_llm_rounds(vec![json!({
-                "tool_calls": [{
-                    "type": "function",
-                    "function": {
-                        "name": public_name,
-                        "arguments": r#"{"action":"revise_current_agent"}"#
-                    }
-                }],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 3}
-            })])
-            .build();
-        host.install_runtime_tool_schemas(
-            vec![json!({
-                "type": "function",
-                "function": {
-                    "name": public_name,
-                    "description": "Transfer runtime control",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            })],
-            crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]),
-        );
-        let mut state = create_test_state();
+        let gateway = ProviderGateway::start(vec![ProviderScript::new("declared idless control", |request| request.path == "/v1/chat/completions" && request.body["model"] == "native-terminal-model", vec![ProviderResponse::OpenAi(json!({
+            "id":"idless-response","model":"native-terminal-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"mcp__provider__runtime_control","arguments":"{\"action\":\"revise_current_agent\"}"}}]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}
+        }))])]).await;
+        let inference = InferenceLedgerFixture::default();
+        let session = "session-native-idless-control";
+        let mut host = server_host_builder(
+            &gateway,
+            &inference,
+            session,
+            "openai",
+            "native-terminal-model",
+            None,
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+        .build();
+        let descriptor = crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(public_name, Some(&json!({"control":{
+            "kind":"moi.control.handoff.v1","target":"agent_authoring","terminal":true,"policy_id":"authoring.handoff.v1"
+        }}))).unwrap().unwrap();
+        host.install_runtime_tool_schemas_with_native_ids(vec![json!({"type":"function","function":{
+            "name":public_name,"description":"Transfer runtime control","parameters":{"type":"object","properties":{"action":{"type":"string"}},"required":["action"]}
+        }})], crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]), HashMap::from([(public_name.to_owned(), public_name.to_owned())]));
+        host.always_load_tool_names.insert(public_name.to_owned());
+        let mut state = loop_state(session, Vec::new(), "Revise the current agent.");
+        host.prepare_model_selection(&mut state).await.unwrap();
         let result = host
-            .run_one_mock_turn_for_test(&mut state)
+            .execute_turn(&mut state)
             .await
-            .expect("mock terminal turn");
-        assert!(
-            result.edge_tool_round.is_empty(),
-            "terminal control must not produce an ordinary edge-tool result"
-        );
-
+            .expect("actual idless provider turn");
+        state.commit_volatile_attempt_lease();
+        assert!(result.edge_tool_round.is_empty());
         let admission = AgenticLoopHost::admit_tool_calls(
             &mut host,
             &result.accum.tool_calls,
@@ -50411,13 +48713,28 @@ mod tests {
         assert!(admission.admitted.is_empty());
         assert_eq!(admission.rejected.len(), 1);
         assert!(host.take_terminal_control_outcome().is_none());
-
         let delivered = host
             .handle_admitted_tool_invocations(&mut state, &admission.admitted)
             .await;
         assert!(delivered.results.is_empty());
         assert_eq!(delivered.control, AdmittedToolCallControl::Continue);
         assert!(host.edge_callback_ledger.lock().await.is_empty());
+        assert!(host.take_emitted_events().iter().all(|event| !matches!(
+            event["type"].as_str(),
+            Some("runtime.control.handoff.requested" | "tool_request" | "approval_request")
+        )));
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(), 1);
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|schema| tool_schema_name(schema) == Some(public_name))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -50918,7 +49235,7 @@ mod tests {
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
         let session_id = "session-terminal-stream";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-        let terminal_tool = "mcp__provider__runtime_control";
+        let terminal_tool = "mcp__provider__arbitrary_control_name";
         let (gateway_url, provider_completed, requests, server) = spawn_delayed_streaming_gateway(
             Duration::from_millis(200),
             vec![
@@ -50949,7 +49266,8 @@ mod tests {
                         "kind": "moi.control.handoff.v1",
                         "target": "agent_authoring",
                         "terminal": true,
-                        "policy_id": "authoring.handoff.v1"
+                        "policy_id": "authoring.handoff.v1",
+                        "ui_visibility": "hidden"
                     }
                 })),
             )
@@ -50987,7 +49305,9 @@ mod tests {
         state.user_intent = state.message.clone();
 
         let result = host.execute_turn(&mut state).await.expect("terminal turn");
+        state.commit_volatile_attempt_lease();
         assert!(result.edge_tool_round.is_empty());
+        assert!(host.edge_callback_ledger.lock().await.is_empty());
         assert!(provider_completed.load(Ordering::SeqCst));
         let mut streamed_events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -51061,6 +49381,37 @@ mod tests {
         state.user_intent = state.message.clone();
 
         host.execute_turn(&mut state).await.expect("execute turn");
+        state.commit_volatile_attempt_lease();
+        let owner = astra_services::OwnerScope::user("user-journal").unwrap();
+        let directory = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(&owner, session_id)
+            .unwrap();
+        let prefix = format!(
+            "llm_capture_t{}_r0_server_loop_host_success",
+            state.session_turn
+        );
+        let captures: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        assert_eq!(captures.len(), 1);
+        let local: Value = serde_json::from_slice(&std::fs::read(&captures[0]).unwrap()).unwrap();
+        assert!(
+            local["request"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["role"] == "user"
+                    && message["content"] == "capture this turn")
+        );
+        assert_eq!(local["response"]["full_text"], "journal capture reply");
+        assert_eq!(local["response"]["usage"]["input_tokens"], 12);
+        assert_eq!(local["response"]["usage"]["output_tokens"], 5);
 
         state
             .turn_event_buffer
@@ -51558,36 +49909,59 @@ mod tests {
     }
 
     #[cfg(feature = "e2e-hooks")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn mock_turn_can_inject_error_with_structured_details() {
-        let mut host = test_host_builder("user-capture", "")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_llm_rounds(vec![json!({
-                "error": {
-                    "message": "synthetic streamed failure",
-                    "kind": "stream_transport",
-                    "details": {
-                        "partial_full_text": "half answer",
-                        "usage": { "input_tokens": 17, "output_tokens": 3, "total_tokens": 20 }
-                    }
-                }
-            })])
-            .build();
-        let mut state = create_test_state();
-        state.message = "fail this turn".to_string();
-        state.user_intent = state.message.clone();
-
-        let error = match host.run_one_mock_turn_for_test(&mut state).await {
-            Ok(_) => panic!("mock round should fail"),
+    #[tokio::test]
+    async fn provider_eof_preserves_partial_text_and_measured_usage() {
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
+            server_host_builder,
+        };
+        let gateway = ProviderGateway::start(vec![ProviderScript::new("partial response without terminal", |request| request.path == "/v1/chat/completions" && request.body["model"] == "partial-model", vec![ProviderResponse::Stream {
+            content_type: "text/event-stream",
+            chunks: vec![format!("data: {}\n\n", json!({"id":"partial-response","model":"partial-model","choices":[{"index":0,"delta":{"content":"half answer"}}],"usage":{"prompt_tokens":17,"completion_tokens":3,"total_tokens":20}})).into_bytes()],
+            release_before_chunk: None,
+        }])]).await;
+        let inference = InferenceLedgerFixture::default();
+        let session = "session-native-partial-eof";
+        let mut host = server_host_builder(
+            &gateway,
+            &inference,
+            session,
+            "openai",
+            "partial-model",
+            None,
+        )
+        .build();
+        let mut state = loop_state(
+            session,
+            Vec::new(),
+            "Explain the facts without making changes.",
+        );
+        host.prepare_model_selection(&mut state).await.unwrap();
+        let error = match host.execute_turn(&mut state).await {
+            Ok(_) => panic!("EOF without terminal must fail"),
             Err(error) => error,
         };
+        state.restore_volatile_attempt_lease();
         assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
-        assert_eq!(error.message, "synthetic streamed failure");
-        let details: Value =
-            serde_json::from_str(error.details_json.as_deref().expect("details json")).unwrap();
-        assert_eq!(details["partial_full_text"].as_str(), Some("half answer"));
-        assert_eq!(details["usage"]["input_tokens"].as_i64(), Some(17));
+        assert!(error.message.contains("terminal marker"), "{error:?}");
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("partial error details"),
+        )
+        .unwrap();
+        assert_eq!(details["partial_full_text"], "half answer");
+        assert_eq!(details["usage"]["input_tokens"], 17);
+        assert_eq!(details["usage"]["output_tokens"], 3);
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(), 1);
+        assert_eq!(
+            gateway.requests.lock().await.len(),
+            1,
+            "visible partial output must not be replayed"
+        );
     }
 
     #[tokio::test]
@@ -52106,9 +50480,8 @@ mod tests {
     #[tokio::test]
     async fn full_progress_queue_backpressures_instead_of_dropping_interaction() {
         let mut host = test_host_builder("user1", "sess1").build();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_token = Arc::new(CancellationToken::new());
-        host.set_client_cancel(Arc::clone(&cancel_flag), Arc::clone(&cancel_token));
+        host.set_client_cancel(Arc::clone(&cancel_token));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let gap = HostEventGapTracker::default();
@@ -52137,10 +50510,6 @@ mod tests {
                 .expect("capacity release delivers the interaction exactly once");
         }
 
-        assert!(
-            !cancel_flag.load(Ordering::SeqCst),
-            "backpressure must not be promoted to user cancellation"
-        );
         assert!(
             !cancel_token.is_cancelled(),
             "LLM cancellation token must remain active on channel backpressure"
@@ -52472,9 +50841,8 @@ mod tests {
     #[test]
     fn disconnected_sse_observer_detaches_without_cancelling_durable_run() {
         let mut host = test_host_builder("user1", "sess1").build();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_token = Arc::new(CancellationToken::new());
-        host.set_client_cancel(Arc::clone(&cancel_flag), Arc::clone(&cancel_token));
+        host.set_client_cancel(Arc::clone(&cancel_token));
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
@@ -52489,7 +50857,6 @@ mod tests {
             "status": "completed"
         }));
 
-        assert!(!cancel_flag.load(Ordering::SeqCst));
         assert!(!cancel_token.is_cancelled());
         assert!(host.event_tx.is_none());
         assert_eq!(host.emitted_events.len(), 1);
@@ -53101,158 +51468,6 @@ mod tests {
         assert_eq!(sse["status"], "idle");
     }
 
-    // ── Mock-LLM prompt-cache verification framework tests ──────────────────
-    //
-    // These exercise the pure helpers that assemble `CapturedLlmRequest` so we
-    // can trust the framework before layering E2E tests on top.
-
-    #[cfg(feature = "e2e-hooks")]
-    #[test]
-    fn captured_request_counts_anthropic_cache_control_blocks() {
-        let primary = json!({
-            "role": "system",
-            "content": [
-                { "type": "text", "text": "stable global" },
-                { "type": "text", "text": "frozen middle", "cache_control": { "type": "ephemeral" } },
-                { "type": "text", "text": "dynamic tail" },
-            ]
-        });
-        assert_eq!(super::count_system_cache_control(&primary), 1);
-
-        let primary_openai = json!({ "role": "system", "content": "plain text" });
-        assert_eq!(super::count_system_cache_control(&primary_openai), 0);
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[test]
-    fn captured_request_prefix_hash_for_anthropic_covers_only_up_to_breakpoint() {
-        let primary = json!({
-            "role": "system",
-            "content": [
-                { "type": "text", "text": "A" },
-                { "type": "text", "text": "B", "cache_control": { "type": "ephemeral" } },
-                { "type": "text", "text": "C" },
-            ]
-        });
-        // Prefix is "AB" (stops at last cache_control breakpoint).
-        let hex = super::sha256_hex("AB");
-        let prefix = super::cacheable_prefix_text(&primary, true);
-        assert_eq!(prefix, "AB");
-        assert_eq!(super::sha256_hex(&prefix), hex);
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[test]
-    fn captured_request_prefix_hash_for_openai_concatenates_all_text() {
-        let primary = json!({
-            "role": "system",
-            "content": "stable prefix text"
-        });
-        let prefix = super::cacheable_prefix_text(&primary, false);
-        assert_eq!(prefix, "stable prefix text");
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[test]
-    fn captured_request_openai_prefix_equal_across_turns_drives_cache_hit() {
-        // Two turns with identical stable system content → identical hash.
-        let p1 = json!({ "role": "system", "content": "SAME" });
-        let p2 = json!({ "role": "system", "content": "SAME" });
-        let h1 = super::sha256_hex(&super::cacheable_prefix_text(&p1, false));
-        let h2 = super::sha256_hex(&super::cacheable_prefix_text(&p2, false));
-        assert_eq!(h1, h2, "OpenAI stable-prefix hash must match byte-for-byte");
-
-        // A schema churn / content diff breaks the prefix hash.
-        let p3 = json!({ "role": "system", "content": "DIFFERENT" });
-        let h3 = super::sha256_hex(&super::cacheable_prefix_text(&p3, false));
-        assert_ne!(h1, h3, "Prefix change must invalidate cache key");
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[test]
-    fn captured_request_detects_last_tool_and_last_message_cache_markers() {
-        let tools = vec![
-            json!({ "type": "function", "function": { "name": "a" } }),
-            json!({
-                "type": "function",
-                "function": { "name": "b" },
-                "cache_control": { "type": "ephemeral" }
-            }),
-        ];
-        let messages = vec![
-            json!({ "role": "user", "content": "hello" }),
-            json!({
-                "role": "assistant",
-                "content": [
-                    { "type": "text", "text": "reply", "cache_control": { "type": "ephemeral" } }
-                ]
-            }),
-        ];
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown::default();
-        let captured = super::build_captured_llm_request(
-            0,
-            "anthropic".to_string(),
-            "claude-sonnet-4".to_string(),
-            &cfg,
-            &[
-                json!({ "role": "system", "content": [{ "type": "text", "text": "x", "cache_control": { "type": "ephemeral" } }] }),
-            ],
-            &tools,
-            &messages,
-            &messages,
-            &breakdown,
-        );
-        assert!(captured.last_tool_has_cache_control);
-        assert!(captured.last_message_has_cache_control);
-        assert_eq!(captured.system_cache_control_count, 1);
-        assert!(captured.is_anthropic);
-        assert!(captured.cache_enabled);
-        assert_eq!(captured.turn_index, 0);
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    #[test]
-    fn normalize_message_for_cache_hash_canonicalizes_tool_content_shapes() {
-        let string_tool = json!({
-            "role": "tool",
-            "tool_call_id": "tooluse_123",
-            "content": "tool output",
-            "cache_control": { "type": "ephemeral" }
-        });
-        let normalized_string = super::normalize_message_for_cache_hash(&string_tool);
-        assert_eq!(
-            normalized_string["content"],
-            json!([{
-                "type": "tool_result",
-                "tool_use_id": "tooluse_123",
-                "content": "tool output"
-            }])
-        );
-
-        let array_tool = json!({
-            "role": "tool",
-            "tool_call_id": "tooluse_456",
-            "content": [{
-                "type": "tool_result",
-                "content": "tool output",
-                "cache_control": { "type": "ephemeral" }
-            }]
-        });
-        let normalized_array = super::normalize_message_for_cache_hash(&array_tool);
-        assert_eq!(
-            normalized_array["content"],
-            json!([{
-                "type": "tool_result",
-                "tool_use_id": "tooluse_456",
-                "content": "tool output"
-            }])
-        );
-    }
-
     // ── Prompt-visible tool schema / skill runtime-policy tests ────────────
 
     fn sample_edge_tools_full() -> Vec<Value> {
@@ -53576,6 +51791,83 @@ mod tests {
                 .contains("web_fetch"),
             "a historical deferred catalog entry must not survive a current capability restriction"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn context_history_writer_obeys_admitted_absolute_deadline() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut host = test_host_builder("owner", "session").build();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        host.execution_time_budget = Some(RunExecutionTimeBudget {
+            deadline,
+            deadline_unix_ms: 1,
+        });
+        let mut state = create_test_state();
+        state.current_session_id = Some("session".into());
+        state.runtime_tool_executor = Some(Arc::new(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                directory.path().to_path_buf(),
+                "owner".into(),
+                "session".into(),
+                None,
+                None,
+            )
+            .with_test_session_artifact_store(Arc::new(
+                crate::server::explain_analyze_artifact::tests::MemoryStore {
+                    block_persistence: true,
+                    ..Default::default()
+                },
+            )),
+        ));
+        let before = state.messages.clone();
+        let history =
+            astra_turn_types::ContextHistoryArtifactV1::new("session", "run", 1, "[{}]".into())
+                .unwrap();
+        let error = host
+            .persist_context_history(&state, &uuid::Uuid::new_v4().to_string(), history)
+            .await
+            .unwrap_err();
+        assert!(error.contains("admitted execution deadline"));
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert_eq!(state.messages, before);
+        assert_eq!(host.execution_time_budget.unwrap().deadline, deadline);
+    }
+
+    #[test]
+    fn context_history_spill_requires_the_actual_model_reader_surface() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut host = test_host_builder("u-recovery", "s-recovery").build();
+        host.remember_resolved_llm_config(&summary_test_config(String::new()));
+        host.last_turn_tool_schemas = vec![json!({"type":"function","function":{
+            "name":"introspect", "parameters":{"type":"object"}
+        }})];
+        let mut state = create_test_state();
+        let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            directory.path().to_path_buf(),
+            "u-recovery".into(),
+            "s-recovery".into(),
+            None,
+            None,
+        )
+        .with_test_session_artifact_store(Arc::new(
+            crate::server::explain_analyze_artifact::tests::MemoryStore::default(),
+        ));
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        assert!(host.context_history_artifacts_available(&state));
+        state.skills.request_constraints.allowed_tools = Some(HashSet::from(["web_fetch".into()]));
+        assert!(!host.context_history_artifacts_available(&state));
+        state.skills.request_constraints.allowed_tools = None;
+        state.restricted_tools.insert("introspect".into());
+        assert!(!host.context_history_artifacts_available(&state));
+        state.restricted_tools.clear();
+        state.hooks.completion_settlement.text_only = true;
+        assert!(!host.context_history_artifacts_available(&state));
+        state.hooks.completion_settlement.text_only = false;
+        state.hooks.completion_settlement.work_settlement_only = true;
+        assert!(!host.context_history_artifacts_available(&state));
+        state.hooks.completion_settlement.work_settlement_only = false;
+        host.last_turn_tool_schemas.clear();
+        assert!(!host.context_history_artifacts_available(&state));
     }
 
     #[test]
@@ -54733,8 +53025,7 @@ mod tests {
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
         async fn read_only_admission_keeps_a_typed_plan_proposal_text_only() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-            let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
-            let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+            let _mode = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
             let proposal = serde_json::json!({
                 "context_id": "work-plan-context-v1:7f2a",
                 "proposal_status": "pending_admission",
@@ -54758,38 +53049,40 @@ mod tests {
                     "successor_item_id": "verification"
                 }]
             });
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let classification_client = SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new([classification_response(false)].into()),
-                requests: requests.clone(),
+            use crate::server::provider_test_support::{
+                InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+                loop_state, server_host_builder,
             };
-            let planner_client = SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                requests: requests.clone(),
-            };
-            let mut host = test_host_builder("plan-user", "plan-session")
-                .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-                    true, false,
-                ))
-                .with_test_inference_ledger(
-                    crate::turn::llm::durable::TestInferenceLedgerPersistence::default(),
-                )
-                .with_test_judgment_clients([
-                    Box::new(classification_client)
-                        as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
-                    Box::new(planner_client),
-                ])
-                .with_turn_intent_policy(TurnIntentExecutionPolicy::Auto)
-                .with_test_llm_rounds(vec![json!({
-                    "full_text": proposal.to_string(),
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                })])
-                .build();
-            let mut state = create_durable_execution_test_state("plan-session");
-            state.message = "prepare a typed non-authoritative plan proposal".to_string();
-            state.user_intent = state.message.clone();
+            let instruction = "prepare a typed non-authoritative plan proposal";
+            let gateway = ProviderGateway::start(vec![
+                ProviderScript::new("classification only", |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini", vec![ProviderResponse::OpenAi(json!({"id":"classification-response","model":"gpt-5-mini","choices":[{"index":0,"message":{"role":"assistant","content":discrete_classification_response(false)},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}))]),
+                ProviderScript::new("read-only primary proposal", |request| request.path == "/v1/chat/completions" && request.body["model"] == "plan-primary-model", vec![ProviderResponse::OpenAi(json!({"id":"proposal-response","model":"plan-primary-model","choices":[{"index":0,"message":{"role":"assistant","content":proposal.to_string()},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18}}))]),
+            ]).await;
+            let ledger = InferenceLedgerFixture::default();
+            let session = "session-native-read-only-proposal";
+            let mut host = server_host_builder(
+                &gateway,
+                &ledger,
+                session,
+                "openai",
+                "plan-primary-model",
+                None,
+            )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .with_turn_intent_policy(TurnIntentExecutionPolicy::Auto)
+            .build();
+            let execution = test_gateway_execution(
+                format!("{}/v1/chat/completions", gateway.base_url),
+                Some(3000),
+            );
+            let mut config = summary_test_config(format!("{}/v1", gateway.base_url));
+            config.model_name = execution.model_name.clone();
+            config.completions_url_override =
+                Some(format!("{}/v1/chat/completions", gateway.base_url));
+            host.judgment_route_cache = Some(Ok(ResolvedJudgmentRoute { config, execution }));
+            let mut state = loop_state(session, Vec::new(), instruction);
 
             assert_eq!(
                 host.judge_turn_intent(&state).await,
@@ -54824,7 +53117,37 @@ mod tests {
             );
             assert!(host.pending_work_establishment.is_none());
             assert_eq!(state.total_tool_calls, 0);
-            assert_eq!(requests.lock().expect("judgment requests").len(), 1);
+            gateway.assert_complete();
+            ledger.assert_quiescent();
+            assert_eq!(
+                ledger.attempt_count(),
+                2,
+                "one classification and one primary, no planner"
+            );
+            let requests = gateway.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            let classification: Vec<_> = requests
+                .iter()
+                .filter(|request| request.body["model"] == "gpt-5-mini")
+                .collect();
+            assert_eq!(classification.len(), 1);
+            let messages = classification[0].body["messages"].as_array().unwrap();
+            let request = astra_turn_types::judgment_request_from_messages(messages).unwrap();
+            let expected =
+                astra_services::work_admission_classification_request(&Default::default());
+            assert_eq!(request.questions, expected.questions);
+            assert!(
+                serde_json::to_string(&request)
+                    .unwrap()
+                    .contains(instruction)
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.body["model"] == "plan-primary-model")
+                    .count(),
+                1
+            );
         }
     }
 }

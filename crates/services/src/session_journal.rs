@@ -2486,6 +2486,31 @@ impl JournalWriter {
         Ok(())
     }
 
+    /// Commit an end boundary. A retry after an ambiguous fsync failure syncs
+    /// the existing end instead of appending a duplicate (or a new start).
+    pub fn append_session_end(&self, turn: u32) -> std::io::Result<()> {
+        self.append_session_end_with_sync(turn, std::fs::File::sync_data)
+    }
+
+    fn append_session_end_with_sync(
+        &self,
+        turn: u32,
+        sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = open_locked_journal_file(&self.path)?;
+        if read_last_event_type(&self.path)? != Some(JournalEventType::SessionEnd) {
+            let event = JournalEvent::session_end(Some(&self.session_id), turn);
+            let events = prepend_session_start_if_needed(&self.path, std::slice::from_ref(&event))?;
+            file.write_all(&serialize_journal_events(events.as_ref())?)?;
+            sync(&file)?;
+            update_cached_session_start_state_from_events(&self.path, events.as_ref());
+        } else {
+            sync(&file)?;
+        }
+        Ok(())
+    }
+
     /// Get the path to this journal file.
     pub fn path(&self) -> &PathBuf {
         &self.path
@@ -7479,15 +7504,22 @@ pub struct SessionMaintenanceResult {
 ///
 /// Both thresholds use the journal file's modification time. This function is
 /// idempotent and safe to call at every REPL startup.
-pub fn run_session_maintenance(
+pub fn run_session_maintenance_for_owner(
+    owner: &OwnerScope,
+    protected_session_id: Option<&str>,
     ttl_days: u64,
     compress_after_days: u64,
-) -> SessionMaintenanceResult {
-    let dir = journal_dir();
+) -> std::io::Result<SessionMaintenanceResult> {
+    let dir = journal_dir_for_owner(owner)?;
     if !dir.exists() {
-        return SessionMaintenanceResult::default();
+        return Ok(SessionMaintenanceResult::default());
     }
-    run_session_maintenance_in(dir, ttl_days, compress_after_days)
+    Ok(run_session_maintenance_in(
+        dir,
+        ttl_days,
+        compress_after_days,
+        protected_session_id,
+    ))
 }
 
 #[cfg(test)]
@@ -8546,6 +8578,7 @@ fn run_session_maintenance_in(
     dir: PathBuf,
     ttl_days: u64,
     compress_after_days: u64,
+    protected_session_id: Option<&str>,
 ) -> SessionMaintenanceResult {
     use std::time::{Duration, SystemTime};
 
@@ -8576,6 +8609,9 @@ fn run_session_maintenance_in(
             Some(sid) => sid.to_string(),
             None => continue,
         };
+        if protected_session_id == Some(session_id.as_str()) {
+            continue;
+        }
         // Skip .jsonl.gz — already compressed
         if name_str.ends_with(".jsonl.gz") {
             continue;
@@ -8606,6 +8642,9 @@ fn run_session_maintenance_in(
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if let Some(sid) = name_str.strip_suffix(".jsonl.gz") {
+                if protected_session_id == Some(sid) {
+                    continue;
+                }
                 let mtime = match entry.metadata().and_then(|m| m.modified()) {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -10634,6 +10673,69 @@ mod tests {
     }
 
     #[test]
+    fn session_end_retry_after_sync_failure_commits_only_once() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let journal = JournalWriter::new("end-sync-retry").unwrap();
+        assert!(
+            journal
+                .append_session_end_with_sync(1, |_| Err(std::io::Error::other("sync fault")))
+                .is_err()
+        );
+        journal.append_session_end(1).unwrap();
+        let events = read_journal("end-sync-retry").unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SessionEnd)
+                .count(),
+            1
+        );
+        journal
+            .append(&JournalEvent::turn(
+                Some("end-sync-retry"),
+                2,
+                None,
+                "continue",
+                "done",
+                1,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+        journal.append_session_end(2).unwrap();
+        assert_eq!(
+            read_journal("end-sync-retry")
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SessionEnd)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn maintenance_preserves_resume_target_and_workspace_for_both_journal_formats() {
+        for suffix in ["jsonl", "jsonl.gz"] {
+            let tmp = tempdir().unwrap();
+            let path = tmp.path().join(format!("resume.{suffix}"));
+            std::fs::write(&path, "journal").unwrap();
+            let mtime = filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400),
+            );
+            filetime::set_file_mtime(&path, mtime).unwrap();
+            std::fs::create_dir(tmp.path().join("resume")).unwrap();
+            let result =
+                run_session_maintenance_in(tmp.path().to_path_buf(), 30, 7, Some("resume"));
+            assert_eq!(result.sessions_deleted, 0);
+            assert_eq!(result.journals_compressed, 0);
+            assert!(path.exists());
+            assert!(tmp.path().join("resume").exists());
+        }
+    }
+
+    #[test]
     fn session_maintenance_all_scenarios() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -10655,7 +10757,7 @@ mod tests {
         std::fs::create_dir_all(session_dir.join("step_checkpoints")).unwrap();
         std::fs::write(session_dir.join("workspace.yaml"), "session_id: test").unwrap();
         create_aged_journal(&dir, "new-session", 1);
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!dir.join("old-session.jsonl").exists());
         assert!(!dir.join("old-session").exists());
@@ -10663,14 +10765,14 @@ mod tests {
 
         // Compress old journals (10 days, compress_after=7)
         create_aged_journal(&dir, "mid-session", 10);
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.journals_compressed, 1);
         assert!(!dir.join("mid-session.jsonl").exists());
         assert!(dir.join("mid-session.jsonl.gz").exists());
 
         // Skip recent sessions (fresh, 0 days)
         std::fs::write(dir.join("fresh.jsonl"), r#"{"type":"session_start"}"#).unwrap();
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert!(dir.join("fresh.jsonl").exists());
@@ -10682,13 +10784,13 @@ mod tests {
             std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400 + 3600),
         );
         filetime::set_file_mtime(&gz_path, mtime).unwrap();
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!gz_path.exists());
 
         // Empty dir returns defaults
         let tmp2 = tempdir().unwrap();
-        let result = run_session_maintenance_in(tmp2.path().to_path_buf(), 30, 7);
+        let result = run_session_maintenance_in(tmp2.path().to_path_buf(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert_eq!(result.bytes_freed, 0);

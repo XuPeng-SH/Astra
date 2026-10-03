@@ -85,7 +85,6 @@ fn ten_turn_session_lifecycle() {
     let session = make_session_context();
     let external = ExternalSources {
         memory_entries: vec![MemoryEntry::new("User prefers concise answers.")],
-        spill_dir: None,
         ..Default::default()
     };
     let limits = OptimizeLimits::default();
@@ -165,7 +164,6 @@ fn ptl_error_recovery_and_abort() {
     let turn = make_turn_state(1, 2);
     let external = ExternalSources {
         memory_entries: vec![],
-        spill_dir: None,
         ..Default::default()
     };
     let limits = OptimizeLimits::default();
@@ -236,7 +234,6 @@ fn full_lifecycle_with_emergent_and_latches() {
     let session = make_session_context();
     let external = ExternalSources {
         memory_entries: vec![MemoryEntry::new("User works on Astra.")],
-        spill_dir: None,
         ..Default::default()
     };
 

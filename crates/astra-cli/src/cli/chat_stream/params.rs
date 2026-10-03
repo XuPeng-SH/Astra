@@ -559,12 +559,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// every SelfModel snapshot surfaces prior-session advice.
     pub(crate) session_lessons: &'a [astra_services::LessonHint],
     pub(crate) memory_selection_reports: &'a [astra_turn_types::MemorySelectionReport],
-    /// P8 seam: most recent auto-invoke diagnosis from the previous turn.
-    /// Injected into this turn's ToolExecutor via
-    /// `set_latest_skill_diagnosis` so the LLM sees "the system already
-    /// noticed X" in the self-awareness section. `None` → no diagnosis
-    /// pending; the ToolExecutor state is untouched.
-    pub(crate) latest_skill_diagnosis: Option<&'a astra_skills::auto_invoke::SkillDiagnosis>,
     /// Evaluator-derived feedback from the previous turn. This is injected
     /// alongside self-awareness on the next turn and cleared by the caller
     /// once a healthy turn completes.
@@ -817,7 +811,7 @@ impl<'a> ChatTurnParams<'a> {
             resume_restricted_tools: &[],
             session_lessons: &[],
             memory_selection_reports: &[],
-            latest_skill_diagnosis: None,
+
             latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
             is_plan_subtask: false,

@@ -130,7 +130,7 @@ fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -
         captured_at_unix_millis: now_millis(),
         session_id: state.session_id.clone(),
         turn: state.turn,
-        model: state.model.clone(),
+        model: state.model.as_deref().map(str::to_string),
         cwd: std::env::current_dir().ok().map(display_path),
         git_branch: detect_git_branch(),
         persistence_error: state.session_persistence_error.clone(),

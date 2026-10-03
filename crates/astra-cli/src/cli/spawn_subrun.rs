@@ -99,6 +99,7 @@ pub struct CliSpawnAgentExecutor {
     bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Session/default model fallback when the spawn request itself omits one.
     default_model: Option<String>,
+    executions: std::sync::Mutex<HashMap<(String, String), Arc<CliSpawnExecution>>>,
 }
 
 /// Build the child agent's message array from system prompt, optional
@@ -529,6 +530,7 @@ impl CliSpawnAgentExecutor {
             bg_task_commands: None,
             bg_task_list_cache: None,
             default_model: None,
+            executions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -546,12 +548,6 @@ impl CliSpawnAgentExecutor {
     pub fn with_token_provider(mut self, provider: TokenProvider) -> Self {
         self.token_provider = Some(provider);
         self
-    }
-
-    fn resolve_effective_model(&self, config_model: Option<&str>) -> Option<String> {
-        config_model
-            .map(ToOwned::to_owned)
-            .or_else(|| self.default_model.clone())
     }
 
     async fn resolve_token_async(&self) -> Result<String, String> {
@@ -666,6 +662,33 @@ impl CliSpawnAgentExecutor {
 
 #[async_trait]
 impl SpawnAgentExecutor for CliSpawnAgentExecutor {
+    async fn cancel_spawned_run_durably(
+        &self,
+        run_id: &str,
+        binding: Option<&str>,
+        _user: Option<&str>,
+        _reason: &str,
+        origin: CancellationOrigin,
+    ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String> {
+        let binding = binding.ok_or("CLI cancellation requires an exact invocation binding")?;
+        let control = astra_core::sync_poison::recover_mutex_lock(&self.executions)
+            .get(&(run_id.to_owned(), binding.to_owned()))
+            .cloned();
+        if let Some(control) = control {
+            {
+                let mut current = astra_core::sync_poison::recover_mutex_lock(&control.origin);
+                if origin == CancellationOrigin::User || *current != CancellationOrigin::User {
+                    *current = origin;
+                }
+            }
+            control.cancellation.cancel();
+            // The receipt exists only after provision, execution, and cleanup
+            // workers actually finish. Observer timeout never cancels that owner.
+            let _ = control.wait().await;
+        }
+        Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+    }
+
     fn bind_parent_session(&self, session_id: &str) {
         self.bind_session_transcript(session_id.to_string());
     }
@@ -682,6 +705,13 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         for input in inputs {
             input.fanout_slot_identity()?;
+            if let (Some(reasoning), Some(limit)) =
+                (input.reasoning.as_ref(), input.max_output_tokens)
+            {
+                reasoning
+                    .config()
+                    .validate_output_budget(u64::from(limit))?;
+            }
         }
         let parent_selection = parent_selection.or_else(|| {
             context
@@ -900,6 +930,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         } else if let Some((selection, model_name)) = parent_model_snapshot {
             vec![
                 crate::cli::session::session_runtime::ServerModelSelection {
+                    pricing: None,
                     name: model_name.to_string(),
                     context_window: None,
                     offering_id: selection.offering_id.clone(),
@@ -907,11 +938,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 inputs.len()
             ]
         } else {
-            let inherited_model_name = self.resolve_effective_model(None);
             let model = crate::cli::skill_subrun::resolve_subrun_model_selection(
                 &self.api,
                 token.as_deref().expect("default resolution requires token"),
-                inherited_model_name.as_deref(),
+                self.default_model.as_deref(),
             )
             .await?;
             vec![model; inputs.len()]
@@ -934,38 +964,14 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     slot: input.fanout_slot_identity()?,
                     model,
                     model_provenance,
+                    isolated: input.isolated,
+                    selected_root: context.working_dir.clone(),
+                    execution_key: Default::default(),
+                    control: None,
                 }) as Box<dyn PreparedSpawn>)
             })
             .collect()
     }
-
-    async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-        self.execute_with_model_selection(config, None).await
-    }
-}
-
-fn validate_prepared_child_model_policy(
-    policy: Option<&astra_turn_types::RequestedModelPolicy>,
-    resolved_selection: Option<&astra_turn_types::ModelSelection>,
-    prepared_model: Option<&crate::cli::session::session_runtime::ServerModelSelection>,
-) -> Result<(), String> {
-    let Some(astra_turn_types::RequestedModelPolicy::Fixed {
-        selector: astra_turn_types::ModelSelector::ConfiguredName { model_name, .. },
-    }) = policy
-    else {
-        return Ok(());
-    };
-    let resolved_selection = resolved_selection
-        .ok_or_else(|| "configured model name has no trusted resolved Offering".to_string())?;
-    let prepared_model = prepared_model.ok_or_else(|| {
-        "configured model name requires a matching Server-prepared child model".to_string()
-    })?;
-    if prepared_model.offering_id != resolved_selection.offering_id
-        || !prepared_model.name.eq_ignore_ascii_case(model_name)
-    {
-        return Err("prepared child model does not match its configured-name selector".into());
-    }
-    Ok(())
 }
 
 struct CliPreparedSpawn {
@@ -978,6 +984,60 @@ struct CliPreparedSpawn {
     slot: Option<AgentFanoutSlotIdentity>,
     model: crate::cli::session::session_runtime::ServerModelSelection,
     model_provenance: &'static str,
+    isolated: bool,
+    selected_root: PathBuf,
+    execution_key: (String, String),
+    control: Option<Arc<CliSpawnExecution>>,
+}
+
+struct CliSpawnExecution {
+    cancellation: tokio_util::sync::CancellationToken,
+    origin: std::sync::Mutex<CancellationOrigin>,
+    result: tokio::sync::watch::Sender<Option<Result<SpawnRunResult, String>>>,
+}
+
+impl CliSpawnExecution {
+    async fn wait(&self) -> Result<SpawnRunResult, String> {
+        let mut receipt = self.result.subscribe();
+        receipt
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| "CLI child execution owner disappeared without settlement".to_string())?
+            .clone()
+            .expect("settlement receipt was checked")
+    }
+}
+
+struct CancelCliExecutionOnDrop(Arc<CliSpawnExecution>);
+impl Drop for CancelCliExecutionOnDrop {
+    fn drop(&mut self) {
+        self.0.cancellation.cancel();
+    }
+}
+
+impl Drop for CliPreparedSpawn {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.take() {
+            control.cancellation.cancel();
+            control
+                .result
+                .send_replace(Some(Err("CLI child was not started".into())));
+            self.executor
+                .remove_execution(&self.execution_key, &control);
+        }
+    }
+}
+
+impl CliSpawnAgentExecutor {
+    fn remove_execution(&self, key: &(String, String), control: &Arc<CliSpawnExecution>) {
+        let mut executions = astra_core::sync_poison::recover_mutex_lock(&self.executions);
+        if executions
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, control))
+        {
+            executions.remove(key);
+        }
+    }
 }
 
 #[async_trait]
@@ -990,12 +1050,17 @@ impl PreparedSpawn for CliPreparedSpawn {
         })
     }
 
-    async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-        if config
-            .parent_address
-            .as_ref()
-            .map(|address| address.run_id.as_str())
-            != Some(self.parent_run_id.as_str())
+    fn launch(
+        mut self: Box<Self>,
+        mut config: SpawnRunConfig,
+    ) -> Result<astra_runtime::orchestration::SpawnExecution, String> {
+        if config.isolated != self.isolated
+            || config.working_dir != self.selected_root
+            || config
+                .parent_address
+                .as_ref()
+                .map(|address| address.run_id.as_str())
+                != Some(self.parent_run_id.as_str())
             || config.fanout_slot != self.slot
             || config.requested_model_policy != self.requested_model_policy
             || config.resolved_model_selection != self.resolved_selection
@@ -1007,27 +1072,315 @@ impl PreparedSpawn for CliPreparedSpawn {
                     .to_string(),
             );
         }
-        self.executor
-            .execute_with_model_selection(config, Some(self.model))
-            .await
+        let key = (
+            config.run_id.clone(),
+            config.cancellation_binding_id.clone(),
+        );
+        let mut executions = astra_core::sync_poison::recover_mutex_lock(&self.executor.executions);
+        if executions.contains_key(&key) {
+            return Err("CLI invocation identity already installed".into());
+        }
+        let (result, _) = tokio::sync::watch::channel(None);
+        let control = Arc::new(CliSpawnExecution {
+            cancellation: crate::cli::skill_subrun::child_cancellation_scope(
+                self.executor.cancel_token.as_ref(),
+            )
+            .as_ref()
+            .clone(),
+            origin: std::sync::Mutex::new(CancellationOrigin::Runtime),
+            result,
+        });
+        executions.insert(key.clone(), Arc::clone(&control));
+        self.execution_key = key;
+        self.control = Some(control);
+        drop(executions);
+        Ok(Box::pin(async move {
+            let control = self
+                .control
+                .take()
+                .ok_or("CLI prepared execution was not installed")?;
+            let key = self.execution_key.clone();
+            let sink = config.live_event_sink.clone();
+            let emitter = config.progress_emitter.clone();
+            let run_id = config.run_id.clone();
+            let agent_id = config.agent_id.clone();
+            let started = std::time::Instant::now();
+            let owner_control = Arc::clone(&control);
+            tokio::spawn(async move {
+                let selected_root = config.working_dir.clone();
+                let deadline_timer = config.execution_deadline.map(|deadline| {
+                    let token = owner_control.cancellation.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(deadline.monotonic_deadline().into()).await;
+                        token.cancel();
+                    })
+                });
+                let mut worktree = None;
+                let provisioned = if config.isolated {
+                    let root = config.working_dir.clone();
+                    let run = run_id.clone();
+                    let cancellation = owner_control.cancellation.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        edge_tools::worktree::provision_child_worktree(&root, &run, &cancellation)
+                    })
+                    .await
+                    {
+                        Ok((handle, result)) => {
+                            worktree = handle;
+                            result
+                        }
+                        Err(error) => Err(format!(
+                            "child workspace provisioning worker failed: {error}"
+                        )),
+                    }
+                } else {
+                    Ok(())
+                };
+                let result = match provisioned {
+                    Err(error) => Err(error),
+                    Ok(()) if owner_control.cancellation.is_cancelled() => {
+                        Err("CLI child cancelled before inference".into())
+                    }
+                    Ok(()) => {
+                        if let Some(handle) = worktree.as_ref() {
+                            config.working_dir = handle.path.clone();
+                        }
+                        use futures_util::FutureExt;
+                        std::panic::AssertUnwindSafe(self.executor.execute_with_model_selection(
+                            config,
+                            self.model.clone(),
+                            Arc::new(owner_control.cancellation.clone()),
+                        ))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Err("CLI child execution panicked".into()))
+                    }
+                };
+                if let Some(timer) = deadline_timer {
+                    timer.abort();
+                }
+                let child_root = worktree.as_ref().map(|handle| handle.path.clone());
+                wait_for_cli_workspace_ownership(
+                    &selected_root,
+                    child_root.as_deref(),
+                    sink.as_ref(),
+                    &run_id,
+                    &agent_id,
+                )
+                .await;
+                // Cleanup is owned independently from observers and uses a fresh
+                // bounded token: cancelling the child must not cancel its cleanup.
+                while let Some(handle) = worktree.take() {
+                    let mut worker_handle = handle.clone();
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    let timer_token = cancellation.clone();
+                    let timer = tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        timer_token.cancel();
+                    });
+                    let cleanup = tokio::task::spawn_blocking(move || {
+                        edge_tools::worktree::cleanup_child_worktree(
+                            &mut worker_handle,
+                            &cancellation,
+                        )
+                    })
+                    .await;
+                    timer.abort();
+                    match cleanup {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%run_id, %error, workspace = %handle.path.display(), "CLI child cleanup remains unsettled");
+                            emit_agent_execution_waiting(sink.as_ref(), &run_id, &agent_id, error);
+                            worktree = Some(handle);
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                        Err(error) => {
+                            // An unknown cleanup outcome cannot authorize Terminal.
+                            // Keep the control unresolved for exact cancellation retries.
+                            tracing::error!(%run_id, %error, "CLI child cleanup worker lost its resource receipt");
+                            worktree = Some(handle);
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                // Cleanup can itself launch Git. Its exit and directory removal
+                // cannot replace a confirmed invocation ownership receipt.
+                wait_for_cli_workspace_ownership(
+                    &selected_root,
+                    child_root.as_deref(),
+                    sink.as_ref(),
+                    &run_id,
+                    &agent_id,
+                )
+                .await;
+                let result = if owner_control.cancellation.is_cancelled() {
+                    let origin =
+                        *astra_core::sync_poison::recover_mutex_lock(&owner_control.origin);
+                    let mut result = result.unwrap_or_else(|error| SpawnRunResult {
+                        agent_id: agent_id.clone(),
+                        run_id: run_id.clone(),
+                        committed_frontier: None,
+                        status: "cancelled".into(),
+                        finish_reason: "cancelled".into(),
+                        cancellation_origin: origin,
+                        output: None,
+                        error: Some(error),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                        turns_completed: 0,
+                        permission_summary: None,
+                        permission_requests: 0,
+                        permission_requests_approved: 0,
+                        tools_blocked: 0,
+                    });
+                    result.status = "cancelled".into();
+                    result.finish_reason = "cancelled".into();
+                    result.cancellation_origin = origin;
+                    Ok(result)
+                } else {
+                    result
+                };
+                publish_cli_spawn_outcome(
+                    &result,
+                    sink.as_ref(),
+                    emitter.as_ref(),
+                    &run_id,
+                    &agent_id,
+                    started,
+                );
+                owner_control.result.send_replace(Some(result));
+                self.executor.remove_execution(&key, &owner_control);
+            });
+            let _cancel_on_drop = CancelCliExecutionOnDrop(Arc::clone(&control));
+            control.wait().await
+        }))
     }
+}
+
+async fn wait_for_cli_workspace_ownership(
+    selected_root: &std::path::Path,
+    child_root: Option<&std::path::Path>,
+    sink: Option<&SharedAgentLiveEventSink>,
+    run_id: &str,
+    agent_id: &str,
+) {
+    // A process error or successful exit without scope ownership is not a
+    // completion receipt. Preserve the existing workspace fence and control.
+    while std::iter::once(selected_root)
+        .chain(child_root)
+        .any(|root| {
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(root) == Some(true)
+        })
+    {
+        emit_agent_execution_waiting(
+            sink,
+            run_id,
+            agent_id,
+            "workspace process ownership remains unsettled".into(),
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Publish execution outcome only after its workspace owner has settled.
+fn publish_cli_spawn_outcome(
+    result: &Result<SpawnRunResult, String>,
+    sink: Option<&SharedAgentLiveEventSink>,
+    emitter: Option<&astra_turn_core::orchestration_progress::AgentProgressEmitter>,
+    run_id: &str,
+    agent_id: &str,
+    started: std::time::Instant,
+) {
+    use astra_turn_core::agent_live_event::AgentLiveTermination;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(emitter) = emitter {
+                emitter.failed(error);
+            }
+            emit_agent_terminated(
+                sink,
+                run_id,
+                agent_id,
+                started,
+                AgentLiveTermination::Failed,
+                Some(error.clone()),
+            );
+            return;
+        }
+    };
+    let summary = result.output.as_deref().unwrap_or("");
+    let preview = summary.chars().take(100).collect::<String>();
+    let reason = result
+        .error
+        .as_deref()
+        .or(result.output.as_deref())
+        .unwrap_or(&result.finish_reason);
+    let duration = started.elapsed().as_millis() as u64;
+    let tokens = (result.prompt_tokens, result.completion_tokens);
+    let termination = match result.status.as_str() {
+        "waiting" | "paused" => {
+            if let Some(emitter) = emitter {
+                emitter.waiting(reason);
+            }
+            emit_agent_execution_waiting(sink, run_id, agent_id, reason.into());
+            return;
+        }
+        "cancelled" => {
+            let reason = if result.cancellation_origin == CancellationOrigin::User {
+                "cancelled by user"
+            } else {
+                "cancelled by runtime"
+            };
+            if let Some(emitter) = emitter {
+                emitter.cancelled(reason, result.cancellation_origin);
+            }
+            AgentLiveTermination::Cancelled
+        }
+        "failed" => {
+            if let Some(emitter) = emitter {
+                emitter.failed(reason);
+            }
+            AgentLiveTermination::Failed
+        }
+        "interrupted" => {
+            if let Some(emitter) = emitter {
+                emitter.interrupted(
+                    &result.finish_reason,
+                    preview,
+                    result.tool_calls,
+                    tokens,
+                    duration,
+                );
+            }
+            AgentLiveTermination::Interrupted
+        }
+        "delegated" => AgentLiveTermination::Delegated,
+        _ => {
+            if let Some(emitter) = emitter {
+                emitter.completed(preview, result.tool_calls, tokens, duration);
+            }
+            AgentLiveTermination::Completed
+        }
+    };
+    emit_agent_terminated(
+        sink,
+        run_id,
+        agent_id,
+        started,
+        termination,
+        Some(result.finish_reason.clone()),
+    );
 }
 
 impl CliSpawnAgentExecutor {
     async fn execute_with_model_selection(
         &self,
         config: SpawnRunConfig,
-        prepared_model: Option<crate::cli::session::session_runtime::ServerModelSelection>,
+        prepared_model: crate::cli::session::session_runtime::ServerModelSelection,
+        child_cancel_token: Arc<tokio_util::sync::CancellationToken>,
     ) -> Result<SpawnRunResult, String> {
-        config.validate_requested_model_policy()?;
-        validate_prepared_child_model_policy(
-            config.requested_model_policy.as_ref(),
-            config.resolved_model_selection.as_ref(),
-            prepared_model.as_ref(),
-        )?;
-        if let Some(limit) = config.max_output_tokens {
-            config.thinking.validate_output_budget(u64::from(limit))?;
-        }
         let runtime_ceiling = astra_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(false)?;
@@ -1049,7 +1402,6 @@ impl CliSpawnAgentExecutor {
         let live_event_sink_for_terminal = config.live_event_sink.clone();
         let run_id_for_terminal = config.run_id.clone();
         let agent_id_for_terminal = config.agent_id.clone();
-        let started_at = std::time::Instant::now();
 
         // A child transcript is inspectable from the moment the run exists,
         // not only after its tool receipt reaches the parent. This start fact
@@ -1106,67 +1458,10 @@ impl CliSpawnAgentExecutor {
         let token = match self.resolve_token_async().await {
             Ok(token) => token,
             Err(err) => {
-                emit_agent_terminated(
-                    live_event_sink_for_terminal.as_ref(),
-                    &run_id_for_terminal,
-                    &agent_id_for_terminal,
-                    started_at,
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
-                    Some(err.clone()),
-                );
                 return Err(err);
             }
         };
-        let inherited_model = self.resolve_effective_model(config.model.as_deref());
-        let model_selection = if let Some(prepared_model) = prepared_model {
-            prepared_model
-        } else if let Some(selection) = config.resolved_model_selection.as_ref() {
-            if let Some(model_name) = config
-                .model
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-            {
-                // The spawner only supplies this resolved name when the
-                // selected Offering is the parent's already-admitted one.
-                // Reuse that request-local projection; each child provider
-                // request still revalidates authorization on Server.
-                crate::cli::session::session_runtime::ServerModelSelection {
-                    name: model_name.to_string(),
-                    context_window: None,
-                    offering_id: selection.offering_id.clone(),
-                }
-            } else {
-                let reasoning = astra_turn_core::orchestration_spawn_tool::ReasoningSelection::from(
-                    config.thinking.clone(),
-                );
-                let request = ModelAdmissionRequestV1 {
-                    slots: vec![ModelAdmissionSlotV1 {
-                        selector: astra_turn_types::ModelSelector::OfferingId {
-                            offering_id: selection.offering_id.clone(),
-                        },
-                        max_output_tokens: config.max_output_tokens,
-                        reasoning: serde_json::to_value(reasoning)
-                            .map_err(|error| error.to_string())?,
-                        inherited_reasoning: None,
-                    }],
-                };
-                crate::cli::session::session_runtime::admit_server_model_slots(
-                    &self.api, &token, request,
-                )
-                .await?
-                .into_iter()
-                .next()
-                .map(|admitted| admitted.model)
-                .ok_or_else(|| "model admission returned no selected Offering".to_string())?
-            }
-        } else {
-            crate::cli::skill_subrun::resolve_subrun_model_selection(
-                &self.api,
-                &token,
-                inherited_model.as_deref(),
-            )
-            .await?
-        };
+        let model_selection = prepared_model;
         let effective_model = Some(model_selection.name);
 
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
@@ -1195,11 +1490,8 @@ impl CliSpawnAgentExecutor {
 
         // Resolve per-model workflow-guard policy once; used for both the
         // `SubRunHost::tool_cache` and the `AgenticLoopState` below.
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_policy
-            .resolve_for_model(effective_model.as_deref());
-        let child_cancel_token =
-            crate::cli::skill_subrun::child_cancellation_scope(self.cancel_token.as_ref());
+        let tool_policy_config = astra_config::RuntimeConfig::load().tool_policy;
+        let resolved_tool_policy = tool_policy_config.resolve_for_model(effective_model.as_deref());
 
         let mut host = SubRunHost {
             api: self.api.clone(),
@@ -1363,8 +1655,6 @@ impl CliSpawnAgentExecutor {
         // only, so children remain traceable offline.
         let server_session_id: Option<String> = None;
 
-        let start_time = std::time::Instant::now();
-        let progress_emitter = config.progress_emitter.clone();
         let has_parent_permissions = config.parent_address.is_some();
 
         let agentic_turn_budget =
@@ -1385,6 +1675,10 @@ impl CliSpawnAgentExecutor {
         );
 
         let mut state = AgenticLoopState {
+            evaluation_thresholds:
+                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
+                    &tool_policy_config,
+                ),
             observation_journal: Default::default(),
             tool_ledger_receipt: Default::default(),
             messages,
@@ -1430,8 +1724,6 @@ impl CliSpawnAgentExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             budget_policy: None,
             restricted_tools,
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -1577,7 +1869,6 @@ impl CliSpawnAgentExecutor {
         let run_id = config.run_id;
         let prompt_tokens = state.total_prompt;
         let completion_tokens = state.total_completion;
-        let duration_ms = start_time.elapsed().as_millis() as u64;
         let ctx = match state.permission_context.as_ref() {
             Some(ctx) => ctx,
             None => {
@@ -1631,51 +1922,29 @@ impl CliSpawnAgentExecutor {
         // is updated via this signal so the strip row flips from ◦
         // (live) to ✓ / ✗ / ⊘ (terminal). Without this, a crashed or
         // timed-out child leaves the row stuck in `live`.
-        let emit_terminated = |termination, reason: Option<String>| {
-            emit_agent_terminated(
-                live_event_sink_for_terminal.as_ref(),
-                &run_id_for_terminal,
-                &agent_id_for_terminal,
-                started_at,
-                termination,
-                reason,
-            );
-        };
 
         match loop_result {
-            Ok(AgenticLoopOutcome::Delegated) => {
-                emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Delegated,
-                    Some("delegated".to_string()),
-                );
-                Ok(SpawnRunResult {
-                    agent_id,
-                    run_id,
-                    committed_frontier: None,
-                    status: "delegated".to_string(),
-                    finish_reason: "delegated".to_string(),
-                    cancellation_origin: CancellationOrigin::Unverified,
-                    output: None,
-                    error: None,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                    turns_completed,
-                    permission_summary,
-                    permission_requests,
-                    permission_requests_approved,
-                    tools_blocked,
-                })
-            }
+            Ok(AgenticLoopOutcome::Delegated) => Ok(SpawnRunResult {
+                agent_id,
+                run_id,
+                committed_frontier: None,
+                status: "delegated".to_string(),
+                finish_reason: "delegated".to_string(),
+                cancellation_origin: CancellationOrigin::Unverified,
+                output: None,
+                error: None,
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
+                turns_completed,
+                permission_summary,
+                permission_requests,
+                permission_requests_approved,
+                tools_blocked,
+            }),
             Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
                 let error = format!("{}: {}", rejection.code, rejection.message);
-                if let Some(ref emitter) = progress_emitter {
-                    emitter.failed(&error);
-                }
-                emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
-                    Some(error.clone()),
-                );
+
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
@@ -1695,91 +1964,30 @@ impl CliSpawnAgentExecutor {
                     tools_blocked,
                 })
             }
-            Ok(AgenticLoopOutcome::Completed) => {
-                let summary = if state.final_text.len() > 100 {
-                    format!(
-                        "{}...",
-                        state.final_text.chars().take(100).collect::<String>()
-                    )
-                } else {
-                    state.final_text.clone()
-                };
-                let interrupted =
-                    astra_turn_core::orchestration_types::agent_completion_is_interrupted(
-                        finish_reason_from_state.as_deref(),
-                    );
-                if let Some(ref emitter) = progress_emitter {
-                    if interrupted {
-                        emitter.interrupted(
-                            finish_reason_from_state
-                                .clone()
-                                .unwrap_or_else(|| "interrupted".to_string()),
-                            summary,
-                            tool_calls,
-                            (prompt_tokens, completion_tokens),
-                            duration_ms,
-                        );
-                    } else {
-                        emitter.completed(
-                            summary,
-                            tool_calls,
-                            (prompt_tokens, completion_tokens),
-                            duration_ms,
-                        );
-                    }
-                }
-                emit_terminated(
-                    if interrupted {
-                        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
-                    } else {
-                        astra_turn_core::agent_live_event::AgentLiveTermination::Completed
-                    },
-                    finish_reason_from_state.clone(),
-                );
-                Ok(SpawnRunResult {
-                    agent_id,
-                    run_id,
-                    committed_frontier: None,
-                    status: spawn_completion_status_from_finish_reason(
-                        finish_reason_from_state.as_deref(),
-                    )
-                    .to_string(),
-                    finish_reason: finish_reason_from_state.unwrap_or_else(|| "normal".to_string()),
-                    cancellation_origin: CancellationOrigin::Unverified,
-                    output: Some(state.final_text),
-                    error: None,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                    turns_completed,
-                    permission_summary,
-                    permission_requests,
-                    permission_requests_approved,
-                    tools_blocked,
-                })
-            }
+            Ok(AgenticLoopOutcome::Completed) => Ok(SpawnRunResult {
+                agent_id,
+                run_id,
+                committed_frontier: None,
+                status: spawn_completion_status_from_finish_reason(
+                    finish_reason_from_state.as_deref(),
+                )
+                .to_string(),
+                finish_reason: finish_reason_from_state.unwrap_or_else(|| "normal".to_string()),
+                cancellation_origin: CancellationOrigin::Unverified,
+                output: Some(state.final_text),
+                error: None,
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
+                turns_completed,
+                permission_summary,
+                permission_requests,
+                permission_requests_approved,
+                tools_blocked,
+            }),
             Ok(AgenticLoopOutcome::Cancelled) => {
                 let cancellation_origin =
                     cancelled_loop_origin(state.interruption.as_ref().map(|record| record.kind));
-                let cancellation_reason = match cancellation_origin {
-                    CancellationOrigin::User => "user cancellation",
-                    CancellationOrigin::Runtime => "runtime cancellation",
-                    CancellationOrigin::Unverified => unreachable!(
-                        "CLI loop cancellation is classified from a local typed interruption"
-                    ),
-                };
-                // Emit cancelled event
-                if let Some(ref emitter) = progress_emitter {
-                    emitter.cancelled(cancellation_reason, cancellation_origin);
-                }
-                emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled,
-                    Some(
-                        finish_reason_from_state
-                            .clone()
-                            .unwrap_or_else(|| cancellation_reason.to_string()),
-                    ),
-                );
                 let projection = project_subrun_status_to_spawn(astra_core::STATUS_CANCELLED, None);
                 Ok(SpawnRunResult {
                     agent_id,
@@ -1807,13 +2015,7 @@ impl CliSpawnAgentExecutor {
             }
             Ok(AgenticLoopOutcome::Error(error)) => {
                 // Emit failed event
-                if let Some(ref emitter) = progress_emitter {
-                    emitter.failed(&error);
-                }
-                emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
-                    Some(error.clone()),
-                );
+
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
@@ -1838,15 +2040,6 @@ impl CliSpawnAgentExecutor {
                 })
             }
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
-                if let Some(ref emitter) = progress_emitter {
-                    emitter.waiting(reason.clone());
-                }
-                emit_agent_execution_waiting(
-                    live_event_sink_for_terminal.as_ref(),
-                    &run_id_for_terminal,
-                    &agent_id_for_terminal,
-                    reason.clone(),
-                );
                 let projection = project_subrun_status_to_spawn(astra_core::STATUS_WAITING, None);
                 Ok(SpawnRunResult {
                     agent_id,
@@ -1871,14 +2064,6 @@ impl CliSpawnAgentExecutor {
             Err(e)
                 if let Some(cancellation_origin) = classified_error_cancellation_origin(e.kind) =>
             {
-                let reason = "runtime cancellation";
-                if let Some(ref emitter) = progress_emitter {
-                    emitter.cancelled(reason, cancellation_origin);
-                }
-                emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled,
-                    Some(reason.to_string()),
-                );
                 let projection = project_subrun_status_to_spawn(astra_core::STATUS_CANCELLED, None);
                 Ok(SpawnRunResult {
                     agent_id,
@@ -1906,13 +2091,7 @@ impl CliSpawnAgentExecutor {
             }
             Err(e) => {
                 let msg = e.to_string();
-                if let Some(ref emitter) = progress_emitter {
-                    emitter.failed(&msg);
-                }
-                emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
-                    Some(msg.clone()),
-                );
+
                 Err(msg)
             }
         }
@@ -1924,7 +2103,7 @@ mod tests {
     use super::{
         CliSpawnAgentExecutor, TokenProvider, agent_live_stream_event_sink, build_child_messages,
         build_child_system_prompt, cancelled_loop_origin, classified_error_cancellation_origin,
-        emit_agent_transcript_committed, validate_prepared_child_model_policy,
+        emit_agent_transcript_committed,
     };
     use crate::lock_recovery::LockRecovery;
     use astra_runtime::orchestration::{
@@ -1946,71 +2125,6 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::cli::chat_stream::StreamEvent;
-
-    #[test]
-    fn configured_name_intent_is_preserved_after_matching_server_preparation() {
-        let policy = astra_turn_types::RequestedModelPolicy::Fixed {
-            selector: astra_turn_types::ModelSelector::ConfiguredName {
-                model_name: "GLM-5.2".into(),
-                source: Some("typesafe".into()),
-            },
-        };
-        let resolved = astra_turn_types::ModelSelection {
-            offering_id: "offer-glm".into(),
-        };
-        let prepared = crate::cli::session::session_runtime::ServerModelSelection {
-            name: "glm-5.2".into(),
-            context_window: Some(128_000),
-            offering_id: "offer-glm".into(),
-        };
-        validate_prepared_child_model_policy(Some(&policy), Some(&resolved), Some(&prepared))
-            .expect("prepared model must match configured identity");
-        assert_eq!(
-            policy,
-            astra_turn_types::RequestedModelPolicy::Fixed {
-                selector: astra_turn_types::ModelSelector::ConfiguredName {
-                    model_name: "GLM-5.2".into(),
-                    source: Some("typesafe".into()),
-                },
-            },
-            "validation must not rewrite the original selector or source"
-        );
-        assert!(
-            validate_prepared_child_model_policy(Some(&policy), Some(&resolved), None).is_err()
-        );
-        assert!(
-            validate_prepared_child_model_policy(Some(&policy), None, Some(&prepared)).is_err()
-        );
-
-        let wrong_offering = crate::cli::session::session_runtime::ServerModelSelection {
-            offering_id: "offer-other".into(),
-            ..prepared.clone()
-        };
-        assert!(
-            validate_prepared_child_model_policy(
-                Some(&policy),
-                Some(&resolved),
-                Some(&wrong_offering),
-            )
-            .is_err()
-        );
-        let wrong_name = crate::cli::session::session_runtime::ServerModelSelection {
-            name: "other-model".into(),
-            ..prepared
-        };
-        assert!(
-            validate_prepared_child_model_policy(Some(&policy), Some(&resolved), Some(&wrong_name),)
-                .is_err()
-        );
-
-        let exact_id = astra_turn_types::RequestedModelPolicy::Fixed {
-            selector: astra_turn_types::ModelSelector::OfferingId {
-                offering_id: "offer-fixed".into(),
-            },
-        };
-        validate_prepared_child_model_policy(Some(&exact_id), None, None)
-            .expect("Offering identity needs no configured-name projection");
-    }
 
     fn cli_fanout_test_context() -> SpawnContext {
         SpawnContext {
@@ -2063,10 +2177,10 @@ mod tests {
             allowed_tools: Vec::new(),
             read_only: true,
             workspace_mutation: Default::default(),
+            isolated: false,
             working_dir: PathBuf::from("/tmp"),
             mailbox: None,
             progress_emitter: None,
-            context_cache: None,
             inherited_permissions,
             parent_address: Some(astra_messaging::types::AgentAddress::new(
                 "parent-run",
@@ -2082,6 +2196,51 @@ mod tests {
             delegation_chain: Vec::new(),
             work_item: None,
         }
+    }
+
+    async fn execute_prepared_cli_for_test(
+        preparation: Box<dyn astra_runtime::orchestration::PreparedSpawn>,
+        config: SpawnRunConfig,
+    ) -> Result<astra_runtime::orchestration::SpawnRunResult, String> {
+        preparation.launch(config)?.await
+    }
+
+    async fn execute_cli_for_test(
+        executor: Arc<CliSpawnAgentExecutor>,
+        mut config: SpawnRunConfig,
+    ) -> Result<astra_runtime::orchestration::SpawnRunResult, String> {
+        let mut context = cli_fanout_test_context();
+        context.working_dir = config.working_dir.clone();
+        context.resolved_model_name = config.model.clone();
+        if let Some(address) = config.parent_address.as_ref() {
+            context.parent_run_id = address.run_id.clone();
+            context.parent_agent_id = address.agent_id.clone();
+        } else {
+            config.parent_address = Some(astra_messaging::AgentAddress::new(
+                &context.parent_run_id,
+                &context.parent_agent_id,
+            ));
+        }
+        let parent = config.resolved_model_selection.clone();
+        context.parent_model_reasoning = parent.clone().map(|selection| {
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection,
+                resolved_model_name: config.model.clone(),
+                thinking: config.thinking.clone(),
+            }
+        });
+        let input = SpawnAgentInput {
+            requested_model_policy: config.requested_model_policy.clone(),
+            resolved_model_selection: config.resolved_model_selection.clone(),
+            reasoning: parent.is_none().then(|| config.thinking.clone().into()),
+            max_output_tokens: config.max_output_tokens,
+            isolated: config.isolated,
+            ..Default::default()
+        };
+        let mut prepared = executor
+            .prepare_batch(&[input], &context, parent.as_ref())
+            .await?;
+        execute_prepared_cli_for_test(prepared.remove(0), config).await
     }
 
     fn prepared_cli_test_config_for_input(
@@ -2128,6 +2287,407 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpolled_cli_launch_stays_unsettled_until_its_future_is_dropped() {
+        let server = MockServer::start().await;
+        let executor = Arc::new(test_executor(&server.uri()));
+        let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+        let mut context = cli_fanout_test_context();
+        context.working_dir = repo.path().to_path_buf();
+        let input = SpawnAgentInput {
+            isolated: true,
+            agent_type: "task".into(),
+            ..Default::default()
+        };
+        let parent = astra_turn_types::ModelSelection {
+            offering_id: "offer-parent".into(),
+        };
+        let preparation = Arc::clone(&executor)
+            .prepare_batch(&[input], &context, Some(&parent))
+            .await
+            .unwrap()
+            .remove(0);
+        let mut config = prepared_cli_test_config(
+            None,
+            Some(parent),
+            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+        );
+        config.run_id = uuid::Uuid::new_v4().to_string();
+        config.working_dir = repo.path().to_path_buf();
+        config.isolated = true;
+        let run_id = config.run_id.clone();
+        let binding = config.cancellation_binding_id.clone();
+        let execution = preparation.launch(config).unwrap();
+        assert_eq!(executor.executions.lock_recover().len(), 1);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                executor.cancel_spawned_run_durably(
+                    &run_id,
+                    Some(&binding),
+                    None,
+                    "stop before poll",
+                    super::CancellationOrigin::User
+                )
+            )
+            .await
+            .is_err(),
+            "an outstanding registered future is not a stopped execution"
+        );
+        assert_eq!(executor.executions.lock_recover().len(), 1);
+        assert!(!repo.path().join(".agent-worktrees").exists());
+        drop(execution);
+        assert!(executor.executions.lock_recover().is_empty());
+        executor
+            .cancel_spawned_run_durably(
+                &run_id,
+                Some(&binding),
+                None,
+                "repeat stop",
+                super::CancellationOrigin::User,
+            )
+            .await
+            .unwrap();
+        assert!(!repo.path().join(".agent-worktrees").exists());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsettled_workspace_ownership_never_produces_a_cli_terminal_receipt() {
+        let server = MockServer::start().await;
+        let executor = Arc::new(test_executor(&server.uri()));
+        let root = tempfile::tempdir().unwrap();
+        astra_tools::workspace_observation::WorkspaceAttributionState::capture(root.path())
+            .unwrap()
+            .mark_unsettled();
+        let mut config = prepared_cli_test_config(
+            None,
+            Some(astra_turn_types::ModelSelection {
+                offering_id: "offer-parent".into(),
+            }),
+            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+        );
+        config.run_id = uuid::Uuid::new_v4().to_string();
+        config.isolated = true;
+        config.working_dir = root.path().to_path_buf();
+        let run_id = config.run_id.clone();
+        let binding = config.cancellation_binding_id.clone();
+        let task = tokio::spawn(execute_cli_for_test(executor.clone(), config));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while executor.executions.lock_recover().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                executor.cancel_spawned_run_durably(
+                    &run_id,
+                    Some(&binding),
+                    None,
+                    "stop unknown workspace process",
+                    super::CancellationOrigin::User
+                )
+            )
+            .await
+            .is_err()
+        );
+        assert!(!task.is_finished());
+        assert_eq!(executor.executions.lock_recover().len(), 1);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            executor.executions.lock_recover().len(),
+            1,
+            "dropping the observer cannot manufacture a stop receipt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_workspace_deadline_stops_git_before_inference_and_waits_for_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = MockServer::start().await;
+        let executor = Arc::new(test_executor(&server.uri()));
+        let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+        let ready = repo.path().join("deadline-hook-ready");
+        let late = repo.path().join("deadline-hook-late");
+        let hook = repo.path().join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf ready > '{}'\nsleep 7\nprintf late > '{}'\n",
+                ready.display(),
+                late.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = prepared_cli_test_config(
+            None,
+            Some(astra_turn_types::ModelSelection {
+                offering_id: "offer-parent".into(),
+            }),
+            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+        );
+        config.run_id = uuid::Uuid::new_v4().to_string();
+        config.isolated = true;
+        config.working_dir = repo.path().to_path_buf();
+        // Admission and Git startup consume the same real absolute budget.
+        // Leave startup headroom under suite load while the hook still lasts
+        // beyond the budget, then observe past its natural completion time.
+        config.execution_deadline = Some(
+            astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 5,
+                },
+                0,
+            )
+            .unwrap(),
+        );
+        let worktree = repo.path().join(".agent-worktrees").join(&config.run_id);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            execute_cli_for_test(executor.clone(), config),
+        )
+        .await
+        .expect("deadline settles real workers")
+        .expect("cancelled result");
+        assert!(ready.exists(), "Git actually reached the blocking hook");
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(
+            result.cancellation_origin,
+            super::CancellationOrigin::Runtime
+        );
+        assert!(!worktree.exists());
+        assert!(executor.executions.lock_recover().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(7_100)).await;
+        assert!(!late.exists(), "deadline cannot leave a delayed writer");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_cli_isolation_waits_for_git_and_cleans_before_terminal() {
+        for (unsettled_child, during_checkout) in [(false, false), (false, true), (true, false)] {
+            use astra_runtime::orchestration::{
+                AgentStatus, DynamicAgentSpawner, SpawnAgentOutput,
+            };
+            use std::os::unix::fs::PermissionsExt;
+            let server = MockServer::start().await;
+            let executor = Arc::new(test_executor(&server.uri()));
+            let repo = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
+            let ready = repo.path().join("hook-ready");
+            let late = repo.path().join("late-hook-write");
+            let hook = if during_checkout {
+                let filter = repo.path().join("blocking-smudge");
+                std::fs::write(
+                    repo.path().join(".gitattributes"),
+                    "tracked.txt filter=blocking\n",
+                )
+                .unwrap();
+                for args in [
+                    vec!["add", ".gitattributes"],
+                    vec!["commit", "-m", "configure checkout filter"],
+                    vec!["config", "filter.blocking.smudge", filter.to_str().unwrap()],
+                    vec!["config", "filter.blocking.required", "true"],
+                ] {
+                    assert!(
+                        std::process::Command::new("git")
+                            .args(args)
+                            .current_dir(repo.path())
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                filter
+            } else {
+                repo.path().join(".git/hooks/post-checkout")
+            };
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\nprintf ready > '{}'\nsleep {}\nprintf late > '{}'\n",
+                    ready.display(),
+                    if during_checkout { "3" } else { "0.6" },
+                    late.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+                Arc::new(astra_messaging::InProcessTransport::new()),
+                Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new()),
+            ));
+            let spawner = DynamicAgentSpawner::new(router).with_executor(executor.clone());
+            let mut context = cli_fanout_test_context();
+            context.working_dir = repo.path().to_path_buf();
+            context.parent_model_reasoning = Some(
+                astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                    selection: astra_turn_types::ModelSelection {
+                        offering_id: "offer-parent".into(),
+                    },
+                    resolved_model_name: context.resolved_model_name.clone(),
+                    thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                },
+            );
+            let _parent = spawner.fanout_parent(&context.parent_run_id);
+            let SpawnAgentOutput::Launched {
+                agent_id, run_id, ..
+            } = spawner
+                .spawn(
+                    SpawnAgentInput {
+                        isolated: true,
+                        agent_type: "task".into(),
+                        prompt: "must not reach inference".into(),
+                        ..Default::default()
+                    },
+                    &context,
+                )
+                .await
+                .expect("launch receipt precedes Git provisioning");
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !ready.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("real Git hook started");
+            if during_checkout {
+                let registration = std::process::Command::new("git")
+                    .args(["worktree", "list", "--porcelain"])
+                    .current_dir(repo.path())
+                    .output()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&registration.stdout).contains("locked initializing"),
+                    "cancel must hit checkout's initialization lock"
+                );
+            }
+            assert!(
+                !spawner
+                    .get_agent_state_any(&agent_id)
+                    .await
+                    .unwrap()
+                    .status
+                    .is_terminal()
+            );
+            if unsettled_child {
+                let child_root = repo.path().join(".agent-worktrees").join(&run_id);
+                astra_tools::workspace_observation::WorkspaceAttributionState::capture(&child_root)
+                    .unwrap()
+                    .mark_unsettled();
+                assert_ne!(
+                    astra_tools::workspace_observation::workspace_ownership_is_unsettled(
+                        repo.path()
+                    ),
+                    Some(true)
+                );
+                let binding = spawner
+                    .get_agent_state_any(&agent_id)
+                    .await
+                    .unwrap()
+                    .cancellation_binding_id
+                    .unwrap();
+                assert!(
+                    spawner
+                        .cancel_agent_for_user(
+                            &agent_id,
+                            "stop child with unconfirmed process ownership",
+                        )
+                        .await
+                        .is_pending(),
+                    "stop request remains pending until the exact executor receipt"
+                );
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(80),
+                        executor.cancel_spawned_run_durably(
+                            &run_id,
+                            Some(&binding),
+                            None,
+                            "observe exact stop receipt",
+                            super::CancellationOrigin::User
+                        ),
+                    )
+                    .await
+                    .is_err(),
+                    "accepted stop is not a settled executor receipt"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(
+                    child_root.exists(),
+                    "unknown child processes forbid deleting their workspace"
+                );
+                assert_eq!(executor.executions.lock_recover().len(), 1);
+                assert!(
+                    !spawner
+                        .get_agent_state_any(&agent_id)
+                        .await
+                        .unwrap()
+                        .status
+                        .is_terminal()
+                );
+                assert!(server.received_requests().await.unwrap().is_empty());
+                continue;
+            }
+            let _ = spawner
+                .cancel_agent_for_user(&agent_id, "stop Git provisioning")
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if spawner
+                        .get_agent_state_any(&agent_id)
+                        .await
+                        .is_some_and(|state| state.status.is_terminal())
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel waits for actual workers and cleanup");
+            let state = spawner.get_agent_state_any(&agent_id).await.unwrap();
+            assert!(
+                matches!(state.status, AgentStatus::Cancelled { by_user: true, .. }),
+                "{:?}",
+                state.status
+            );
+            assert!(!repo.path().join(".agent-worktrees").join(run_id).exists());
+            assert!(executor.executions.lock_recover().is_empty());
+            let registration = std::process::Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(registration.status.success());
+            assert!(!String::from_utf8_lossy(&registration.stdout).contains(".agent-worktrees"));
+
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "cancelled provisioning must not start a model round"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(if during_checkout {
+                3_100
+            } else {
+                650
+            }))
+            .await;
+            assert!(
+                !late.exists(),
+                "Git must not outlive its cancellation receipt"
+            );
+            spawner
+                .shutdown_and_wait(std::time::Duration::from_secs(2))
+                .await;
+        }
+    }
+
+    #[tokio::test]
     async fn cli_fanout_reuses_inherited_offering_without_model_access_io() {
         let server = MockServer::start().await;
         let executor = Arc::new(test_executor(&server.uri()));
@@ -2170,24 +2730,21 @@ mod tests {
             astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         );
         let mut prepared = prepared.into_iter();
-        let inherited = prepared
-            .next()
-            .unwrap()
-            .execute(prepared_cli_test_config(
+        let inherited = execute_prepared_cli_for_test(
+            prepared.next().unwrap(),
+            prepared_cli_test_config(
                 inputs[0].fanout_slot_identity().unwrap(),
                 Some(parent.clone()),
                 astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
-            ))
-            .await
-            .expect_err("valid binding reaches the non-network turn-limit guard");
+            ),
+        )
+        .await
+        .expect_err("valid binding reaches the non-network turn-limit guard");
         assert!(
             inherited.contains("hard_turn_limit must be positive"),
             "{inherited}"
         );
-        let error = prepared
-            .next()
-            .unwrap()
-            .execute(wrong_slot)
+        let error = execute_prepared_cli_for_test(prepared.next().unwrap(), wrong_slot)
             .await
             .expect_err("prepared slot must not execute another slot");
         assert!(error.contains("does not match"), "{error}");
@@ -2363,8 +2920,9 @@ mod tests {
                 Some(&parent),
             )
             .unwrap_or(admitted_selection);
-            let result = prepared
-                .execute(prepared_cli_test_config_for_input(
+            let result = execute_prepared_cli_for_test(
+                prepared,
+                prepared_cli_test_config_for_input(
                     input,
                     requested_selection,
                     input
@@ -2372,9 +2930,10 @@ mod tests {
                         .as_ref()
                         .map(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::config)
                         .unwrap_or(astra_turn_core::thinking_config::ThinkingConfig::ModelDefault),
-                ))
-                .await
-                .expect_err("valid binding reaches the non-network turn-limit guard");
+                ),
+            )
+            .await
+            .expect_err("valid binding reaches the non-network turn-limit guard");
             assert!(
                 result.contains("hard_turn_limit must be positive"),
                 "{result}"
@@ -2503,11 +3062,9 @@ mod tests {
         let identity = prepared[0].model_identity().expect("prepared identity");
         assert_eq!(identity.offering_id, "offer-glm");
         assert_eq!(identity.model_name, "glm-5.2");
-        let result = prepared
-            .into_iter()
-            .next()
-            .unwrap()
-            .execute(prepared_cli_test_config_for_input(
+        let result = execute_prepared_cli_for_test(
+            prepared.into_iter().next().unwrap(),
+            prepared_cli_test_config_for_input(
                 &input,
                 Some(astra_turn_types::ModelSelection {
                     offering_id: "offer-glm".into(),
@@ -2515,9 +3072,10 @@ mod tests {
                 astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
                     effort: astra_turn_core::thinking_config::ThinkingEffort::High,
                 },
-            ))
-            .await
-            .expect_err("trusted binding reaches the deliberate test turn-limit guard");
+            ),
+        )
+        .await
+        .expect_err("trusted binding reaches the deliberate test turn-limit guard");
         assert!(
             result.contains("hard_turn_limit must be positive"),
             "{result}"
@@ -2581,17 +3139,16 @@ mod tests {
             )
             .await
             .expect("reasoning-only slot admitted");
-        let result = prepared
-            .into_iter()
-            .next()
-            .unwrap()
-            .execute(prepared_cli_test_config(
+        let result = execute_prepared_cli_for_test(
+            prepared.into_iter().next().unwrap(),
+            prepared_cli_test_config(
                 input.fanout_slot_identity().unwrap(),
                 Some(parent),
                 astra_turn_core::thinking_config::ThinkingConfig::Off,
-            ))
-            .await
-            .expect_err("valid binding reaches the non-network turn-limit guard");
+            ),
+        )
+        .await
+        .expect_err("valid binding reaches the non-network turn-limit guard");
         assert!(
             result.contains("hard_turn_limit must be positive"),
             "{result}"
@@ -2699,8 +3256,9 @@ mod tests {
                     body["slots"][slot_indexes[index]]["reasoning"],
                     serde_json::to_value(ReasoningSelection::from(thinking.clone())).unwrap()
                 );
-                let error = prepared
-                    .execute(prepared_cli_test_config_for_input(
+                let error = execute_prepared_cli_for_test(
+                    prepared,
+                    prepared_cli_test_config_for_input(
                         input,
                         astra_turn_types::resolve_requested_model_selection(
                             input.requested_model_policy.as_ref(),
@@ -2708,9 +3266,10 @@ mod tests {
                         )
                         .unwrap(),
                         thinking,
-                    ))
-                    .await
-                    .unwrap_err();
+                    ),
+                )
+                .await
+                .unwrap_err();
                 assert!(
                     error.contains("hard_turn_limit must be positive"),
                     "{error}"
@@ -2779,7 +3338,9 @@ mod tests {
                     },
                 );
                 config.max_output_tokens = consumed_cap;
-                let error = prepared.execute(config).await.unwrap_err();
+                let error = execute_prepared_cli_for_test(prepared, config)
+                    .await
+                    .unwrap_err();
                 if consumed_budget == 4096 && consumed_cap == Some(8192) {
                     assert!(
                         error.contains("hard_turn_limit must be positive"),
@@ -2990,25 +3551,6 @@ mod tests {
             Some(&astra_services::session_journal::journal_file_path(
                 &session_id
             ))
-        );
-    }
-
-    #[test]
-    fn resolve_effective_model_prefers_spawn_model_then_default() {
-        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
-        let executor =
-            CliSpawnAgentExecutor::new(api, "token".to_string(), PathBuf::from("/tmp"), None)
-                .with_default_model(Some("session-default".to_string()));
-
-        assert_eq!(
-            executor
-                .resolve_effective_model(Some("spawn-model"))
-                .as_deref(),
-            Some("spawn-model")
-        );
-        assert_eq!(
-            executor.resolve_effective_model(None).as_deref(),
-            Some("session-default")
         );
     }
 
@@ -3252,7 +3794,7 @@ mod tests {
         config.model = Some("parent-model".into());
         config.hard_turn_limit = Some(1);
 
-        let _ = executor.execute(config).await;
+        let _ = execute_cli_for_test(Arc::new(executor), config).await;
         let requests = mock.received_requests();
         assert_eq!(
             requests.len(),
@@ -3274,8 +3816,9 @@ mod tests {
             CliSpawnAgentExecutor::new(api, "stale-token".to_string(), PathBuf::from("/tmp"), None)
                 .with_token_provider(provider);
 
-        let err = executor
-            .execute(SpawnRunConfig {
+        let err = execute_cli_for_test(
+            Arc::new(executor),
+            SpawnRunConfig {
                 run_id: "run-1".into(),
                 cancellation_binding_id: "test-run-1-binding".into(),
                 agent_id: "reviewer@panic".into(),
@@ -3285,6 +3828,9 @@ mod tests {
                 description: "Review token failure".into(),
                 task: "review".into(),
                 model: Some("test-model".into()),
+                resolved_model_selection: Some(astra_turn_types::ModelSelection {
+                    offering_id: "offer-test-model".into(),
+                }),
                 hard_turn_limit: Some(1),
                 parent_address: None,
                 live_event_sink: Some(live_sink.clone()),
@@ -3293,9 +3839,10 @@ mod tests {
                     None,
                     astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                 )
-            })
-            .await
-            .expect_err("token provider panic should fail execute");
+            },
+        )
+        .await
+        .expect_err("token provider panic should fail execute");
 
         assert!(err.contains("token provider task failed"), "{err}");
         let events = live_sink.events.lock_recover();
@@ -3327,8 +3874,9 @@ mod tests {
         let executor =
             CliSpawnAgentExecutor::new(api, "test-token".into(), std::env::temp_dir(), None);
 
-        let result = executor
-            .execute(SpawnRunConfig {
+        let result = execute_cli_for_test(
+            Arc::new(executor),
+            SpawnRunConfig {
                 run_id: "run-live-output".into(),
                 cancellation_binding_id: "test-run-live-output-binding".into(),
                 agent_id: "reviewer@run-live-output".into(),
@@ -3339,7 +3887,11 @@ mod tests {
                 description: "Live output child".into(),
                 task: "Return one concise finding.".into(),
                 model: Some("mock-model".into()),
+                resolved_model_selection: Some(astra_turn_types::ModelSelection {
+                    offering_id: "offer-mock-model".into(),
+                }),
                 hard_turn_limit: Some(1),
+                isolated: false,
                 working_dir: std::env::temp_dir(),
                 parent_address: None,
                 live_event_sink: Some(live_sink.clone()),
@@ -3350,9 +3902,10 @@ mod tests {
                         budget_tokens: 16384,
                     },
                 )
-            })
-            .await
-            .expect("spawned run");
+            },
+        )
+        .await
+        .expect("spawned run");
         assert_eq!(result.status, "completed");
         let requests = mock.received_requests();
         assert!(!requests.is_empty(), "child must send an actual request");
@@ -3403,8 +3956,7 @@ mod tests {
             );
             config.max_output_tokens = Some(cap);
             config.hard_turn_limit = Some(1);
-            let error = test_executor(&server.uri())
-                .execute(config)
+            let error = execute_cli_for_test(Arc::new(test_executor(&server.uri())), config)
                 .await
                 .unwrap_err();
             assert_eq!(

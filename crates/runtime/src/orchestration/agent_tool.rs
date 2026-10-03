@@ -164,7 +164,7 @@ fn render_spawn_agent_output(
     transcript_location: AgentTranscriptLocation,
     prepared_model: Option<&super::spawner::PreparedSpawnModelIdentity>,
 ) -> String {
-    let control_receipt = matches!(&output, SpawnAgentOutput::Launched { .. });
+    let SpawnAgentOutput::Launched { agent_id, .. } = &output;
     let mut value = match serde_json::to_value(&output) {
         Ok(value) => value,
         Err(_) => return render_agent_tool_error(None, "Failed to serialize output"),
@@ -174,19 +174,13 @@ fn render_spawn_agent_output(
     };
     object.insert(
         "result_family".into(),
-        json!(if control_receipt {
-            AgentToolResultFamily::ControlReceipt
-        } else {
-            AgentToolResultFamily::ChildResult
-        }),
+        json!(AgentToolResultFamily::ControlReceipt),
     );
-    if control_receipt {
-        let outcome = AgentControlOutcome::SpawnLaunched;
-        object.insert("action".into(), json!(outcome.action().as_str()));
-        object.insert("status".into(), json!(outcome));
-        object.insert("success".into(), json!(true));
-        object.insert("parent_run_id".into(), json!(parent_run_id));
-    }
+    let outcome = AgentControlOutcome::SpawnLaunched;
+    object.insert("action".into(), json!(outcome.action().as_str()));
+    object.insert("status".into(), json!(outcome));
+    object.insert("success".into(), json!(true));
+    object.insert("parent_run_id".into(), json!(parent_run_id));
     object.insert(
         "transcript_location".to_string(),
         Value::String(transcript_location.wire_value().to_string()),
@@ -200,83 +194,25 @@ fn render_spawn_agent_output(
             }),
         );
     }
-    let status = object
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("failed")
-        .to_string();
-    if let (Some(agent_id), Some(_run_id)) = (
-        object.get("agent_id").and_then(Value::as_str),
-        object.get("run_id").and_then(Value::as_str),
+    if let Some(observation) = WorkUnitObservation::new(
+        agent_id,
+        "agent",
+        WorkUnitStatus::Running,
+        1,
+        WorkUnitObservationMode::Transition,
     ) {
-        let work_status = match status.as_str() {
-            "launched" => WorkUnitStatus::Running,
-            "waiting" | "paused" => WorkUnitStatus::WaitingForInput,
-            "completed" => WorkUnitStatus::Completed,
-            "interrupted" => WorkUnitStatus::Interrupted,
-            "cancelled" => WorkUnitStatus::Cancelled,
-            _ => WorkUnitStatus::Failed,
-        };
-        if let Some(observation) = WorkUnitObservation::new(
-            agent_id,
-            "agent",
-            work_status,
-            match work_status {
-                WorkUnitStatus::Running => 1,
-                WorkUnitStatus::WaitingForInput => 2,
-                _ => 3,
-            },
-            WorkUnitObservationMode::Transition,
-        ) {
-            let observation = if work_status.is_terminal() {
-                observation
-            } else {
-                observation.with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal)
-            };
-            object.insert(
-                WORK_UNIT_OBSERVATION_FIELD.to_string(),
-                observation.to_value(),
-            );
-        }
-    }
-    if status == "launched" {
         object.insert(
-            "lifecycle".to_string(),
-            Value::String("running".to_string()),
-        );
-        object.insert(
-            "delivery".to_string(),
-            Value::String("parent_owned_concurrent".to_string()),
-        );
-        object.insert(
-            "instruction".to_string(),
-            Value::String(format!(
-                "The child is running under this parent's ownership. {CHILD_OUTCOME_GUIDANCE} Do not claim child work is complete before observing its result."
-            )),
+            WORK_UNIT_OBSERVATION_FIELD.to_string(),
+            observation
+                .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal)
+                .to_value(),
         );
     }
-    if object.get("status").and_then(Value::as_str) == Some("failed")
-        && object.get("finish_reason").and_then(Value::as_str) == Some("executor_dropped")
-    {
-        object.insert(
-            "diagnostic".to_string(),
-            Value::String("executor_dropped".to_string()),
-        );
-        object.insert(
-            "instruction".to_string(),
-            Value::String(
-                "The child run was scheduled but its foreground completion payload was lost. \
-                 Do not retry the agent spawn or create replacement sub-agents — the run already \
-                 executed and a duplicate would double the side effects. \
-                 If the child was read-only and its partial progress is recoverable, you may call \
-                 `get_result` once with the agent_id above to retrieve whatever was observed. \
-                 Otherwise continue with currently bound local tools and report that the \
-                 multi-agent runtime lost the child completion."
-                    .to_string(),
-            ),
-        );
-        object.insert("retryable".to_string(), Value::Bool(false));
-    }
+    object.insert("lifecycle".into(), json!("running"));
+    object.insert("delivery".into(), json!("parent_owned_concurrent"));
+    object.insert("instruction".into(), json!(format!(
+        "The child is running under this parent's ownership. {CHILD_OUTCOME_GUIDANCE} Do not claim child work is complete before observing its result."
+    )));
     serde_json::to_string(&value)
         .unwrap_or_else(|_| render_agent_tool_error(None, "Failed to serialize output"))
 }
@@ -470,8 +406,9 @@ pub struct AgentToolContext {
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
     /// Product-optional capabilities enabled on the current request.
-    /// `None` preserves the legacy unrestricted contract; `Some(empty)` is an
-    /// explicit deny-all boundary and must not be widened by delegation.
+    /// `None` applies no additional capability filter; execution binding and
+    /// authorization still apply. `Some(empty)` denies all capabilities and
+    /// must not be widened by delegation.
     pub enabled_tools: Option<HashSet<String>>,
     /// Skills available to this agent and inherited by children.
     pub active_skills: Vec<String>,
@@ -1784,7 +1721,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
             );
         }
     }
-    let declared_new = match ctx
+    match ctx
         .spawner
         .declare_fanout_group_with_start_claim(
             &group_id,
@@ -1801,29 +1738,9 @@ async fn handle_agent_fanout_start_action_with_deadline(
         )
         .await
     {
-        Ok(declared_new) => declared_new,
+        Ok(()) => {}
         Err(error) => return render_agent_tool_error(None, &error.to_string()),
     };
-    if !declared_new {
-        let Some(existing) = ctx.spawner.fanout_group(&group_id).await else {
-            return render_agent_tool_error(
-                None,
-                "fanout group disappeared after idempotent declaration",
-            );
-        };
-        if existing.is_terminal() {
-            return render_agent_fanout_results(
-                ctx,
-                &existing.group_id,
-                input._tool_call_id,
-                FanoutResultReadOptions::default(),
-                true,
-            )
-            .await;
-        }
-        return fanout_start_replay_receipt(&existing, ctx.transcript_location).to_string();
-    }
-
     // Spawn all slots concurrently — no head-of-line blocking.
     let futs: Vec<_> = planned_slots
         .into_iter()
@@ -2753,7 +2670,6 @@ fn fanout_slot_spawn_input(
         agent_type,
         // Fanout is a concurrent accepted-launch operation. The parent loop
         // must not wait for every child terminal result before continuing.
-        run_in_background: true,
         name: None,
         initial_turns: slot
             .initial_turns
@@ -2953,7 +2869,7 @@ async fn handle_agent_spawn_action_with_controls(
     reservation_owner_id: Option<&str>,
     preparation: Option<Box<dyn super::spawner::PreparedSpawn>>,
 ) -> String {
-    let mut input: SpawnAgentInput = match normalize_agent_spawn_args(args)
+    let input: SpawnAgentInput = match normalize_agent_spawn_args(args)
         .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
     {
         Ok(i) => i,
@@ -2965,7 +2881,6 @@ async fn handle_agent_spawn_action_with_controls(
     // Public single-child delegation releases the parent after the spawner
     // installs execution ownership. This is a scheduling choice, not the
     // caller-authored background handoff (which remains rejected above).
-    input.run_in_background = true;
 
     handle_agent_spawn_input_with_controls(
         input,
@@ -3123,9 +3038,10 @@ async fn handle_agent_spawn_input_with_controls(
             }
         };
     }
-    let prepared_model = preparation
-        .as_ref()
-        .and_then(|prepared| prepared.model_identity());
+    let Some(preparation) = preparation else {
+        return render_agent_tool_error(None, "spawn admission returned no preparation");
+    };
+    let prepared_model = preparation.model_identity();
     let prepared_selection =
         prepared_model
             .as_ref()
@@ -4052,6 +3968,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for CapturingModelExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn prepare_batch(
             self: Arc<Self>,
             inputs: &[SpawnAgentInput],
@@ -4112,11 +4040,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::orchestration::PreparedSpawn for CapturingPrepared {
-        async fn execute(
+        fn launch(
             self: Box<Self>,
             config: SpawnRunConfig,
-        ) -> Result<SpawnRunResult, String> {
-            self.executor.execute(config).await
+        ) -> Result<crate::orchestration::SpawnExecution, String> {
+            Ok(Box::pin(async move { self.executor.execute(config).await }))
         }
     }
 
@@ -4126,6 +4054,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for RejectingBatchExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, _: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             panic!("failed batch preparation must never start a child")
         }
@@ -4148,6 +4088,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for FixedOutputExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -4174,6 +4126,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for InterruptedSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -4200,6 +4164,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for LargeInterruptedSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn prepare_batch(
             self: Arc<Self>,
             inputs: &[SpawnAgentInput],
@@ -4249,11 +4225,11 @@ mod tests {
             })
         }
 
-        async fn execute(
+        fn launch(
             self: Box<Self>,
             config: SpawnRunConfig,
-        ) -> Result<SpawnRunResult, String> {
-            self.0.execute(config).await
+        ) -> Result<crate::orchestration::SpawnExecution, String> {
+            Ok(Box::pin(async move { self.0.execute(config).await }))
         }
     }
 
@@ -4261,6 +4237,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for ExecutionIncompleteSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -4287,6 +4275,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for FailedSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -4313,6 +4313,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for EmptyCompletionExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -4339,6 +4351,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for ExecutorDroppedExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -4365,6 +4389,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for PendingExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             std::future::pending::<Result<SpawnRunResult, String>>().await
         }
@@ -4376,6 +4412,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for PendingExecutionAndCancelExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            self.cancel_spawned_run(run, binding, user, reason, origin)
+                .await?;
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             std::future::pending().await
         }
@@ -4400,6 +4449,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for GatedFanoutExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: crate::orchestration::CancellationOrigin,
+        ) -> Result<crate::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(crate::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             let description = config.description.clone();
             let _ = self.started_tx.send(description.clone());

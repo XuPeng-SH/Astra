@@ -4856,18 +4856,12 @@ struct PreparedWorkspaceRestore {
 fn prepared_workspace_restore_from_workspace(
     ws: session_workspace::WorkspaceMetadata,
 ) -> PreparedWorkspaceRestore {
-    let pending_adaptive_state = (ws.last_scenario_change_turn.is_some()
-        || ws.last_token_budget_direction != 0
-        || ws.active_experiment_id.is_some()
-        || ws.tuned_config_json.is_some())
-    .then(|| session_state::PersistedAdaptiveState {
-        last_scenario_change_turn: ws.last_scenario_change_turn,
-        last_token_budget_direction: ws.last_token_budget_direction,
-        last_token_budget_change_turn: ws.last_token_budget_change_turn,
-        active_experiment_id: ws.active_experiment_id.clone(),
-        active_variant: ws.active_variant.clone(),
-        tuned_config_json: ws.tuned_config_json.clone(),
-    });
+    let pending_adaptive_state =
+        ws.tuned_config_json
+            .as_ref()
+            .map(|json| session_state::PersistedAdaptiveState {
+                tuned_config_json: Some(json.clone()),
+            });
     PreparedWorkspaceRestore {
         session_persistence_error: ws.last_persistence_error.clone(),
         discovered_skills: ws.discovered_skills.iter().cloned().collect(),
@@ -5565,9 +5559,8 @@ async fn apply_restored_session(
 
     match normalize_model_override(restored.model.as_deref()) {
         Some(m) => {
-            state.model = Some(m.to_string());
+            state.model = Some((m.to_string()).into());
             let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
-            state.cached_pricing = crate::cli::session::session_runtime::fallback_pricing(base);
             state.context_budget =
                 prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
         }
@@ -5577,7 +5570,6 @@ async fn apply_restored_session(
                 prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
         }
     }
-    crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
 
     if use_typed_continuation {
         state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);
@@ -7559,8 +7551,6 @@ mod resume_tests {
 
         let mut ws = session_workspace::read_workspace(&session_id).unwrap();
         ws.discovered_skills = vec!["session-recovery".to_string()];
-        ws.last_scenario_change_turn = Some(2);
-        ws.last_token_budget_direction = 1;
         ws.last_persistence_error = Some("failed to append turn event".to_string());
         session_workspace::write_workspace(&ws).unwrap();
 
@@ -7618,8 +7608,6 @@ mod resume_tests {
         workspace.total_cache_creation_tokens = 7;
         workspace.status = "active".to_string();
         workspace.discovered_skills = vec!["cloud-recovery".to_string()];
-        workspace.last_scenario_change_turn = Some(3);
-        workspace.last_token_budget_direction = 1;
         workspace.last_persistence_error = Some("failed to write workspace metadata".to_string());
 
         let server = MockServer::start().await;
@@ -7873,7 +7861,7 @@ mod resume_tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let mut state = SessionState {
-            model: Some("default".to_string()),
+            model: Some(("default".to_string()).into()),
             ..SessionState::default()
         };
         restore_session_into_state(&session_id, None, &api, &mut state)

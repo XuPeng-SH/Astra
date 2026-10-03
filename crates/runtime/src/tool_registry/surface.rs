@@ -423,6 +423,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 // “use high reasoning” cannot produce a valid canonical field
                 // that the model's visible schema rejects.
                 "reasoning",
+                "max_output_tokens",
                 "agent_id",
                 "timeout_ms",
                 "to",

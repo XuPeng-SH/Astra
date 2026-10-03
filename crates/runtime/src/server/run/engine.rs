@@ -11825,10 +11825,6 @@ mod tests {
                 }
             );
             assert_eq!(run.checkpoint_json.as_deref(), Some(checkpoint.as_str()));
-            assert!(
-                crate::server::server_loop_host::decode_execution_handoff(&checkpoint, run)
-                    .is_err()
-            );
             let durable = engine
                 .load_run("user-1", "opaque-handoff")
                 .await

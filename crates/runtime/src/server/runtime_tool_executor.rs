@@ -2828,6 +2828,10 @@ impl RuntimeToolExecutor {
         self
     }
 
+    pub(crate) fn context_history_artifact_store(&self) -> Option<&dyn SessionArtifactJsonStore> {
+        self.session_artifact_store.as_deref()
+    }
+
     pub fn with_session_artifact_store(
         mut self,
         store: astra_services::DatabaseSessionArtifactStore,
@@ -8020,6 +8024,36 @@ pub(crate) mod tests {
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine introspect results should still receive execution metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn server_introspect_reads_remote_context_history_without_a_local_transcript() {
+        let (exec, _workspace) = test_executor();
+        let store =
+            Arc::new(crate::server::explain_analyze_artifact::tests::MemoryStore::default());
+        let id = uuid::Uuid::new_v4().to_string();
+        let transcript =
+            serde_json::to_string(&json!([{"role":"user","content":"remote exact evidence"}]))
+                .unwrap();
+        crate::server::context_history_artifact::persist(
+            store.as_ref(),
+            &exec.user_id,
+            &id,
+            astra_turn_types::ContextHistoryArtifactV1::new(
+                &exec.session_id,
+                "earlier-run",
+                1,
+                transcript.clone(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let exec = exec.with_test_session_artifact_store(store);
+        let result = exec.execute_with_metadata("introspect", &json!({"artifact":format!("{}{id}", astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)})).await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains(&transcript));
+        assert!(result.output.contains("<context-history-artifact>"));
     }
 
     #[tokio::test]

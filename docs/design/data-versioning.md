@@ -5,6 +5,8 @@
 
 Data versioning defines how Astra makes agent decisions reproducible across changing prompts, memory, provider state, tools, and user data.
 
+The legacy sandbox restore endpoint is also retired: authenticated session access does not authorize restoring the configured service database. Database administration must use an explicit administrative boundary.
+
 ## Principle
 
 Reproducibility requires versioned inputs and durable facts, not only a transcript.
@@ -35,6 +37,14 @@ Track versions or stable references for:
 | Memory snapshot | Which memories were retrieved and with what scores. |
 | Artifact manifest | Which external or large objects were referenced. |
 | Policy snapshot | Permissions, plan mode, and safety policy. |
+
+## Work branches and database administration
+
+Work branches use the owner-scoped Work contracts and canonical recovery-point
+capture. The legacy `/branches` create, diff, merge, delete, and cost-estimate
+routes are retired. They are not database administration: snapshot restore must
+never be exposed as an authenticated Work merge, and estimated costs require
+actual model pricing and usage evidence.
 
 ## Branching and experimentation
 

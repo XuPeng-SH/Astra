@@ -1131,16 +1131,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / runtime plan handlers",
         product_owner="plan step audit, retry/redo, execution history",
     ),
-    "wf_triggers": TableMetadata(
-        semantic_owner="astra_services::triggers",
-        state_class="durable workflow trigger fact",
-        primary_query="trigger lookup/list by trigger_id, user_id, trigger_type, is_active, agent_id, and session_id",
-        retention_policy="retain while the trigger is active or webhook/cron execution can invoke it; session hard delete removes session-scoped triggers",
-        rebuildability="not rebuildable after user_input, context, cron_expr, secret, and agent/session binding are lost",
-        merge_guidance="keep separate from agent_agents; triggers bind invocation policy to agents and sessions with separate activation lifecycle",
-        migration_owner="astra_services::storage / triggers",
-        product_owner="workflow triggers, webhook/cron automation",
-    ),
     "infra_sandbox_metadata": TableMetadata(
         semantic_owner="astra_services::sandbox",
         state_class="durable sandbox metadata fact",

@@ -21,8 +21,11 @@ const STORAGE: &str = "database_session";
 const REPRESENTATION: &str = "canonical";
 const ARTIFACT_SCHEMA_VERSION: u16 = 1;
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
-const DEFAULT_WINDOW_BYTES: usize = 8 * 1024;
-const MAX_WINDOW_BYTES: usize = 64 * 1024;
+#[cfg(test)]
+use astra_services::session_artifact_store::DEFAULT_ARTIFACT_WINDOW_BYTES as DEFAULT_WINDOW_BYTES;
+use astra_services::session_artifact_store::{
+    artifact_window_arguments as window_arguments, read_artifact_window as read_window,
+};
 const EXACT_RUN_OBSERVATION_EVENTS: usize = astra_services::runs::MAX_RUN_OBSERVATION_EVENTS;
 
 #[cfg(test)]
@@ -1105,25 +1108,6 @@ fn render_summary(
     Ok(output)
 }
 
-fn window_arguments(args: &Value) -> Result<(usize, usize), String> {
-    let offset = match args.get("offset") {
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or("offset must be a non-negative integer")?,
-        None => 0,
-    };
-    let max_bytes = match args.get("max_bytes") {
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| (1..=MAX_WINDOW_BYTES).contains(value))
-            .ok_or_else(|| format!("max_bytes must be an integer from 1 to {MAX_WINDOW_BYTES}"))?,
-        None => DEFAULT_WINDOW_BYTES,
-    };
-    Ok((offset, max_bytes))
-}
-
 fn render_window(
     artifact: &StoredSessionArtifact,
     session_id: &str,
@@ -1383,34 +1367,6 @@ fn render_bounded_exact_run_json(
     Ok(encoded)
 }
 
-fn read_window(
-    content: &str,
-    offset: usize,
-    max_bytes: usize,
-) -> Result<(String, usize, usize), String> {
-    let total_bytes = content.len();
-    if total_bytes > MAX_ARTIFACT_BYTES {
-        return Err("Explain Analyze artifact exceeds the read bound".to_string());
-    }
-    if offset > total_bytes {
-        return Err("offset is past the end of the Explain Analyze artifact".to_string());
-    }
-    if offset < total_bytes && !content.is_char_boundary(offset) {
-        return Err("offset must be a UTF-8 boundary".to_string());
-    }
-    let available = total_bytes.saturating_sub(offset);
-    let mut end = (offset + available.min(max_bytes)).min(total_bytes);
-    while end > offset && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    if end == offset && available > 0 {
-        return Err(
-            "max_bytes is too small to advance one UTF-8 character; increase max_bytes".to_string(),
-        );
-    }
-    Ok((content[offset..end].to_string(), total_bytes, end))
-}
-
 /// Resolve only server-owned Explain handles. `None` means the handle belongs
 /// to another artifact reader (for example a tool-result or edge-local copy).
 pub(crate) async fn resolve_request(
@@ -1446,15 +1402,16 @@ pub(crate) async fn resolve_request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    struct MemoryStore {
-        artifacts: Mutex<HashMap<(String, String, String), StoredSessionArtifact>>,
+    pub(crate) struct MemoryStore {
+        pub(crate) block_persistence: bool,
+        pub(crate) artifacts: Mutex<HashMap<(String, String, String), StoredSessionArtifact>>,
     }
 
     fn stored(record: SessionArtifactJsonRecord) -> StoredSessionArtifact {
@@ -1485,6 +1442,9 @@ mod tests {
             &self,
             record: SessionArtifactJsonRecord,
         ) -> Result<StoredSessionArtifact, astra_services::SessionArtifactStoreError> {
+            if self.block_persistence {
+                std::future::pending::<()>().await;
+            }
             let artifact = stored(record);
             self.artifacts.lock().unwrap().insert(
                 (

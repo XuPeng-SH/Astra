@@ -5415,7 +5415,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // instead of manufacturing a success result.
                 "Error: delegate must be handled by the delegation runtime before \
                  local tool execution. Use agent(action='spawn', description='...', \
-                 prompt='...', run_in_background=true) for direct agent spawning."
+                 prompt='...') for direct agent spawning."
                     .to_string()
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
                 self.ask_user_via_tui(args).await

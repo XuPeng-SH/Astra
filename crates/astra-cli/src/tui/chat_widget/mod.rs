@@ -1996,7 +1996,7 @@ impl ChatWidget {
                         astra_thin_client::SessionRunRuntimeFacts {
                             runtime_profile: Some("cli_local".into()),
                             agent_binding_name: Some(agent.agent_type.clone()),
-                            background: Some(agent.run_in_background),
+                            background: Some(true),
                             permission: Some(astra_thin_client::SessionRunPermissionFacts {
                                 has_issues: agent.has_permission_issues,
                                 requests: agent.metrics.permission_requests,
@@ -5271,7 +5271,6 @@ mod tests {
             ended_at,
             metrics: astra_turn_core::orchestration_types::SpawnedAgentMetrics::default(),
             has_permission_issues: false,
-            run_in_background: false,
             spawn_tool_call_id: None,
             fanout_slot: None,
         }
@@ -10493,7 +10492,6 @@ mod tests {
         agent.metrics.permission_requests_approved = 2;
         agent.metrics.tools_blocked = 1;
         agent.has_permission_issues = true;
-        agent.run_in_background = true;
         assert!(widget.reconcile_local_agent_snapshot(&local_agent_snapshot(vec![agent]), &[]));
 
         let state = widget

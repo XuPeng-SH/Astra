@@ -31,6 +31,12 @@ current model, `/model clear` to clear the selection, or `/model <name>` to
 switch directly. `/model list` remains accepted as an alias for the picker,
 but the bare command is the suggested form.
 
+The selected model name, Offering identity and catalog pricing form one session
+selection. Switching or clearing it replaces that selection; unknown catalog
+prices stay unknown, while explicit zero prices remain zero. `/model info <name>`
+shows that model's catalog prices. `/cost` evaluates usage at the current model's
+rates; it is not a historical invoice across model switches.
+
 Without an explicit model, Astra loads the server's configured default. Model
 catalog requests allow up to 30 seconds per page. If that lookup fails, the turn
 reports the lookup failure before model or tool execution; it does not report
@@ -88,8 +94,9 @@ for the board. If you press Enter with a normal message while that first Work
 action is still starting, the message is shown in the queue and sent after the
 same Session is attached. A deliberate Session switch leaves the message in
 the composer for review instead of sending it to the wrong conversation. `/tasks`
-opens the live shell and local-agent task panel used by Shift+Down/Ctrl+B; it
-reuses the same session-bound registry and controls.
+opens the live shell and local-agent task panel. Shift+Down/Ctrl+B detaches
+foreground shell work; agents already run asynchronously. The panel reuses the
+same session-bound registry and controls.
 
 Selecting an agent in `/agent` opens its conversation and work record, where
 you can inspect, guide, pause, resume, or stop the run. `/agent list` remains

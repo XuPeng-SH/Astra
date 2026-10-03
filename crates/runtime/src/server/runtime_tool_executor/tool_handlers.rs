@@ -915,6 +915,28 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
             };
         }
         if args.get("artifact").is_some() {
+            if args
+                .get("artifact")
+                .and_then(Value::as_str)
+                .is_some_and(|handle| {
+                    handle.starts_with(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
+                })
+            {
+                return match crate::server::context_history_artifact::resolve_request(
+                    context.session_artifact_store.as_deref(),
+                    &context.user_id,
+                    &context.session_id,
+                    args,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        tool_result_from_output(output).with_source_bounded_model_projection()
+                    }
+                    Err(error) => astra_tools::ToolResult::error(format!("Error: {error}"))
+                        .with_source_bounded_model_projection(),
+                };
+            }
             // Explain Analyze snapshots are owned by the server run/session
             // store.  Resolve this typed handle before the legacy local
             // tool-result reader; a client-local Explain path/handle must

@@ -865,7 +865,9 @@ async fn prepare_session_auth_transition(
         // scope and credentials are still installed. Only then may local
         // ownerless APIs be rebound to the authenticated account.
         retire_auth_runtime(state).await;
-        crate::cli::session::session_cleanup::finalize_session(state).await;
+        crate::cli::session::session_cleanup::finalize_session(state).await?;
+        // A model preference may cross accounts; Offering identity and pricing may not.
+        state.model = state.model.as_deref().map(|name| name.to_string().into());
         state.reset_for_new_session();
         state.clear_session_id();
     } else if runtime_needs_initialization {
@@ -892,19 +894,16 @@ async fn initialize_authenticated_runtime(
 
 /// End the old owner's runtime before browser login can publish new credentials.
 /// Cancellation retains credentials, but starts a fresh local conversation.
-pub(crate) async fn begin_browser_session_login(state: &mut SessionState) {
+pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
     retire_auth_runtime(state).await;
     if state.session_id.is_some() {
-        crate::cli::session::session_cleanup::finalize_session(state).await;
+        crate::cli::session::session_cleanup::finalize_session(state).await?;
     }
-    if let Some(memory) = state.session_memory_extractor.take() {
-        memory
-            .stop_for_process_shutdown(AUTH_RUNTIME_SHUTDOWN_WAIT)
-            .await;
-    }
+    state.session_memory_port = None;
     state.reset_for_new_session();
     state.clear_session_id();
     state.model = None;
+    Ok(())
 }
 
 pub(crate) async fn finish_browser_session_login(
@@ -955,9 +954,8 @@ async fn rebuild_browser_identity_services(
     );
     state.unified_skill_registry = modules.unified_skill_registry.clone();
     state.mcp_manager = modules.mcp_manager.clone();
-    state.session_memory_extractor =
-        crate::cli::session::session_startup::build_cli_session_memory_extractor(api, profile)
-            .await;
+    state.session_memory_port =
+        crate::cli::session::session_startup::build_cli_session_memory_port(api, profile).await;
     modules
 }
 
@@ -1033,7 +1031,7 @@ mod tests {
         let _env_token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let server = MockServer::start().await;
         let mut state = crate::cli::session::session_state::SessionState::default();
-        assert!(state.session_memory_extractor.is_none());
+        assert!(state.session_memory_port.is_none());
         let mut previous_registry = None;
         // First login, same-account re-login, then account switch.
         for (generation, owner) in [("g1", "alice"), ("g2", "alice"), ("g3", "bob")] {
@@ -1076,11 +1074,12 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&server.uri(), None)
                 .unwrap()
                 .with_bearer_provider(Arc::new(GenerationBearer(generation)));
-            super::begin_browser_session_login(&mut state).await;
-            assert!(state.session_memory_extractor.is_none());
+            super::begin_browser_session_login(&mut state)
+                .await
+                .unwrap();
+            assert!(state.session_memory_port.is_none());
             let _modules = super::rebuild_browser_identity_services(&api, None, &mut state).await;
-            let memory = state.session_memory_extractor.as_ref().unwrap();
-            assert_eq!(memory.owner_user_id(), Some(owner));
+            let memory = state.session_memory_port.as_ref().unwrap();
             Mock::given(method("POST"))
                 .and(path("/memory/retrieve"))
                 .and(header("authorization", bearer.as_str()))
@@ -1089,10 +1088,13 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            memory
-                .run_session_end_governance(&Default::default(), "identity-test-session")
-                .await
-                .unwrap();
+            astra_runtime::turn::cloud::session_end_governance::run_session_end_governance(
+                &Default::default(),
+                "identity-test-session",
+                memory.as_ref(),
+            )
+            .await
+            .unwrap();
             let registry = state.unified_skill_registry.clone();
             if let Some(old) = previous_registry.take() {
                 assert!(!Arc::ptr_eq(&old, &registry));
@@ -1762,6 +1764,16 @@ mod tests {
         state.set_session_id(session_id);
         state.journal = Some(writer);
         state.turn = 1;
+        state.model = Some(
+            crate::cli::session::session_state::SessionModelChoice::Selected(
+                crate::cli::session::session_runtime::ServerModelSelection {
+                    name: "model-a(thinking:high)".into(),
+                    offering_id: "owner-a-offering".into(),
+                    context_window: Some(8192),
+                    pricing: Some(astra_services::models::PricingData::default()),
+                },
+            ),
+        );
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1781,6 +1793,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "access-b");
+        assert_eq!(state.model.as_deref(), Some("model-a(thinking:high)"));
+        assert!(state.model.as_ref().unwrap().offering_id().is_none());
+        assert!(state.model.as_ref().unwrap().pricing().is_none());
         assert!(state.session_id.is_none());
         assert_ne!(astra_services::local_owner_scope(), old_owner);
         let old_events =

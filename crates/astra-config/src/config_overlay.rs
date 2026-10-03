@@ -202,12 +202,6 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             value: Value::from(config.context_window.adaptive),
         },
         SettingItem {
-            id: "context_window.adaptive_budget_reduction".to_string(),
-            label: "Shrink budget under pressure (off = avoid spiral)".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(config.context_window.adaptive_budget_reduction),
-        },
-        SettingItem {
             id: "context_window.dynamic_compression".to_string(),
             label: "Dynamic compression threshold".to_string(),
             kind: SettingKind::Bool,
@@ -505,9 +499,6 @@ pub fn apply_edit(
         }
         "context_window.adaptive" => {
             config.context_window.adaptive = as_bool(&new_value, id)?;
-        }
-        "context_window.adaptive_budget_reduction" => {
-            config.context_window.adaptive_budget_reduction = as_bool(&new_value, id)?;
         }
         "context_window.dynamic_compression" => {
             config.context_window.dynamic_compression = as_bool(&new_value, id)?;

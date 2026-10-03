@@ -128,14 +128,8 @@ pub(super) fn build_core_state(
             .with_uc_native(uc_provider)
             .with_pool(shared_pool.clone()),
     ))
-    .with_trigger_service(Arc::new(
-        DatabaseTriggerService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
     .with_sandbox_service(Arc::new(
         DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_branch_service(Arc::new(
-        DatabaseBranchService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_data_versioning_service(Arc::new(
         DatabaseDataVersioningService::new(settings.matrixone.clone())

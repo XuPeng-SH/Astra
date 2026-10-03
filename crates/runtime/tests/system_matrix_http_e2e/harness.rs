@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use astra_core::SharedPool;
 use astra_core::config::AppSettings;
+pub use astra_runtime::server::provider_test_support::{
+    ProviderGateway, ProviderResponse, ProviderScript,
+};
 use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
 use astra_services::runs::{
     AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
@@ -36,8 +39,6 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
-
-use crate::test_support::DelegationJudgmentProvider;
 
 const INTERRUPTED_MATRIX_E2E_MIN_AGE_MINUTES: u64 = 15;
 const MATRIX_E2E_HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
@@ -426,53 +427,6 @@ pub async fn post_empty(app: &Router, path: &str, auth: Option<&str>) -> (Status
     (status, json)
 }
 
-/// POST JSON and collect the response body as UTF-8 (for small buffered SSE bodies).
-pub async fn collect_sse_body_text(
-    app: &Router,
-    req: Request<Body>,
-    max_bytes: usize,
-) -> (StatusCode, String) {
-    let response = app.clone().oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    if !status.is_success() {
-        let bytes = body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap_or_default();
-        return (status, String::from_utf8_lossy(&bytes).into_owned());
-    }
-    let mut stream = response.into_body().into_data_stream();
-    let mut acc = Vec::new();
-    let mut matched = false;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
-        let chunk = chunk.expect("body chunk");
-        acc.extend_from_slice(&chunk);
-        if acc.len() >= max_bytes {
-            matched = true;
-            break;
-        }
-        let preview = String::from_utf8_lossy(&acc);
-        if preview.contains("\"run_id\"") && preview.contains("session_info") {
-            matched = true;
-            break;
-        }
-        if preview.contains("\"type\":\"error\"") {
-            matched = true;
-            break;
-        }
-    }
-    if !matched {
-        let preview = String::from_utf8_lossy(&acc);
-        panic!(
-            "SSE stream timed out (5s) without expected events (run_id/session_info/error). \
-             Collected {} bytes, preview: {}",
-            acc.len(),
-            &preview[..preview.len().min(500)]
-        );
-    }
-    (status, String::from_utf8_lossy(&acc).into_owned())
-}
-
 /// Parse SSE `data: {...}` blocks; return the first JSON object whose `type` matches.
 pub fn sse_first_data_json_with_type(body: &str, want_type: &str) -> Option<Value> {
     for block in body.split("\n\n") {
@@ -732,9 +686,57 @@ pub struct MatrixE2eCtx {
     pub suffix: String,
     fixture_heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
     fixture_heartbeat_error: Arc<Mutex<Option<String>>>,
+    native_providers: Mutex<Vec<ProviderGateway>>,
 }
 
 impl MatrixE2eCtx {
+    /// Configure the fixture Offering through the public model API. Scripts
+    /// respond at the provider boundary; they never enter request context.
+    /// Background extraction may skip or resolve another deployment Offering.
+    /// This primary fixture does not own extraction cardinality. Strictly
+    /// matched background snapshots receive empty updates; owner tests need
+    /// their own extraction oracle.
+    pub async fn install_native_provider(&self, auth: &str, mut scripts: Vec<ProviderScript>) {
+        let fixture_model = format!("mock-{}", self.suffix);
+        let extraction_system=astra_turn_core::cloud::session_memory_extract::build_extraction_prompt("",&[])[0]["content"].clone();
+        scripts.push(ProviderScript::optional_background_json("sparse memory extraction for the live session",move |request|
+            request.path=="/v1/chat/completions" && request.body["model"]==fixture_model
+            && request.body["stream"]==false && request.body["temperature"]==0.0
+            && request.body["max_completion_tokens"]==2048 && request.body.get("tools").is_none()
+            && request.body["messages"].as_array().is_some_and(|messages| messages.len()==2
+                && messages[0]["role"]=="system" && messages[0]["content"]==extraction_system
+                && messages[1]["role"]=="user" && messages[1]["content"].as_str().is_some_and(|text|
+                    text.starts_with("## Current session memory:") && text.contains("## Recent conversation:") && text.ends_with("Output the sparse JSON update:"))),
+            json!({"choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":13,"completion_tokens":2,"total_tokens":15}})));
+        let gateway = ProviderGateway::start(scripts).await;
+        let (status, body) = put_json(
+            &self.app,
+            &format!("/models/mock-{}", self.suffix),
+            Some(auth),
+            json!({
+                "provider":"openai","base_url":format!("{}/v1",gateway.base_url)
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "configure native fixture Offering: {body}"
+        );
+        self.native_providers.lock().await.push(gateway);
+    }
+
+    pub async fn native_provider_requests(
+        &self,
+    ) -> Vec<astra_runtime::server::provider_test_support::ProviderRequest> {
+        let providers = self.native_providers.lock().await;
+        let mut requests = Vec::new();
+        for provider in providers.iter() {
+            requests.extend(provider.requests.lock().await.iter().cloned());
+        }
+        requests
+    }
+
     async fn stop_fixture_heartbeat(&self) {
         if let Some(heartbeat) = self.fixture_heartbeat.lock().await.take() {
             heartbeat.abort();
@@ -793,7 +795,10 @@ impl MatrixE2eCtx {
         astra_services::models::invalidate_active_llm_model_resolution_cache();
         self.pool.close().await;
         self.app_state.close_database_pools().await;
-        offering_cleanup.expect("remove Matrix E2E mock Offering");
+        offering_cleanup.expect("remove Matrix E2E fixture Offering");
+        for gateway in self.native_providers.lock().await.iter() {
+            gateway.assert_complete();
+        }
         if let Some(error) = self.fixture_heartbeat_error.lock().await.take() {
             panic!("Matrix E2E fixture heartbeat failed before cleanup: {error}");
         }
@@ -804,22 +809,6 @@ pub struct BootstrapResult {
     pub ctx: MatrixE2eCtx,
     pub auth_header: String,
     pub refresh_token: String,
-    pub delegation_judgment: Option<DelegationJudgmentProvider>,
-}
-
-impl BootstrapResult {
-    pub fn assert_delegation_judgment(&self, user_text: &str, slots: &[(&str, &str)]) {
-        self.delegation_judgment
-            .as_ref()
-            .expect("journey opted into HTTP judgment provider")
-            .assert_request(
-                user_text,
-                &self.ctx.model_offering_id,
-                &format!("mock-{}", self.ctx.suffix),
-                slots,
-                true,
-            );
-    }
 }
 
 /// Seed the durable precondition for `/approval/respond` through the same run
@@ -999,20 +988,7 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
     .expect("revoke_astra_admin_role delete");
 }
 
-/// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
-    bootstrap_with_judgment_provider(None).await
-}
-
-/// Only delegation journeys opt into real HTTP/SSE candidate assessment.
-/// Other cases retain the deliberately unserved default model.
-pub async fn bootstrap_with_delegation_judgment() -> BootstrapResult {
-    bootstrap_with_judgment_provider(Some(DelegationJudgmentProvider::start().await)).await
-}
-
-async fn bootstrap_with_judgment_provider(
-    delegation_judgment: Option<DelegationJudgmentProvider>,
-) -> BootstrapResult {
     let memoria = Arc::new(E2eMemoriaStub::default());
     let memoria_base_url = start_mock_memoria().await;
     let (state, matrixone_database, url) =
@@ -1123,7 +1099,7 @@ async fn bootstrap_with_judgment_provider(
         "/sessions",
         Some(&auth_header),
         json!({ "title": "product matrix session", "metadata": {
-            "suite": "matrix", "full_llm_capture": delegation_judgment.is_some()
+            "suite": "matrix", "full_llm_capture": false
         } }),
     )
     .await;
@@ -1179,10 +1155,10 @@ async fn bootstrap_with_judgment_provider(
         Some(&auth_header),
         json!({
             "name": mock_model,
-            "provider": if delegation_judgment.is_some() { "openai" } else { "mock" },
+            "provider": "mock",
             "context_window": 200000,
             "api_key": "unused",
-            "base_url": delegation_judgment.as_ref().map_or("http://127.0.0.1:1", DelegationJudgmentProvider::base_url),
+            "base_url": "http://127.0.0.1:1",
             "context_window": 200000
         }),
     )
@@ -1241,10 +1217,10 @@ async fn bootstrap_with_judgment_provider(
             suffix,
             fixture_heartbeat: Mutex::new(Some(fixture_heartbeat)),
             fixture_heartbeat_error,
+            native_providers: Mutex::new(Vec::new()),
         },
         auth_header,
         refresh_token,
-        delegation_judgment,
     }
 }
 

@@ -64,7 +64,7 @@ fn settings_file_path_reads_and_applies() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tmp.path(),
-        r#"{"context_window":{"adaptive_budget_reduction":true}}"#,
+        r#"{"token_budget":{"max_turn_input_tokens":123456}}"#,
     )
     .unwrap();
 
@@ -72,10 +72,7 @@ fn settings_file_path_reads_and_applies() {
         .expect("path-form --settings must read the file");
     let base = RuntimeConfig::default();
     let overlaid = apply_settings_json(base, &raw).expect("file JSON must apply");
-    assert!(
-        overlaid.context_window.adaptive_budget_reduction,
-        "file-sourced overlay must take effect"
-    );
+    assert_eq!(overlaid.token_budget.max_turn_input_tokens, 123456);
 }
 
 #[test]
@@ -145,7 +142,7 @@ fn catalog_includes_knobs_that_motivated_this_refactor() {
         "token_budget.system_prompt_reserve",
         "token_budget.tools_reserve",
         "context_window.adaptive",
-        "context_window.adaptive_budget_reduction",
+        "trace.llm_exchanges",
         "context_window.compression_threshold_min",
         "context_window.compression_threshold_max",
         "compression.compression_threshold",
@@ -169,7 +166,7 @@ fn catalog_items_carry_kind_matching_their_concrete_type() {
 
     let adaptive = items
         .iter()
-        .find(|i| i.id == "context_window.adaptive_budget_reduction")
+        .find(|i| i.id == "trace.llm_exchanges")
         .expect("must be present");
     assert!(matches!(adaptive.kind, SettingKind::Bool));
 
@@ -262,16 +259,22 @@ fn filter_settings_empty_query_returns_all() {
 fn apply_edit_roundtrip_bool_knob() {
     let config = RuntimeConfig::default();
     assert!(
-        !config.context_window.adaptive_budget_reduction,
+        !config
+            .trace
+            .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
         "precondition: default off"
     );
-    let updated = apply_edit(
-        config,
-        "context_window.adaptive_budget_reduction",
-        serde_json::json!(true),
-    )
-    .expect("bool edit must succeed");
-    assert!(updated.context_window.adaptive_budget_reduction);
+    let updated = apply_edit(config, "trace.llm_exchanges", serde_json::json!(true))
+        .expect("bool edit must succeed");
+    assert!(
+        updated
+            .trace
+            .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges)
+    );
+    assert_eq!(
+        updated.trace.profile,
+        astra_config::runtime_config::TraceProfile::Custom
+    );
 }
 
 #[test]
@@ -301,7 +304,7 @@ fn apply_edit_rejects_type_mismatch() {
     let config = RuntimeConfig::default();
     let err = apply_edit(
         config,
-        "context_window.adaptive_budget_reduction",
+        "trace.llm_exchanges",
         serde_json::json!("not a bool"),
     )
     .unwrap_err();

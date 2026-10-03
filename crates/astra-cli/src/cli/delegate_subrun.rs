@@ -511,6 +511,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 return Err("prepared sub-run Offering changed before execution".into());
             }
             crate::cli::session::session_runtime::ServerModelSelection {
+                pricing: None,
                 name: prepared.model_name.clone(),
                 context_window: None,
                 offering_id: prepared.offering_id.clone(),
@@ -536,9 +537,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::default();
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_policy
-            .resolve_for_model(effective_model.as_deref());
+        let tool_policy_config = astra_config::RuntimeConfig::load().tool_policy;
+        let resolved_tool_policy = tool_policy_config.resolve_for_model(effective_model.as_deref());
         let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
@@ -723,6 +723,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         );
 
         let mut state = AgenticLoopState {
+            evaluation_thresholds:
+                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
+                    &tool_policy_config,
+                ),
             observation_journal: Default::default(),
             tool_ledger_receipt: Default::default(),
             messages,
@@ -772,8 +776,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             budget_policy: None,
             restricted_tools,
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(

@@ -279,7 +279,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -421,7 +421,7 @@ async fn stream_chat_sse_simple_text_response() {
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -539,7 +539,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -659,7 +659,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             workspace_observation_quarantine: None,
             session_lessons: &[],
             memory_selection_reports: &[],
-            latest_skill_diagnosis: None,
+
             latest_turn_quality_feedback: None,
             unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
             is_plan_subtask: false,
@@ -792,7 +792,7 @@ async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() 
             workspace_observation_quarantine: None,
             session_lessons: &[],
             memory_selection_reports: &[],
-            latest_skill_diagnosis: None,
+
             latest_turn_quality_feedback: None,
             unified_skill_registry: &unified_skill_registry,
             is_plan_subtask: false,
@@ -908,7 +908,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -1015,7 +1015,7 @@ async fn stream_chat_sse_api_error_propagated() {
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -1133,7 +1133,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -1297,7 +1297,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -1471,7 +1471,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
@@ -1631,7 +1631,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         workspace_observation_quarantine: None,
         session_lessons: &[],
         memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
+
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,

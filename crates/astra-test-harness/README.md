@@ -444,6 +444,9 @@ and per-case evidence are persisted under
 
 ## Cross-surface Work journey (TUI + Web)
 
+This live lane requires Linux process supervision. Other platforms return
+`not_tested` before setup, including when reusing an existing Web server.
+
 The YAML harness does not drive a browser or a controlling terminal. To verify
 the user journey across surfaces, run the separate opt-in live harness:
 

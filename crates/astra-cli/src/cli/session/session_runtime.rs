@@ -12,23 +12,6 @@ use astra_services::{
 use astra_text_utils::str_preview::prefix_chars;
 use crossterm::style::Stylize;
 use std::collections::HashSet;
-use std::sync::{OnceLock, RwLock};
-
-static ACTIVE_OFFERING_ID_FOR_REQUEST: OnceLock<RwLock<Option<String>>> = OnceLock::new();
-
-pub(crate) fn set_active_offering_id_for_request(offering_id: Option<String>) {
-    let lock = ACTIVE_OFFERING_ID_FOR_REQUEST.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
-        *guard = offering_id;
-    }
-}
-
-pub(crate) fn active_offering_id_for_request() -> Option<String> {
-    ACTIVE_OFFERING_ID_FOR_REQUEST
-        .get()
-        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
-}
-
 pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -336,20 +319,21 @@ fn create_pipeline_modules_inner(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ServerModelSelection {
     pub name: String,
     pub context_window: Option<u32>,
     pub offering_id: String,
+    pub pricing: Option<astra_services::models::PricingData>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AdmittedServerModel {
     pub model: ServerModelSelection,
     pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ServerDefaultModel {
     Selected(ServerModelSelection),
     NoModels,
@@ -412,138 +396,6 @@ pub(crate) fn find_model_entry_by_name<'a>(
     })
 }
 
-/// Built-in pricing table for known models (USD per token).
-/// Seeds the client estimate when restoring a session's model selection.
-/// Pricing from https://platform.claude.com/docs/en/about-claude/pricing
-/// and https://openai.com/api/pricing/
-pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::PricingData {
-    use astra_services::models::PricingData;
-    let name = model_name.to_lowercase();
-
-    // Claude Opus 4/4.1: $15/$75 per Mtok
-    if name.contains("opus-4") && !name.contains("4.5") && !name.contains("4.6") {
-        return PricingData {
-            prompt: 0.000_015,
-            completion: 0.000_075,
-            cache_read: Some(0.000_001_5),
-            cache_write: Some(0.000_018_75),
-        };
-    }
-    // Claude Opus 4.5/4.6: $5/$25 per Mtok
-    if name.contains("opus") {
-        return PricingData {
-            prompt: 0.000_005,
-            completion: 0.000_025,
-            cache_read: Some(0.000_000_5),
-            cache_write: Some(0.000_006_25),
-        };
-    }
-    // Claude Sonnet (3.5/3.7/4/4.5/4.6): $3/$15 per Mtok
-    if name.contains("sonnet") {
-        return PricingData {
-            prompt: 0.000_003,
-            completion: 0.000_015,
-            cache_read: Some(0.000_000_3),
-            cache_write: Some(0.000_003_75),
-        };
-    }
-    // Claude Haiku 4.5: $1/$5 per Mtok
-    if name.contains("haiku") && (name.contains("4.5") || name.contains("4-5")) {
-        return PricingData {
-            prompt: 0.000_001,
-            completion: 0.000_005,
-            cache_read: Some(0.000_000_1),
-            cache_write: Some(0.000_001_25),
-        };
-    }
-    // Claude Haiku 3.5: $0.80/$4 per Mtok
-    if name.contains("haiku") {
-        return PricingData {
-            prompt: 0.000_000_8,
-            completion: 0.000_004,
-            cache_read: Some(0.000_000_08),
-            cache_write: Some(0.000_001),
-        };
-    }
-    // GPT-4o / GPT-4.1: $2.5/$10 per Mtok
-    if name.contains("gpt-4o") || name.contains("gpt-4.1") {
-        return PricingData {
-            prompt: 0.000_002_5,
-            completion: 0.000_01,
-            cache_read: Some(0.000_000_625),
-            cache_write: None,
-        };
-    }
-    // GPT-4o-mini / GPT-4.1-mini: $0.15/$0.60 per Mtok
-    if name.contains("4o-mini")
-        || name.contains("4.1-mini")
-        || name.contains("5-mini")
-        || name.contains("5.4-mini")
-    {
-        return PricingData {
-            prompt: 0.000_000_15,
-            completion: 0.000_000_6,
-            cache_read: Some(0.000_000_037_5),
-            cache_write: None,
-        };
-    }
-    // DeepSeek V3/R1: $0.27/$1.10 per Mtok (cache read $0.07)
-    if name.contains("deepseek") {
-        return PricingData {
-            prompt: 0.000_000_27,
-            completion: 0.000_001_1,
-            cache_read: Some(0.000_000_07),
-            cache_write: None,
-        };
-    }
-    // Qwen (DashScope): cache reads ≈ 40% of input, no cache_write premium.
-    // Per-Mtok varies widely by Qwen tier (qwen-plus, qwen-max, ...); leave
-    // prompt/completion for the yaml to populate and supply only the cache
-    // ratio so `extract_pricing_for_model` can blend it in.
-    if name.contains("qwen") {
-        return PricingData {
-            prompt: 0.000_000_8,
-            completion: 0.000_002,
-            cache_read: Some(0.000_000_32),
-            cache_write: None,
-        };
-    }
-    // MiniMax: cache reads discounted, no cache_write premium.
-    if name.contains("minimax") {
-        return PricingData {
-            prompt: 0.000_000_8,
-            completion: 0.000_008,
-            cache_read: Some(0.000_000_2),
-            cache_write: None,
-        };
-    }
-    // GLM / Zhipu: cache reads ~25% of input, no cache_write premium.
-    if name.contains("glm") {
-        return PricingData {
-            prompt: 0.000_000_5,
-            completion: 0.000_001_5,
-            cache_read: Some(0.000_000_125),
-            cache_write: None,
-        };
-    }
-    // Kimi (Moonshot): cache reads ~25%, no cache_write premium.
-    if name.contains("kimi") || name.contains("moonshot") {
-        return PricingData {
-            prompt: 0.000_003,
-            completion: 0.000_015,
-            cache_read: Some(0.000_000_75),
-            cache_write: None,
-        };
-    }
-    // Default: Sonnet pricing as safe fallback
-    PricingData {
-        prompt: 0.000_003,
-        completion: 0.000_015,
-        cache_read: Some(0.000_000_3),
-        cache_write: Some(0.000_003_75),
-    }
-}
-
 pub(crate) fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
     entry.is_active
 }
@@ -559,7 +411,9 @@ pub(crate) fn model_list_entry_context_window(entry: &ModelListItemResponse) -> 
         .filter(|value| *value > 0)
 }
 
-fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<ServerModelSelection> {
+pub(crate) fn model_selection_from_list_entry(
+    entry: &ModelListItemResponse,
+) -> Option<ServerModelSelection> {
     let offering_id = entry.offering_id.as_str();
     if offering_id.is_empty() || offering_id.trim() != offering_id {
         return None;
@@ -568,6 +422,15 @@ fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<Serv
         name: model_list_entry_name(entry)?.to_string(),
         context_window: model_list_entry_context_window(entry),
         offering_id: offering_id.to_string(),
+        pricing: entry
+            .pricing
+            .as_ref()
+            .map(|price| astra_services::models::PricingData {
+                prompt: price.prompt,
+                completion: price.completion,
+                cache_read: price.cache_read,
+                cache_write: price.cache_write,
+            }),
     })
 }
 
@@ -1053,6 +916,7 @@ pub(crate) async fn admit_server_model_slots(
             .config();
             Ok(AdmittedServerModel {
                 model: ServerModelSelection {
+                    pricing: None,
                     name: admitted.model_name,
                     context_window: admitted.context_window,
                     offering_id: admitted.offering_id,
@@ -1133,6 +997,19 @@ pub(crate) async fn ensure_state_default_model(
     token: &str,
     state: &mut SessionState,
 ) -> Result<Option<String>, astra_core::ClassifiedError> {
+    if let Some(super::session_state::SessionModelChoice::Selected(selection)) =
+        state.model.as_ref()
+    {
+        if let Some(context_window) = selection.context_window {
+            state.context_budget =
+                astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
+                    &state.runtime_config,
+                    Some(&selection.name),
+                    Some(context_window),
+                );
+        }
+        return Ok(Some(selection.name.clone()));
+    }
     if let Some(model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
         match resolve_server_model_selection(
             api,
@@ -1142,8 +1019,11 @@ pub(crate) async fn ensure_state_default_model(
         )
         .await
         {
-            Ok(selection) => {
-                set_active_offering_id_for_request(Some(selection.offering_id));
+            Ok(mut selection) => {
+                selection.name = model.clone();
+                state.model = Some(super::session_state::SessionModelChoice::Selected(
+                    selection.clone(),
+                ));
                 if let Some(context_window) = selection.context_window {
                     state.context_budget = astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
                         &state.runtime_config,
@@ -1166,8 +1046,9 @@ pub(crate) async fn ensure_state_default_model(
     }
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
-            state.model = Some(selection.name.clone());
-            set_active_offering_id_for_request(Some(selection.offering_id.clone()));
+            state.model = Some(super::session_state::SessionModelChoice::Selected(
+                selection.clone(),
+            ));
             if let Some(context_window) = selection.context_window {
                 state.context_budget =
                     astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
@@ -1563,7 +1444,7 @@ pub(crate) fn initialize_session_state(
         state.pending_recovery = None;
     }
     if let Some(m) = normalize_model_override(initial_model) {
-        state.model = Some(m.to_string());
+        state.model = Some((m.to_string()).into());
     }
 
     // Initialize observability hub for M1-M6 integration
@@ -2460,7 +2341,7 @@ mod tests {
         super::print_session_banner(
             Some(profile),
             &super::SessionState {
-                model: Some("模型-deepseek-".repeat(10)),
+                model: Some(("模型-deepseek-".repeat(10)).into()),
                 ..Default::default()
             },
             native_auth,
@@ -3154,7 +3035,7 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
         let mut state = SessionState {
-            model: Some("deepseek-v4-pro-official".to_string()),
+            model: Some(("deepseek-v4-pro-official(thinking:high)".to_string()).into()),
             ..SessionState::default()
         };
 
@@ -3164,13 +3045,48 @@ mod tests {
 
         assert_eq!(
             selected.as_deref(),
-            Some("deepseek-v4-pro-official"),
+            Some("deepseek-v4-pro-official(thinking:high)"),
             "explicit model selection should be preserved"
+        );
+        assert_eq!(state.model.as_deref(), selected.as_deref());
+        assert_eq!(
+            state.model.as_ref().and_then(|model| model.offering_id()),
+            Some("offer-deepseek")
         );
         assert_eq!(
             state.context_budget.model_limit, 1_000_000,
             "state diagnostics must reflect the server model context_window, not the client default"
         );
+    }
+
+    #[tokio::test]
+    async fn selected_offering_and_reasoning_are_preserved_without_catalog_io() {
+        let mock = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let mut state = SessionState {
+            model: Some(super::super::session_state::SessionModelChoice::Selected(
+                super::ServerModelSelection {
+                    name: "same-name(thinking:high)".into(),
+                    offering_id: "chosen-offering".into(),
+                    context_window: Some(64_000),
+                    pricing: None,
+                },
+            )),
+            ..SessionState::default()
+        };
+        assert_eq!(
+            ensure_state_default_model(&api, "token", &mut state)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("same-name(thinking:high)")
+        );
+        assert_eq!(
+            state.model.as_ref().and_then(|model| model.offering_id()),
+            Some("chosen-offering")
+        );
+        assert_eq!(state.context_budget.model_limit, 64_000);
+        assert!(mock.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
@@ -4316,7 +4232,7 @@ mod tests {
     #[test]
     fn model_display_shows_actual_name_when_set() {
         let state = SessionState {
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             ..Default::default()
         };
         let display = state.model.as_deref().unwrap_or("auto");

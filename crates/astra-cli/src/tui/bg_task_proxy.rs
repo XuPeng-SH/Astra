@@ -151,10 +151,6 @@ pub(crate) fn background_local_agent_projection_from_info(
     agent: &astra_turn_core::orchestration_types::SpawnedAgentInfo,
     fanout_title: Option<&str>,
 ) -> Option<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
-    if !agent.run_in_background {
-        return None;
-    }
-
     let (status, output, terminal_reason) = local_agent_status_projection(&agent.status);
     let started_at_ms = agent
         .started_at

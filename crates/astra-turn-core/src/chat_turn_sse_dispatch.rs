@@ -204,6 +204,7 @@ pub struct ChatTurnSseAccum {
     /// and clients must not turn it into an ordinary tool failure followed by
     /// another model round.
     pub run_terminal: Option<DurableRunTerminal>,
+    pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     pub full_text: String,
     /// Thinking / reasoning chunks (for models that stream reasoning separately).
     pub reasoning_content: String,
@@ -1593,6 +1594,47 @@ fn apply_one_event(
                 }
                 match durable_run_terminal_from_event(event) {
                     Ok(Some(terminal)) => {
+                        let evaluation = event
+                            .get("turn_evaluation")
+                            .filter(|value| !value.is_null())
+                            .map(|value| {
+                                crate::evaluation::turn_evaluation_from_terminal(
+                                    value,
+                                    accum.session_id.as_deref(),
+                                    &terminal.run_id,
+                                    terminal.owner_generation,
+                                    event
+                                        .get("status")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default(),
+                                )
+                            })
+                            .transpose();
+                        let evaluation = match evaluation {
+                            Ok(evaluation) => evaluation,
+                            Err(error) => {
+                                accum.turn_evaluation = None;
+                                accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                                accum.error_message =
+                                    Some(format!("Invalid terminal evaluation: {error}"));
+                                return;
+                            }
+                        };
+                        if accum
+                            .run_terminal
+                            .as_ref()
+                            .is_some_and(|previous| previous != &terminal)
+                            || (accum.run_terminal.is_some()
+                                && serde_json::to_value(&accum.turn_evaluation).ok()
+                                    != serde_json::to_value(&evaluation).ok())
+                        {
+                            accum.turn_evaluation = None;
+                            accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                            accum.error_message =
+                                Some("Conflicting root terminal evaluation".into());
+                            return;
+                        }
+                        accum.turn_evaluation = evaluation;
                         accum.attempt_error_supersession_eligible = accum.pending_attempt_error
                             && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
                             && matches!(
@@ -1809,6 +1851,9 @@ pub fn dispatch_chat_turn_sse_event_block(
             continue;
         };
         apply_one_event(&event, accum, edge_pending, &mut effects);
+        if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+            accum.turn_evaluation = None;
+        }
     }
     effects
 }
@@ -1928,6 +1973,204 @@ pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn dispatch_evaluation_event(accum: &mut ChatTurnSseAccum, event: &Value) {
+        dispatch_chat_turn_sse_event_block(&format!("data: {event}\n\n"), accum, &mut Vec::new());
+    }
+
+    fn terminal_evaluation_wire(status: &str) -> Value {
+        use crate::evaluation::{
+            EvalSignal, EvaluationThresholds, eval_signals_to_json_with_thresholds,
+        };
+        let mut event = astra_services::session_journal::JournalEvent::turn_evaluation(
+            Some("session"),
+            Some(9),
+            "server_runtime",
+            false,
+            matches!(status, "completed" | "delegated"),
+            0.8,
+            0.9,
+            0.0,
+            0,
+            false,
+            0,
+            eval_signals_to_json_with_thresholds(
+                &[
+                    EvalSignal::RepeatToolCall("read_file".into()),
+                    EvalSignal::StallDetected,
+                    EvalSignal::VerdictWarning,
+                    EvalSignal::ToolOutcomeFailure {
+                        class: "test_failure".into(),
+                        count: 2,
+                    },
+                    EvalSignal::BlockedToolCall { count: 1 },
+                    EvalSignal::ExplorationFamilyChurn {
+                        family: "read".into(),
+                        streak: 7,
+                    },
+                ],
+                EvaluationThresholds::default(),
+            ),
+        )
+        .with_producer_scope(Some("root"));
+        let metadata = event.metadata.as_mut().unwrap();
+        metadata["execution_owner_generation"] = serde_json::json!(4);
+        metadata["tool_evaluation_success"] = serde_json::json!(true);
+        metadata["run_status"] = serde_json::json!(status);
+        serde_json::json!({"type":"run_finished", "run_id":"root", "owner_generation":4,
+            "status":status, "turn_evaluation":event})
+    }
+
+    #[test]
+    fn root_terminal_evaluation_preserves_the_canonical_fact_and_replay_duplicate() {
+        for status in ["completed", "delegated", "failed", "cancelled", "paused"] {
+            let mut accum = ChatTurnSseAccum::default();
+            dispatch_evaluation_event(
+                &mut accum,
+                &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+            );
+            let wire = terminal_evaluation_wire(status);
+            dispatch_evaluation_event(&mut accum, &wire);
+            assert_eq!(accum.error_kind, None);
+            assert_eq!(
+                serde_json::to_value(accum.turn_evaluation.as_ref().unwrap()).unwrap(),
+                wire["turn_evaluation"]
+            );
+            let signals = crate::evaluation::turn_evaluation_feedback_signals(
+                accum
+                    .turn_evaluation
+                    .as_ref()
+                    .unwrap()
+                    .metadata
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(signals.len(), 6);
+            assert!(
+                matches!(&signals[3], crate::evaluation::EvalSignal::ToolOutcomeFailure { class, count: 2 } if class == "test_failure")
+            );
+            dispatch_evaluation_event(&mut accum, &wire);
+            assert_eq!(accum.error_kind, None);
+        }
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+        );
+        let mut wire = terminal_evaluation_wire("completed");
+        wire["owner_generation"] = serde_json::json!(0);
+        wire["turn_evaluation"]["metadata"]["execution_owner_generation"] = serde_json::json!(0);
+        dispatch_evaluation_event(&mut accum, &wire);
+        assert_eq!(accum.error_kind, None);
+        assert!(accum.turn_evaluation.is_some());
+    }
+
+    #[test]
+    fn root_terminal_evaluation_rejects_wrong_authority_or_malformed_known_evidence() {
+        for (pointer, replacement) in [
+            ("/turn_evaluation/session_id", serde_json::json!("foreign")),
+            (
+                "/turn_evaluation/producer_scope/run_id",
+                serde_json::json!("child"),
+            ),
+            (
+                "/turn_evaluation/metadata/execution_owner_generation",
+                serde_json::json!(3),
+            ),
+            ("/owner_generation", Value::Null),
+            (
+                "/turn_evaluation/metadata/run_status",
+                serde_json::json!("failed"),
+            ),
+            ("/turn_evaluation/metadata/success", Value::Null),
+            (
+                "/turn_evaluation/metadata/signals/3/count",
+                serde_json::json!("2"),
+            ),
+            ("/turn_evaluation/metadata/signals/5/family", Value::Null),
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            dispatch_evaluation_event(
+                &mut accum,
+                &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+            );
+            let mut wire = terminal_evaluation_wire("completed");
+            *wire.pointer_mut(pointer).unwrap() = replacement;
+            dispatch_evaluation_event(&mut accum, &wire);
+            assert_eq!(
+                accum.error_kind,
+                Some(astra_core::ErrorKind::ContractViolation),
+                "{pointer}"
+            );
+            assert!(accum.turn_evaluation.is_none());
+        }
+    }
+
+    #[test]
+    fn root_terminal_evaluation_ignores_child_and_rejects_conflicting_duplicate() {
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+        );
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"run_finished", "run_id":"child", "status":"malformed", "turn_evaluation":false}),
+        );
+        assert!(accum.turn_evaluation.is_none());
+        assert_eq!(accum.error_kind, None);
+        let mut wire = terminal_evaluation_wire("completed");
+        dispatch_evaluation_event(&mut accum, &wire);
+        wire["turn_evaluation"]["metadata"]["quality"] = serde_json::json!(0.1);
+        dispatch_evaluation_event(&mut accum, &wire);
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(accum.turn_evaluation.is_none());
+    }
+
+    #[test]
+    fn terminal_protocol_failure_keeps_evaluation_unknown_in_either_delivery_order() {
+        for malformed_first in [false, true] {
+            let mut accum = ChatTurnSseAccum::default();
+            dispatch_evaluation_event(
+                &mut accum,
+                &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+            );
+            let valid = terminal_evaluation_wire("completed");
+            let invalid =
+                serde_json::json!({"type":"run_finished", "run_id":"root", "status":"invalid"});
+            for event in if malformed_first {
+                [&invalid, &valid]
+            } else {
+                [&valid, &invalid]
+            } {
+                dispatch_evaluation_event(&mut accum, event);
+            }
+            assert_eq!(
+                accum.error_kind,
+                Some(astra_core::ErrorKind::ContractViolation)
+            );
+            assert!(accum.turn_evaluation.is_none());
+        }
+    }
+
+    #[test]
+    fn root_terminal_without_evaluation_retains_unknown_quality() {
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+        );
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"run_finished", "run_id":"root", "status":"completed", "owner_generation":4}),
+        );
+        assert_eq!(accum.error_kind, None);
+        assert!(accum.run_terminal.is_some());
+        assert!(accum.turn_evaluation.is_none());
+    }
 
     fn server_runtime_feedback_fragment(llm_rounds: u32) -> String {
         let frame = crate::introspect::test_runtime_feedback(1, llm_rounds, 8);

@@ -4068,6 +4068,9 @@ fn build_server_skill_executor(
     execution_lease_lost: Option<Arc<AtomicBool>>,
     memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
+    #[cfg(any(test, feature = "e2e-hooks"))] test_inference_ledger: Option<
+        &crate::turn::llm::durable::TestInferenceLedgerPersistence,
+    >,
     #[cfg(feature = "harness")] harness_sink: Option<
         &std::sync::Arc<dyn astra_harness::SnapshotSink>,
     >,
@@ -4099,6 +4102,10 @@ fn build_server_skill_executor(
     .with_reflect_service(reflect_service)
     .with_cancel_token(cancel_token)
     .with_execution_lease_lost(execution_lease_lost);
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    {
+        subrun_executor.test_inference_ledger = test_inference_ledger.cloned();
+    }
     subrun_executor = subrun_executor.with_interaction_mode(interaction_mode);
     if let (Some(parent_owner_generation), Some(parent_owner_pod_id), Some(invocation_ledger)) = (
         parent_owner_generation,
@@ -4157,7 +4164,7 @@ fn build_runtime_turn_evaluation_event(
     settled_status: &str,
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
-    let eval_thresholds = crate::turn::runtime_policy::configured_evaluation_thresholds();
+    let eval_thresholds = state.evaluation_thresholds;
     let resolved_children = state
         .stall
         .terminal_child_evaluation_refs
@@ -4197,6 +4204,20 @@ fn build_runtime_turn_evaluation_event(
         // Tool quality is evidence, not lifecycle authority. Successful tools
         // cannot make a failed or interrupted run successful; retain their
         // accurate health signals separately from the settled turn outcome.
+        metadata.insert(
+            "evaluation_thresholds".into(),
+            json!(state.evaluation_thresholds),
+        );
+        metadata.insert(
+            "execution_owner_generation".into(),
+            json!(state.current_run_owner_generation),
+        );
+        if let Some(notice) = astra_turn_core::evaluation::turn_evaluation_status_notice_for_records(
+            &eval,
+            &state.stall.tool_call_records,
+        ) {
+            metadata.insert("status_notice".into(), Value::String(notice));
+        }
         metadata.insert("tool_evaluation_success".into(), Value::Bool(eval.success));
         metadata.insert("run_status".into(), Value::String(settled_status.into()));
         metadata.insert(
@@ -4209,21 +4230,38 @@ fn build_runtime_turn_evaluation_event(
     event
 }
 
+fn discard_root_turn_evaluation(events: &mut [Value], run_id: &str) {
+    for event in events {
+        if event
+            .pointer("/data/turn_evaluation/producer_scope/run_id")
+            .and_then(Value::as_str)
+            == Some(run_id)
+            && let Some(data) = event.get_mut("data").and_then(Value::as_object_mut)
+        {
+            data.remove("turn_evaluation");
+        }
+        if event
+            .pointer("/turn_evaluation/producer_scope/run_id")
+            .and_then(Value::as_str)
+            == Some(run_id)
+            && let Some(data) = event.as_object_mut()
+        {
+            data.remove("turn_evaluation");
+        }
+    }
+}
+
 fn persist_turn_evaluation_journal(
     user_id: &str,
     session_id: &str,
-    source: &str,
-    state: &AgenticLoopState,
-    settled_status: &str,
+    event: &astra_services::session_journal::JournalEvent,
 ) {
     if session_id.is_empty() {
         return;
     }
-
-    let event = build_runtime_turn_evaluation_event(session_id, source, state, settled_status);
     match astra_services::session_journal::JournalWriter::for_user(user_id, session_id) {
         Ok(journal) => {
-            if let Err(err) = journal.append(&event) {
+            if let Err(err) = journal.append(event) {
                 tracing::warn!(
                     target: "astra_runtime::run_lifecycle",
                     session_id = %session_id,
@@ -4801,8 +4839,6 @@ struct ServerSpawnRuntimeContext {
     /// cancellation is generation-scoped; only canonical user lineage may
     /// intentionally cross generations.
     execution_owner_generation: Arc<ExecutionOwnerGenerationSink>,
-    #[cfg(feature = "e2e-hooks")]
-    test_child_llm_rounds: Vec<Value>,
     #[cfg(feature = "harness")]
     harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
 }
@@ -5474,6 +5510,7 @@ pub struct AgenticRunLifecycleService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Durable workspace record store for cloud workspace ownership/audit.
     workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
+    selected_server_workspace_provider: Option<ServerWorkspaceProvisioner>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
     /// Exact model catalog used to resolve client-visible Offering IDs.
@@ -5582,6 +5619,9 @@ impl AgenticRunLifecycleService {
                     Err(error) => (None, Some(Arc::<str>::from(error))),
                 }
         };
+        let selected_server_workspace_provider = run_engine
+            .execution_owner_pod_id()
+            .map(|id| ServerWorkspaceProvisioner::from_env(id.to_owned()));
         let admission_limits = canonical_session_admission_limits();
         Self {
             runs: Arc::new(RwLock::new(HashMap::new())),
@@ -5611,6 +5651,7 @@ impl AgenticRunLifecycleService {
             resource_governor: None,
             edge_connection_pool: None,
             workspace_record_store: None,
+            selected_server_workspace_provider,
             skill_service: None,
             model_service: Arc::new(astra_services::UnconfiguredModelService),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
@@ -6314,6 +6355,35 @@ impl AgenticRunLifecycleService {
         self
     }
 
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub(crate) fn fixture_server_workspace(
+        &self,
+        session_id: &str,
+    ) -> Result<RuntimeWorkspaceRecord, astra_runtime_env::WorkspaceProvisionError> {
+        self.selected_server_workspace_provider
+            .as_ref()
+            .ok_or_else(|| {
+                astra_runtime_env::WorkspaceProvisionError::unavailable(
+                    session_id,
+                    "fixture provider unavailable",
+                )
+            })?
+            .provision(session_id)
+            .map(|record| record.workspace)
+            .map_err(crate::server::run::workspace_provisioning::server_error_to_workspace_error)
+    }
+
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub(crate) fn with_fixture_workspace_provider(
+        mut self,
+        directory: Arc<tempfile::TempDir>,
+        executor_id: &str,
+    ) -> Self {
+        self.selected_server_workspace_provider =
+            Some(ServerWorkspaceProvisioner::fixture(directory, executor_id));
+        self
+    }
+
     pub(crate) fn with_workspace_record_store(
         mut self,
         store: Arc<dyn WorkspaceStateStore>,
@@ -6357,8 +6427,11 @@ impl AgenticRunLifecycleService {
     /// fixtures. Provider calls still use canonical admission and settlement;
     /// this does not inject a model judgment or grant delegation authority.
     #[cfg(feature = "e2e-hooks")]
-    pub fn with_e2e_inference_ledger(mut self) -> Self {
-        self.test_inference_ledger = Some(Default::default());
+    pub fn with_e2e_inference_ledger(
+        mut self,
+        fixture: &crate::server::provider_test_support::InferenceLedgerFixture,
+    ) -> Self {
+        self.test_inference_ledger = Some(fixture.persistence.clone());
         self
     }
 
@@ -6681,11 +6754,19 @@ impl AgenticRunLifecycleService {
         .with_reflect_service(Arc::clone(&self.reflect_service))
         .with_auxiliary_event_writer(self.auxiliary_event_writer.clone())
         .with_trace_ingestion(self.trace_ingestion.clone());
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        {
+            executor._workspace_provider_guard = self.selected_server_workspace_provider.clone();
+        }
         if let Some(service) = self.edge_dispatch_service.clone() {
             executor = executor.with_edge_dispatch_service(service);
         }
         if let Some(service) = self.edge_registry_service.clone() {
             executor = executor.with_edge_registry_service(service);
+        }
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        {
+            executor.test_inference_ledger = self.test_inference_ledger.clone();
         }
         let executor = Arc::new(executor);
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
@@ -7194,14 +7275,6 @@ impl AgenticRunLifecycleService {
                 pause_flag,
                 cancel_token,
                 execution_owner_generation: Arc::new(ExecutionOwnerGenerationSink::preparing(0)),
-                #[cfg(feature = "e2e-hooks")]
-                test_child_llm_rounds: request
-                    .context
-                    .as_ref()
-                    .and_then(|ctx| ctx.get("test_spawn_child_llm_rounds"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
                 #[cfg(feature = "harness")]
                 harness_sink,
             })
@@ -10095,7 +10168,7 @@ impl AgenticRunLifecycleService {
                 "server_shutting_down",
             ));
         }
-        Self::validate_effective_user_input(&request)?;
+        Self::prepare_effective_user_input(&mut request)?;
         match request.requested_model_policy.as_ref() {
             Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
                 if request.model_selection.is_none() =>
@@ -10351,17 +10424,19 @@ impl AgenticRunLifecycleService {
         astra_plan::plan_resume_snapshot_for_session(&repo, user_id, session_id).await
     }
 
-    fn validate_effective_user_input(
-        request: &ChatRequestData,
+    fn prepare_effective_user_input(
+        request: &mut ChatRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         if !request.message.trim().is_empty() {
             return Ok(());
         }
-        if request
+        if let Some(intent) = request
             .user_intent
             .as_deref()
-            .is_some_and(|intent| !intent.trim().is_empty())
+            .map(str::trim)
+            .filter(|intent| !intent.is_empty())
         {
+            request.message = intent.to_string();
             return Ok(());
         }
         Err(error_response_coded(
@@ -12009,27 +12084,6 @@ impl AgenticRunLifecycleService {
                 .with_provider_capabilities(shared_tes.provider_capabilities_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
-        // Wire test LLM rounds from request context (E2E test hook).
-        #[cfg(feature = "e2e-hooks")]
-        if let Some(rounds) = request
-            .context
-            .as_ref()
-            .and_then(|c| c.get("test_llm_rounds"))
-            .and_then(Value::as_array)
-            .cloned()
-        {
-            builder = builder.with_test_llm_rounds(rounds);
-        }
-        #[cfg(feature = "e2e-hooks")]
-        if let Some(decision) = request
-            .context
-            .as_ref()
-            .and_then(|c| c.get("test_work_admission"))
-        {
-            let decision = astra_services::parse_work_admission_response(&decision.to_string())
-                .expect("test_work_admission must satisfy the typed semantic-admission contract");
-            builder = builder.with_test_work_admission(decision);
-        }
         let mut host = builder.build();
         if let ModelSelectionMode::Auto(policy) = &request.model_selection_mode {
             host.configure_model_routing(
@@ -12455,6 +12509,8 @@ impl AgenticRunLifecycleService {
             execution_lease_lost.clone(),
             memory_extraction_service.as_ref(),
             interaction_sink,
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            self.test_inference_ledger.as_ref(),
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -12601,7 +12657,8 @@ impl AgenticRunLifecycleService {
         });
 
         let task_profile = infer_task_execution_profile(&prompt_user_message);
-        let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
+        let admitted_runtime_config = astra_config::RuntimeConfig::load();
+        let runtime_turn_ceiling = admitted_runtime_config
             .runtime_limits
             .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context))
             .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
@@ -12666,6 +12723,10 @@ impl AgenticRunLifecycleService {
             remaining_turns: max_turns,
             charged_iterations: 0,
             original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts {
+                evaluation_thresholds:
+                    crate::turn::runtime_policy::evaluation_thresholds_from_policy(
+                        &admitted_runtime_config.tool_policy,
+                    ),
                 pending_context: Vec::new(),
                 context_compression_triggered: false,
                 skill_execution: Default::default(),
@@ -12870,6 +12931,7 @@ impl AgenticRunLifecycleService {
                 facts.original.agentic_turn_budget,
                 &resolved_tool_policy,
                 astra_turn_types::InferencePurpose::PrimaryAgent,
+                facts.original.evaluation_thresholds,
             )
         }
     }
@@ -13328,12 +13390,26 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    fn server_workspace_provider(
+        &self,
+    ) -> Result<&ServerWorkspaceProvisioner, (StatusCode, Json<ErrorResponse>)> {
+        self.selected_server_workspace_provider
+            .as_ref()
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No local workspace provider is selected",
+                )
+            })
+    }
+
     /// Provision a sandboxed workspace directory for server-side tool execution.
     fn provision_server_workspace(
         &self,
         session_id: &str,
     ) -> Result<std::path::PathBuf, (StatusCode, Json<ErrorResponse>)> {
-        let record = ServerWorkspaceProvisioner::from_env()
+        let record = self
+            .server_workspace_provider()?
             .provision(session_id)
             .map_err(server_workspace_provision_error)?;
         Ok(record.root)
@@ -13349,7 +13425,22 @@ impl AgenticRunLifecycleService {
         session_id: &str,
         run_id: &str,
     ) -> Result<std::path::PathBuf, (StatusCode, Json<ErrorResponse>)> {
-        let record = ServerWorkspaceProvisioner::from_env()
+        let provider = self.server_workspace_provider()?;
+        if let Some(store) = self.workspace_record_store.as_ref()
+            && let Some(existing) = store
+                .load_workspace_record(user_id, session_id)
+                .await
+                .map_err(workspace_record_store_error)?
+        {
+            let root = provider
+                .resolve_existing(&existing.record)
+                .map_err(server_workspace_provision_error)?;
+            self.persist_workspace_record(user_id, session_id, run_id, &existing.record)
+                .await?;
+            return Ok(root);
+        }
+        let record = self
+            .server_workspace_provider()?
             .provision(session_id)
             .map_err(server_workspace_provision_error)?;
         self.persist_workspace_record(user_id, session_id, run_id, &record.workspace)
@@ -14361,7 +14452,8 @@ fn workspace_record_store_error(
             format!("Invalid workspace ownership record: {error}"),
         ),
         WorkspaceRecordStoreError::WorkspaceOwnerConflict { .. }
-        | WorkspaceRecordStoreError::SourceOwnerConflict { .. } => error_response(
+        | WorkspaceRecordStoreError::SourceOwnerConflict { .. }
+        | WorkspaceRecordStoreError::PhysicalIdentityConflict { .. } => error_response(
             StatusCode::CONFLICT,
             format!("Workspace ownership conflict: {error}"),
         ),
@@ -14460,6 +14552,8 @@ impl AgenticRunLifecycleService {
         let bg_work_runtime_binding = work_runtime_binding.clone();
         let bg_work_workspace = tool_runtime_workspace.clone();
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        let bg_workspace_provider_guard = self.selected_server_workspace_provider.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let bg_shared_pool = self.shared_pool.clone();
         let bg_trace_ingestion = self.trace_ingestion.clone();
@@ -14514,6 +14608,8 @@ impl AgenticRunLifecycleService {
                 // The task is in flight from spawn, including while it waits
                 // for capacity.  Construct this guard before admission so a
                 // cancellation in that wait cannot leak shutdown accounting.
+                #[cfg(any(test, feature = "e2e-hooks"))]
+                let _workspace_provider_guard = bg_workspace_provider_guard;
                 let _guard = task_guard;
                 let _owner_lease_heartbeat = owner_lease_heartbeat;
                 if bg_execution_lease_lost.load(Ordering::Acquire) {
@@ -14940,6 +15036,27 @@ impl AgenticRunLifecycleService {
                     &mut final_events,
                     execution_owner_generation,
                 );
+                let turn_evaluation = build_runtime_turn_evaluation_event(
+                    &bg_session_id,
+                    "server_runtime",
+                    &state,
+                    final_status.as_str(),
+                );
+                if let Some(data) = final_events.iter_mut().rev().find_map(|event| {
+                    (event.get("event_type").and_then(Value::as_str) == Some("run_finished")
+                        && event
+                            .get("run_id")
+                            .or_else(|| event.pointer("/data/run_id"))
+                            .and_then(Value::as_str)
+                            .is_none_or(|id| id == bg_run_id))
+                    .then(|| event.get_mut("data"))
+                    .flatten()
+                    .and_then(Value::as_object_mut)
+                }) {
+                    data.insert("status".into(), json!(final_status.as_str()));
+                    data.insert("turn_evaluation".into(), json!(&turn_evaluation));
+                }
+
                 let mut core_trace_result = Err(
                     "canonical terminal settlement did not acquire durable authority".to_string(),
                 );
@@ -14974,7 +15091,7 @@ impl AgenticRunLifecycleService {
                 let (
                     live_events_flushed,
                     mut streamed_final_events,
-                    streaming_events_for_durable,
+                    mut streaming_events_for_durable,
                     mut terminal_state_events,
                 ) = if let Some(event_tx) = event_tx.as_ref() {
                     // Ensure fast synchronous child-agent progress has reached both
@@ -15124,6 +15241,10 @@ impl AgenticRunLifecycleService {
                     publish_stream_terminal = false;
                     runs.write().await.remove(&bg_run_id);
                 }
+                // The process-local terminal projection may retain drained
+                // facts for pause promotion, but a candidate evaluation has no
+                // authority until this owner wins the durable terminal CAS.
+                discard_root_turn_evaluation(&mut terminal_state_events, &bg_run_id);
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                     run.execution_live = false;
                     run.settlement_in_progress = true;
@@ -15446,6 +15567,32 @@ impl AgenticRunLifecycleService {
                     }
                 }
 
+                if owner_terminal_committed {
+                    if let Some(run) = runs.write().await.get_mut(&bg_run_id)
+                        && let Some(data) = run.events.iter_mut().rev().find_map(|event| {
+                            (event.get("event_type").and_then(Value::as_str)
+                                == Some("run_finished")
+                                && event
+                                    .pointer("/data/owner_generation")
+                                    .and_then(Value::as_u64)
+                                    == Some(execution_owner_generation)
+                                && event.pointer("/data/status").and_then(Value::as_str)
+                                    == Some(final_status.as_str()))
+                            .then(|| event.get_mut("data"))
+                            .flatten()
+                            .and_then(Value::as_object_mut)
+                        })
+                    {
+                        data.insert("turn_evaluation".into(), json!(&turn_evaluation));
+                    }
+                } else {
+                    // A control-owned pause can retain pending completion facts
+                    // for later promotion. It must never persist this losing
+                    // owner's claim about the completed/delegated outcome.
+                    discard_root_turn_evaluation(&mut streaming_events_for_durable, &bg_run_id);
+                    discard_root_turn_evaluation(&mut streamed_final_events, &bg_run_id);
+                }
+
                 if user_cancellation
                     && durable_status_committed
                     && persisted_status == RunStatus::Cancelled
@@ -15746,9 +15893,7 @@ impl AgenticRunLifecycleService {
                         persist_turn_evaluation_journal(
                             &bg_user_id,
                             &bg_session_id,
-                            "server_runtime",
-                            &state,
-                            persisted_status.as_str(),
+                            &turn_evaluation,
                         );
                     }
                     if let (Some(pool), Some(binding), Some(workspace)) = (
@@ -15846,6 +15991,28 @@ impl AgenticRunLifecycleService {
 
 #[async_trait]
 impl RunLifecycleService for AgenticRunLifecycleService {
+    fn workspace_executor_id(&self) -> Option<&str> {
+        self.selected_server_workspace_provider
+            .as_ref()
+            .map(ServerWorkspaceProvisioner::executor_id)
+    }
+
+    fn resolve_server_workspace(
+        &self,
+        record: &astra_runtime_env::WorkspaceRecord,
+    ) -> Result<PathBuf, astra_runtime_env::WorkspaceProvisionError> {
+        self.selected_server_workspace_provider
+            .as_ref()
+            .ok_or_else(|| {
+                astra_runtime_env::WorkspaceProvisionError::unavailable(
+                    &record.workspace_id,
+                    "No local workspace provider is selected",
+                )
+            })?
+            .resolve_existing(record)
+            .map_err(crate::server::run::workspace_provisioning::server_error_to_workspace_error)
+    }
+
     fn execution_owner_pod_id(&self) -> Option<&str> {
         self.run_engine.execution_owner_pod_id()
     }
@@ -17622,7 +17789,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         });
         host.set_event_tx_with_gap(host_event_tx, host_event_gap.clone());
         host.set_interaction_sink(interaction_sink);
-        host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
+        host.set_client_cancel(llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_snapshot_fields(snapshot)));
         }
@@ -19550,6 +19717,10 @@ use crate::server::delegation::engine::{
 /// and observe-only harness path as delegated children. Spawn-specific
 /// semantics stay in `DynamicAgentSpawner` and `agent_tool`.
 pub struct ServerSpawnAgentExecutor {
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    _workspace_provider_guard: Option<ServerWorkspaceProvisioner>,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
     model_service: Option<Arc<dyn ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -19761,6 +19932,10 @@ impl ServerSpawnAgentExecutor {
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         Self {
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            test_inference_ledger: None,
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            _workspace_provider_guard: None,
             model_service: None,
             matrixone,
             encryptor,
@@ -20189,21 +20364,6 @@ impl ServerSpawnAgentExecutor {
         }
     }
 
-    async fn runtime_context_for_config(
-        &self,
-        config: &SpawnRunConfig,
-    ) -> Result<ServerSpawnRuntimeContext, String> {
-        let parent_run_id = config
-            .parent_address
-            .as_ref()
-            .map(|address| address.run_id.as_str())
-            .ok_or_else(|| {
-                "server dynamic agent executor requires parent run lineage".to_string()
-            })?;
-
-        self.runtime_context_for_parent_run(parent_run_id).await
-    }
-
     async fn runtime_context_is_current(&self, parent_run_id: &str, context_id: &str) -> bool {
         self.runtime_context_registry
             .read()
@@ -20347,54 +20507,6 @@ impl ServerSpawnAgentExecutor {
         Err("configured model names require the authenticated model catalog service".into())
     }
 
-    async fn select_spawn_model_execution(
-        &self,
-        parent: &ServerSpawnRuntimeContext,
-        selection: Option<&ModelSelection>,
-    ) -> Result<astra_services::AdmittedModelExecution, String> {
-        let parent_execution = parent.admitted_model_execution.as_ref();
-        let Some(selection) = selection else {
-            return parent_execution.cloned().ok_or_else(|| {
-                "server dynamic child cannot inherit a missing parent model admission".to_string()
-            });
-        };
-        astra_services::validate_model_offering_id(&selection.offering_id)
-            .map_err(|error| format!("invalid child model selection: {error}"))?;
-        if let Some(parent_execution) = parent_execution
-            && parent_execution.offering_id == selection.offering_id
-        {
-            return Ok(parent_execution.clone());
-        }
-        let mut admitted = self
-            .admit_model_selectors(
-                parent,
-                &[astra_turn_types::ModelSelector::OfferingId {
-                    offering_id: selection.offering_id.clone(),
-                }],
-            )
-            .await?;
-        let execution = admitted
-            .pop()
-            .ok_or_else(|| "model admission returned no selected Offering".to_string())?;
-        astra_services::models::validate_model_execution_purpose(
-            &execution,
-            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
-        )
-        .map_err(|(_, body)| body.0.detail)?;
-        Ok(execution)
-    }
-
-    async fn prepare_spawn_model(
-        &self,
-        parent: &ServerSpawnRuntimeContext,
-        selection: Option<&ModelSelection>,
-        thinking: &astra_turn_core::thinking_config::ThinkingConfig,
-    ) -> Result<astra_services::AdmittedModelExecution, String> {
-        let execution = self.select_spawn_model_execution(parent, selection).await?;
-        crate::server::model_execution_admission::validate_reasoning_control(&execution, thinking)?;
-        Ok(execution)
-    }
-
     /// Publish the child as the next possible parent before its loop starts.
     ///
     /// Dynamic agents use the same session-owned spawner at every depth.  A
@@ -20450,8 +20562,6 @@ impl ServerSpawnAgentExecutor {
             pause_flag: Some(pause_flag),
             cancel_token: Some(cancel_token),
             execution_owner_generation,
-            #[cfg(feature = "e2e-hooks")]
-            test_child_llm_rounds: parent.test_child_llm_rounds.clone(),
             #[cfg(feature = "harness")]
             harness_sink: parent.harness_sink.clone(),
         };
@@ -20482,6 +20592,10 @@ impl ServerSpawnAgentExecutor {
         }
         if let Some(ledger) = self.invocation_ledger.clone() {
             executor = executor.with_invocation_ledger(ledger);
+        }
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        {
+            executor.test_inference_ledger = self.test_inference_ledger.clone();
         }
         executor = executor.with_inherited_permissions(inherited_permissions);
         if let Some(pool) = self.shared_pool.clone() {
@@ -20908,6 +21022,7 @@ impl ServerSpawnAgentExecutor {
                         .await;
                 }
                 SpawnRunCancellationDurability::Terminal
+                | SpawnRunCancellationDurability::LocalExecution
                 | SpawnRunCancellationDurability::Superseded(_) => {
                     unreachable!("authoritative retirement handled above")
                 }
@@ -21431,34 +21546,39 @@ impl PreparedSpawn for ServerPreparedSpawn {
         })
     }
 
-    async fn execute(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-        let parent_run_id = config
-            .parent_address
-            .as_ref()
-            .map(|address| address.run_id.as_str());
-        if parent_run_id != Some(self.parent.parent_run_id.as_str())
-            || config.fanout_slot != self.slot
-            || config.delegated_model_requirements != self.delegated_model_requirements
-            || config.requested_model_policy != self.requested_model_policy
-            || config.thinking != self.thinking
-            || config.max_output_tokens != self.max_output_tokens
-            || config.resolved_model_selection != self.resolved_selection
-        {
-            return Err("prepared child execution does not match its admitted parent, slot, Offering, or reasoning".to_string());
-        }
-        if !self
-            .executor
-            .runtime_context_is_current(
-                parent_run_id.expect("validated parent run"),
-                &self.parent.runtime_context_id,
-            )
-            .await
-        {
-            return Err("prepared child parent generation is no longer current".to_string());
-        }
-        self.executor
-            .execute_with_admitted_model(config, self.parent, self.execution)
-            .await
+    fn launch(
+        self: Box<Self>,
+        config: SpawnRunConfig,
+    ) -> Result<crate::orchestration::SpawnExecution, String> {
+        Ok(Box::pin(async move {
+            let parent_run_id = config
+                .parent_address
+                .as_ref()
+                .map(|address| address.run_id.as_str());
+            if parent_run_id != Some(self.parent.parent_run_id.as_str())
+                || config.fanout_slot != self.slot
+                || config.delegated_model_requirements != self.delegated_model_requirements
+                || config.requested_model_policy != self.requested_model_policy
+                || config.thinking != self.thinking
+                || config.max_output_tokens != self.max_output_tokens
+                || config.resolved_model_selection != self.resolved_selection
+            {
+                return Err("prepared child execution does not match its admitted parent, slot, Offering, or reasoning".to_string());
+            }
+            if !self
+                .executor
+                .runtime_context_is_current(
+                    parent_run_id.expect("validated parent run"),
+                    &self.parent.runtime_context_id,
+                )
+                .await
+            {
+                return Err("prepared child parent generation is no longer current".to_string());
+            }
+            self.executor
+                .execute_with_admitted_model(config, self.parent, self.execution)
+                .await
+        }))
     }
 }
 
@@ -21470,6 +21590,9 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         context: &SpawnContext,
         _parent_selection: Option<&ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        if inputs.iter().any(|input| input.isolated) {
+            return Err("this Server execution boundary does not support isolated Git workspaces; select a CLI execution boundary".into());
+        }
         let parent = self
             .runtime_context_for_parent_run(&context.parent_run_id)
             .await?;
@@ -21948,20 +22071,6 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             )
             .await
     }
-
-    async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-        config.validate_requested_model_policy()?;
-        let context = self.runtime_context_for_config(&config).await?;
-        let admitted_model_execution = self
-            .prepare_spawn_model(
-                &context,
-                config.resolved_model_selection.as_ref(),
-                &config.thinking,
-            )
-            .await?;
-        self.execute_with_admitted_model(config, context, admitted_model_execution)
-            .await
-    }
 }
 
 impl ServerSpawnAgentExecutor {
@@ -22115,12 +22224,6 @@ impl ServerSpawnAgentExecutor {
             .with_provider_scope_bound(context.provider_run_owner.is_some())
             .with_model_catalog_reader(child_runtime_context.model_catalog_reader.clone())
             .with_admitted_execution_deadline(config.execution_deadline);
-        #[cfg(feature = "e2e-hooks")]
-        let executor = if !context.test_child_llm_rounds.is_empty() {
-            executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
-        } else {
-            executor
-        };
         let execution = AssertUnwindSafe(executor.execute_with_frontier(subrun))
             .catch_unwind()
             .await;
@@ -22236,6 +22339,8 @@ fn inherited_provider_run_owner(
 /// Creates a real agentic loop for each sub-run with the agent's system prompt,
 /// model, and tool configuration.
 pub struct ServerSubRunExecutor {
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
     model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     provider_scope_bound: bool,
     model_service: Option<Arc<dyn ModelService>>,
@@ -22271,8 +22376,6 @@ pub struct ServerSubRunExecutor {
     edge_tools: Arc<Vec<Value>>,
     /// Shared ToolExecutionService so executors share the same disabled_tool_offers set.
     pub tool_execution_service: Option<ToolExecutionService>,
-    #[cfg(feature = "e2e-hooks")]
-    test_llm_rounds: Vec<Value>,
 }
 
 impl ServerSubRunExecutor {
@@ -22326,6 +22429,8 @@ impl ServerSubRunExecutor {
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         Self {
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            test_inference_ledger: None,
             model_service: None,
             model_catalog_reader: None,
             provider_scope_bound: false,
@@ -22350,8 +22455,6 @@ impl ServerSubRunExecutor {
             client_tool_delivery_tx: None,
             edge_tools: Arc::new(Vec::new()),
             tool_execution_service: None,
-            #[cfg(feature = "e2e-hooks")]
-            test_llm_rounds: Vec::new(),
         }
     }
 
@@ -22470,12 +22573,6 @@ impl ServerSubRunExecutor {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
-        self
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
-        self.test_llm_rounds = rounds;
         self
     }
 }
@@ -23073,6 +23170,7 @@ impl ServerSubRunExecutor {
         error_message: Option<&str>,
         cancellation_origin: Option<CancellationOrigin>,
         final_text: Option<&str>,
+        turn_evaluation: Option<&astra_services::session_journal::JournalEvent>,
     ) -> Result<Option<crate::orchestration::spawner::SpawnRunFrontier>, String> {
         let Some(run_engine) = self.durable_run_engine() else {
             return Ok(None);
@@ -23113,7 +23211,10 @@ impl ServerSubRunExecutor {
                 error_code,
                 error_message,
                 cancellation_origin,
-                Map::new(),
+                Map::from_iter([
+                    ("owner_generation".into(), json!(execution_owner_generation)),
+                    ("turn_evaluation".into(), json!(turn_evaluation)),
+                ]),
             )?);
         }
 
@@ -24027,9 +24128,9 @@ impl ServerSubRunExecutor {
         if let Some(snapshot) = execution_bindings.as_ref() {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
         }
-        #[cfg(feature = "e2e-hooks")]
-        if !self.test_llm_rounds.is_empty() {
-            builder = builder.with_test_llm_rounds(self.test_llm_rounds.clone());
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        if let Some(ledger) = self.test_inference_ledger.as_ref() {
+            builder = builder.with_test_inference_ledger(ledger.clone());
         }
         // NOTE on grandchild inheritance: delegated children don't get
         // a prefix_store wired here because this sub-run executor
@@ -24058,7 +24159,7 @@ impl ServerSubRunExecutor {
                 delegated_edge_tool_schema_names(&config.request_constraints);
             host.merge_allowlisted_edge_tool_schemas(&inherited_edge_tools);
         }
-        host.set_client_cancel(local_cancel_flag.clone(), local_cancel_token.clone());
+        host.set_client_cancel(local_cancel_token.clone());
         if let Some(sink) = config.live_event_sink.clone() {
             host.set_agent_live_event_sink(
                 config.run_id.clone(),
@@ -24137,9 +24238,8 @@ impl ServerSubRunExecutor {
 
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .resolve_for_model(child_model_name.as_deref());
+        let runtime_config = astra_config::RuntimeConfig::load();
+        let resolved_tool_policy = runtime_config.tool_selection.resolve_for_model(child_model_name.as_deref());
         let mut effective_inherited_permissions = self.inherited_permissions.clone();
         if child_workspace_mutation
             == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
@@ -24244,6 +24344,7 @@ impl ServerSubRunExecutor {
                 agentic_turn_budget,
                 &resolved_tool_policy,
                 astra_turn_types::InferencePurpose::SubAgent,
+                crate::turn::runtime_policy::evaluation_thresholds_from_policy(&runtime_config.tool_policy),
             )
         };
         if let Some(trace_context) =
@@ -24562,6 +24663,10 @@ impl ServerSubRunExecutor {
         // Root and delegated loops share one canonical append transaction.
         // Commit the durable record before publishing a terminal run status;
         // otherwise readers can observe "completed" with no canonical history.
+        let turn_evaluation = (control_authority.is_none() && durable_run_status_is_terminal(durable_status))
+            .then(|| build_runtime_turn_evaluation_event(
+                &config.session_id, "server_subrun", &loop_state, durable_status,
+            ));
         let terminal_expected_statuses = [STATUS_RUNNING];
         let mut atomic_terminal_events = if tool_terminals_precommitted {
             Vec::with_capacity(2)
@@ -24586,7 +24691,10 @@ impl ServerSubRunExecutor {
                 durable_error_code,
                 durable_error.as_deref(),
                 cancellation_origin,
-                Map::new(),
+                Map::from_iter([
+                    ("owner_generation".into(), json!(execution_owner_generation)),
+                    ("turn_evaluation".into(), json!(&turn_evaluation)),
+                ]),
             )?);
         }
         let terminal_settlement = if control_authority.is_none()
@@ -24740,7 +24848,8 @@ impl ServerSubRunExecutor {
                                 Some(&error),
                                 None,
                                 None,
-                            )
+                            None,
+)
                             .await
                             .is_ok();
                         if failed_status_committed {
@@ -24783,7 +24892,8 @@ impl ServerSubRunExecutor {
                     cancellation_origin,
                     (!loop_state.final_text.trim().is_empty())
                         .then_some(loop_state.final_text.as_str()),
-                )
+                turn_evaluation.as_ref(),
+)
                 .await;
             match durable_status_result {
                 Ok(frontier) => {
@@ -24924,13 +25034,11 @@ impl ServerSubRunExecutor {
             &loop_state.telemetry.promotion_events,
         )
         .await?;
-        persist_turn_evaluation_journal(
-            &config.user_id,
-            &config.session_id,
-            "server_subrun",
-            &loop_state,
-            control_authority.map_or(durable_status, DurableSubrunControlAuthority::status),
-        );
+        if durable_terminal_committed && control_authority.is_none()
+            && let Some(event) = turn_evaluation.as_ref()
+        {
+            persist_turn_evaluation_journal(&config.user_id, &config.session_id, event);
+        }
         flush_turn_observability(&mut loop_state, &config.user_id, &config.session_id,
             control_authority == Some(DurableSubrunControlAuthority::Cancelled),
             self.trace_ingestion.as_ref(), execution_owner_generation);
@@ -25145,6 +25253,7 @@ impl ServerSubRunExecutor {
                         None,
                         Some("executor_failed_before_terminal"),
                         Some(error),
+                        None,
                         None,
                         None,
                     )

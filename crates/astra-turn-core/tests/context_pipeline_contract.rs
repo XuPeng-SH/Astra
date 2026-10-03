@@ -65,7 +65,6 @@ fn build_sources() -> (
         },
         ExternalSources {
             memory_entries: vec![MemoryEntry::new("contract memory")],
-            spill_dir: None,
             ..Default::default()
         },
         EmergentContext::default(),
@@ -282,7 +281,7 @@ fn cache_marker_indices_match_serialized_system_blocks() {
             scope: CacheScope::Session,
             cumulative_tokens: 10,
         }],
-        spilled: Vec::new(),
+
         stats: Default::default(),
     };
 

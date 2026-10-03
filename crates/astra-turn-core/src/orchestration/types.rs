@@ -224,7 +224,6 @@ pub struct SpawnedAgentInfo {
     pub ended_at: Option<SystemTime>,
     pub metrics: SpawnedAgentMetrics,
     pub has_permission_issues: bool,
-    pub run_in_background: bool,
     /// Parent tool-call identity that launched this run. This is the typed
     /// reconciliation key between a provisional control row and the child
     /// runtime identity published after admission.

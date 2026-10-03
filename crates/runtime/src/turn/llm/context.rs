@@ -1114,7 +1114,7 @@ pub(crate) struct ContextManifestProjectionInput<'a> {
     pub run_id: &'a str,
     pub turn_index: usize,
     pub llm_attempt_index: u32,
-    pub pre_llm_messages: &'a [Value],
+    pub message_tokens: ContextManifestMessageTokens,
     pub tool_results: &'a [Value],
     pub schema_tokens: u32,
     pub result_prompt_tokens: Option<u32>,
@@ -1255,6 +1255,30 @@ fn is_tool_result_wire_message(message: &Value) -> bool {
         })
 }
 
+/// Request-time zone totals; no transcript bytes survive the provider await.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContextManifestMessageTokens {
+    message_tokens: u32,
+    tool_result_tokens: u32,
+}
+
+impl ContextManifestMessageTokens {
+    pub(crate) fn from_messages(messages: &[Value]) -> Self {
+        messages
+            .iter()
+            .fold(Self::default(), |mut totals, message| {
+                let tokens = estimate_json_tokens(message);
+                let zone = if is_tool_result_wire_message(message) {
+                    &mut totals.tool_result_tokens
+                } else {
+                    &mut totals.message_tokens
+                };
+                *zone = zone.saturating_add(tokens);
+                totals
+            })
+    }
+}
+
 /// Build the persisted context-manifest projection for a single LLM call.
 ///
 /// This is deliberately inside `llm_context` so manifest rows are derived by
@@ -1266,18 +1290,10 @@ pub(crate) fn build_context_manifest_projection(
 ) -> ContextManifestProjection {
     let budget_allocation = astra_services::budget_for_turn_intent(Some(input.turn_intent));
     let budget = budget_allocation.budget.clone();
-    let (message_tokens, tool_result_tokens) =
-        input
-            .pre_llm_messages
-            .iter()
-            .fold((0_u32, 0_u32), |(messages, tool_results), message| {
-                let tokens = estimate_json_tokens(message);
-                if is_tool_result_wire_message(message) {
-                    (messages, tool_results.saturating_add(tokens))
-                } else {
-                    (messages.saturating_add(tokens), tool_results)
-                }
-            });
+    let ContextManifestMessageTokens {
+        message_tokens,
+        tool_result_tokens,
+    } = input.message_tokens;
     let total_estimated_tokens = input.result_prompt_tokens.unwrap_or_else(|| {
         message_tokens
             .saturating_add(tool_result_tokens)
@@ -1901,7 +1917,7 @@ fn classify_pipeline_abort(
 /// placement instead of each host rebuilding this logic.  The caller must
 /// explicitly mark a real history rewrite; ordinary provider rounds must not
 /// replay skill bodies that are already carried by canonical history.
-#[cfg(any(test, feature = "e2e-hooks"))]
+#[cfg(test)]
 pub(crate) fn assemble_wire_messages(
     mut input: LlmWireAssemblyInput<'_>,
 ) -> Result<Vec<Value>, astra_core::ClassifiedError> {
@@ -5056,7 +5072,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &messages,
+            message_tokens: ContextManifestMessageTokens::from_messages(&messages),
             tool_results: &[],
             schema_tokens: 7,
             result_prompt_tokens: Some(1_100),
@@ -5089,7 +5105,7 @@ mod context_cache_contract_tests {
 
     #[test]
     fn context_manifest_estimates_each_final_wire_zone_once() {
-        let messages = vec![
+        let mut messages = vec![
             json!({"role": "user", "content": "inspect"}),
             json!({
                 "role": "assistant",
@@ -5115,13 +5131,21 @@ mod context_cache_contract_tests {
             "result": "file body"
         })];
         let schema_tokens = 7;
+        let expected_wire_tokens = messages
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(schema_tokens, u32::saturating_add);
+        let message_tokens = ContextManifestMessageTokens::from_messages(&messages);
+        // Hosts may compact canonical history while assembling the request.
+        // The persisted pre-request zone totals must not follow that mutation.
+        messages.clear();
         let projection = build_context_manifest_projection(ContextManifestProjectionInput {
             owner_id: "user-a",
             session_id: "session-a",
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &messages,
+            message_tokens,
             tool_results: &duplicate_runtime_projection,
             schema_tokens,
             result_prompt_tokens: None,
@@ -5135,10 +5159,6 @@ mod context_cache_contract_tests {
             context_window_tokens: 64_000,
         });
 
-        let expected_wire_tokens = messages
-            .iter()
-            .map(estimate_json_tokens)
-            .fold(schema_tokens, u32::saturating_add);
         assert_eq!(projection.total_estimated_tokens, expected_wire_tokens);
         let zone_used_total = projection.manifest_json["zones"]
             .as_object()
@@ -5171,7 +5191,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &[],
+            message_tokens: ContextManifestMessageTokens::default(),
             tool_results: &tool_results,
             schema_tokens: 0,
             result_prompt_tokens: None,
@@ -5214,7 +5234,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &[],
+            message_tokens: ContextManifestMessageTokens::default(),
             tool_results: &invalid_results,
             schema_tokens: 0,
             result_prompt_tokens: None,
@@ -5256,7 +5276,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &[],
+            message_tokens: ContextManifestMessageTokens::default(),
             tool_results: &bounded_results,
             schema_tokens: 0,
             result_prompt_tokens: None,

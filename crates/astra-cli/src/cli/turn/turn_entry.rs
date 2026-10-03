@@ -7,7 +7,7 @@ use super::turn_settlement::TurnDispatch;
 use super::turn_stream_runner::{
     TurnAttempt, TurnExecutionInput, TurnExecutionRequest, execute_stream_turn,
 };
-use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
+use crate::cli::session::session_adaptation::prepare_turn_adaptation;
 use crate::cli::session::session_input::{finalize_effective_line, prepare_input};
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
@@ -226,9 +226,7 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
         return TurnAttempt::Completed(Box::new(Err(failure)));
     }
     prepare_turn_adaptation(state, input.api, input.token, input.message).await;
-    let attempt = execute_stream_turn(TurnExecutionRequest { state, input }).await;
-    finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
-    attempt
+    execute_stream_turn(TurnExecutionRequest { state, input }).await
 }
 
 /// Establish the canonical identity transaction before an interactive turn
@@ -806,7 +804,7 @@ mod tests {
         let mut state = SessionState {
             // A selected model with no Offering makes the later provider
             // preflight fail deterministically, without spending model tokens.
-            model: Some("mock-model".to_string()),
+            model: Some(("mock-model".to_string()).into()),
             ..SessionState::default()
         };
         let ctx = TurnContext {
@@ -956,7 +954,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
         state.set_session_id(session_id.clone());
-        state.model = Some("mock-model".to_string());
+        state.model = Some(("mock-model".to_string()).into());
         let ctx = TurnContext {
             api: &api,
             profile: None,

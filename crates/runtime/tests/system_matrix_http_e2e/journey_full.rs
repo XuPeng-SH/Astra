@@ -1,4 +1,5 @@
 //! Full product matrix journey: sessions through logout (see `main.rs` module docs).
+use super::harness::{ProviderResponse, ProviderScript};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -10,10 +11,9 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     MATRIX_E2E_EDGE_WORKSPACE_ROOT, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data,
-    delete_json, delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events,
-    post_empty, post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str,
-    row_get_str, seed_pending_approval, seeded_model_selection, tool_result_payload,
-    wait_for_agent_event_types,
+    delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events, post_empty,
+    post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str, row_get_str,
+    seed_pending_approval, seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -35,6 +35,17 @@ async fn run_tool_backed_chat_turn(
             }
         }
     });
+    // Background extraction resolves deployment candidates asynchronously and
+    // may skip or use another Offering. Only primary API requests are exact.
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth_header,vec![ProviderScript::new("run_tool_backed_chat_turn",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="read README through a tool")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[{
+                        "id": "ctx-trace-tool-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"tool-backed calibration reply","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16 }}))])]).await;
     let payload = json!({
         "agent_id": agent_id,
         "session_id": session_id,
@@ -57,6 +68,7 @@ async fn run_tool_backed_chat_turn(
             "status": "online"
         },
         "message": "read README through a tool",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
@@ -64,25 +76,7 @@ async fn run_tool_backed_chat_turn(
                 "edge_agent_id": ctx.edge_agent_id,
                 "hostname": "system-matrix-edge"
             },
-            "edge_tools": [read_file_tool],
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "ctx-trace-tool-1",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"README.md\"}"
-                        }
-                    }]
-                },
-                {
-                    "full_text": "tool-backed calibration reply",
-                    "reasoning": "",
-                    "usage": { "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16 }
-                }
-            ]
-        }
+            "edge_tools": [read_file_tool]}
     });
 
     let req = axum::http::Request::builder()
@@ -820,58 +814,6 @@ pub async fn run_product_matrix_full_journey(
         "sandbox row should be removed after DELETE"
     );
 
-    let (st_tr, tr_j) = post_json(
-        app,
-        "/triggers",
-        Some(auth_header),
-        json!({
-            "trigger_type": "webhook",
-            "name": format!("wh_{suffix}"),
-            "agent_id": agent_id,
-            "user_input": "matrix e2e webhook trigger",
-            "session_id": session_id,
-            "context": { "suite": "matrix" }
-        }),
-    )
-    .await;
-    assert_eq!(st_tr, StatusCode::OK, "create webhook trigger: {tr_j}");
-    let trigger_id = tr_j["trigger_id"].as_str().expect("trigger_id").to_string();
-    let wh_secret = tr_j["secret"].as_str().expect("webhook secret");
-
-    let (st_tr_l, tr_l) = get_json(app, "/triggers", Some(auth_header), &[]).await;
-    assert_eq!(st_tr_l, StatusCode::OK, "list triggers: {tr_l}");
-    assert!(
-        tr_l.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|t| t["trigger_id"].as_str() == Some(trigger_id.as_str()))
-        }),
-        "trigger not listed: {tr_l}"
-    );
-
-    let (st_fire, fire_j) = post_json(
-        app,
-        &format!("/triggers/{trigger_id}/fire"),
-        None,
-        json!({ "secret": wh_secret, "payload": { "hello": "matrix" } }),
-    )
-    .await;
-    assert_eq!(st_fire, StatusCode::OK, "fire webhook: {fire_j}");
-    assert_eq!(fire_j["fired"], true);
-
-    let (st_tr_d, tr_d) =
-        delete_json(app, &format!("/triggers/{trigger_id}"), Some(auth_header)).await;
-    assert_eq!(st_tr_d, StatusCode::OK, "delete trigger: {tr_d}");
-
-    let trig_gone = sqlx::query("SELECT 1 FROM wf_triggers WHERE trigger_id = ?")
-        .bind(&trigger_id)
-        .fetch_optional(pool)
-        .await
-        .expect("trigger gone");
-    assert!(
-        trig_gone.is_none(),
-        "wf_triggers row should be deleted: {trigger_id}"
-    );
-
     let (st_sks, sks_j) = get_json(app, "/skills", Some(auth_header), &[]).await;
     assert_eq!(st_sks, StatusCode::OK, "list skills: {sks_j}");
     assert!(sks_j["skills"].is_array(), "skills list record: {sks_j}");
@@ -926,21 +868,20 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_trace, StatusCode::OK, "decision-trace: {trace}");
 
     const LLM_TEXT: &str = "product-matrix-e2e-reply";
+    // Background extraction resolves deployment candidates asynchronously and
+    // may skip or use another Offering. Only primary API requests are exact.
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth_header,vec![ProviderScript::new("run_product_matrix_full_journey",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="matrix journey ping")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":LLM_TEXT,"reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 5, "completion_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0},
+                    "total_tokens": 20 }}))])]).await;
     let chat_body = json!({
         "agent_id": agent_id,
         "session_id": session_id,
         "message": "matrix journey ping",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "edge_tools": [],
-            "test_llm_rounds": [{
-                "full_text": LLM_TEXT,
-                "reasoning": "",
-                "usage": { "prompt_tokens": 5, "completion_tokens": 15,
-                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0},
-                    "total_tokens": 20 }
-            }]
-        }
+            "edge_tools": []}
     });
 
     let chat_req = axum::http::Request::builder()

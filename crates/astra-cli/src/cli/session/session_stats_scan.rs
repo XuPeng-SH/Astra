@@ -2,9 +2,12 @@ use crate::cli::session::session_state::SessionState;
 use astra_services::{session_analytics, session_journal};
 
 pub(crate) fn current_rate_cost_rows(state: &SessionState) -> Vec<(&'static str, String)> {
-    let pricing = &state.cached_pricing;
+    let pricing = state.model.as_ref().and_then(|model| model.pricing());
     let amount = |usage: [u64; 4]| {
-        format_optional_cost(pricing.estimated_cost_usd(usage[0], usage[1], usage[2], usage[3]))
+        format_optional_cost(
+            pricing
+                .and_then(|price| price.estimated_cost_usd(usage[0], usage[1], usage[2], usage[3])),
+        )
     };
     let mut rows = vec![
         ("basis", "observed counters".into()),
@@ -13,7 +16,11 @@ pub(crate) fn current_rate_cost_rows(state: &SessionState) -> Vec<(&'static str,
         ("attribution", "unknown".into()),
         (
             "model",
-            state.model.clone().unwrap_or_else(|| "<unset>".into()),
+            state
+                .model
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| "<unset>".into()),
         ),
     ];
     for (label, count, index) in [

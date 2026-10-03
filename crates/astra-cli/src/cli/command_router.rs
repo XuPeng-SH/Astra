@@ -194,7 +194,7 @@ fn maybe_wire_delegation_engine(
     let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
         api.clone(),
         token.to_string(),
-        state.model.clone(),
+        state.model.as_deref().map(str::to_string),
         project_root.clone(),
         state.perm_manager.inherited_permissions_for_child(true),
         None,
@@ -4793,6 +4793,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
+            turn_evaluation: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -4928,6 +4929,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
+            turn_evaluation: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,

@@ -72,7 +72,6 @@ fn build_sources() -> (
             memory_entries: vec![MemoryEntry::new(
                 "Relevant memory: main.rs has flaky parsing.",
             )],
-            spill_dir: None,
             ..Default::default()
         },
         EmergentContext::default(),

@@ -2153,6 +2153,11 @@ struct TestInferenceLedgerState {
 #[cfg(any(test, feature = "e2e-hooks"))]
 #[derive(Default)]
 struct TestInvocationState {
+    #[cfg(feature = "e2e-hooks")]
+    admission: Option<(
+        astra_turn_types::InferenceInvocationScope,
+        Option<astra_services::InferenceRunAdmissionAuthority>,
+    )>,
     settlement: Option<astra_services::InferenceInvocationTerminal>,
     settlement_attempt_id: Option<String>,
     settlement_delivery_state: Option<astra_services::InferenceProviderDeliveryState>,
@@ -2162,7 +2167,6 @@ struct TestInvocationState {
 #[cfg(any(test, feature = "e2e-hooks"))]
 struct TestProviderAttemptState {
     invocation_id: String,
-    #[cfg(test)]
     canonical_transition_hash: Option<String>,
     terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
@@ -2175,7 +2179,6 @@ impl TestInferenceLedgerPersistence {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    #[cfg(test)]
     pub(crate) fn assert_quiescent(&self) {
         let state = self.lock();
         assert!(
@@ -2192,6 +2195,32 @@ impl TestInferenceLedgerPersistence {
                 .all(|attempt| attempt.terminal.is_some()),
             "every admitted test provider attempt must have one terminal"
         );
+    }
+
+    pub(crate) fn attempt_count(&self) -> usize {
+        self.lock().attempts.len()
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    pub(crate) fn admissions(
+        &self,
+    ) -> Vec<(
+        astra_turn_types::InferenceInvocationScope,
+        Option<astra_services::InferenceRunAdmissionAuthority>,
+    )> {
+        self.lock()
+            .invocations
+            .values()
+            .filter_map(|invocation| invocation.admission.clone())
+            .collect()
+    }
+
+    pub(crate) fn canonical_transition_hashes(&self) -> Vec<String> {
+        self.lock()
+            .attempts
+            .values()
+            .filter_map(|attempt| attempt.canonical_transition_hash.clone())
+            .collect()
     }
 
     #[cfg(test)]
@@ -2359,7 +2388,11 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
                 )))
             }
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(TestInvocationState::default());
+                entry.insert(TestInvocationState {
+                    #[cfg(feature = "e2e-hooks")]
+                    admission: Some(plan.e2e_admission_coordinates()),
+                    ..Default::default()
+                });
                 Ok(())
             }
         }
@@ -2547,7 +2580,6 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(TestProviderAttemptState {
                     invocation_id: attempt.invocation_id().to_string(),
-                    #[cfg(test)]
                     canonical_transition_hash: attempt
                         .canonical_transition_hash()
                         .map(str::to_string),

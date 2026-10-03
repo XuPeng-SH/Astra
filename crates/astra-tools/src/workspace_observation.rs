@@ -401,6 +401,7 @@ pub fn mark_workspace_observation_unsettled(workspace_root: &Path) -> bool {
 
 /// Retain the admitted observation state across root renames or retargeting.
 /// This handle carries attribution state only; it does not acquire a writer lease.
+#[derive(Clone)]
 pub struct WorkspaceAttributionState {
     state: Arc<WriterEpochState>,
     aliases: Vec<PathBuf>,

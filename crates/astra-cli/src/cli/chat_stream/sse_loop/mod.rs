@@ -479,9 +479,6 @@ pub(crate) async fn stream_chat_sse(
     // turn's LLM reads "the system already noticed X" in the self-awareness
     // section. Cloned because the setter takes ownership; the state-side
     // cache keeps its copy for the next turn's render / eventual clear.
-    if let Some(diag) = p.latest_skill_diagnosis {
-        executor.set_latest_skill_diagnosis(Some(diag.clone()));
-    }
     if let Some(feedback) = p.latest_turn_quality_feedback {
         executor.set_latest_turn_quality_feedback(Some(feedback.clone()));
     }
@@ -785,6 +782,7 @@ pub(crate) async fn stream_chat_sse(
         callback_client_detached: false,
         remote_cancel_run_id: None,
         last_physical_run_id: None,
+        turn_evaluation: None,
         last_error_code: None,
         last_error_metadata: None,
         output_transport_failure: None,
@@ -866,6 +864,10 @@ pub(crate) async fn stream_chat_sse(
                 .unwrap_or_default(),
         );
     let mut state = AgenticLoopState {
+        evaluation_thresholds:
+            astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
+                &tool_policy_config,
+            ),
         observation_journal: Default::default(),
         tool_ledger_receipt: Default::default(),
         messages,
@@ -911,8 +913,6 @@ pub(crate) async fn stream_chat_sse(
         turn_guard,
         budget_policy: None,
         restricted_tools: initial_restricted,
-        boosted_tools: HashSet::new(),
-        widen_selection_pending: false,
         step_recorder,
         idempotency_cache: p.idempotency_cache.unwrap_or_default(),
         semantic_dedup: SemanticDedup::new(
@@ -1376,6 +1376,7 @@ pub(crate) async fn stream_chat_sse(
     let token_usage_coverage = state.token_usage_coverage();
     let tool_ledger_aggregate = state.tool_ledger_receipt.canonical_aggregate();
     let result = build_stream_result(StreamResultBuild {
+        turn_evaluation: host.turn_evaluation.take(),
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
         run_id: state.current_run_id,
@@ -1762,6 +1763,19 @@ mod tests {
         struct PendingExecutor;
         #[async_trait::async_trait]
         impl SpawnAgentExecutor for PendingExecutor {
+            async fn cancel_spawned_run_durably(
+                &self,
+                run: &str,
+                binding: Option<&str>,
+                user: Option<&str>,
+                reason: &str,
+                origin: astra_runtime::orchestration::CancellationOrigin,
+            ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String>
+            {
+                let _ = (run, binding, user, reason, origin);
+                Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+            }
+
             async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
                 std::future::pending().await
             }
@@ -1795,15 +1809,11 @@ mod tests {
             description: "live review".into(),
             prompt: "review the change".into(),
             agent_type: "explore".into(),
-            run_in_background: true,
             ..Default::default()
         };
         let parent = spawner.attach_fanout_parent("root").await;
         let SpawnAgentOutput::Launched { agent_id, .. } =
-            spawner.spawn(input, &context).await.unwrap()
-        else {
-            panic!("expected live child");
-        };
+            spawner.spawn(input, &context).await.unwrap();
         let live = spawner.get_agent_state(&agent_id).await.unwrap();
         let projection = astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
             id: agent_id.clone(),

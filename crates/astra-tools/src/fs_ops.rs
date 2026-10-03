@@ -3624,8 +3624,9 @@ mod tests {
     #[test]
     fn str_replace_multi_path_reports_partial_commit_as_quarantine_fact() {
         let tmp = TempDir::new().unwrap();
-        let a = tmp.path().join("a.txt");
-        let b = tmp.path().join("b.txt");
+        let root = tmp.path().canonicalize().unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
         std::fs::write(&a, "alpha beta").unwrap();
         std::fs::write(&b, "gamma delta").unwrap();
         let args = serde_json::json!({
@@ -3634,7 +3635,7 @@ mod tests {
                 {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
             ]
         });
-        let mut prepared = prepare_multi_path_edit(tmp.path(), &args).expect("prepared");
+        let mut prepared = prepare_multi_path_edit(&root, &args).expect("prepared");
         prepared.rename_failure_index = Some(1);
         let mut committed = Vec::new();
         let result = prepared.apply_with_committed(|edit| {

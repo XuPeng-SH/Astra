@@ -589,7 +589,7 @@ fn render_value_short(v: &Value) -> String {
 
 /// Drop the dotted prefix so the list row fits comfortably in the
 /// 55% list column. Keep the tail segment, which is the human-readable
-/// leaf name (`max_turn_input_tokens`, `adaptive_budget_reduction`).
+/// leaf name (`max_turn_input_tokens`, `llm_exchanges`).
 fn short_id(id: &str) -> String {
     match id.rsplit_once('.') {
         Some((_, tail)) => tail.to_string(),

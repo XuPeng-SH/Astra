@@ -50,6 +50,11 @@ The design does not require one physical backend. Vector, fulltext, graph, tabul
 
 ## Credential authority and admission
 
+Per-turn memory extraction is Server-owned. CLI exit uses the authenticated
+`MemoriaPort` session-end governance operation directly, without constructing a
+local extraction service, background broker or duplicate snapshot/writer caches.
+The CLI memory inference adapter remains available for lesson relevance checks.
+
 The Server composes one per-user memory authority policy. Prompt recall, background extraction, explicit `memory` tools, HTTP memory routes and session-end governance must use that same policy.
 
 Hosted or browser-login deployments use the application-scoped credential resolver owned by authentication. Each operation resolves the current owner binding and generation; no master-key fallback is inferred by a generic pool builder.

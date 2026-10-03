@@ -46,6 +46,24 @@ The server default runtime must not imply:
 
 Server may expose a tool only when a provider contract explicitly grants that capability and safety policy permits it.
 
+A skill fork isolates model context while inheriting the parent's selected
+execution boundary. For a selected Server sandbox, its file executor and
+sandbox policy use that exact root; a missing or relative root is rejected.
+Edge and Cloud workspace paths remain with their respective providers and
+must not become Server-local filesystem roots.
+
+A managed Server sandbox records the selected executor identity in its
+Workspace source. Its owner, session, executor, root and physical capability
+are immutable; a later run may update only nonphysical metadata. Patch export,
+apply and commit resolve the current Work binding through that same selected
+provider. Another instance must skip the operation without claiming it,
+changing its recovery time, or turning a missing local directory into failure.
+After waiting for the physical workspace lease, the executor rechecks the
+binding and provider identity before durable claim or Git access. Existing
+operations with unknown external effects remain reconciliation work; affinity
+does not authorize replay of a mutation.
+
+
 ## Edge boundary
 
 Edge/CLI local runtime may expose local capabilities only within declared authority:

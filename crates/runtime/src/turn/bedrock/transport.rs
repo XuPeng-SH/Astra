@@ -354,31 +354,8 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::server::provider_test_support::eventstream_frame;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    pub(crate) fn eventstream_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
-        fn string_header(out: &mut Vec<u8>, name: &str, value: &str) {
-            out.push(name.len() as u8);
-            out.extend_from_slice(name.as_bytes());
-            out.push(7);
-            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
-            out.extend_from_slice(value.as_bytes());
-        }
-
-        let mut headers = Vec::new();
-        string_header(&mut headers, ":message-type", "event");
-        string_header(&mut headers, ":event-type", event_type);
-        let headers_len = headers.len() as u32;
-        let total_len = 12 + headers_len + payload.len() as u32 + 4;
-        let mut frame = Vec::with_capacity(total_len as usize);
-        frame.extend_from_slice(&total_len.to_be_bytes());
-        frame.extend_from_slice(&headers_len.to_be_bytes());
-        frame.extend_from_slice(&crc32fast::hash(&frame[..8]).to_be_bytes());
-        frame.extend_from_slice(&headers);
-        frame.extend_from_slice(payload);
-        frame.extend_from_slice(&crc32fast::hash(&frame).to_be_bytes());
-        frame
-    }
 
     async fn spawn_bedrock_stream(metadata_payload: Option<&'static [u8]>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

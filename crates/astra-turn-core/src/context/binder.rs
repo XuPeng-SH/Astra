@@ -501,7 +501,6 @@ mod tests {
             },
             external: ExternalSources {
                 memory_entries: vec![MemoryEntry::new("Remember: prefer pipeline-first design.")],
-                spill_dir: None,
                 ..Default::default()
             },
             emergent: EmergentContext::default(),
