@@ -1424,7 +1424,9 @@ pub(crate) fn initialize_session_state(
     initial_model: Option<&str>,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> SessionState {
+    let account_id = crate::cli::cli_config::cli_utils::cli_account_id();
     let mut state = SessionState::default();
+    state.ingestion_user_id = account_id.clone();
     state.cli_context = cli_context.clone();
     let project_root = std::env::current_dir().unwrap_or_default();
     state.perm_manager = match cli_context.permission_mode.as_deref() {
@@ -1458,11 +1460,8 @@ pub(crate) fn initialize_session_state(
     // context assembly traces.  The session keeps this "pending" ID for its
     // lifetime — handle_turn_result skips re-creation since is_none() is false.
     if let Some(ref hub) = state.observability_hub {
-        let user_id = state
-            .ingestion_user_id
-            .clone()
-            .unwrap_or_else(|| "anonymous".to_string());
-        state.observability_session = Some(hub.start_session(&user_id, "pending"));
+        let user_id = account_id.as_deref().unwrap_or("anonymous");
+        state.observability_session = Some(hub.start_session(user_id, "pending"));
         // Resolve the existing profile preferences into the execution authority
         // once, before deriving budgets or publishing observability projections.
         if let Some(obs) = &state.observability_session {
@@ -3786,6 +3785,10 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn initialized_profile_configuration_survives_fresh_session_rebind() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
         let (tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _credentials = isolate_credentials();
         let _root = EnvGuard::set("ASTRA_LOCAL_STATE_ROOT", tmp.path().to_str().unwrap());
@@ -3837,6 +3840,29 @@ mod tests {
                 .max_prompt_tokens,
             12345
         );
+        // A bound account without preferences must not inherit anonymous's values.
+        let _account = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("unconfigured-account"),
+        )
+        .unwrap();
+        let state = initialize_session_state(
+            None,
+            None,
+            &crate::cli::cli_config::cli_context::CliContext::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(astra_config::RuntimeConfig::load()).unwrap()
+        );
+        let obs = state
+            .observability_session
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap();
+        assert_eq!(obs.user_id, "unconfigured-account");
+        assert_eq!(obs.profile.user_id, "unconfigured-account");
     }
 
     #[serial_test::serial]

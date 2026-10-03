@@ -7600,6 +7600,10 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn resume_restores_full_configuration_including_explicit_defaults() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _home = crate::test_utils::HomeGuard::temp();
         let _top_k = EnvGuard::set("ASTRA_RETRIEVAL_TOP_K", "7");
@@ -7866,6 +7870,10 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn switch_session_into_state_restores_workspace_scoped_state() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let mut process_config = astra_config::RuntimeConfig::load();
         let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());

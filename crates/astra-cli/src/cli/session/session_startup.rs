@@ -42,11 +42,11 @@ pub(crate) fn prepare_session_runtime_config(
     let mut config = saved.unwrap_or_else(|| {
         let mut config = astra_config::RuntimeConfig::load();
         if let Some(hub) = &state.observability_hub {
-            let profile = hub.profiles().get_profile(
-                profile_user_id
-                    .or(state.ingestion_user_id.as_deref())
-                    .unwrap_or("anonymous"),
-            );
+            let user_id = profile_user_id
+                .map(str::to_owned)
+                .or_else(crate::cli::cli_config::cli_utils::cli_account_id)
+                .unwrap_or_else(|| "anonymous".to_string());
+            let profile = hub.profiles().get_profile(&user_id);
             profile.preferences.apply_to_config(&mut config);
         }
         config
@@ -292,9 +292,7 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
 
     if state.observability_session.is_none() {
         state.observability_session = Some(if let Some(hub) = &state.observability_hub {
-            let user_id = state
-                .ingestion_user_id
-                .clone()
+            let user_id = crate::cli::cli_config::cli_utils::cli_account_id()
                 .unwrap_or_else(|| "anonymous".to_string());
             hub.start_session(&user_id, session_id)
         } else {

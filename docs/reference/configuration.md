@@ -152,6 +152,10 @@ snapshot; an explicit `/explain --format` choice for the current CLI session ret
 Starting a new conversation with `/clear` selects the current process and profile configuration,
 rather than inheriting a restored session snapshot. Explicit CLI Explain preferences and the
 selected model remain in effect; budgets, configuration version and observability are derived again.
+Cold startup, new conversations, no-snapshot recovery and telemetry select profile identity from the
+account identity installed at entry, not ingestion metadata. An account without stored
+preferences uses its own default profile; only a CLI without an installed account identity uses
+anonymous preferences.
 Authentication changes select preferences for the verified target account after credentials are saved;
 re-authenticating the same account without resetting its conversation retains that session configuration.
 A saved snapshot must parse and satisfy the current invariants before resume changes the active session; invalid
