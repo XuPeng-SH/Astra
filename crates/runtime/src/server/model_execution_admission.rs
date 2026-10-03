@@ -291,7 +291,7 @@ pub(crate) fn validate_reasoning_control(
         Ok(())
     } else {
         Err(format!(
-            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?})",
+            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?}). If the task permits the Offering default instead of this explicit control, retry with reasoning={{\"mode\":\"model_default\"}}; this suppresses parent reasoning inheritance. The requested control was not changed or executed.",
             execution.offering_id,
             thinking,
             capability.map_or("unknown", |capability| capability.as_str()),

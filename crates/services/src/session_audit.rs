@@ -965,7 +965,7 @@ async fn load_durable_tool_observations(
     user_id: &str,
 ) -> AuditResult<Vec<DurableToolCallObservation>> {
     let rows = query(
-        "SELECT session_id, event_idx, event_type, run_id, CAST(payload_json AS CHAR) AS payload_json, \
+        "SELECT session_id, event_idx, event_type, run_id, payload_json, \
                 CAST(created_at AS CHAR) AS created_at \
          FROM agent_run_events \
          WHERE session_id = ? AND user_id = ? \
@@ -1001,7 +1001,7 @@ async fn load_durable_tool_observations_by_session(
     }
     let sql = format!(
         "SELECT session_id, event_idx, event_type, run_id, \
-                CAST(payload_json AS CHAR) AS payload_json, CAST(created_at AS CHAR) AS created_at \
+                payload_json, CAST(created_at AS CHAR) AS created_at \
          FROM agent_run_events WHERE {} ORDER BY session_id, run_id, event_idx",
         predicates.join(" AND ")
     );
@@ -1051,7 +1051,7 @@ async fn load_durable_model_names(
     user_id: &str,
 ) -> AuditResult<Vec<String>> {
     let rows = query(
-        "SELECT CAST(payload_json AS CHAR) AS payload_json \
+        "SELECT payload_json \
          FROM agent_run_events \
          WHERE session_id = ? AND user_id = ? AND event_type = 'run_started' \
          ORDER BY event_idx ASC",
@@ -1489,7 +1489,7 @@ async fn load_turn_observed_metrics(
         .collect::<Vec<_>>()
         .join(",");
     let run_sql = format!(
-        "SELECT event_type, run_id, CAST(payload_json AS CHAR) AS payload_json, \
+        "SELECT event_type, run_id, payload_json, \
                 CAST(created_at AS CHAR) AS created_at \
          FROM agent_run_events \
          WHERE session_id = ? AND user_id = ? AND run_id IN ({run_placeholders}) \
@@ -3727,7 +3727,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // Include the canonical run/transport errors so the error endpoint
         // agrees with the summary instead of reporting an empty session.
         let durable_error_sql = "SELECT id AS event_id, event_type, \
-                    CAST(payload_json AS CHAR) AS content, \
+                    payload_json AS content, \
                     CAST(JSON_OBJECT('run_id', run_id, 'event_idx', event_idx) AS CHAR) AS metadata, \
                     CAST(created_at AS CHAR) AS created_at \
              FROM agent_run_events \

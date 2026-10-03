@@ -27,53 +27,6 @@ fn insert_parsed_work_unit_observation(parsed: Option<&Value>, metadata: &mut Ma
     }
 }
 
-/// Carry a producer-owned control execution fact through the server tool
-/// boundary.  Control tools may reject a request after inspecting durable
-/// state (for example, a duplicate fanout start) while returning a structured
-/// error that still contains the existing group.  The JSON fact must reach the
-/// journal as `Rejected`; otherwise the record fallback promotes the request
-/// to `Executed` and completion policy treats a request that never ran as a
-/// failed execution.
-fn insert_parsed_execution_fact(parsed: Option<&Value>, metadata: &mut Map<String, Value>) {
-    let Some(executed) = parsed.and_then(|value| {
-        value
-            .get("executed")
-            .or_else(|| value.pointer("/advisory/executed"))
-    }) else {
-        return;
-    };
-    match executed {
-        Value::Bool(false) => {
-            metadata.insert("execution_started".to_string(), Value::Bool(false));
-            metadata.insert(
-                "disposition".to_string(),
-                Value::String("rejected".to_string()),
-            );
-            metadata.insert(
-                "execution_fact".to_string(),
-                Value::String("not_executed".to_string()),
-            );
-        }
-        Value::Bool(true) => {
-            metadata.insert("execution_started".to_string(), Value::Bool(true));
-            metadata.insert(
-                "execution_fact".to_string(),
-                Value::String("executed".to_string()),
-            );
-        }
-        Value::Null => {
-            // `null` is an explicit outcome-unknown fact. Do not turn it into
-            // `execution_started=false`: the operation may already have had
-            // side effects and must remain fail-closed for settlement.
-            metadata.insert(
-                "execution_fact".to_string(),
-                Value::String("unknown".to_string()),
-            );
-        }
-        _ => {}
-    }
-}
-
 pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
     let json_error = parsed
@@ -106,7 +59,7 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
     }
     if parsed.is_some() {
         let metadata = result.metadata.get_or_insert_with(Map::new);
-        insert_parsed_execution_fact(parsed.as_ref(), metadata);
+        astra_tools::execution_outcome::insert_producer_execution_fact(parsed.as_ref(), metadata);
     }
     if let Some(observation) = parsed_work_unit_observation(parsed.as_ref()) {
         let metadata = result.metadata.get_or_insert_with(Map::new);
@@ -221,7 +174,7 @@ pub(crate) fn agent_tool_result_from_output(
     // their producer-owned execution fact must still reach the canonical
     // invocation ledger. In particular, `executed=null` remains outcome
     // unknown and `executed=false` remains a pre-dispatch rejection.
-    insert_parsed_execution_fact(parsed.as_ref(), &mut metadata);
+    astra_tools::execution_outcome::insert_producer_execution_fact(parsed.as_ref(), &mut metadata);
     insert_parsed_work_unit_observation(parsed.as_ref(), &mut metadata);
     if let Some(result_class) = result_class {
         metadata.insert(
@@ -549,6 +502,33 @@ mod tests {
             result_metadata_str(&result, "result_class"),
             Some("fanout_incomplete")
         );
+    }
+
+    #[test]
+    fn preparation_failure_is_a_rejected_request_not_a_started_child() {
+        let output =
+            astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error(
+                "the requested execution control is unsupported",
+            );
+        for tool in ["agent", "agent_fanout"] {
+            let result = agent_tool_result_from_output(tool, output.clone());
+            assert!(result.is_error);
+            let metadata = result.metadata.unwrap();
+            assert_eq!(metadata["execution_started"], false);
+            assert_eq!(metadata["disposition"], "rejected");
+        }
+        let launched = agent_tool_result_from_output(
+            "agent",
+            astra_turn_core::orchestration::agent_result_wire::render_agent_tool_error(
+                Some("child-identity"),
+                "child execution failed",
+            ),
+        );
+        assert!(launched.is_error);
+        let metadata = launched.metadata.unwrap();
+        assert_eq!(metadata["result_class"], "agent_incomplete");
+        assert!(!metadata.contains_key("execution_started"));
+        assert!(!metadata.contains_key("disposition"));
     }
 
     #[test]
