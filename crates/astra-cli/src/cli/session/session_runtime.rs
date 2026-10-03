@@ -1463,8 +1463,19 @@ pub(crate) fn initialize_session_state(
             .clone()
             .unwrap_or_else(|| "anonymous".to_string());
         state.observability_session = Some(hub.start_session(&user_id, "pending"));
-        // Apply the explicit configuration stashed during workspace restore.
-        super::session_startup::apply_pending_runtime_config(&mut state);
+        // Resolve the existing profile preferences into the execution authority
+        // once, before deriving budgets or publishing observability projections.
+        if let Some(obs) = &state.observability_session {
+            let guard = obs.read().unwrap_or_else(|error| error.into_inner());
+            guard
+                .profile
+                .preferences
+                .apply_to_config(&mut state.runtime_config);
+        }
+        state.context_budget =
+            astra_runtime::prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
+        state.observability_config_pending = true;
+        super::session_startup::sync_pending_observability_config(&mut state);
     }
 
     state
@@ -3770,6 +3781,62 @@ mod tests {
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn initialized_profile_configuration_survives_fresh_session_rebind() {
+        let (tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
+        let _root = EnvGuard::set("ASTRA_LOCAL_STATE_ROOT", tmp.path().to_str().unwrap());
+        let hub = astra_runtime::observability::ObservabilityHub::with_storage(
+            tmp.path().join("observability"),
+        );
+        let mut profile = hub.profiles().get_profile("anonymous");
+        profile.preferences.config_overrides.insert(
+            "token_budget.max_prompt_tokens".into(),
+            serde_json::json!(12345),
+        );
+        hub.profiles().update_profile(profile);
+        let mut state = initialize_session_state(
+            None,
+            None,
+            &crate::cli::cli_config::cli_context::CliContext::default(),
+        );
+        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 12345);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"session_id":"profile-rebind"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        crate::cli::slash::slash_state::start_fresh_session(
+            &api,
+            None,
+            "fixture-token",
+            &mut state,
+        )
+        .await
+        .unwrap();
+        server.verify().await;
+        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 12345);
+        assert_eq!(
+            state
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .config
+                .token_budget
+                .max_prompt_tokens,
+            12345
+        );
     }
 
     #[serial_test::serial]

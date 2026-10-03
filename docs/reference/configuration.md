@@ -146,7 +146,9 @@ window metadata and tool verification contracts retain their existing owners.
 
 Unknown top-level runtime fields are rejected by the configuration parser.
 `--settings` reports the parse error. A saved session configuration is a complete snapshot, not an overlay: restoring
-it replaces the live configuration, including values equal to built-in defaults.
+it replaces the execution configuration before deriving context budgets and the observability projection,
+including values equal to built-in defaults. The configuration version identifies the effective
+snapshot; an explicit `/explain --format` choice for the current CLI session retains precedence.
 It must parse and satisfy the current invariants before resume changes the active session; invalid
 snapshots remain unchanged and are not migrated or filtered. This also rejects
 full snapshots that contain the retired sections, even if their values were defaults.

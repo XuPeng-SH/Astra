@@ -4841,50 +4841,75 @@ mod export_tests {
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct PreparedWorkspaceRestore {
     workspace: Option<session_workspace::WorkspaceMetadata>,
     session_persistence_error: Option<String>,
     discovered_skills: std::collections::HashSet<String>,
-    pending_runtime_config: Option<astra_config::RuntimeConfig>,
+    runtime_config: astra_config::RuntimeConfig,
+    config_version_id: String,
 }
 
 fn prepared_workspace_restore_from_workspace(
-    ws: session_workspace::WorkspaceMetadata,
+    ws: Option<session_workspace::WorkspaceMetadata>,
+    state: &SessionState,
 ) -> Result<PreparedWorkspaceRestore, String> {
-    let pending_runtime_config = ws
-        .tuned_config_json
-        .as_deref()
+    let saved = ws
+        .as_ref()
+        .and_then(|workspace| workspace.tuned_config_json.as_deref())
         .map(|json| {
-            let saved: astra_config::RuntimeConfig = serde_json::from_str(json)
-                .map_err(|error| format!("saved runtime configuration is invalid: {error}"))?;
-            astra_config::validate_governed_config_candidate(&saved).map_err(|error| {
-                format!(
-                    "saved runtime configuration is invalid: {}",
-                    error.to_json()
-                )
-            })?;
-            Ok::<_, String>(saved)
+            serde_json::from_str::<astra_config::RuntimeConfig>(json)
+                .map_err(|error| format!("saved runtime configuration is invalid: {error}"))
         })
         .transpose()?;
+    let mut runtime_config = saved.unwrap_or_else(|| {
+        let mut config = astra_config::RuntimeConfig::load();
+        if let Some(hub) = &state.observability_hub {
+            let profile = hub
+                .profiles()
+                .get_profile(state.ingestion_user_id.as_deref().unwrap_or("anonymous"));
+            profile.preferences.apply_to_config(&mut config);
+        }
+        config
+    });
+    if let Some(format) = state.explain_report_format_override {
+        runtime_config.explain.report_format = Some(format);
+    }
+    astra_config::validate_governed_config_candidate(&runtime_config).map_err(|error| {
+        format!(
+            "saved runtime configuration is invalid: {}",
+            error.to_json()
+        )
+    })?;
+    let toml = toml::to_string_pretty(&runtime_config)
+        .map_err(|error| format!("serialize restored runtime configuration: {error}"))?;
+    let config_version_id =
+        astra_config::config_versions::VersionId::from_toml_bytes(toml.as_bytes())
+            .as_str()
+            .to_string();
     Ok(PreparedWorkspaceRestore {
-        session_persistence_error: ws.last_persistence_error.clone(),
-        discovered_skills: ws.discovered_skills.iter().cloned().collect(),
-        pending_runtime_config,
-        workspace: Some(ws),
+        session_persistence_error: ws.as_ref().and_then(|ws| ws.last_persistence_error.clone()),
+        discovered_skills: ws
+            .as_ref()
+            .map(|ws| ws.discovered_skills.iter().cloned().collect())
+            .unwrap_or_default(),
+        runtime_config,
+        config_version_id,
+        workspace: ws,
     })
 }
 
 fn load_prepared_workspace_restore(
     restored: &RestoredSession,
+    state: &SessionState,
 ) -> Result<PreparedWorkspaceRestore, String> {
     if let Some(workspace) = restored.workspace.clone() {
-        return prepared_workspace_restore_from_workspace(workspace);
+        return prepared_workspace_restore_from_workspace(Some(workspace), state);
     }
     match session_workspace::read_workspace(&restored.session_id) {
-        Ok(ws) => prepared_workspace_restore_from_workspace(ws),
+        Ok(ws) => prepared_workspace_restore_from_workspace(Some(ws), state),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(PreparedWorkspaceRestore::default())
+            prepared_workspace_restore_from_workspace(None, state)
         }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             let backup = session_workspace::backup_invalid_workspace_file(&restored.session_id)
@@ -4906,7 +4931,7 @@ fn load_prepared_workspace_restore(
             workspace.last_persistence_error = Some(format!(
                 "workspace metadata unreadable during resume; rebuilt from journal/checkpoint ({e})"
             ));
-            prepared_workspace_restore_from_workspace(workspace)
+            prepared_workspace_restore_from_workspace(Some(workspace), state)
         }
         Err(e) => Err(format!(
             "read workspace state for session {}: {e}",
@@ -4918,8 +4943,10 @@ fn load_prepared_workspace_restore(
 fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
     state.session_persistence_error = prepared.session_persistence_error.clone();
     state.discovered_skills = prepared.discovered_skills.clone();
-    state.pending_runtime_config = prepared.pending_runtime_config.clone();
-    session_startup::apply_pending_runtime_config(state);
+    state.runtime_config = prepared.runtime_config.clone();
+    state.config_version_id = Some(prepared.config_version_id.clone());
+    state.observability_config_pending = true;
+    session_startup::sync_pending_observability_config(state);
 }
 
 fn persist_resumed_workspace_metadata(
@@ -5251,7 +5278,7 @@ async fn apply_restored_session(
     let total_cache_creation_tokens = restored
         .total_cache_creation_tokens
         .max(local_state.total_cache_creation_tokens);
-    let prepared_workspace = load_prepared_workspace_restore(&restored)?;
+    let prepared_workspace = load_prepared_workspace_restore(&restored, state)?;
     let prepared_history = prepare_session_history(&restored.session_id).await?;
     let use_typed_continuation = match (
         prepared_history.resume.as_ref(),
@@ -6983,7 +7010,7 @@ mod resume_tests {
                     .as_deref(),
                 Some(invalid)
             );
-            assert!(state.pending_runtime_config.is_none());
+            assert!(!state.observability_config_pending);
         }
     }
 
@@ -7615,7 +7642,9 @@ mod resume_tests {
         );
         let session_id = format!("resume-default-config-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
-        let saved = astra_config::RuntimeConfig::default();
+        let mut saved = astra_config::RuntimeConfig::default();
+        saved.memory.max_memory_tokens = 1300;
+        saved.compression.preserve_recent_turns = 7;
         assert_eq!(saved.memory.retrieval_top_k, 5);
         let saved_json = serde_json::to_string(&saved).unwrap();
         session_workspace::update_existing_workspace_config(
@@ -7630,10 +7659,53 @@ mod resume_tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
         state.set_session_id("current-session");
+        state.config_version_id = Some("stale-config-version".into());
+        let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
+        let mut profile = hub.profiles().get_profile("anonymous");
+        profile.preferences.config_overrides.insert(
+            "token_budget.max_prompt_tokens".into(),
+            serde_json::json!(12345),
+        );
+        hub.profiles().update_profile(profile);
+        state.observability_hub = Some(hub);
         switch_session_into_state(&session_id, None, &api, &mut state)
             .await
             .unwrap();
-        assert!(state.pending_runtime_config.is_none());
+        assert!(!state.observability_config_pending);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(state.context_budget.keep_recent_turns, 7);
+        assert_eq!(state.context_budget.memory_budget_chars, 5200);
+        let expected_version = astra_config::config_versions::VersionId::from_toml_bytes(
+            toml::to_string_pretty(&saved).unwrap().as_bytes(),
+        );
+        assert_eq!(
+            state.config_version_id.as_deref(),
+            Some(expected_version.as_str())
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/search"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"query": "restored config", "top_k": 5}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let memory_api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        crate::cli::slash::slash_memory::handle_memory_domain_command(
+            "/memory",
+            "search restored config",
+            &memory_api,
+            &mut state,
+            Some("fixture-token"),
+        )
+        .await
+        .unwrap();
+        server.verify().await;
         assert_eq!(
             serde_json::to_value(
                 &state
@@ -7645,7 +7717,43 @@ mod resume_tests {
                     .config
             )
             .unwrap(),
-            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(&saved).unwrap(),
+        );
+        // A replacement observability instance must also use the restored config.
+        state.observability_session = None;
+        crate::cli::session::session_startup::initialize_journal_pub(&mut state, &session_id);
+        assert_eq!(
+            serde_json::to_value(
+                &state
+                    .observability_session
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .unwrap()
+                    .config
+            )
+            .unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        state.set_explain_report_format_override(
+            astra_config::runtime_config::ExplainReportFormat::Text,
+        );
+        switch_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+        saved.explain.report_format = Some(astra_config::runtime_config::ExplainReportFormat::Text);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(
+            state.config_version_id.as_deref(),
+            Some(
+                astra_config::config_versions::VersionId::from_toml_bytes(
+                    toml::to_string_pretty(&saved).unwrap().as_bytes()
+                )
+                .as_str()
+            )
         );
         assert_eq!(
             session_workspace::read_workspace(&session_id)
@@ -7660,6 +7768,7 @@ mod resume_tests {
     #[tokio::test]
     async fn switch_session_into_state_restores_workspace_scoped_state() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let mut process_config = astra_config::RuntimeConfig::load();
         let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
 
@@ -7676,6 +7785,17 @@ mod resume_tests {
             ..Default::default()
         };
         state.set_session_id("current-session");
+        state.runtime_config.memory.retrieval_top_k = 42;
+        state.config_version_id = Some("stale-config-version".into());
+        let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
+        let mut profile = hub.profiles().get_profile("anonymous");
+        profile.preferences.config_overrides.insert(
+            "token_budget.max_prompt_tokens".into(),
+            serde_json::json!(12345),
+        );
+        hub.profiles().update_profile(profile);
+        state.observability_hub = Some(hub);
+        process_config.token_budget.max_prompt_tokens = 12345;
 
         switch_session_into_state(&session_id, None, &api, &mut state)
             .await
@@ -7692,7 +7812,15 @@ mod resume_tests {
             state.session_persistence_error.as_deref(),
             Some("failed to append turn event")
         );
-        assert!(state.pending_runtime_config.is_none());
+        assert!(!state.observability_config_pending);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&process_config).unwrap()
+        );
+        assert_ne!(
+            state.config_version_id.as_deref(),
+            Some("stale-config-version")
+        );
         assert!(
             state.journal.is_some(),
             "switch should initialize a journal"

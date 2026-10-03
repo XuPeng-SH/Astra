@@ -33,17 +33,18 @@ pub(crate) struct SessionStartupArtifacts {
 // Note: `selector` field was removed — tool surface is now handled by the LLM directly.
 
 /// Replace the live configuration with the complete snapshot validated at restore.
-pub(crate) fn apply_pending_runtime_config(state: &mut SessionState) {
+pub(crate) fn sync_pending_observability_config(state: &mut SessionState) {
+    if !state.observability_config_pending {
+        return;
+    }
     let Some(obs) = &state.observability_session else {
         return;
     };
     let Ok(mut guard) = obs.write() else {
         return;
     };
-    let Some(saved) = state.pending_runtime_config.take() else {
-        return;
-    };
-    guard.config = saved;
+    guard.config = state.runtime_config.clone();
+    state.observability_config_pending = false;
 }
 
 pub(crate) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
@@ -243,8 +244,11 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
                 astra_runtime::observability::ObservabilitySession::new_simple(session_id),
             ))
         });
-        apply_pending_runtime_config(state);
+        // Rebound sessions must project the active configuration again, even
+        // when the previous observability instance already consumed the marker.
+        state.observability_config_pending = true;
     }
+    sync_pending_observability_config(state);
 }
 
 async fn prune_stale_pending_recovery(
@@ -759,8 +763,8 @@ pub(crate) async fn complete_session_startup(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliSessionMemoryMemoriaPort, apply_pending_runtime_config, build_cli_session_memory_port,
-        initialize_journal, prune_stale_pending_recovery,
+        CliSessionMemoryMemoriaPort, build_cli_session_memory_port, initialize_journal,
+        prune_stale_pending_recovery, sync_pending_observability_config,
     };
     use crate::cli::session::session_state::SessionState;
     use astra_runtime::turn::cloud::memoria_compact::MemoriaPort;
@@ -1133,38 +1137,55 @@ mod tests {
             saved.memory.retrieval_top_k = saved_top_k;
             let expected = serde_json::to_value(&saved).unwrap();
             let mut state = SessionState {
-                pending_runtime_config: Some(saved),
+                runtime_config: saved,
+                observability_config_pending: true,
                 ..Default::default()
             };
-            apply_pending_runtime_config(&mut state);
-            assert!(state.pending_runtime_config.is_some());
+            sync_pending_observability_config(&mut state);
+            assert!(state.observability_config_pending);
             let mut obs =
                 astra_runtime::observability::ObservabilitySession::new_simple("config-restore");
             obs.config.memory.retrieval_top_k = 9;
             obs.config.token_budget.tools_reserve += 1;
             state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
-            apply_pending_runtime_config(&mut state);
-            assert!(state.pending_runtime_config.is_none());
+            sync_pending_observability_config(&mut state);
+            assert!(!state.observability_config_pending);
             let obs = state.observability_session.as_ref().unwrap().clone();
             assert_eq!(
                 serde_json::to_value(&obs.read().unwrap().config).unwrap(),
                 expected
             );
             obs.write().unwrap().config.memory.retrieval_top_k = 9;
-            apply_pending_runtime_config(&mut state);
+            sync_pending_observability_config(&mut state);
             assert_eq!(obs.read().unwrap().config.memory.retrieval_top_k, 9);
         }
     }
 
     #[test]
-    fn apply_pending_runtime_config_requeues_when_lock_is_poisoned() {
+    fn sync_pending_observability_config_requeues_when_lock_is_poisoned() {
         let mut state = SessionState::default();
-        state.pending_runtime_config = Some(astra_config::RuntimeConfig::default());
+        state.observability_config_pending = true;
         state.observability_session = Some(poisoned_observability_session("sid-adaptive"));
 
-        apply_pending_runtime_config(&mut state);
+        sync_pending_observability_config(&mut state);
 
-        assert!(state.pending_runtime_config.is_some());
+        assert!(state.observability_config_pending);
+        state.runtime_config.memory.retrieval_top_k = 11;
+        state.observability_session.as_ref().unwrap().clear_poison();
+        sync_pending_observability_config(&mut state);
+        assert!(!state.observability_config_pending);
+        assert_eq!(
+            state
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .config
+                .memory
+                .retrieval_top_k,
+            11
+        );
     }
 
     #[test]
