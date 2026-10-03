@@ -291,7 +291,7 @@ pub(crate) fn validate_reasoning_control(
         Ok(())
     } else {
         Err(format!(
-            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?}). If the task permits the Offering default instead of this explicit control, retry with reasoning={{\"mode\":\"model_default\"}}; this suppresses parent reasoning inheritance. The requested control was not changed or executed.",
+            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?}). If the task permits the Offering default instead of this explicit control, retry /chat with {{\"context\":{{\"thinking\":{{\"mode\":\"model_default\"}}}}}}; for agent use {{\"reasoning\":{{\"mode\":\"model_default\"}}}}; for agent_fanout use {{\"defaults\":{{\"reasoning\":{{\"mode\":\"model_default\"}}}}}}. If slots[i].reasoning is explicitly set, replace that slot's reasoning with {{\"mode\":\"model_default\"}} instead: defaults does not override explicit slot controls. These explicit model_default controls suppress parent reasoning inheritance. The requested control was not changed or executed.",
             execution.offering_id,
             thinking,
             capability.map_or("unknown", |capability| capability.as_str()),
@@ -468,7 +468,33 @@ mod tests {
             128_000,
         );
         execution.thinking_capability = Some(ThinkingCapability::Both);
-        assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
+        let rejection = validate_reasoning_control(&execution, &ThinkingConfig::Off).unwrap_err();
+        let chat_hint = rejection
+            .split("retry /chat with ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let mut chat_json: serde_json::Value = serde_json::from_str(chat_hint).unwrap();
+        chat_json["message"] = serde_json::json!("retry");
+        let chat: astra_server_types::ChatRequest = serde_json::from_value(chat_json).unwrap();
+        let thinking: ThinkingConfig =
+            serde_json::from_value(chat.context.unwrap()["thinking"].clone()).unwrap();
+        assert!(validate_reasoning_control(&execution, &thinking).is_ok());
+        let child_hint = rejection
+            .split("for agent use ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let mut child_json: serde_json::Value = serde_json::from_str(child_hint).unwrap();
+        child_json["description"] = serde_json::json!("Retry child");
+        child_json["prompt"] = serde_json::json!("Retry the task");
+        let child: astra_turn_core::orchestration_spawn_tool::SpawnAgentInput =
+            serde_json::from_value(child_json).unwrap();
+        assert!(validate_reasoning_control(&execution, &child.reasoning.unwrap().config()).is_ok());
         for protocol in [ThinkingProtocol::Unknown, ThinkingProtocol::ReasoningEffort] {
             execution.thinking_protocol = Some(protocol);
             assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
