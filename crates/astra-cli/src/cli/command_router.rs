@@ -1442,8 +1442,10 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
+            let mut continuation_context = cli_context.clone();
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs()?;
+                session_routing.continuation_turn_inputs(&mut continuation_context)?;
+            let cli_context = &continuation_context;
             let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = PermissionManager::with_load_policy(
                 effective_permission_mode,
@@ -2055,8 +2057,10 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
+            let mut continuation_context = cli_context.clone();
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs()?;
+                session_routing.continuation_turn_inputs(&mut continuation_context)?;
+            let cli_context = &continuation_context;
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = {
@@ -3380,8 +3384,10 @@ pub(crate) async fn run_print_mode(
         session_routing.restored_permission_mode(),
         true,
     )?;
+    let mut continuation_context = cli_context.clone();
     let (mut continuation_messages, deferred_tool_activations) =
-        session_routing.continuation_turn_inputs()?;
+        session_routing.continuation_turn_inputs(&mut continuation_context)?;
+    let cli_context = &continuation_context;
     let _pipeline = create_pipeline_modules(api, profile).await;
     // Print mode is non-interactive. Restored session mode wins when present;
     // otherwise Auto is the headless fallback.
