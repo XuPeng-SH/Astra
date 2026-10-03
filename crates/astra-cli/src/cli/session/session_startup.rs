@@ -32,7 +32,67 @@ pub(crate) struct SessionStartupArtifacts {
 
 // Note: `selector` field was removed — tool surface is now handled by the LLM directly.
 
-/// Replace the live configuration with the complete snapshot validated at restore.
+/// Select a complete snapshot, or the current process/profile configuration
+/// for a fresh conversation. Preparation must finish before a session rebind.
+pub(crate) fn prepare_session_runtime_config(
+    state: &SessionState,
+    saved: Option<astra_config::RuntimeConfig>,
+    profile_user_id: Option<&str>,
+) -> Result<(astra_config::RuntimeConfig, String), String> {
+    let mut config = saved.unwrap_or_else(|| {
+        let mut config = astra_config::RuntimeConfig::load();
+        if let Some(hub) = &state.observability_hub {
+            let profile = hub.profiles().get_profile(
+                profile_user_id
+                    .or(state.ingestion_user_id.as_deref())
+                    .unwrap_or("anonymous"),
+            );
+            profile.preferences.apply_to_config(&mut config);
+        }
+        config
+    });
+    if let Some(format) = state.explain_report_format_override {
+        config.explain.report_format = Some(format);
+    }
+    astra_config::validate_governed_config_candidate(&config)
+        .map_err(|error| format!("runtime configuration is invalid: {}", error.to_json()))?;
+    let toml = toml::to_string_pretty(&config)
+        .map_err(|error| format!("serialize runtime configuration: {error}"))?;
+    let version = astra_config::config_versions::VersionId::from_toml_bytes(toml.as_bytes())
+        .as_str()
+        .to_string();
+    Ok((config, version))
+}
+
+/// Commit the selected configuration and its derived execution/observability data.
+pub(crate) fn apply_session_runtime_config(
+    state: &mut SessionState,
+    config: astra_config::RuntimeConfig,
+    version: String,
+) {
+    let context_window = match &state.model {
+        Some(super::session_state::SessionModelChoice::Selected(selection)) => {
+            selection.context_window
+        }
+        _ => None,
+    };
+    let model = state
+        .model
+        .as_deref()
+        .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).0);
+    state.context_budget =
+        astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
+            &config,
+            model,
+            context_window,
+        );
+    state.runtime_config = config;
+    state.config_version_id = Some(version);
+    state.observability_config_pending = true;
+    sync_pending_observability_config(state);
+}
+
+/// Synchronize the observability projection from the execution authority.
 pub(crate) fn sync_pending_observability_config(state: &mut SessionState) {
     if !state.observability_config_pending {
         return;
@@ -121,9 +181,7 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
         super::session_side_effects::enqueue_ingestion_pub(state, &start_event);
 
         use astra_config::config_versions::ConfigVersionStore;
-        if state.config_version_id.is_none()
-            && let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root()
-        {
+        if let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root() {
             let meta = astra_config::config_versions::PutMetadata {
                 source_session: Some(session_id.to_string()),
                 parent: None,

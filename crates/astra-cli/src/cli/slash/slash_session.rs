@@ -31,7 +31,6 @@ use crate::cli::{
     stream::stream_render,
     theme,
 };
-use astra_runtime::prompts;
 use crossterm::style::Stylize;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
@@ -4862,31 +4861,9 @@ fn prepared_workspace_restore_from_workspace(
                 .map_err(|error| format!("saved runtime configuration is invalid: {error}"))
         })
         .transpose()?;
-    let mut runtime_config = saved.unwrap_or_else(|| {
-        let mut config = astra_config::RuntimeConfig::load();
-        if let Some(hub) = &state.observability_hub {
-            let profile = hub
-                .profiles()
-                .get_profile(state.ingestion_user_id.as_deref().unwrap_or("anonymous"));
-            profile.preferences.apply_to_config(&mut config);
-        }
-        config
-    });
-    if let Some(format) = state.explain_report_format_override {
-        runtime_config.explain.report_format = Some(format);
-    }
-    astra_config::validate_governed_config_candidate(&runtime_config).map_err(|error| {
-        format!(
-            "saved runtime configuration is invalid: {}",
-            error.to_json()
-        )
-    })?;
-    let toml = toml::to_string_pretty(&runtime_config)
-        .map_err(|error| format!("serialize restored runtime configuration: {error}"))?;
-    let config_version_id =
-        astra_config::config_versions::VersionId::from_toml_bytes(toml.as_bytes())
-            .as_str()
-            .to_string();
+    let (runtime_config, config_version_id) =
+        session_startup::prepare_session_runtime_config(state, saved, None)
+            .map_err(|error| format!("saved {error}"))?;
     Ok(PreparedWorkspaceRestore {
         session_persistence_error: ws.as_ref().and_then(|ws| ws.last_persistence_error.clone()),
         discovered_skills: ws
@@ -4943,10 +4920,11 @@ fn load_prepared_workspace_restore(
 fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
     state.session_persistence_error = prepared.session_persistence_error.clone();
     state.discovered_skills = prepared.discovered_skills.clone();
-    state.runtime_config = prepared.runtime_config.clone();
-    state.config_version_id = Some(prepared.config_version_id.clone());
-    state.observability_config_pending = true;
-    session_startup::sync_pending_observability_config(state);
+    session_startup::apply_session_runtime_config(
+        state,
+        prepared.runtime_config.clone(),
+        prepared.config_version_id.clone(),
+    );
 }
 
 fn persist_resumed_workspace_metadata(
@@ -5542,6 +5520,8 @@ async fn apply_restored_session(
     if let Some(mode) = restored_permission_mode {
         state.perm_manager.set_mode(mode);
     }
+    state.model =
+        normalize_model_override(restored.model.as_deref()).map(|model| model.to_string().into());
     apply_prepared_workspace_restore(state, &prepared_workspace);
 
     if let Some(step_restored) = step_restored {
@@ -5587,20 +5567,6 @@ async fn apply_restored_session(
             0,
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
-    }
-
-    match normalize_model_override(restored.model.as_deref()) {
-        Some(m) => {
-            state.model = Some((m.to_string()).into());
-            let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
-            state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
-        }
-        None => {
-            state.model = None;
-            state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
-        }
     }
 
     if use_typed_continuation {
@@ -7635,6 +7601,7 @@ mod resume_tests {
     #[tokio::test]
     async fn resume_restores_full_configuration_including_explicit_defaults() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
         let _top_k = EnvGuard::set("ASTRA_RETRIEVAL_TOP_K", "7");
         assert_eq!(
             astra_config::RuntimeConfig::load().memory.retrieval_top_k,
@@ -7755,6 +7722,138 @@ mod resume_tests {
                 .as_str()
             )
         );
+
+        // A rejected new-session admission must leave A's selected configuration intact.
+        let fresh_server = MockServer::start().await;
+        let fresh_api = astra_thin_client::ThinClient::new(&fresh_server.uri(), None).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&fresh_server)
+            .await;
+        let previous_version = state.config_version_id.clone();
+        crate::cli::slash::slash_state::start_fresh_session(
+            &fresh_api,
+            None,
+            "fixture-token",
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        fresh_server.verify().await;
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(state.config_version_id, previous_version);
+        assert_eq!(state.context_budget.keep_recent_turns, 7);
+        assert_eq!(state.context_budget.memory_budget_chars, 5200);
+        fresh_server.reset().await;
+
+        let fresh_id = format!("fresh-config-{}", uuid::Uuid::new_v4());
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"session_id":fresh_id})),
+            )
+            .expect(1)
+            .mount(&fresh_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/memory/search"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"query":"fresh config","top_k":7}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(2)
+            .mount(&fresh_server)
+            .await;
+        let mut fresh_config = astra_config::RuntimeConfig::load();
+        fresh_config.token_budget.max_prompt_tokens = 12345;
+        fresh_config.explain.report_format =
+            Some(astra_config::runtime_config::ExplainReportFormat::Text);
+        let fresh_version = astra_config::config_versions::VersionId::from_toml_bytes(
+            toml::to_string_pretty(&fresh_config).unwrap().as_bytes(),
+        );
+        state.model = Some(
+            crate::cli::session::session_state::SessionModelChoice::Selected(
+                crate::cli::session::session_runtime::ServerModelSelection {
+                    name: "gpt-5".into(),
+                    context_window: Some(77777),
+                    offering_id: "selected-offering".into(),
+                    pricing: None,
+                },
+            ),
+        );
+        crate::cli::slash::slash_state::start_fresh_session(
+            &fresh_api,
+            None,
+            "fixture-token",
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.context_budget.model_limit, 77777);
+        assert!(
+            session_workspace::read_workspace(&fresh_id)
+                .unwrap()
+                .tuned_config_json
+                .is_none()
+        );
+        let events = session_journal::read_journal(&fresh_id).unwrap();
+        assert!(events.iter().any(|event| event.event_type
+            == session_journal::JournalEventType::ConfigChange
+            && event.metadata.as_ref().unwrap()["config_version"]["to"] == fresh_version.as_str()));
+        for phase in 0..2 {
+            if phase == 1 {
+                write_local_resumable_session(&fresh_id, 1);
+                switch_session_into_state(&fresh_id, None, &api, &mut state)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                serde_json::to_value(&state.runtime_config).unwrap(),
+                serde_json::to_value(&fresh_config).unwrap()
+            );
+            assert_eq!(
+                state.config_version_id.as_deref(),
+                Some(fresh_version.as_str())
+            );
+            assert_eq!(
+                state.context_budget.keep_recent_turns,
+                fresh_config.compression.preserve_recent_turns as usize
+            );
+            assert_eq!(
+                state.context_budget.memory_budget_chars,
+                fresh_config.memory.max_memory_tokens as usize * 4
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    &state
+                        .observability_session
+                        .as_ref()
+                        .unwrap()
+                        .read()
+                        .unwrap()
+                        .config
+                )
+                .unwrap(),
+                serde_json::to_value(&fresh_config).unwrap()
+            );
+            crate::cli::slash::slash_memory::handle_memory_domain_command(
+                "/memory",
+                "search fresh config",
+                &fresh_api,
+                &mut state,
+                Some("fixture-token"),
+            )
+            .await
+            .unwrap();
+        }
+        fresh_server.verify().await;
         assert_eq!(
             session_workspace::read_workspace(&session_id)
                 .unwrap()

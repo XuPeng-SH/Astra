@@ -812,7 +812,9 @@ impl SessionState {
     /// Reset session-scoped runtime state after starting a new session.
     ///
     /// Intentionally preserves user preferences, model selection, project
-    /// instructions, runtime config, and long-lived registries/services.
+    /// instructions, and long-lived registries/services. This mechanical reset
+    /// does not select configuration: new-session boundaries must prepare and
+    /// install process/profile settings, while restore installs its snapshot.
     ///
     /// Call `prepare_for_session_rebind().await` before using this at a
     /// session boundary; this synchronous reset does not tear down the

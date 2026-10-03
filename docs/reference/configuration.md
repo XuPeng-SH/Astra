@@ -149,7 +149,12 @@ Unknown top-level runtime fields are rejected by the configuration parser.
 it replaces the execution configuration before deriving context budgets and the observability projection,
 including values equal to built-in defaults. The configuration version identifies the effective
 snapshot; an explicit `/explain --format` choice for the current CLI session retains precedence.
-It must parse and satisfy the current invariants before resume changes the active session; invalid
+Starting a new conversation with `/clear` selects the current process and profile configuration,
+rather than inheriting a restored session snapshot. Explicit CLI Explain preferences and the
+selected model remain in effect; budgets, configuration version and observability are derived again.
+Authentication changes select preferences for the verified target account after credentials are saved;
+re-authenticating the same account without resetting its conversation retains that session configuration.
+A saved snapshot must parse and satisfy the current invariants before resume changes the active session; invalid
 snapshots remain unchanged and are not migrated or filtered. This also rejects
 full snapshots that contain the retired sections, even if their values were defaults.
 The existing disk
