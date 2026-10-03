@@ -5562,7 +5562,17 @@ async fn apply_restored_session(
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
     }
 
-    match normalize_model_override(restored.model.as_deref()) {
+    // A restored effective model does not establish user intent. Preserve a
+    // current explicit selection; otherwise restore only the model baseline.
+    let restored_model = if matches!(
+        state.cli_context.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+    ) {
+        state.model.clone()
+    } else {
+        restored.model.clone()
+    };
+    match normalize_model_override(restored_model.as_deref()) {
         Some(m) => {
             state.model = Some((m.to_string()).into());
             let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
