@@ -32,18 +32,6 @@ pub(crate) struct SessionStartupArtifacts {
 
 // Note: `selector` field was removed — tool surface is now handled by the LLM directly.
 
-pub(crate) struct GoalSteeringChange {
-    pub previous_goal: Option<String>,
-    pub turn: u32,
-}
-
-pub(crate) fn steer_observability_goal(
-    _state: &mut SessionState,
-    _goal: &str,
-) -> Option<GoalSteeringChange> {
-    None
-}
-
 /// Replace the live configuration with the complete snapshot validated at restore.
 pub(crate) fn apply_pending_runtime_config(state: &mut SessionState) {
     let Some(obs) = &state.observability_session else {
