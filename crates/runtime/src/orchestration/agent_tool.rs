@@ -32,9 +32,9 @@ use astra_tools::agent_tool_contract::{
 use astra_turn_core::orchestration::agent_result_wire::{
     AGENT_RESULT_CLASS_SUCCESS, DecodedAgentToolResult, agent_tool_result_needs_recovery,
     agent_tool_structured_result_class, decode_agent_tool_result,
-    fanout_slot_status_is_recoverable_issue, render_agent_tool_error,
-    render_agent_tool_error_with_kind, render_unknown_agent_result, render_wait_for_agent_status,
-    render_wait_timeout_outcome,
+    fanout_slot_status_is_recoverable_issue, render_agent_tool_admission_error,
+    render_agent_tool_admission_error_with_kind, render_agent_tool_error,
+    render_unknown_agent_result, render_wait_for_agent_status, render_wait_timeout_outcome,
 };
 use astra_turn_core::orchestration_fanout_group::{
     AgentFanoutGroupProjection, AgentFanoutSlot, AgentFanoutSlotStatus,
@@ -222,11 +222,14 @@ pub fn render_agent_runtime_binding_error(tool_name: &str, action: &str) -> Stri
         tool_name,
         Some(action),
     );
-    render_agent_tool_error_with_kind(None, &error, Some(astra_core::ErrorKind::ToolBinding))
+    render_agent_tool_admission_error_with_kind(&error, Some(astra_core::ErrorKind::ToolBinding))
 }
 
 fn render_agent_tool_contract_error(message: &str) -> String {
-    render_agent_tool_error_with_kind(None, message, Some(astra_core::ErrorKind::ToolInvalidArgs))
+    render_agent_tool_admission_error_with_kind(
+        message,
+        Some(astra_core::ErrorKind::ToolInvalidArgs),
+    )
 }
 
 #[derive(Default)]
@@ -456,13 +459,10 @@ fn unavailable_requested_tools<'a>(
 }
 
 fn render_unavailable_delegation_capabilities(unavailable: &[String]) -> String {
-    render_agent_tool_error(
-        None,
-        &format!(
-            "Delegation requested capabilities that are unavailable or not enabled for the current request: {}. Add supported product-optional capabilities to the parent request or remove unsupported names.",
-            unavailable.join(", ")
-        ),
-    )
+    render_agent_tool_admission_error(&format!(
+        "Delegation requested capabilities that are unavailable or not enabled for the current request: {}. Add supported product-optional capabilities to the parent request or remove unsupported names.",
+        unavailable.join(", ")
+    ))
 }
 
 /// Handle the consolidated `agent` tool for shared dynamic-agent actions.
@@ -1404,7 +1404,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
 ) -> String {
     let validated = validated_agent_fanout_start_input(args);
     if let Err(FanoutStartInputError::Shape(message)) = &validated {
-        return render_agent_tool_error(None, message);
+        return render_agent_tool_admission_error(message);
     }
     let ctx = match ctx {
         Some(c) => c,
@@ -1412,7 +1412,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
     };
     let mut input = match validated {
         Ok(input) => input,
-        Err(error) => return render_agent_tool_error(None, error.message()),
+        Err(error) => return render_agent_tool_admission_error(error.message()),
     };
     let mut request_identity = args.clone();
     if let Some(object) = request_identity.as_object_mut() {
@@ -1518,7 +1518,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
             })
             .to_string();
         }
-        Err(error) => return render_agent_tool_error(None, &error.to_string()),
+        Err(error) => return render_agent_tool_admission_error(&error.to_string()),
     };
     let unavailable =
         unavailable_requested_tools(requested_optional_tools.iter(), ctx.enabled_tools.as_ref());
@@ -1551,7 +1551,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .collect::<Result<_, String>>()
     {
         Ok(planned) => planned,
-        Err(error) => return render_agent_tool_error(None, &error),
+        Err(error) => return render_agent_tool_admission_error(&error),
     };
     let inherited_selection = ctx
         .parent_model_reasoning
@@ -1560,10 +1560,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .or(ctx.current_model_selection.as_ref());
     for (_, slot_id, spawn_input) in &mut planned_slots {
         if let Err(error) = normalize_spawn_model_selection(spawn_input, inherited_selection) {
-            return render_agent_tool_error(
-                None,
-                &format!("fanout slot {}: {error}", slot_id.as_deref().unwrap_or("?")),
-            );
+            return render_agent_tool_admission_error(&format!(
+                "fanout slot {}: {error}",
+                slot_id.as_deref().unwrap_or("?")
+            ));
         }
     }
     if let Some(admission) = ctx.delegation_model_admission.as_ref() {
@@ -1574,7 +1574,9 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 &ctx.run_id,
                 tool_call_id.as_deref(),
             ) {
-                return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
+                return render_agent_tool_admission_error(&format!(
+                    "fanout preflight failed: {error}"
+                ));
             }
         }
     }
@@ -1584,8 +1586,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
             Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
         ) && input.resolved_model_selection.is_none()
     }) {
-        return render_agent_tool_error(
-            None,
+        return render_agent_tool_admission_error(
             &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable.to_string(),
         );
     }
@@ -1619,7 +1620,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .spawner
         .validate_spawn_inputs(&resolved_inputs, &spawn_context)
     {
-        return render_agent_tool_error(None, &format!("fanout preflight failed: {error}"));
+        return render_agent_tool_admission_error(&format!("fanout preflight failed: {error}"));
     }
     let _capacity_reservation = match ctx
         .spawner
@@ -1628,10 +1629,9 @@ async fn handle_agent_fanout_start_action_with_deadline(
     {
         Ok(reservation) => reservation,
         Err(error) => {
-            return render_agent_tool_error(
-                None,
-                &format!("fanout capacity admission failed: {error}"),
-            );
+            return render_agent_tool_admission_error(&format!(
+                "fanout capacity admission failed: {error}"
+            ));
         }
     };
     let capacity_reservation_owner = _capacity_reservation.owner_id().map(str::to_owned);
@@ -1654,10 +1654,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
     );
     let preparations = match tokio::select! {
         _ = start_cancellation.cancelled() => {
-            return render_agent_tool_error(None, "fanout start cancelled during model admission");
+            return render_agent_tool_admission_error("fanout start cancelled during model admission");
         }
         _ = shutdown.cancelled() => {
-            return render_agent_tool_error(None, "runtime shutting down during fanout model admission");
+            return render_agent_tool_admission_error("runtime shutting down during fanout model admission");
         }
         _ = async {
             if let Some(cutoff) = preparation_cutoff {
@@ -1670,7 +1670,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
     } {
         Ok(preparations) => preparations,
         Err(error) => {
-            return render_agent_tool_error(None, &format!("fanout admission failed: {error}"));
+            return render_agent_tool_admission_error(&format!("fanout admission failed: {error}"));
         }
     };
     for (index, preparation) in preparations.iter().enumerate() {
@@ -1686,8 +1686,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
             .zip(prepared_selection.as_ref())
             .is_some_and(|(requested, prepared)| requested != prepared)
         {
-            return render_agent_tool_error(
-                None,
+            return render_agent_tool_admission_error(
                 "fanout admission resolved an Offering that conflicts with the requested selection",
             );
         }
@@ -1698,8 +1697,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
             })
         ) && prepared_selection.is_none()
         {
-            return render_agent_tool_error(
-                None,
+            return render_agent_tool_admission_error(
                 "configured model name was not resolved by trusted batch admission",
             );
         }
@@ -1715,10 +1713,9 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 tool_call_id.as_deref(),
             )
         {
-            return render_agent_tool_error(
-                None,
-                &format!("fanout model requirement failed: {error}"),
-            );
+            return render_agent_tool_admission_error(&format!(
+                "fanout model requirement failed: {error}"
+            ));
         }
     }
     match ctx
@@ -1739,7 +1736,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .await
     {
         Ok(()) => {}
-        Err(error) => return render_agent_tool_error(None, &error.to_string()),
+        Err(error) => return render_agent_tool_admission_error(&error.to_string()),
     };
     // Spawn all slots concurrently — no head-of-line blocking.
     let futs: Vec<_> = planned_slots
@@ -1859,7 +1856,7 @@ async fn handle_agent_fanout_get_results_action(
         FANOUT_GET_RESULTS_FIELDS,
         FANOUT_GET_RESULTS_SHAPE,
     ) {
-        return render_agent_tool_error(None, &format!("Invalid input: {e}"));
+        return render_agent_tool_admission_error(&format!("Invalid input: {e}"));
     }
     let ctx = match ctx {
         Some(c) => c,
@@ -2370,7 +2367,7 @@ async fn handle_agent_fanout_stop_slot_action(
             FANOUT_STOP_SLOT_SHAPE,
         )
     }) {
-        return render_agent_tool_error(None, &format!("Invalid input: {e}"));
+        return render_agent_tool_admission_error(&format!("Invalid input: {e}"));
     }
     let ctx = match ctx {
         Some(c) => c,
@@ -2874,7 +2871,7 @@ async fn handle_agent_spawn_action_with_controls(
     {
         Ok(i) => i,
         Err(e) => {
-            return render_agent_tool_error(None, &format!("Invalid input: {e}"));
+            return render_agent_tool_admission_error(&format!("Invalid input: {e}"));
         }
     };
 
@@ -2916,7 +2913,7 @@ async fn handle_agent_spawn_input_with_controls(
         .map(|parent| &parent.selection)
         .or(ctx.current_model_selection.as_ref());
     if let Err(error) = normalize_spawn_model_selection(&mut input, inherited_selection) {
-        return render_agent_tool_error(None, &error);
+        return render_agent_tool_admission_error(&error);
     }
 
     if let Some(admission) = ctx.delegation_model_admission.as_ref() {
@@ -2926,7 +2923,7 @@ async fn handle_agent_spawn_input_with_controls(
             &ctx.run_id,
             spawn_tool_call_id.as_deref(),
         ) {
-            return render_agent_tool_error(None, &error.to_string());
+            return render_agent_tool_admission_error(&error.to_string());
         }
     }
     if matches!(
@@ -2934,8 +2931,7 @@ async fn handle_agent_spawn_input_with_controls(
         Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
     ) && input.resolved_model_selection.is_none()
     {
-        return render_agent_tool_error(
-            None,
+        return render_agent_tool_admission_error(
             &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable.to_string(),
         );
     }
@@ -2952,7 +2948,7 @@ async fn handle_agent_spawn_input_with_controls(
     // completion owner prevents the parent from finalizing before required
     // child evidence is staged.
     if let Err(e) = input.validate_fanout_metadata() {
-        return render_agent_tool_error(None, &format!("Invalid input: {e}"));
+        return render_agent_tool_admission_error(&format!("Invalid input: {e}"));
     }
 
     let derived = match deadline_policy {
@@ -3015,7 +3011,7 @@ async fn handle_agent_spawn_input_with_controls(
             if matches!(error, SpawnError::ExecutorUnavailable) {
                 return render_agent_runtime_binding_error("agent", "spawn");
             }
-            return render_agent_tool_error(None, &format!("spawn preflight failed: {error}"));
+            return render_agent_tool_admission_error(&format!("spawn preflight failed: {error}"));
         }
         preparation = match ctx
             .spawner
@@ -3028,18 +3024,19 @@ async fn handle_agent_spawn_input_with_controls(
         {
             Ok(mut preparations) if preparations.len() == 1 => preparations.pop(),
             Ok(_) => {
-                return render_agent_tool_error(
-                    None,
+                return render_agent_tool_admission_error(
                     "spawn admission returned an incomplete preparation",
                 );
             }
             Err(error) => {
-                return render_agent_tool_error(None, &format!("spawn admission failed: {error}"));
+                return render_agent_tool_admission_error(&format!(
+                    "spawn admission failed: {error}"
+                ));
             }
         };
     }
     let Some(preparation) = preparation else {
-        return render_agent_tool_error(None, "spawn admission returned no preparation");
+        return render_agent_tool_admission_error("spawn admission returned no preparation");
     };
     let prepared_model = preparation.model_identity();
     let prepared_selection =
@@ -3054,8 +3051,7 @@ async fn handle_agent_spawn_input_with_controls(
         .zip(prepared_selection.as_ref())
         .is_some_and(|(requested, prepared)| requested != prepared)
     {
-        return render_agent_tool_error(
-            None,
+        return render_agent_tool_admission_error(
             "spawn admission resolved an Offering that conflicts with the requested selection",
         );
     }
@@ -3066,8 +3062,7 @@ async fn handle_agent_spawn_input_with_controls(
         })
     ) && prepared_selection.is_none()
     {
-        return render_agent_tool_error(
-            None,
+        return render_agent_tool_admission_error(
             "configured model name was not resolved by trusted admission",
         );
     }
@@ -3082,7 +3077,9 @@ async fn handle_agent_spawn_input_with_controls(
             spawn_ctx.spawn_tool_call_id.as_deref(),
         )
     {
-        return render_agent_tool_error(None, &format!("spawn model requirement failed: {error}"));
+        return render_agent_tool_admission_error(&format!(
+            "spawn model requirement failed: {error}"
+        ));
     }
 
     // CLI parents have a turn-scoped execution run_id but a stable root
@@ -6177,11 +6174,11 @@ mod tests {
             let mut args = valid.clone();
             *args.pointer_mut(pointer).unwrap() = value;
             let error = canonical_delegation_slot_briefs("agent_fanout", &args).unwrap_err();
-            assert_eq!(
-                handle_agent_fanout_start_action_with_deadline(&args, Some(&ctx)).await,
-                render_agent_tool_error(None, &error),
-                "validation drift for {pointer}",
-            );
+            let output = handle_agent_fanout_start_action_with_deadline(&args, Some(&ctx)).await;
+            let result: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(result["error"], error, "validation drift for {pointer}");
+            assert_eq!(result["status"], "failed");
+            assert_eq!(result["executed"], false);
         }
         assert!(spawner.list_fanout_groups().await.is_empty());
         assert_eq!(executor.take_captured_model(), None);
@@ -6193,10 +6190,13 @@ mod tests {
             render_agent_runtime_binding_error("agent_fanout", "start"),
         );
         invalid_task["target_count"] = json!(0);
+        let rejected = handle_agent_fanout_start_action_with_deadline(&invalid_task, None).await;
+        let rejected: Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(
-            handle_agent_fanout_start_action_with_deadline(&invalid_task, None).await,
-            render_agent_tool_error(None, "Invalid input: target_count must be >= 1"),
+            rejected["error"],
+            "Invalid input: target_count must be >= 1"
         );
+        assert_eq!(rejected["executed"], false);
     }
 
     #[test]
@@ -7380,6 +7380,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_spawn_preparation_failure_does_not_create_child_work() {
+        let executor = Arc::new(RejectingBatchExecutor {
+            preparations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let output = handle_agent_tool(
+            &json!({
+                "action": "spawn", "description": "review", "prompt": "review"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let result: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["status"], "failed", "{result}");
+        assert_eq!(result["executed"], false, "{result}");
+        assert_eq!(
+            executor
+                .preparations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(spawner.list_agents(&ctx.run_id).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn fanout_capacity_rejection_skips_admission_and_failed_admission_releases_capacity() {
         let executor = Arc::new(RejectingBatchExecutor {
             preparations: std::sync::atomic::AtomicUsize::new(0),
@@ -7416,6 +7442,9 @@ mod tests {
                 "{group_id}"
             );
             assert!(spawner.fanout_group(group_id).await.is_none());
+            if expected_preparations > 0 {
+                assert_eq!(value["executed"], false, "{value}");
+            }
         }
     }
 

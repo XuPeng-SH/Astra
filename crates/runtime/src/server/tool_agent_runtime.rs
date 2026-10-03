@@ -6,7 +6,9 @@ use astra_tools::agent_tool_contract::{
 use astra_tools::executor::DefaultToolExecutor;
 
 use crate::orchestration::AgentToolContext;
-use crate::server::tool_execution_result::agent_tool_result_from_output;
+use crate::server::tool_execution_result::{
+    agent_tool_result_from_output, pre_dispatch_rejection_tool_result,
+};
 
 pub(crate) async fn execute_agent_tool(
     _default_executor: &DefaultToolExecutor,
@@ -57,22 +59,25 @@ pub(crate) async fn execute_agent_tool(
 }
 
 fn server_agent_run_chain_unavailable_result() -> astra_tools::ToolResult {
-    let mut result = astra_tools::ToolResult::error(
+    let mut result = pre_dispatch_rejection_tool_result(
         "The agent.run_chain action is local-executor-only and is not part of the server agent contract. Use start_work for durable task tracking, or call the visible tools directly."
             .to_string(),
     );
-    result.metadata = Some(serde_json::Map::from_iter([
-        (
-            "error_kind".to_string(),
-            Value::String("tool_action_not_available".to_string()),
-        ),
-        ("tool_name".to_string(), Value::String("agent".to_string())),
-        ("action".to_string(), Value::String("run_chain".to_string())),
-        (
-            "available_actions".to_string(),
-            serde_json::json!(["spawn", "list", "get_result", "send_message"]),
-        ),
-    ]));
+    result
+        .metadata
+        .get_or_insert_with(Default::default)
+        .extend([
+            (
+                "error_kind".to_string(),
+                Value::String("tool_action_not_available".to_string()),
+            ),
+            ("tool_name".to_string(), Value::String("agent".to_string())),
+            ("action".to_string(), Value::String("run_chain".to_string())),
+            (
+                "available_actions".to_string(),
+                serde_json::json!(["spawn", "list", "get_result", "send_message"]),
+            ),
+        ]);
     result
 }
 
@@ -133,8 +138,7 @@ fn correlated_agent_arguments(args: &Value, tool_call_id: Option<&str>) -> Value
 }
 
 fn render_agent_error(error: String) -> String {
-    astra_turn_core::orchestration::agent_result_wire::render_agent_tool_error_with_kind(
-        None,
+    astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error_with_kind(
         &error,
         Some(astra_core::ErrorKind::ToolInvalidArgs),
     )
@@ -152,6 +156,8 @@ mod tests {
         assert!(!result.output.contains("Tool 'run_chain' not available"));
         let metadata = result.metadata.expect("typed metadata");
         assert_eq!(metadata["error_kind"], "tool_action_not_available");
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
         assert_eq!(metadata["tool_name"], "agent");
         assert_eq!(metadata["action"], "run_chain");
         assert_eq!(

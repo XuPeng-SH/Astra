@@ -201,6 +201,14 @@ impl ToolResult {
         self
     }
 
+    /// Reject an invocation only when its owner proves execution never began.
+    /// A failed or unchanged workspace alone does not establish this fact.
+    #[must_use]
+    pub fn with_execution_not_started(mut self) -> Self {
+        execution_outcome::insert_not_executed_fact(self.metadata.get_or_insert_with(Map::new));
+        self
+    }
+
     /// Attach exit-code semantics while preserving the existing output/error shape.
     pub fn with_exit_semantics(mut self, semantics: exit_semantics::ExitSemantics) -> Self {
         self.exit_semantics = Some(semantics);

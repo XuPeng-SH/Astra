@@ -17,7 +17,7 @@ use super::harness::{
     revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
-use astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING;
+use astra_services::{ADMIN_CONFIG_KEY_REASONING_OFFERING, RunStateStore};
 
 struct E2eUserAuth {
     auth_header: String,
@@ -1591,13 +1591,68 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     .await;
     assert_eq!(st_chat, StatusCode::OK, "chat for audit: {chat_j}");
 
+    wait_for_agent_event_types(
+        &ctx.pool,
+        &ctx.user_id,
+        session_id,
+        &["user_query"],
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+
+    // Audit reads the canonical LONGTEXT event payload, not a CHAR cast
+    // whose default length can truncate otherwise valid large UTF-8 JSON.
+    let run_id = chat_j["run_id"].as_str().expect("run_id");
+    let large_output = "审计 boundary output ".repeat(8_000);
+    assert!(large_output.len() > 65_535);
+    astra_services::DatabaseRunStateStore::new(ctx.shared_pool.clone())
+        .append_events_batch(
+            &ctx.user_id,
+            session_id,
+            run_id,
+            &[
+                json!({"event_type": "tool_call", "data": {
+                    "id": "large-audit-call", "name": "read_file", "arguments": {"path": "fixture.txt"}
+                }}),
+                json!({"event_type": "tool_call_end", "data": {
+                    "id": "large-audit-call", "name": "read_file", "success": true,
+                    "result": large_output
+                }}),
+                json!({"event_type": "run_error", "data": {
+                    "error": format!("large-audit-error-fixture:{large_output}"), "sentinel": "complete-json-tail"
+                }}),
+            ],
+        )
+        .await
+        .expect("persist large canonical audit events");
+
     for path in [
         format!("/sessions/{session_id}/audit/summary"),
         format!("/sessions/{session_id}/audit/turns?page=1&per_page=10"),
         format!("/sessions/{session_id}/audit/tools"),
+        format!("/sessions/{session_id}/audit/errors"),
+        format!("/sessions/{session_id}/audit/turns/1"),
+        "/audit/stats".to_string(),
+        "/audit/tools".to_string(),
     ] {
         let (st, body) = get_json(app, &path, Some(auth), &[]).await;
         assert_eq!(st, StatusCode::OK, "GET {path}: {body}");
+        if path.ends_with("/errors") {
+            let error = body["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| {
+                    entry["event_type"] == "run_error"
+                        && entry["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("large-audit-error-fixture:"))
+                })
+                .expect("durable error included in audit");
+            let payload: Value = serde_json::from_str(error["content"].as_str().unwrap())
+                .expect("large durable error must remain complete JSON");
+            assert_eq!(payload["data"]["sentinel"], "complete-json-tail");
+        }
     }
 
     ctx.close().await;

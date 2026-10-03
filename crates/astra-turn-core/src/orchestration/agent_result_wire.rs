@@ -901,11 +901,34 @@ pub fn render_agent_tool_error(agent_id: Option<&str>, message: &str) -> String 
     render_agent_tool_error_with_kind(agent_id, message, None)
 }
 
+/// A rejected request that provably never launched child execution.
+/// Do not use for launch failures or partially started fanout groups.
+pub fn render_agent_tool_admission_error(message: &str) -> String {
+    render_agent_tool_admission_error_with_kind(message, None)
+}
+
+pub fn render_agent_tool_admission_error_with_kind(
+    message: &str,
+    error_kind: Option<astra_core::ErrorKind>,
+) -> String {
+    let mut body = agent_tool_error_body(None, message, error_kind);
+    body["executed"] = json!(false);
+    body.to_string()
+}
+
 pub fn render_agent_tool_error_with_kind(
     agent_id: Option<&str>,
     message: &str,
     error_kind: Option<astra_core::ErrorKind>,
 ) -> String {
+    agent_tool_error_body(agent_id, message, error_kind).to_string()
+}
+
+fn agent_tool_error_body(
+    agent_id: Option<&str>,
+    message: &str,
+    error_kind: Option<astra_core::ErrorKind>,
+) -> Value {
     let mut body = json!({
         "result_family": AgentToolResultFamily::ControlReceipt,
         "success": false,
@@ -918,7 +941,7 @@ pub fn render_agent_tool_error_with_kind(
     if let Some(agent_id) = agent_id {
         body["agent_id"] = json!(agent_id);
     }
-    body.to_string()
+    body
 }
 
 /// A malformed provider tool-call is not a failed sub-agent run. It is an

@@ -536,7 +536,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
 fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
     if let Err(error) = validate_read_file_args(args) {
-        return ToolResult::error(error);
+        return caller_correctable_no_effect(
+            error,
+            astra_core::ToolRecoveryAction::CorrectArguments,
+        )
+        .with_execution_not_started();
     }
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
@@ -3081,6 +3085,68 @@ mod tests {
             result.output.contains("exceeds"),
             "expected range-exceeds-file error, got: {}",
             result.output
+        );
+    }
+
+    #[test]
+    fn read_file_argument_failures_preserve_recovery_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test.txt"),
+            "Error: ordinary file content\n",
+        )
+        .unwrap();
+        for args in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"path": ""}),
+            serde_json::json!({"path": "missing.txt", "unknown": true}),
+            serde_json::json!({"path": "missing.txt", "start_line": 0}),
+            serde_json::json!({"path": "missing.txt", "start_line": -1}),
+            serde_json::json!({"path": "missing.txt", "start_line": 1.5}),
+            serde_json::json!({"path": "missing.txt", "end_line": "2"}),
+            serde_json::json!({"path": "missing.txt", "start_line": 3, "end_line": 1}),
+            serde_json::json!({"path": "missing.txt", "outline": 1}),
+        ] {
+            let result = read_file(dir.path(), &args);
+            assert!(result.is_error, "{args}: {result:?}");
+            let metadata = result.metadata.as_ref().unwrap();
+            assert_eq!(metadata["execution_started"], false);
+            assert_eq!(metadata["disposition"], "rejected");
+            assert_eq!(metadata["execution_fact"], "not_executed");
+            assert_eq!(
+                metadata["error_kind"],
+                astra_core::ErrorKind::ToolInvalidArgs.as_str()
+            );
+            let evidence: astra_core::ToolFailureEvidence =
+                serde_json::from_value(metadata["recovery_evidence"].clone()).unwrap();
+            assert_eq!(
+                evidence.cause,
+                astra_core::ToolFailureCause::InvalidArguments
+            );
+            assert_eq!(
+                evidence.recovery_actions,
+                vec![astra_core::ToolRecoveryAction::CorrectArguments]
+            );
+        }
+        let read = |args: &Value| read_file(dir.path(), args);
+        let corrected =
+            read(&serde_json::json!({"path": "test.txt", "start_line": 1, "end_line": 1}));
+        assert!(!corrected.is_error, "{corrected:?}");
+        assert!(corrected.output.contains("Error: ordinary file content"));
+        let missing = read(&serde_json::json!({"path": "missing.txt"}));
+        assert!(missing.is_error);
+        assert!(missing.metadata.as_ref().is_none_or(
+            |metadata| metadata.get("disposition") != Some(&serde_json::json!("rejected"))
+        ));
+        assert!(
+            missing
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.get("error_kind")
+                    != Some(&serde_json::json!(
+                        astra_core::ErrorKind::ToolInvalidArgs.as_str()
+                    )))
         );
     }
 

@@ -76,6 +76,11 @@ and static slot selection do not have an alternate execution path. Launch
 registers cancellation controls synchronously without starting I/O. The child
 supervisor starts the returned future, and rechecks mutable generation,
 cancellation, and deadline authority at execution boundaries.
+A failed preparation or model admission reports a rejected request with an
+explicit non-execution fact. CLI and Server carry that same fact into the
+execution journal; it remains observable as a blocked request and does not
+create an unfinished child obligation. Failure after launch, partially started
+fanout, and unknown outcomes retain their execution and settlement obligations.
 
 An isolated child workspace belongs to the explicitly selected CLI workspace
 boundary, which provisions tracked sources through Git and retains cleanup

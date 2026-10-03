@@ -4789,6 +4789,17 @@ impl ToolExecutor {
         let (mut output, _) =
             astra_tools::credential_redaction::redact_credentials_for_display(&output);
         let embedded_work_observation = embedded_work_unit_observation(&output);
+        // Only control-handler output is a producer-owned execution fact;
+        // file contents and process stdout cannot certify non-execution.
+        if matches!(name, "agent" | "agent_fanout")
+            && let Ok(parsed) = serde_json::from_str::<Value>(&output)
+        {
+            astra_tools::execution_outcome::insert_producer_execution_fact(
+                Some(&parsed),
+                tool_result_fields.get_or_insert_with(Default::default),
+            );
+        }
+
         // Source status wins over result prose. Unmigrated String handlers
         // retain their status adapter, but cannot invent an error category.
         let mut is_error = source_is_error.unwrap_or_else(|| cli_tool_output_is_error(&output))
@@ -5236,8 +5247,7 @@ impl ToolExecutor {
                     ) {
                         Ok(action) => action,
                         Err(error) => {
-                            return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_error_with_kind(
-                                    None,
+                            return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error_with_kind(
                                     &error,
                                     Some(astra_core::ErrorKind::ToolInvalidArgs),
                                 );
@@ -5275,7 +5285,7 @@ impl ToolExecutor {
                         astra_tools::agent_tool_contract::AgentAction::Spawn => {
                             if self.delegation_requires_admission {
                                 *source_is_error = Some(true);
-                                return "Error: inherited model requirements cannot be bound to a CLI child delegation".into();
+                                return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error("inherited model requirements cannot be bound to a CLI child delegation");
                             }
                             let context = self.spawn_context_for_admission();
                             agent_spawning::handle_agent_spawn_action(args, context.as_ref()).await
@@ -5328,7 +5338,7 @@ impl ToolExecutor {
                         && args.get("action").and_then(Value::as_str) == Some("start")
                     {
                         *source_is_error = Some(true);
-                        return "Error: inherited model requirements cannot be bound to a CLI child delegation".into();
+                        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error("inherited model requirements cannot be bound to a CLI child delegation");
                     }
                     if self.spawn_context.is_none()
                         && args.get("action").and_then(Value::as_str) == Some("get_results")
@@ -6499,6 +6509,38 @@ pub(crate) mod tests {
                 .parent_model_reasoning
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn cli_agent_admission_rejection_preserves_non_execution_metadata() {
+        let executor = test_executor()
+            .with_spawn_context(fanout_test_context(test_spawner()))
+            .require_delegation_admission(true);
+        executor.set_current_visible_tool_schemas(&[
+            function_schema("agent"),
+            function_schema("agent_fanout"),
+        ]);
+        for (name, args) in [
+            (
+                "agent",
+                serde_json::json!({"action": "spawn", "description": "review", "prompt": "review"}),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({"action": "start", "target_count": 1, "slots": [{"description":"review", "prompt":"review"}]}),
+            ),
+        ] {
+            let result = executor.execute_with_metadata(name, &args).await;
+            assert!(result.is_error, "{result:?}");
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(
+                fields.get("execution_started"),
+                Some(&Value::Bool(false)),
+                "{name}: {} {fields:?}",
+                result.output
+            );
+            assert_eq!(fields["disposition"], "rejected");
+        }
     }
 
     #[tokio::test]
