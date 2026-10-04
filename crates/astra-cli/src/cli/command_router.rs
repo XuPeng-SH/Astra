@@ -1,7 +1,6 @@
 use crate::cli::arg_render::{
     apply_system_prompt, render_agent_args, render_bug_args, render_debug_args, render_diff_args,
     render_grep_args, render_memory_args, render_permissions_args, render_review_args,
-    render_team_args,
 };
 use crate::cli::auth_flow::{
     clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
@@ -1721,13 +1720,7 @@ async fn execute_cli_command_impl(
             state.team_store = std::sync::Arc::new(
                 crate::cli::http_team_store::HttpTeamStore::new(api, profile.as_deref()),
             );
-            slash_team::handle_team_command(
-                &render_team_args(&args),
-                api,
-                profile.as_deref(),
-                &mut state,
-            )
-            .await?;
+            slash_team::handle_team_command(args, api, profile.as_deref(), &mut state).await?;
             Ok(ExitCode::Success)
         }
 

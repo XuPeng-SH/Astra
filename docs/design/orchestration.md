@@ -59,6 +59,10 @@ the complete definition, including member profiles, capabilities and shared cont
 The accepted save response supplies the persisted identity without a follow-up
 read. Failed reads or writes must not publish success or a locally committed
 configuration, and standalone commands must return a failing exit status.
+Native configuration commands carry typed arguments to this owner rather than
+rendering a command string and parsing it again. Names, context keys, and literal
+descriptions retain their parsed identity; listing is not a help operation.
+Team execution remains with ordinary Chat, not the configuration command owner.
 Snapshot restore uses the complete saved configuration and preserves the current
 Team identity. It requires the exact returned snapshot ID, publishes only the
 accepted save response, and never checks out Git or changes running tasks.

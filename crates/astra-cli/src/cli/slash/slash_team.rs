@@ -1,5 +1,8 @@
 use crate::cli::{
-    cli_config::cli_utils::truncate_str, session::session_state::SessionState, theme,
+    cli_config::cli_args::{TeamArgs, TeamSubcommand},
+    cli_config::cli_utils::truncate_str,
+    session::session_state::SessionState,
+    theme,
 };
 use astra_services::team_persistence::TeamPersistenceService;
 use crossterm::style::Stylize;
@@ -152,11 +155,14 @@ fn team_member_description(member: &TeamMember) -> String {
 // ── Slash Command Handler ───────────────────────────────────────────────
 
 pub(crate) async fn handle_team_command(
-    arg: &str,
+    args: TeamArgs,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     state: &mut SessionState,
 ) -> Result<(), String> {
+    if matches!(args.command, Some(TeamSubcommand::Run(_))) {
+        return Err("Team execution must use the ordinary Chat entrypoint".into());
+    }
     // Hydrate registry from persistence store on first command
     if !state.team_registry.store_loaded {
         let user_id = state
@@ -172,12 +178,8 @@ pub(crate) async fn handle_team_command(
         state.team_registry.store_loaded = true;
     }
 
-    let mut parts = arg.splitn(2, ' ');
-    let sub = parts.next().unwrap_or("").trim();
-    let sub_arg = parts.next().unwrap_or("").trim();
-
-    match sub {
-        "" | "help" => {
+    match args.command {
+        None => {
             eprintln!(
                 "\n{}",
                 "─── Team ───────────────────────────────────────"
@@ -217,7 +219,7 @@ pub(crate) async fn handle_team_command(
             eprintln!();
         }
 
-        "list" => {
+        Some(TeamSubcommand::List) => {
             let teams = state.team_registry.list();
             if teams.is_empty() {
                 eprintln!(
@@ -270,11 +272,10 @@ pub(crate) async fn handle_team_command(
             eprintln!();
         }
 
-        "create" => {
-            // /team create <name> [description]
-            let mut parts = sub_arg.splitn(2, ' ');
-            let name = parts.next().unwrap_or("").trim();
-            let rest = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Create(command)) => {
+            let name = command.name.as_str();
+            let description = command.description.join(" ");
+            let rest = description.as_str();
             if name.is_empty() {
                 return Err("Usage: /team create <name> [description]".into());
             }
@@ -315,17 +316,7 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        "add-member" => {
-            let crate::cli::cli_config::cli_args::Command::Team(args) =
-                crate::cli::command_router::parse_team_bridge_command(arg)?
-            else {
-                return Err("expected a Team command".into());
-            };
-            let Some(crate::cli::cli_config::cli_args::TeamSubcommand::AddMember(member_args)) =
-                args.command
-            else {
-                return Err("expected add-member arguments".into());
-            };
+        Some(TeamSubcommand::AddMember(member_args)) => {
             let team = member_args.team.as_str();
             let role = member_args.role.as_str();
             let desc = member_args.description.join(" ");
@@ -389,8 +380,8 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        "info" => {
-            let name = sub_arg.trim();
+        Some(TeamSubcommand::Info(command)) => {
+            let name = command.name.as_str();
             if name.is_empty() {
                 return Err("Usage: /team info <name>".into());
             }
@@ -437,8 +428,8 @@ pub(crate) async fn handle_team_command(
             }
         }
 
-        "delete" => {
-            let name = sub_arg.trim();
+        Some(TeamSubcommand::Delete(command)) => {
+            let name = command.name.as_str();
             if name.is_empty() {
                 return Err("Usage: /team delete <name>".into());
             }
@@ -461,12 +452,11 @@ pub(crate) async fn handle_team_command(
             eprintln!("  {} Team '{}' deleted", theme::icon_ok(), name);
         }
 
-        "context" => {
-            // /team context <team> <key> <value>
-            let mut parts = sub_arg.splitn(3, ' ');
-            let team = parts.next().unwrap_or("").trim();
-            let key = parts.next().unwrap_or("").trim();
-            let value = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Context(command)) => {
+            let team = command.team.as_str();
+            let key = command.key.as_str();
+            let context_value = command.value.join(" ");
+            let value = context_value.as_str();
             if team.is_empty() || key.is_empty() {
                 return Err("Usage: /team context <team> <key> <value>".into());
             }
@@ -491,11 +481,10 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        "snapshot" => {
-            // /team snapshot <team> [label]
-            let mut parts = sub_arg.splitn(2, ' ');
-            let name = parts.next().unwrap_or("").trim();
-            let label = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Snapshot(command)) => {
+            let name = command.team.as_str();
+            let snapshot_label = command.label.join(" ");
+            let label = snapshot_label.as_str();
             if name.is_empty() {
                 return Err("Usage: /team snapshot <team> [label]".into());
             }
@@ -555,10 +544,9 @@ pub(crate) async fn handle_team_command(
             eprintln!();
         }
 
-        "restore" => {
-            let mut parts = sub_arg.splitn(2, ' ');
-            let name = parts.next().unwrap_or("").trim();
-            let snapshot_id = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Restore(command)) => {
+            let name = command.team.as_str();
+            let snapshot_id = command.snapshot_id.as_str();
             if name.is_empty() || snapshot_id.is_empty() {
                 return Err("Usage: /team restore <team> <snapshot-id>".into());
             }
@@ -606,7 +594,9 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        _ => return Err(format!("Unknown /team subcommand: '{sub}'")),
+        Some(TeamSubcommand::Run(_)) => {
+            return Err("Team execution must use the ordinary Chat entrypoint".into());
+        }
     }
     Ok(())
 }
@@ -623,6 +613,20 @@ mod tests {
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::session::session_state::SessionState;
     use std::collections::HashMap;
+
+    async fn handle_team_command(
+        command: &str,
+        api: &astra_thin_client::ThinClient,
+        profile: Option<&str>,
+        state: &mut SessionState,
+    ) -> Result<(), String> {
+        let crate::cli::cli_config::cli_args::Command::Team(args) =
+            crate::cli::command_router::parse_team_bridge_command(command)?
+        else {
+            unreachable!("the Team parser only returns Team commands")
+        };
+        super::handle_team_command(args, api, profile, state).await
+    }
 
     #[test]
     fn registry_starts_empty_until_remote_hydration() {
@@ -661,7 +665,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn failed_team_http_commands_leave_the_published_projection_unchanged() {
+    async fn team_http_commands_preserve_literals_and_publish_only_accepted_state() {
         let _creds_guard = crate::tests::isolate_credentials();
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
@@ -699,7 +703,7 @@ mod tests {
             "context test key value",
         ] {
             assert!(
-                super::handle_team_command(command, &api, None, &mut state)
+                handle_team_command(command, &api, None, &mut state)
                     .await
                     .is_err()
             );
@@ -711,7 +715,7 @@ mod tests {
         }
         state.team_registry.store_loaded = false;
         assert!(
-            super::handle_team_command("list", &api, None, &mut state)
+            handle_team_command("list", &api, None, &mut state)
                 .await
                 .is_err()
         );
@@ -721,6 +725,59 @@ mod tests {
             expected
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
+
+        let mut accepted = make_team(&[]);
+        accepted.name = "fresh team's".into();
+        accepted.description = "Keep user's exact words".into();
+        state.team_registry.store_loaded = true;
+        for (command, expected) in [
+            (
+                "create \"fresh team's\" \"Keep user's exact words\"",
+                serde_json::json!({"name": "fresh team's", "description": "Keep user's exact words"}),
+            ),
+            (
+                "context \"fresh team's\" \"acceptance criteria\" \"Don't change --flags\"",
+                serde_json::json!({"name": "fresh team's", "context": {"acceptance criteria": "Don't change --flags"}}),
+            ),
+            (
+                "add-member \"fresh team's\" \"delivery lead\" --can-delegate --max-delegation-depth 3 -- --can-delegate \"literal description\"",
+                serde_json::json!({"name": "fresh team's", "members": [{
+                    "role": "delivery lead", "system_prompt": "--can-delegate literal description",
+                    "skills": [], "mcp_servers": [],
+                    "can_delegate": true, "max_delegation_depth": 3
+                }]}),
+            ),
+        ] {
+            server.reset().await;
+            if let Some(context) = expected.get("context") {
+                accepted.context = serde_json::from_value(context.clone()).unwrap();
+            }
+            if let Some(members) = expected.get("members") {
+                accepted.members = serde_json::from_value(members.clone()).unwrap();
+            }
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/teams"))
+                .and(wiremock::matchers::body_partial_json(expected))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&accepted))
+                .expect(1)
+                .mount(&server)
+                .await;
+            handle_team_command(command, &api, None, &mut state)
+                .await
+                .unwrap();
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(
+                serde_json::to_value(state.team_registry.get("fresh team's").unwrap()).unwrap(),
+                serde_json::to_value(&accepted).unwrap()
+            );
+        }
+        for command in [
+            "add-member test lead --max-delegation-depth 0",
+            "add-member test lead --max-delegation-depth 3",
+        ] {
+            assert!(crate::cli::command_router::parse_team_bridge_command(command).is_err());
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
@@ -774,7 +831,7 @@ mod tests {
             std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(&api, None));
         let mut initial = SessionState::default();
         initial.team_store = store.clone();
-        super::handle_team_command("snapshot test local-label", &api, None, &mut initial)
+        handle_team_command("snapshot test local-label", &api, None, &mut initial)
             .await
             .unwrap();
         assert_eq!(initial.team_registry.get("test").unwrap().user_id, "u");
@@ -814,7 +871,7 @@ mod tests {
             .await;
         let mut state = SessionState::default();
         state.team_store = store;
-        super::handle_team_command("restore test snap-server-identity", &api, None, &mut state)
+        handle_team_command("restore test snap-server-identity", &api, None, &mut state)
             .await
             .unwrap();
         let expected_json = serde_json::to_value(&expected).unwrap();
@@ -841,7 +898,7 @@ mod tests {
             .await;
         for command in ["restore test snap-server-identity", "snapshot test failed"] {
             assert!(
-                super::handle_team_command(command, &api, None, &mut state)
+                handle_team_command(command, &api, None, &mut state)
                     .await
                     .is_err()
             );
@@ -873,14 +930,9 @@ mod tests {
                 .mount(&server)
                 .await;
             assert!(
-                super::handle_team_command(
-                    "restore test snap-server-identity",
-                    &api,
-                    None,
-                    &mut state
-                )
-                .await
-                .is_err()
+                handle_team_command("restore test snap-server-identity", &api, None, &mut state)
+                    .await
+                    .is_err()
             );
             assert_eq!(
                 serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
