@@ -4740,6 +4740,7 @@ struct PreparedAgentBindingLoopContext {
 /// Validated execution facts supplied to the shared loop assembler.
 /// This is not a serialized checkpoint and must not acquire a Default fallback.
 struct LoopExecutionFacts {
+    admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
     original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts,
     messages: Vec<Value>,
     tool_ledger_receipt: crate::turn::agentic_loop::host::ToolLedgerReceiptAccumulator,
@@ -13015,7 +13016,15 @@ impl AgenticRunLifecycleService {
                 provider_adaptation: Default::default(),
                 skill_produced_output: false,
             },
-            stall: Default::default(),
+            stall: crate::turn::agentic_loop::host::StallTrackingState {
+                circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+                    crate::turn::runtime_policy::circuit_breaker_config_from_tool_policy(
+                        &admitted_runtime_config.tool_policy,
+                    ),
+                ),
+                ..Default::default()
+            },
+            admitted_tool_policy: admitted_runtime_config.tool_policy,
             user_intents: Default::default(),
             hooks: StopHookState {
                 stop_hooks: hook_sets.stop_hooks,
@@ -13063,10 +13072,8 @@ impl AgenticRunLifecycleService {
         let thinking_config = Self::root_generation_controls(request)
             .expect("generation controls validated during request admission")
             .thinking;
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .resolve_for_model(request.model.as_deref());
         AgenticLoopState {
+            evaluation_thresholds: facts.original.evaluation_thresholds,
             messages: facts.messages,
             volatile_pending: facts.original.pending_context,
             current_session_id: Some(session_id.to_string()),
@@ -13180,9 +13187,9 @@ impl AgenticRunLifecycleService {
             ..AgenticLoopState::fresh(
                 facts.step_recorder,
                 facts.original.agentic_turn_budget,
-                &resolved_tool_policy,
+                facts.admitted_tool_policy,
+                request.model.as_deref(),
                 astra_turn_types::InferencePurpose::PrimaryAgent,
-                facts.original.evaluation_thresholds,
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         }
@@ -21986,7 +21993,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         _parent_selection: Option<&ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
         if inputs.iter().any(|input| input.isolated) {
-            return Err("this Server execution boundary does not support isolated Git workspaces; select a CLI execution boundary".into());
+            return Err("agent execution does not support isolated Git workspaces".into());
         }
         let parent = self
             .runtime_context_for_parent_run(&context.parent_run_id)
@@ -24561,8 +24568,8 @@ impl ServerSubRunExecutor {
         } else {
             crate::orchestration::workspace_mutation_from_context(&config.context)
         };
-        let execution_bindings = if child_workspace_mutation
-            == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        let execution_bindings = if self.inherited_permissions.read_only_execution
+            || config.agent_profile.read_only
         {
             execution_bindings_from_metadata_with_authority(
                 config.execution_metadata.as_ref(),
@@ -24748,11 +24755,9 @@ impl ServerSubRunExecutor {
 
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
-        let runtime_config = astra_config::RuntimeConfig::load();
-        let resolved_tool_policy = runtime_config.tool_selection.resolve_for_model(child_model_name.as_deref());
+        let admitted_tool_policy = astra_config::RuntimeConfig::load().tool_policy;
         let mut effective_inherited_permissions = self.inherited_permissions.clone();
-        if config.agent_profile.read_only || child_workspace_mutation
-            == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        if config.agent_profile.read_only
             || execution_bindings.as_ref().is_some_and(|snapshot| {
                 snapshot.workspace.authority == astra_runtime_env::WorkspaceAuthority::ReadOnly
             })
@@ -24852,9 +24857,9 @@ impl ServerSubRunExecutor {
                     &config.run_id,
                 ),
                 agentic_turn_budget,
-                &resolved_tool_policy,
+                admitted_tool_policy,
+                child_model_name.as_deref(),
                 astra_turn_types::InferencePurpose::SubAgent,
-                crate::turn::runtime_policy::evaluation_thresholds_from_policy(&runtime_config.tool_policy),
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         };

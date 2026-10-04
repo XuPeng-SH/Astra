@@ -1,7 +1,7 @@
 //! Server-side skill fork (sub-run) executor.
 //!
 //! Enables skills with `execution_context: Fork` to run in isolated sub-agent
-//! loops on the server, matching the CLI's `CliSkillSubRunExecutor` behavior.
+//! loops owned by the Server, including for CLI-originated admissions.
 //!
 //! Each sub-run creates a fresh [`ServerAgenticLoopHost`] +
 //! [`AgenticLoopState`] pair and runs [`run_agentic_loop_with_host`] to
@@ -996,10 +996,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             parent_recursion_depth,
         );
 
-        // Resolve per-model workflow-guard policy before `effective_model` is
-        // consumed by `.with_model(...)` below.
-        let runtime_config = astra_config::RuntimeConfig::load();
-        let resolved_tool_policy = runtime_config.tool_selection.resolve_for_model(effective_model.as_deref());
+        // Select the policy once for this skill execution.
+        let admitted_tool_policy = astra_config::RuntimeConfig::load().tool_policy;
 
         // Build the host for the sub-run.
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -1185,9 +1183,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             ..AgenticLoopState::fresh(
                 step_recorder,
                 agentic_turn_budget,
-                &resolved_tool_policy,
+                admitted_tool_policy,
+                effective_model.as_deref(),
                 astra_turn_types::InferencePurpose::SubAgent,
-                crate::turn::runtime_policy::evaluation_thresholds_from_policy(&runtime_config.tool_policy),
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         };
@@ -1349,14 +1347,24 @@ mod tests {
         const SECRET: &str = "FIRST_FORK_ONLY_FILE_EVIDENCE";
         const TASK: &str = "Explain the supplied facts without making changes.";
         let workspace = tempfile::TempDir::new().unwrap();
-        std::fs::write(workspace.path().join("facts.txt"), SECRET).unwrap();
+        // Exceed the retired selection policy's 15-call cap through actual execution.
+        let reads: Vec<_> = (0..16)
+            .map(|index| {
+                let path = format!("facts-{index}.txt");
+                std::fs::write(workspace.path().join(&path), format!("{SECRET}-{index}")).unwrap();
+                let id = if index == 0 {
+                    "first-fork-read".to_string()
+                } else {
+                    format!("first-fork-read-{index}")
+                };
+                json!({"id":id,"type":"function","function":{"name":"read_file",
+                "arguments":json!({"path":path}).to_string()}})
+            })
+            .collect();
         let allowed_tools = vec!["read_file".to_string()];
         let read = ProviderResponse::OpenAi(json!({
             "id":"fork-first-read","model":"genesis-wire-model",
-            "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{
-                "id":"first-fork-read","type":"function","function":{"name":"read_file",
-                    "arguments":json!({"path":"facts.txt"}).to_string()}
-            }]},"finish_reason":"tool_calls"}],
+            "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":reads},"finish_reason":"tool_calls"}],
             "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
         }));
         let gateway = ProviderGateway::start(vec![ProviderScript::new(
@@ -1520,20 +1528,19 @@ mod tests {
         let requests = gateway.requests.lock().await;
         assert_eq!(requests.len(), 3);
         let first_followup = requests[1].body["messages"].as_array().unwrap();
-        assert!(
-            first_followup
-                .iter()
-                .any(|message| message["role"] == "tool"
-                    && message["tool_call_id"] == "first-fork-read"
-                    && message["content"]
-                        .as_str()
-                        .is_some_and(|content| content.contains(SECRET))),
-            "first fork must consume the actual read result: {:?}",
-            first_followup
-                .iter()
-                .filter(|message| message["role"] == "tool")
-                .collect::<Vec<_>>()
-        );
+        for call in &reads {
+            assert!(
+                first_followup.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == call["id"]
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains(SECRET))
+                }),
+                "every admitted read must reach the next provider request: {}",
+                call["id"]
+            );
+        }
         assert!(first_followup.iter().any(|message| {
             message["role"] == "assistant"
                 && message["tool_calls"]
@@ -1857,13 +1864,8 @@ mod tests {
         );
     }
 
-    /// Server-side symmetric to `cli_skill_subrun_rejects_when_recursion_depth_limit_reached`:
-    /// the fork sub-run executor must refuse to spawn once the agent recursion
-    /// cap is reached. Without this guard, a fork-context skill could recurse
-    /// into itself indefinitely. The CLI has had this test; the server did not
-    /// — so this closes an asymmetric coverage gap where a misbehaving
-    /// resolver on the server path could recurse without a fast-fail at the
-    /// depth boundary.
+    /// Fork-skill execution must reject excessive recursion before model or
+    /// tool admission, preventing a resolver from recursively spawning itself.
     #[tokio::test]
     async fn server_skill_subrun_rejects_when_recursion_depth_limit_reached() {
         let executor = ServerSkillSubRunExecutor::new(

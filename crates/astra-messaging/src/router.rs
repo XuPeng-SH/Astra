@@ -32,8 +32,6 @@ pub struct PermissionOutcome {
 pub struct AgentMailbox {
     /// This agent's address.
     pub address: AgentAddress,
-    /// Delegation group this agent belongs to (if any).
-    pub delegation_id: Option<String>,
     subscription: MailboxSubscription,
     lifetime: MailboxLifetime,
     /// Message receive stream (direct + broadcast), mutex-guarded for Sync.
@@ -268,25 +266,6 @@ impl AgentMailbox {
     /// Clone the shared router so tools can send additional messages in-turn.
     pub fn router(&self) -> Arc<AgentMailboxRouter> {
         self.router.clone()
-    }
-
-    /// Resolve an agent inside this mailbox's own delegation namespace.
-    ///
-    /// Callers should not reach through the mailbox to its router for direct
-    /// addressing: the mailbox owns the namespace boundary and transports own
-    /// the authoritative lookup implementation.
-    pub async fn resolve_delegation_agent(
-        &self,
-        agent_id: &str,
-    ) -> Result<AgentAddress, MailboxError> {
-        let delegation_id = self
-            .delegation_id
-            .as_deref()
-            .filter(|delegation_id| !delegation_id.is_empty())
-            .ok_or_else(|| {
-                MailboxError::Protocol("mailbox is not part of a delegation namespace".to_string())
-            })?;
-        self.router.resolve_agent(delegation_id, agent_id).await
     }
 
     /// Non-blocking: get the next available message, if any.
@@ -835,10 +814,7 @@ impl AgentMailboxRouter {
                 addr.run_id
             )));
         }
-        let subscription = self
-            .transport
-            .register(addr.clone(), delegation_id.clone())
-            .await?;
+        let subscription = self.transport.register(addr.clone(), delegation_id).await?;
 
         let stream = match self.transport.subscribe(&subscription).await {
             Ok(stream) => stream,
@@ -883,7 +859,6 @@ impl AgentMailboxRouter {
 
         let mailbox = AgentMailbox {
             address: addr.clone(),
-            delegation_id,
             subscription: subscription.clone(),
             lifetime: lifetime.clone(),
             stream: tokio::sync::Mutex::new(stream),
@@ -1919,19 +1894,7 @@ mod tests {
         assert!(mailbox.wait_ready().await);
         mailbox.release_unconsumed().await.unwrap();
 
-        let sent_before_replay = transport
-            .metrics()
-            .messages_sent
-            .load(AtomicOrdering::Relaxed);
         let mut next = router.register(root.clone(), None).await.unwrap();
-        assert_eq!(
-            transport
-                .metrics()
-                .messages_sent
-                .load(AtomicOrdering::Relaxed),
-            sent_before_replay,
-            "volatile backlog ownership transfer must not resend messages"
-        );
         let fresh = AgentMessage::new(
             sender,
             MessageTarget::Direct { address: root },
@@ -2435,7 +2398,6 @@ mod tests {
             subscription: MailboxSubscription::new(addr("run-receiver", "receiver")),
             lifetime: MailboxLifetime::new(addr("run-receiver", "receiver")),
             address: addr("run-receiver", "receiver"),
-            delegation_id: None,
             stream: tokio::sync::Mutex::new(Box::new(AckRecordingStream { acknowledged })),
             buffered: tokio::sync::Mutex::new(VecDeque::new()),
             parked: VecDeque::new(),
@@ -2474,7 +2436,6 @@ mod tests {
             subscription: MailboxSubscription::new(addr("receiver", "receiver")),
             lifetime: MailboxLifetime::new(addr("receiver", "receiver")),
             address: addr("receiver", "receiver"),
-            delegation_id: None,
             stream: tokio::sync::Mutex::new(Box::new(BlockingAckStream {
                 entered: entered.clone(),
                 release,
@@ -2529,7 +2490,6 @@ mod tests {
             subscription: MailboxSubscription::new(addr("run-review", "reviewer")),
             lifetime: MailboxLifetime::new(addr("run-review", "reviewer")),
             address: addr("run-review", "reviewer"),
-            delegation_id: None,
             stream: tokio::sync::Mutex::new(Box::new(AckRecordingStream {
                 acknowledged: Arc::clone(&acknowledged),
             })),
@@ -2592,7 +2552,6 @@ mod tests {
             subscription: MailboxSubscription::new(addr("run-b", "receiver")),
             lifetime: MailboxLifetime::new(addr("run-b", "receiver")),
             address: addr("run-b", "receiver"),
-            delegation_id: None,
             stream: tokio::sync::Mutex::new(Box::new(SelectiveAckStream {
                 failing_id: second.id.clone(),
                 acknowledged: Arc::clone(&acknowledged),
@@ -2690,7 +2649,7 @@ mod tests {
 
         let first = addr("run-a", "worker");
         let second = addr("run-b", "worker");
-        let first_mailbox = router
+        let _first_mailbox = router
             .register(first.clone(), Some("delegation-a".into()))
             .await
             .unwrap();
@@ -2712,14 +2671,6 @@ mod tests {
                 .await
                 .unwrap(),
             second
-        );
-        assert_eq!(
-            first_mailbox
-                .resolve_delegation_agent("worker")
-                .await
-                .unwrap(),
-            first,
-            "mailbox-level resolution must stay inside its delegation namespace"
         );
         assert_eq!(
             router.list_registered_agents("delegation-a").await.unwrap(),

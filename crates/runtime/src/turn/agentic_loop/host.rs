@@ -2306,8 +2306,6 @@ pub struct MessagingState {
     /// Run-owned question obligations shared with the sending tool. These
     /// remain empty for ordinary turns and never trigger a database read.
     pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
-    /// Unified messaging metrics (optional, shared across agents in a delegation).
-    pub metrics: Option<std::sync::Arc<astra_messaging::metrics::MessagingMetrics>>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
@@ -3470,6 +3468,8 @@ impl ToolLedgerReceiptAccumulator {
 }
 
 pub struct AgenticLoopState {
+    /// Selected once for this execution; model changes resolve against this input.
+    pub admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
     /// Fixed for this execution, including cooperative owner handoff.
     pub evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
     // ── Message context ──
@@ -3972,12 +3972,21 @@ impl AgenticLoopState {
     pub fn fresh(
         step_recorder: StepRecorder,
         agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
-        policy: &astra_config::runtime_config::EffectiveToolPolicy,
+        admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
+        model: Option<&str>,
         inference_purpose: astra_turn_types::InferencePurpose,
-        evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
         api: astra_thin_client::ThinClient,
     ) -> Self {
+        let policy = admitted_tool_policy.resolve_for_model(model);
+        let evaluation_thresholds =
+            crate::turn::runtime_policy::evaluation_thresholds_from_policy(&admitted_tool_policy);
+        let circuit_breaker = astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+            crate::turn::runtime_policy::circuit_breaker_config_from_tool_policy(
+                &admitted_tool_policy,
+            ),
+        );
         Self {
+            admitted_tool_policy,
             evaluation_thresholds,
             messages: Vec::new(),
             run_transcript_capture: None,
@@ -4028,7 +4037,10 @@ impl AgenticLoopState {
             max_identical_tool_calls: policy.max_identical_tool_calls,
             max_tools_per_turn: policy.max_tools_per_turn,
             max_consecutive_empty_name: policy.max_consecutive_empty_name,
-            stall: Default::default(),
+            stall: StallTrackingState {
+                circuit_breaker,
+                ..Default::default()
+            },
             telemetry: Default::default(),
             skills: SkillState {
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
@@ -5717,13 +5729,11 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 
 /// **Test-only.** Like [`make_test_loop_state`], but resolves workflow-guard
 /// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
-/// [`astra_config::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
+/// [`astra_config::runtime_config::ToolPolicyConfig::resolve_for_model`], so a
 /// request carrying a specific model id sees that model's profile.
 #[doc(hidden)]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
-    let policy = astra_config::runtime_config::RuntimeConfig::load()
-        .tool_policy
-        .resolve_for_model(model);
+    let policy = astra_config::runtime_config::RuntimeConfig::load().tool_policy;
     AgenticLoopState {
         max_turns: 10,
         remaining_turns: 10,
@@ -5736,9 +5746,9 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         ..AgenticLoopState::fresh(
             StepRecorder::new("test-user", "test-session", "test-task"),
             TaskExecutionProfile::default().agentic_turn_budget,
-            &policy,
+            policy,
+            model,
             astra_turn_types::InferencePurpose::PrimaryAgent,
-            Default::default(),
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
         )
     }
@@ -11364,6 +11374,43 @@ pub(crate) mod tests {
         };
         assert!(exhausted.advance().is_err());
         assert_eq!(exhausted.iteration_index(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn fresh_execution_uses_the_admitted_circuit_breaker() {
+        use astra_turn_core::loop_circuit_breaker::{BreakerAction, RoundSignal};
+        let policy = astra_config::runtime_config::ToolPolicyConfig {
+            circuit_breaker_absolute_max_rounds: 20,
+            circuit_breaker_read_only_stall_threshold: 17,
+            ..Default::default()
+        };
+        let mut state = AgenticLoopState::fresh(
+            StepRecorder::new("test-user", "test-session", "test-task"),
+            TaskExecutionProfile::default().agentic_turn_budget,
+            policy,
+            None,
+            astra_turn_types::InferencePurpose::SubAgent,
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+        );
+        assert_eq!(state.stall.circuit_breaker.read_only_threshold(), 17);
+        for round in 1..=20 {
+            let action = state.stall.circuit_breaker.observe(RoundSignal {
+                tool_signatures: Default::default(),
+                produced_mutation: true,
+                tool_count: 1,
+            });
+            if round == 20 {
+                assert_eq!(
+                    action,
+                    BreakerAction::HardRoundLimitReached {
+                        rounds: 20,
+                        limit: 20
+                    }
+                );
+            } else {
+                assert_eq!(action, BreakerAction::Continue);
+            }
+        }
     }
 
     #[test]
