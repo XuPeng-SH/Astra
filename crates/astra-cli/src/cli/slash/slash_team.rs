@@ -32,6 +32,21 @@ pub(crate) async fn resolve_team_run_chat_request(
         .await
         .map_err(|error| format!("failed to load team '{team_name_or_id}': {error}"))?
         .ok_or_else(|| format!("Team '{team_name_or_id}' not found"))?;
+    let lead = resolve_team_lead_profile(&team, lead_agent_id)?;
+    Ok(TeamChatRequest {
+        message: task.trim().to_string(),
+        selection: astra_services::runs::AgentProfileSelection {
+            team_id: team.team_id,
+            lead_agent_id: Some(lead.agent_id),
+        },
+    })
+}
+
+/// Resolve configuration intent only. Root admission owns current authority.
+pub(crate) fn resolve_team_lead_profile(
+    team: &Team,
+    lead_agent_id: Option<&str>,
+) -> Result<astra_services::coordination::AgentProfile, String> {
     if team.members.is_empty() {
         return Err(format!(
             "Team '{}' has no members. Add a member before starting a lead turn.",
@@ -42,7 +57,7 @@ pub(crate) async fn resolve_team_run_chat_request(
         .members
         .iter()
         .map(|member| astra_services::team_persistence::resolve_member_to_profile(member, &team));
-    let lead = match lead_agent_id {
+    match lead_agent_id {
         Some(id) => profiles
             .find(|profile| profile.agent_id == id.trim())
             .ok_or_else(|| {
@@ -50,7 +65,7 @@ pub(crate) async fn resolve_team_run_chat_request(
                     "lead '{}' is not a member of Team '{}'; use an Agent ID shown by `team info`",
                     id, team.name
                 )
-            })?,
+            }),
         None => {
             let mut coordinators = profiles.filter(|profile| profile.can_delegate);
             let lead = coordinators.next().ok_or_else(|| {
@@ -62,16 +77,9 @@ pub(crate) async fn resolve_team_run_chat_request(
                     team.name
                 ));
             }
-            lead
+            Ok(lead)
         }
-    };
-    Ok(TeamChatRequest {
-        message: task.trim().to_string(),
-        selection: astra_services::runs::AgentProfileSelection {
-            team_id: team.team_id,
-            lead_agent_id: Some(lead.agent_id),
-        },
-    })
+    }
 }
 
 // ── Team Registry ───────────────────────────────────────────────────────
@@ -186,11 +194,11 @@ pub(crate) fn team_configuration_lines<'a>(
         for member in &team.members {
             let profile = astra_services::team_persistence::resolve_member_to_profile(member, team);
             lines.push(format!(
-                "{} [{}] · {}",
+                "{} · {}",
                 member.role,
-                profile.agent_id,
                 team_member_description(member)
             ));
+            lines.push(format!("  Profile ID: {}", profile.agent_id));
             lines.push(format!(
                 "  Can delegate: {} · read-only: {} · max depth: {}",
                 member.can_delegate, member.read_only, profile.max_delegation_depth
@@ -248,6 +256,9 @@ pub(crate) async fn handle_team_command(
 ) -> Result<(), String> {
     if matches!(args.command, Some(TeamSubcommand::Run(_))) {
         return Err("Team execution must use the ordinary Chat entrypoint".into());
+    }
+    if matches!(args.command, Some(TeamSubcommand::Leave)) {
+        return Err("Use /team leave in the interactive workbench; this one-shot command cannot change a conversation's next-turn selection.".into());
     }
     // Hydrate registry from persistence store on first command
     if !state.team_registry.store_loaded {
@@ -556,7 +567,7 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        Some(TeamSubcommand::Run(_)) => {
+        Some(TeamSubcommand::Run(_) | TeamSubcommand::Leave) => {
             return Err("Team execution must use the ordinary Chat entrypoint".into());
         }
     }

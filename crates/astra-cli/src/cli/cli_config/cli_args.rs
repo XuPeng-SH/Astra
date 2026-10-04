@@ -511,6 +511,9 @@ pub(crate) struct TeamArgs {
 pub(crate) enum TeamSubcommand {
     /// List defined teams
     List,
+    /// Interactive workbench only: return future messages to the default agent
+    #[command(hide = true)]
+    Leave,
     /// Create a team
     Create(TeamCreateArgs),
     #[command(name = "add-member")]

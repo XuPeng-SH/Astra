@@ -9,7 +9,7 @@ use ratatui::{
     widgets::Widget,
 };
 
-use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
+use super::view::{BottomPaneView, CancellationEvent, ViewCompletion, ViewResult};
 use crate::tui::{
     inspection::{InspectorFactStatus, WorkbenchInspection},
     theme,
@@ -24,6 +24,8 @@ pub(crate) struct InfoView {
     scroll: usize,
     completed: bool,
     reopen: Option<String>,
+    accept_action: Option<(ViewResult, &'static str)>,
+    accepted: bool,
     primary_workspace: bool,
     primary_visible_rows: Cell<usize>,
 }
@@ -36,6 +38,8 @@ impl InfoView {
             scroll: 0,
             completed: false,
             reopen: None,
+            accept_action: None,
+            accepted: false,
             primary_workspace: false,
             primary_visible_rows: Cell::new(MAX_VISIBLE),
         }
@@ -43,6 +47,12 @@ impl InfoView {
 
     pub fn with_reopen(mut self, parent: &str) -> Self {
         self.reopen = Some(parent.to_string());
+        self
+    }
+
+    /// An explicit primary action; dismissing the view never accepts it.
+    pub fn with_accept_action(mut self, result: ViewResult, hint: &'static str) -> Self {
+        self.accept_action = Some((result, hint));
         self
     }
 
@@ -387,7 +397,9 @@ impl BottomPaneView for InfoView {
             y += 1;
         }
         if y < area.bottom() {
-            let hint = if self.lines.len() > max_visible {
+            let hint = if let Some((_, hint)) = &self.accept_action {
+                hint
+            } else if self.lines.len() > max_visible {
                 "  ↑/↓ scroll  Esc close"
             } else {
                 "  Esc close"
@@ -424,7 +436,11 @@ impl BottomPaneView for InfoView {
                 self.scroll =
                     (self.scroll + max_visible).min(self.lines.len().saturating_sub(max_visible));
             }
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Enter => {
+                self.accepted = self.accept_action.is_some();
+                self.completed = true;
+            }
+            KeyCode::Esc => {
                 self.completed = true;
             }
             _ => {}
@@ -451,8 +467,16 @@ impl BottomPaneView for InfoView {
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
             Some(ViewCompletion {
-                result: None,
-                reopen: self.reopen.clone(),
+                result: self
+                    .accept_action
+                    .as_ref()
+                    .filter(|_| self.accepted)
+                    .map(|(result, _)| result.clone()),
+                reopen: if self.accepted {
+                    None
+                } else {
+                    self.reopen.clone()
+                },
             })
         } else {
             None

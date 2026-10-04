@@ -176,6 +176,7 @@ enum SlashBackgroundReadEffect {
     Team {
         result: Result<Vec<crate::cli::slash::slash_team::Team>, String>,
         detail: bool,
+        attachment_epoch: u64,
     },
     Clipboard {
         success_message: String,
@@ -1329,11 +1330,12 @@ fn dispatch_slash_background_read(
 ) {
     tasks.spawn(async move {
         let effect = match action {
-            slash_dispatch::SlashBackgroundRead::Team { api, profile, name } => {
+            slash_dispatch::SlashBackgroundRead::Team { api, profile, name, attachment_epoch } => {
                 let store = crate::cli::http_team_store::HttpTeamStore::new(&api, profile.as_deref());
                 SlashBackgroundReadEffect::Team {
                     result: crate::cli::slash::slash_team::load_team_configurations(&store, "", name.as_deref()).await,
                     detail: name.is_some(),
+                    attachment_epoch,
                 }
             }
             slash_dispatch::SlashBackgroundRead::Clipboard {
@@ -1831,17 +1833,28 @@ fn apply_slash_background_read_effect(
     chat_widget: &mut chat_widget::ChatWidget,
 ) {
     match effect {
-        SlashBackgroundReadEffect::Team { result, detail } => match result {
-            Ok(teams) if detail || teams.is_empty() => {
+        SlashBackgroundReadEffect::Team {
+            result,
+            detail,
+            attachment_epoch,
+        } => match result {
+            Ok(mut teams) if detail || teams.is_empty() => {
                 chat_widget.commit_system(history_cell::system::SystemCell::response(
                     "Opened Team configuration",
                 ));
-                bottom_pane.push_view(Box::new(
-                    crate::tui::bottom_pane::info_view::InfoView::from_plain(
-                        "Team configuration",
-                        crate::cli::slash::slash_team::team_configuration_lines(&teams),
-                    ),
-                ));
+                if let Some(team) = teams.pop() {
+                    bottom_pane.push_view(Box::new(slash_dispatch::team_configuration_view(
+                        std::sync::Arc::new(team),
+                        attachment_epoch,
+                    )));
+                } else {
+                    bottom_pane.push_view(Box::new(
+                        crate::tui::bottom_pane::info_view::InfoView::from_plain(
+                            "Team configuration",
+                            crate::cli::slash::slash_team::team_configuration_lines(&teams),
+                        ),
+                    ));
+                }
             }
             Ok(teams) => {
                 use crate::tui::bottom_pane::list_selection_view::{
@@ -1861,9 +1874,12 @@ fn apply_slash_background_read_effect(
                     .collect();
                 let results = teams
                     .into_iter()
-                    .map(|team| {
-                        crate::tui::bottom_pane::view::ViewResult::TeamConfiguration(Box::new(team))
-                    })
+                    .map(
+                        |team| crate::tui::bottom_pane::view::ViewResult::TeamConfiguration {
+                            team: std::sync::Arc::new(team),
+                            attachment_epoch,
+                        },
+                    )
                     .collect();
                 bottom_pane.push_view(Box::new(
                     ListSelectionView::new(items, Some("Teams · configuration".into()))
@@ -7077,6 +7093,9 @@ fn refresh_footer_from_state(
 ) {
     bottom_pane.footer.model = state.model.as_deref().map(str::to_string);
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
+    bottom_pane
+        .footer
+        .sync_team_selection(state.cli_context.agent_profile_selection.as_ref());
     if let Some(trace) = latest_context_trace(state)
         && let Some(usage) = context_window_from_trace(&trace)
     {
@@ -11847,6 +11866,9 @@ pub(crate) async fn run_tui_session(
                 // happens to call `refresh_footer_from_state`. Cheap:
                 // a string format and an Option<u64> compare per 50ms.
                 let live_mode_enum = state.perm_manager.mode();
+                if bottom_pane.footer.sync_team_selection(state.cli_context.agent_profile_selection.as_ref()) {
+                    frame_requester.schedule_frame();
+                }
                 if bottom_pane.footer.permission_mode != Some(live_mode_enum) {
                     bottom_pane.footer.permission_mode = Some(live_mode_enum);
                     // The manager's active mode just shifted (for example,
@@ -20095,6 +20117,7 @@ mod tests {
                     api: api.clone(),
                     profile: None,
                     name: name.map(str::to_owned),
+                    attachment_epoch: state.session_attachment_epoch,
                 },
                 7,
                 tx,
@@ -20128,7 +20151,7 @@ mod tests {
                     panic!("Enter should inspect the selected definition")
                 };
                 assert!(matches!(&result,
-                    crate::tui::bottom_pane::view::ViewResult::TeamConfiguration(team)
+                    crate::tui::bottom_pane::view::ViewResult::TeamConfiguration { team, .. }
                     if team.team_id == "team-1"));
                 slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
             }
@@ -20147,6 +20170,184 @@ mod tests {
             }
         }
         server.verify().await;
+    }
+
+    #[test]
+    fn team_lead_picker_preserves_draft_and_changes_only_explicit_intent() {
+        use crate::tui::bottom_pane::view::ViewResult;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        for delegation in [[false, false], [true, false], [true, true]] {
+            let team = std::sync::Arc::new(astra_services::team_persistence::TeamDefinition {
+                team_id: "exact-team".into(),
+                user_id: "owner".into(),
+                name: "Product team".into(),
+                description: "A reusable team".into(),
+                context: Default::default(),
+                created_at: "2026-10-05".into(),
+                updated_at: "2026-10-05".into(),
+                members: ["Research", "Delivery"]
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(index, role)| astra_services::team_persistence::TeamMemberDef {
+                            role: role.into(),
+                            agent_id: Some(format!("opaque-member-{index}")),
+                            can_delegate: delegation[index],
+                            ..Default::default()
+                        },
+                    )
+                    .collect(),
+            });
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            state.model = Some("parent-model".into());
+            let previous = Some(astra_turn_types::AgentProfileSelection {
+                team_id: "previous-team".into(),
+                lead_agent_id: Some("previous-lead".into()),
+            });
+            state.cli_context.agent_profile_selection = previous.clone();
+            let permission = state.perm_manager.mode();
+            let mut pane = BottomPane::new();
+            pane.composer.set_text("My unfinished objective");
+            let mut widget = chat_widget::ChatWidget::new("session-team");
+            for dismiss in [
+                escape,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ] {
+                slash_dispatch::handle_view_result(
+                    ViewResult::TeamConfiguration {
+                        team: team.clone(),
+                        attachment_epoch: state.session_attachment_epoch,
+                    },
+                    &mut state,
+                    &mut pane,
+                    &mut widget,
+                );
+                assert!(render_bottom_pane_text(&pane, 60, 30).contains("Enter use team"));
+                assert!(!matches!(
+                    pane.handle_key(dismiss),
+                    BottomPaneAction::ViewCompleted {
+                        result: Some(_),
+                        ..
+                    }
+                ));
+                assert_eq!(state.cli_context.agent_profile_selection, previous);
+            }
+            slash_dispatch::handle_view_result(
+                ViewResult::TeamConfiguration {
+                    team: team.clone(),
+                    attachment_epoch: state.session_attachment_epoch,
+                },
+                &mut state,
+                &mut pane,
+                &mut widget,
+            );
+            let BottomPaneAction::ViewCompleted {
+                result: Some(result),
+                reopen: None,
+            } = pane.handle_key(enter)
+            else {
+                panic!("explicit Enter should choose Team intent")
+            };
+            slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
+            let expected_lead = if delegation == [true, false] {
+                "opaque-member-0"
+            } else {
+                assert_eq!(state.cli_context.agent_profile_selection, previous);
+                assert!(matches!(
+                    pane.handle_key(escape),
+                    BottomPaneAction::ViewCompleted { result: None, .. }
+                ));
+                assert_eq!(state.cli_context.agent_profile_selection, previous);
+                slash_dispatch::handle_view_result(
+                    ViewResult::UseTeam {
+                        team: team.clone(),
+                        attachment_epoch: state.session_attachment_epoch,
+                    },
+                    &mut state,
+                    &mut pane,
+                    &mut widget,
+                );
+                for character in "Delivery".chars() {
+                    pane.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+                }
+                let BottomPaneAction::ViewCompleted {
+                    result: Some(result),
+                    ..
+                } = pane.handle_key(enter)
+                else {
+                    panic!("filtered row must retain its exact member identity")
+                };
+                slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
+                "opaque-member-1"
+            };
+            let selected = state.cli_context.agent_profile_selection.clone();
+            assert_eq!(
+                selected,
+                Some(astra_turn_types::AgentProfileSelection {
+                    team_id: "exact-team".into(),
+                    lead_agent_id: Some(expected_lead.into()),
+                })
+            );
+            assert_eq!(pane.composer.text(), "My unfinished objective");
+            assert_eq!(state.model.as_deref(), Some("parent-model"));
+            assert_eq!(state.perm_manager.mode(), permission);
+            assert!(render_bottom_pane_text(&pane, 80, 15).contains("Product team"));
+            assert!(
+                state.run_id.is_none(),
+                "selecting a team is not starting a run"
+            );
+            slash_dispatch::handle_view_result(
+                ViewResult::TeamLead {
+                    team: team.clone(),
+                    lead_agent_id: "foreign-member".into(),
+                    attachment_epoch: state.session_attachment_epoch,
+                },
+                &mut state,
+                &mut pane,
+                &mut widget,
+            );
+            assert_eq!(state.cli_context.agent_profile_selection, selected);
+            slash_dispatch::handle_view_result(
+                ViewResult::TeamLeave {
+                    attachment_epoch: state.session_attachment_epoch,
+                },
+                &mut state,
+                &mut pane,
+                &mut widget,
+            );
+            assert!(state.cli_context.agent_profile_selection.is_none());
+            assert_eq!(pane.composer.text(), "My unfinished objective");
+            assert_eq!(state.model.as_deref(), Some("parent-model"));
+            assert_eq!(state.perm_manager.mode(), permission);
+            assert!(!render_bottom_pane_text(&pane, 80, 15).contains("Product team"));
+            // Keep an old detail view open across an actual session rebind.
+            slash_dispatch::handle_view_result(
+                ViewResult::TeamConfiguration {
+                    team,
+                    attachment_epoch: state.session_attachment_epoch,
+                },
+                &mut state,
+                &mut pane,
+                &mut widget,
+            );
+            state.reset_for_new_session();
+            refresh_footer_from_state(&mut pane, &state);
+            let BottomPaneAction::ViewCompleted {
+                result: Some(stale),
+                ..
+            } = pane.handle_key(enter)
+            else {
+                panic!("retained view emits its original scope")
+            };
+            slash_dispatch::handle_view_result(stale, &mut state, &mut pane, &mut widget);
+            assert!(state.cli_context.agent_profile_selection.is_none());
+            assert!(
+                !pane.has_active_view(),
+                "stale Team intent cannot open a fresh picker"
+            );
+        }
     }
 
     #[test]

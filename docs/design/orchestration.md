@@ -66,8 +66,19 @@ The TUI's `/team` and `/team list` open a searchable configuration picker;
 `/team info <name>` inspects one exact definition. Both use the same persistence
 reader as CLI configuration. Inspecting a picker row reuses its loaded definition
 without another read or changing the active agent. These are configuration
-observations, not live execution status. Configuration editing still uses native
-CLI commands; the picker does not yet implement the complete workbench below.
+observations, not live execution status. Enter in a populated detail view
+explicitly chooses the Team for future messages in the current conversation;
+it does not start a run or discard existing context. The sole delegation-capable
+member is the default lead; otherwise the TUI presents typed member choices by
+name with delegation permissions visible. Dismissal never accepts a selection.
+Retained views carry the existing attachment epoch and cannot change a different
+conversation after a rebind. `/team leave` clears future selection locally without
+changing history, model, permissions, or running work. It is an interactive TUI
+control, not a standalone command that edits durable conversation state.
+The status line labels the exact selected intent; unavailable friendly labels
+remain generic rather than guessed. Root admission reauthorizes configuration.
+Configuration editing still uses native CLI commands; this does not yet implement
+the complete workbench below.
 Team execution remains with ordinary Chat, not the configuration command owner.
 Snapshot restore uses the complete saved configuration and preserves the current
 Team identity. It requires the exact returned snapshot ID, publishes only the
@@ -100,9 +111,10 @@ current owner-scoped configuration. Switching or clearing a session drops the
 previous selection, while an explicit Team launch overrides restored intent.
 Same-run recovery continues to use its frozen admitted profiles.
 Native entrypoints select the sole delegation-capable member from the already
-loaded configuration. With zero or multiple such members, use `team info` and
-`--lead-agent-id <agent_id>` to choose explicitly; role names and member order
-never choose a lead or grant permission. Server admission authorizes and freezes
+loaded configuration. With zero or multiple such members, the TUI offers a
+member picker; one-shot CLI uses `team info` and `--lead-agent-id <agent_id>` to
+choose explicitly. Role names and member order never choose a lead or grant
+permission. Server admission authorizes and freezes
 the explicit resolved identity. This UI default does not change the protocol's
 `lead_agent_id: null` meaning: an ordinary root with an admitted member directory.
 Native `team run --json` reuses the ordinary turn's terminal JSON; its hidden

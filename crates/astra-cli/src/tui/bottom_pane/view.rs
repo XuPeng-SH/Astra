@@ -68,7 +68,23 @@ pub(crate) enum ViewResult {
     },
     InsertCommand(String),
     /// Inspect the loaded definition without a second read or execution change.
-    TeamConfiguration(Box<astra_services::team_persistence::TeamDefinition>),
+    TeamConfiguration {
+        team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
+        attachment_epoch: u64,
+    },
+    /// Begin choosing a lead, without starting execution or changing selection.
+    UseTeam {
+        team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
+        attachment_epoch: u64,
+    },
+    TeamLead {
+        team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
+        lead_agent_id: String,
+        attachment_epoch: u64,
+    },
+    TeamLeave {
+        attachment_epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
