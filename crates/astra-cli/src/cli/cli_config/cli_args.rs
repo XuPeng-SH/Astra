@@ -595,6 +595,12 @@ pub(crate) struct TeamRunArgs {
     /// Write the existing structured JSONL turn events to this machine-event file.
     #[arg(long = "stream-events", hide = true, value_name = "PATH")]
     pub stream_events: Option<PathBuf>,
+    /// Capture the ordinary Chat execution explanation.
+    #[arg(long, num_args = 0..=1, default_missing_value = "on", value_name = "MODE", value_parser = parse_explain_mode_arg)]
+    pub explain: Option<crate::cli::session::session_state::ExplainMode>,
+    /// Bound execution using the ordinary Chat wall-clock budget.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(71..))]
+    pub max_wall_time_seconds: Option<u64>,
     /// Task description
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub task: Vec<String>,

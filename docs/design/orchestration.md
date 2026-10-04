@@ -80,6 +80,11 @@ remain generic rather than guessed. Root admission reauthorizes configuration.
 Configuration editing still uses native CLI commands; this does not yet implement
 the complete workbench below.
 Team execution remains with ordinary Chat, not the configuration command owner.
+Native `team run` forwards ordinary Explain capture and wall-clock limits.
+Shared Team context is required factual input to the admitted lead and members,
+not system instructions or a source of execution permissions. It is frozen in
+the admitted profile snapshot and uses the existing required-context projection;
+configuration edits affect later admissions, not already running members.
 Snapshot restore uses the complete saved configuration and preserves the current
 Team identity. It requires the exact returned snapshot ID, publishes only the
 accepted save response, and never checks out Git or changes running tasks.

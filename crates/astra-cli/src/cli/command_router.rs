@@ -772,6 +772,8 @@ fn team_run_chat_args(run: &TeamRunArgs, message: String) -> ChatArgs {
     chat.json = run.json;
     chat.no_resume = run.no_resume;
     chat.stream_events = run.stream_events.clone();
+    chat.explain = run.explain;
+    chat.max_wall_time_seconds = run.max_wall_time_seconds;
     chat
 }
 
@@ -784,7 +786,7 @@ mod team_run_capture_tests {
     #[test]
     fn team_run_projection_preserves_existing_chat_capture_controls() {
         let Command::Team(args) = parse_team_bridge_command(
-            "run dev --lead-agent-id lead --json --no-resume --stream-events events.jsonl task",
+            "run dev --lead-agent-id lead --json --no-resume --stream-events events.jsonl --explain=verbose --max-wall-time-seconds 90 task",
         )
         .expect("Team command") else {
             panic!("Team command")
@@ -797,9 +799,20 @@ mod team_run_capture_tests {
         assert!(chat.json);
         assert!(chat.no_resume);
         assert_eq!(
+            chat.explain,
+            Some(crate::cli::session::session_state::ExplainMode::Verbose)
+        );
+        assert_eq!(chat.max_wall_time_seconds, Some(90));
+        assert_eq!(
             chat.stream_events.as_deref(),
             Some(Path::new("events.jsonl"))
         );
+        for (budget, valid) in [("0", false), ("70", false), ("71", true)] {
+            let parsed = parse_team_bridge_command(&format!(
+                "run dev --max-wall-time-seconds {budget} task"
+            ));
+            assert_eq!(parsed.is_ok(), valid, "wall budget {budget}");
+        }
     }
 }
 

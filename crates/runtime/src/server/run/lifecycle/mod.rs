@@ -10341,6 +10341,9 @@ impl AgenticRunLifecycleService {
             snapshot.registry(user_id).map_err(|error| {
                 error_response_coded(StatusCode::BAD_REQUEST, error, "agent_profile_invalid")
             })?;
+            for profile in &snapshot.profiles {
+                Self::agent_profile_context(profile)?;
+            }
             if let Some(lead_id) = snapshot.lead_agent_id.as_ref() {
                 let lead = snapshot
                     .profiles
@@ -12054,6 +12057,60 @@ impl AgenticRunLifecycleService {
         );
     }
 
+    fn agent_profile_context(
+        profile: &AgentProfile,
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        let Some(context) = profile.metadata.get("team_context") else {
+            return Ok(None);
+        };
+        let context = context.as_object().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "Admitted agent profile context must be an object of text facts",
+                "agent_profile_context_invalid",
+            )
+        })?;
+        if context.values().any(|value| !value.is_string()) {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "Admitted agent profile context must contain text facts",
+                "agent_profile_context_invalid",
+            ));
+        }
+        if context.is_empty() {
+            return Ok(None);
+        }
+        // The admitted profile already freezes these facts. Keep them out of
+        // instructions and runtime identities out of the reusable payload.
+        let context: std::collections::BTreeMap<_, _> = context.iter().collect();
+        let text = json!({
+            "schema": "agent_profile_context.v1",
+            "team": profile.metadata.get("team_name"),
+            "context": context,
+        })
+        .to_string();
+        if text.len() > AGENT_BINDING_TURN_CONTEXT_MAX_BYTES
+            || crate::prompts::estimate_str_tokens(&text) > AGENT_BINDING_TURN_CONTEXT_MAX_TOKENS
+        {
+            return Err(error_response_coded(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Admitted agent profile context exceeds the supported prompt budget",
+                "agent_profile_context_too_large",
+            ));
+        }
+        Ok(Some(text))
+    }
+
+    fn append_agent_profile_context(
+        edge_profile: &mut Map<String, Value>,
+        profile: &AgentProfile,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let Some(text) = Self::agent_profile_context(profile)? {
+            Self::append_runtime_required_prompt_text(edge_profile, text);
+        }
+        Ok(())
+    }
+
     fn append_runtime_stable_prompt_text(edge_profile: &mut Map<String, Value>, text: String) {
         Self::append_runtime_prompt_text(
             edge_profile,
@@ -12222,9 +12279,11 @@ impl AgenticRunLifecycleService {
                     .iter()
                     .find(|profile| &profile.agent_id == id)
             })
-            && let Some(prompt) = lead.system_prompt.as_ref()
         {
-            Self::append_runtime_stable_prompt_text(edge_profile, prompt.clone());
+            if let Some(prompt) = lead.system_prompt.as_ref() {
+                Self::append_runtime_stable_prompt_text(edge_profile, prompt.clone());
+            }
+            Self::append_agent_profile_context(edge_profile, lead)?;
         }
         let turn_context_section = match (agent_binding_context, request_context) {
             (Some(_), Some(context)) => Self::agent_binding_turn_context_section(context)?,
@@ -24515,6 +24574,11 @@ impl ServerSubRunExecutor {
                 Value::String(prompt.clone()),
             );
         }
+        AgenticRunLifecycleService::append_agent_profile_context(
+            &mut edge_profile,
+            &config.agent_profile,
+        )
+        .map_err(|(_, Json(error))| error.detail)?;
         if let Some(model) = &child_model_name {
             edge_profile.insert("model".to_string(), Value::String(model.clone()));
         }
