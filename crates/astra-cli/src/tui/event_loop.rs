@@ -173,6 +173,10 @@ async fn restore_login_identity_services(
 /// reaches the workbench, so the UI decides how to present an empty result,
 /// a load failure, or an interactive view without parsing display strings.
 enum SlashBackgroundReadEffect {
+    Team {
+        result: Result<Vec<crate::cli::slash::slash_team::Team>, String>,
+        detail: bool,
+    },
     Clipboard {
         success_message: String,
         result: Result<(), String>,
@@ -1325,6 +1329,13 @@ fn dispatch_slash_background_read(
 ) {
     tasks.spawn(async move {
         let effect = match action {
+            slash_dispatch::SlashBackgroundRead::Team { api, profile, name } => {
+                let store = crate::cli::http_team_store::HttpTeamStore::new(&api, profile.as_deref());
+                SlashBackgroundReadEffect::Team {
+                    result: crate::cli::slash::slash_team::load_team_configurations(&store, "", name.as_deref()).await,
+                    detail: name.is_some(),
+                }
+            }
             slash_dispatch::SlashBackgroundRead::Clipboard {
                 text,
                 success_message,
@@ -1820,6 +1831,50 @@ fn apply_slash_background_read_effect(
     chat_widget: &mut chat_widget::ChatWidget,
 ) {
     match effect {
+        SlashBackgroundReadEffect::Team { result, detail } => match result {
+            Ok(teams) if detail || teams.is_empty() => {
+                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                    "Opened Team configuration",
+                ));
+                bottom_pane.push_view(Box::new(
+                    crate::tui::bottom_pane::info_view::InfoView::from_plain(
+                        "Team configuration",
+                        crate::cli::slash::slash_team::team_configuration_lines(&teams),
+                    ),
+                ));
+            }
+            Ok(teams) => {
+                use crate::tui::bottom_pane::list_selection_view::{
+                    ListSelectionView, SelectionItem,
+                };
+                let items = teams
+                    .iter()
+                    .map(|team| SelectionItem {
+                        name: team.name.clone(),
+                        description: Some(format!(
+                            "{} · {} members",
+                            team.description,
+                            team.members.len()
+                        )),
+                        is_current: false,
+                    })
+                    .collect();
+                let results = teams
+                    .into_iter()
+                    .map(|team| {
+                        crate::tui::bottom_pane::view::ViewResult::TeamConfiguration(Box::new(team))
+                    })
+                    .collect();
+                bottom_pane.push_view(Box::new(
+                    ListSelectionView::new(items, Some("Teams · configuration".into()))
+                        .with_results(results)
+                        .with_footer_hint("Type to filter · Enter inspect · Esc back"),
+                ));
+                chat_widget
+                    .commit_system(history_cell::system::SystemCell::response("Opened Teams"));
+            }
+            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
+        },
         SlashBackgroundReadEffect::Clipboard {
             success_message,
             result,
@@ -11566,7 +11621,24 @@ pub(crate) async fn run_tui_session(
                                         client_id: &tui_client_id,
                                         pending_work_retries: &mut pending_work_retries,
                                     };
-                                    let _ = slash_dispatch::dispatch(&cmd, &mut dctx).await;
+                                    if let slash_dispatch::SlashResult::BackgroundRead(action) =
+                                        slash_dispatch::dispatch(&cmd, &mut dctx).await
+                                    {
+                                        if let slash_dispatch::SlashBackgroundRead::WorkContinue {
+                                            request_id, ..
+                                        } = action.as_ref() {
+                                            settled_work_continue_requests.remove(request_id);
+                                        }
+                                        slash_background_read_count += 1;
+                                        dispatch_slash_background_action(
+                                            *action,
+                                            slash_background_read_generation,
+                                            slash_background_read_tx.clone(),
+                                            work_continue_progress_tx.clone(),
+                                            &mut slash_background_read_tasks,
+                                            &mut work_continue_tasks,
+                                        );
+                                    }
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     // Generic reopen path: same rationale
                                     // as the Agents branch above.
@@ -19961,6 +20033,120 @@ mod tests {
                 ..
             }) if text == "Cannot reach server — check connection"
         ));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn team_browser_reads_once_and_inspects_without_changing_execution() {
+        use astra_credentials::{CredentialsFile, Profile};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _creds = crate::tests::isolate_credentials();
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some("test-token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let server = MockServer::start().await;
+        let definition = serde_json::json!({
+            "team_id": "team-1", "user_id": "owner-1", "name": "Product team",
+            "description": "Ship a small feature", "members": [],
+            "context": {}, "created_at": "2026-10-05", "updated_at": "2026-10-05"
+        });
+        for (endpoint, status, body) in [
+            (
+                "/teams",
+                200,
+                serde_json::json!({"teams": [definition.clone()]}),
+            ),
+            ("/teams/Product%20team", 200, definition),
+            (
+                "/teams/missing",
+                404,
+                serde_json::json!({"error": "not found"}),
+            ),
+            (
+                "/teams/offline",
+                503,
+                serde_json::json!({"error": "unavailable"}),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some("parent-model".into());
+        for name in [None, Some("Product team"), Some("missing"), Some("offline")] {
+            let mut pane = BottomPane::new();
+            let mut widget = chat_widget::ChatWidget::new("session-team");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let mut tasks = tokio::task::JoinSet::new();
+            dispatch_slash_background_read(
+                slash_dispatch::SlashBackgroundRead::Team {
+                    api: api.clone(),
+                    profile: None,
+                    name: name.map(str::to_owned),
+                },
+                7,
+                tx,
+                &mut tasks,
+            );
+            let completion = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completion.generation, 7);
+            apply_slash_background_read_effect(completion.effect, &mut pane, &mut widget);
+            tasks.join_next().await.unwrap().unwrap();
+            if matches!(name, Some("missing" | "offline")) {
+                assert!(!pane.has_active_view());
+                assert!(matches!(
+                    widget.history()[0].to_persist(),
+                    Some(crate::tui::turn_event::TurnEvent::System {
+                        level: crate::tui::turn_event::SystemLevel::Error,
+                        ..
+                    })
+                ));
+                continue;
+            }
+            if name.is_none() {
+                assert!(render_bottom_pane_text(&pane, 60, 15).contains("Product team"));
+                let BottomPaneAction::ViewCompleted {
+                    result: Some(result),
+                    ..
+                } = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                else {
+                    panic!("Enter should inspect the selected definition")
+                };
+                assert!(matches!(&result,
+                    crate::tui::bottom_pane::view::ViewResult::TeamConfiguration(team)
+                    if team.team_id == "team-1"));
+                slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
+            }
+            let rendered = render_bottom_pane_text(&pane, 80, 24);
+            assert!(rendered.contains("not live execution status"), "{rendered}");
+            assert!(rendered.contains("Draft"), "{rendered}");
+            assert!(rendered.contains("astra team add-member"), "{rendered}");
+            assert!(!rendered.contains("Start:"), "an empty draft cannot run");
+            assert_eq!(state.model.as_deref(), Some("parent-model"));
+            if name.is_none() {
+                assert!(matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                    BottomPaneAction::ViewCompleted { result: None, reopen: Some(command) }
+                    if command == "/team"
+                ));
+            }
+        }
+        server.verify().await;
     }
 
     #[test]

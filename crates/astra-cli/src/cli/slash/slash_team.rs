@@ -152,6 +152,92 @@ fn team_member_description(member: &TeamMember) -> String {
         .unwrap_or_else(|| format!("{} agent", member.role))
 }
 
+/// Configuration observations, not execution or completion evidence.
+pub(crate) async fn load_team_configurations(
+    store: &dyn TeamPersistenceService,
+    user_id: &str,
+    name: Option<&str>,
+) -> Result<Vec<Team>, String> {
+    match name {
+        Some(name) => store
+            .load_team(user_id, name)
+            .await?
+            .map(|team| vec![team])
+            .ok_or_else(|| format!("Team '{name}' not found")),
+        None => store.list_teams(user_id).await,
+    }
+}
+
+pub(crate) fn team_configuration_lines<'a>(
+    teams: impl IntoIterator<Item = &'a Team>,
+) -> Vec<String> {
+    let mut teams = teams.into_iter().peekable();
+    let mut lines = vec!["Team definitions · not live execution status".into()];
+    if teams.peek().is_none() {
+        lines.push("No teams defined. Create one with astra team create <name>.".into());
+    }
+    for team in teams {
+        lines.push(String::new());
+        lines.push(format!("{} · {}", team.name, team.description));
+        lines.push(format!("Updated: {}", team.updated_at));
+        if team.members.is_empty() {
+            lines.push("Draft · add members before starting a task.".into());
+        }
+        for member in &team.members {
+            let profile = astra_services::team_persistence::resolve_member_to_profile(member, team);
+            lines.push(format!(
+                "{} [{}] · {}",
+                member.role,
+                profile.agent_id,
+                team_member_description(member)
+            ));
+            lines.push(format!(
+                "  Can delegate: {} · read-only: {} · max depth: {}",
+                member.can_delegate, member.read_only, profile.max_delegation_depth
+            ));
+            lines.push(format!(
+                "  Configured model: {}",
+                member
+                    .model_selection
+                    .as_ref()
+                    .map(|model| model.offering_id.as_str())
+                    .unwrap_or("inherit parent")
+            ));
+            if let Some(tools) = &member.allow_tools {
+                lines.push(format!(
+                    "  Allowed tools: {}",
+                    if tools.is_empty() {
+                        "none".into()
+                    } else {
+                        tools.join(", ")
+                    }
+                ));
+            }
+            if !member.skills.is_empty() {
+                lines.push(format!("  Skills: {}", member.skills.join(", ")));
+            }
+            if !member.mcp_servers.is_empty() {
+                lines.push(format!(
+                    "  MCP selection: {} (unsupported at run admission)",
+                    member.mcp_servers.join(", ")
+                ));
+            }
+        }
+        let mut context: Vec<_> = team.context.iter().collect();
+        context.sort_by(|left, right| left.0.cmp(right.0));
+        for (key, value) in context {
+            lines.push(format!("  {key} = {}", truncate_str(value, 60)));
+        }
+        let name = shell_words::quote(&team.name);
+        lines.push(if team.members.is_empty() {
+            format!("Next: astra team add-member {name} <role>")
+        } else {
+            format!("Start: /team run {name} <task>")
+        });
+    }
+    lines
+}
+
 // ── Slash Command Handler ───────────────────────────────────────────────
 
 pub(crate) async fn handle_team_command(
@@ -169,9 +255,7 @@ pub(crate) async fn handle_team_command(
             .ingestion_user_id
             .clone()
             .unwrap_or_else(|| "local".into());
-        let teams = state
-            .team_store
-            .list_teams(&user_id)
+        let teams = load_team_configurations(state.team_store.as_ref(), &user_id, None)
             .await
             .map_err(|error| format!("failed to hydrate teams: {error}"))?;
         state.team_registry.merge_from_store(teams);
@@ -179,97 +263,12 @@ pub(crate) async fn handle_team_command(
     }
 
     match args.command {
-        None => {
+        None | Some(TeamSubcommand::List) => {
             eprintln!(
-                "\n{}",
-                "─── Team ───────────────────────────────────────"
-                    .bold()
-                    .magenta()
+                "{}",
+                team_configuration_lines(state.team_registry.list()).join("\n")
             );
-            let teams = state.team_registry.list();
-            let names = teams
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!(
-                "  {:<16} {}",
-                "teams:".dim(),
-                if names.is_empty() {
-                    "(none)".dim().to_string()
-                } else {
-                    names.magenta().to_string()
-                }
-            );
-            eprintln!(
-                "  {:<16} {}",
-                "built-ins:".dim(),
-                "owner-scoped team service".magenta()
-            );
-            eprintln!();
-            eprintln!("  {}", team_subcommands_hint().dim());
-            eprintln!("  {}", "Examples:".dim());
-            eprintln!("    {}", "/team info review".magenta());
-            eprintln!(
-                "    {}",
-                "/team run review --lead-agent-id team-review-reviewer review the latest diff"
-                    .magenta()
-            );
-            eprintln!("    {}", "/team snapshot dev before-refactor".magenta());
-            eprintln!();
-        }
-
-        Some(TeamSubcommand::List) => {
-            let teams = state.team_registry.list();
-            if teams.is_empty() {
-                eprintln!(
-                    "  {}",
-                    "No teams defined. Use /team create <name> <description>".dim()
-                );
-                return Ok(());
-            }
-            eprintln!(
-                "\n{}",
-                "─── Teams ───────────────────────────────────────────────"
-                    .bold()
-                    .magenta()
-            );
-            for t in &teams {
-                eprintln!(
-                    "\n  {} {}",
-                    t.name.as_str().magenta().bold(),
-                    format!("({})", t.description).dim()
-                );
-                if t.members.is_empty() {
-                    eprintln!("    {}", "No members. Use /team add-member".dim());
-                } else {
-                    for m in &t.members {
-                        let agent_id =
-                            astra_services::team_persistence::resolve_member_to_profile(m, t)
-                                .agent_id;
-                        eprintln!(
-                            "    {} {} [{}] {}",
-                            "•".dim(),
-                            m.role.as_str().green(),
-                            agent_id.dim(),
-                            format!("— {}", team_member_description(m)).dim()
-                        );
-                    }
-                }
-                if !t.context.is_empty() {
-                    eprintln!(
-                        "    {} shared keys: {}",
-                        "📎".to_string().dim(),
-                        t.context
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                            .dim()
-                    );
-                }
-            }
-            eprintln!();
+            eprintln!("{}", team_subcommands_hint());
         }
 
         Some(TeamSubcommand::Create(command)) => {
@@ -381,51 +380,14 @@ pub(crate) async fn handle_team_command(
         }
 
         Some(TeamSubcommand::Info(command)) => {
-            let name = command.name.as_str();
-            if name.is_empty() {
-                return Err("Usage: /team info <name>".into());
-            }
-            match state.team_registry.get(name) {
-                Some(t) => {
-                    eprintln!(
-                        "\n  {} {}",
-                        "Team:".bold(),
-                        t.name.as_str().magenta().bold()
-                    );
-                    eprintln!("  {} {}", "Description:".dim(), t.description);
-                    eprintln!("  {} {}", "Created:".dim(), t.created_at);
-                    eprintln!("\n  {}", "Members:".bold());
-                    for m in &t.members {
-                        let agent_id =
-                            astra_services::team_persistence::resolve_member_to_profile(m, t)
-                                .agent_id;
-                        eprintln!(
-                            "    {} {} [{}] — {}",
-                            "•".dim(),
-                            m.role.as_str().green(),
-                            agent_id.dim(),
-                            team_member_description(m)
-                        );
-                        if !m.skills.is_empty() {
-                            eprintln!("      {} {}", "Skills:".dim(), m.skills.join(", "));
-                        }
-                        if let Some(ref model) = m.model_selection {
-                            eprintln!("      {} {}", "Offering:".dim(), model.offering_id);
-                        }
-                    }
-                    if !t.context.is_empty() {
-                        eprintln!("\n  {}", "Shared Context:".bold());
-                        for (k, v) in &t.context {
-                            let preview = truncate_str(v, 60);
-                            eprintln!("    {} = {}", k.as_str().magenta(), preview);
-                        }
-                    }
-                    eprintln!();
-                }
-                None => {
-                    return Err(format!("Team '{name}' not found"));
-                }
-            }
+            let team = state
+                .team_registry
+                .get(&command.name)
+                .ok_or_else(|| format!("Team '{}' not found", command.name))?;
+            eprintln!(
+                "{}",
+                team_configuration_lines(std::iter::once(team)).join("\n")
+            );
         }
 
         Some(TeamSubcommand::Delete(command)) => {

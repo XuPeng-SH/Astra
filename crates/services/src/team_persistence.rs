@@ -72,7 +72,7 @@ fn team_cursor_required_id(
 
 /// Persistent team definition stored in MatrixOne.
 ///
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamDefinition {
     pub team_id: String,
     pub user_id: String,
@@ -87,7 +87,7 @@ pub struct TeamDefinition {
 /// Lightweight member declaration within a team.
 ///
 /// Resolved to a full [`AgentProfile`] at execution time via [`resolve_member_to_profile`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeamMemberDef {
     pub role: String,

@@ -81,6 +81,11 @@ impl SlashResult {
 /// can complete after the user keeps composing without borrowing UI state
 /// across a network wait.
 pub(crate) enum SlashBackgroundRead {
+    Team {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        name: Option<String>,
+    },
     Clipboard {
         text: String,
         success_message: String,
@@ -361,8 +366,32 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
     match resolved {
         "/team" => {
-            ctx.show_info("Use /team run <team> --lead-agent-id <agent_id> <task>. Configure teams with astra team.".to_string());
-            SlashResult::Handled
+            let parsed = crate::cli::command_router::parse_team_bridge_command(args);
+            match parsed {
+                Ok(crate::cli::cli_config::cli_args::Command::Team(command)) => {
+                    let name = match command.command {
+                        None | Some(crate::cli::cli_config::cli_args::TeamSubcommand::List) => None,
+                        Some(crate::cli::cli_config::cli_args::TeamSubcommand::Info(command)) => {
+                            Some(command.name)
+                        }
+                        _ => {
+                            ctx.show_info("Use /team run <team> <task> to start work. Configuration changes currently use astra team; /team list and /team info are available here.".into());
+                            return SlashResult::Handled;
+                        }
+                    };
+                    ctx.show_response("Loading Team configuration…".into());
+                    SlashResult::background_read(SlashBackgroundRead::Team {
+                        api: ctx.api.clone(),
+                        profile: ctx.profile.map(str::to_string),
+                        name,
+                    })
+                }
+                Err(error) => {
+                    ctx.show_error(error);
+                    SlashResult::Handled
+                }
+                Ok(_) => unreachable!("the Team parser only returns Team commands"),
+            }
         }
         // ── Exit ────────────────────────────────────────────────────
         "/exit" => SlashResult::Exit,
@@ -1657,6 +1686,17 @@ pub(crate) fn handle_view_result(
                     ],
                 )
                 .with_reopen("/memory"),
+            ));
+        }
+        ViewResult::TeamConfiguration(team) => {
+            bottom_pane.push_view(Box::new(
+                crate::tui::bottom_pane::info_view::InfoView::from_plain(
+                    &team.name,
+                    crate::cli::slash::slash_team::team_configuration_lines(std::iter::once(
+                        team.as_ref(),
+                    )),
+                )
+                .with_reopen("/team"),
             ));
         }
         ViewResult::InsertCommand(command) => {

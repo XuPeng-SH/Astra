@@ -62,6 +62,12 @@ configuration, and standalone commands must return a failing exit status.
 Native configuration commands carry typed arguments to this owner rather than
 rendering a command string and parsing it again. Names, context keys, and literal
 descriptions retain their parsed identity; listing is not a help operation.
+The TUI's `/team` and `/team list` open a searchable configuration picker;
+`/team info <name>` inspects one exact definition. Both use the same persistence
+reader as CLI configuration. Inspecting a picker row reuses its loaded definition
+without another read or changing the active agent. These are configuration
+observations, not live execution status. Configuration editing still uses native
+CLI commands; the picker does not yet implement the complete workbench below.
 Team execution remains with ordinary Chat, not the configuration command owner.
 Snapshot restore uses the complete saved configuration and preserves the current
 Team identity. It requires the exact returned snapshot ID, publishes only the

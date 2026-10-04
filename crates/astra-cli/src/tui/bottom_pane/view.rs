@@ -67,6 +67,8 @@ pub(crate) enum ViewResult {
         cursor: astra_thin_client::WorkCatalogCursorV1,
     },
     InsertCommand(String),
+    /// Inspect the loaded definition without a second read or execution change.
+    TeamConfiguration(Box<astra_services::team_persistence::TeamDefinition>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
