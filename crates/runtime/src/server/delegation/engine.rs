@@ -966,7 +966,7 @@ async fn reconcile_agent_result_with_durable_authority(
     let durable = match run_engine.load_run(user_id, &result.run_id).await {
         Ok(Some(durable)) => durable,
         Ok(None) => {
-            result.status = STATUS_FAILED.to_string();
+            result.status = STATUS_WAITING.to_string();
             result.output = None;
             result.error = Some(format!(
                 "{persistence_detail}; durable run {} is missing",
@@ -975,7 +975,7 @@ async fn reconcile_agent_result_with_durable_authority(
             return (result, None);
         }
         Err(load_error) => {
-            result.status = STATUS_FAILED.to_string();
+            result.status = STATUS_WAITING.to_string();
             result.output = None;
             result.error = Some(format!(
                 "{persistence_detail}; failed to load durable winner for run {}: {load_error}",
@@ -2897,6 +2897,7 @@ impl DelegationEngine {
             &parent_run,
             &request.user_id,
         )?;
+        parent_profile_authority.require_delegation()?;
         let mut execution = self.clone();
         if let Some(snapshot) = admitted_agent_profiles.as_ref() {
             let registry = snapshot.registry(&request.user_id)?;
@@ -2910,7 +2911,7 @@ impl DelegationEngine {
                         .get(profile_id)
                         .ok_or("admitted parent profile is missing")?,
                 ),
-                ParentProfileAuthority::Unbound => {
+                ParentProfileAuthority::Unbound | ParentProfileAuthority::NonDelegating { .. } => {
                     return Err("admitted roster requires parent profile authority".into());
                 }
             };
@@ -3348,6 +3349,7 @@ impl DelegationEngine {
                 Ok((result, frontier))
             };
             spawner.supervise_child(
+                None,
                 &instance_id, parent, execution, settlement, delegated_spawn_projection, Some(cancellation),
             ).await.map(|(receipt, _)| receipt).map_err(|error| error.to_string())
         }.await;
@@ -4284,9 +4286,11 @@ impl DelegationEngine {
         } else {
             Self::delegation_chain_for_child(request, agent_id)?
         };
-        let profile_authority = match parent_profile_authority {
-            ParentProfileAuthority::Unbound => ParentProfileAuthority::Unbound,
-            _ => parent_profile_authority.for_child(agent_id)?,
+        let profile_authority = ParentProfileAuthority::NonDelegating {
+            authority: Box::new(match parent_profile_authority {
+                ParentProfileAuthority::Unbound => ParentProfileAuthority::Unbound,
+                _ => parent_profile_authority.for_child(agent_id)?,
+            }),
         };
         drop(reg);
 
@@ -6656,6 +6660,9 @@ mod tests {
             profile.allow_tools = Some(vec!["read_file".into(), "write_file".into()]);
             profile.skill_filter = vec!["analysis".into()];
             profile.read_only = true;
+            profile.can_delegate = true;
+            profile.max_delegation_depth = 4;
+            profile.delegate_to = vec!["outside".into()];
             profile.initial_turns = Some(2);
             profile.max_turns = Some(5);
             registry.write().await.register(profile.clone()).unwrap();
@@ -6684,6 +6691,14 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+            };
+            let is_fork = matches!(&pattern, CoordinationPattern::Fork { .. });
+            let expected_child_authority = if is_fork {
+                ParentProfileAuthority::NonDelegating {
+                    authority: Box::new(expected_child_authority),
+                }
+            } else {
+                expected_child_authority
             };
             let mut request = fan_out_request(vec!["coder"]);
             request.pattern = pattern;
@@ -6813,6 +6828,16 @@ mod tests {
                     .unwrap(),
                     Some(snapshot.clone())
                 );
+                if is_fork {
+                    for inherited_prefix in [false, true] {
+                        crate::orchestration::agent_tool::tests::assert_restricted_child_handlers(
+                            &child,
+                            inherited_prefix,
+                            "outside",
+                        )
+                        .await;
+                    }
+                }
                 let start = child
                     .events
                     .iter()
@@ -7347,6 +7372,57 @@ mod tests {
         let de =
             DelegationEngine::with_executor(reg.clone(), engine.clone(), tracker.clone(), executor);
         (reg, engine, tracker, de)
+    }
+
+    #[tokio::test]
+    async fn lost_child_receipt_preserves_unknown_durable_outcome() {
+        use crate::server::run::lifecycle::tests::FaultInjectedRunStateStore;
+
+        for read_fails in [false, true] {
+            for receipt_closed in [false, true] {
+                let (registry, _, tracker) = setup();
+                let store = FaultInjectedRunStateStore::new(&[], &[]);
+                let store = if read_fails {
+                    store.with_failed_load_run_call(1)
+                } else {
+                    store
+                };
+                let engine = Arc::new(RunEngine::new(Arc::new(store)));
+                let de = bind_test_engine(&DelegationEngine::with_executor(
+                    registry,
+                    engine,
+                    tracker,
+                    Arc::new(EchoExecutor),
+                ));
+                let parent = de.spawner.as_ref().unwrap().fanout_parent("parent");
+                let (sender, receipt) = tokio::sync::oneshot::channel();
+                if receipt_closed {
+                    drop(sender);
+                } else {
+                    sender
+                        .send((Err(("settlement panicked".into(), Some("panic"))), 0))
+                        .unwrap();
+                }
+                let result = de
+                    .collect_supervised_subrun(
+                        "worker".into(),
+                        "unknown-child".into(),
+                        Ok(receipt),
+                        parent,
+                        "u",
+                        "s",
+                    )
+                    .await;
+                assert_eq!(result.status, STATUS_WAITING);
+                assert!(result.is_unfinished());
+                assert!(result.output.is_none());
+                assert!(result.error.as_deref().unwrap().contains(if read_fails {
+                    "failed to load durable winner"
+                } else {
+                    "is missing"
+                }));
+            }
+        }
     }
 
     #[tokio::test]
@@ -10022,47 +10098,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_children_cannot_delegate() {
-        /// Executor that checks can_delegate is false on fork children.
-        struct DelegateCheckExecutor;
-
-        #[async_trait]
-        impl SubRunExecutor for DelegateCheckExecutor {
-            async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
-                let can_del = config.agent_profile.can_delegate;
-                let depth = config.agent_profile.max_delegation_depth;
-                Ok((
-                    AgentResult {
-                        agent_id: config.agent_profile.agent_id,
-                        run_id: config.run_id,
-                        status: "completed".to_string(),
-                        output: Some(format!("can_delegate={can_del},depth={depth}")),
-                        error: None,
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    },
-                    None,
-                ))
-            }
-        }
-
-        let (reg, engine, tracker) = setup();
-        let de =
-            DelegationEngine::with_executor(reg, engine, tracker, Arc::new(DelegateCheckExecutor));
-
-        let req = fork_request("del-fork-deleg", vec!["task-a"], "writer");
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            result.agent_results[0].output.as_deref(),
-            Some("can_delegate=false,depth=0")
-        );
-    }
-
-    #[tokio::test]
     async fn fork_partial_failure() {
         let executor = Arc::new(FailingExecutor {
             fail_agents: vec!["writer".to_string()],
@@ -10906,7 +10941,8 @@ mod tests {
         )
         .await
         .0;
-        assert_eq!(result.status, STATUS_FAILED);
+        assert_eq!(result.status, STATUS_WAITING);
+        assert!(result.is_unfinished());
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while transport.retained_inbox_count().await != 2 {
@@ -11389,6 +11425,7 @@ mod tests {
 
         struct PrefixExecutor {
             model: &'static str,
+            run_engine: Arc<RunEngine>,
             inherited: Arc<std::sync::Mutex<Vec<bool>>>,
         }
         #[async_trait]
@@ -11418,6 +11455,22 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(config.inherited_prefix.is_some());
+                if matches!(
+                    config.profile_authority,
+                    ParentProfileAuthority::NonDelegating { .. }
+                ) {
+                    let child = self
+                        .run_engine
+                        .load_run(&config.user_id, &config.run_id)
+                        .await?
+                        .unwrap();
+                    crate::orchestration::agent_tool::tests::assert_restricted_child_handlers(
+                        &child,
+                        config.inherited_prefix.is_some(),
+                        "coder",
+                    )
+                    .await;
+                }
                 EchoExecutor.execute(config).await
             }
         }
@@ -11428,10 +11481,11 @@ mod tests {
                 let engine = bind_test_engine(
                     &DelegationEngine::with_executor(
                         registry,
-                        run_engine,
+                        run_engine.clone(),
                         tracker,
                         Arc::new(PrefixExecutor {
                             model,
+                            run_engine: run_engine.clone(),
                             inherited: inherited.clone(),
                         }),
                     )
