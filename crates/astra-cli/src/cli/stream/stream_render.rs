@@ -44,7 +44,8 @@ const STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES: usize = 64_000;
 const RELIABLE_STREAM_EVENT_RESERVE: usize = 2;
 
 fn approval_unavailable_tool_output(reason: &str) -> String {
-    let (redacted, _) = astra_tools::credential_redaction::redact_credentials_for_display(reason);
+    let (redacted, _) =
+        astra_text_utils::credential_redaction::redact_credentials_for_display(reason);
     let reason = astra_text_utils::str_preview::truncate_line(&redacted, 240);
     format!(
         "Operation not executed: {reason}. Approval is unavailable in this execution context. Use an operation within the permitted scope, or report this blocker to the parent/user."
@@ -2139,7 +2140,7 @@ impl<'a> CliSseStreamHost<'a> {
         duration_ms: u64,
     ) -> EdgeToolExecResult {
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         let typed_fields = tool_result_fields.as_ref();
         if self.callback_tool_belongs_to_foreground(request_id)
             && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
@@ -2915,11 +2916,11 @@ impl<'a> CliSseStreamHost<'a> {
         // output and extensible fields once before any side channel sees
         // them.
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         let mut tool_result_fields =
             self.tool_result_fields_with_cli_runtime(&req.tool, tool_result_fields);
         for value in tool_result_fields.values_mut() {
-            astra_tools::credential_redaction::redact_credentials_in_json(value);
+            astra_text_utils::credential_redaction::redact_credentials_in_json(value);
         }
 
         if self.callback_tool_belongs_to_foreground(&req.request_id)
@@ -3304,7 +3305,18 @@ impl CliSseStreamHost<'_> {
 
     async fn emit_stream_event(&self, event: chat_stream::StreamEvent) {
         if let Some(tx) = &self.stream_event_tx {
-            if tx.send(event.clone()).await.is_err() {
+            let cancelled = async {
+                match self.cancel_token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let sent = tokio::select! {
+                biased;
+                result = tx.send(event.clone()) => Some(result),
+                _ = cancelled => None,
+            };
+            if matches!(sent, Some(Err(_))) {
                 tracing::debug!("stream event receiver closed");
             }
         }
@@ -4707,12 +4719,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.try_emit_stream_event(chat_stream::StreamEvent::AgentCommunication(event));
     }
 
-    fn on_agent_live_event(&mut self, event: astra_turn_core::agent_live_event::AgentLiveEvent) {
-        self.try_emit_stream_event(chat_stream::StreamEvent::AgentLive(event));
+    async fn on_agent_live_event(
+        &mut self,
+        event: astra_turn_core::agent_live_event::AgentLiveEvent,
+    ) {
+        if !event.requires_ordered_delivery() {
+            self.try_emit_stream_event(chat_stream::StreamEvent::AgentLive(event));
+        } else {
+            self.emit_stream_event(chat_stream::StreamEvent::AgentLive(event))
+                .await;
+        }
     }
 
-    fn on_agent_live_gap(&mut self, gap: astra_turn_core::agent_live_event::AgentLiveGap) {
-        self.try_emit_stream_event(chat_stream::StreamEvent::AgentLiveGap(gap));
+    async fn on_agent_live_gap(&mut self, gap: astra_turn_core::agent_live_event::AgentLiveGap) {
+        self.emit_stream_event(chat_stream::StreamEvent::AgentLiveGap(gap))
+            .await;
     }
 
     fn on_server_tool_surface_admission(&mut self, tool: &str) -> Result<(), String> {
@@ -5634,7 +5655,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // callback request before the runtime's durable record pass.  Keep
         // those earlier lanes on the same executor-owned redacted value.
         let (sanitized_output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         output = sanitized_output;
         let status = if !allowed || tool_execution_marked_error {
             "failed"
@@ -10090,6 +10111,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_explain_analyze_fact_reaches_the_typed_stream_channel() {
+        let cancel = tokio_util::sync::CancellationToken::new();
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
@@ -10104,7 +10126,7 @@ mod tests {
             executor,
             render_policy: RenderPolicy::Silent,
             perm_manager: None,
-            cancel_token: None,
+            cancel_token: Some(&cancel),
             stream_event_tx: Some(tx),
             stream_event_sink: None,
             approval_request_tx: None,
@@ -10186,12 +10208,36 @@ mod tests {
             host.explain_analyze_observer_gap,
             "a dropped typed fact must retain an integrity marker outside the lossy queue"
         );
-        for _ in 0..8 {
-            assert!(matches!(
-                rx.recv().await,
-                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
-            ));
-        }
+        // Lifecycle facts must survive the same congestion that may sample
+        // Explain observations. Drain only after polling the terminal send.
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+        let terminal = AgentLiveEvent {
+            run_id: "child-run".into(),
+            agent_id: "child".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: AgentLiveTermination::Completed,
+                duration_ms: 10,
+                reason: None,
+            },
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(host.on_agent_live_event(terminal), async {
+                for _ in 0..8 {
+                    assert!(matches!(
+                        rx.recv().await,
+                        Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
+                    ));
+                }
+                assert!(
+                    matches!(rx.recv().await, Some(chat_stream::StreamEvent::AgentLive(event))
+                    if matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. }))
+                );
+            });
+        })
+        .await
+        .expect("child terminal survives the full renderer channel");
 
         host.last_bound_run_id = Some("run-1".into());
         for _ in 0..8 {
@@ -10373,6 +10419,25 @@ mod tests {
         )
         .await
         .expect("full TUI queue must not block final text capture");
+        while fill_tx
+            .try_send(chat_stream::StreamEvent::StatusLine("queued".into()))
+            .is_ok()
+        {}
+        let delivery = host.on_agent_live_gap(astra_turn_core::agent_live_event::AgentLiveGap {
+            run_id: "child-run".into(),
+            agent_id: "child".into(),
+            dropped_event_count: 1,
+        });
+        tokio::pin!(delivery);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+            .await
+            .expect("cancellation releases reliable delivery to an unread UI");
     }
 
     #[test]
