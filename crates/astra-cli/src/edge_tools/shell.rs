@@ -5936,6 +5936,7 @@ mod tests {
             .bash_outcome_with_cancel_async(
                 &args,
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    admission_deadline: None,
                     task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
@@ -5996,6 +5997,7 @@ mod tests {
                     "timeout": 5
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    admission_deadline: None,
                     task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
@@ -6077,6 +6079,7 @@ mod tests {
                     "timeout": 1
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    admission_deadline: None,
                     task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
@@ -6155,6 +6158,7 @@ mod tests {
                     "timeout": 5
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    admission_deadline: None,
                     task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),

@@ -9200,7 +9200,7 @@ mod tests {
         ));
         assert_eq!(
             detail.error.as_deref(),
-            Some("Needs continuation: The run reached its turn budget.")
+            Some("Needs continuation: The run reached its execution budget.")
         );
     }
 
@@ -9230,7 +9230,7 @@ mod tests {
         assert_eq!(detail.output_summary.as_deref(), Some("partial draft"));
         assert_eq!(
             detail.error.as_deref(),
-            Some("Needs continuation: The run reached its turn budget.")
+            Some("Needs continuation: The run reached its execution budget.")
         );
     }
 

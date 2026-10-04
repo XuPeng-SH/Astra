@@ -32,7 +32,6 @@ pub use astra_turn_core::orchestration_progress::{
     AgentProgressEmitter, AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
 };
 pub use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
-pub use astra_turn_core::orchestration_team_config::{AgentRegistry, AgentTypeConfig};
 pub use astra_turn_core::orchestration_types::CancellationOrigin;
 pub mod permission_sync {
     pub use astra_turn_core::permission::sync::*;

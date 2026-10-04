@@ -390,7 +390,8 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         state.final_text_streamed = false;
     }
     let started = Instant::now();
-    let remaining = host.execution_time_budget_remaining();
+    let time_budget = host.execution_time_budget_remaining();
+    let remaining = time_budget.map(|budget| budget.total_remaining);
     let authority_deadline = remaining.map(|remaining| tokio::time::Instant::now() + remaining);
     // Yielding a committed pause spends no synthesis allowance. Hard cancel
     // and actual execution authority still precede that nonterminal outcome.
@@ -441,11 +442,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         host.release_execution_capacity_for_wait();
         let requested_wait =
             observation_request.map(|request| Duration::from_millis(request.timeout_ms));
-        let authorized_wait = remaining.map(|remaining| {
-            remaining.saturating_sub(
-                astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET,
-            )
-        });
+        let authorized_wait = time_budget.map(|budget| budget.work_remaining);
         let wait_budget = match (requested_wait, authorized_wait) {
             (Some(requested), Some(authorized)) => Some(requested.min(authorized)),
             (requested, authorized) => requested.or(authorized),
@@ -6159,11 +6156,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 && !state.budget_wrapup_injected
                 && host
                     .execution_time_budget_remaining()
-                    .is_some_and(|remaining| {
-                        remaining.as_secs()
-                            <= astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-                                .as_secs()
-                    });
+                    .is_some_and(|remaining| !remaining.has_work());
             let run_deadline_stopped_safe_work = error.kind
                 == astra_core::ErrorKind::BudgetExhausted
                 || (error.kind == astra_core::ErrorKind::ProviderDeadline
@@ -10734,8 +10727,12 @@ mod tests {
             },
         });
         let wait_started = Arc::new(tokio::sync::Notify::new());
-        let mut host =
-            MockHost::new(vec![]).with_execution_time_budget_remaining(Duration::from_secs(45));
+        let mut host = MockHost::new(vec![]).with_execution_time_budget_remaining(
+            astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::from_secs(15),
+                total_remaining: Duration::from_secs(45),
+            },
+        );
         host.direct_child_owner = Some(Arc::clone(&owner));
         host.child_wait_started = Some(Arc::clone(&wait_started));
         let mut state = make_state();
@@ -10793,7 +10790,12 @@ mod tests {
             host.direct_child_owner = Some(Arc::clone(&owner));
             host.child_wait_started = Some(Arc::clone(&wait_started));
             if let Some(remaining) = remaining {
-                host = host.with_execution_time_budget_remaining(remaining);
+                host = host.with_execution_time_budget_remaining(
+                    astra_turn_types::ExecutionTimeRemaining {
+                        work_remaining: remaining.saturating_sub(Duration::from_secs(30)),
+                        total_remaining: remaining,
+                    },
+                );
             }
             let mut state = make_state();
             state.current_run_id = Some("parent-run".into());

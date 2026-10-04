@@ -23115,7 +23115,23 @@ impl ServerSubRunExecutor {
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| "durable sub-run parent has no ancestor root".to_string())?
         };
+        let execution_restrictions = config.request_constraints.durable_execution_restrictions(
+            config.execution_deadline,
+            (config.initial_turns.is_some() || config.max_turns.is_some()).then_some(
+                astra_services::runs::ExecutionBudget {
+                    initial_turns: config.initial_turns,
+                    hard_turn_limit: config.max_turns,
+                },
+            ),
+        );
         if let Some(existing) = existing {
+            if existing
+                .execution_restrictions()
+                .map_err(|error| error.to_string())?
+                != Some(execution_restrictions.clone())
+            {
+                return Err("durable sub-run retry changed its execution restrictions".into());
+            }
             if crate::server::run::engine::durable_run_profile_authority(
                 &existing,
                 &config.user_id,
@@ -23292,6 +23308,7 @@ impl ServerSubRunExecutor {
                     profile_authority: config.profile_authority.clone(),
                     interaction_mode: config.interaction_mode,
                     child_runtime_id: Some(config.agent_profile.agent_id.clone()),
+                    execution_restrictions: Some(execution_restrictions),
                     requested_model_policy: config.requested_model_policy.clone(),
                     generation_controls: Some(crate::server::run::engine::RunGenerationControls {
                         thinking: config.thinking.clone(),

@@ -177,14 +177,28 @@ enum PendingUserIntentCustody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingUserIntentTarget {
     ActiveRun,
-    AgentRun { run_id: String, agent_name: String },
+    AgentRun {
+        run_id: String,
+        agent_name: String,
+        attachment_epoch: u64,
+    },
 }
 
 fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatus) -> String {
-    if matches!(intent.target, PendingUserIntentTarget::ActiveRun)
-        && intent.custody == PendingUserIntentCustody::Unconfirmed
-    {
-        return "Guidance delivery uncertain · stable identity retained".to_string();
+    if intent.custody == PendingUserIntentCustody::Unconfirmed {
+        return match &intent.target {
+            PendingUserIntentTarget::ActiveRun => {
+                "Guidance delivery uncertain · stable identity retained".to_string()
+            }
+            PendingUserIntentTarget::AgentRun { agent_name, .. } => {
+                let phase = if intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote {
+                    "application"
+                } else {
+                    "delivery"
+                };
+                format!("Guidance {phase} unknown for {agent_name} · stable identity retained")
+            }
+        };
     }
     match (&intent.target, intent.status) {
         (
@@ -388,13 +402,18 @@ impl BottomPane {
         run_id: String,
         agent_name: String,
         text: String,
+        attachment_epoch: u64,
     ) -> bool {
         self.accept_user_intent_for_target(
             intent_id,
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             astra_turn_types::UserIntentStatus::AcceptedLocal,
             text,
-            PendingUserIntentTarget::AgentRun { run_id, agent_name },
+            PendingUserIntentTarget::AgentRun {
+                run_id,
+                agent_name,
+                attachment_epoch,
+            },
         )
         .is_ok()
     }
@@ -463,7 +482,6 @@ impl BottomPane {
     pub fn mark_user_intent_unconfirmed(&mut self, intent_id: &str) -> bool {
         let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
             intent.intent_id == intent_id
-                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
                 && matches!(
                     intent.custody,
                     PendingUserIntentCustody::Client | PendingUserIntentCustody::Run
@@ -506,10 +524,21 @@ impl BottomPane {
         self.pending_user_intents.remove(index)
     }
 
-    pub fn remove_agent_guide(&mut self, intent_id: &str) -> Option<PendingUserIntent> {
+    /// Claim one member intent in its original attachment. Mailbox receipts
+    /// additionally have to identify the exact run that observed the message.
+    pub fn remove_agent_guide(
+        &mut self,
+        intent_id: &str,
+        attachment_epoch: u64,
+        receiver_run_id: Option<&str>,
+    ) -> Option<PendingUserIntent> {
         let index = self.pending_user_intents.iter().position(|intent| {
             intent.intent_id == intent_id
-                && matches!(intent.target, PendingUserIntentTarget::AgentRun { .. })
+                && matches!(&intent.target,
+                    PendingUserIntentTarget::AgentRun { run_id, attachment_epoch: bound_epoch, .. }
+                        if *bound_epoch == attachment_epoch
+                            && receiver_run_id.is_none_or(|receiver| receiver == run_id)
+                )
         })?;
         self.pending_user_intents.remove(index)
     }
@@ -688,12 +717,16 @@ impl BottomPane {
         self.pending_user_intents.len()
     }
 
+    #[cfg(test)]
     fn has_pending_user_intents(&self) -> bool {
         !self.pending_user_intents.is_empty()
     }
 
     fn has_pending_composer_queue(&self) -> bool {
-        self.has_pending_user_intents() || !self.queued_next_turn_submissions.is_empty()
+        self.pending_user_intents
+            .iter()
+            .any(|intent| matches!(intent.target, PendingUserIntentTarget::ActiveRun))
+            || !self.queued_next_turn_submissions.is_empty()
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
@@ -2286,11 +2319,15 @@ impl BottomPane {
             .enumerate()
         {
             // Truncate by the actual column budget, not a hard-coded 100.
-            let status = match pending.status {
-                astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
-                astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
-                astra_turn_types::UserIntentStatus::Applied => "applied",
-                astra_turn_types::UserIntentStatus::Returned => "returned",
+            let status = if pending.custody == PendingUserIntentCustody::Unconfirmed {
+                "unknown"
+            } else {
+                match pending.status {
+                    astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
+                    astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
+                    astra_turn_types::UserIntentStatus::Applied => "applied",
+                    astra_turn_types::UserIntentStatus::Returned => "returned",
+                }
             };
             let prefix = format!("{}  {status} · ", idx + 1);
             let budget = area.width.saturating_sub(prefix.width() as u16) as usize;

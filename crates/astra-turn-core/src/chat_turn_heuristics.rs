@@ -18,7 +18,7 @@ const EXPLORATORY_ROUND_WINDOW: usize = 8;
 
 /// Maximum provider slice reserved for synthesizing a final answer after
 /// exploratory execution is closed by a wall-clock deadline.
-pub const PROVIDER_ACTION_CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
+pub const PROVIDER_ACTION_CONVERGENCE_BUDGET: Duration = astra_turn_types::FINAL_SYNTHESIS_TIME_CAP;
 
 /// Receipt/cleanup space after an Edge action. Process-backed actions must
 /// allow reaping and publishing a terminal receipt; direct callbacks need a
@@ -29,16 +29,9 @@ pub const DIRECT_ACTION_SETTLEMENT_GRACE: Duration = Duration::from_secs(5);
 /// Maximum command time still admissible under the run's immutable deadline.
 /// The caller retains the authority to reject a selected action whose declared
 /// or default timeout exceeds this allowance; this never shortens a command.
-pub fn action_command_window(remaining: Duration, settlement_grace: Duration) -> Duration {
-    remaining
-        .saturating_sub(PROVIDER_ACTION_CONVERGENCE_BUDGET)
-        .saturating_sub(settlement_grace)
+pub fn action_command_window(work_remaining: Duration, settlement_grace: Duration) -> Duration {
+    work_remaining.saturating_sub(settlement_grace)
 }
-
-/// A foreground child needs one ordinary provider-action window and its own
-/// final-answer window. Do not admit a child with less than both windows.
-pub const MIN_FOREGROUND_CHILD_EXECUTION_BUDGET: Duration =
-    Duration::from_secs(PROVIDER_ACTION_CONVERGENCE_BUDGET.as_secs() * 2);
 
 // Profiles select a useful initial slice and renewal step. The resolver uses
 // caller/administrator limits for the hard boundary, not these profile caps.
@@ -366,27 +359,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn action_window_reserves_final_answer_and_receipt_without_shortening_commands() {
+    fn action_window_reserves_receipt_from_the_already_partitioned_work_slice() {
         let process = PROCESS_ACTION_SETTLEMENT_GRACE;
         let direct = DIRECT_ACTION_SETTLEMENT_GRACE;
         assert_eq!(
-            action_command_window(Duration::from_secs(90), process),
+            action_command_window(Duration::from_secs(60), process),
             Duration::from_secs(30)
         );
         assert_eq!(
-            action_command_window(Duration::from_secs(89), process),
+            action_command_window(Duration::from_secs(59), process),
             Duration::from_secs(29)
         );
         assert_eq!(
-            action_command_window(Duration::from_secs(90), direct),
+            action_command_window(Duration::from_secs(60), direct),
             Duration::from_secs(55)
         );
         assert_eq!(
-            action_command_window(Duration::from_secs(35), direct),
+            action_command_window(Duration::from_secs(5), direct),
             Duration::ZERO
         );
         assert_eq!(
-            action_command_window(Duration::from_secs(34), direct),
+            action_command_window(Duration::from_secs(4), direct),
             Duration::ZERO
         );
     }

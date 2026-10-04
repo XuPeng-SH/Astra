@@ -1011,6 +1011,7 @@ mod tests {
         admission_source: Option<ToolInvocationAdmissionSource>,
     ) -> ToolInvocationMetadata<'a> {
         ToolInvocationMetadata {
+            admission_deadline: None,
             run_id: Some("run-1"),
             turn_chain_id: Some("turn-1"),
             tool_call_id: Some(call_id),

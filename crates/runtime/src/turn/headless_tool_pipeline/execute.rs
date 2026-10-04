@@ -62,6 +62,9 @@ pub(crate) async fn execute_tool_pure(
     permission_grant: Option<&crate::server::tool_execution_binding::ToolPermissionGrantSnapshot>,
     session_turn: u32,
     edge_round_present: bool,
+    runtime_control_kind: Option<
+        astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind,
+    >,
 ) -> crate::server::runtime_tool_executor::RuntimeToolDispatchControl {
     let mut dispatch_control =
         crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Continue;
@@ -87,6 +90,7 @@ pub(crate) async fn execute_tool_pure(
                             durable_dispatch_admission,
                             delegation_model_admission,
                             task_resolution_authority,
+                            runtime_control_kind,
                         )
                         .await;
                     dispatch_control = deferred.dispatch_control;
@@ -629,6 +633,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             .ctx
             .delegation_model_admissions
             .and_then(|admissions| admissions.get(&execution.id));
+        let runtime_control_kind = self
+            .ctx
+            .runtime_control_calls_by_id
+            .get(&execution.id)
+            .copied();
         let dispatch_control = execute_tool_pure(
             &mut execution,
             self.ctx.runtime_tool_executor,
@@ -644,6 +653,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             permission_grant.as_ref(),
             self.ctx.session_turn,
             !self.ctx.edge_tool_round.is_empty(),
+            runtime_control_kind,
         )
         .await;
 

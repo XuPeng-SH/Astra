@@ -424,6 +424,10 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
             .unwrap()
             .expect("typed restriction reader");
         assert_eq!(decoded.execution_deadline_unix_ms(), Some(601_000));
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap()["execution_work_deadline_unix_ms"],
+            571_000
+        );
         if mode == RunStartPersistenceMode::ClaimOrReplay {
             let mut replay = request.clone();
             replay.admitted_execution_deadline = Some(
@@ -503,6 +507,7 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
             "allow_skill_sources",
             "execution_budget",
             "execution_deadline_unix_ms",
+            "execution_work_deadline_unix_ms",
         ] {
             let mut incomplete = durable.clone();
             incomplete.events[0]["data"]["execution_restrictions"]
@@ -516,6 +521,21 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
         }
         unknown.events[0]["data"]["execution_restrictions"]["version"] = json!("future");
         assert!(unknown.execution_restrictions().is_err());
+        for (work, total) in [
+            (json!(null), json!(10)),
+            (json!(10), json!(null)),
+            (json!(11), json!(10)),
+        ] {
+            let mut invalid = durable.clone();
+            invalid.events[0]["data"]["execution_restrictions"]["execution_work_deadline_unix_ms"] =
+                work;
+            invalid.events[0]["data"]["execution_restrictions"]["execution_deadline_unix_ms"] =
+                total;
+            assert!(
+                invalid.execution_restrictions().is_err(),
+                "invalid phase cutoffs must not authorize reconstruction"
+            );
+        }
         let mut missing = durable;
         missing.events[0]["data"]
             .as_object_mut()
@@ -14609,6 +14629,76 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         .expect("durable child");
     assert_eq!(child.model_offering_id.as_deref(), Some("model-test-model"));
     assert_eq!(child.resolved_model_name.as_deref(), Some("test-model"));
+    let restrictions = child.execution_restrictions().unwrap().unwrap();
+    let stored = serde_json::to_value(&restrictions).unwrap();
+    assert_eq!(stored["execution_deadline_unix_ms"], Value::Null);
+    assert_eq!(stored["execution_work_deadline_unix_ms"], Value::Null);
+    for changed_lane in ["deadline", "capability", "round_budget"] {
+        let original_constraints = config.request_constraints.clone();
+        let original_turns = config.max_turns;
+        match changed_lane {
+            "deadline" => {
+                config.execution_deadline = Some(
+                    astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                        astra_services::runs::ExecutionTimeBudget {
+                            remaining_seconds: 48,
+                        },
+                        100_000,
+                    )
+                    .unwrap(),
+                )
+            }
+            "capability" => config.request_constraints.allowed_tools = Some(HashSet::new()),
+            "round_budget" => config.max_turns = Some(2),
+            _ => unreachable!(),
+        }
+        let error = executor
+            .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+            .await
+            .unwrap_err();
+        assert!(error.contains("changed its execution restrictions"));
+        config.execution_deadline = None;
+        config.request_constraints = original_constraints;
+        config.max_turns = original_turns;
+    }
+    config.run_id = "bounded-child-run".into();
+    config.execution_owner_generation = None;
+    let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+        astra_services::runs::ExecutionTimeBudget {
+            remaining_seconds: 48,
+        },
+        100_000,
+    )
+    .unwrap();
+    config.execution_deadline = Some(deadline);
+    let bounded = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    config.execution_owner_generation = Some(bounded.owner_generation);
+    for change_work in [false, true] {
+        let mut changed = deadline;
+        if change_work {
+            changed.work_deadline_unix_ms += 1;
+        } else {
+            changed.deadline_unix_ms += 1;
+        }
+        config.execution_deadline = Some(changed);
+        let error = executor
+            .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+            .await
+            .unwrap_err();
+        assert!(error.contains("changed its execution restrictions"));
+    }
+    config.execution_deadline = Some(deadline);
+    executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .unwrap();
+    config.run_id = "child-run".into();
+    config.execution_owner_generation = Some(authority.owner_generation);
+    config.execution_deadline = None;
     assert_eq!(
         crate::server::run::engine::durable_run_generation_controls(&child).unwrap(),
         crate::server::run::engine::RunGenerationControls {

@@ -153,7 +153,6 @@ pub(super) async fn build_runtime_wiring(
     Ok(RuntimeWiring {
         matrix_rt,
         run_lifecycle,
-        profile_registry,
         delegation_engine,
         team_store,
         resource_governor,

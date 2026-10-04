@@ -4472,6 +4472,7 @@ fn apply_tui_control_event(
     event: &TuiAppEvent,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
+    attachment_epoch: u64,
 ) -> UserIntentProjection {
     match event {
         TuiAppEvent::PermissionAutoApproved { tool, reason } => {
@@ -4533,7 +4534,7 @@ fn apply_tui_control_event(
             }
         }
         TuiAppEvent::AgentCommunication(event) => {
-            apply_agent_communication_event(event, bottom_pane, chat_widget);
+            apply_agent_communication_event(event, bottom_pane, chat_widget, attachment_epoch);
             UserIntentProjection::None
         }
         TuiAppEvent::AgentLive(event) => {
@@ -4541,7 +4542,7 @@ fn apply_tui_control_event(
                 astra_turn_core::agent_live_event::AgentLiveSignal::AgentCommunication(event),
             ) = &event.kind
             {
-                apply_agent_communication_event(event, bottom_pane, chat_widget);
+                apply_agent_communication_event(event, bottom_pane, chat_widget, attachment_epoch);
             }
             UserIntentProjection::None
         }
@@ -4553,7 +4554,12 @@ fn apply_tui_control_event(
                     ),
                 ) = &event.kind
                 {
-                    apply_agent_communication_event(communication, bottom_pane, chat_widget);
+                    apply_agent_communication_event(
+                        communication,
+                        bottom_pane,
+                        chat_widget,
+                        attachment_epoch,
+                    );
                 }
             }
             UserIntentProjection::None
@@ -4571,6 +4577,7 @@ fn apply_agent_communication_event(
     event: &astra_turn_types::AgentCommunicationEvent,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
+    attachment_epoch: u64,
 ) {
     if let Some(notice) = parent_agent_communication_notice(event)
         && chat_widget.claim_parent_communication_notice(&event.message_id)
@@ -4580,14 +4587,17 @@ fn apply_agent_communication_event(
     if event.direction != astra_turn_types::AgentCommunicationDirection::Received {
         return;
     }
-    if let Some(intent) = bottom_pane.remove_agent_guide(&event.message_id) {
+    if let Some(intent) = bottom_pane.remove_agent_guide(
+        &event.message_id,
+        attachment_epoch,
+        Some(&event.observed_by.run_id),
+    ) {
         let agent_name = match intent.target {
             bottom_pane::PendingUserIntentTarget::AgentRun { agent_name, .. } => agent_name,
             bottom_pane::PendingUserIntentTarget::ActiveRun => return,
         };
         chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-            "Guidance received by {agent_name}: {}",
-            intent.text
+            "Guidance received by {agent_name}"
         )));
     }
 }
@@ -4652,8 +4662,9 @@ fn apply_active_turn_tui_control_event(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     run_control: &crate::cli::turn::local_run_control::LocalRunControl,
+    attachment_epoch: u64,
 ) {
-    match apply_tui_control_event(event, bottom_pane, chat_widget) {
+    match apply_tui_control_event(event, bottom_pane, chat_widget, attachment_epoch) {
         UserIntentProjection::Applied => {
             let TuiAppEvent::UserIntentApplied {
                 intent_id,
@@ -4778,23 +4789,24 @@ enum AgentWorkbenchOutcome {
         reason: String,
     },
     GuideAccepted {
+        attachment_epoch: u64,
         intent_id: String,
     },
     GuideApplied {
+        attachment_epoch: u64,
         intent_id: String,
-        agent_name: String,
-        content: String,
     },
     GuideRejected {
+        attachment_epoch: u64,
         intent_id: String,
         agent_id: String,
         agent_name: String,
         run_id: String,
         target: crate::tui::agent_run_projection::AgentControlTarget,
-        content: String,
         reason: String,
     },
-    GuideApplicationUnconfirmed {
+    GuideUnconfirmed {
+        attachment_epoch: u64,
         intent_id: String,
         agent_name: String,
         reason: String,
@@ -5017,11 +5029,21 @@ fn agent_control_action_label(action: astra_thin_client::SessionRunAction) -> &'
 fn drain_agent_workbench_outcomes(
     outcome_rx: &mut tokio::sync::mpsc::Receiver<AgentWorkbenchOutcome>,
     active_session_id: Option<&str>,
+    attachment_epoch: u64,
     chat_widget: &mut chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) {
     while let Ok(outcome) = outcome_rx.try_recv() {
+        if matches!(&outcome,
+            AgentWorkbenchOutcome::GuideAccepted { attachment_epoch: epoch, .. }
+                | AgentWorkbenchOutcome::GuideApplied { attachment_epoch: epoch, .. }
+                | AgentWorkbenchOutcome::GuideRejected { attachment_epoch: epoch, .. }
+                | AgentWorkbenchOutcome::GuideUnconfirmed { attachment_epoch: epoch, .. }
+                if *epoch != attachment_epoch
+        ) {
+            continue;
+        }
         match outcome {
             AgentWorkbenchOutcome::Clipboard {
                 success_message,
@@ -5090,17 +5112,17 @@ fn drain_agent_workbench_outcomes(
                     );
                 }
             }
-            AgentWorkbenchOutcome::GuideAccepted { intent_id } => {
+            AgentWorkbenchOutcome::GuideAccepted { intent_id, .. } => {
                 bottom_pane.promote_agent_guide_accepted(&intent_id);
             }
-            AgentWorkbenchOutcome::GuideApplied {
-                intent_id,
-                agent_name,
-                content,
-            } => {
-                if bottom_pane.remove_agent_guide(&intent_id).is_some() {
+            AgentWorkbenchOutcome::GuideApplied { intent_id, .. } => {
+                if let Some(intent) =
+                    bottom_pane.remove_agent_guide(&intent_id, attachment_epoch, None)
+                    && let bottom_pane::PendingUserIntentTarget::AgentRun { agent_name, .. } =
+                        intent.target
+                {
                     chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                        "Guidance applied to {agent_name}: {content}"
+                        "Guidance applied to {agent_name}"
                     )));
                 }
             }
@@ -5110,17 +5132,21 @@ fn drain_agent_workbench_outcomes(
                 agent_name,
                 run_id,
                 target,
-                content,
                 reason,
+                ..
             } => {
-                bottom_pane.remove_agent_guide(&intent_id);
+                let Some(intent) =
+                    bottom_pane.remove_agent_guide(&intent_id, attachment_epoch, Some(&run_id))
+                else {
+                    continue;
+                };
                 bottom_pane.push_view(Box::new(
                     bottom_pane::agent_guide_view::AgentGuideView::with_draft(
                         agent_id,
                         agent_name.clone(),
                         run_id,
                         target,
-                        content,
+                        intent.text,
                         format!("Not sent: {reason}"),
                     ),
                 ));
@@ -5128,14 +5154,15 @@ fn drain_agent_workbench_outcomes(
                     "Could not send guidance to {agent_name}: {reason}. Your draft is preserved."
                 )));
             }
-            AgentWorkbenchOutcome::GuideApplicationUnconfirmed {
+            AgentWorkbenchOutcome::GuideUnconfirmed {
                 intent_id,
                 agent_name,
                 reason,
+                ..
             } => {
-                if bottom_pane.remove_agent_guide(&intent_id).is_some() {
+                if bottom_pane.mark_user_intent_unconfirmed(&intent_id) {
                     chat_widget.commit_system(history_cell::system::SystemCell::warning(format!(
-                        "{agent_name} accepted the guidance, but application could not be confirmed: {reason}. It was not resent."
+                        "Guidance to {agent_name} is unconfirmed: {reason}. Its stable identity is retained; it was not resent."
                     )));
                 }
             }
@@ -5209,6 +5236,7 @@ struct ViewActionBackends {
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
     session_id: Option<String>,
+    session_attachment_epoch: u64,
     file_writer: Option<super::file_writer::TuiFileWriter>,
     agent_workbench_tx: tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
 }
@@ -6196,6 +6224,47 @@ fn dispatch_root_transcript_load(
     });
 }
 
+async fn submit_agent_guide(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    run_id: &str,
+    request: &astra_thin_client::RunUserIntentRequest,
+) -> Result<String, GuidanceSubmissionError> {
+    // Use the same bounded acknowledgement protocol as root guidance, but
+    // do not couple a member's lifetime to the foreground turn or retry it.
+    tokio::time::timeout(ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT, async {
+        let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+            .await
+            .ok_or_else(|| {
+                GuidanceSubmissionError::Rejected("authentication is unavailable".into())
+            })?;
+        let response = api
+            .submit_run_user_intent(Some(&token), run_id, request)
+            .await
+            .map_err(GuidanceSubmissionError::from_thin_client)?;
+        if response.run_id != run_id
+            || response.intent_id != request.intent_id
+            || response.status != astra_turn_types::UserIntentStatus::AcceptedRemote
+            || response.event_index < 0
+        {
+            return Err(GuidanceSubmissionError::Unconfirmed(
+                "the server returned an inconsistent acknowledgement".into(),
+            ));
+        }
+        tracing::debug!(
+            duplicate = response.duplicate,
+            "agent guidance accepted remotely"
+        );
+        Ok(token)
+    })
+    .await
+    .map_err(|_| {
+        GuidanceSubmissionError::Unconfirmed(
+            "Guidance submission exceeded its bounded acknowledgement deadline.".into(),
+        )
+    })?
+}
+
 // This is a one-shot UI-to-runtime command boundary; identity, routing, and
 // repaint capabilities remain explicit and independently testable.
 #[allow(clippy::too_many_arguments)]
@@ -6216,6 +6285,7 @@ fn dispatch_agent_guide(
         run_id.clone(),
         agent_name.clone(),
         content.clone(),
+        backends.session_attachment_epoch,
     ) {
         chat_widget.commit_system(history_cell::system::SystemCell::error(
             "Could not stage agent guidance. The draft was not sent.",
@@ -6239,6 +6309,7 @@ fn dispatch_agent_guide(
         api,
         profile,
         agent_workbench_tx: outcome_tx,
+        session_attachment_epoch: attachment_epoch,
         ..
     } = backends;
     tokio::spawn(async move {
@@ -6246,23 +6317,29 @@ fn dispatch_agent_guide(
             agent_id: local_agent_id,
         } = &target
         {
-            let result = match spawner {
-                Some(spawner) => {
-                    spawner
-                        .guide_agent(local_agent_id, &intent_id, &content)
-                        .await
-                }
-                None => Err("the local runtime that owns this agent is unavailable".into()),
-            };
-            if let Err(reason) = result {
+            let Some(spawner) = spawner else {
                 let _ = outcome_tx
                     .send(AgentWorkbenchOutcome::GuideRejected {
+                        attachment_epoch,
                         intent_id,
                         agent_id,
                         agent_name,
                         run_id,
                         target,
-                        content,
+                        reason: "the local runtime that owns this agent is unavailable".into(),
+                    })
+                    .await;
+                return;
+            };
+            if let Err(reason) = spawner
+                .guide_agent(local_agent_id, &intent_id, &content)
+                .await
+            {
+                let _ = outcome_tx
+                    .send(AgentWorkbenchOutcome::GuideUnconfirmed {
+                        attachment_epoch,
+                        intent_id,
+                        agent_name,
                         reason,
                     })
                     .await;
@@ -6270,12 +6347,14 @@ fn dispatch_agent_guide(
             }
             let _ = outcome_tx
                 .send(AgentWorkbenchOutcome::GuideAccepted {
+                    attachment_epoch,
                     intent_id: intent_id.clone(),
                 })
                 .await;
             tokio::time::sleep(AGENT_GUIDE_APPLICATION_TIMEOUT).await;
             let _ = outcome_tx
-                .send(AgentWorkbenchOutcome::GuideApplicationUnconfirmed {
+                .send(AgentWorkbenchOutcome::GuideUnconfirmed {
+                    attachment_epoch,
                     intent_id,
                     agent_name,
                     reason: "no matching mailbox-received event arrived within 60 seconds".into(),
@@ -6293,90 +6372,59 @@ fn dispatch_agent_guide(
         if target_run_id != &run_id {
             let _ = outcome_tx
                 .send(AgentWorkbenchOutcome::GuideRejected {
+                    attachment_epoch,
                     intent_id,
                     agent_id,
                     agent_name,
                     run_id,
                     target,
-                    content,
                     reason: "the selected run identity changed before guidance dispatch".into(),
                 })
                 .await;
             return;
         }
-        let token = match crate::cli::session::session_runtime::fresh_access_token(
-            &api,
-            profile.as_deref(),
-        )
-        .await
-        {
-            Some(token) => token,
-            None => {
-                let _ = outcome_tx
-                    .send(AgentWorkbenchOutcome::GuideRejected {
-                        intent_id,
-                        agent_id,
-                        agent_name,
-                        run_id,
-                        target,
-                        content,
-                        reason: "authentication is unavailable".into(),
-                    })
-                    .await;
-                return;
-            }
-        };
         let request = astra_thin_client::RunUserIntentRequest {
             intent_id: intent_id.clone(),
             delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             input: serde_json::json!({ "content": content }),
         };
-        let response = match api
-            .submit_run_user_intent(Some(&token), &run_id, &request)
-            .await
-        {
-            Ok(response)
-                if response.run_id == run_id
-                    && response.intent_id == intent_id
-                    && response.status == astra_turn_types::UserIntentStatus::AcceptedRemote =>
-            {
-                response
-            }
-            Ok(_) => {
-                let _ = outcome_tx
-                    .send(AgentWorkbenchOutcome::GuideRejected {
-                        intent_id,
-                        agent_id,
-                        agent_name,
-                        run_id,
-                        target,
-                        content,
-                        reason: "the server returned an inconsistent acknowledgement".into(),
-                    })
-                    .await;
-                return;
-            }
+        let token = match submit_agent_guide(&api, profile.as_deref(), &run_id, &request).await {
+            Ok(token) => token,
             Err(error) => {
+                let reason = match error {
+                    GuidanceSubmissionError::Rejected(reason) => reason,
+                    GuidanceSubmissionError::GuidanceClosed(_) => {
+                        "the selected run no longer accepts guidance".to_string()
+                    }
+                    GuidanceSubmissionError::Unconfirmed(reason) => {
+                        let _ = outcome_tx
+                            .send(AgentWorkbenchOutcome::GuideUnconfirmed {
+                                attachment_epoch,
+                                intent_id,
+                                agent_name,
+                                reason,
+                            })
+                            .await;
+                        return;
+                    }
+                };
                 let _ = outcome_tx
                     .send(AgentWorkbenchOutcome::GuideRejected {
+                        attachment_epoch,
                         intent_id,
                         agent_id,
                         agent_name,
                         run_id,
                         target,
-                        content,
-                        reason: error.to_string(),
+                        reason,
                     })
                     .await;
                 return;
             }
         };
-        tracing::debug!(
-            duplicate = response.duplicate,
-            "agent guidance accepted remotely"
-        );
         let _ = outcome_tx
             .send(AgentWorkbenchOutcome::GuideAccepted {
+                attachment_epoch,
                 intent_id: intent_id.clone(),
             })
             .await;
@@ -6388,10 +6436,9 @@ fn dispatch_agent_guide(
                     Ok(astra_thin_client::StreamEvent::RunUserIntentApplied {
                         run_id: event_run_id,
                         intent_id: event_intent_id,
-                        content: applied_content,
                         ..
                     }) if event_run_id == run_id && event_intent_id == intent_id => {
-                        return Ok(applied_content);
+                        return Ok(());
                     }
                     Ok(astra_thin_client::StreamEvent::RunUserIntentReturned {
                         run_id: event_run_id,
@@ -6415,17 +6462,18 @@ fn dispatch_agent_guide(
         })
         .await;
         let outcome = match observed {
-            Ok(Ok(applied_content)) => AgentWorkbenchOutcome::GuideApplied {
+            Ok(Ok(())) => AgentWorkbenchOutcome::GuideApplied {
+                attachment_epoch,
                 intent_id,
-                agent_name,
-                content: applied_content,
             },
-            Ok(Err(reason)) => AgentWorkbenchOutcome::GuideApplicationUnconfirmed {
+            Ok(Err(reason)) => AgentWorkbenchOutcome::GuideUnconfirmed {
+                attachment_epoch,
                 intent_id,
                 agent_name,
                 reason,
             },
-            Err(_) => AgentWorkbenchOutcome::GuideApplicationUnconfirmed {
+            Err(_) => AgentWorkbenchOutcome::GuideUnconfirmed {
+                attachment_epoch,
                 intent_id,
                 agent_name,
                 reason: "no matching applied event arrived within 60 seconds".into(),
@@ -8193,6 +8241,7 @@ pub(crate) async fn run_tui_session(
                                         session_id: state.session_id.clone(),
                                         file_writer: Some(file_writer.clone()),
                                         agent_workbench_tx: agent_workbench_tx.clone(),
+                                        session_attachment_epoch: state.session_attachment_epoch,
                                     },
                                     &frame_requester,
                                 );
@@ -8680,6 +8729,7 @@ pub(crate) async fn run_tui_session(
                                                     ),
                                                     file_writer: Some(file_writer.clone()),
                                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                                    session_attachment_epoch: state.session_attachment_epoch,
                                                 },
                                                 &frame_requester,
                                             );
@@ -9033,6 +9083,7 @@ pub(crate) async fn run_tui_session(
                                         let active_session_hub_snapshot =
                                             slash_dispatch::session_hub_snapshot(&state);
                                         let turn_session_id = state.session_id.clone();
+                                        let turn_session_attachment_epoch = state.session_attachment_epoch;
                                         let turn_submission_id =
                                             uuid::Uuid::now_v7().to_string();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext {
@@ -9334,6 +9385,7 @@ pub(crate) async fn run_tui_session(
                                                                             session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                             file_writer: Some(file_writer.clone()),
                                                                             agent_workbench_tx: agent_workbench_tx.clone(),
+                                                                            session_attachment_epoch: turn_session_attachment_epoch,
                                                                         },
                                                                         &frame_requester,
                                                                     );
@@ -9788,6 +9840,7 @@ pub(crate) async fn run_tui_session(
                                                                                 session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                                 file_writer: Some(file_writer.clone()),
                                                                                 agent_workbench_tx: agent_workbench_tx.clone(),
+                                                                                session_attachment_epoch: turn_session_attachment_epoch,
                                                                             },
                                                                             &restored_local_agent_task_projections,
                                                                             &mut chat_widget,
@@ -10266,6 +10319,7 @@ pub(crate) async fn run_tui_session(
                                                         &mut bottom_pane,
                                                         &mut chat_widget,
                                                         &preinstalled_run_control,
+                                                        turn_session_attachment_epoch,
                                                     );
                                                     refresh_open_transcript_view(
                                                         &chat_widget,
@@ -10472,6 +10526,7 @@ pub(crate) async fn run_tui_session(
                                                     drain_agent_workbench_outcomes(
                                                         &mut agent_workbench_rx,
                                                         background_registry_session_id.as_deref(),
+                                                        turn_session_attachment_epoch,
                                                         &mut chat_widget,
                                                         &mut bottom_pane,
                                                         &frame_requester,
@@ -10495,6 +10550,7 @@ pub(crate) async fn run_tui_session(
                                                             session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                             file_writer: Some(file_writer.clone()),
                                                             agent_workbench_tx: agent_workbench_tx.clone(),
+                                                            session_attachment_epoch: turn_session_attachment_epoch,
                                                         },
                                                         &restored_local_agent_task_projections,
                                                         &mut chat_widget,
@@ -11005,6 +11061,7 @@ pub(crate) async fn run_tui_session(
                                         session_id: state.session_id.clone(),
                                         file_writer: Some(file_writer.clone()),
                                         agent_workbench_tx: agent_workbench_tx.clone(),
+                                        session_attachment_epoch: state.session_attachment_epoch,
                                     },
                                     &restored_local_agent_task_projections,
                                     &mut chat_widget,
@@ -11790,7 +11847,7 @@ pub(crate) async fn run_tui_session(
                         &frame_requester,
                     );
                 }
-                apply_tui_control_event(&ae, &mut bottom_pane, &mut chat_widget);
+                apply_tui_control_event(&ae, &mut bottom_pane, &mut chat_widget, state.session_attachment_epoch);
                 refresh_open_transcript_view(&chat_widget, &mut bottom_pane, w);
                 handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
                 if apply_live_work_update_from_event(&ae, &task_board) {
@@ -11823,6 +11880,7 @@ pub(crate) async fn run_tui_session(
                 drain_agent_workbench_outcomes(
                     &mut agent_workbench_rx,
                     background_registry_session_id.as_deref(),
+                    state.session_attachment_epoch,
                     &mut chat_widget,
                     &mut bottom_pane,
                     &frame_requester,
@@ -11846,6 +11904,7 @@ pub(crate) async fn run_tui_session(
                         session_id: state.session_id.clone(),
                         file_writer: Some(file_writer.clone()),
                         agent_workbench_tx: agent_workbench_tx.clone(),
+                        session_attachment_epoch: state.session_attachment_epoch,
                     },
                     &restored_local_agent_task_projections,
                     &mut chat_widget,
@@ -12039,6 +12098,7 @@ pub(crate) async fn run_tui_session(
                                     session_id: state.session_id.clone(),
                                     file_writer: Some(file_writer.clone()),
                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                    session_attachment_epoch: state.session_attachment_epoch,
                                 },
                             );
                         }
@@ -12057,6 +12117,7 @@ pub(crate) async fn run_tui_session(
                                     session_id: state.session_id.clone(),
                                     file_writer: Some(file_writer.clone()),
                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                    session_attachment_epoch: state.session_attachment_epoch,
                                 },
                                 &restored_local_agent_task_projections,
                                 &mut chat_widget,
@@ -13933,6 +13994,7 @@ mod tests {
             &mut bottom_pane,
             &mut chat_widget,
             &run_control,
+            0,
         );
         assert_eq!(
             projection.await.unwrap(),
@@ -13950,6 +14012,7 @@ mod tests {
             &mut bottom_pane,
             &mut chat_widget,
             &run_control,
+            0,
         );
         assert!(run_control.pending_remote_disposition_ids().is_empty());
         assert_eq!(
@@ -18292,8 +18355,8 @@ mod tests {
             content: "runtime transport content".into(),
         };
 
-        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
-        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, 0);
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, 0);
 
         let rendered = rendered_transcript_overlay(&chat_widget, 80);
         assert!(
@@ -18742,14 +18805,305 @@ mod tests {
     }
 
     #[test]
+    fn member_guidance_outcomes_cannot_cross_a_real_session_reset() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let attachment_epoch = state.session_attachment_epoch;
+        let mut pane = BottomPane::new();
+        assert!(pane.accept_agent_guide(
+            "guide".into(),
+            "member-run".into(),
+            "Reviewer".into(),
+            "private guidance".into(),
+            attachment_epoch
+        ));
+        let before = render_bottom_pane_text(&pane, 100, 20);
+        state.reset_for_new_session();
+        assert_ne!(attachment_epoch, state.session_attachment_epoch);
+        let mut widget = chat_widget::ChatWidget::new("new-session");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        for outcome in [
+            AgentWorkbenchOutcome::GuideAccepted {
+                attachment_epoch,
+                intent_id: "guide".into(),
+            },
+            AgentWorkbenchOutcome::GuideApplied {
+                attachment_epoch,
+                intent_id: "guide".into(),
+            },
+            AgentWorkbenchOutcome::GuideRejected {
+                attachment_epoch,
+                intent_id: "guide".into(),
+                agent_id: "reviewer".into(),
+                agent_name: "Reviewer".into(),
+                run_id: "member-run".into(),
+                target: crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "member-run".into(),
+                },
+                reason: "closed".into(),
+            },
+            AgentWorkbenchOutcome::GuideUnconfirmed {
+                attachment_epoch,
+                intent_id: "guide".into(),
+                agent_name: "Reviewer".into(),
+                reason: "lost acknowledgement".into(),
+            },
+        ] {
+            tx.try_send(outcome).unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                state.session_id.as_deref(),
+                state.session_attachment_epoch,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert_eq!(render_bottom_pane_text(&pane, 100, 20), before);
+            assert!(!pane.has_active_view());
+            assert!(widget.history().is_empty());
+        }
+        let pending = pane
+            .remove_agent_guide("guide", attachment_epoch, Some("member-run"))
+            .unwrap();
+        assert_eq!(
+            pending.status,
+            astra_turn_types::UserIntentStatus::AcceptedLocal
+        );
+        assert_eq!(pending.text, "private guidance");
+    }
+
+    #[test]
+    fn member_guidance_settles_once_and_uncertain_application_keeps_custody() {
+        // Definitive rejection, unknown POST, and accepted-but-unconfirmed application.
+        for (applied, accepted) in [(false, false), (true, false), (true, true)] {
+            let mut pane = BottomPane::new();
+            let mut widget = chat_widget::ChatWidget::new("session");
+            assert!(pane.accept_agent_guide(
+                "guide".into(),
+                "member-run".into(),
+                "Reviewer".into(),
+                "private guidance".into(),
+                3
+            ));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let reject = || AgentWorkbenchOutcome::GuideRejected {
+                attachment_epoch: 3,
+                intent_id: "guide".into(),
+                agent_id: "reviewer".into(),
+                agent_name: "Reviewer".into(),
+                run_id: "member-run".into(),
+                target: crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "member-run".into(),
+                },
+                reason: "closed".into(),
+            };
+            if applied {
+                if accepted {
+                    tx.try_send(AgentWorkbenchOutcome::GuideAccepted {
+                        attachment_epoch: 3,
+                        intent_id: "guide".into(),
+                    })
+                    .unwrap();
+                }
+                tx.try_send(AgentWorkbenchOutcome::GuideUnconfirmed {
+                    attachment_epoch: 3,
+                    intent_id: "guide".into(),
+                    agent_name: "Reviewer".into(),
+                    reason: "acknowledgement timeout".into(),
+                })
+                .unwrap();
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    Some("session"),
+                    3,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                assert_eq!(pane.pending_user_intent_count(), 1);
+                assert!(!pane.has_active_view());
+                assert!(pane.take_client_recoverable_user_intents().is_empty());
+                assert!(pane.take_queued_next_turn_submissions().is_empty());
+                let phase = if accepted {
+                    "application unknown"
+                } else {
+                    "delivery unknown"
+                };
+                assert!(render_bottom_pane_text(&pane, 100, 20).contains(phase));
+                for _ in 0..2 {
+                    tx.try_send(AgentWorkbenchOutcome::GuideApplied {
+                        attachment_epoch: 3,
+                        intent_id: "guide".into(),
+                    })
+                    .unwrap();
+                }
+            }
+            tx.try_send(reject()).unwrap();
+            tx.try_send(reject()).unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                3,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert_eq!(pane.pending_user_intent_count(), 0);
+            let rendered = rendered_transcript_overlay(&widget, 100);
+            assert!(!rendered.contains("private guidance"), "{rendered}");
+            if applied {
+                assert!(
+                    !pane.has_active_view(),
+                    "a rejection after Applied must not reopen a draft"
+                );
+                assert_eq!(rendered.matches("Guidance applied to Reviewer").count(), 1);
+            } else {
+                assert!(pane.has_active_view());
+                assert!(render_bottom_pane_text(&pane, 100, 20).contains("private guidance"));
+                assert_eq!(rendered.matches("Your draft is preserved").count(), 1);
+                pane.handle_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+                assert!(
+                    !pane.has_active_view(),
+                    "duplicate rejection must not stack draft views"
+                );
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn member_guidance_post_failures_are_bounded_and_single_attempt() {
+        use astra_credentials::{CredentialsFile, Profile};
+        use tokio::io::AsyncReadExt;
+
+        let _creds = crate::tests::isolate_credentials();
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some("test-token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let request = astra_thin_client::RunUserIntentRequest {
+            intent_id: "stable-guide".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            input: serde_json::json!({"content": "private guidance"}),
+        };
+        for (response, rejected) in [
+            (None, false), // Complete POST received, then acknowledgement lost.
+            (Some(ResponseTemplate::new(200).set_delay(ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT * 2)), false),
+            (Some(ResponseTemplate::new(503).set_body_string("unavailable")), false),
+            (Some(ResponseTemplate::new(200).set_body_raw("{", "application/json")), false),
+            (Some(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "member-run", "intent_id": "wrong-identity", "status": "accepted_remote", "duplicate": false, "event_index": 1
+            }))), false),
+            (Some(ResponseTemplate::new(403).set_body_string("denied")), true),
+            (Some(ResponseTemplate::new(409).set_body_json(serde_json::json!({"error_code": RUN_INTENT_RUN_TERMINAL_ERROR_CODE}))), true),
+        ] {
+            let server = MockServer::start().await;
+            let (url, lost_ack) = if let Some(response) = response {
+                Mock::given(method("POST")).and(path("/chat/runs/member-run/intents"))
+                    .respond_with(response).expect(1).mount(&server).await;
+                (server.uri(), None)
+            } else {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let received = tokio::spawn(async move {
+                    let (mut connection, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        assert!(bytes.len() < 65536, "bounded fixture request");
+                        assert!(connection.read_buf(&mut bytes).await.unwrap() > 0);
+                        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                            && let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes[index + 4..])
+                        {
+                            return body; // Lose the response only after receiving the full request.
+                        }
+                    }
+                });
+                (url, Some(received))
+            };
+            let api = astra_thin_client::ThinClient::new(&url, None).unwrap();
+            let error = tokio::time::timeout(
+                ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT + Duration::from_secs(2),
+                submit_agent_guide(&api, None, "member-run", &request),
+            ).await.unwrap().unwrap_err();
+            assert!(match error {
+                GuidanceSubmissionError::Rejected(_) | GuidanceSubmissionError::GuidanceClosed(_) => rejected,
+                GuidanceSubmissionError::Unconfirmed(_) => !rejected,
+            });
+            let received = if let Some(received) = lost_ack {
+                received.await.unwrap()
+            } else {
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1);
+                serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap()
+            };
+            assert_eq!(received, serde_json::to_value(&request).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn member_guidance_local_absence_is_rejected_but_untyped_failure_is_uncertain() {
+        for spawner in [
+            None,
+            Some(test_agent_spawner(Arc::new(PendingAgentExecutor))),
+        ] {
+            let rejected = spawner.is_none();
+            let mut pane = BottomPane::new();
+            let mut widget = chat_widget::ChatWidget::new("session");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            dispatch_agent_guide(
+                "unavailable-member".into(),
+                "Reviewer".into(),
+                "member-run".into(),
+                crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
+                    agent_id: "unavailable-member".into(),
+                },
+                "private guidance".into(),
+                ViewActionBackends {
+                    agent_spawner: spawner,
+                    api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+                    profile: None,
+                    session_id: Some("session".into()),
+                    session_attachment_epoch: 9,
+                    file_writer: None,
+                    agent_workbench_tx: tx,
+                },
+                &mut pane,
+                &mut widget,
+                &FrameRequester::test_dummy(),
+            );
+            let outcome = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&outcome,
+                    AgentWorkbenchOutcome::GuideRejected { .. } if rejected
+                ) || matches!(&outcome,
+                    AgentWorkbenchOutcome::GuideUnconfirmed { .. } if !rejected
+                )
+            );
+        }
+    }
+
+    #[test]
     fn local_agent_mailbox_received_event_closes_guidance_delivery_once() {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let attachment_epoch = state.session_attachment_epoch;
         assert!(bottom_pane.accept_agent_guide(
             "guide-7".into(),
             "run-reviewer".into(),
             "Reviewer".into(),
             "inspect the storage race".into(),
+            attachment_epoch,
         ));
         assert!(bottom_pane.promote_agent_guide_accepted("guide-7"));
         let event = TuiAppEvent::AgentCommunication(astra_turn_types::AgentCommunicationEvent {
@@ -18778,14 +19132,43 @@ mod tests {
             correlation_id: None,
         });
 
-        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
-        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+        let TuiAppEvent::AgentCommunication(mut wrong_receiver) = event.clone() else {
+            unreachable!();
+        };
+        wrong_receiver.observed_by.run_id = "another-run".into();
+        apply_tui_control_event(
+            &TuiAppEvent::AgentCommunication(wrong_receiver),
+            &mut bottom_pane,
+            &mut chat_widget,
+            attachment_epoch,
+        );
+        assert_eq!(bottom_pane.pending_user_intent_count(), 1);
+        assert!(!rendered_transcript_overlay(&chat_widget, 100).contains("Guidance received"));
 
-        assert!(bottom_pane.remove_agent_guide("guide-7").is_none());
+        state.reset_for_new_session();
+        assert_ne!(state.session_attachment_epoch, attachment_epoch);
+        apply_tui_control_event(
+            &event,
+            &mut bottom_pane,
+            &mut chat_widget,
+            state.session_attachment_epoch,
+        );
+        assert_eq!(bottom_pane.pending_user_intent_count(), 1);
+        assert!(!rendered_transcript_overlay(&chat_widget, 100).contains("Guidance received"));
+
+        // The receipt settles only its original attachment and exact member run.
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, attachment_epoch);
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, attachment_epoch);
+
+        assert!(
+            bottom_pane
+                .remove_agent_guide("guide-7", attachment_epoch, None)
+                .is_none()
+        );
         let rendered = rendered_transcript_overlay(&chat_widget, 100);
         assert_eq!(rendered.matches("Guidance received by Reviewer").count(), 1);
         assert!(
-            rendered.contains("inspect the storage race"),
+            !rendered.contains("inspect the storage race"),
             "{rendered:?}"
         );
     }
@@ -18815,7 +19198,7 @@ mod tests {
             correlation_id: None,
         });
 
-        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, 0);
 
         let rendered = rendered_transcript_overlay(&chat_widget, 100);
         assert!(
@@ -18875,13 +19258,14 @@ mod tests {
             )),
         });
 
-        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, 0);
         // A later durable observation of the same message must not duplicate
         // the parent receipt.
         apply_tui_control_event(
             &TuiAppEvent::AgentCommunication(communication),
             &mut bottom_pane,
             &mut chat_widget,
+            0,
         );
 
         let rendered = rendered_transcript_overlay(&chat_widget, 100);
@@ -18925,7 +19309,7 @@ mod tests {
             correlation_id: None,
         });
 
-        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, 0);
 
         let rendered = rendered_transcript_overlay(&chat_widget, 100);
         assert!(!rendered.contains("still reading 12 files"), "{rendered:?}");
@@ -18984,6 +19368,7 @@ mod tests {
                 session_id: Some("durable-root-session".into()),
                 file_writer: None,
                 agent_workbench_tx,
+                session_attachment_epoch: 0,
             },
             &FrameRequester::test_dummy(),
         );
@@ -19049,6 +19434,7 @@ mod tests {
                 session_id: Some("durable-root-session".into()),
                 file_writer: None,
                 agent_workbench_tx,
+                session_attachment_epoch: 0,
             },
             &FrameRequester::test_dummy(),
         );

@@ -6764,6 +6764,7 @@ pub(crate) mod tests {
     async fn structured_writer_receipts_do_not_depend_on_full_workspace_fingerprints() {
         fn invocation(tool_call_id: &str) -> astra_tools::tool_engine::ToolInvocationMetadata<'_> {
             astra_tools::tool_engine::ToolInvocationMetadata {
+                admission_deadline: None,
                 task_resolution_authority: None,
                 run_id: Some("run-convergence"),
                 turn_chain_id: Some("turn-convergence"),
@@ -6953,6 +6954,7 @@ pub(crate) mod tests {
                     "content": content,
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    admission_deadline: None,
                     task_resolution_authority: None,
                     run_id: Some("run-external-noop"),
                     turn_chain_id: Some("turn-external-noop"),

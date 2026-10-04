@@ -80,7 +80,8 @@ use astra_services::multi_agent::EdgeDispatchService;
 #[cfg(test)]
 use astra_services::runs::ExecutionTimeBudget;
 use astra_services::runs::{
-    RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
+    ExecutionDeadlineAuthority, RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy,
+    TurnIntentExecutionPolicy,
 };
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use astra_services::{AdmittedModelExecution, SessionArtifactStore};
@@ -102,74 +103,6 @@ use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 /// observer.  The event is retained before this bounded live delivery and can
 /// therefore be replayed after the observer catches up or reconnects.
 const COMMITTED_LIFECYCLE_LIVE_DELIVERY_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Process-local monotonic authority for one run's wall-clock budget.
-///
-/// Wire snapshots are relative and may be replayed by transport retries. Once
-/// anchored, a later snapshot may only move the deadline earlier; it can never
-/// replenish time already spent by this host.
-#[derive(Clone, Copy, Debug)]
-struct RunExecutionTimeBudget {
-    deadline: tokio::time::Instant,
-    deadline_unix_ms: u64,
-}
-
-impl RunExecutionTimeBudget {
-    #[cfg(test)]
-    fn new(snapshot: ExecutionTimeBudget) -> Self {
-        Self::new_at(snapshot, tokio::time::Instant::now())
-    }
-
-    #[cfg(test)]
-    fn new_at(snapshot: ExecutionTimeBudget, now: tokio::time::Instant) -> Self {
-        let wall_now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        Self {
-            deadline: now + Duration::from_secs(snapshot.remaining_seconds),
-            deadline_unix_ms: wall_now_ms
-                .saturating_add(snapshot.remaining_seconds.saturating_mul(1_000)),
-        }
-    }
-
-    #[cfg(test)]
-    fn tighten_at(&mut self, snapshot: ExecutionTimeBudget, now: tokio::time::Instant) {
-        let proposed = now + Duration::from_secs(snapshot.remaining_seconds);
-        if proposed < self.deadline {
-            self.deadline = proposed;
-            let wall_now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
-            self.deadline_unix_ms =
-                wall_now_ms.saturating_add(snapshot.remaining_seconds.saturating_mul(1_000));
-        }
-    }
-
-    fn remaining(self) -> Duration {
-        self.remaining_at(tokio::time::Instant::now())
-    }
-
-    fn remaining_at(self, now: tokio::time::Instant) -> Duration {
-        self.deadline.saturating_duration_since(now)
-    }
-
-    fn authority_snapshot(self) -> ExecutionDeadlineAuthority {
-        ExecutionDeadlineAuthority {
-            deadline_unix_ms: self.deadline_unix_ms,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ExecutionDeadlineAuthority {
-    deadline_unix_ms: u64,
-}
 
 /// Execution-owned provider-work slice derived from the run's monotonic
 /// deadline. It is deliberately distinct from the admitted endpoint's
@@ -3680,7 +3613,7 @@ pub struct ServerAgenticLoopHost {
     /// for the same durable run scope.
     summary_attempt_allocator: DurableSummaryAttemptAllocator,
     /// Monotonic wall-clock authority for this process-local run host.
-    execution_time_budget: Option<RunExecutionTimeBudget>,
+    execution_time_budget: Option<ExecutionDeadlineAuthority>,
     /// Recovery gate for provider-attempt-owned canonical append WAL. It is
     /// opened exactly once, after session history restoration and before any
     /// real provider dispatch owned by this host.
@@ -5041,7 +4974,7 @@ pub struct ServerAgenticLoopHostBuilder {
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     inference_owner_pod_id: Option<String>,
-    execution_time_budget: Option<RunExecutionTimeBudget>,
+    execution_time_budget: Option<ExecutionDeadlineAuthority>,
     edge_tools: Vec<Value>,
     edge_provider_tool_native_ids: HashMap<String, String>,
     edge_profile: Map<String, Value>,
@@ -5242,10 +5175,18 @@ impl ServerAgenticLoopHostBuilder {
     #[cfg(test)]
     pub fn with_execution_time_budget(mut self, budget: Option<ExecutionTimeBudget>) -> Self {
         if let Some(snapshot) = budget {
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap();
+            let candidate = ExecutionDeadlineAuthority::from_budget_at(snapshot, now_unix_ms)
+                .expect("valid test execution deadline");
             if let Some(current) = self.execution_time_budget.as_mut() {
-                current.tighten_at(snapshot, tokio::time::Instant::now());
+                current.tighten_to(candidate);
             } else {
-                self.execution_time_budget = Some(RunExecutionTimeBudget::new(snapshot));
+                self.execution_time_budget = Some(candidate);
             }
         }
         self
@@ -5257,15 +5198,10 @@ impl ServerAgenticLoopHostBuilder {
         deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Self {
         if let Some(deadline) = deadline {
-            let candidate = RunExecutionTimeBudget {
-                deadline: tokio::time::Instant::from_std(deadline.monotonic_deadline()),
-                deadline_unix_ms: deadline.deadline_unix_ms,
-            };
-            if self
-                .execution_time_budget
-                .is_none_or(|current| candidate.deadline < current.deadline)
-            {
-                self.execution_time_budget = Some(candidate);
+            if let Some(current) = self.execution_time_budget.as_mut() {
+                current.tighten_to(deadline);
+            } else {
+                self.execution_time_budget = Some(deadline);
             }
         }
         self
@@ -7458,6 +7394,40 @@ impl ServerAgenticLoopHost {
             }
         }
         admission.admitted = admitted;
+        self.enforce_tool_execution_time(admission)
+    }
+
+    fn enforce_tool_execution_time(
+        &self,
+        mut admission: crate::turn::agentic_loop::host::ToolCallAdmission,
+    ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
+        let Some(authority) = self.execution_time_budget else {
+            return admission;
+        };
+        let now = tokio::time::Instant::now().into_std();
+        let mut retained = Vec::with_capacity(admission.admitted.len());
+        for invocation in admission.admitted.drain(..) {
+            let cutoff = if invocation.runtime_control_kind() == Some(
+                astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement,
+            ) {
+                authority.monotonic_deadline()
+            } else {
+                authority.monotonic_work_deadline()
+            };
+            if now < cutoff {
+                retained.push(invocation);
+            } else {
+                admission.rejected.push(crate::turn::agentic_loop::host::RejectedToolCall {
+                    invocation,
+                    result: json!({
+                        "status": "rejected", "error_kind": "execution_time_budget_exhausted",
+                        "retryable": false, "executed": false,
+                        "error": "The tool's admitted execution window closed before dispatch; it was not executed.",
+                    }).to_string(),
+                });
+            }
+        }
+        admission.admitted = retained;
         admission
     }
 
@@ -7616,31 +7586,8 @@ impl ServerAgenticLoopHost {
         )
     }
 
-    #[cfg(test)]
-    fn execution_provider_work_budget(
-        execution_time_budget: Option<RunExecutionTimeBudget>,
-    ) -> Result<Option<ProviderWorkBudget>, astra_core::ClassifiedError> {
-        let Some(budget) = execution_time_budget else {
-            return Ok(None);
-        };
-        let remaining = budget.remaining();
-        if remaining.is_zero() {
-            return Err(Self::execution_time_budget_error());
-        }
-        Ok(Some(ProviderWorkBudget(remaining)))
-    }
-
-    #[cfg(test)]
-    fn provider_work_budget_at_client_boundary(
-        execution_time_budget: Option<RunExecutionTimeBudget>,
-        boundary: ProviderAttemptBoundary,
-    ) -> Result<Option<Duration>, astra_core::ClassifiedError> {
-        Ok(boundary
-            .provider_work_budget(Self::execution_provider_work_budget(execution_time_budget)?))
-    }
-
     fn provider_dispatch_budget(
-        execution_time_budget: Option<RunExecutionTimeBudget>,
+        execution_time_budget: Option<ExecutionDeadlineAuthority>,
         boundary: ProviderAttemptBoundary,
         final_settlement: bool,
     ) -> Result<ProviderDispatchBudget, astra_core::ClassifiedError> {
@@ -7652,17 +7599,15 @@ impl ServerAgenticLoopHost {
         // The wire schema is second-granular. Clamp the actual provider slice
         // to those same whole seconds instead of advertising a smaller value
         // while silently granting the fractional remainder.
-        let remaining = execution_time_budget.remaining();
+        let remaining = execution_time_budget.remaining_at(tokio::time::Instant::now().into_std());
         // Ordinary provider work must not consume the convergence window that
         // the agentic loop needs to produce a final, tool-free answer. Once
         // typed settlement has begun, that reserve is available to the final
         // request itself.
         let remaining = if final_settlement {
-            remaining
+            remaining.total_remaining
         } else {
-            remaining.saturating_sub(
-                astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET,
-            )
+            remaining.work_remaining
         };
         let remaining_seconds = remaining.as_secs();
         if remaining_seconds == 0 {
@@ -7686,7 +7631,9 @@ impl ServerAgenticLoopHost {
     fn clamp_execution_timeout(&self, requested: Duration) -> Option<Duration> {
         self.execution_time_budget
             .map_or(Some(requested), |budget| {
-                let remaining = budget.remaining();
+                let remaining = budget
+                    .remaining_at(tokio::time::Instant::now().into_std())
+                    .work_remaining;
                 let usable = astra_turn_core::chat_turn_heuristics::action_command_window(
                     remaining,
                     Duration::ZERO,
@@ -7697,12 +7644,11 @@ impl ServerAgenticLoopHost {
 
     fn execution_time_budget_context(
         snapshot: ExecutionDeadlineAuthority,
-        remaining: Duration,
+        remaining: astra_turn_types::ExecutionTimeRemaining,
         round_index: u32,
     ) -> Option<String> {
         use astra_turn_core::chat_turn_heuristics::{
-            DIRECT_ACTION_SETTLEMENT_GRACE, PROCESS_ACTION_SETTLEMENT_GRACE,
-            PROVIDER_ACTION_CONVERGENCE_BUDGET, action_command_window,
+            DIRECT_ACTION_SETTLEMENT_GRACE, PROCESS_ACTION_SETTLEMENT_GRACE, action_command_window,
         };
         let injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
             kind: "execution_time_budget".to_string(),
@@ -7711,12 +7657,14 @@ impl ServerAgenticLoopHost {
             payload: json!({
                 "schema": "execution_time_deadline.v3",
                 "deadline_unix_ms": snapshot.deadline_unix_ms,
+                "work_deadline_unix_ms": snapshot.work_deadline_unix_ms,
                 "status": "active",
                 "action_budget_at_request": {
-                    "remaining_seconds": remaining.as_secs(),
-                    "final_answer_reserved_seconds": PROVIDER_ACTION_CONVERGENCE_BUDGET.as_secs(),
-                    "max_process_command_seconds": action_command_window(remaining, PROCESS_ACTION_SETTLEMENT_GRACE).as_secs(),
-                    "max_direct_callback_seconds": action_command_window(remaining, DIRECT_ACTION_SETTLEMENT_GRACE).as_secs(),
+                    "remaining_seconds": remaining.total_remaining.as_secs(),
+                    "work_remaining_seconds": remaining.work_remaining.as_secs(),
+                    "final_answer_reserved_seconds": remaining.total_remaining.saturating_sub(remaining.work_remaining).as_secs(),
+                    "max_process_command_seconds": action_command_window(remaining.work_remaining, PROCESS_ACTION_SETTLEMENT_GRACE).as_secs(),
+                    "max_direct_callback_seconds": action_command_window(remaining.work_remaining, DIRECT_ACTION_SETTLEMENT_GRACE).as_secs(),
                 },
                 "instruction": "This is the immutable wall-clock deadline paired with the runtime's monotonic hard timeout. The action allowances are a snapshot before model generation and shrink while the request runs. Process actions also reserve cleanup/receipt time; choose an explicit bounded timeout only when the work safely fits. Admission remains authoritative. Finish or hand off before the deadline; do not treat it as a replenishable per-request allowance.",
             }),
@@ -7733,8 +7681,8 @@ impl ServerAgenticLoopHost {
     fn current_execution_time_budget_preamble(&self, round_index: u32) -> Option<Value> {
         let budget = self.execution_time_budget?;
         let content = Self::execution_time_budget_context(
-            budget.authority_snapshot(),
-            budget.remaining(),
+            budget,
+            budget.remaining_at(tokio::time::Instant::now().into_std()),
             round_index,
         )?;
         crate::turn::wire_assembly::required_runtime_preamble_message(
@@ -8027,6 +7975,7 @@ impl ServerAgenticLoopHost {
             admission.admitted = retained;
         }
         let admission = self.enforce_canonical_delegation_lifecycle(state, admission);
+        let admission = self.enforce_tool_execution_time(admission);
         let admitted = admission
             .admitted
             .iter()
@@ -15612,15 +15561,21 @@ impl ServerAgenticLoopHost {
                     stop_after_started_calls = true;
                     break;
                 };
-                let execution_deadline =
+                let mut execution_deadline =
                     Instant::now() + Duration::from_millis(execution_timeout_ms);
-                let execution_deadline_unix_ms = SystemTime::now()
+                let mut execution_deadline_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis()
                     .saturating_add(u128::from(execution_timeout_ms))
                     .min(u128::from(u64::MAX))
                     as u64;
+                if let Some(authority) = self.execution_time_budget {
+                    execution_deadline =
+                        execution_deadline.min(authority.monotonic_work_deadline());
+                    execution_deadline_unix_ms =
+                        execution_deadline_unix_ms.min(authority.work_deadline_unix_ms);
+                }
                 let mut progress_events = Vec::new();
                 let mut tool_request_event = None;
                 for event in sse_maps_through_tool_request(
@@ -16241,7 +16196,9 @@ impl ServerAgenticLoopHost {
         if self.execution_time_budget.is_some_and(|budget| {
             command_timeout
                 > astra_turn_core::chat_turn_heuristics::action_command_window(
-                    budget.remaining(),
+                    budget
+                        .remaining_at(tokio::time::Instant::now().into_std())
+                        .work_remaining,
                     settlement_grace,
                 )
         }) {
@@ -18725,7 +18682,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         if let Some(budget) = self.execution_time_budget {
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(budget.deadline) => Err("context history persistence reached the admitted execution deadline".into()),
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(budget.monotonic_deadline())) => Err("context history persistence reached the admitted execution deadline".into()),
                 result = persist => result,
             }
         } else {
@@ -18820,9 +18777,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .is_some_and(|context| context.requested.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    fn execution_time_budget_remaining(&self) -> Option<Duration> {
+    fn execution_time_budget_remaining(&self) -> Option<astra_turn_types::ExecutionTimeRemaining> {
         self.execution_time_budget
-            .map(RunExecutionTimeBudget::remaining)
+            .map(|budget| budget.remaining_at(tokio::time::Instant::now().into_std()))
     }
 
     fn direct_child_completion_owner(
@@ -19150,7 +19107,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         tool_calls: &[Value],
         finish_reason: Option<&str>,
     ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
-        let mut admission = match self.pending_tool_call_admission.take() {
+        match self.pending_tool_call_admission.take() {
             Some(admission) => Self::cached_admission_for_provider_calls(admission, tool_calls)
                 .unwrap_or_else(|| {
                     crate::turn::agentic::tool_interception::admit_tool_calls(
@@ -19161,25 +19118,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             None => {
                 crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
             }
-        };
-        if self
-            .execution_time_budget
-            .is_some_and(|budget| budget.remaining().is_zero())
-        {
-            admission.rejected.extend(admission.admitted.drain(..).map(|canonical_call| {
-                crate::turn::agentic_loop::host::RejectedToolCall {
-                    invocation: canonical_call,
-                    result: json!({
-                        "status": "rejected",
-                        "error_kind": "execution_time_budget_exhausted",
-                        "retryable": false,
-                        "error": "The run wall-clock budget expired before this tool could be admitted; it was not executed.",
-                    })
-                    .to_string(),
-                }
-            }));
         }
-        admission
     }
 
     fn injects_round_guidance(&self) -> bool {
@@ -19289,6 +19228,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         self.publish_explain_analyze_tool_route_spans();
         let outcome = match result {
+            Ok(AgenticLoopOutcome::Completed) if state.interruption.is_some() => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+            }
             Ok(AgenticLoopOutcome::Completed) => {
                 astra_turn_types::ExplainAnalyzeOutcomeV1::Completed
             }
@@ -22626,21 +22568,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return AdmittedToolCallOutcome::default();
         }
-        if self
-            .execution_time_budget
-            .is_some_and(|budget| budget.remaining().is_zero())
-        {
-            let results = self.edge_action_blocked_results(
-                tool_calls,
-                "execution_time_budget_exhausted",
-                "The run wall-clock budget expired before tool execution; the tool was not executed.",
-            );
-            return AdmittedToolCallOutcome {
-                results,
-                control: AdmittedToolCallControl::FailedClosed,
-                ..AdmittedToolCallOutcome::default()
-            };
-        }
         self.emit_admitted_tool_call_events(state.current_round_index, tool_calls);
         let externally_dispatchable = tool_calls
             .iter()
@@ -22679,10 +22606,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .map(|invocation| invocation.logical_target_call().clone())
             .collect::<Vec<_>>();
         let (admissions, blocked) = if self.admitted_tool_side_effects_enabled
-            && !self
-                .execution_time_budget
-                .is_some_and(|budget| budget.remaining().is_zero())
-        {
+            && !self.execution_time_budget.is_some_and(|budget| {
+                !budget
+                    .remaining_at(tokio::time::Instant::now().into_std())
+                    .has_work()
+            }) {
             self.admitted_delegation_models(state, &tool_calls).await
         } else {
             (std::collections::HashMap::new(), Vec::new())
@@ -24149,51 +24077,17 @@ mod tests {
         assert!(!work_scheduler_batch_conflict("run_next_work_item", true));
     }
 
-    #[test]
-    fn execution_time_budget_retry_can_only_tighten_deadline() {
-        let start = tokio::time::Instant::now();
-        let mut budget = RunExecutionTimeBudget::new_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 10,
-            },
-            start,
-        );
-
-        budget.tighten_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 20,
-            },
-            start + Duration::from_secs(2),
-        );
-        assert_eq!(
-            budget.remaining_at(start + Duration::from_secs(2)),
-            Duration::from_secs(8),
-            "a replayed larger relative snapshot must not extend the original deadline"
-        );
-
-        budget.tighten_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 2,
-            },
-            start + Duration::from_secs(3),
-        );
-        assert_eq!(
-            budget.remaining_at(start + Duration::from_secs(3)),
-            Duration::from_secs(2),
-            "a smaller snapshot must tighten the deadline"
-        );
+    fn test_execution_deadline(remaining_seconds: u64) -> ExecutionDeadlineAuthority {
+        ExecutionDeadlineAuthority::from_budget_at(ExecutionTimeBudget { remaining_seconds }, 0)
+            .unwrap()
     }
 
     #[test]
     fn execution_time_budget_zero_rejects_new_timeout() {
-        let now = tokio::time::Instant::now();
-        let budget = RunExecutionTimeBudget::new_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 0,
-            },
-            now,
-        );
-        assert_eq!(budget.remaining_at(now), Duration::ZERO);
+        let budget = test_execution_deadline(0);
+        let remaining = budget.remaining_at(std::time::Instant::now());
+        assert_eq!(remaining.total_remaining, Duration::ZERO);
+        assert_eq!(remaining.work_remaining, Duration::ZERO);
         assert!(
             ServerAgenticLoopHost::provider_dispatch_budget(
                 Some(budget),
@@ -24209,11 +24103,13 @@ mod tests {
         let host = test_host_builder("u-unbounded-time", "s-unbounded-time").build();
 
         assert_eq!(
-            ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
+            ServerAgenticLoopHost::provider_dispatch_budget(
                 host.execution_time_budget,
                 ProviderAttemptBoundary::new(false, false),
+                false,
             )
-            .expect("unbounded behavior"),
+            .expect("unbounded behavior")
+            .client_timeout,
             None
         );
         assert_eq!(
@@ -24250,15 +24146,16 @@ mod tests {
             .build();
         let installed = host.execution_time_budget.unwrap();
         assert_eq!(installed.deadline_unix_ms, 723_000);
-        assert_eq!(installed.deadline.into_std(), deadline.monotonic_deadline());
+        assert_eq!(
+            installed.monotonic_deadline(),
+            deadline.monotonic_deadline()
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn execution_deadline_preserves_provider_settlement_reserve_after_admission_delay() {
         let mut host = test_host_builder("u-delayed-provider", "s-delayed-provider").build();
-        host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
-            remaining_seconds: 100,
-        }));
+        host.execution_time_budget = Some(test_execution_deadline(100));
         let ordinary = ProviderAttemptBoundary::new(false, false);
 
         assert_eq!(
@@ -24313,9 +24210,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn execution_deadline_final_settlement_can_use_the_reserved_provider_window() {
-        let budget = RunExecutionTimeBudget::new(ExecutionTimeBudget {
-            remaining_seconds: 20,
-        });
+        let budget = test_execution_deadline(20);
 
         assert_eq!(
             ServerAgenticLoopHost::provider_dispatch_budget(
@@ -24331,9 +24226,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn typed_completion_action_preserves_the_following_provider_window() {
-        let budget = RunExecutionTimeBudget::new(ExecutionTimeBudget {
-            remaining_seconds: 20,
-        });
+        let budget = test_execution_deadline(20);
         let boundary = ProviderAttemptBoundary::new(false, false);
         let mut settlement = astra_turn_types::CompletionSettlementState::default();
 
@@ -24363,6 +24256,7 @@ mod tests {
         assert!(!ServerAgenticLoopHost::provider_attempt_is_settlement(
             &settlement
         ));
+        tokio::time::advance(Duration::from_secs(10)).await;
         assert!(
             ServerAgenticLoopHost::provider_dispatch_budget(
                 Some(budget),
@@ -24522,28 +24416,45 @@ mod tests {
         assert!(message_text(skill_attachments[0]).contains("review instructions"));
     }
 
-    #[test]
-    fn exhausted_execution_time_budget_rejects_new_tool_admission() {
-        let mut host = test_host_builder("u-expired-tool", "s-expired-tool")
-            .with_execution_time_budget(Some(ExecutionTimeBudget {
-                remaining_seconds: 0,
-            }))
-            .build();
-        let calls = vec![json!({
-            "id": "call-expired",
-            "type": "function",
-            "function": {"name": "shell", "arguments": "{}"},
-        })];
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_execution_time_budget_rejects_new_tool_admission() {
+        for remaining_seconds in [0, 10] {
+            let mut host = test_host_builder("u-expired-tool", "s-expired-tool")
+                .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+                .with_execution_time_budget(Some(ExecutionTimeBudget { remaining_seconds }))
+                .build();
+            if remaining_seconds != 0 {
+                tokio::time::advance(Duration::from_secs(6)).await;
+                assert!(
+                    host.execution_time_budget
+                        .unwrap()
+                        .remaining_at(tokio::time::Instant::now().into_std())
+                        .total_remaining
+                        > Duration::ZERO
+                );
+            }
+            let calls = vec![json!({
+                "id": "call-expired",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"echo should-not-run\"}"},
+            })];
 
-        let admission = AgenticLoopHost::admit_tool_calls(&mut host, &calls, Some("tool_calls"));
-        assert!(admission.admitted.is_empty());
-        assert_eq!(admission.rejected.len(), 1);
-        assert!(
-            admission.rejected[0]
-                .result
-                .contains("execution_time_budget_exhausted")
-        );
-        assert!(admission.rejected[0].result.contains("\"retryable\":false"));
+            let admission =
+                AgenticLoopHost::admit_tool_calls(&mut host, &calls, Some("tool_calls"));
+            let admission = AgenticLoopHost::canonicalize_deferred_tool_admission(
+                &mut host,
+                &create_test_state(),
+                admission,
+            );
+            assert!(admission.admitted.is_empty());
+            assert_eq!(admission.rejected.len(), 1);
+            assert!(
+                admission.rejected[0]
+                    .result
+                    .contains("execution_time_budget_exhausted")
+            );
+            assert!(admission.rejected[0].result.contains("\"retryable\":false"));
+        }
     }
 
     #[test]
@@ -34665,10 +34576,17 @@ mod tests {
     #[test]
     fn deadline_producer_keeps_instruction_separate_from_timestamp() {
         let content = ServerAgenticLoopHost::execution_time_budget_context(
-            ExecutionDeadlineAuthority {
-                deadline_unix_ms: 123456789,
+            ExecutionDeadlineAuthority::from_budget_at(
+                ExecutionTimeBudget {
+                    remaining_seconds: 90,
+                },
+                123366789,
+            )
+            .unwrap(),
+            astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::from_secs(60),
+                total_remaining: Duration::from_secs(90),
             },
-            Duration::from_secs(90),
             7,
         )
         .unwrap();
@@ -36140,11 +36058,12 @@ mod tests {
 
     #[tokio::test]
     async fn explain_analyze_tracks_tool_calls_and_final_settlement_with_explicit_coverage() {
-        for lane in [
-            None,
-            Some((256, false)),
-            Some((1, false)),
-            Some((256, true)),
+        for (lane, interrupted) in [
+            (None, false),
+            (Some((256, false)), false),
+            (Some((1, false)), false),
+            (Some((256, true)), false),
+            (None, true),
         ] {
             let mut host = test_host_builder("u-explain-tools", "s-explain-tools").build();
             let (tx, mut live_events) =
@@ -36216,8 +36135,17 @@ mod tests {
                 outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
             });
             host.on_final_output_ready(&state).await;
+            state.final_text = "Observed output".into();
+            if interrupted {
+                state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                    astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+                    astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                    crate::turn::agentic_loop::lifecycle::interruption_state_summary(&state, None),
+                ));
+            }
             host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
                 .await;
+            assert_eq!(state.final_text, "Observed output");
 
             let explain_facts = host
                 .take_emitted_events()
@@ -36286,10 +36214,26 @@ mod tests {
                 .expect("answer settlement node");
             assert_eq!(settlement["label"], "Deliver final answer");
             assert_eq!(settlement["transition"], "finished");
+            assert_eq!(
+                settlement["outcome"],
+                if interrupted {
+                    "interrupted"
+                } else {
+                    "completed"
+                }
+            );
             let turn_terminal = explain_facts
                 .iter()
                 .find(|event| event["kind"] == "turn" && event["transition"] == "finished")
                 .expect("turn terminal fact");
+            assert_eq!(
+                turn_terminal["outcome"],
+                if interrupted {
+                    "interrupted"
+                } else {
+                    "completed"
+                }
+            );
             assert_eq!(
                 turn_terminal["coverage_gaps"],
                 json!([
@@ -41755,12 +41699,7 @@ mod tests {
                     astra_turn_types::InferencePurpose::Introspection,
                     crate::turn::llm::client::llm_nonstream_timeout(),
                 ));
-                host.execution_time_budget = Some(RunExecutionTimeBudget {
-                    deadline: tokio::time::Instant::now()
-                        + astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-                        + slice / 2,
-                    deadline_unix_ms: 0,
-                });
+                host.execution_time_budget = Some(test_execution_deadline(slice.as_secs()));
             }
             let response = host
                 .call_delegation_judgment(
@@ -43829,11 +43768,11 @@ mod tests {
                 .is_empty()
             );
             host.pending_tool_call_admission = None;
-            host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
-                remaining_seconds: 0,
-            }));
+            host.execution_time_budget = Some(test_execution_deadline(0));
             let expired =
                 AgenticLoopHost::admit_tool_calls(&mut host, &[fanout], Some("tool_calls"));
+            let expired =
+                AgenticLoopHost::canonicalize_deferred_tool_admission(&mut host, &state, expired);
             assert!(expired.admitted.is_empty());
             assert_eq!(expired.rejected.len(), 1);
             assert!(
@@ -50232,12 +50171,7 @@ mod tests {
                 .build();
             host.judgment_route_cache = Some(Ok(ResolvedJudgmentRoute { config, execution }));
             if partial_budget {
-                host.execution_time_budget = Some(RunExecutionTimeBudget {
-                    deadline: tokio::time::Instant::now()
-                        + astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-                        + Duration::from_millis(1),
-                    deadline_unix_ms: 0,
-                });
+                host.execution_time_budget = Some(test_execution_deadline(0));
             }
             let result = host
                 .call_delegation_judgment(
@@ -51931,11 +51865,9 @@ mod tests {
     async fn context_history_writer_obeys_admitted_absolute_deadline() {
         let directory = tempfile::TempDir::new().unwrap();
         let mut host = test_host_builder("owner", "session").build();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        host.execution_time_budget = Some(RunExecutionTimeBudget {
-            deadline,
-            deadline_unix_ms: 1,
-        });
+        let authority = test_execution_deadline(1);
+        let deadline = tokio::time::Instant::from_std(authority.monotonic_deadline());
+        host.execution_time_budget = Some(authority);
         let mut state = create_test_state();
         state.current_session_id = Some("session".into());
         state.runtime_tool_executor = Some(Arc::new(
@@ -51964,7 +51896,10 @@ mod tests {
         assert!(error.contains("admitted execution deadline"));
         assert_eq!(tokio::time::Instant::now(), deadline);
         assert_eq!(state.messages, before);
-        assert_eq!(host.execution_time_budget.unwrap().deadline, deadline);
+        assert_eq!(
+            host.execution_time_budget.unwrap().monotonic_deadline(),
+            deadline.into_std()
+        );
     }
 
     #[test]

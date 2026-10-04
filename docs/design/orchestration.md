@@ -40,6 +40,22 @@ FanOut and Fork admit one absolute deadline before model preparation and pass
 it unchanged through queuing into Server loops, tools and nested children.
 Sequential retains its explicit per-stage timeout policy; a zero timeout adds
 no deadline. Invalid deadline ranges fail before child admission.
+Admission freezes separate ordinary-work and total execution cutoffs. Final
+synthesis reserves half the admitted interval, capped at 30 seconds; elapsed
+time and retries never repartition or renew either cutoff. Ordinary model and
+tool admission use the work cutoff, while final synthesis and result draining
+use the total cutoff. A foreground child's total cutoff precedes its parent's
+work cutoff by the existing delivery grace, and its own work/synthesis split
+is frozen once. Short usable child intervals do not require a fixed 60-second
+minimum; insufficient intervals reject launch without claiming member work.
+Tool dispatch rechecks that same admitted cutoff after asynchronous preparation
+and waits. Only exact runtime-owned Work settlement uses the total cutoff;
+ordinary calls and completion-action work retain the work cutoff. The selected
+invocation-local admission deadline is not serialized or supplied by providers.
+A claimed invocation that expires before dispatch still settles once as not
+executed. If an MCP call already started, expiry prevents another call without
+claiming prior execution was side-effect-free or settled. Acknowledged results
+retain their existing completion custody and total-time drain.
 The scheduler does not parse task output into a second findings store or copy
 it into ancestor state rows. Sequential execution stops at a paused or waiting
 stage instead of launching a successor without a settled predecessor. Active

@@ -196,7 +196,6 @@ pub use orchestration::builtin_agents as orchestration_builtin_agents;
 pub use orchestration::fanout_group as orchestration_fanout_group;
 pub use orchestration::progress as orchestration_progress;
 pub use orchestration::spawn_tool as orchestration_spawn_tool;
-pub use orchestration::team_config as orchestration_team_config;
 pub use orchestration::types as orchestration_types;
 
 // Re-exports: pipeline_* → pipeline::*

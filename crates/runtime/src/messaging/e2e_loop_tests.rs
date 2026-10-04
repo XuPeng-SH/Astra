@@ -72,7 +72,7 @@ mod tests {
         capacity_semaphore: Option<Arc<tokio::sync::Semaphore>>,
         capacity_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         readmission_started: Option<Arc<tokio::sync::Notify>>,
-        execution_budget: Option<std::time::Duration>,
+        execution_budget: Option<astra_turn_types::ExecutionTimeRemaining>,
     }
 
     impl MockHost {
@@ -104,7 +104,9 @@ mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
-        fn execution_time_budget_remaining(&self) -> Option<std::time::Duration> {
+        fn execution_time_budget_remaining(
+            &self,
+        ) -> Option<astra_turn_types::ExecutionTimeRemaining> {
             self.execution_budget
         }
 
@@ -1507,7 +1509,10 @@ mod tests {
         host.capacity_semaphore = Some(Arc::clone(&semaphore));
         host.readmission_started = Some(Arc::clone(&readmission_started));
         host.wait_started = Some(Arc::clone(&wait_started));
-        host.execution_budget = Some(std::time::Duration::from_millis(30_300));
+        host.execution_budget = Some(astra_turn_types::ExecutionTimeRemaining {
+            work_remaining: std::time::Duration::from_millis(300),
+            total_remaining: std::time::Duration::from_millis(30_300),
+        });
         let mut state = make_state();
         state.current_run_id = Some(child_run_id.clone());
         state.messaging.mailbox = Some(child_mailbox);

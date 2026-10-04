@@ -546,10 +546,10 @@ pub trait AgenticLoopHost: Send {
         Ok(())
     }
 
-    /// Remaining wall-clock authority for this execution, when the host has a
-    /// request-scoped deadline. The runtime uses this to stop exploration
-    /// before the host's hard boundary, leaving time for safe settlement.
-    fn execution_time_budget_remaining(&self) -> Option<Duration> {
+    /// Observe both frozen cutoffs at one instant. Ordinary work stops at its
+    /// own cutoff; final synthesis and result draining retain total authority.
+    /// Missing authority means unbounded wall-clock execution.
+    fn execution_time_budget_remaining(&self) -> Option<astra_turn_types::ExecutionTimeRemaining> {
         None
     }
 
@@ -1715,6 +1715,47 @@ impl RequestConstraints {
         crate::turn::skill_tool::SkillSurfacingPolicy {
             allowed_names: self.allowed_skills.clone(),
             allowed_sources: self.allowed_skill_sources.clone(),
+        }
+    }
+
+    /// Freeze the exact admitted child inputs for durable admission and retry
+    /// comparison. Set order is not authority; absent and empty lanes are distinct.
+    /// Both phase cutoffs come from the same authority, never a new clock read.
+    pub fn durable_execution_restrictions(
+        &self,
+        deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+        execution_budget: Option<astra_services::runs::ExecutionBudget>,
+    ) -> astra_services::runs::DurableExecutionRestrictions {
+        let sorted = |values: Option<Vec<String>>| {
+            values.map(|mut values| {
+                values.sort_unstable();
+                values
+            })
+        };
+        astra_services::runs::DurableExecutionRestrictions::V1 {
+            allow_tools: sorted(
+                self.allowed_tools
+                    .as_ref()
+                    .map(|set| set.iter().cloned().collect()),
+            ),
+            enabled_tools: sorted(
+                self.enabled_tools
+                    .as_ref()
+                    .map(|set| set.iter().cloned().collect()),
+            ),
+            allow_skills: sorted(
+                self.allowed_skills
+                    .as_ref()
+                    .map(|set| set.iter().cloned().collect()),
+            ),
+            allow_skill_sources: sorted(
+                self.allowed_skill_sources
+                    .as_ref()
+                    .map(|set| set.iter().map(|kind| kind.as_str().to_owned()).collect()),
+            ),
+            execution_budget,
+            execution_deadline_unix_ms: deadline.map(|value| value.deadline_unix_ms),
+            execution_work_deadline_unix_ms: deadline.map(|value| value.work_deadline_unix_ms),
         }
     }
 }
@@ -5769,6 +5810,71 @@ pub(crate) mod tests {
     use serde_json::json;
 
     #[test]
+    fn request_constraints_freeze_exact_durable_execution_restrictions() {
+        use crate::skills::manifest::SkillSourceKind;
+        use astra_services::runs::{
+            DurableExecutionRestrictions, ExecutionBudget, ExecutionDeadlineAuthority,
+            ExecutionTimeBudget,
+        };
+
+        let authority = ExecutionDeadlineAuthority::from_budget_at(
+            ExecutionTimeBudget {
+                remaining_seconds: 60,
+            },
+            1_000,
+        )
+        .unwrap();
+        for names in [
+            None,
+            Some(vec![]),
+            Some(vec!["zeta", "alpha"]),
+            Some(vec!["alpha", "zeta"]),
+        ] {
+            let bounded = names.as_ref().is_some_and(|names| !names.is_empty());
+            let lane: Option<HashSet<String>> = names
+                .as_ref()
+                .map(|names| names.iter().map(|name| (*name).to_owned()).collect());
+            let sources = names.as_ref().map(|names| {
+                if names.is_empty() {
+                    HashSet::new()
+                } else {
+                    HashSet::from([SkillSourceKind::Local, SkillSourceKind::Bundled])
+                }
+            });
+            let constraints = RequestConstraints::new(lane.clone(), lane.clone(), lane, sources);
+            let deadline = bounded.then_some(authority);
+            let budget = bounded.then_some(ExecutionBudget {
+                initial_turns: Some(2),
+                hard_turn_limit: Some(5),
+            });
+            let expected_names = names.as_ref().map(|names| {
+                if names.is_empty() {
+                    vec![]
+                } else {
+                    vec!["alpha".to_owned(), "zeta".to_owned()]
+                }
+            });
+            assert_eq!(
+                constraints.durable_execution_restrictions(deadline, budget),
+                DurableExecutionRestrictions::V1 {
+                    allow_tools: expected_names.clone(),
+                    enabled_tools: expected_names.clone(),
+                    allow_skills: expected_names,
+                    allow_skill_sources: names.as_ref().map(|names| if names.is_empty() {
+                        vec![]
+                    } else {
+                        vec!["bundled".to_owned(), "local".to_owned()]
+                    }),
+                    execution_budget: budget,
+                    execution_deadline_unix_ms: bounded.then_some(authority.deadline_unix_ms),
+                    execution_work_deadline_unix_ms: bounded
+                        .then_some(authority.work_deadline_unix_ms),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn durable_user_intent_continuation_retains_backoff_without_process_deadlines() {
         let now = tokio::time::Instant::now();
         let mut original = UserIntentState::default();
@@ -6576,7 +6682,7 @@ pub(crate) mod tests {
         committed_work_synthesis: Result<bool, String>,
         committed_work_synthesis_sequence: std::collections::VecDeque<Result<bool, String>>,
         pub(crate) committed_work_synthesis_checks: usize,
-        execution_time_budget_remaining: Option<Duration>,
+        execution_time_budget_remaining: Option<astra_turn_types::ExecutionTimeRemaining>,
         pub(crate) direct_child_owner: Option<Arc<crate::orchestration::FanoutParentAdmission>>,
         pub(crate) child_wait_started: Option<Arc<tokio::sync::Notify>>,
         pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
@@ -6684,7 +6790,10 @@ pub(crate) mod tests {
             self
         }
 
-        pub(crate) fn with_execution_time_budget_remaining(mut self, remaining: Duration) -> Self {
+        pub(crate) fn with_execution_time_budget_remaining(
+            mut self,
+            remaining: astra_turn_types::ExecutionTimeRemaining,
+        ) -> Self {
             self.execution_time_budget_remaining = Some(remaining);
             self
         }
@@ -6806,7 +6915,9 @@ pub(crate) mod tests {
                 notify.notify_one();
             }
         }
-        fn execution_time_budget_remaining(&self) -> Option<Duration> {
+        fn execution_time_budget_remaining(
+            &self,
+        ) -> Option<astra_turn_types::ExecutionTimeRemaining> {
             self.execution_time_budget_remaining
         }
 

@@ -32,7 +32,11 @@ mod context_identity;
 mod context_window;
 mod deferred_tool;
 mod delegation_model_admission;
+mod execution_time_budget;
 mod explain_analyze;
+pub use execution_time_budget::{
+    ExecutionTimeRemaining, FINAL_SYNTHESIS_TIME_CAP, final_synthesis_reserve,
+};
 mod memory_selection;
 pub use memory_selection::*;
 mod explain_analyze_projection;

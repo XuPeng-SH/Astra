@@ -74,11 +74,6 @@ const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
 // The child runtime needs a small bounded interval after its work deadline to
 // publish the terminal receipt that the parent is waiting for.
 const FANOUT_TERMINAL_DELIVERY_GRACE: Duration = Duration::from_secs(5);
-/// Keep the parent's final-answer window after a foreground child settles.
-/// Optional parent verification can use time left if the child finishes early;
-/// it must not shorten every child's deadline pre-emptively.
-const FOREGROUND_CHILD_PARENT_FINAL_RESERVE: Duration =
-    astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET;
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
 /// caller-supplied agent_id — that value already appears in the
@@ -1591,12 +1586,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
     let start_cancellation = start_claim.cancellation().clone();
     let shutdown = ctx.spawner.background_shutdown_token();
     let preparation_cutoff = child_execution_deadline.map(|deadline| {
-        let min_child_budget =
-            astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET;
         tokio::time::Instant::from_std(
             deadline
-                .monotonic_deadline()
-                .checked_sub(min_child_budget)
+                .monotonic_work_deadline()
+                .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(std::time::Instant::now),
         )
     });
@@ -2793,12 +2786,9 @@ fn derive_foreground_child_deadline(
     let Some(parent) = parent else {
         return Ok(None);
     };
-    let child = parent
-        .with_parent_reserve(FOREGROUND_CHILD_PARENT_FINAL_RESERVE + FANOUT_TERMINAL_DELIVERY_GRACE)
-        .ok_or(())?;
-    (child.remaining()
-        >= astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET)
-        .then_some(Some(child))
+    parent
+        .child_with_delivery_grace(FANOUT_TERMINAL_DELIVERY_GRACE)
+        .map(Some)
         .ok_or(())
 }
 
@@ -2809,8 +2799,8 @@ fn execution_deadline_too_short_outcome() -> String {
         "reason_code": "insufficient_time_to_delegate",
         "retryable": false,
         "executed": false,
-        "result": "No child run was accepted. Delegation is optional; continue the original task in this parent run with available tools and evidence. Do not retry delegation. Clearly identify any requested checks that remain unverified.",
-        "instruction": "No child run was accepted. Delegation is optional; continue the original task in this parent run with available tools and evidence. Do not retry delegation or ask the user to resume solely because delegation was skipped. Clearly identify any requested checks that remain unverified.",
+        "result": "No child run was accepted within the remaining execution window. Requested child work remains unperformed.",
+        "instruction": "Do not retry this rejected child launch or claim that a member performed the work. Continue only useful independent work within the remaining authority and clearly report any requested child work or checks that remain unverified.",
     })
     .to_string()
 }
@@ -4875,7 +4865,7 @@ pub(crate) mod tests {
         ctx.execution_deadline = Some(
             astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
                 astra_services::runs::ExecutionTimeBudget {
-                    remaining_seconds: 89,
+                    remaining_seconds: 10,
                 },
                 1_000,
             )
@@ -4898,8 +4888,8 @@ pub(crate) mod tests {
         assert_eq!(result["reason_code"], "insufficient_time_to_delegate");
         assert_eq!(result["executed"], false);
         let instruction = result["instruction"].as_str().unwrap();
-        assert!(instruction.contains("continue the original task in this parent run"));
-        assert!(instruction.contains("Do not retry delegation"));
+        assert!(instruction.contains("requested child work or checks that remain unverified"));
+        assert!(instruction.contains("Do not retry this rejected child launch"));
         assert_eq!(executor.spawn_count(), 0);
     }
 
@@ -4907,19 +4897,21 @@ pub(crate) mod tests {
     fn foreground_child_requires_one_work_window_and_its_final_window() {
         let parent = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
             astra_services::runs::ExecutionTimeBudget {
-                remaining_seconds: 96,
+                remaining_seconds: 48,
             },
             1_000,
         )
         .expect("valid request deadline");
         let child = derive_foreground_child_deadline(Some(parent))
-            .expect("96 seconds leaves at least 60 for child work and settlement")
+            .expect("short child budgets retain both work and settlement windows")
             .expect("finite parent produces finite child deadline");
-        assert!(child.remaining() >= Duration::from_secs(60));
+        assert!(child.remaining() < Duration::from_secs(60));
+        assert!(child.remaining_at(std::time::Instant::now()).has_work());
+        assert!(child.monotonic_deadline() < parent.monotonic_work_deadline());
 
         let too_short = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
             astra_services::runs::ExecutionTimeBudget {
-                remaining_seconds: 95,
+                remaining_seconds: 10,
             },
             1_000,
         )

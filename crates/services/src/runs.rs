@@ -403,13 +403,13 @@ pub struct ExecutionBudget {
     pub hard_turn_limit: Option<u32>,
 }
 
-/// Request-local snapshot of the wall-clock slice still available for useful
-/// agent execution.
+/// Request-local upper bound on total wall-clock execution, including final
+/// synthesis. Admission freezes ordinary-work and total cutoffs within it.
 ///
 /// This is intentionally independent from [`ExecutionBudget`]: round limits
 /// may auto-expand as the runtime makes progress, while elapsed wall time must
-/// never be replenished. A missing value preserves the legacy unbounded
-/// wall-clock behavior. Servers must treat this client-provided value as an
+/// never be replenished. A missing value means unbounded wall-clock execution.
+/// Servers must treat this client-provided value as an
 /// upper bound and monotonically decrease it at later model boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionTimeBudget {
@@ -419,7 +419,9 @@ pub struct ExecutionTimeBudget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionDeadlineAuthority {
     pub deadline_unix_ms: u64,
+    pub work_deadline_unix_ms: u64,
     monotonic_deadline: std::time::Instant,
+    monotonic_work_deadline: std::time::Instant,
 }
 
 impl ExecutionDeadlineAuthority {
@@ -429,12 +431,17 @@ impl ExecutionDeadlineAuthority {
             .checked_mul(1_000)
             .and_then(|duration| now_unix_ms.checked_add(duration))
             .ok_or_else(|| "execution time budget exceeds supported deadline range".to_string())?;
-        let monotonic_deadline = std::time::Instant::now()
-            .checked_add(Duration::from_secs(budget.remaining_seconds))
+        let available = Duration::from_secs(budget.remaining_seconds);
+        let reserve = astra_turn_types::final_synthesis_reserve(available);
+        let monotonic_deadline = tokio::time::Instant::now()
+            .into_std()
+            .checked_add(available)
             .ok_or_else(|| "execution time budget exceeds monotonic clock range".to_string())?;
         Ok(Self {
             deadline_unix_ms,
+            work_deadline_unix_ms: deadline_unix_ms - reserve.as_millis() as u64,
             monotonic_deadline,
+            monotonic_work_deadline: monotonic_deadline - reserve,
         })
     }
 
@@ -442,28 +449,55 @@ impl ExecutionDeadlineAuthority {
         self.monotonic_deadline
     }
 
+    pub fn monotonic_work_deadline(self) -> std::time::Instant {
+        self.monotonic_work_deadline
+    }
+
+    pub fn remaining_at(self, now: std::time::Instant) -> astra_turn_types::ExecutionTimeRemaining {
+        astra_turn_types::ExecutionTimeRemaining {
+            work_remaining: self.monotonic_work_deadline.saturating_duration_since(now),
+            total_remaining: self.monotonic_deadline.saturating_duration_since(now),
+        }
+    }
+
+    /// Independently tighten both frozen cutoffs; a retry cannot repartition
+    /// time and reopen an already closed ordinary-work window.
+    pub fn tighten_to(&mut self, candidate: Self) {
+        if candidate.monotonic_deadline < self.monotonic_deadline {
+            self.monotonic_deadline = candidate.monotonic_deadline;
+            self.deadline_unix_ms = candidate.deadline_unix_ms;
+        }
+        if candidate.monotonic_work_deadline < self.monotonic_work_deadline {
+            self.monotonic_work_deadline = candidate.monotonic_work_deadline;
+            self.work_deadline_unix_ms = candidate.work_deadline_unix_ms;
+        }
+    }
+
     /// Remaining time according to the monotonic authority clock.
     pub fn remaining(self) -> Duration {
         self.monotonic_deadline
-            .saturating_duration_since(std::time::Instant::now())
+            .saturating_duration_since(tokio::time::Instant::now().into_std())
     }
 
     /// Derive a strictly earlier deadline while reserving time for the parent
     /// to consume the child result. The absolute deadline is narrowed; it is
     /// never reconstructed from a relative snapshot, so retries and nested
     /// delegation cannot replenish elapsed time.
-    pub fn with_parent_reserve(self, reserve: Duration) -> Option<Self> {
-        if self.remaining() <= reserve {
-            return None;
-        }
-        let monotonic_deadline = self.monotonic_deadline.checked_sub(reserve)?;
-        let reserve_ms = reserve.as_nanos().div_ceil(1_000_000);
-        let reserve_ms = u64::try_from(reserve_ms).ok()?;
-        let deadline_unix_ms = self.deadline_unix_ms.checked_sub(reserve_ms)?;
-        Some(Self {
+    pub fn child_with_delivery_grace(self, grace: Duration) -> Option<Self> {
+        let now = tokio::time::Instant::now().into_std();
+        let monotonic_deadline = self.monotonic_work_deadline.checked_sub(grace)?;
+        let available = monotonic_deadline.checked_duration_since(now)?;
+        let reserve = astra_turn_types::final_synthesis_reserve(available);
+        let grace_ms = u64::try_from(grace.as_nanos().div_ceil(1_000_000)).ok()?;
+        let deadline_unix_ms = self.work_deadline_unix_ms.checked_sub(grace_ms)?;
+        let child = Self {
             deadline_unix_ms,
+            work_deadline_unix_ms: deadline_unix_ms
+                .checked_sub(u64::try_from(reserve.as_nanos().div_ceil(1_000_000)).ok()?)?,
             monotonic_deadline,
-        })
+            monotonic_work_deadline: monotonic_deadline.checked_sub(reserve)?,
+        };
+        child.remaining_at(now).has_work().then_some(child)
     }
 }
 
@@ -486,6 +520,8 @@ pub enum DurableExecutionRestrictions {
         execution_budget: Option<ExecutionBudget>,
         #[serde(deserialize_with = "deserialize_required_option")]
         execution_deadline_unix_ms: Option<u64>,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        execution_work_deadline_unix_ms: Option<u64>,
     },
 }
 
@@ -498,6 +534,19 @@ where
 }
 
 impl DurableExecutionRestrictions {
+    fn validate(&self) -> Result<(), &'static str> {
+        let Self::V1 {
+            execution_deadline_unix_ms: total,
+            execution_work_deadline_unix_ms: work,
+            ..
+        } = self;
+        match (work, total) {
+            (None, None) => Ok(()),
+            (Some(work), Some(total)) if work <= total => Ok(()),
+            _ => Err("execution work and total cutoffs must be paired and ordered"),
+        }
+    }
+
     pub fn from_admitted_request(request: &ChatRequestData) -> Result<Self, String> {
         if request.execution_time_budget.is_some() != request.admitted_execution_deadline.is_some()
         {
@@ -513,6 +562,9 @@ impl DurableExecutionRestrictions {
             allow_skill_sources: request.allow_skill_sources.clone(),
             execution_budget: request.execution_budget,
             execution_deadline_unix_ms,
+            execution_work_deadline_unix_ms: request
+                .admitted_execution_deadline
+                .map(|deadline| deadline.work_deadline_unix_ms),
         })
     }
 
@@ -2294,7 +2346,14 @@ impl DurableRunRecord {
             .iter()
             .find(|event| event["event_type"] == "run_started")
             .and_then(|event| event.get("data")?.get("execution_restrictions"))
-            .map(|value| serde_json::from_value(value.clone()))
+            .map(|value| {
+                let restrictions: DurableExecutionRestrictions =
+                    serde_json::from_value(value.clone())?;
+                restrictions
+                    .validate()
+                    .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+                Ok(restrictions)
+            })
             .transpose()
     }
 }
@@ -26811,6 +26870,127 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn execution_deadline_uses_one_clock_for_creation_observation_and_children() {
+        let zero = super::ExecutionDeadlineAuthority::from_budget_at(
+            super::ExecutionTimeBudget {
+                remaining_seconds: 0,
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(zero.remaining(), std::time::Duration::ZERO);
+        let admitted = super::ExecutionDeadlineAuthority::from_budget_at(
+            super::ExecutionTimeBudget {
+                remaining_seconds: 100,
+            },
+            0,
+        )
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(71)).await;
+        let remaining = admitted.remaining_at(tokio::time::Instant::now().into_std());
+        assert_eq!(remaining.work_remaining, std::time::Duration::ZERO);
+        assert_eq!(
+            remaining.total_remaining,
+            std::time::Duration::from_secs(29)
+        );
+        assert_eq!(admitted.remaining(), remaining.total_remaining);
+        assert!(
+            admitted
+                .child_with_delivery_grace(std::time::Duration::from_secs(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn execution_deadline_freezes_work_and_total_cutoffs() {
+        for seconds in [0, 1, 2, 20, 60, 100] {
+            let deadline = super::ExecutionDeadlineAuthority::from_budget_at(
+                super::ExecutionTimeBudget {
+                    remaining_seconds: seconds,
+                },
+                100_000,
+            )
+            .unwrap();
+            let total = std::time::Duration::from_secs(seconds);
+            let start = deadline.monotonic_deadline() - total;
+            let reserve = astra_turn_types::final_synthesis_reserve(total);
+            let initial = deadline.remaining_at(start);
+            assert_eq!(initial.total_remaining, total);
+            assert_eq!(initial.work_remaining, total - reserve);
+            assert_eq!(
+                deadline.work_deadline_unix_ms,
+                100_000 + (total - reserve).as_millis() as u64
+            );
+            let at_work_cutoff = deadline.remaining_at(deadline.monotonic_work_deadline());
+            assert!(!at_work_cutoff.has_work());
+            assert_eq!(at_work_cutoff.total_remaining, reserve);
+            assert_eq!(
+                deadline
+                    .remaining_at(deadline.monotonic_deadline())
+                    .total_remaining,
+                std::time::Duration::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn execution_deadline_replay_only_tightens_both_phases() {
+        let mut authority = super::ExecutionDeadlineAuthority::from_budget_at(
+            super::ExecutionTimeBudget {
+                remaining_seconds: 20,
+            },
+            100_000,
+        )
+        .unwrap();
+        let original = authority;
+        authority.tighten_to(
+            super::ExecutionDeadlineAuthority::from_budget_at(
+                super::ExecutionTimeBudget {
+                    remaining_seconds: 100,
+                },
+                100_000,
+            )
+            .unwrap(),
+        );
+        assert_eq!(authority, original);
+        let narrowed = super::ExecutionDeadlineAuthority::from_budget_at(
+            super::ExecutionTimeBudget {
+                remaining_seconds: 2,
+            },
+            100_000,
+        )
+        .unwrap();
+        authority.tighten_to(narrowed);
+        assert_eq!(authority, narrowed);
+        authority.tighten_to(original);
+        assert_eq!(authority, narrowed);
+    }
+
+    #[test]
+    fn child_deadline_uses_parent_work_cutoff_and_keeps_short_work_usable() {
+        for seconds in [10, 48, 100] {
+            let parent = super::ExecutionDeadlineAuthority::from_budget_at(
+                super::ExecutionTimeBudget {
+                    remaining_seconds: seconds,
+                },
+                100_000,
+            )
+            .unwrap();
+            let child = parent.child_with_delivery_grace(std::time::Duration::from_secs(5));
+            if seconds == 10 {
+                assert!(child.is_none());
+            } else {
+                let child = child.unwrap();
+                assert_eq!(
+                    child.monotonic_deadline(),
+                    parent.monotonic_work_deadline() - std::time::Duration::from_secs(5)
+                );
+                assert!(child.remaining_at(std::time::Instant::now()).has_work());
+                assert!(child.monotonic_work_deadline() < child.monotonic_deadline());
+            }
+        }
+    }
     #[test]
     fn admitted_profile_snapshot_rebuild_preserves_controls_and_rejects_invalid_authority() {
         use crate::coordination::{AgentProfile, AgentTier};

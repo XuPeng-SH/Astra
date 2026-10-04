@@ -215,7 +215,7 @@ pub use server::{build_app, build_server_state, serve};
 
 // ── Re-exports: orchestration ────────────────────────────────────────────────
 
-pub use orchestration::{AgentHistoryRecord, AgentRegistry};
+pub use orchestration::AgentHistoryRecord;
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 

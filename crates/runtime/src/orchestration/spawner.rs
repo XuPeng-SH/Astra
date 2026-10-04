@@ -3015,8 +3015,6 @@ pub struct DynamicAgentSpawner {
     /// Explicit test/local journal root captured at the session ownership
     /// boundary. Tokio blocking workers do not inherit thread-local guards.
     journal_dir_override: Arc<std::sync::RwLock<Option<PathBuf>>>,
-    /// Agent type registry (builtins + user-defined).
-    agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry,
     /// Completed agents archive for history queries.
     completed_agents: Arc<RwLock<VecDeque<SpawnedAgentState>>>,
     /// Strong ownership of the task supervisor exists only on the
@@ -3171,10 +3169,7 @@ struct CancellationRetryBatchGuard {
 fn foreground_child_has_work_time(
     deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
 ) -> bool {
-    deadline.is_none_or(|deadline| {
-        deadline.remaining()
-            >= astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET
-    })
+    deadline.is_none_or(|deadline| deadline.remaining_at(std::time::Instant::now()).has_work())
 }
 
 impl CancellationRetryBatchGuard {
@@ -3247,8 +3242,6 @@ impl DynamicAgentSpawner {
             journal_dir_override: Arc::new(std::sync::RwLock::new(
                 astra_services::session_journal::current_journal_dir_override(),
             )),
-            agent_registry:
-                astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(VecDeque::new())),
             background_tasks: Arc::downgrade(&background_task_owner),
             _background_task_owner: Some(background_task_owner),
@@ -6284,11 +6277,6 @@ impl DynamicAgentSpawner {
         event.metadata = metadata;
         self.write_trace_event(event).await;
     }
-    /// Get a reference to the agent registry.
-    pub fn agent_registry(&self) -> &astra_turn_core::orchestration_team_config::AgentRegistry {
-        &self.agent_registry
-    }
-
     /// Check if an executor is configured.
     pub fn has_executor(&self) -> bool {
         self.executor.is_some()
@@ -6613,7 +6601,11 @@ impl DynamicAgentSpawner {
         let agent_def = admitted_profile
             .as_ref()
             .map(Self::agent_definition_from_admitted_profile)
-            .or_else(|| self.agent_registry.get(&input.agent_type))
+            .or_else(|| {
+                astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types()
+                    .into_iter()
+                    .find(|definition| definition.agent_type == input.agent_type)
+            })
             .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
         // An isolated child requires filesystem/process work to provision a
         // worktree. Decide that capability before allocating IDs, reserving
@@ -9904,7 +9896,6 @@ impl DynamicAgentSpawner {
             executor: self.executor.clone(),
             session_id: self.session_id.clone(),
             journal_dir_override: Arc::clone(&self.journal_dir_override),
-            agent_registry: self.agent_registry.clone(),
             completed_agents: Arc::clone(&self.completed_agents),
             _background_task_owner: None,
             background_tasks: self.background_tasks.clone(),
@@ -11568,7 +11559,12 @@ pub(crate) mod tests {
             host.direct_child_owner = Some(parent);
             let mut state = make_state();
             if deadline {
-                host = host.with_execution_time_budget_remaining(Duration::from_secs(30));
+                host = host.with_execution_time_budget_remaining(
+                    astra_turn_types::ExecutionTimeRemaining {
+                        work_remaining: Duration::ZERO,
+                        total_remaining: Duration::from_secs(30),
+                    },
+                );
             } else {
                 state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(1);
             }
@@ -15168,12 +15164,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_unknown_agent_type() {
         let spawner = DynamicAgentSpawner::new(mock_router());
-        let input = SpawnAgentInput {
-            description: "Test".to_string(),
-            prompt: "Test".to_string(),
-            agent_type: "unknown-type".to_string(),
-            ..Default::default()
-        };
         let context = SpawnContext {
             parent_profile_authority: ParentProfileAuthority::Unbound,
             admitted_agent_profiles: None,
@@ -15196,8 +15186,35 @@ pub(crate) mod tests {
             delegation_chain: Vec::new(),
         };
 
-        let result = spawner.spawn(input, &context).await;
-        assert!(matches!(result, Err(SpawnError::UnknownAgentType(_))));
+        for agent_type in [
+            "unknown-type",
+            "code_review",
+            "codereview",
+            "general_purpose",
+            "generalpurpose",
+            "general",
+            "EXPLORE",
+            "CODE-REVIEW",
+            "TASK",
+            "GENERAL-PURPOSE",
+            " explore",
+            "explore ",
+            " code-review ",
+            " task ",
+            "general-purpose\t",
+        ] {
+            let input = SpawnAgentInput {
+                description: "Test".to_string(),
+                prompt: "Test".to_string(),
+                agent_type: agent_type.to_string(),
+                ..Default::default()
+            };
+            let result = spawner.spawn(input, &context).await;
+            assert!(
+                matches!(result, Err(SpawnError::UnknownAgentType(ref rejected)) if rejected == agent_type),
+                "noncanonical built-in name {agent_type:?} must be rejected unchanged, got {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -21629,23 +21646,25 @@ pub(crate) mod tests {
     async fn wait_for_agent_returns_immediately_when_completed() {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+        let context = make_bg_context();
 
-        let result = spawner
-            .spawn(make_bg_input(), &make_bg_context())
-            .await
-            .unwrap();
-        let agent_id = match result {
-            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-        };
+        for agent_type in ["explore", "code-review", "task", "general-purpose"] {
+            let mut input = make_bg_input();
+            input.agent_type = agent_type.to_string();
+            let result = spawner.spawn(input, &context).await.unwrap();
+            let agent_id = match result {
+                SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            };
 
-        // Wait for background task to complete via the notifier.
-        let status = spawner
-            .wait_for_agent(&agent_id, std::time::Duration::from_secs(5))
-            .await;
-        assert!(
-            matches!(status, Some(AgentStatus::Completed { .. })),
-            "wait_for_agent must return Completed, got {status:?}"
-        );
+            // Wait for background task to complete via the notifier.
+            let status = spawner
+                .wait_for_agent(&agent_id, std::time::Duration::from_secs(5))
+                .await;
+            assert!(
+                matches!(status, Some(AgentStatus::Completed { .. })),
+                "wait_for_agent must return Completed for {agent_type}, got {status:?}"
+            );
+        }
     }
 
     #[tokio::test]
