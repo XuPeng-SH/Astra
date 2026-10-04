@@ -1019,6 +1019,67 @@ pub struct SessionAdmissionFacts {
     pub active_plan_id: Option<String>,
 }
 
+pub use astra_turn_types::AgentProfileSelection;
+
+/// Immutable admitted configuration. Runtime registries and credentials are
+/// deliberately not part of the protected run-start facts.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileSnapshot {
+    pub owner_user_id: String,
+    pub source_team_id: String,
+    pub lead_agent_id: Option<String>,
+    pub profiles: Vec<crate::coordination::AgentProfile>,
+}
+
+impl std::fmt::Debug for AgentProfileSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentProfileSnapshot")
+            .field("profile_count", &self.profiles.len())
+            .field("has_selected_lead", &self.lead_agent_id.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentProfileSnapshot {
+    /// Rebuild the existing registry from protected facts, never from a
+    /// client-authored registry or last-writer-wins map.
+    pub fn registry(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<crate::coordination::AgentProfileRegistry, String> {
+        if self.owner_user_id != owner_user_id || self.source_team_id.trim().is_empty() {
+            return Err("agent profile snapshot owner or source is invalid".into());
+        }
+        if self.profiles.is_empty() || self.profiles.len() > 64 {
+            return Err("agent profile snapshot requires between 1 and 64 profiles".into());
+        }
+        if serde_json::to_vec(self)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 262_144
+        {
+            return Err("agent profile snapshot exceeds its byte budget".into());
+        }
+        let mut registry = crate::coordination::AgentProfileRegistry::new();
+        for profile in &self.profiles {
+            if !profile.mcp_servers.is_empty() {
+                return Err("profile MCP selection is not supported by the shared execution binding; inherit the authorized parent MCP scope".into());
+            }
+            registry.register(profile.clone())?;
+        }
+        if self
+            .lead_agent_id
+            .as_ref()
+            .is_some_and(|lead| registry.get(lead).is_none())
+        {
+            return Err("selected lead is not an admitted member".into());
+        }
+        Ok(registry)
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     /// Trusted, non-serialized observation binding. No catalog is read until
@@ -1038,6 +1099,9 @@ pub struct ChatRequestData {
     pub run_start_idempotency: Option<RunStartIdempotency>,
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
+    pub agent_profile_selection: Option<AgentProfileSelection>,
+    /// Server-materialized facts; never accepted from client transports.
+    pub admitted_agent_profiles: Option<std::sync::Arc<AgentProfileSnapshot>>,
     pub model: Option<String>,
     /// Optional exact-name assertion for a client-prepared child Offering.
     /// This is not execution authority; the Server freshly admits the
@@ -11812,6 +11876,29 @@ impl DatabaseRunStateStore {
                ) ranked_terminal WHERE recovery_rank = 1",
         );
         if !recovery_event_run_ids.is_empty() {
+            // Runtime identity is an admission fact, not terminal progress.
+            // Keep every admission so the consumer can reject ambiguity;
+            // ranking to the latest one would hide conflicting identities.
+            // The recovery consumer needs no private profile/model snapshot.
+            builder
+                .push(
+                    " UNION ALL SELECT run_id, event_idx,
+                    CAST(JSON_OBJECT('event_type', 'run_started', 'data',
+                        JSON_OBJECT('child_runtime_id',
+                            JSON_EXTRACT(payload_json, '$.data.child_runtime_id'))) AS CHAR) AS payload_json
+                    FROM agent_run_events WHERE user_id = ",
+                )
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type = 'run_started' AND run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &recovery_event_run_ids {
+                    ids.push_bind(*run_id);
+                }
+            }
+            builder.push(")");
             builder.push(
                 "
                UNION ALL
@@ -19798,14 +19885,15 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        if events
+        let keys = events
             .iter()
-            .any(|event| extract_optional_string(event, "idempotency_key").is_none())
-        {
-            return Err(
-                "generation-fenced append requires an idempotency key on every event".to_string(),
-            );
-        }
+            .map(|event| {
+                extract_optional_string(event, "idempotency_key").ok_or_else(|| {
+                    "generation-fenced append requires an idempotency key on every event"
+                        .to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| {
@@ -19835,77 +19923,42 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(false);
         }
 
+        let existing_events = self
+            .load_run_control_events_by_keys_tx(
+                &mut tx,
+                user_id,
+                run_id,
+                &keys,
+                "generation_fenced_append_load_idempotency",
+            )
+            .await?
+            .into_iter()
+            .map(|event| (event.idempotency_key, event.payload))
+            .collect::<HashMap<_, _>>();
         let mut events_to_commit = Vec::with_capacity(events.len());
-        for event in events {
-            if let Some(key) = extract_optional_string(event, "idempotency_key") {
-                let existing = sqlx::query(
-                    "SELECT payload_json FROM agent_run_events
-                     WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(run_id)
-                .bind(&key)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|source| {
-                    db_error("generation_fenced_append_load_idempotency", run_id, source)
-                        .to_string()
-                })?;
-                if let Some(row) = existing {
-                    let payload_json: String = row.try_get("payload_json").map_err(|source| {
+        let mut staged_keys = HashMap::with_capacity(events.len());
+        for (event, key) in events.iter().zip(keys) {
+            let previous = existing_events
+                .get(&key)
+                .or_else(|| staged_keys.get(&key).map(|&index| &events_to_commit[index]));
+            if let Some(previous) = previous {
+                if !run_events_have_same_immutable_payload(previous, event) {
+                    tx.rollback().await.map_err(|source| {
                         db_error(
-                            "generation_fenced_append_decode_idempotency",
+                            "generation_fenced_append_rollback_immutable_conflict",
                             run_id,
                             source,
                         )
                         .to_string()
                     })?;
-                    let existing: serde_json::Value =
-                        serde_json::from_str(&payload_json).map_err(|source| {
-                            DatabaseRunStateStoreError::Json {
-                                operation: "generation_fenced_append_decode_payload",
-                                entity: run_id.to_string(),
-                                source,
-                            }
-                            .to_string()
-                        })?;
-                    if !run_events_have_same_immutable_payload(&existing, event) {
-                        tx.rollback().await.map_err(|source| {
-                            db_error(
-                                "generation_fenced_append_rollback_immutable_conflict",
-                                run_id,
-                                source,
-                            )
-                            .to_string()
-                        })?;
-                        connection.release();
-                        return Err(format!(
-                            "immutable run event conflict for idempotency key {key}"
-                        ));
-                    }
-                    continue;
+                    connection.release();
+                    return Err(format!(
+                        "immutable run event conflict for idempotency key {key}"
+                    ));
                 }
-                if let Some(staged) = events_to_commit.iter().find(|staged| {
-                    extract_optional_string(staged, "idempotency_key").as_deref()
-                        == Some(key.as_str())
-                }) {
-                    if !run_events_have_same_immutable_payload(staged, event) {
-                        tx.rollback().await.map_err(|source| {
-                            db_error(
-                                "generation_fenced_append_rollback_staged_conflict",
-                                run_id,
-                                source,
-                            )
-                            .to_string()
-                        })?;
-                        connection.release();
-                        return Err(format!(
-                            "immutable run event conflict for idempotency key {key}"
-                        ));
-                    }
-                    continue;
-                }
+                continue;
             }
+            staged_keys.insert(key, events_to_commit.len());
             events_to_commit.push(event.clone());
         }
         if events_to_commit.is_empty() {
@@ -19984,6 +20037,27 @@ impl RunStateStore for DatabaseRunStateStore {
         if let Err(source) = tx.commit().await {
             drop(connection);
             let commit_error = db_error("generation_fenced_append_commit", run_id, source);
+            let keys = event_rows
+                .iter()
+                .map(|event| {
+                    event
+                        .idempotency_key
+                        .clone()
+                        .expect("generation-fenced events validated idempotency keys")
+                })
+                .collect::<Vec<_>>();
+            let durable_hashes = self
+                .load_run_control_events_by_keys(
+                    user_id,
+                    run_id,
+                    &keys,
+                    "generation_fenced_append_reconcile_commit",
+                )
+                .await
+                .map_err(|error| format!("{commit_error}; {error}"))?
+                .into_iter()
+                .map(|event| (event.idempotency_key, event.event_hash))
+                .collect::<HashMap<_, _>>();
             let mut exact = 0usize;
             let mut missing = 0usize;
             for event in &event_rows {
@@ -19991,27 +20065,8 @@ impl RunStateStore for DatabaseRunStateStore {
                     .idempotency_key
                     .as_deref()
                     .expect("generation-fenced events validated idempotency keys");
-                let durable_hash: Option<String> = sqlx::query_scalar(
-                    "SELECT event_hash FROM agent_run_events
-                     WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(run_id)
-                .bind(idempotency_key)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|reconcile_source| {
-                    format!(
-                        "{commit_error}; {}",
-                        db_error(
-                            "generation_fenced_append_reconcile_commit",
-                            run_id,
-                            reconcile_source,
-                        )
-                    )
-                })?;
-                match durable_hash {
-                    Some(hash) if hash == event.event_hash => exact += 1,
+                match durable_hashes.get(idempotency_key) {
+                    Some(hash) if hash == &event.event_hash => exact += 1,
                     Some(_) => {
                         return Err(format!(
                             "{commit_error}; immutable run event conflict for idempotency key {}",
@@ -27512,6 +27567,47 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_profile_snapshot_rebuild_preserves_controls_and_rejects_invalid_authority() {
+        use crate::coordination::{AgentProfile, AgentTier};
+        let mut member = AgentProfile::new("member", "Member", AgentTier::System);
+        member.allow_tools = Some(Vec::new());
+        member.read_only = true;
+        member.system_prompt = Some("private member instructions".into());
+        member.max_turns = Some(3);
+        let snapshot = super::AgentProfileSnapshot {
+            owner_user_id: "owner".into(),
+            source_team_id: "team".into(),
+            lead_agent_id: Some("member".into()),
+            profiles: vec![member.clone()],
+        };
+        let restored: super::AgentProfileSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert!(!format!("{restored:?}").contains("private member instructions"));
+        assert_eq!(
+            restored.registry("owner").unwrap().get("member"),
+            Some(&member)
+        );
+        assert!(restored.registry("other-owner").is_err());
+        let mut invalid = restored.clone();
+        invalid.profiles.push(member);
+        assert!(invalid.registry("owner").is_err());
+        invalid = restored.clone();
+        invalid.lead_agent_id = Some("absent".into());
+        assert!(invalid.registry("owner").is_err());
+        invalid = restored.clone();
+        invalid.profiles[0].mcp_servers = vec!["unresolved-binding".into()];
+        assert!(
+            invalid
+                .registry("owner")
+                .err()
+                .unwrap()
+                .contains("MCP selection")
+        );
+        invalid = restored;
+        invalid.profiles[0].max_turns = Some(0);
+        assert!(invalid.registry("owner").is_err());
+    }
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
@@ -32417,6 +32513,24 @@ mod tests {
         child.ancestor_path = Some(format!("{root_id}/{child_id}"));
         child.depth = 1;
         child.agent_id = Some("reviewer".into());
+        let mut profile = crate::coordination::AgentProfile::new(
+            "reviewer",
+            "Reviewer",
+            crate::coordination::AgentTier::System,
+        );
+        profile.system_prompt = Some("x".repeat(200 * 1024));
+        let snapshot = AgentProfileSnapshot {
+            owner_user_id: user_id.clone(),
+            source_team_id: "recovery-team".into(),
+            lead_agent_id: Some("reviewer".into()),
+            profiles: vec![profile],
+        };
+        snapshot.registry(&user_id).unwrap();
+        child.events = vec![serde_json::json!({
+            "event_type": "run_started",
+            "data": {"child_runtime_id": "reviewer", "run_id": child_id,
+                "admitted_agent_profiles": snapshot}
+        })];
         store.insert_run(child).await.unwrap();
         store
             .append_events_batch(
@@ -32427,7 +32541,7 @@ mod tests {
                         "type": "agent_spawned",
                         "run_id": child_id,
                         "agent_id": "reviewer",
-                        "agent_type": "code-review",
+                        "agent_type": "reviewer",
                         "description": "review storage",
                         "fanout_slot": {"group_id":"review","target_count":1,"slot_index":0,"slot_id":"correctness"}
                     }),
@@ -32499,7 +32613,12 @@ mod tests {
             noise.root_run_id = Some(root_id.clone());
             noise.ancestor_path = Some(format!("{root_id}/{noise_id}"));
             noise.depth = 1;
-            noise.agent_id = Some(format!("noise-{index}"));
+            noise.agent_id = Some("reviewer".into());
+            noise.events = vec![serde_json::json!({
+                "event_type": "run_started",
+                "data": {"child_runtime_id": format!("reviewer-{index}"), "run_id": noise_id,
+                    "admitted_agent_profiles": snapshot}
+            })];
             store.insert_run(noise).await.unwrap();
         }
         sqlx::query(
@@ -32546,8 +32665,15 @@ mod tests {
         assert_eq!(root.events[1]["type"], "fanout_group_cancelled");
         assert_eq!(root.events[1]["data"]["group_id"], "review-b");
         assert_eq!(child.status, STATUS_RUNNING);
-        assert_eq!(child.events.len(), 1);
-        assert_eq!(child.events[0]["data"]["attempt"], 39);
+        assert_eq!(child.events.len(), 2);
+        assert_eq!(
+            child.events[0],
+            serde_json::json!({
+                "event_type": "run_started", "data": {"child_runtime_id": "reviewer"}
+            }),
+            "recovery reads only identity despite the large legal private snapshot"
+        );
+        assert_eq!(child.events[1]["data"]["attempt"], 39);
         assert_eq!(
             active_page.recovery_next_cursor.as_deref(),
             Some(child_id.as_str())
@@ -32561,7 +32687,49 @@ mod tests {
             after_page.recovery_cancellation_run_ids,
             vec![child_id.clone()]
         );
-        assert!(after_page.runs.iter().any(|run| run.run_id == child_id));
+        let after_child = after_page
+            .runs
+            .iter()
+            .find(|run| run.run_id == child_id)
+            .unwrap();
+        assert_eq!(
+            after_child.events[0]["data"]["child_runtime_id"],
+            "reviewer"
+        );
+
+        store
+            .recovery_batch_reads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let exact_page = store
+            .load_session_agent_recovery_for(
+                &user_id,
+                &session_id,
+                &[child_id.clone(), noise_ids[0].clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .recovery_batch_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "child identities use the existing row and event batches"
+        );
+        for (run_id, runtime_id) in [(&child_id, "reviewer"), (&noise_ids[0], "reviewer-0")] {
+            let run = exact_page
+                .runs
+                .iter()
+                .find(|run| run.run_id == *run_id)
+                .unwrap();
+            assert_eq!(run.agent_id.as_deref(), Some("reviewer"));
+            assert_eq!(run.events[0]["data"]["child_runtime_id"], runtime_id);
+        }
+        let full_child = store.load_run(&user_id, &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            full_child.events[0]["data"]["admitted_agent_profiles"],
+            serde_json::json!(snapshot),
+            "the original admission remains fully persisted"
+        );
         let wrapped_page = store
             .load_session_agent_recovery(&user_id, &session_id, 2)
             .await
@@ -32606,9 +32774,54 @@ mod tests {
             .find(|run| run.run_id == child_id)
             .unwrap();
         assert_eq!(child.status, STATUS_CANCELLED);
-        assert_eq!(child.events.len(), 1);
-        assert_eq!(child.events[0]["event_type"], "run_finished");
-        assert_eq!(child.events[0]["data"]["cancellation_origin"], "user");
+        assert_eq!(child.events.len(), 2);
+        assert_eq!(child.events[0]["data"]["child_runtime_id"], "reviewer");
+        assert_eq!(child.events[1]["event_type"], "run_finished");
+        assert_eq!(child.events[1]["data"]["cancellation_origin"], "user");
+
+        store
+            .append_events_batch(
+                &user_id,
+                &session_id,
+                &child_id,
+                &[
+                    serde_json::json!({
+                        "event_type": "run_started",
+                        "data": {"child_runtime_id": "conflicting-reviewer", "run_id": child_id}
+                    }),
+                    serde_json::json!({
+                        "event_type": "run_started", "data": {"child_runtime_id": 7}
+                    }),
+                    serde_json::json!({"event_type": "run_started", "data": {}}),
+                ],
+            )
+            .await
+            .unwrap();
+        let ambiguous = store
+            .load_session_agent_recovery_for(&user_id, &session_id, std::slice::from_ref(&child_id))
+            .await
+            .unwrap();
+        let child = ambiguous
+            .runs
+            .iter()
+            .find(|run| run.run_id == child_id)
+            .unwrap();
+        let identities = child
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_started")
+            .map(|event| event["data"]["child_runtime_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                serde_json::json!("reviewer"),
+                serde_json::json!("conflicting-reviewer"),
+                serde_json::json!(7),
+                serde_json::Value::Null
+            ],
+            "the reader preserves duplicate admissions and JSON types for fail-closed recovery"
+        );
 
         for run_id in [&root_id, &child_id].into_iter().chain(noise_ids.iter()) {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
@@ -39856,6 +40069,8 @@ mod tests {
         forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
 
         let request = ChatRequestData {
+            agent_profile_selection: None,
+            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
@@ -40064,6 +40279,8 @@ mod tests {
     #[test]
     fn chat_request_data_debug_redacts_runtime_auth_value() {
         let request = ChatRequestData {
+            agent_profile_selection: None,
+            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
@@ -40188,6 +40405,8 @@ mod tests {
             .create_run(
                 "u1".to_string(),
                 ChatRequestData {
+                    agent_profile_selection: None,
+                    admitted_agent_profiles: None,
                     model_catalog_reader: None,
                     message: "hi".to_string(),
                     user_intent: None,

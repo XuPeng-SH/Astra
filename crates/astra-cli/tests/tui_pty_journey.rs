@@ -19,6 +19,9 @@ const DA1_RESPONSE_WITHOUT_SIXEL: &[u8] = b"\x1b[?1;2c";
 // PTY and mock server is isolated. Keep UI transitions bounded, but do not use
 // a sub-suite timing assumption as the product contract.
 const UI_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
+const LIVE_TEAM_API_URL_ENV: &str = "ASTRA_TUI_LIVE_API_URL";
+const LIVE_TEAM_MODEL_ENV: &str = "ASTRA_TUI_LIVE_MODEL";
+const LIVE_TEAM_ACCESS_TOKEN_ENV: &str = "ASTRA_TUI_LIVE_ACCESS_TOKEN";
 
 /// A PTY journey owns a controlling terminal and flips the child into raw
 /// mode. Keep those process-level terminal journeys serial even though their
@@ -47,6 +50,16 @@ struct PtyAstra {
 
 impl PtyAstra {
     fn spawn(home: &std::path::Path, api_url: &str) -> Self {
+        Self::spawn_with_config(home, api_url, "mock-model", "pty-journey-token", &[])
+    }
+
+    fn spawn_with_config(
+        home: &std::path::Path,
+        api_url: &str,
+        model: &str,
+        access_token: &str,
+        launch_args: &[&str],
+    ) -> Self {
         let size = Winsize {
             ws_row: 30,
             ws_col: 100,
@@ -61,13 +74,14 @@ impl PtyAstra {
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_astra"));
         child
+            .args(launch_args)
             .args([
                 "--api-url",
                 api_url,
                 "--profile",
                 "pty-journey",
                 "--model",
-                "mock-model",
+                model,
                 "--bare",
                 "--no-instructions",
                 "interactive",
@@ -80,9 +94,10 @@ impl PtyAstra {
             // This is the documented gateway hand-off contract. It bypasses
             // interactive login validation but keeps normal request auth and
             // the full chat turn path intact.
-            .env("ASTRA_ACCESS_TOKEN", "pty-journey-token")
+            .env("ASTRA_ACCESS_TOKEN", access_token)
             .env("ASTRA_API_URL", api_url)
             .env("TERM", "xterm-256color")
+            .env_remove("ASTRA_CLI_CREDENTIALS_DIR")
             .env_remove("TMUX")
             .env_remove("ZELLIJ_SESSION_NAME")
             .stdin(Stdio::from(stdin))
@@ -145,8 +160,11 @@ impl PtyAstra {
         self.write(b"\x1b[200~");
         self.write(text.as_bytes());
         self.write(b"\x1b[201~");
-        let expected = text
-            .chars()
+        // Long pastes scroll the composer; its visible suffix confirms delivery.
+        let suffix = text.chars().rev().take(120).collect::<Vec<_>>();
+        let expected = suffix
+            .into_iter()
+            .rev()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
         let deadline = Instant::now() + timeout;
@@ -167,6 +185,21 @@ impl PtyAstra {
             self.receive(Duration::from_millis(25));
         }
         self.write(b"\r");
+    }
+
+    fn select_conversation(&mut self, name: &str) {
+        self.write(&[0x07]);
+        self.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+        self.wait_for(name, UI_TRANSITION_TIMEOUT);
+        let choice = self
+            .current_screen()
+            .lines()
+            .find_map(|line| {
+                let (prefix, _) = line.split_once(&format!(". {name}"))?;
+                prefix.split_whitespace().last()?.parse::<usize>().ok()
+            })
+            .expect("conversation is selectable in the picker");
+        self.write(format!("{choice}\r").as_bytes());
     }
 
     fn signal(&self, signal: nix::sys::signal::Signal) {
@@ -190,28 +223,6 @@ impl PtyAstra {
             assert!(
                 !remaining.is_zero(),
                 "timed out waiting for {needle:?}\n{}",
-                self.screen_diagnostic()
-            );
-            self.receive(remaining.min(Duration::from_millis(100)));
-        }
-    }
-
-    fn wait_for_absent(&mut self, needle: &str, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if !self.current_screen().contains(needle) {
-                return;
-            }
-            if let Some(status) = self.child.try_wait().expect("poll Astra child") {
-                panic!(
-                    "Astra exited before clearing {needle:?} ({status})\n{}",
-                    self.screen_diagnostic()
-                );
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "timed out waiting for {needle:?} to clear\n{}",
                 self.screen_diagnostic()
             );
             self.receive(remaining.min(Duration::from_millis(100)));
@@ -318,7 +329,20 @@ impl PtyAstra {
 impl Drop for PtyAstra {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            // Give the ordinary shutdown path a bounded opportunity to cancel
+            // active execution before forcing cleanup of this owned process.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.child.id() as i32),
+                nix::sys::signal::Signal::SIGHUP,
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.child.try_wait().ok().flatten().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = self.child.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
         let _ = self.child.wait();
         if let Some(reader) = self.reader.take() {
@@ -334,43 +358,11 @@ fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
-fn selected_task_slot(screen: &str) -> Option<String> {
-    screen.lines().find_map(|line| {
-        let numbered = line.trim_start().strip_prefix('›')?.trim_start();
-        let (ordinal, _) = numbered.split_once('.')?;
-        ordinal.parse::<usize>().ok()?;
-        numbered
-            .split_once("slot ")
-            .map(|(_, slot)| slot.trim().to_string())
-    })
-}
-
-fn select_task_slot(astra: &mut PtyAstra, target: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let before = selected_task_slot(&astra.current_screen())
-            .expect("task panel has one selected stable row");
-        if before == target {
-            return;
-        }
-        astra.write(b"\x1b[B");
-        loop {
-            astra.receive(Duration::from_millis(50));
-            if selected_task_slot(&astra.current_screen()).as_deref() != Some(before.as_str()) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "task selection did not move toward {target}\n{}",
-                astra.current_screen()
-            );
-        }
-        assert!(
-            Instant::now() < deadline,
-            "could not select task slot {target}\n{}",
-            astra.current_screen()
-        );
-    }
+fn required_live_env(name: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| panic!("ignored live PTY journey requires {name}"))
 }
 
 fn seed_trusted_workspace(home: &std::path::Path) {
@@ -474,263 +466,6 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
     );
     mock.release_held_response();
     astra.wait_for("Message Astra", Duration::from_secs(15));
-}
-
-fn is_agent_journey_child_request(request: &serde_json::Value) -> bool {
-    request.get("message").and_then(serde_json::Value::as_str)
-        == Some(astra_cli::cli::mock_llm::AGENT_JOURNEY_CHILD_TASK)
-        && request
-            .pointer("/context/agent_type")
-            .and_then(serde_json::Value::as_str)
-            == Some("general-purpose")
-}
-
-fn summarize_mock_request(request: &serde_json::Value) -> String {
-    let latest_message = request
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|messages| messages.last())
-        .map(|message| {
-            let role = message
-                .get("role")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let content = message
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let calls = message
-                .get("tool_calls")
-                .and_then(serde_json::Value::as_array)
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .filter_map(|call| {
-                            call.pointer("/function/name")
-                                .and_then(serde_json::Value::as_str)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            format!("latest={role}:{content:?} calls={calls:?}")
-        })
-        .unwrap_or_else(|| "latest=<none>".to_string());
-    let edge_tool_names = request
-        .get("edge_tools")
-        .and_then(serde_json::Value::as_array)
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(|tool| {
-                    tool.pointer("/function/name")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let tool_result_names = request
-        .get("tool_results")
-        .and_then(serde_json::Value::as_array)
-        .map(|results| {
-            results
-                .iter()
-                .map(|result| {
-                    result
-                        .get("name")
-                        .or_else(|| result.get("tool"))
-                        .and_then(serde_json::Value::as_str)
-                        .or_else(|| {
-                            result
-                                .get("tool_call_id")
-                                .and_then(serde_json::Value::as_str)
-                        })
-                        .unwrap_or("<unknown>")
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let assistant_tool_calls = request
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .map(|messages| {
-            messages
-                .iter()
-                .filter(|message| {
-                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-                })
-                .flat_map(|message| {
-                    message
-                        .get("tool_calls")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                })
-                .filter_map(|call| {
-                    call.pointer("/function/name")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    format!(
-        "agent_id={:?} agent_type={:?} message={:?} context={:?} {latest_message} edge_tools={edge_tool_names:?} assistant_tool_calls={assistant_tool_calls:?} tool_results={tool_result_names:?}",
-        request.get("agent_id").and_then(serde_json::Value::as_str),
-        request
-            .get("agent_type")
-            .and_then(serde_json::Value::as_str),
-        request.get("message").and_then(serde_json::Value::as_str),
-        request.get("context"),
-    )
-}
-
-fn request_edge_profile(request: &serde_json::Value) -> Option<&serde_json::Value> {
-    request.pointer("/context/edge_profile")
-}
-
-async fn wait_for_agent_journey_child_request(
-    mock: &astra_cli::cli::mock_llm::MockLlmServer,
-    astra: &mut PtyAstra,
-    timeout: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let requests = mock.received_requests();
-        if requests.iter().any(is_agent_journey_child_request) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "mock did not receive a canonical child request; observed {} requests; latest request: {}\nPTY tail:\n{}",
-            requests.len(),
-            requests
-                .last()
-                .map(summarize_mock_request)
-                .unwrap_or_else(|| "<none>".to_string()),
-            astra.output_tail(),
-        );
-        // Keep servicing terminal capability queries while the child is
-        // starting. A real terminal answers these concurrently; a PTY test
-        // that only polls HTTP would deadlock the product on its next CPR.
-        astra.receive(Duration::from_millis(10));
-        tokio::task::yield_now().await;
-    }
-}
-
-fn is_fanout_journey_child_request(request: &serde_json::Value) -> bool {
-    let message = request.get("message").and_then(serde_json::Value::as_str);
-    request.get("context").is_some()
-        && message.is_some_and(|content| {
-            astra_cli::cli::mock_llm::FANOUT_JOURNEY_CHILD_TASKS.contains(&content)
-        })
-}
-
-fn is_fanout_reconciliation_request(request: &serde_json::Value) -> bool {
-    let message = request.get("message").and_then(serde_json::Value::as_str);
-    request.get("context").is_some()
-        && message
-            == Some(astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE)
-}
-
-fn is_fanout_status_question(request: &serde_json::Value) -> bool {
-    let message = request.get("message").and_then(serde_json::Value::as_str);
-    request.get("context").is_some()
-        && message == Some(astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION)
-}
-
-fn is_fanout_root_request(request: &serde_json::Value) -> bool {
-    !is_fanout_journey_child_request(request)
-}
-
-fn terminal_fanout_hint(
-    request: &serde_json::Value,
-    mock: &astra_cli::cli::mock_llm::MockLlmServer,
-) -> serde_json::Value {
-    let profile = request_edge_profile(request).expect("runtime reconciliation profile");
-    assert_eq!(profile["runtime_reconciliation_turn"], true);
-    let hint = profile["runtime_required_texts"]
-        .as_array()
-        .expect("required terminal facts")
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .flat_map(str::lines)
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|fact| fact["event"] == "fanout_group_settled")
-        .expect("typed fanout settlement hint");
-    assert_eq!(hint["schema"], "agent_attention_hint.v1");
-    assert_eq!(hint["group_id"], "mock-review-group");
-    let launch = mock
-        .tool_results()
-        .into_iter()
-        .find(|callback| callback["request_id"] == "call-start-fanout")
-        .expect("canonical launch callback");
-    let receipt: serde_json::Value =
-        serde_json::from_str(launch["output"].as_str().unwrap()).unwrap();
-    assert!(receipt["fanout"]["parent_run_id"].is_string());
-    assert_eq!(hint["parent_run_id"], receipt["fanout"]["parent_run_id"]);
-    assert_eq!(hint["target_count"], 3);
-    assert_eq!(hint["terminal"], 3);
-    assert_eq!(
-        hint["authoritative_result_call"],
-        serde_json::json!({
-            "tool": "agent_fanout", "action": "get_results", "group_id": "mock-review-group"
-        })
-    );
-    hint
-}
-
-async fn wait_for_three_fanout_children(
-    mock: &astra_cli::cli::mock_llm::MockLlmServer,
-    astra: &mut PtyAstra,
-) {
-    let deadline = tokio::time::Instant::now() + UI_TRANSITION_TIMEOUT;
-    loop {
-        let received = mock.received_requests();
-        let count = received
-            .iter()
-            .filter(|request| is_fanout_journey_child_request(request))
-            .count();
-        if count == 3 {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "expected three fanout child requests, got {count}; observed requests: {:?}\n{}",
-            received
-                .iter()
-                .map(summarize_mock_request)
-                .collect::<Vec<_>>(),
-            astra.screen_diagnostic()
-        );
-        astra.receive(Duration::from_millis(25));
-        tokio::task::yield_now().await;
-    }
-}
-
-async fn wait_for_completed_fanout_children(
-    mock: &astra_cli::cli::mock_llm::MockLlmServer,
-    astra: &mut PtyAstra,
-    expected: u32,
-) {
-    let deadline = tokio::time::Instant::now() + UI_TRANSITION_TIMEOUT;
-    loop {
-        let completed = mock.completed_fanout_children();
-        if completed == expected {
-            return;
-        }
-        assert!(
-            completed < expected,
-            "fanout advanced past the expected {expected} completed children; got {completed}\n{}",
-            astra.screen_diagnostic()
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "expected {expected} completed fanout children, got {completed}\n{}",
-            astra.screen_diagnostic()
-        );
-        astra.receive(Duration::from_millis(25));
-        tokio::task::yield_now().await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -838,14 +573,11 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
     astra.write(b"\r");
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
+    assert_committed_mock_write(&mock, home.path());
 
     astra.write(&[0x0f]); // Ctrl+O after the compact view observed the tool.
     astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Edited mock-output-astra-cli.txt", UI_TRANSITION_TIMEOUT);
-    assert_eq!(
-        std::fs::read_to_string(home.path().join("mock-output-astra-cli.txt")).unwrap(),
-        "Output from astra-cli\n"
-    );
 
     astra.write(&[0x0f]);
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
@@ -880,410 +612,702 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     astra.wait_for("Approval · Write File", UI_TRANSITION_TIMEOUT);
     astra.write(b"\r"); // The focused Yes action approves exactly this request.
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
+    assert_committed_mock_write(&mock, home.path());
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ctrl_g_reopens_a_child_transcript_after_completion() {
-    let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
-        astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
-    )
-    .await
-    .expect("start scripted parent and child LLM server");
-    let home = tempfile::tempdir().expect("temporary isolated Astra home");
-    seed_trusted_workspace(home.path());
-    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
-
-    astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"delegate_one_child_and_keep_it_observable\r");
-    wait_for_agent_journey_child_request(&mock, &mut astra, UI_TRANSITION_TIMEOUT).await;
-
-    // Match the established Claude Code task-management mental model: while
-    // detached work is live, the footer advertises the Shift+Down route and
-    // that exact key opens the background-task manager.
-    astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\x1b[1;2B"); // xterm Shift+Down
-    astra.wait_for("  Tasks", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\x1b"); // close the manager before opening Conversations
-    astra.wait_for_absent("  Tasks", UI_TRANSITION_TIMEOUT);
-
-    astra.write(&[0x07]); // Ctrl+G while the child response is still pending.
-    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
-
-    astra.write(b"1\r"); // Numeric selection addresses the first child, not the root tab.
-    astra.wait_for("Transcript", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("child_evidence_visible", Duration::from_secs(10));
-
-    // Ctrl+O always focuses the retained root conversation without destroying
-    // the child workspace.
-    astra.write(&[0x0f]);
-    astra.wait_for(
-        "Parent acknowledged the child launch",
-        Duration::from_secs(10),
-    );
-
-    // Completed children remain addressable from the same conversation
-    // navigator. Reopening must hydrate the stored transcript prefix rather
-    // than showing only events emitted after the view was opened.
-    astra.write(&[0x07]);
-    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
-    astra.write(b"1\r");
-    astra.wait_for("Transcript", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+fn assert_committed_mock_write(
+    mock: &astra_cli::cli::mock_llm::MockLlmServer,
+    workspace: &std::path::Path,
+) {
     assert_eq!(
-        mock.received_requests()
-            .iter()
-            .filter(|request| is_agent_journey_child_request(request))
-            .count(),
-        1,
-        "one canonical spawn result must advance the parent instead of repeating delegation"
+        std::fs::read_to_string(workspace.join("mock-output-astra-cli.txt")).unwrap(),
+        "Output from astra-cli\n",
     );
+    assert_eq!(mock.received_requests().len(), 1, "no client continuation");
+    let callbacks = mock.tool_results();
+    assert_eq!(callbacks.len(), 1, "one validated write callback");
+    assert_eq!(callbacks[0]["status"], "completed");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn asynchronous_fanout_stays_observable_and_wakes_once_after_full_settlement() {
-    let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
-        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
-    )
-    .await
-    .expect("start scripted fanout LLM server");
-    let home = tempfile::tempdir().expect("temporary isolated Astra home");
-    seed_trusted_workspace(home.path());
-    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+async fn live_team_json(
+    client: &reqwest::Client,
+    api: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut request = client.request(method, format!("{api}{path}"));
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    request
+        .send()
+        .await
+        .expect("live API request")
+        .error_for_status()
+        .expect("live API accepted request")
+        .json()
+        .await
+        .expect("live API JSON")
+}
 
-    astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"launch_three_reviews_as_one_group\r");
-    wait_for_three_fanout_children(&mock, &mut astra).await;
-    astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("one update after the group", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Three mock reviews are running.", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Shift+↓ inspect", UI_TRANSITION_TIMEOUT);
-
-    // The first two children settle while the third remains deliberately
-    // blocked. Neither completion may advance the parent model; the runtime
-    // projection, not another analysis turn, keeps the user informed.
-    assert_eq!(
-        mock.received_requests()
-            .iter()
-            .filter(|request| is_fanout_root_request(request))
-            .count(),
-        1,
-        "discovery, launch receipt and acknowledgement share one Server stream; requests: {:#?}",
-        mock.received_requests()
-            .iter()
-            .filter(|request| is_fanout_root_request(request))
-            .collect::<Vec<_>>()
-    );
-
-    astra.write(&[0x02]); // Agents are already asynchronous; Ctrl+B opens their panel.
-    astra.wait_for("Tasks", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Three mock reviews", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("slot 1: Mock review 1", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("slot 2: Mock review 2", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("slot 3: Mock review 3", UI_TRANSITION_TIMEOUT);
-    let selected_before_move = selected_task_slot(&astra.current_screen())
-        .expect("task panel has one selected stable row");
-    astra.write(b"\x1b[B");
-    let selection_deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
-    let selected_after_move = loop {
-        astra.receive(Duration::from_millis(50));
-        if let Some(selected) = selected_task_slot(&astra.current_screen())
-            && selected != selected_before_move
+fn wait_for_live_session_id(astra: &mut PtyAstra, home: &std::path::Path) -> String {
+    let store = astra_credentials::CredentialStore::with_path(home.join(".astra/credentials.json"));
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Ok(credentials) = store.load()
+            && let Some(id) = credentials
+                .profiles
+                .get("pty-journey")
+                .and_then(|profile| profile.last_session_id.as_ref())
         {
-            break selected;
+            return id.clone();
         }
         assert!(
-            Instant::now() < selection_deadline,
-            "Down did not move the stable task selection\n{}",
-            astra.current_screen()
+            Instant::now() < deadline,
+            "CLI did not persist its admitted session identity"
         );
+        astra.receive(Duration::from_millis(100));
+    }
+}
+
+fn live_tool_json(value: &serde_json::Value) -> serde_json::Value {
+    match value.as_str() {
+        Some(text) => serde_json::from_str(text).expect("structured tool arguments"),
+        None => value.clone(),
+    }
+}
+
+fn assert_live_work_artifacts(workspace: &std::path::Path, version: u64) {
+    let master: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.join("customer_master.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        master,
+        serde_json::json!({"version":version,"customers":[
+            {"id":"C001","name":if version == 1 {"Alice"} else {"Alice Updated"},"credit_limit":if version == 1 {100} else {150}},
+            {"id":"C002","name":"Bob","credit_limit":200},
+            {"id":"C003","name":"Cara","credit_limit":50}
+        ]})
+    );
+    let exceptions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.join("invoice_exceptions.json")).unwrap())
+            .unwrap();
+    let mut expected = vec![
+        serde_json::json!({"invoice_id":"I003","customer_id":"C999","amount":30,"reason":"unknown_customer"}),
+        serde_json::json!({"invoice_id":"I004","customer_id":"C003","amount":70,"reason":"over_credit_limit"}),
+    ];
+    if version == 1 {
+        expected.insert(0,serde_json::json!({"invoice_id":"I001","customer_id":"C001","amount":120,"reason":"over_credit_limit"}));
+    }
+    assert_eq!(
+        exceptions,
+        serde_json::json!({"version":version,"exceptions":expected,"total_amount":if version == 1 {220} else {100}})
+    );
+}
+
+struct LiveTeamRound {
+    root_id: String,
+    graph: serde_json::Value,
+    proposal: Option<serde_json::Value>,
+}
+
+async fn assert_live_team_round(
+    astra: &mut PtyAstra,
+    client: &reqwest::Client,
+    api: &str,
+    session_id: &str,
+    team: &serde_json::Value,
+    round: usize,
+) -> LiveTeamRound {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let tree = loop {
+        astra.receive(Duration::from_millis(25));
+        let tree = live_team_json(
+            client,
+            api,
+            reqwest::Method::GET,
+            &format!("/sessions/{session_id}/runs"),
+            None,
+        )
+        .await;
+        let roots: Vec<_> = tree["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|run| run["depth"] == 0)
+            .collect();
+        if roots.len() == round && roots.iter().all(|run| run["status"] == "completed") {
+            break tree;
+        }
+        assert!(
+            roots.iter().all(|run| !matches!(
+                run["status"].as_str(),
+                Some("failed" | "cancelled" | "interrupted" | "paused")
+            )),
+            "live root did not deliver: {roots:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "live Team turn did not settle: {roots:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
     };
-
-    wait_for_completed_fanout_children(&mock, &mut astra, 2).await;
-    astra.wait_for("2 done", UI_TRANSITION_TIMEOUT);
-    let refreshed = astra.current_screen();
-    let first = refreshed
-        .find("slot 1: Mock review 1")
-        .expect("first fanout row");
-    let second = refreshed
-        .find("slot 2: Mock review 2")
-        .expect("second fanout row");
-    let third = refreshed
-        .find("slot 3: Mock review 3")
-        .expect("third fanout row");
-    assert!(
-        first < second && second < third,
-        "rows jumped after refresh:\n{refreshed}"
-    );
-    assert_eq!(
-        selected_task_slot(&refreshed).as_deref(),
-        Some(selected_after_move.as_str()),
-        "selected stable task identity changed during refresh:\n{refreshed}"
-    );
-    assert_eq!(
-        mock.received_requests()
-            .iter()
-            .filter(|request| is_fanout_root_request(request))
-            .count(),
-        1,
-        "partial child settlement must not trigger additional parent analysis"
-    );
-    assert_eq!(
-        mock.received_requests()
-            .iter()
-            .filter(|request| is_fanout_reconciliation_request(request))
-            .count(),
-        0,
-        "a running group must not wake the parent"
-    );
-    astra.write(b"\x1b");
-    mock.release_held_response();
-
-    astra.wait_for(
-        "Parent reconciled one terminal fanout group exactly once.",
-        Duration::from_secs(10),
-    );
-    let received = mock.received_requests();
-    let root_requests = received
+    assert_eq!(tree["truncated"], false);
+    let runs = tree["runs"].as_array().expect("durable run tree");
+    let roots: Vec<_> = runs.iter().filter(|run| run["depth"] == 0).collect();
+    assert_eq!(roots.len(), round, "each user turn owns one root");
+    let root = roots
         .iter()
-        .filter(|request| is_fanout_root_request(request))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        root_requests.len(),
-        2,
-        "launch acknowledgement and one terminal reconciliation are distinct; root requests: {:#?}",
-        root_requests
-            .iter()
-            .map(|request| summarize_mock_request(request))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        received
-            .iter()
-            .filter(|request| is_fanout_reconciliation_request(request))
-            .count(),
-        1,
-        "full settlement triggers exactly one runtime reconciliation"
-    );
-    let reconciliation = received
-        .iter()
-        .find(|request| is_fanout_reconciliation_request(request))
+        .max_by_key(|run| run["created_at"].as_str().unwrap())
         .unwrap();
-    let hint = terminal_fanout_hint(reconciliation, &mock);
-    assert_eq!(hint["completed"], 3);
-    assert_eq!(hint["failed"], 0);
-    assert_eq!(hint["status"], "finished");
-    assert!(
-        !String::from_utf8_lossy(&astra.output)
-            .contains("Fanout did not return a usable launch receipt"),
-        "receipt-based launch must not paint a transient transport failure\n{}",
-        astra.current_screen()
-    );
-
-    astra.write(b"/exit\r");
-    let status = astra.wait_for_exit(Duration::from_secs(10));
-    assert!(status.success(), "Astra exit status: {status}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
-    let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
-        astra_cli::cli::mock_llm::MockScenario::FanoutPartialThenComplete,
-    )
-    .await
-    .expect("start partial fanout LLM server");
-    let home = tempfile::tempdir().expect("temporary isolated Astra home");
-    seed_trusted_workspace(home.path());
-    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
-
-    astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"launch_three_reviews_with_one_unhappy_child\r");
-    wait_for_three_fanout_children(&mock, &mut astra).await;
-    astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Three mock reviews are running.", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\x1b[1;2B");
-    astra.wait_for("slot 2: Mock review 2", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("failed", UI_TRANSITION_TIMEOUT);
-
-    // Select the failed slot by stable identity and verify that its distinct
-    // cause is inspectable while the final slow slot is still running.
-    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\r");
-    astra.wait_for(
-        "fanout_child_2_failed_with_distinct_cause",
-        UI_TRANSITION_TIMEOUT,
-    );
-    assert_eq!(
-        mock.received_requests()
-            .iter()
-            .filter(|request| is_fanout_root_request(request))
-            .count(),
-        1,
-        "one child failure must not trigger partial parent reconciliation"
-    );
-    astra.write(b"\x1b");
-    astra.wait_for("  Tasks", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\x1b");
-    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
-    mock.release_held_response();
-
-    astra.wait_for(
-        "Parent reconciled 2 completed and 1 failed slot exactly once.",
-        Duration::from_secs(10),
-    );
-    let received = mock.received_requests();
-    let root_requests = received
+    assert_eq!(root["status"], "completed");
+    let root_id = root["run_id"].as_str().unwrap();
+    let children: Vec<_> = runs
         .iter()
-        .filter(|request| is_fanout_root_request(request))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        root_requests.len(),
-        2,
-        "partial settlement gets one reconciliation"
-    );
-    let fanout_result = mock
-        .tool_results()
-        .into_iter()
-        .find(|result| {
-            result.get("request_id").and_then(serde_json::Value::as_str)
-                == Some("call-start-fanout")
-        })
-        .expect("the accepted fanout callback must be recorded");
-    assert_eq!(
-        fanout_result["session_id"], "mock-session",
-        "fanout callback must retain the stream session identity"
-    );
-    assert_eq!(
-        fanout_result["run_id"], "mock-run-fanout-root",
-        "fanout callback must retain the durable fanout run identity"
-    );
-    assert_eq!(
-        fanout_result["turn_chain_id"], "mock-turn-chain-fanout-root",
-        "fanout callback must retain the fanout turn-chain identity"
-    );
-    let fanout_output = fanout_result["output"]
-        .as_str()
-        .expect("launch receipt JSON");
-    let receipt: serde_json::Value = serde_json::from_str(fanout_output).unwrap();
-    assert_eq!(receipt["fanout"]["accepted"], 3);
-    assert!(
-        receipt["fanout"]["terminal"].as_u64().unwrap() < 3,
-        "held child keeps the launch receipt non-terminal"
-    );
-    assert_eq!(
-        received
-            .iter()
-            .filter(|request| is_fanout_reconciliation_request(request))
-            .count(),
-        1,
-        "partial settlement wakes the parent once with the failed slot"
-    );
-    let reconciliation = received
-        .iter()
-        .find(|request| is_fanout_reconciliation_request(request))
-        .unwrap();
-    let hint = terminal_fanout_hint(reconciliation, &mock);
-    assert_eq!(hint["completed"], 2);
-    assert_eq!(hint["failed"], 1);
-    assert_eq!(hint["status"], "finished");
-    assert!(
-        !String::from_utf8_lossy(&astra.output)
-            .contains("Fanout did not return a usable launch receipt"),
-        "an unhappy child must not fabricate a launch-transport failure"
-    );
-
-    astra.write(b"/exit\r");
-    let status = astra.wait_for_exit(Duration::from_secs(10));
-    assert!(status.success(), "Astra exit status: {status}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn background_group_is_queryable_before_its_single_terminal_wake() {
-    let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
-        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
+        .filter(|run| run["parent_run_id"] == root_id)
+        .collect();
+    assert_eq!(children.len(), 2, "builder and reviewer each execute once");
+    let root_projection = live_team_json(
+        client,
+        api,
+        reqwest::Method::GET,
+        &format!("/chat/runs/{root_id}/projection?recent_limit=500"),
+        None,
     )
-    .await
-    .expect("start scripted fanout LLM server");
-    let home = tempfile::tempdir().expect("temporary isolated Astra home");
-    seed_trusted_workspace(home.path());
-    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
-
-    astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"launch_then_ask_about_background_state\r");
-    wait_for_three_fanout_children(&mock, &mut astra).await;
-    astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Three mock reviews are running.", UI_TRANSITION_TIMEOUT);
-    wait_for_completed_fanout_children(&mock, &mut astra, 2).await;
-    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
-
-    astra.paste_and_submit(
-        astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION,
-        UI_TRANSITION_TIMEOUT,
+    .await;
+    assert!(
+        root_projection["run_event_high_watermark"]
+            .as_i64()
+            .unwrap()
+            < 500,
+        "bounded journey must retain its complete public event sequence"
     );
-    astra.wait_for(
-        "Astra knows Three mock reviews are running as one background work group.",
-        UI_TRANSITION_TIMEOUT,
-    );
-    let status_requests = mock
-        .received_requests()
-        .into_iter()
-        .filter(is_fanout_status_question)
-        .collect::<Vec<_>>();
-    assert_eq!(status_requests.len(), 1);
-    let status_request = &status_requests[0];
-    let active_work = request_edge_profile(status_request)
-        .and_then(|profile| profile.get("runtime_volatile_injections"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|injections| {
-            injections
+    let root_events = root_projection["recent_events"].as_array().unwrap();
+    let mut member_ids = std::collections::BTreeMap::new();
+    for spawn in root_events
+        .iter()
+        .filter(|event| event["type"] == "agent_spawned")
+    {
+        let profile = spawn["agent_type"].as_str().unwrap();
+        let child_id = spawn["run_id"].as_str().unwrap();
+        let child = children
+            .iter()
+            .find(|run| run["run_id"] == child_id)
+            .unwrap();
+        assert_eq!(child["agent_id"], spawn["agent_id"]);
+        assert_eq!(spawn["parent_run_id"], root_id);
+        assert_eq!(child["status"], "completed");
+        assert_eq!(child["root_run_id"], root_id);
+        assert!(
+            member_ids
+                .insert(profile.to_string(), child_id.to_string())
+                .is_none()
+        );
+        let projection = live_team_json(
+            client,
+            api,
+            reqwest::Method::GET,
+            &format!("/chat/runs/{child_id}/projection?recent_limit=500"),
+            None,
+        )
+        .await;
+        assert!(projection["run_event_high_watermark"].as_i64().unwrap() < 500);
+        let events = projection["recent_events"].as_array().unwrap();
+        let facts = events
+            .iter()
+            .filter(|event| event["type"] == "explain_analyze")
+            .map(|event| astra_turn_types::decode_explain_analyze_wire(event).unwrap())
+            .collect::<Vec<_>>();
+        assert!(facts.iter().all(|fact| fact.run_id == child_id));
+        use astra_turn_types::{ExplainAnalyzeNodeKindV1, ExplainAnalyzeTransitionV1};
+        for kind in [
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            ExplainAnalyzeNodeKindV1::ToolCall,
+        ] {
+            assert!(
+                facts.iter().any(|fact| fact.kind == kind
+                    && fact.transition == ExplainAnalyzeTransitionV1::Finished),
+                "{profile} must replay its own terminal {kind:?} facts"
+            );
+        }
+        let expected: &[(&str, &str)] = if profile == "builder" {
+            &[
+                ("read_file", "customers.csv"),
+                ("write_file", "customer_master.json"),
+            ]
+        } else {
+            &[
+                ("read_file", "invoices.csv"),
+                ("read_file", "customer_master.json"),
+                ("write_file", "invoice_exceptions.json"),
+            ]
+        };
+        for (tool, path) in expected {
+            let (request, end) = events
                 .iter()
-                .find(|injection| injection["kind"] == "active_work_snapshot")
+                .filter(|event| {
+                    event["type"] == "tool_request"
+                        && event["tool"] == *tool
+                        && live_tool_json(&event["args"])["path"]
+                            .as_str()
+                            .is_some_and(|value| std::path::Path::new(value).ends_with(path))
+                })
+                .find_map(|request| {
+                    events
+                        .iter()
+                        .find(|event| {
+                            event["type"] == "tool_call_end"
+                                && event["call_id"] == request["request_id"]
+                                && event["status"] == "completed"
+                        })
+                        .map(|end| (request, end))
+                })
+                .unwrap_or_else(|| panic!("{profile} must successfully {tool} {path}"));
+            assert_eq!(request["run_id"], child_id);
+            assert_eq!(end["success"], true);
+            assert_eq!(end["transport"], "edge_ledger");
+        }
+    }
+    assert_eq!(
+        member_ids.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["builder", "reviewer"]
+    );
+    assert!(
+        root_events
+            .iter()
+            .filter(|event| event["type"] == "tool_request" && event["run_id"] == root_id)
+            .all(|event| !matches!(event["tool"].as_str(), Some("write_file" | "bash"))),
+        "lead must delegate artifact production"
+    );
+    let builder_done = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_completed" && event["run_id"] == member_ids["builder"]
         })
-        .expect("ordinary user questions receive typed runtime-owned work truth");
-    assert_eq!(active_work["delivery_class"], "required_context");
-    assert_eq!(active_work["payload"]["authority"], "runtime_producer");
-    assert_eq!(active_work["payload"]["schema"], "active_work_snapshot.v1");
-    let observation = &active_work["payload"]["work_unit_observations"][0];
-    assert_eq!(observation["id"], "mock-review-group");
-    assert_eq!(observation["kind"], "agent_fanout");
-    assert_eq!(observation["status"], "running");
-    assert_eq!(
-        mock.received_requests()
+        .expect("observed builder completion");
+    let reviewer_started = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_spawned" && event["run_id"] == member_ids["reviewer"]
+        })
+        .unwrap();
+    assert!(
+        builder_done < reviewer_started,
+        "reviewer consumes a settled builder result"
+    );
+    let receipts = |tool: &str| -> Vec<(usize, serde_json::Value)> {
+        root_events
             .iter()
-            .filter(|request| is_fanout_reconciliation_request(request))
-            .count(),
-        0,
-        "an active background group must not wake before its terminal boundary"
+            .enumerate()
+            .filter_map(|(index, end)| {
+                if end["type"] != "tool_call_end"
+                    || end["status"] != "completed"
+                    || end["success"] != true
+                {
+                    return None;
+                }
+                if end["tool"] != tool {
+                    return None;
+                }
+                let (start_index, _) = root_events
+                    .iter()
+                    .enumerate()
+                    .find(|(_, event)| {
+                        event["type"] == "tool_call_start"
+                            && event["call_id"] == end["call_id"]
+                            && event["tool"] == tool
+                    })
+                    .expect("Server Work terminal has its exact start");
+                assert!(start_index < index);
+                assert_ne!(end["result_truncated"], serde_json::json!(true));
+                let receipt: serde_json::Value = serde_json::from_str(
+                    end["result"]
+                        .as_str()
+                        .expect("Server Work receipt is JSON text"),
+                )
+                .expect("Work receipt JSON");
+                assert!(receipt.is_object());
+                Some((index, receipt))
+            })
+            .collect()
+    };
+    let starts = receipts("start_work");
+    let proposals = receipts("propose_work_plan");
+    let (assignment_index, assignment) = if round == 1 {
+        assert_eq!(starts.len(), 1);
+        let (index, start) = &starts[0];
+        assert_eq!(start["status"], "started");
+        assert_eq!(start["initial_item_count"], 2);
+        assert!(proposals.is_empty());
+        (*index, start["initial_task"].clone())
+    } else {
+        assert!(starts.is_empty(), "guidance must retain the existing Work");
+        let inspections = receipts("inspect_work_plan");
+        let assignments = receipts("run_next_work_item");
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(assignments.len(), 1);
+        assert!(inspections.iter().any(|(index, _)| *index < proposals[0].0));
+        assert_eq!(proposals[0].1["status"], "accepted");
+        assert!(proposals[0].0 < assignments[0].0);
+        assignments[0].clone()
+    };
+    let settlements = receipts("settle_work_item");
+    assert_eq!(settlements.len(), 2);
+    let assignments = [assignment, settlements[0].1["next_task"].clone()];
+    for key in ["item_id", "attempt_id"] {
+        assert_ne!(assignments[0][key], assignments[1][key]);
+    }
+    for ((_, settlement), assignment) in settlements.iter().zip(&assignments) {
+        assert_eq!(assignment["status"], "assigned");
+        assert_eq!(assignment["execution"], "primary_session");
+        assert_eq!(settlement["status"], "recorded");
+        assert_eq!(settlement["outcome"], "delivered");
+        assert_eq!(settlement["status_scope"], "task_graph_execution");
+        for key in ["item_id", "item_revision", "attempt_id"] {
+            assert!(!assignment[key].is_null());
+            assert_eq!(settlement[key], assignment[key]);
+        }
+    }
+    assert!(settlements[1].1["next_task"].is_null());
+    assert_eq!(settlements[1].1["next_action"], "synthesize_final_response");
+    let builder_started = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_spawned" && event["run_id"] == member_ids["builder"]
+        })
+        .unwrap();
+    let reviewer_done = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_completed" && event["run_id"] == member_ids["reviewer"]
+        })
+        .unwrap();
+    assert!(assignment_index < builder_started);
+    assert!(builder_done < settlements[0].0 && settlements[0].0 < reviewer_started);
+    assert!(reviewer_done < settlements[1].0);
+    let spawns: Vec<_> = root_events
+        .iter()
+        .filter(|event| {
+            event["type"] == "tool_call_end"
+                && event["tool"] == "agent"
+                && event["success"] == true
+                && live_tool_json(&event["arguments"])["action"] == "spawn"
+        })
+        .collect();
+    assert_eq!(spawns.len(), 2);
+    for spawn in spawns {
+        assert!(
+            live_tool_json(&spawn["arguments"])
+                .get("work_item")
+                .is_none(),
+            "helpers must not create a parallel Work attempt owner"
+        );
+    }
+    let work_id = settlements[0].1["work_id"].as_str().unwrap();
+    let branch_id = settlements[0].1["branch_id"].as_str().unwrap();
+    let graph: serde_json::Value = client
+        .get(format!(
+            "{api}/v1/works/{work_id}/branches/{branch_id}/task-graph?item_limit=8&dependency_limit=8"
+        ))
+        .header("x-astra-work-api-major", "1")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(graph["schema_version"], 1);
+    assert_eq!(graph["scope"], "declared_work");
+    assert!(graph["next_cursor"].is_null());
+    assert_eq!(graph["basis"]["work_id"], work_id);
+    assert_eq!(graph["basis"]["branch_id"], branch_id);
+    assert_eq!(graph["items"]["total"], 3);
+    let entries = graph["items"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(
+        entries
+            .iter()
+            .any(|item| item["item_id"] == "root" && item["kind"] == "milestone")
     );
-    mock.release_held_response();
-
-    astra.wait_for(
-        // Keep the screen assertion shorter than the remaining terminal row;
-        // the exact-once property is asserted structurally against received
-        // requests immediately below rather than inferred from line wrapping.
-        "Parent reconciled one",
-        Duration::from_secs(12),
+    let items: Vec<_> = entries
+        .iter()
+        .filter(|item| item["kind"] == "task")
+        .collect();
+    assert_eq!(items.len(), 2);
+    for assignment in &assignments {
+        let item = items
+            .iter()
+            .find(|item| item["item_id"] == assignment["item_id"])
+            .unwrap();
+        assert_eq!(item["revision"], assignment["item_revision"]);
+        assert_eq!(item["kind"], "task");
+        assert_eq!(item["declaration_state"], "active");
+        assert_eq!(item["execution"]["status"], "completed");
+        assert_eq!(item["execution"]["terminal"], true);
+        assert_eq!(item["execution"]["run"]["run_id"], root_id);
+        assert_eq!(
+            item["execution"]["run"]["attempt_id"],
+            assignment["attempt_id"]
+        );
+        assert_eq!(
+            item["execution"]["run"]["graph_revision"],
+            graph["basis"]["graph_revision"]
+        );
+        assert_eq!(item["delivery"]["status"], "delivered");
+    }
+    for (_, settlement) in &settlements {
+        assert_eq!(settlement["work_id"], work_id);
+        assert_eq!(settlement["branch_id"], branch_id);
+    }
+    if let Some((_, start)) = starts.first() {
+        assert_eq!(start["work_id"], work_id);
+        assert_eq!(start["branch_id"], branch_id);
+        assert_eq!(start["graph_revision"], graph["basis"]["graph_revision"]);
+    }
+    if let Some((_, proposal)) = proposals.first() {
+        assert!(!proposal["proposal_id"].as_str().unwrap().is_empty());
+        assert!(!proposal["payload_hash"].as_str().unwrap().is_empty());
+        assert_eq!(
+            proposal["result_graph_revision"],
+            graph["basis"]["graph_revision"]
+        );
+        assert_eq!(
+            proposal["result_branch_revision"],
+            graph["basis"]["branch_revision"]
+        );
+        for key in ["added_items", "dependencies_added", "dependencies_removed"] {
+            assert!(
+                proposal["applied_mutations"][key]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            proposal["applied_mutations"]["revised_items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    assert_eq!(graph["dependencies"]["total"], 1);
+    let edges = graph["dependencies"]["entries"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["predecessor_item_id"], assignments[0]["item_id"]);
+    assert_eq!(edges[0]["successor_item_id"], assignments[1]["item_id"]);
+    assert_eq!(edges[0]["kind"], "dependency");
+    let resume = live_team_json(
+        client,
+        api,
+        reqwest::Method::POST,
+        &format!("/sessions/{session_id}/resume"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        resume["resume_bundle"]["projections"]["provider"]["payload"]["agent_profile_selection"]["team_id"],
+        team["team_id"]
     );
     assert_eq!(
-        mock.received_requests()
-            .iter()
-            .filter(|request| is_fanout_reconciliation_request(request))
-            .count(),
-        1,
-        "the same group receives one terminal wake after becoming queryable"
+        resume["resume_bundle"]["projections"]["provider"]["payload"]["agent_profile_selection"]["lead_agent_id"],
+        "lead"
     );
+    LiveTeamRound {
+        root_id: root_id.to_string(),
+        graph,
+        proposal: proposals.first().map(|(_, receipt)| receipt.clone()),
+    }
+}
 
-    astra.write(b"/exit\r");
-    let status = astra.wait_for_exit(Duration::from_secs(10));
-    assert!(status.success(), "Astra exit status: {status}");
+#[ignore = "opt-in native live Team delivery; requires ASTRA_TUI_LIVE_API_URL, ASTRA_TUI_LIVE_MODEL, and ASTRA_TUI_LIVE_ACCESS_TOKEN"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restart() {
+    let _journey = pty_journey_lock().lock().await;
+    let api = required_live_env(LIVE_TEAM_API_URL_ENV);
+    let model = required_live_env(LIVE_TEAM_MODEL_ENV);
+    let token = required_live_env(LIVE_TEAM_ACCESS_TOKEN_ENV);
+    let client = astra_core::net::client_builder_for_target(&api)
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        )]))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let team_name = format!("pty-delivery-{}", uuid::Uuid::new_v4().simple());
+    let members: Vec<_> = ["lead", "builder", "reviewer"].into_iter().map(|role|
+        serde_json::json!({
+            "role":role, "agent_id":role, "skills":[], "mcp_servers":[],
+            "system_prompt": if role == "lead" {
+                "Coordinate the two independently useful Work deliverables using builder then reviewer with their exact profile identities. Start durable Work before exploration. Execute each server-assigned primary task, delegate only its artifact work, and settle delivery after observing its result. Helpers must not receive a work_item assignment. Wait for each actual result. Never edit files yourself. Reviewer independently reads invoices and the generated customer master. Guidance revises the existing Work through inspect and propose; never start a replacement Work."
+            } else { "Carry out the delegated file task using actual tools, then report the observed result." },
+            "allow_tools": if role == "lead" { vec!["agent", "tool_search", "introspect", "read_file", "write_file", "start_work", "run_next_work_item", "settle_work_item", "inspect_work_plan", "propose_work_plan"] }
+                else { vec!["read_file", "write_file", "tool_search"] },
+            "initial_turns":6, "max_turns": if role == "lead" {24} else {12},
+            "can_delegate": role == "lead", "max_delegation_depth": if role == "lead" {1} else {0}
+        })
+    ).collect();
+    let team = live_team_json(
+        &client,
+        &api,
+        reqwest::Method::POST,
+        "/teams",
+        Some(
+            serde_json::json!({"name":team_name, "description":"Dependent CSV delivery",
+            "members":members,"context":{}}),
+        ),
+    )
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    astra_credentials::CredentialStore::with_path(home.path().join(".astra/credentials.json"))
+        .mutate(|credentials| {
+            credentials.profiles.insert(
+                "pty-journey".into(),
+                astra_credentials::Profile {
+                    account_id: Some(team["user_id"].as_str().unwrap().to_string()),
+                    access_token: Some(token.clone()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+    std::fs::write(
+        home.path().join("customers.csv"),
+        "id,name,credit_limit\nC001,Alice,100\nC002,Bob,200\nC001,Alice Updated,150\nC003,Cara,50\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("invoices.csv"),
+        "invoice_id,customer_id,amount\nI001,C001,120\nI002,C002,80\nI003,C999,30\nI004,C003,70\n",
+    )
+    .unwrap();
+    let mut astra = PtyAstra::spawn_with_config(home.path(), &api, &model, &token, &["--yes"]);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    let task = format!(
+        "/team run {team_name} --lead-agent-id lead \"Use durable Work for exactly two independently useful deliverables. A: builder reads customers.csv and writes customer_master.json with version=1 and customers sorted by id, each containing id, name and numeric credit_limit. Keep the first row for each customer id. B depends on completed A: reviewer independently reads invoices.csv and customer_master.json and writes invoice_exceptions.json with version=1, exceptions sorted by invoice_id, and total_amount summing exceptions. Each exception contains invoice_id, customer_id, numeric amount and reason: unknown_customer for missing customer or over_credit_limit for amount strictly above the limit. Do not report ordinary invoices. Give helpers the descriptions CSV builder and CSV reviewer, in that order. Helpers produce artifacts without Work item assignments; you own the primary tasks and settle each observed delivery. Do not invent file results.\""
+    );
+    astra.paste_and_submit(&task, UI_TRANSITION_TIMEOUT);
+    let session_id = wait_for_live_session_id(&mut astra, home.path());
+    let first_root = assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 1).await;
+    assert_live_work_artifacts(home.path(), 1);
+    // Completed children retain their transcripts across conversation switches.
+    astra.select_conversation("CSV builder");
+    astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("customers.csv", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x0f]);
+    astra.wait_for("Main conversation ·", UI_TRANSITION_TIMEOUT);
+    astra.select_conversation("CSV builder");
+    astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("customers.csv", UI_TRANSITION_TIMEOUT);
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    let mut astra = PtyAstra::spawn_with_config(home.path(), &api, &model, &token, &["--yes"]);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.paste_and_submit(&format!("/resume {session_id}"), UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Resumed", Duration::from_secs(30));
+    astra.paste_and_submit("Change the duplicate rule to keep the last customer row. Inspect and revise the existing two Work items together, keeping their identities and dependency. Use the same builder then reviewer to deliver version=2 of customer_master.json and invoice_exceptions.json with the same schemas. Recompute invoice exceptions against the revised credit limits. Each member must read its existing output before rewriting it. Settle both new primary attempts; do not create another Work.", UI_TRANSITION_TIMEOUT);
+    let second_root =
+        assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 2).await;
+    assert_ne!(first_root.root_id, second_root.root_id);
+    for key in ["work_id", "branch_id"] {
+        assert_eq!(
+            first_root.graph["basis"][key],
+            second_root.graph["basis"][key]
+        );
+    }
+    for key in ["graph_revision", "branch_revision"] {
+        assert!(
+            second_root.graph["basis"][key].as_i64().unwrap()
+                > first_root.graph["basis"][key].as_i64().unwrap()
+        );
+    }
+    assert!(first_root.proposal.is_none());
+    let revisions = second_root.proposal.as_ref().unwrap()["applied_mutations"]["revised_items"]
+        .as_array()
+        .unwrap();
+    for first in first_root.graph["items"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "task")
+    {
+        let second = second_root.graph["items"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["item_id"] == first["item_id"])
+            .unwrap();
+        let revision = revisions
+            .iter()
+            .find(|revision| revision["item_id"] == first["item_id"])
+            .unwrap();
+        assert_eq!(revision["from_revision"], first["revision"]);
+        assert_eq!(revision["declaration_state"], "active");
+        assert!(second["revision"].as_i64().unwrap() > first["revision"].as_i64().unwrap());
+        assert_ne!(
+            second["execution"]["run"]["attempt_id"],
+            first["execution"]["run"]["attempt_id"]
+        );
+    }
+    assert_live_work_artifacts(home.path(), 2);
+    let audit: astra_services::session_audit::SessionAuditSummary = serde_json::from_value(
+        live_team_json(
+            &client,
+            &api,
+            reqwest::Method::GET,
+            &format!("/sessions/{session_id}/audit/summary"),
+            None,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(audit.session_id, session_id);
+    assert_eq!(audit.turn_count, 2);
+    let usage = audit.request_usage;
+    assert_eq!(
+        usage.scope,
+        astra_services::session_audit::SessionRequestUsageScope::SessionAllRuns
+    );
+    assert!(
+        usage.request_count >= 6,
+        "both leads and all four children infer"
+    );
+    assert_eq!(usage.nonterminal_attempt_count, 0);
+    for lane in [
+        usage.fresh_input_tokens,
+        usage.cache_read_tokens,
+        usage.cache_creation_tokens,
+        usage.output_tokens,
+    ] {
+        assert!(lane.observed_attempts <= usage.request_count);
+        assert_eq!(lane.known_tokens.is_some(), lane.observed_attempts > 0);
+    }
+    if let Some(amount) = audit.cost.estimated_cost_usd {
+        assert!(amount.is_finite() && amount >= 0.0);
+        assert!(audit.cost.unavailable_reason.is_none());
+    } else {
+        assert!(audit.cost.unavailable_reason.is_some());
+    }
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    live_team_json(
+        &client,
+        &api,
+        reqwest::Method::DELETE,
+        &format!("/teams/{team_name}"),
+        None,
+    )
+    .await;
 }

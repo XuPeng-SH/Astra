@@ -377,7 +377,6 @@ const TEAM_SUBCOMMANDS: &[(&str, &str)] = &[
     ("create", "Create new team"),
     ("delete", "Delete a team"),
     ("help", "Show team overview and examples"),
-    ("history", "Show team execution history"),
     ("info", "Show team information"),
     ("list", "List all teams"),
     ("restore", "Restore team snapshot"),
@@ -677,12 +676,13 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(
         "/team",
-        "Teams: list|info|create|add-member|context|run|history|snapshot|restore|delete|help",
+        "Teams: list|info|create|add-member|context|run|snapshot|restore|delete|help",
         CommandGroup::Work,
     )
     .with_subcommands(TEAM_SUBCOMMANDS)
+    .with_tui_subcommands(&[("run", "Start an ordinary lead turn with a configured team")])
     .with_arg_hint("[list|info|create|add-member|context|run|…]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/agent",
         "Open the agent monitor to inspect and manage runs",
@@ -1299,6 +1299,7 @@ mod tests {
                 "/info",
                 "/skill",
                 "/mcp",
+                "/team",
                 "/agent",
                 "/login",
                 "/register",
