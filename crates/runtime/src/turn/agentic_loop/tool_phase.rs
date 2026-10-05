@@ -215,6 +215,7 @@ fn publish_live_snapshot_for_introspection_calls<H: AgenticLoopHost + ?Sized>(
 
 pub(crate) enum TurnToolPhaseControl {
     ContinueLoop,
+    WaitForInput(super::host::RuntimeInputWait),
     Return(AgenticLoopOutcome),
 }
 
@@ -3182,25 +3183,15 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             .min_by_key(|receipt| receipt.timeout_ms);
         let reply_pending = state.messaging.reply_obligations.has_pending(run_id);
         if reply_pending || admitted_wait.is_some() {
-            let continue_after_reply = super::execution_phase::await_runtime_activity(
-                host,
-                state,
-                super::host::ContinuationAuthority::Runtime,
-                // An unanswered exact question retains its synchronization
-                // obligation; a sibling observation timeout cannot bypass it.
-                admitted_wait.as_ref().filter(|_| !reply_pending),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            try_write_heavy_checkpoint(state);
-            return Ok(match continue_after_reply {
-                super::execution_phase::RuntimeActivityOutcome::ExecutionPaused(reason) => {
-                    finalize_turn_trace(state).await;
-                    TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(reason))
-                }
-                outcome if outcome.should_continue() => TurnToolPhaseControl::ContinueLoop,
-                _ => TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed),
-            });
+            // Finish the host's PostToolBatch/PostTurn before the shared loop
+            // waits. A correlated question cannot be bypassed by a sibling's
+            // observation timeout.
+            return Ok(TurnToolPhaseControl::WaitForInput(
+                super::host::RuntimeInputWait::from_observation(
+                    admitted_wait.filter(|_| !reply_pending),
+                )
+                .map_err(|error| error.to_string())?,
+            ));
         }
         Ok(TurnToolPhaseControl::ContinueLoop)
     })

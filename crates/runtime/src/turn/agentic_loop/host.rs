@@ -2450,6 +2450,56 @@ pub struct ProviderAdaptationState {
 
 // ─── Loop state ──────────────────────────────────────────────────────────────
 
+/// Input synchronization at a settled round boundary, not another model round.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeInputWait {
+    Completion,
+    Observation {
+        receipt: astra_tools::agent_tool_contract::AgentWaitReceipt,
+        deadline_unix_ms: u64,
+    },
+}
+
+impl RuntimeInputWait {
+    pub(crate) fn from_observation(
+        observation: Option<astra_tools::agent_tool_contract::AgentWaitReceipt>,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        match observation {
+            Some(receipt) => Ok(Self::Observation {
+                deadline_unix_ms: (chrono::Utc::now().timestamp_millis() as u64)
+                    .checked_add(receipt.timeout_ms)
+                    .ok_or_else(|| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "input observation deadline exceeds supported range",
+                        )
+                    })?,
+                receipt,
+            }),
+            None => Ok(Self::Completion),
+        }
+    }
+
+    fn observation_at(
+        &self,
+        now_unix_ms: u64,
+    ) -> Option<astra_tools::agent_tool_contract::AgentWaitReceipt> {
+        match self {
+            Self::Completion => None,
+            Self::Observation {
+                receipt,
+                deadline_unix_ms,
+            } => Some(astra_tools::agent_tool_contract::AgentWaitReceipt {
+                timeout_ms: receipt
+                    .timeout_ms
+                    .min(deadline_unix_ms.saturating_sub(now_unix_ms)),
+                ..receipt.clone()
+            }),
+        }
+    }
+}
+
 /// The next logical loop entry, independent of tool-slot state and charged
 /// budget. Only the shared loop advances it; restoration never infers it from
 /// a recent record or repeats a completed preamble.
@@ -2462,13 +2512,20 @@ pub enum LoopEntry {
         next_index: u32,
         harness_pause_recovery_count: u32,
     },
+    InputWait {
+        next_index: u32,
+        harness_pause_recovery_count: u32,
+        wait: RuntimeInputWait,
+    },
 }
 
 impl LoopEntry {
     fn iteration_index(&self) -> Option<u32> {
         match self {
             Self::BeforePreamble => None,
-            Self::IterationBoundary { next_index, .. } => Some(*next_index),
+            Self::IterationBoundary { next_index, .. } | Self::InputWait { next_index, .. } => {
+                Some(*next_index)
+            }
         }
     }
 
@@ -2485,6 +2542,34 @@ impl LoopEntry {
                 "loop round identity exhausted",
             )
         })?;
+        Ok(())
+    }
+
+    fn wait_for_input(
+        &mut self,
+        wait: RuntimeInputWait,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let Self::IterationBoundary {
+            next_index,
+            harness_pause_recovery_count,
+        } = self
+        else {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "input wait requires a completed round boundary",
+            ));
+        };
+        let next_index = next_index.checked_add(1).ok_or_else(|| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "loop round identity exhausted",
+            )
+        })?;
+        *self = Self::InputWait {
+            next_index,
+            harness_pause_recovery_count: *harness_pause_recovery_count,
+            wait,
+        };
         Ok(())
     }
 
@@ -5384,6 +5469,47 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         };
     }
     loop {
+        if host.execution_handoff_requested() {
+            freeze_for_execution_handoff(host, state).await;
+        }
+        if let LoopEntry::InputWait {
+            next_index,
+            harness_pause_recovery_count,
+            wait,
+        } = state.loop_entry.clone()
+        {
+            let observation = wait.observation_at(chrono::Utc::now().timestamp_millis() as u64);
+            if observation.as_ref().is_some_and(|receipt| {
+                state.current_run_id.as_deref() != Some(receipt.parent_run_id.as_str())
+            }) {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "input observation belongs to another run",
+                ));
+            }
+            let outcome = super::execution_phase::await_runtime_activity(
+                host,
+                state,
+                ContinuationAuthority::Runtime,
+                observation.as_ref(),
+            )
+            .await?;
+            try_write_heavy_checkpoint(state);
+            if !outcome.should_continue() {
+                if let super::execution_phase::RuntimeActivityOutcome::ExecutionPaused(reason) =
+                    outcome
+                {
+                    finalize_turn_trace(state).await;
+                    return Ok(AgenticLoopOutcome::Waiting(reason));
+                }
+                finalize_and_render(host, state).await;
+                return Ok(AgenticLoopOutcome::Completed);
+            }
+            state.loop_entry = LoopEntry::IterationBoundary {
+                next_index,
+                harness_pause_recovery_count,
+            };
+        }
         let turn_index = state.loop_entry.iteration_index().ok_or_else(|| {
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContractViolation,
@@ -5392,9 +5518,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         })? as usize;
         if turn_index >= state.max_turns && state.remaining_turns != 0 {
             break;
-        }
-        if host.execution_handoff_requested() {
-            freeze_for_execution_handoff(host, state).await;
         }
         state.current_round_index = turn_index as u32;
         let TurnIterationPrep {
@@ -5429,6 +5552,12 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             TurnExecutionControl::Proceed(phase) => *phase,
             TurnExecutionControl::ContinueLoop => {
                 state.loop_entry.advance()?;
+                continue;
+            }
+            TurnExecutionControl::WaitForInput => {
+                state
+                    .loop_entry
+                    .wait_for_input(RuntimeInputWait::Completion)?;
                 continue;
             }
             TurnExecutionControl::Return(outcome) => {
@@ -5633,15 +5762,18 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         "harness pause recovery limit exceeded at PostTurn; forcing text-only finalization"
                     );
                     force_text_only_harness_finalization(state, &reason);
-                    continue;
+                    if !matches!(tool_phase_control, TurnToolPhaseControl::WaitForInput(_)) {
+                        continue;
+                    }
+                } else {
+                    tracing::info!(
+                        count = harness_pause_recovery_count,
+                        reason = %reason,
+                        "harness pause recovered at PostTurn — injecting checkpoint guidance"
+                    );
+                    state.push_volatile(VolatileKind::HarnessBoundary, reason);
+                    apply_harness_pause_recovery_threshold(state, recovery_threshold);
                 }
-                tracing::info!(
-                    count = harness_pause_recovery_count,
-                    reason = %reason,
-                    "harness pause recovered at PostTurn — injecting checkpoint guidance"
-                );
-                state.push_volatile(VolatileKind::HarnessBoundary, reason);
-                apply_harness_pause_recovery_threshold(state, recovery_threshold);
                 // Fall through to continue the loop
             }
             astra_harness::HookVerdict::Continue => {}
@@ -5649,6 +5781,10 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         match tool_phase_control {
             TurnToolPhaseControl::ContinueLoop => {}
+            TurnToolPhaseControl::WaitForInput(wait) => {
+                state.loop_entry.wait_for_input(wait)?;
+                continue;
+            }
             TurnToolPhaseControl::Return(outcome) => return Ok(outcome),
         }
 
@@ -11461,6 +11597,164 @@ pub(crate) mod tests {
         assert_eq!(exhausted.iteration_index(), Some(u32::MAX));
     }
 
+    #[tokio::test]
+    async fn input_wait_continuation_preserves_pause_and_charges_only_the_resumed_round() {
+        use std::sync::atomic::Ordering;
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        state.current_round_index = 6;
+        state.max_turns = 10;
+        state.remaining_turns = 5;
+        state.charged_iterations = 3;
+        state.loop_entry = LoopEntry::IterationBoundary {
+            next_index: 6,
+            harness_pause_recovery_count: 2,
+        };
+        state
+            .loop_entry
+            .wait_for_input(RuntimeInputWait::Completion)
+            .unwrap();
+        let wire =
+            serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+        let captured: OriginalLoopExecutionFacts = serde_json::from_value(wire).unwrap();
+        state.loop_entry = captured.loop_entry;
+        #[cfg(feature = "harness")]
+        let trace = {
+            use astra_harness::{
+                HarnessKernel, HarnessLimits, InMemorySnapshotSink, RecordingKernel, SnapshotSink,
+                StandardKernel,
+            };
+            let trace = Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(
+                None,
+            )));
+            let sink = InMemorySnapshotSink::arc();
+            state.harness = crate::turn::harness_adapter::HarnessSlot::new(
+                Arc::new(RecordingKernel::with_trace(
+                    Arc::new(StandardKernel::configured(
+                        sink.clone() as Arc<dyn SnapshotSink>,
+                        HarnessLimits::default(),
+                    )) as Arc<dyn HarnessKernel>,
+                    Arc::clone(&trace),
+                )) as Arc<dyn HarnessKernel>,
+                sink as Arc<dyn SnapshotSink>,
+            );
+            trace
+        };
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child",
+        );
+        let child = |status| crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status,
+        };
+        owner.set_direct_child_for_test(child(crate::orchestration::AgentStatus::Paused {
+            reason: "waiting for prerequisite".into(),
+        }));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+        host.provider_call_counter = Some(Arc::clone(&calls));
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        assert!(matches!(
+            run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap(),
+            AgenticLoopOutcome::Waiting(_),
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!((state.charged_iterations, state.remaining_turns), (3, 5));
+        #[cfg(feature = "harness")]
+        assert_eq!(
+            trace
+                .read()
+                .unwrap()
+                .records_at_point(astra_harness::HookPoint::SessionEnd)
+                .len(),
+            0
+        );
+        assert!(matches!(
+            state.loop_entry,
+            LoopEntry::InputWait { next_index: 7, .. }
+        ));
+        owner.set_direct_child_for_test(child(crate::orchestration::AgentStatus::Completed {
+            result: "child result".into(),
+            finish_reason: None,
+        }));
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.current_round_index, 7);
+        assert_eq!((state.charged_iterations, state.remaining_turns), (4, 4));
+        assert_eq!(state.final_text, "done");
+        #[cfg(feature = "harness")]
+        {
+            let trace = trace.read().unwrap();
+            assert_eq!(
+                trace
+                    .records_at_point(astra_harness::HookPoint::SessionEnd)
+                    .len(),
+                1
+            );
+            assert_eq!(
+                trace.records.back().unwrap().point,
+                astra_harness::HookPoint::SessionEnd
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_wait_restored_observation_expires_without_renewal_and_rejects_wrong_owner() {
+        use std::sync::atomic::Ordering;
+        for wrong_owner in [false, true] {
+            let mut state = make_state();
+            state.current_run_id = Some("parent-run".into());
+            state.loop_entry = LoopEntry::InputWait {
+                next_index: 1,
+                harness_pause_recovery_count: 0,
+                wait: RuntimeInputWait::Observation {
+                    receipt: astra_tools::agent_tool_contract::AgentWaitReceipt {
+                        parent_run_id: if wrong_owner {
+                            "another-run"
+                        } else {
+                            "parent-run"
+                        }
+                        .into(),
+                        tool_call_id: "wait-call".into(),
+                        timeout_ms: 30_000,
+                    },
+                    deadline_unix_ms: 1,
+                },
+            };
+            state.loop_entry =
+                serde_json::from_value(serde_json::to_value(&state.loop_entry).unwrap()).unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+            host.provider_call_counter = Some(Arc::clone(&calls));
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_agentic_loop_with_host(&mut host, &mut state),
+            )
+            .await
+            .expect("an expired observation must not regain its original 30s wait");
+            if wrong_owner {
+                assert_eq!(
+                    outcome.unwrap_err().kind,
+                    astra_core::ErrorKind::ContractViolation
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                outcome.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(host.executed_volatile[0].iter().any(|entry| {
+                    entry.payload.get("agent_wait").and_then(Value::as_str) == Some("timed_out")
+                }));
+            }
+        }
+    }
+
     #[test]
     fn fresh_execution_uses_the_admitted_circuit_breaker() {
         use astra_turn_core::loop_circuit_breaker::{BreakerAction, RoundSignal};
@@ -15312,6 +15606,84 @@ mod parallel_execution_tests {
                 1,
                 "exactly one SessionEnd must fire even when harness blocks"
             );
+        }
+
+        #[tokio::test]
+        async fn input_wait_runs_post_turn_once_and_does_not_bypass_a_question_at_recovery_limit() {
+            use std::sync::atomic::Ordering;
+            for tool_round in [false, true] {
+                let mut state = make_state();
+                state.current_run_id = Some("questioner".into());
+                state.loop_entry = LoopEntry::IterationBoundary {
+                    next_index: 0,
+                    harness_pause_recovery_count: MAX_HARNESS_PAUSE_RECOVERIES,
+                };
+                state.max_turns = 5;
+                state.remaining_turns = 5;
+                state
+                    .messaging
+                    .reply_obligations
+                    .reserve(
+                        "questioner",
+                        "question-1",
+                        astra_messaging::AgentAddress {
+                            run_id: "responder-run".into(),
+                            agent_id: "responder".into(),
+                        },
+                    )
+                    .unwrap();
+                let trace = Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(
+                    None,
+                )));
+                state.harness = crate::turn::harness_adapter::HarnessSlot::new(
+                    Arc::new(RecordingKernel::with_trace(
+                        Arc::new(PauseAtPostTurnKernel) as Arc<dyn HarnessKernel>,
+                        Arc::clone(&trace),
+                    )) as Arc<dyn HarnessKernel>,
+                    InMemorySnapshotSink::arc() as Arc<dyn SnapshotSink>,
+                );
+                let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+                state.cancellation.token = Some(Arc::clone(&cancellation));
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let started = Arc::new(tokio::sync::Notify::new());
+                let first = if tool_round {
+                    edge_tool_result(vec![make_edge_tool("bash", "evidence")], 10, 5, None)
+                } else {
+                    text_result("intermediate result", 10, 5, None)
+                };
+                let mut host = MockHost::new(vec![first, text_result("must not run", 10, 5, None)])
+                    .with_valid_tools(&["bash"]);
+                host.provider_call_counter = Some(Arc::clone(&calls));
+                host.child_wait_started = Some(Arc::clone(&started));
+                let task =
+                    tokio::spawn(
+                        async move { run_agentic_loop_with_host(&mut host, &mut state).await },
+                    );
+                tokio::time::timeout(Duration::from_secs(1), started.notified())
+                    .await
+                    .expect("the real producer must reach the shared input-wait consumer");
+                let calls_at_wait = calls.load(Ordering::SeqCst);
+                cancellation.cancel();
+                let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
+                assert_eq!(
+                    calls_at_wait, 1,
+                    "PostTurn recovery cannot bypass the question"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let trace = trace.read().unwrap();
+                assert_eq!(
+                    trace.records_at_point(HookPoint::PostTurn).len(),
+                    usize::from(tool_round)
+                );
+                assert_eq!(
+                    trace.records_at_point(HookPoint::PostToolBatch).len(),
+                    usize::from(tool_round)
+                );
+            }
         }
 
         #[tokio::test]

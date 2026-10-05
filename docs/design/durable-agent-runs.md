@@ -293,12 +293,18 @@ constraints. Reassembly installs those facts without activating the skill again
 or replacing delivered instructions with a newer catalog version. A saved sandbox
 does not authorize a different workspace or restore environment variable values.
 
-The shared loop owns an explicit entry cursor: before its preamble, or at an
-iteration boundary with the next round identity and consumed harness recovery
-count. Neither the last tool step nor charged budget can reconstruct this cursor.
-A restored iteration boundary skips SessionStart effects and preserves compression
-tracking; every new host still installs its local skill schema. A returned loop
-resets the entry for a subsequent user turn; a frozen handoff does not return.
+The shared loop owns an explicit entry cursor: before its preamble, at an
+iteration boundary, or waiting for runtime input after the previous round's
+existing postlude. The latter two preserve the next round identity and consumed
+harness recovery count. Neither the last tool step nor charged budget can
+reconstruct this cursor. Input wait uses the common message/child barrier before
+preparation or another budget charge; observation waits retain their original
+absolute cutoff. A paused input wait retains this entry when the same live state
+is continued, without replaying the postlude. This is not durable parking or
+same-run reconstruction after restart. A restored boundary skips SessionStart
+effects and preserves compression tracking; every new host still installs its
+local skill schema. Terminal returns reset the entry for a subsequent user turn;
+a frozen handoff does not return.
 This does not authorize a preamble checkpoint with no current step or with a step
 left over from another logical turn; actual recovery must verify the reservation
 and frontier together.

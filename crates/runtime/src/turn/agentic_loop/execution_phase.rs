@@ -5241,6 +5241,7 @@ pub(crate) struct TurnExecutionPhase {
 pub(crate) enum TurnExecutionControl {
     Proceed(Box<TurnExecutionPhase>),
     ContinueLoop,
+    WaitForInput,
     Return(AgenticLoopOutcome),
 }
 
@@ -7044,10 +7045,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     Some("direct_child_completion_wait"),
                 );
+                state.step_recorder.end_turn(false);
+                if continuation_authority == ContinuationAuthority::Runtime {
+                    finalize_turn_trace(state).await;
+                    return Ok(TurnExecutionControl::WaitForInput);
+                }
                 let child_barrier =
                     await_direct_children_before_completion(host, state, continuation_authority)
                         .await;
-                state.step_recorder.end_turn(false);
                 if matches!(
                     &child_barrier,
                     Ok(RuntimeActivityOutcome::ExecutionPaused(_))
