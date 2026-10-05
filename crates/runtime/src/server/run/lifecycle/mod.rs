@@ -4881,7 +4881,13 @@ struct OwnedBackgroundExecution {
     user_id: String,
     session_id: String,
     run_id: String,
-    request: ChatRequestData,
+    explain: bool,
+    profile_selection: Option<astra_turn_types::AgentProfileSelection>,
+    agent_id: Option<String>,
+    model_name: Option<String>,
+    user_message: String,
+    #[cfg(feature = "e2e-hooks")]
+    test_post_loop_settlement_delay_ms: u64,
     host: server_loop_host::ServerAgenticLoopHost,
     loop_state: AgenticLoopState,
     execution_owner_generation: u64,
@@ -14924,7 +14930,13 @@ impl AgenticRunLifecycleService {
             user_id,
             session_id,
             run_id,
-            request,
+            explain,
+            profile_selection,
+            agent_id,
+            model_name,
+            user_message,
+            #[cfg(feature = "e2e-hooks")]
+            test_post_loop_settlement_delay_ms,
             mut host,
             loop_state,
             execution_owner_generation,
@@ -14973,13 +14985,8 @@ impl AgenticRunLifecycleService {
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let bg_shared_pool = self.shared_pool.clone();
         let bg_trace_ingestion = self.trace_ingestion.clone();
-        let bg_explain = request.explain;
-        let bg_profile_selection = request.admitted_agent_profiles.as_ref().map(|snapshot| {
-            astra_turn_types::AgentProfileSelection {
-                team_id: snapshot.source_team_id.clone(),
-                lead_agent_id: snapshot.lead_agent_id.clone(),
-            }
-        });
+        let bg_explain = explain;
+        let bg_profile_selection = profile_selection;
         let missing_lifecycle_spawner = descendant_spawner;
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
@@ -14988,17 +14995,9 @@ impl AgenticRunLifecycleService {
         let bg_execution_lease_lost = execution_lease_lost.clone();
         let mut bg_root_runtime_context_guard = root_runtime_context_guard;
         #[cfg(feature = "e2e-hooks")]
-        let bg_test_post_loop_settlement_delay_ms = request
-            .context
-            .as_ref()
-            .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
+        let bg_test_post_loop_settlement_delay_ms = test_post_loop_settlement_delay_ms;
         let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
-        let bg_root_mailbox_agent_id = request
-            .agent_id
-            .clone()
-            .unwrap_or_else(|| "root-agent".to_string());
+        let bg_root_mailbox_agent_id = agent_id.clone().unwrap_or_else(|| "root-agent".to_string());
         let mut persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -15010,9 +15009,9 @@ impl AgenticRunLifecycleService {
             terminal_authority: owner_lease_heartbeat
                 .as_ref()
                 .map(|heartbeat| heartbeat.terminal_authority()),
-            agent_id: request.agent_id.clone(),
-            model_name: request.model.clone(),
-            user_message: request.message.clone(),
+            agent_id,
+            model_name,
+            user_message,
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             metrics_registry: self.metrics_registry.clone(),
@@ -17164,7 +17163,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             user_id,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
-            request,
+            explain,
+            profile_selection: request.admitted_agent_profiles.as_ref().map(|snapshot| {
+                astra_turn_types::AgentProfileSelection {
+                    team_id: snapshot.source_team_id.clone(),
+                    lead_agent_id: snapshot.lead_agent_id.clone(),
+                }
+            }),
+            agent_id: request.agent_id,
+            model_name: request.model,
+            user_message: request.message,
+            #[cfg(feature = "e2e-hooks")]
+            test_post_loop_settlement_delay_ms: request
+                .context
+                .as_ref()
+                .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
             host,
             loop_state,
             execution_owner_generation,
@@ -18588,7 +18603,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             user_id,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
-            request,
+            explain: request.explain,
+            profile_selection: request.admitted_agent_profiles.as_ref().map(|snapshot| {
+                astra_turn_types::AgentProfileSelection {
+                    team_id: snapshot.source_team_id.clone(),
+                    lead_agent_id: snapshot.lead_agent_id.clone(),
+                }
+            }),
+            agent_id: request.agent_id,
+            model_name: request.model,
+            user_message: request.message,
+            #[cfg(feature = "e2e-hooks")]
+            test_post_loop_settlement_delay_ms: request
+                .context
+                .as_ref()
+                .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
             host,
             loop_state: state,
             execution_owner_generation,
