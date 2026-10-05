@@ -17683,7 +17683,14 @@ mod tests {
         assert!(!snap.tool_call_records[0].ok);
         assert_eq!(
             snap.tool_call_records[0].error.as_deref(),
-            Some("Permission denied")
+            Some("status=permission_denied\nPermission denied")
+        );
+        let record = &snap.tool_call_records[0];
+        assert_eq!(record.result_full.as_deref(), record.error.as_deref());
+        assert_eq!(record.result_preview.as_deref(), record.error.as_deref());
+        assert_eq!(
+            record.output_bytes,
+            Some("status=permission_denied\nPermission denied".len() as u32)
         );
         assert_eq!(snap.tools_used, vec!["bash"]);
 
