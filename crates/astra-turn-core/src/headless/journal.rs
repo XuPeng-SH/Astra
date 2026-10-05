@@ -448,26 +448,54 @@ mod tests {
 
     #[test]
     fn callback_audit_matches_remote_content_for_each_terminal_status() {
-        for (status, output, expected, failed) in [
-            ("completed", "read result", "read result", false),
+        for (tool, status, output, expected, failed) in [
             (
+                "read_file",
+                "completed",
+                "read result",
+                "read result",
+                false,
+            ),
+            (
+                "read_file",
                 "failed",
                 "Denied by policy",
                 "status=failed\nDenied by policy",
                 true,
             ),
-            ("cancelled", "Stopped", "status=cancelled\nStopped", true),
             (
+                "read_file",
+                "cancelled",
+                "Stopped",
+                "status=cancelled\nStopped",
+                true,
+            ),
+            (
+                "read_file",
                 "failed",
                 r#"{"error":"denied"}"#,
                 r#"{"error":"denied"}"#,
                 true,
             ),
-            ("failed", "", r#"{"status":"failed"}"#, true),
+            ("read_file", "failed", "", r#"{"status":"failed"}"#, true),
+            (
+                "write_file",
+                "completed",
+                r#"{"message":"written","_cli_diff":"display only"}"#,
+                r#"{"message":"written"}"#,
+                false,
+            ),
+            (
+                "str_replace",
+                "failed",
+                "Conflict\n<<<ASTRA_UNIFIED_DIFF>>>\ndisplay only\n<<<END_ASTRA_UNIFIED_DIFF>>>\n",
+                "status=failed\nConflict",
+                true,
+            ),
         ] {
             let result = crate::sse_stream_host::EdgeToolExecResult {
                 request_id: "call-1".into(),
-                tool: "read_file".into(),
+                tool: tool.into(),
                 args: serde_json::json!({"path": "document.txt"}),
                 output: output.into(),
                 status: status.into(),
@@ -479,8 +507,13 @@ mod tests {
             let remote_content = crate::edge_ledger::tool_content_from_ledger_entry(
                 &serde_json::json!({"body": {"status": status, "output": output}}),
             );
+            let remote_content =
+                crate::tool_result_sanitize::tool_result_content_for_model_unbounded(
+                    tool,
+                    &remote_content,
+                );
             let remote = journal_record_executed_tool_call(
-                "read_file".into(),
+                tool.into(),
                 failed,
                 1,
                 0,

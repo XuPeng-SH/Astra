@@ -2490,7 +2490,6 @@ mod tests {
                     vec![json!({"role":"user", "content":"Explain this."})],
                     &[],
                     &[],
-                    &[],
                     "Explain this.",
                     None,
                     Some((
