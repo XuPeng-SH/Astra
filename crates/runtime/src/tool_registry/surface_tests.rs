@@ -481,8 +481,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let agent_description = find(&resident, "agent")["function"]["description"]
         .as_str()
         .expect("resident agent description");
-    assert!(agent_description.contains("agent(wait) yields for automatic results"));
-    assert!(agent_description.contains("no re-fetch if sufficient"));
+    assert!(agent_description.contains("wait auto-delivers"));
+    assert!(agent_description.contains("fetch if needed"));
     let full = catalog_schemas();
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
@@ -561,7 +561,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("runtime binds requested models")
+            .contains("Runtime binds models")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,

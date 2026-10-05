@@ -8938,16 +8938,21 @@ mod tests {
             None,
             Some(r#"{"status":"started","group_id":"review-42"}"#),
         ));
-        assert!(fanout_completion_is_authoritative(
+        assert!(!fanout_completion_is_authoritative(
             None,
             Some(r#"{"status":"failed","error":"capacity unavailable"}"#),
         ));
-        assert!(fanout_completion_is_authoritative(
+        assert!(!fanout_completion_is_authoritative(
             None,
             Some(
                 "{\"status\":\"failed\",\"error\":\"capacity unavailable\"}\nRetry after capacity returns."
             ),
         ));
+        let rejection =
+            astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error(
+                "capacity unavailable",
+            );
+        assert!(fanout_completion_is_authoritative(None, Some(&rejection)));
     }
 
     #[test]
@@ -8966,12 +8971,7 @@ mod tests {
             duration_ms: 3,
             output_summary: None,
             output: Some(
-                serde_json::json!({
-                    "status": "failed",
-                    "error_kind": "capacity_unavailable",
-                    "error": "No execution slots are available."
-                })
-                .to_string(),
+                astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error("No execution slots are available."),
             ),
             tool_use_id: "fanout-rejected".into(),
             parent_tool_use_id: None,

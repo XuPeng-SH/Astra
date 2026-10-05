@@ -22232,11 +22232,7 @@ pub(crate) mod tests {
         };
 
         let early = spawner
-            .spawn_with_execution_deadline(
-                make_slot(0),
-                &make_bg_context(),
-                Some(make_deadline(30)),
-            )
+            .spawn_with_execution_deadline(make_slot(0), &make_bg_context(), Some(make_deadline(1)))
             .await;
         assert!(matches!(early, Err(SpawnError::ExecutionDeadlineElapsed)));
 
@@ -22248,13 +22244,13 @@ pub(crate) mod tests {
                     .spawn_with_execution_deadline(
                         make_slot(1),
                         &make_bg_context(),
-                        Some(make_deadline(66)),
+                        Some(make_deadline(4)),
                     )
                     .await
             })
         };
         wait_for_spawn_reservation(&reservation_entered, &release_reservation).await;
-        tokio::time::sleep(Duration::from_millis(6_100)).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         release_reservation
             .send(())
             .expect("spawn hook is waiting for its release signal");

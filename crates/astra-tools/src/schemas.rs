@@ -679,8 +679,8 @@ pub fn submit_task_resolution_schema() -> Value {
 }
 
 fn start_work_schema() -> Value {
-    let tasks = "Known acceptance units, including dependent outcomes; honor counts. Keep observation/verification/report together; omit later decisions/additions/replacements.";
-    let prerequisites = "1-based prerequisites that must deliver first. Reference consumed task outputs here: list order and objective text create no edges. Omit if independent.";
+    let tasks = "Known acceptance units incl. dependents; no report subtasks.";
+    let prerequisites = "1-based output prerequisites; no order/text edges. Omit if independent.";
     json!({
         "type": "function",
         "function": {
@@ -689,7 +689,7 @@ fn start_work_schema() -> Value {
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
-                "x-astra-discovery-summary": "Declare known outcomes, including dependencies. Omit later decisions/additions/replacements until graph update. Preserve exactly N named initial tracks. start assigns the first task; use its returned assignment.",
+                "x-astra-discovery-summary": "Declare known outcomes, including dependencies. Omit later decisions/additions/replacements. Use exactly N named initial tracks. start returns the first assignment.",
                 "properties": {
                     "goal": {
                         "type": "string",
