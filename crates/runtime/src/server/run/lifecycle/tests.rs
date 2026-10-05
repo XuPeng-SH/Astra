@@ -33705,13 +33705,13 @@ async fn delegation_tracker_get_children() {
 #[tokio::test]
 async fn drain_background_tasks_returns_immediately_when_idle() {
     let service = test_service();
-    assert!(!service.execution_handoff_requested.load(Ordering::Acquire));
+    assert!(!service.execution_handoff_requested.is_cancelled());
     assert!(
         service
             .drain_background_tasks_impl(Duration::from_millis(100))
             .await
     );
-    assert!(service.execution_handoff_requested.load(Ordering::Acquire));
+    assert!(service.execution_handoff_requested.is_cancelled());
 }
 
 /// P0-C: background_task_count increments on spawn and decrements on exit.

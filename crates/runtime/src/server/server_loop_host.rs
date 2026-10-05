@@ -3951,7 +3951,7 @@ pub struct ServerAgenticLoopHost {
 }
 
 struct ExecutionHandoffContext {
-    requested: Arc<std::sync::atomic::AtomicBool>,
+    requested: tokio_util::sync::CancellationToken,
     engine: crate::server::run::engine::RunEngine,
     reservation: astra_turn_types::TurnReservationV1,
 }
@@ -7334,7 +7334,7 @@ impl ServerAgenticLoopHost {
 
     pub(crate) fn bind_execution_handoff(
         &mut self,
-        requested: Arc<std::sync::atomic::AtomicBool>,
+        requested: tokio_util::sync::CancellationToken,
         engine: crate::server::run::engine::RunEngine,
         reservation: astra_turn_types::TurnReservationV1,
     ) {
@@ -18773,10 +18773,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         server_context_manifest_identity(&self.session_id, state.current_run_id.as_deref(), result)
     }
 
-    fn execution_handoff_requested(&self) -> bool {
+    fn execution_handoff_wake(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.execution_handoff
             .as_ref()
-            .is_some_and(|context| context.requested.load(std::sync::atomic::Ordering::Acquire))
+            .map(|context| context.requested.clone())
     }
 
     fn execution_time_budget_remaining(&self) -> Option<astra_turn_types::ExecutionTimeRemaining> {
@@ -24856,7 +24856,11 @@ mod tests {
             json!({"role":"tool","tool_call_id":"replay-tool","content":"one result"}),
         ];
         host.bind_execution_handoff(
-            Arc::new(AtomicBool::new(true)),
+            {
+                let wake = tokio_util::sync::CancellationToken::new();
+                wake.cancel();
+                wake
+            },
             engine.clone(),
             reservation.clone(),
         );
@@ -25010,7 +25014,11 @@ mod tests {
                 idempotency_key: "handoff-reservation".into(),
             };
             host.bind_execution_handoff(
-                Arc::new(AtomicBool::new(true)),
+                {
+                    let wake = tokio_util::sync::CancellationToken::new();
+                    wake.cancel();
+                    wake
+                },
                 engine.clone(),
                 reservation.clone(),
             );

@@ -778,7 +778,14 @@ pub trait AgenticLoopHost: Send {
 
     /// Process shutdown, distinct from user cancellation or turn completion.
     fn execution_handoff_requested(&self) -> bool {
-        false
+        self.execution_handoff_wake()
+            .is_some_and(|wake| wake.is_cancelled())
+    }
+
+    /// The same shutdown signal wakes an idle execution without cancelling
+    /// user work or interrupting a durable input transaction.
+    fn execution_handoff_wake(&self) -> Option<CancellationToken> {
+        None
     }
 
     /// Persist a fresh settled boundary. Success is custody, not permission
@@ -5494,6 +5501,15 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 observation.as_ref(),
             )
             .await?;
+            if outcome == super::execution_phase::RuntimeActivityOutcome::ExecutionHandoff
+                || outcome.should_continue()
+                    && host.execution_handoff_requested()
+                    && host
+                        .execution_time_budget_remaining()
+                        .is_none_or(|budget| !budget.total_remaining.is_zero())
+            {
+                freeze_for_execution_handoff(host, state).await;
+            }
             try_write_heavy_checkpoint(state);
             if !outcome.should_continue() {
                 if let super::execution_phase::RuntimeActivityOutcome::ExecutionPaused(reason) =
@@ -6768,9 +6784,9 @@ pub(crate) mod tests {
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
 
     pub(crate) struct MockHost {
-        handoff_requested: bool,
-        handoff_accepted: bool,
-        handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
+        pub(crate) handoff_requested: Option<CancellationToken>,
+        pub(crate) handoff_accepted: bool,
+        pub(crate) handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
         pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -6831,7 +6847,7 @@ pub(crate) mod tests {
     impl MockHost {
         pub(crate) fn new(results: Vec<HostTurnResult>) -> Self {
             Self {
-                handoff_requested: false,
+                handoff_requested: None,
                 handoff_accepted: false,
                 handoff_snapshots: Vec::new(),
                 turn_results: results,
@@ -7074,8 +7090,8 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn execution_handoff_requested(&self) -> bool {
-            self.handoff_requested
+        fn execution_handoff_wake(&self) -> Option<CancellationToken> {
+            self.handoff_requested.clone()
         }
 
         async fn persist_execution_handoff(
@@ -7830,7 +7846,9 @@ pub(crate) mod tests {
     async fn shutdown_handoff_freezes_before_charge_or_model_dispatch() {
         for (has_step, accepted) in [(true, true), (true, false), (false, false)] {
             let mut host = MockHost::new(Vec::new());
-            host.handoff_requested = true;
+            let handoff = CancellationToken::new();
+            handoff.cancel();
+            host.handoff_requested = Some(handoff);
             host.handoff_accepted = accepted;
             let mut state = make_state();
             state.current_run_id = Some("shutdown-run".to_string());
@@ -7857,6 +7875,183 @@ pub(crate) mod tests {
             assert_eq!(state.remaining_turns, remaining);
             assert_eq!(state.charged_iterations, 7);
             assert_eq!(state.run_execution_budget_snapshot(), budget);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_handoff_wakes_idle_input_wait_without_settling_questions() {
+        for (accepted, cancelled, capacity_wait, observation_timeout) in [
+            (true, false, false, false),
+            (false, false, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, false, true, true),
+        ] {
+            let mut host = MockHost::new(Vec::new());
+            let handoff = CancellationToken::new();
+            host.handoff_requested = Some(handoff.clone());
+            host.handoff_accepted = accepted;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            if capacity_wait {
+                host.capacity_readmission_gate =
+                    Some((Arc::clone(&entered), Arc::new(tokio::sync::Notify::new())));
+            } else {
+                host.child_wait_started = Some(Arc::clone(&entered));
+            }
+            let mut state = make_state();
+            state.current_run_id = Some("shutdown-question-run".into());
+            state.current_run_owner_generation = Some(3);
+            let (_intent_tx, intent_rx) = tokio::sync::watch::channel(0);
+            if capacity_wait && !observation_timeout {
+                state.user_intents.bind_wake(Some(intent_rx));
+            }
+            state.step_recorder.begin_turn(0);
+            if observation_timeout {
+                let owner =
+                    crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                        "shutdown-question-run",
+                        "working-child",
+                    );
+                owner.set_direct_child_for_test(
+                    crate::orchestration::spawner::DirectChildCompletion {
+                        agent_id: "working-child".into(),
+                        run_id: "child-run".into(),
+                        parent_agent_id: "parent".into(),
+                        status: crate::orchestration::AgentStatus::Running {
+                            activity: "working".into(),
+                        },
+                    },
+                );
+                host.direct_child_owner = Some(owner);
+            } else {
+                state
+                    .messaging
+                    .reply_obligations
+                    .reserve(
+                        "shutdown-question-run",
+                        "question-id",
+                        astra_messaging::AgentAddress::new("responder-run", "responder"),
+                    )
+                    .unwrap();
+            }
+            state.loop_entry = LoopEntry::IterationBoundary {
+                next_index: 0,
+                harness_pause_recovery_count: 0,
+            };
+            let wait = if observation_timeout {
+                RuntimeInputWait::Observation {
+                    receipt: astra_tools::agent_tool_contract::AgentWaitReceipt {
+                        parent_run_id: "shutdown-question-run".into(),
+                        tool_call_id: "wait-call".into(),
+                        timeout_ms: 30_000,
+                    },
+                    deadline_unix_ms: 1,
+                }
+            } else {
+                RuntimeInputWait::Completion
+            };
+            state.loop_entry.wait_for_input(wait).unwrap();
+            let remaining = state.remaining_turns;
+            let budget = state.run_execution_budget_snapshot();
+            let cancellation = Arc::new(CancellationToken::new());
+            state.cancellation.token = Some(Arc::clone(&cancellation));
+            let signal = tokio::spawn(async move {
+                entered.notified().await;
+                if cancelled {
+                    cancellation.cancel();
+                }
+                handoff.cancel();
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                run_agentic_loop_impl(&mut host, &mut state),
+            )
+            .await;
+            if cancelled {
+                assert_eq!(
+                    result.unwrap().unwrap_err().kind,
+                    astra_core::ErrorKind::Cancelled
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "handoff remains frozen until shutdown disposal"
+                );
+            }
+            signal.await.unwrap();
+            assert_eq!(
+                host.handoff_snapshots.len(),
+                usize::from(!cancelled),
+                "an already idle wait must reach the existing snapshot writer"
+            );
+            assert_eq!(
+                state
+                    .messaging
+                    .reply_obligations
+                    .has_pending("shutdown-question-run"),
+                !observation_timeout,
+            );
+            if observation_timeout {
+                assert!(
+                    host.direct_child_owner
+                        .as_ref()
+                        .unwrap()
+                        .has_pending_direct_children()
+                );
+            }
+            assert_eq!(host.current_turn, 0);
+            assert!(host.cancelled_agent_ids.is_empty());
+            assert!(host.turn_completed_run_ids.is_empty());
+            assert_eq!(state.remaining_turns, remaining);
+            assert_eq!(state.run_execution_budget_snapshot(), budget);
+            assert!(matches!(
+                state.loop_entry,
+                LoopEntry::InputWait { next_index: 1, .. }
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_handoff_preserves_soft_cutoff_but_not_expired_authority() {
+        for total_seconds in [60, 0] {
+            let mut host = MockHost::new(Vec::new());
+            let wake = CancellationToken::new();
+            wake.cancel();
+            host.handoff_requested = Some(wake);
+            host.execution_time_budget_remaining = Some(astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: std::time::Duration::ZERO,
+                total_remaining: std::time::Duration::from_secs(total_seconds),
+            });
+            let mut state = make_state();
+            state.current_run_id = Some("cutoff-run".into());
+            state
+                .messaging
+                .reply_obligations
+                .reserve(
+                    "cutoff-run",
+                    "question",
+                    astra_messaging::AgentAddress::new("responder", "agent"),
+                )
+                .unwrap();
+            let outcome = super::super::execution_phase::await_runtime_activity(
+                &mut host,
+                &mut state,
+                ContinuationAuthority::Runtime,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome,
+                if total_seconds == 0 {
+                    super::super::execution_phase::RuntimeActivityOutcome::Incomplete
+                } else {
+                    super::super::execution_phase::RuntimeActivityOutcome::ExecutionHandoff
+                }
+            );
+            assert_eq!(host.current_turn, 0);
+            assert!(host.handoff_snapshots.is_empty());
+            assert!(host.cancelled_agent_ids.is_empty());
         }
     }
 

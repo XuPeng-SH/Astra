@@ -5658,7 +5658,7 @@ pub struct AgenticRunLifecycleService {
     background_run_abort_handles: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
     /// Process shutdown asks executors to hand off at their next settled
     /// boundary. This never acts as a user cancellation marker.
-    execution_handoff_requested: Arc<AtomicBool>,
+    execution_handoff_requested: CancellationToken,
     /// Global admission control: limits the number of concurrently executing
     /// agentic loop tasks across all users. A permit is acquired before
     /// spawn and automatically released when the task completes.
@@ -5779,7 +5779,7 @@ impl AgenticRunLifecycleService {
             trace_ingestion: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             background_run_abort_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
-            execution_handoff_requested: Arc::new(AtomicBool::new(false)),
+            execution_handoff_requested: CancellationToken::new(),
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
             weighted_admission: astra_services::WeightedAdmissionController::new(admission_limits)
                 .expect("per-owner weighted admission limits fit global limits"),
@@ -7865,8 +7865,7 @@ impl AgenticRunLifecycleService {
     /// intervals up to `timeout`. Returns `true` if all tasks drained within
     /// the timeout, `false` if tasks are still running.
     async fn drain_background_tasks_impl(&self, timeout: std::time::Duration) -> bool {
-        self.execution_handoff_requested
-            .store(true, Ordering::Release);
+        self.execution_handoff_requested.cancel();
         self.drain_background_tasks_with_checkpoint(timeout, true)
             .await
     }
@@ -10343,7 +10342,7 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         mut request: ChatRequestData,
     ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
-        if self.execution_handoff_requested.load(Ordering::Acquire) {
+        if self.execution_handoff_requested.is_cancelled() {
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Server is shutting down; retry on an available server",

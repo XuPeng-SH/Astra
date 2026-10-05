@@ -250,6 +250,14 @@ terminal settlement must not run merely because the process is stopping.
 An unresolved tool, failed snapshot construction, or unconfirmed write cannot
 produce an exact handoff. A previously cached snapshot is not a substitute.
 
+For roots bound to cooperative handoff, the same shutdown token wakes an idle
+agent-input or capacity wait, rather than
+waiting for another child/message event. Explicit cancellation and wait deadlines
+retain their precedence. An in-flight durable input transaction is not interrupted
+by that wake; its existing settlement completes before the next handoff boundary.
+This improves checkpoint capture during shutdown, not durable parking or restart
+execution admission.
+
 The handoff's runtime payload pairs the heavy snapshot with the original turn
 reservation and a canonical WAL continuation transition. The existing transition
 already identifies its committed base and parent result; these are not duplicated
