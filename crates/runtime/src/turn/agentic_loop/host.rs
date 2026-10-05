@@ -1698,6 +1698,56 @@ pub struct RequestConstraints {
 }
 
 impl RequestConstraints {
+    /// Recover the original selection ceiling from the existing protected
+    /// run-start record. This does not authorize any tool or skill today.
+    pub(crate) fn from_durable_run(
+        run: &astra_services::runs::DurableRunRecord,
+        delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
+    ) -> Result<Self, &'static str> {
+        let astra_services::runs::DurableExecutionRestrictions::V1 {
+            allow_tools,
+            enabled_tools,
+            allow_skills,
+            allow_skill_sources,
+            ..
+        } = run
+            .execution_restrictions()
+            .map_err(|_| "original execution restrictions are malformed")?
+            .ok_or("original execution restrictions are missing")?;
+        Ok(Self {
+            delegated_model_requirements,
+            allowed_tools: allow_tools.map(|values| values.into_iter().collect()),
+            enabled_tools: enabled_tools.map(|values| values.into_iter().collect()),
+            allowed_skills: allow_skills.map(|values| values.into_iter().collect()),
+            allowed_skill_sources: allow_skill_sources
+                .map(|values| values.into_iter().map(|value| value.parse()).collect())
+                .transpose()
+                .map_err(|_| "original skill source selection is invalid")?,
+        })
+    }
+
+    /// Preserve both the original selection ceiling and current authorization.
+    pub(crate) fn restrict_to(&mut self, original: Self) {
+        fn intersect<T: Eq + std::hash::Hash>(
+            current: &mut Option<HashSet<T>>,
+            original: Option<HashSet<T>>,
+        ) {
+            match (current.as_mut(), original) {
+                (Some(current), Some(original)) => current.retain(|value| original.contains(value)),
+                (None, original) => *current = original,
+                _ => {}
+            }
+        }
+        intersect(&mut self.allowed_tools, original.allowed_tools);
+        intersect(&mut self.enabled_tools, original.enabled_tools);
+        intersect(&mut self.allowed_skills, original.allowed_skills);
+        intersect(
+            &mut self.allowed_skill_sources,
+            original.allowed_skill_sources,
+        );
+        self.delegated_model_requirements = original.delegated_model_requirements;
+    }
+
     /// Construct with the four external tool/skill lanes set explicitly.
     ///
     /// Callers that don't have a specific external lane pass `None`. The
@@ -2178,7 +2228,6 @@ impl UserIntentState {
     /// Only for a durable provider: its outbox replays unacknowledged inputs.
     /// Process-local poll deadlines cannot survive a restart. Allow one immediate
     /// poll/ack, retaining the failure count for subsequent bounded backoff.
-    #[cfg(test)]
     pub(crate) fn from_durable_continuation(durable: DurableUserIntentState) -> Self {
         Self {
             durable,
@@ -5960,6 +6009,48 @@ pub(crate) mod tests {
     use serde_json::json;
 
     #[test]
+    fn request_constraints_preserve_original_and_current_selection_ceilings() {
+        let set = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        for (current, original, expected) in [
+            (None, None, None),
+            (None, Some(set(&["a"])), Some(set(&["a"]))),
+            (Some(set(&["a"])), None, Some(set(&["a"]))),
+            (Some(set(&["a"])), Some(set(&[])), Some(set(&[]))),
+            (Some(set(&[])), Some(set(&["a"])), Some(set(&[]))),
+            (
+                Some(set(&["a", "b"])),
+                Some(set(&["b", "c"])),
+                Some(set(&["b"])),
+            ),
+        ] {
+            let mut constraints =
+                RequestConstraints::new(current.clone(), current.clone(), current, None);
+            constraints.restrict_to(RequestConstraints::new(
+                original.clone(),
+                original.clone(),
+                original,
+                None,
+            ));
+            assert_eq!(constraints.allowed_tools, expected);
+            assert_eq!(constraints.enabled_tools, expected);
+            assert_eq!(constraints.allowed_skills, expected);
+        }
+        use crate::skills::manifest::SkillSourceKind::{Bundled, Database, Local};
+        let mut current =
+            RequestConstraints::new(None, None, None, Some(HashSet::from([Local, Bundled])));
+        current.restrict_to(RequestConstraints::new(
+            None,
+            None,
+            None,
+            Some(HashSet::from([Bundled, Database])),
+        ));
+        assert_eq!(
+            current.allowed_skill_sources,
+            Some(HashSet::from([Bundled]))
+        );
+    }
+
+    #[test]
     fn request_constraints_freeze_exact_durable_execution_restrictions() {
         use crate::skills::manifest::SkillSourceKind;
         use astra_services::runs::{
@@ -8075,7 +8166,8 @@ pub(crate) mod tests {
     #[test]
     fn invalid_harness_recovery_threshold_resets_streak_instead_of_overriding() {
         let mut state = make_state();
-        state.stall.circuit_breaker.set_read_only_threshold(12);
+        state.stall.circuit_breaker =
+            astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::with_defaults();
         state
             .stall
             .circuit_breaker
@@ -8099,7 +8191,8 @@ pub(crate) mod tests {
     #[test]
     fn valid_harness_recovery_threshold_tightens_breaker() {
         let mut state = make_state();
-        state.stall.circuit_breaker.set_read_only_threshold(12);
+        state.stall.circuit_breaker =
+            astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::with_defaults();
 
         apply_harness_pause_recovery_threshold(&mut state, Some(4));
 

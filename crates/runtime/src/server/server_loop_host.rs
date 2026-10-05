@@ -3967,9 +3967,79 @@ pub(crate) enum ToolLedgerContinuation {
     Unavailable,
 }
 
+/// Handoff-only pairing with an existing authority reference. Ordinary journal
+/// restoration intentionally cannot install execution evidence from display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoricalToolCallContinuation {
+    pub(crate) record: astra_services::session_journal::ToolCallRecord,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub(crate) completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
+}
+
+fn validate_handoff_tool_history(
+    history: &[HistoricalToolCallContinuation],
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    chain: Option<&str>,
+    journal_next_round: Option<u32>,
+) -> Result<(), &'static str> {
+    let mut identities = HashSet::new();
+    let mut previous_round = None;
+    for entry in history {
+        if let Some(round) = entry.record.round {
+            if journal_next_round.is_none_or(|next| round >= next)
+                || previous_round.is_some_and(|previous| round < previous)
+            {
+                return Err("handoff tool history has conflicting chronology");
+            }
+            previous_round = Some(round);
+        }
+        let Some(reference) = &entry.completion else {
+            continue;
+        };
+        let identity = reference.identity();
+        if identity.user_id != user_id
+            || identity.session_id != session_id
+            || identity.run_id != run_id
+            || Some(identity.turn_chain_id.as_str()) != chain
+            || entry.record.tool_call_id.as_deref() != Some(identity.invocation_id.as_str())
+            || !identities.insert(identity.invocation_id.as_str())
+        {
+            return Err("handoff tool history has conflicting execution identity");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeExecutionHandoff {
+    // Original composed model inputs, not credentials or execution grants.
+    // Restore must independently authorize capabilities before reusing these
+    // contracts. The enclosing checkpoint's byte limit bounds their retention.
+    pub(crate) edge_profile: Map<String, Value>,
+    pub(crate) edge_provider_tool_schemas: Vec<Value>,
+    pub(crate) tool_schemas: Vec<Value>,
+    pub(crate) admission_tool_schemas: Vec<Value>,
+    pub(crate) deferred_tool_schemas: Vec<Value>,
+    pub(crate) always_load_tool_names: BTreeSet<String>,
+    pub(crate) client_pipeline_skill_names: BTreeSet<String>,
+    pub(crate) admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
+    pub(crate) permissions: astra_turn_core::permission::types::PermissionSyncContinuation,
+    pub(crate) tool_history: Vec<HistoricalToolCallContinuation>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub(crate) journal_next_round: Option<u32>,
+    pub(crate) circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
+    pub(crate) last_turn_policy: astra_turn_core::interaction_types::TurnInteractionPolicy,
+    pub(crate) work_evidence_advisory_emitted: bool,
+    pub(crate) parallel_batching_advisory_emitted: bool,
+    pub(crate) cache_waste_advisory_emitted: bool,
+    pub(crate) introspection_count: u32,
+    pub(crate) work_unit_observations: astra_core::work_unit::WorkUnitObservationTracker,
+    pub(crate) turn_sigs: Vec<BTreeSet<astra_turn_core::stall::StallSignature>>,
+    pub(crate) stall_events: Vec<(String, u32)>,
     pub(crate) original_facts: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts,
     pub(crate) hooks: crate::skills::hooks::HookContinuation,
     pub(crate) user_intents: crate::turn::agentic_loop::host::DurableUserIntentState,
@@ -3977,10 +4047,176 @@ pub(crate) struct RuntimeExecutionHandoff {
     pub(crate) primary_work: crate::server::runtime_tool_executor::PrimaryWorkHandoff,
     pub(crate) verification: astra_turn_types::VerificationHandoff,
     pub(crate) heavy: astra_pipeline::step_protocol::HeavyCheckpoint,
+    pub(crate) recorder: astra_pipeline::step_recorder::SettledRecorderContinuation,
     pub(crate) reservation: astra_turn_types::TurnReservationV1,
     pub(crate) continuation: astra_turn_types::ProviderCanonicalTransitionV2,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub(crate) execution_deadline: Option<astra_services::runs::ExecutionDeadlineSnapshot>,
+}
+
+impl RuntimeExecutionHandoff {
+    /// Decode only the immutable checkpoint returned by committed adoption.
+    /// Historical provenance is not permission to execute with old credentials.
+    pub(crate) fn from_adopted(
+        adopted: &astra_services::session_context_coordinator::ResumedExecutionTurn,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let invalid = |detail: &str| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                detail.to_string(),
+            )
+        };
+        let receipt = adopted.receipt();
+        let checkpoint = adopted.checkpoint();
+        astra_services::runs::validate_run_checkpoint_size(&checkpoint.checkpoint_json)
+            .map_err(invalid)?;
+        if checkpoint.checkpoint_kind != "execution_handoff"
+            || checkpoint.checkpoint_version != "execution_handoff_v1"
+            || checkpoint.checkpoint_id != receipt.checkpoint_id
+            || checkpoint.run_id != receipt.run_id
+            || checkpoint.user_id != receipt.source.key.owner_user_id
+            || checkpoint.session_id != receipt.source.key.session_id
+            || receipt.turn_reservation.key != receipt.source.key
+            || receipt.run_generation <= receipt.producer_generation
+        {
+            return Err(invalid(
+                "adopted checkpoint has conflicting execution identity",
+            ));
+        }
+        let astra_services::runs::DurableExecutionHandoff::V1 {
+            producer_run_id,
+            producer_owner_generation,
+            heavy: mut payload,
+        } = serde_json::from_str::<astra_services::runs::DurableExecutionHandoff<Self>>(
+            &checkpoint.checkpoint_json,
+        )
+        .map_err(|_| invalid("adopted execution checkpoint is malformed"))?;
+        if producer_run_id != receipt.run_id
+            || producer_owner_generation != receipt.producer_generation
+            || payload.reservation != receipt.source
+            || payload.original_facts.session_turn != receipt.source.reserved_turn
+        {
+            return Err(invalid(
+                "execution facts do not belong to the adopted producer",
+            ));
+        }
+        payload.heavy = validate_handoff_heavy(payload.heavy)?;
+        validate_handoff_tool_history(
+            &payload.tool_history,
+            &checkpoint.user_id,
+            &checkpoint.session_id,
+            &receipt.run_id,
+            payload.original_facts.canonical_turn_chain_id.as_deref(),
+            payload.journal_next_round,
+        )
+        .map_err(invalid)?;
+        let Some(astra_pipeline::step_protocol::RunExecutionBudget::V1 {
+            run_id,
+            producer_owner_generation,
+            ..
+        }) = payload.heavy.run_execution_budget.as_ref()
+        else {
+            return Err(invalid("adopted execution has no original run budget"));
+        };
+        if run_id != &receipt.run_id
+            || *producer_owner_generation != receipt.producer_generation
+            || payload.heavy.run_execution_control.is_none()
+        {
+            return Err(invalid(
+                "adopted execution budget or control belongs to another producer",
+            ));
+        }
+        payload
+            .work_unit_observations
+            .validate_continuation()
+            .map_err(invalid)?;
+        payload
+            .circuit_breaker
+            .validate_continuation()
+            .map_err(invalid)?;
+        payload
+            .primary_work
+            .validate()
+            .map_err(|error| invalid(&error))?;
+        Ok(payload)
+    }
+}
+
+impl ServerAgenticLoopHost {
+    /// Reuse model-visible contracts only after current runtime authorization.
+    /// Execution routing, credentials and capability grants stay with the host.
+    pub(crate) fn restore_handoff_contracts(&mut self, handoff: &RuntimeExecutionHandoff) {
+        self.edge_profile = handoff.edge_profile.clone();
+        self.edge_provider_tool_schemas = handoff.edge_provider_tool_schemas.clone();
+        self.tool_schemas = handoff.tool_schemas.clone();
+        self.admission_tool_schemas = handoff.admission_tool_schemas.clone();
+        self.deferred_tool_schemas = handoff.deferred_tool_schemas.clone();
+        self.always_load_tool_names = handoff.always_load_tool_names.iter().cloned().collect();
+    }
+
+    pub(crate) async fn restore_handoff_wal(
+        &mut self,
+        state: &mut AgenticLoopState,
+        handoff: &RuntimeExecutionHandoff,
+        durable_prefix: &[Value],
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let invalid = |detail: String| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, detail)
+        };
+        let pool = self
+            .shared_pool
+            .as_ref()
+            .ok_or_else(|| invalid("handoff has no durable WAL owner".into()))?;
+        let receipts = astra_services::load_inference_canonical_transitions_for_session(
+            pool,
+            &self.user_id,
+            &self.session_id,
+            state.session_turn,
+        )
+        .await
+        .map_err(|error| invalid(format!("load handoff WAL: {error}")))?;
+        let mut recovered = durable_prefix.to_vec();
+        let outcome = apply_provider_canonical_transition_receipts(&mut recovered, receipts)?;
+        if outcome.head.as_ref().map(|head| &head.transition_id)
+            != handoff.continuation.parent_transition_id.as_ref()
+            || outcome.head.as_ref().map(|head| &head.result)
+                != handoff.continuation.parent_result.as_ref()
+        {
+            return Err(invalid(
+                "handoff no longer matches the durable provider frontier".into(),
+            ));
+        }
+        handoff
+            .continuation
+            .apply_to(&mut recovered)
+            .map_err(|error| invalid(error.to_string()))?;
+        if astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(&recovered)
+            .map_err(|error| invalid(error.to_string()))?
+            != handoff.continuation.result
+        {
+            return Err(invalid(
+                "handoff WAL result differs from its settled checkpoint".into(),
+            ));
+        }
+        state.provider_canonical_wal_base = Some(handoff.continuation.durable_base.clone());
+        state.provider_canonical_wal_head = outcome.head;
+        let replacement = if handoff.continuation.recovery_mode
+            == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+        {
+            Some(&handoff.continuation)
+        } else {
+            outcome.replacement.as_ref()
+        };
+        if let Some(replacement) = replacement {
+            state
+                .recover_provider_canonical_replacement(replacement, &recovered)
+                .map_err(invalid)?;
+        }
+        // The loop's normal hydration hook must not treat the already restored
+        // suffix as a new user request and append it a second time.
+        self.canonical_transition_hydrated = true;
+        Ok(())
+    }
 }
 
 fn validate_handoff_heavy(
@@ -18926,6 +19162,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let classify = |error: String| {
             astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
         };
+        // Recovery must not silently persist credentials or rewrite the
+        // original model inputs. Reuse the canonical redaction boundary as a
+        // detection-only gate; a secret-bearing profile is not resumable.
+        let mut profile = Value::Object(self.edge_profile.clone());
+        if astra_text_utils::credential_redaction::redact_credentials_in_json(&mut profile) > 0 {
+            return Err(classify(
+                "execution profile contains non-persistable credentials".into(),
+            ));
+        }
         let authorization =
             state.provider_canonical_replacement_authorization(base, &state.messages);
         let plan = plan_provider_canonical_wal_transition(
@@ -18960,10 +19205,85 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ToolLedgerContinuation::Unavailable
             }
         };
+        // Session decisions belong to the existing permission owner. Persist
+        // them separately from inherited authorization, which recovery must
+        // acquire again. Missing or non-persistable decisions retain custody.
+        let Some(permission_context) = state.permission_context.as_ref() else {
+            return Ok(false);
+        };
+        let permissions = match permission_context.read().await.capture_continuation() {
+            Ok(permissions) => permissions,
+            Err(_) => return Ok(false),
+        };
+        let tool_history = state
+            .stall
+            .tool_call_records
+            .iter()
+            .map(|record| {
+                let mut durable_record = record.clone();
+                durable_record.runtime_args_full = None;
+                durable_record.runtime_model_result_full = None;
+                durable_record.execution_completion = None;
+                HistoricalToolCallContinuation {
+                    record: durable_record,
+                    completion: record.execution_completion.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let journal_next_round = state
+            .turn_event_buffer
+            .as_ref()
+            .map(|buffer| buffer.current_round());
+        if validate_handoff_tool_history(
+            &tool_history,
+            &self.user_id,
+            &self.session_id,
+            run_id,
+            state.canonical_turn_chain_id.as_deref(),
+            journal_next_round,
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
         let payload = astra_services::runs::DurableExecutionHandoff::V1 {
             producer_run_id: run_id.to_string(),
             producer_owner_generation: generation,
             heavy: RuntimeExecutionHandoff {
+                edge_profile: self.edge_profile.clone(),
+                edge_provider_tool_schemas: self.edge_provider_tool_schemas.clone(),
+                tool_schemas: self.tool_schemas.clone(),
+                admission_tool_schemas: self.admission_tool_schemas.clone(),
+                deferred_tool_schemas: self.deferred_tool_schemas.clone(),
+                always_load_tool_names: self.always_load_tool_names.iter().cloned().collect(),
+                client_pipeline_skill_names: state.skills.client_pipeline_skill_names.iter().cloned().collect(),
+                admitted_tool_policy: state.admitted_tool_policy.clone(),
+                permissions,
+                tool_history,
+                journal_next_round,
+                last_turn_policy: state.last_turn_policy.clone(),
+                work_evidence_advisory_emitted: state.stall.work_evidence_advisory_emitted,
+                parallel_batching_advisory_emitted: state.stall.parallel_batching_advisory_emitted,
+                cache_waste_advisory_emitted: state.stall.cache_waste_advisory_emitted,
+                introspection_count: state.stall.introspection_count,
+                work_unit_observations: {
+                    state.stall.work_unit_observations.validate_continuation()
+                        .map_err(|error| classify(error.to_string()))?;
+                    state.stall.work_unit_observations.clone()
+                },
+                turn_sigs: {
+                    let window = state.turn_guard.stall_window().max(
+                        astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD,
+                    );
+                    state.stall.turn_sigs[state.stall.turn_sigs.len().saturating_sub(window)..]
+                        .to_vec()
+                },
+                stall_events: state.stall.events.clone(),
+                circuit_breaker: {
+                    state.stall.circuit_breaker.validate_continuation()
+                        .map_err(|error| classify(error.to_string()))?;
+                    state.stall.circuit_breaker.clone()
+                },
                 hooks: crate::skills::hooks::HookContinuation::capture(
                     &state.skills.tool_event_hooks,
                     &state.skills.session_event_hooks,
@@ -18984,14 +19304,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     &state.stall.tool_call_records,
                     state.canonical_turn_chain_id.as_deref(),
                 ),
+                recorder: state.step_recorder.capture_settled_continuation(&heavy.light)
+                    .map_err(|error| classify(error.to_string()))?,
                 heavy,
                 reservation: context.reservation.clone(),
                 continuation: plan.transition,
                 execution_deadline: self.execution_time_budget.map(|deadline| deadline.snapshot()),
             },
         };
-        let checkpoint_json =
-            serde_json::to_string(&payload).map_err(|error| classify(error.to_string()))?;
+        let checkpoint_json = match astra_services::runs::encode_execution_handoff(&payload) {
+            Ok(json) => json,
+            Err(_) => return Ok(false),
+        };
+        state
+            .step_recorder
+            .confirm_handoff_persistence()
+            .await
+            .map_err(classify)?;
         context
             .engine
             .persist_owned_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
@@ -24780,12 +25109,15 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated MatrixOne: run with ASTRA_TEST_DB_IT=1"]
-    async fn execution_handoff_custody_survives_claims_and_production_recovery() {
+    async fn execution_handoff_adoption_preserves_checkpoint_across_owner_generations() {
+        let journal = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(journal.path());
         use astra_services::runs::RunStateStore;
         use astra_services::session_context_coordinator::{
             AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
-            SessionContextCoordinator,
+            ResumedExecutionTurnRequest, SessionContextCoordinator,
         };
+        use sqlx::Row;
         assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
         let _ = dotenvy::dotenv();
         // Recovery discovery is intentionally database-wide. Give this test a
@@ -24803,21 +25135,139 @@ mod tests {
             .await
             .unwrap();
         let pool = SharedPool::new(&settings).await.unwrap();
-        let user = "replay-user";
+        let auth = astra_services::DatabaseAuthService::new(
+            settings.clone(),
+            astra_core::JwtSettings {
+                secret_key: format!("execution-handoff-test-{database}"),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 30,
+                refresh_token_expire_days: 7,
+            },
+        )
+        .with_pool(pool.clone());
+        let account_name = format!("execution_handoff_{}", uuid::Uuid::new_v4().simple());
+        let account_password = "execution-handoff-test-password";
+        let account = astra_services::AuthService::register(
+            &auth,
+            astra_services::AuthRegisterRequestData {
+                username: account_name.clone(),
+                email: format!("{account_name}@example.invalid"),
+                password: account_password.into(),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        let login = astra_services::AuthService::login(
+            &auth,
+            astra_services::AuthLoginRequestData {
+                username: account_name.clone(),
+                password: account_password.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let auth_session_id: String = sqlx::query(
+            "SELECT session_id FROM auth_refresh_tokens WHERE user_id = ? AND is_revoked = 0 LIMIT 1",
+        )
+        .bind(&account.user_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+        .try_get("session_id")
+        .unwrap();
+        // Make the refresh extension observable without sleeping. The grant
+        // below is still produced by current_principal from this live row.
+        assert_eq!(
+            sqlx::query(
+                "UPDATE auth_refresh_tokens SET expires_at = DATE_ADD(NOW(), INTERVAL 1 HOUR) \
+                 WHERE user_id = ? AND session_id = ? AND is_revoked = 0",
+            )
+            .bind(&account.user_id)
+            .bind(&auth_session_id)
+            .execute(pool.get())
+            .await
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        let mut login_headers = axum::http::HeaderMap::new();
+        login_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", login.access_token)).unwrap(),
+        );
+        let principal = astra_services::AuthService::current_principal(&auth, &login_headers)
+            .await
+            .unwrap();
+        let frozen_grant = principal.execution_continuation.clone().unwrap();
+        assert_eq!(principal.user.user_id, account.user_id);
+        assert_eq!(
+            principal.session_id.as_deref(),
+            Some(auth_session_id.as_str())
+        );
         let session = "replay-session";
+        assert_ne!(principal.session_id.as_deref(), Some(session));
+        let execution_authentication = principal
+            .execution_authentication_provenance()
+            .expect("a local JWT principal must provide trusted run provenance");
+        let refreshed_login = astra_services::AuthService::refresh(
+            &auth,
+            astra_services::AuthRefreshRequestData {
+                refresh_token: login.refresh_token.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut refreshed_headers = axum::http::HeaderMap::new();
+        refreshed_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", refreshed_login.access_token))
+                .unwrap(),
+        );
+        let refreshed_principal =
+            astra_services::AuthService::current_principal(&auth, &refreshed_headers)
+                .await
+                .unwrap();
+        assert_eq!(
+            refreshed_principal.session_id.as_deref(),
+            Some(auth_session_id.as_str())
+        );
+        assert!(
+            refreshed_principal
+                .execution_continuation
+                .as_ref()
+                .unwrap()
+                .expires_at_unix
+                > frozen_grant.expires_at_unix,
+            "same-session refresh must extend current session state in the DB"
+        );
+        let user = account.user_id.clone();
         let run_id = "replay-run";
         sqlx::query("INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) VALUES (?, ?, 'replay', 'active', 0)")
-            .bind(session).bind(user).execute(pool.get()).await.unwrap();
+            .bind(session).bind(&user).execute(pool.get()).await.unwrap();
         let store = Arc::new(
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("replay-test-owner"),
         );
         let engine = crate::server::run::engine::RunEngine::new(store.clone());
-        engine.start_run(run_id, user, session).await.unwrap();
+        engine
+            .start_run_with_context(
+                run_id,
+                &user,
+                session,
+                crate::server::run::engine::RunStartContext {
+                    execution_authentication: Some(execution_authentication.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let original_admission =
+            store.load_run(&user, run_id).await.unwrap().unwrap().events[0].clone();
         let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-        let key = astra_turn_types::SessionKeyV1::owner_session("server", user, session, "main");
+        let key = astra_turn_types::SessionKeyV1::owner_session("server", &user, session, "main");
         let actor = astra_turn_types::ActorContextV1::owner_user(
-            user,
+            &user,
             "replay-writer",
             astra_turn_types::ActorKindV1::Cli,
             astra_turn_types::SessionSurfaceV1::Cli,
@@ -24839,22 +25289,52 @@ mod tests {
         else {
             panic!("original turn admission failed")
         };
+        let original_profile = Map::from_iter([(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS.into(),
+            json!(["Original native runtime instructions"]),
+        )]);
         let mut host = ServerAgenticLoopHostBuilder::new(
             settings.clone(),
             mock_encryptor(),
-            user.into(),
+            user.clone(),
             session.into(),
         )
         .with_pool(pool.clone())
+        .with_edge_profile(original_profile.clone())
         .build();
+        let original_tools = host.tool_schemas.clone();
+        let original_deferred = host.deferred_tool_schemas.clone();
+        let original_always_load: BTreeSet<_> =
+            host.always_load_tool_names.iter().cloned().collect();
         let mut state = create_test_state();
         state.current_run_id = Some(run_id.into());
         state.current_session_id = Some(session.into());
+        state.permission_context = Some(
+            astra_turn_core::permission::types::PermissionSyncContext::shared_root(
+                astra_turn_core::permission::types::PermissionMode::Prompt,
+            ),
+        );
         state.current_run_owner_generation = Some(0);
         state.canonical_turn_chain_id = Some("replay-chain".into());
         state.session_turn = reservation.reserved_turn;
         state.total_prompt = 123;
+        state
+            .skills
+            .client_pipeline_skill_names
+            .insert("original-client-skill".into());
+        state.step_recorder = astra_pipeline::step_recorder::StepRecorder::with_persistence_for_run(
+            &user, session, run_id, run_id,
+        );
         state.step_recorder.begin_turn(reservation.reserved_turn);
+        // Tool-free rounds still advance the journal; the last tool record
+        // cannot reconstruct this cursor.
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn_with_round(
+                Some(session),
+                reservation.reserved_turn,
+                7,
+            ),
+        );
         state.initialize_provider_canonical_wal_base(&[]);
         state.messages = vec![
             json!({"role":"user","content":"inspect result"}),
@@ -24875,69 +25355,321 @@ mod tests {
                 .unwrap();
         assert!(host.persist_execution_handoff(&state, heavy).await.unwrap());
         let checkpoint = engine
-            .load_latest_checkpoint(user, run_id, Some("execution_handoff"))
+            .load_latest_checkpoint(&user, run_id, Some("execution_handoff"))
             .await
             .unwrap()
             .unwrap();
         coordinator.release_writer(&lease).await.unwrap();
-        let authority_sql = "SELECT writer_epoch, active_writer_json, active_reservation_json FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?";
-        let original_authority: (i64, Option<String>, Option<String>) =
-            sqlx::query_as(authority_sql)
-                .bind(&key.isolation_domain)
-                .bind(user)
-                .bind(session)
-                .bind(&key.branch_id)
-                .fetch_one(pool.get())
+        let first_claim = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .unwrap()
+            .remove(0);
+        store
+            .reconcile_execution_handoff(&first_claim)
+            .await
+            .unwrap()
+            .unwrap();
+        let custody_snapshot = || async {
+            let run: (
+                String,
+                i64,
+                Option<String>,
+                Option<chrono::NaiveDateTime>,
+                i64,
+            ) = sqlx::query_as(
+                "SELECT status, run_generation, owner_pod_id, owner_lease_expires_at,
+                     last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&user)
+            .bind(run_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            let slot: Option<String> = sqlx::query_scalar(
+                "SELECT run_id FROM agent_session_execution_slots
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user)
+            .bind(session)
+            .fetch_optional(pool.get())
+            .await
+            .unwrap();
+            (run, slot)
+        };
+        let resume_request = |generation, owner| ResumedExecutionTurnRequest {
+            user_id: &user,
+            session_id: session,
+            run_id,
+            expected_owner_generation: generation,
+            checkpoint_id: &checkpoint.checkpoint_id,
+            source: &reservation,
+            actor: &actor,
+            owner_pod_id: owner,
+            ttl: Duration::from_secs(60),
+        };
+        // Rejection must preserve durable custody and canonical turn authority.
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = 'live-owner', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(run_id).execute(pool.get()).await.unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
                 .await
-                .unwrap();
-        for generation in 1..=2 {
-            let mut claims = store.claim_recoverable_active_runs(1).await.unwrap();
-            assert_eq!(claims.len(), 1);
-            let claim = claims.remove(0);
-            assert_eq!(claim.run.run_generation, generation);
+                .is_err()
+        );
+        assert_eq!(custody_snapshot().await, before);
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = NULL, owner_lease_expires_at = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(run_id).execute(pool.get()).await.unwrap();
+
+        engine
+            .start_run("slot-blocker", &user, session)
+            .await
+            .unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
+                .await
+                .is_err()
+        );
+        assert_eq!(custody_snapshot().await, before);
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user,
+                    session,
+                    "slot-blocker",
+                    &[astra_core::STATUS_RUNNING],
+                    Some(0),
+                    astra_core::STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut conflicting_checkpoint: Value =
+            serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
+        conflicting_checkpoint["heavy"]["original_facts"]["total_prompt"] = json!(124);
+        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(conflicting_checkpoint.to_string())
+            .bind(&user)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            custody_snapshot().await,
+            before,
+            "checkpoint mismatch cannot retain the provisional claim"
+        );
+        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(&checkpoint.checkpoint_json)
+            .bind(&user)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+
+        let tail_index = custody_snapshot().await.0.4;
+        let tail: String = sqlx::query_scalar("SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(&user).bind(run_id).bind(tail_index).fetch_one(pool.get()).await.unwrap();
+        sqlx::query("UPDATE agent_run_events SET payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(json!({"event_type":"unrelated"}).to_string())
+            .bind(&user).bind(run_id).bind(tail_index).execute(pool.get()).await.unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            custody_snapshot().await,
+            before,
+            "unassociated tail rolls back Running, generation, lease and slot"
+        );
+        sqlx::query("UPDATE agent_run_events SET payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(tail).bind(&user).bind(run_id).bind(tail_index).execute(pool.get()).await.unwrap();
+        for generation in 2..=4 {
+            let (first, second) = tokio::join!(
+                coordinator
+                    .resume_execution_turn(resume_request(generation - 1, "replay-test-owner-a")),
+                coordinator
+                    .resume_execution_turn(resume_request(generation - 1, "replay-test-owner-b")),
+            );
+            assert_ne!(
+                first.is_ok(),
+                second.is_ok(),
+                "only one concurrent owner wins"
+            );
+            let adopted = first.or(second).unwrap();
+            assert_eq!(adopted.receipt().producer_generation, 0);
+            assert_eq!(adopted.run().events.len(), 1);
+            assert_eq!(adopted.run().events[0]["event_type"], "run_started");
             assert_eq!(
-                claim.run.checkpoint_json.as_deref(),
-                Some(checkpoint.checkpoint_json.as_str())
+                adopted.run().original_admission_data().unwrap(),
+                original_admission["data"].as_object().unwrap(),
+                "preserve original admission facts independently of display indexes"
+            );
+            assert_eq!(adopted.run().run_generation, generation);
+            assert!(adopted.run().checkpoint_json.is_none());
+            assert_eq!(
+                adopted.run().execution_authentication().unwrap(),
+                Some(execution_authentication.clone())
+            );
+            let recovered = RuntimeExecutionHandoff::from_adopted(&adopted)
+                .expect("decode the exact checkpoint returned by atomic adoption");
+            assert_eq!(recovered.edge_profile, original_profile);
+            assert_eq!(recovered.tool_schemas, original_tools);
+            assert_eq!(recovered.deferred_tool_schemas, original_deferred);
+            assert_eq!(recovered.always_load_tool_names, original_always_load);
+            assert_eq!(
+                recovered.client_pipeline_skill_names,
+                BTreeSet::from(["original-client-skill".into()])
+            );
+            assert_eq!(recovered.reservation, reservation);
+            assert_eq!(recovered.journal_next_round, Some(7));
+            assert_eq!(
+                adopted.checkpoint().checkpoint_json.as_str(),
+                checkpoint.checkpoint_json.as_str()
             );
             assert_eq!(
                 engine
-                    .load_latest_checkpoint(user, run_id, Some("execution_handoff"))
+                    .load_latest_checkpoint(&user, run_id, Some("execution_handoff"))
                     .await
                     .unwrap()
                     .unwrap(),
                 checkpoint
             );
-        }
-        engine.recover_active_runs().await.unwrap();
-        let final_run = store.load_run(user, run_id).await.unwrap().unwrap();
-        assert_eq!(final_run.status, "paused");
-        assert_eq!(final_run.run_generation, 3);
-        let current_authority: (i64, Option<String>, Option<String>) =
-            sqlx::query_as(authority_sql)
-                .bind(&key.isolation_domain)
-                .bind(user)
-                .bind(session)
-                .bind(&key.branch_id)
-                .fetch_one(pool.get())
+            assert!(adopted.receipt().writer_lease.writer_epoch > lease.writer_epoch);
+            let reauthorized =
+                astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                    .await
+                    .expect("the live original session may reauthorize the adopted proof");
+            assert_eq!(reauthorized.user.user_id, user);
+            assert_eq!(
+                reauthorized.session_id.as_deref(),
+                Some(auth_session_id.as_str())
+            );
+            assert_eq!(
+                reauthorized.execution_continuation,
+                Some(frozen_grant.clone())
+            );
+            if generation == 4 {
+                sqlx::query("INSERT INTO auth_external_identities (provider_id, external_subject, astra_user_id) VALUES ('memoria:changed-origin', 'changed-subject', ?)")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                let (status, _) =
+                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                        .await
+                        .expect_err(
+                            "a changed provider origin cannot downgrade to local authority",
+                        );
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+                sqlx::query("DELETE FROM auth_external_identities WHERE astra_user_id = ? AND provider_id = 'memoria:changed-origin'")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE auth_users SET is_active = 0 WHERE user_id = ?")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                let (status, _) =
+                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                        .await
+                        .expect_err("an inactive account cannot continue an adopted run");
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+                sqlx::query("UPDATE auth_users SET is_active = 1 WHERE user_id = ?")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                astra_services::AuthService::logout(
+                    &auth,
+                    astra_services::AuthRefreshRequestData {
+                        refresh_token: refreshed_login.refresh_token.clone(),
+                    },
+                )
                 .await
                 .unwrap();
-        assert_eq!(current_authority, original_authority);
-        let recovery = final_run.events.last().unwrap();
-        assert_eq!(recovery["data"]["execution_handoff_preserved"], true);
-        assert_eq!(recovery["data"]["automatic_execution_reconstructed"], false);
-        assert_eq!(
-            recovery["data"]["execution_handoff_recovery"],
-            json!({
-                "checkpoint_id": checkpoint.checkpoint_id,
-                "producer_generation": 0,
-                "claimed_from_generation": 2,
-                "recovered_generation": 3,
-            })
-        );
-        assert_eq!(
-            final_run.checkpoint_json.as_deref(),
-            Some(checkpoint.checkpoint_json.as_str())
-        );
+                let replacement_login = astra_services::AuthService::login(
+                    &auth,
+                    astra_services::AuthLoginRequestData {
+                        username: account_name.clone(),
+                        password: account_password.into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let mut replacement_headers = axum::http::HeaderMap::new();
+                replacement_headers.insert(
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_str(&format!(
+                        "Bearer {}",
+                        replacement_login.access_token
+                    ))
+                    .unwrap(),
+                );
+                let replacement_principal =
+                    astra_services::AuthService::current_principal(&auth, &replacement_headers)
+                        .await
+                        .unwrap();
+                assert_eq!(replacement_principal.user.user_id, user);
+                assert_ne!(
+                    replacement_principal.session_id.as_deref(),
+                    Some(auth_session_id.as_str())
+                );
+                let (status, _) =
+                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                        .await
+                        .expect_err("a new login must not replace the revoked original session");
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+            }
+            coordinator
+                .release_writer(&adopted.receipt().writer_lease)
+                .await
+                .unwrap();
+            if generation < 4 {
+                assert!(
+                    store
+                        .update_run_status_with_events_if_current(
+                            &user,
+                            session,
+                            run_id,
+                            &[astra_core::STATUS_RUNNING],
+                            Some(generation),
+                            astra_core::STATUS_PAUSED,
+                            None,
+                            None,
+                            &[],
+                        )
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    store
+                        .release_owner_lease(&user, session, run_id, generation)
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+        let final_run = store.load_run(&user, run_id).await.unwrap().unwrap();
         assert_eq!(
             final_run
                 .events
@@ -24958,6 +25690,8 @@ mod tests {
 
     #[tokio::test]
     async fn execution_handoff_preserves_settled_checkpoint_without_reconstructing_execution() {
+        let journal = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(journal.path());
         for (cancelled, chain, accounting_available) in [
             (false, Some("handoff-chain"), true),
             (true, Some("handoff-chain"), true),
@@ -24983,10 +25717,57 @@ mod tests {
                 .build();
             let mut state = create_test_state();
             state.current_run_id = Some("handoff-run".into());
+            let mut permissions = astra_turn_core::permission::types::PermissionSyncContext::root(
+                astra_turn_core::permission::types::PermissionMode::Prompt,
+            );
+            permissions.apply_update(
+                &astra_turn_core::permission::types::PermissionUpdate::allow(
+                    astra_turn_core::permission::types::PermissionRule::tool("read_file"),
+                ),
+            );
+            permissions.apply_update(&astra_turn_core::permission::types::PermissionUpdate::deny(
+                astra_turn_core::permission::types::PermissionRule::tool("write_file"),
+            ));
+            state.permission_context = Some(permissions.into_shared());
             state.canonical_turn_chain_id = chain.map(str::to_owned);
             state.current_run_owner_generation = Some(0);
             state.current_session_id = Some("handoff-session".into());
             state.session_turn = 1;
+            state.turn_guard = astra_turn_core::turn_guard::TurnGuard::new();
+            state.stall.turn_sigs = (0..8)
+                .map(|index| {
+                    BTreeSet::from([astra_turn_core::stall::StallSignature::new(
+                        "read_file",
+                        index.to_string().as_bytes(),
+                    )])
+                })
+                .collect();
+            state.stall.events.push(("repetition_threshold".into(), 5));
+            let observation = astra_core::work_unit::WorkUnitObservation::new(
+                "finished-child",
+                "agent",
+                astra_core::work_unit::WorkUnitStatus::Completed,
+                2,
+                astra_core::work_unit::WorkUnitObservationMode::Transition,
+            )
+            .unwrap();
+            state.stall.work_unit_observations.observe(&observation);
+            state.stall.work_evidence_advisory_emitted = true;
+            state.stall.parallel_batching_advisory_emitted = true;
+            state.stall.cache_waste_advisory_emitted = true;
+            state.stall.introspection_count = 2;
+            state.last_turn_policy =
+                astra_turn_core::interaction_types::TurnInteractionPolicy::from_visible_tool_names(
+                    astra_turn_core::interaction_types::TurnInteractionMode::Prompt,
+                    vec!["read_file".into(), "ask_user".into()],
+                );
+            state.step_recorder =
+                astra_pipeline::step_recorder::StepRecorder::with_persistence_for_run(
+                    "handoff-user",
+                    "handoff-session",
+                    "handoff-run",
+                    "handoff-run",
+                );
             state.step_recorder.begin_turn(1);
             state.initialize_provider_canonical_wal_base(&[]);
             state.messages = vec![
@@ -25037,6 +25818,20 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            host.edge_profile.insert(
+                "api_key".into(),
+                Value::String(format!("sk-{}", "z".repeat(48))),
+            );
+            let secret_profile =
+                crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
+                    .unwrap();
+            assert!(
+                host.persist_execution_handoff(&state, secret_profile)
+                    .await
+                    .is_err(),
+                "credential-bearing input must not become a recovery checkpoint"
+            );
+            host.edge_profile.remove("api_key");
             state.push_volatile_payload(
                 crate::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
                 json!({"mode": "text_only"}),
@@ -25066,6 +25861,29 @@ mod tests {
             );
             state.restore_volatile_attempt_lease();
             let mut wire: serde_json::Value = serde_json::from_str(&saved.checkpoint_json).unwrap();
+            for field in [
+                "edge_profile",
+                "edge_provider_tool_schemas",
+                "tool_schemas",
+                "admission_tool_schemas",
+                "deferred_tool_schemas",
+                "always_load_tool_names",
+                "client_pipeline_skill_names",
+            ] {
+                let original = wire["heavy"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field)
+                    .unwrap();
+                assert!(
+                    serde_json::from_value::<
+                        astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
+                    >(wire.clone())
+                    .is_err(),
+                    "missing native input {field} cannot default during recovery"
+                );
+                wire["heavy"][field] = original;
+            }
             let deadline_field = wire["heavy"]
                 .as_object_mut()
                 .unwrap()
@@ -25097,6 +25915,67 @@ mod tests {
                 accounting_available
             );
             assert_eq!(payload.execution_deadline, Some(deadline.snapshot()));
+            assert_eq!(
+                payload.permissions,
+                state
+                    .permission_context
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .await
+                    .capture_continuation()
+                    .unwrap(),
+            );
+            let permission_context = state.permission_context.take();
+            let without_permissions =
+                crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
+                    .unwrap();
+            assert!(
+                !host
+                    .persist_execution_handoff(&state, without_permissions)
+                    .await
+                    .unwrap()
+            );
+            state.permission_context = permission_context;
+            assert_eq!(payload.last_turn_policy, state.last_turn_policy);
+            assert!(payload.work_evidence_advisory_emitted);
+            assert!(payload.parallel_batching_advisory_emitted);
+            assert!(payload.cache_waste_advisory_emitted);
+            assert_eq!(payload.introspection_count, 2);
+            assert_eq!(payload.turn_sigs, state.stall.turn_sigs[3..]);
+            assert_eq!(payload.stall_events, state.stall.events);
+            payload
+                .work_unit_observations
+                .validate_continuation()
+                .unwrap();
+            let mut restored_observations = payload.work_unit_observations.clone();
+            let mut stale_observation = observation.clone();
+            stale_observation.status = astra_core::work_unit::WorkUnitStatus::Running;
+            stale_observation.revision = 1;
+            assert_eq!(
+                restored_observations.observe(&stale_observation),
+                astra_core::work_unit::WorkUnitObservationOutcome::Ignored
+            );
+            payload.circuit_breaker.validate_continuation().unwrap();
+            assert_eq!(
+                serde_json::to_value(&payload.admitted_tool_policy).unwrap(),
+                serde_json::to_value(&state.admitted_tool_policy).unwrap(),
+                "recovery must retain the original admission policy, not current configuration",
+            );
+            let restored_recorder =
+                astra_pipeline::step_recorder::StepRecorder::restore_settled_continuation(
+                    "handoff-user",
+                    "handoff-session",
+                    "handoff-run",
+                    payload.recorder.clone(),
+                    &payload.heavy,
+                )
+                .expect("restore the recorder captured by the actual handoff writer");
+            assert!(restored_recorder.events().is_empty());
+            assert_eq!(
+                serde_json::to_value(restored_recorder.current_step()).unwrap(),
+                serde_json::to_value(state.step_recorder.current_step()).unwrap(),
+            );
             payload
                 .hooks
                 .clone()
@@ -29300,6 +30179,93 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let history = records
+            .iter()
+            .map(|record| HistoricalToolCallContinuation {
+                record: record.clone(),
+                completion: record.execution_completion.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut wire = serde_json::to_value(&history).unwrap();
+        let decoded: Vec<HistoricalToolCallContinuation> =
+            serde_json::from_value(wire.clone()).unwrap();
+        validate_handoff_tool_history(&decoded, "user1", "sess1", "run1", Some("chain"), Some(2))
+            .unwrap();
+        for cursor in [None, Some(1)] {
+            assert!(
+                validate_handoff_tool_history(
+                    &decoded,
+                    "user1",
+                    "sess1",
+                    "run1",
+                    Some("chain"),
+                    cursor,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            decoded
+                .iter()
+                .all(|entry| entry.record.execution_completion.is_none())
+        );
+        assert_eq!(decoded[0].completion, records[0].execution_completion);
+        assert_eq!(decoded[1].completion, records[1].execution_completion);
+        assert!(
+            validate_handoff_tool_history(
+                &decoded,
+                "other-owner",
+                "sess1",
+                "run1",
+                Some("chain"),
+                Some(2)
+            )
+            .is_err()
+        );
+        let mut reversed = decoded.clone();
+        reversed.reverse();
+        assert!(
+            validate_handoff_tool_history(
+                &reversed,
+                "user1",
+                "sess1",
+                "run1",
+                Some("chain"),
+                Some(2)
+            )
+            .is_err()
+        );
+        let mut duplicated = decoded.clone();
+        duplicated.push(decoded[1].clone());
+        assert!(
+            validate_handoff_tool_history(
+                &duplicated,
+                "user1",
+                "sess1",
+                "run1",
+                Some("chain"),
+                Some(2)
+            )
+            .is_err()
+        );
+        wire[0].as_object_mut().unwrap().remove("completion");
+        assert!(
+            serde_json::from_value::<Vec<HistoricalToolCallContinuation>>(wire.clone()).is_err()
+        );
+        wire[0]["completion"] = Value::Null;
+        let unknown: Vec<HistoricalToolCallContinuation> = serde_json::from_value(wire).unwrap();
+        assert!(unknown[0].completion.is_none());
+        assert!(unknown[0].record.execution_completion.is_none());
+        // Exercise the reconstructed continuation, not the original live
+        // records: ordinary record serde deliberately drops authority.
+        let records = decoded
+            .into_iter()
+            .map(|entry| {
+                let mut record = entry.record;
+                record.execution_completion = entry.completion;
+                record
+            })
+            .collect::<Vec<_>>();
         let assessment = TaskResolutionAssessment {
             scope: "intent".into(),
             boundary_id: "boundary".into(),

@@ -7,10 +7,8 @@ use astra_turn_types::{StopHook, ToolInvocationCompletionRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum VerificationRecoveryError {
-    #[cfg(test)]
     #[error("verification checkpoint evidence is invalid")]
     InvalidEvidence,
-    #[cfg(test)]
     #[error("verification checkpoint belongs to a different execution or contract")]
     ScopeMismatch,
     #[cfg(test)]
@@ -38,7 +36,6 @@ impl Evidence {
         })
     }
 
-    #[cfg(test)]
     fn restore(evidence: &astra_turn_types::VerificationEvidence) -> Self {
         Self {
             ordinal: evidence.ordinal,
@@ -64,7 +61,6 @@ impl MutationSource {
         })
     }
 
-    #[cfg(test)]
     fn restore(source: &astra_turn_types::WorkspaceMutationSource) -> Self {
         Self {
             evidence: Evidence::restore(&source.evidence),
@@ -195,7 +191,6 @@ impl WorkspaceObservationFacts {
         })
     }
 
-    #[cfg(test)]
     fn restore(snapshot: &astra_turn_types::BoundWorkspaceObservation) -> Self {
         Self {
             barrier: snapshot.barrier.as_ref().map(Evidence::restore),
@@ -1031,6 +1026,38 @@ pub(crate) mod tests {
         );
         assert_eq!(restored.cursor, 0);
         assert_eq!(restored.processed_through, 2);
+        let paired = history
+            .iter()
+            .map(
+                |record| crate::server::server_loop_host::HistoricalToolCallContinuation {
+                    record: record.clone(),
+                    completion: record.execution_completion.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let cursor = VerificationFrontier::adopted_history_cursor(
+            &snapshot, &paired, "user", "session", "run", "chain",
+        )
+        .unwrap();
+        let mut complete_history =
+            VerificationFrontier::restore_bound_snapshot(None, &snapshot, "chain", &hooks, cursor)
+                .unwrap();
+        complete_history.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.processed_through, 2);
+        assert_eq!(complete_history.missing(), uninterrupted.missing());
+        let mut changed_prefix = paired.clone();
+        changed_prefix[1].completion = None;
+        assert!(
+            VerificationFrontier::adopted_history_cursor(
+                &snapshot,
+                &changed_prefix,
+                "user",
+                "session",
+                "run",
+                "chain",
+            )
+            .is_err()
+        );
         assert!(
             VerificationFrontier::restore(
                 None, &snapshot, "other", "session", "run", "chain", &hooks, &rows
@@ -1074,7 +1101,12 @@ pub(crate) mod tests {
         );
         let suffix = vec![executed(&mut ledger, "check-b", "bash", "./b")];
         history.extend(suffix.clone());
+        complete_history.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.processed_through, 3);
+        complete_history.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.processed_through, 3);
         uninterrupted.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.missing(), uninterrupted.missing());
         restored.advance(None, &hooks, &suffix).unwrap();
         assert_eq!(restored.missing(), uninterrupted.missing());
         assert_eq!(restored.processed_through, uninterrupted.processed_through);
@@ -1293,18 +1325,16 @@ impl Default for VerificationFrontier {
 }
 
 impl VerificationFrontier {
-    /// Semantic association comes from the immutable owner checkpoint;
-    /// terminal authenticity comes from these exact invocation ledger rows.
-    #[cfg(test)]
-    pub(crate) fn restore(
+    /// Rebuild the reducer from a semantically scoped snapshot. The caller is
+    /// responsible for proving the snapshot's provenance; this helper owns the
+    /// invariant checks and the one reconstruction path shared by raw tests
+    /// and atomically adopted execution handoffs.
+    fn restore_bound_snapshot(
         workspace_root: Option<&str>,
         snapshot: &astra_turn_types::BoundVerificationFrontier,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
         turn_chain_id: &str,
         hooks: &[StopHook],
-        records: &[astra_turn_types::ToolInvocationRecord],
+        cursor: usize,
     ) -> Result<Self, VerificationRecoveryError> {
         snapshot
             .validate()
@@ -1318,6 +1348,152 @@ impl VerificationFrontier {
         {
             return Err(VerificationRecoveryError::ScopeMismatch);
         }
+        for source in snapshot.workspace.latest_source.iter().chain(
+            snapshot
+                .workspace
+                .proof
+                .iter()
+                .filter_map(|proof| proof.literal_source.as_ref()),
+        ) {
+            if let Some(path) = &source.delivered_path {
+                if super::lifecycle::normalize_workspace_path(path, workspace_root).as_deref()
+                    != Some(std::path::Path::new(path))
+                {
+                    return Err(VerificationRecoveryError::ScopeMismatch);
+                }
+            }
+        }
+        Ok(Self {
+            contract: snapshot.contract.clone(),
+            workspace_root: snapshot.workspace_root.clone(),
+            observation: WorkspaceObservationFacts::restore(&snapshot.workspace),
+            cursor,
+            processed_through: snapshot.processed_through,
+            mutation: snapshot.mutation.as_ref().map(Evidence::restore),
+            proofs: snapshot
+                .proofs
+                .iter()
+                .map(|proof| proof.as_ref().map(Evidence::restore))
+                .collect(),
+            historical_prefix: snapshot.processed_through != 0,
+        })
+    }
+
+    fn adopted_history_cursor(
+        snapshot: &astra_turn_types::BoundVerificationFrontier,
+        history: &[crate::server::server_loop_host::HistoricalToolCallContinuation],
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+    ) -> Result<usize, VerificationRecoveryError> {
+        let history_len = u64::try_from(history.len())
+            .map_err(|_| VerificationRecoveryError::OrdinalExhausted)?;
+        if snapshot.processed_through != history_len {
+            return Err(VerificationRecoveryError::InvalidEvidence);
+        }
+        for evidence in snapshot.evidence() {
+            let identity = &evidence.invocation.identity;
+            if identity.user_id != user_id
+                || identity.session_id != session_id
+                || identity.run_id != run_id
+                || identity.turn_chain_id != turn_chain_id
+            {
+                return Err(VerificationRecoveryError::ScopeMismatch);
+            }
+            let index = usize::try_from(
+                evidence
+                    .ordinal
+                    .checked_sub(1)
+                    .ok_or(VerificationRecoveryError::InvalidEvidence)?,
+            )
+            .map_err(|_| VerificationRecoveryError::OrdinalExhausted)?;
+            let Some(entry) = history.get(index) else {
+                return Err(VerificationRecoveryError::InvalidEvidence);
+            };
+            if !entry.record.was_executed()
+                || entry
+                    .completion
+                    .as_ref()
+                    .and_then(|completion| completion.as_invocation())
+                    != Some(&evidence.invocation)
+            {
+                return Err(VerificationRecoveryError::InvalidEvidence);
+            }
+        }
+        Ok(history.len())
+    }
+
+    /// Restore only the verification prefix carried by an atomically adopted
+    /// execution handoff. `AdoptedExecutionHandoff` is deliberately not
+    /// deserializable: its locked checkpoint and receipt are the provenance
+    /// boundary. This method therefore accepts no arbitrary snapshot, no
+    /// trusted flag, and no historical ledger rows.
+    ///
+    /// The current workspace and hook contract are required to match the
+    /// retained prefix. This restores observation facts only; current tool,
+    /// Work, and execution permissions remain owned by their live admission
+    /// paths. In particular, an `OutcomeUnknown` invocation is copied with its
+    /// original state and is never promoted to a successful outcome.
+    pub(crate) fn restore_from_adopted_handoff(
+        workspace_root: Option<&str>,
+        hooks: &[StopHook],
+        adopted: &astra_services::session_context_coordinator::ResumedExecutionTurn,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+    ) -> Result<Self, VerificationRecoveryError> {
+        let receipt = adopted.receipt();
+        let checkpoint = adopted.checkpoint();
+        if checkpoint.checkpoint_kind != "execution_handoff"
+            || checkpoint.checkpoint_version != "execution_handoff_v1"
+            || checkpoint.user_id != user_id
+            || checkpoint.session_id != session_id
+            || checkpoint.run_id != run_id
+            || receipt.run_id != run_id
+        {
+            return Err(VerificationRecoveryError::ScopeMismatch);
+        }
+
+        let payload =
+            crate::server::server_loop_host::RuntimeExecutionHandoff::from_adopted(adopted)
+                .map_err(|_| VerificationRecoveryError::InvalidEvidence)?;
+        if payload.original_facts.canonical_turn_chain_id.as_deref() != Some(turn_chain_id) {
+            return Err(VerificationRecoveryError::ScopeMismatch);
+        }
+        let snapshot = match &payload.verification {
+            astra_turn_types::VerificationHandoff::Bound { snapshot } => snapshot.as_ref(),
+            astra_turn_types::VerificationHandoff::Unavailable { .. } => {
+                return Err(VerificationRecoveryError::HistoryUnavailable);
+            }
+        };
+        let cursor = Self::adopted_history_cursor(
+            snapshot,
+            &payload.tool_history,
+            user_id,
+            session_id,
+            run_id,
+            turn_chain_id,
+        )?;
+        Self::restore_bound_snapshot(workspace_root, snapshot, turn_chain_id, hooks, cursor)
+    }
+
+    /// Semantic association comes from the immutable owner checkpoint;
+    /// terminal authenticity comes from these exact invocation ledger rows.
+    #[cfg(test)]
+    pub(crate) fn restore(
+        workspace_root: Option<&str>,
+        snapshot: &astra_turn_types::BoundVerificationFrontier,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+        hooks: &[StopHook],
+        records: &[astra_turn_types::ToolInvocationRecord],
+    ) -> Result<Self, VerificationRecoveryError> {
+        let restored =
+            Self::restore_bound_snapshot(workspace_root, snapshot, turn_chain_id, hooks, 0)?;
         let mut actual = std::collections::BTreeMap::new();
         for record in records {
             let reference = ToolInvocationCompletionRef::from_record(record)
@@ -1348,35 +1524,7 @@ impl VerificationFrontier {
         if expected.len() != actual.len() {
             return Err(VerificationRecoveryError::LedgerMismatch);
         }
-        for source in snapshot.workspace.latest_source.iter().chain(
-            snapshot
-                .workspace
-                .proof
-                .iter()
-                .filter_map(|proof| proof.literal_source.as_ref()),
-        ) {
-            if let Some(path) = &source.delivered_path {
-                if super::lifecycle::normalize_workspace_path(path, workspace_root).as_deref()
-                    != Some(std::path::Path::new(path))
-                {
-                    return Err(VerificationRecoveryError::ScopeMismatch);
-                }
-            }
-        }
-        Ok(Self {
-            contract: snapshot.contract.clone(),
-            workspace_root: snapshot.workspace_root.clone(),
-            observation: WorkspaceObservationFacts::restore(&snapshot.workspace),
-            cursor: 0,
-            processed_through: snapshot.processed_through,
-            mutation: snapshot.mutation.as_ref().map(Evidence::restore),
-            proofs: snapshot
-                .proofs
-                .iter()
-                .map(|proof| proof.as_ref().map(Evidence::restore))
-                .collect(),
-            historical_prefix: snapshot.processed_through != 0,
-        })
+        Ok(restored)
     }
 
     pub(crate) fn export(

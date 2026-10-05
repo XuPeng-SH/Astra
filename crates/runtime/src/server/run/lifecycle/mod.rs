@@ -9,6 +9,7 @@
 
 mod admission;
 mod cancellation;
+mod execution_resume;
 mod persistence;
 mod projection;
 pub(crate) mod run_state;
@@ -4742,6 +4743,7 @@ struct PreparedAgentBindingLoopContext {
 /// This is not a serialized checkpoint and must not acquire a Default fallback.
 struct LoopExecutionFacts {
     admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
+    request_constraints: RequestConstraints,
     original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts,
     messages: Vec<Value>,
     tool_ledger_receipt: crate::turn::agentic_loop::host::ToolLedgerReceiptAccumulator,
@@ -4750,6 +4752,7 @@ struct LoopExecutionFacts {
     charged_iterations: u64,
     stall: crate::turn::agentic_loop::host::StallTrackingState,
     user_intents: crate::turn::agentic_loop::host::UserIntentState,
+    reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
     hooks: StopHookState,
     tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
     session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
@@ -4757,6 +4760,7 @@ struct LoopExecutionFacts {
     budget_wrapup_ignored_rounds: u32,
     last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy,
     step_recorder: StepRecorder,
+    turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
 }
 
 impl LoopExecutionFacts {
@@ -4780,6 +4784,7 @@ impl LoopExecutionFacts {
     ) -> Self {
         let max_turns = agentic_turn_budget.initial_turns;
         Self {
+            turn_event_buffer: None,
             messages: vec![json!({"role": "user", "content": message})],
             tool_ledger_receipt: Default::default(),
             max_turns,
@@ -4840,7 +4845,9 @@ impl LoopExecutionFacts {
                 ..Default::default()
             },
             admitted_tool_policy,
+            request_constraints: request_constraints.clone(),
             user_intents: Default::default(),
+            reply_obligations: Arc::new(Default::default()),
             hooks,
             tool_event_hooks,
             session_event_hooks,
@@ -4848,6 +4855,234 @@ impl LoopExecutionFacts {
             budget_wrapup_ignored_rounds: 0,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             step_recorder,
+        }
+    }
+
+    /// Historical facts come from committed adoption, never fresh defaults.
+    /// Current hooks are supplied by the authorized workspace owner.
+    fn from_handoff(
+        adopted: &astra_services::session_context_coordinator::ResumedExecutionTurn,
+        mut hooks: StopHookState,
+        tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
+        session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
+        current_permissions: &mut PermissionSyncContext,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let invalid = |detail: &str| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                detail.to_string(),
+            )
+        };
+        let payload = server_loop_host::RuntimeExecutionHandoff::from_adopted(adopted)?;
+        let checkpoint = adopted.checkpoint();
+        let receipt = adopted.receipt();
+        let run = adopted.run();
+        if run.run_id != receipt.run_id
+            || run.user_id != checkpoint.user_id
+            || run.session_id != checkpoint.session_id
+            || run.run_generation != receipt.run_generation
+        {
+            return Err(invalid("current run does not own the adopted execution"));
+        }
+        let request_constraints = RequestConstraints::from_durable_run(
+            run,
+            payload.original_facts.delegated_model_requirements.clone(),
+        )
+        .map_err(invalid)?;
+        let chain = payload
+            .original_facts
+            .canonical_turn_chain_id
+            .as_deref()
+            .filter(|chain| !chain.is_empty())
+            .ok_or_else(|| invalid("adopted execution has no original turn chain"))?;
+        let verification_frontier =
+            crate::turn::agentic_loop::verification_frontier::VerificationFrontier::restore_from_adopted_handoff(
+                hooks.workspace_root_hint.as_deref(),
+                &hooks.stop_hooks,
+                adopted,
+                &checkpoint.user_id,
+                &checkpoint.session_id,
+                &receipt.run_id,
+                chain,
+            ).map_err(|_| invalid("adopted verification frontier cannot be restored"))?;
+        let astra_pipeline::step_protocol::RunExecutionBudget::V1 {
+            charged_iterations,
+            granted_iteration_boundary,
+            remaining_iterations,
+            ..
+        } = payload
+            .heavy
+            .run_execution_budget
+            .as_ref()
+            .ok_or_else(|| invalid("adopted execution has no run budget"))?;
+        let max_turns = usize::try_from(*granted_iteration_boundary)
+            .map_err(|_| invalid("adopted iteration boundary exceeds runtime capacity"))?;
+        let remaining_turns = usize::try_from(*remaining_iterations)
+            .map_err(|_| invalid("adopted remaining iterations exceed runtime capacity"))?;
+        let charged_iterations = *charged_iterations;
+        let astra_pipeline::step_protocol::RunExecutionControl::V3 {
+            completion_settlement,
+            hook_obligations,
+            reply_obligations,
+            budget_wrapup_injected,
+            budget_wrapup_ignored_rounds,
+        } = payload
+            .heavy
+            .run_execution_control
+            .as_ref()
+            .ok_or_else(|| invalid("adopted execution has no completion control"))?;
+        if hooks.stop_hooks != hook_obligations.stop_hooks
+            || hooks.teammate_idle_hooks != hook_obligations.teammate_idle_hooks
+        {
+            return Err(invalid(
+                "current hooks do not match the adopted execution contract",
+            ));
+        }
+        hooks.stop_hook_runs = hook_obligations.stop_hook_runs;
+        hooks.teammate_idle_hook_runs = hook_obligations.teammate_idle_hook_runs;
+        hooks.completion_settlement = completion_settlement.clone();
+        let replies = Arc::new(crate::messaging::reply_obligations::ReplyObligations::default());
+        replies
+            .restore(
+                reply_obligations,
+                &receipt.run_id,
+                receipt.producer_generation,
+            )
+            .map_err(invalid)?;
+        let tool_ledger_receipt = match &payload.tool_ledger {
+            server_loop_host::ToolLedgerContinuation::Bound { snapshot } => snapshot
+                .restore(&receipt.run_id, receipt.producer_generation)
+                .map_err(invalid)?,
+            server_loop_host::ToolLedgerContinuation::Unavailable => {
+                return Err(invalid("adopted execution has incomplete tool accounting"));
+            }
+        };
+        let step_recorder = StepRecorder::restore_settled_continuation(
+            &checkpoint.user_id,
+            &checkpoint.session_id,
+            &receipt.run_id,
+            payload.recorder,
+            &payload.heavy,
+        )
+        .map_err(invalid)?;
+        let (tool_event_hooks, session_event_hooks) = payload
+            .hooks
+            .restore(tool_event_hooks, session_event_hooks)
+            .map_err(|_| invalid("current hook registries cannot restore the adopted execution"))?;
+        current_permissions
+            .restore_continuation(&payload.permissions)
+            .map_err(|_| invalid("current permission owner cannot restore session decisions"))?;
+        Ok(Self {
+            admitted_tool_policy: payload.admitted_tool_policy,
+            turn_event_buffer: payload.journal_next_round.map(|round| {
+                astra_services::session_journal::TurnEventBuffer::begin_turn_with_round(
+                    Some(&checkpoint.session_id),
+                    receipt.source.reserved_turn,
+                    round,
+                )
+            }),
+            request_constraints,
+            original: payload.original_facts,
+            messages: payload.heavy.messages,
+            tool_ledger_receipt,
+            max_turns,
+            remaining_turns,
+            charged_iterations,
+            stall: crate::turn::agentic_loop::host::StallTrackingState {
+                verification_frontier,
+                tool_call_records: payload
+                    .tool_history
+                    .into_iter()
+                    .map(|entry| {
+                        let mut record = entry.record;
+                        record.execution_completion = entry.completion;
+                        record
+                    })
+                    .collect(),
+                circuit_breaker: payload.circuit_breaker,
+                work_unit_observations: payload.work_unit_observations,
+                turn_sigs: payload.turn_sigs,
+                events: payload.stall_events,
+                work_evidence_advisory_emitted: payload.work_evidence_advisory_emitted,
+                parallel_batching_advisory_emitted: payload.parallel_batching_advisory_emitted,
+                cache_waste_advisory_emitted: payload.cache_waste_advisory_emitted,
+                introspection_count: payload.introspection_count,
+                ..Default::default()
+            },
+            user_intents:
+                crate::turn::agentic_loop::host::UserIntentState::from_durable_continuation(
+                    payload.user_intents,
+                ),
+            reply_obligations: replies,
+            hooks,
+            tool_event_hooks,
+            session_event_hooks,
+            budget_wrapup_injected: *budget_wrapup_injected,
+            budget_wrapup_ignored_rounds: *budget_wrapup_ignored_rounds,
+            last_turn_policy: payload.last_turn_policy,
+            step_recorder,
+        })
+    }
+}
+
+/// Process-local dependencies, never serialized as execution continuation.
+struct LoopEnvironmentAuthorization {
+    agent_id: String,
+    model_name: Option<String>,
+    model_execution: Option<astra_services::AdmittedModelExecution>,
+    model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
+    permissions: PermissionSyncContext,
+    workspace_record: Option<RuntimeWorkspaceRecord>,
+    runtime_process_authorization:
+        Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
+    runtime_edge_dispatch_authorization:
+        Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
+    forward_headers: HashMap<String, String>,
+    thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    interaction_mode: RequestedTurnInteractionMode,
+}
+
+impl LoopEnvironmentAuthorization {
+    /// Fresh admission only; recovery supplies reauthorized inputs directly.
+    fn fresh(
+        request: &ChatRequestData,
+        constraints: &RequestConstraints,
+        bindings: Option<&ExecutionBindingSnapshot>,
+    ) -> Self {
+        Self {
+            agent_id: request
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "root-agent".into()),
+            model_name: request.model.clone(),
+            model_execution: request.admitted_model_execution.clone(),
+            model_catalog_reader: request.model_catalog_reader.clone(),
+            permissions: PermissionSyncContext::new(
+                AgenticRunLifecycleService::inherited_permissions_from_request(
+                    request,
+                    constraints,
+                    bindings,
+                ),
+            ),
+            workspace_record: provider_effective_workspace_record(
+                None,
+                request.provider_run_owner.as_ref(),
+            ),
+            runtime_process_authorization:
+                AgenticRunLifecycleService::runtime_process_authorization_context(request)
+                    .expect("runtime process authorization was validated before state construction"),
+            runtime_edge_dispatch_authorization:
+                AgenticRunLifecycleService::runtime_edge_dispatch_authorization_context(request)
+                    .expect(
+                        "runtime executor authorization was validated before state construction",
+                    ),
+            forward_headers: request.forward_headers.clone(),
+            thinking: AgenticRunLifecycleService::root_generation_controls(request)
+                .expect("generation controls validated during request admission")
+                .thinking,
+            interaction_mode: AgenticRunLifecycleService::effective_requested_interaction_mode(
+                request,
+            ),
         }
     }
 }
@@ -4878,6 +5113,7 @@ struct LoopEnvironment {
 /// same background runner only after their respective authority checks.
 /// These are live resources, not a second durable execution-state record.
 struct OwnedBackgroundExecution {
+    resumed: bool,
     user_id: String,
     session_id: String,
     run_id: String,
@@ -5634,6 +5870,7 @@ pub struct AgenticRunLifecycleService {
     skill_service: Option<Arc<dyn SkillService>>,
     /// Exact model catalog used to resolve client-visible Offering IDs.
     model_service: Arc<dyn ModelService>,
+    auth_service: Arc<dyn astra_services::AuthService>,
     /// Registry-backed MCP bindings available to server-side chat loops.
     mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     /// Immutable Agent Binding snapshots for binding-backed chat loops.
@@ -5774,6 +6011,7 @@ impl AgenticRunLifecycleService {
             selected_server_workspace_provider,
             skill_service: None,
             model_service: Arc::new(astra_services::UnconfiguredModelService),
+            auth_service: Arc::new(astra_services::auth::UnconfiguredAuthService),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -6158,17 +6396,43 @@ impl AgenticRunLifecycleService {
                 };
                 (distributed_permit, prior_messages, lease, reservation, true)
             };
-        let renewal_cancel = CancellationToken::new();
-        let heartbeat_cancel = renewal_cancel.clone();
+        let admission = CanonicalTurnAdmission {
+            coordinator,
+            inference_pool: pool.clone(),
+            lease,
+            reservation,
+            prior_messages,
+            had_canonical_head: head.is_some(),
+            release_writer_on_finish,
+            release_started: Arc::new(AtomicBool::new(false)),
+            renewal_cancel: CancellationToken::new(),
+            _weighted_permit: weighted_permit,
+            distributed_permit,
+        };
+        self.start_canonical_turn_renewal(&admission, authority_loss_cancel)?;
+        Ok(Some(admission))
+    }
+
+    fn start_canonical_turn_renewal(
+        &self,
+        admission: &CanonicalTurnAdmission,
+        authority_loss_cancel: CancellationToken,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let heartbeat_cancel = admission.renewal_cancel.clone();
         let heartbeat_run_cancel = authority_loss_cancel;
-        let heartbeat_coordinator = Arc::clone(&coordinator);
-        let heartbeat_distributed_admission = self
-            .distributed_weighted_admission
-            .clone()
-            .expect("checked above");
-        let mut heartbeat_lease = lease.clone();
-        let mut heartbeat_reservation = reservation.clone();
-        let mut heartbeat_distributed_reservation = distributed_permit.reservation().clone();
+        let heartbeat_coordinator = Arc::clone(&admission.coordinator);
+        let heartbeat_distributed_admission =
+            self.distributed_weighted_admission.clone().ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cross-pod weighted session admission is unavailable",
+                    "distributed_session_admission_unavailable",
+                )
+            })?;
+        let mut heartbeat_lease = admission.lease.clone();
+        let mut heartbeat_reservation = admission.reservation.clone();
+        let mut heartbeat_distributed_reservation =
+            admission.distributed_permit.reservation().clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -6216,19 +6480,7 @@ impl AgenticRunLifecycleService {
                 };
             }
         });
-        Ok(Some(CanonicalTurnAdmission {
-            coordinator,
-            inference_pool: pool.clone(),
-            lease,
-            reservation,
-            prior_messages,
-            had_canonical_head: head.is_some(),
-            release_writer_on_finish,
-            release_started: Arc::new(AtomicBool::new(false)),
-            renewal_cancel,
-            _weighted_permit: weighted_permit,
-            distributed_permit,
-        }))
+        Ok(())
     }
 
     async fn commit_canonical_turn(
@@ -6550,6 +6802,11 @@ impl AgenticRunLifecycleService {
 
     pub fn with_model_service(mut self, service: Arc<dyn ModelService>) -> Self {
         self.model_service = service;
+        self
+    }
+
+    pub fn with_auth_service(mut self, service: Arc<dyn astra_services::AuthService>) -> Self {
+        self.auth_service = service;
         self
     }
 
@@ -7381,96 +7638,34 @@ impl AgenticRunLifecycleService {
         cancel_token: Option<Arc<CancellationToken>>,
         #[cfg(feature = "harness")] harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
     ) -> Result<ServerDynamicAgentToolsWiring, String> {
-        if let Err(error) = durable_restore {
-            tracing::warn!(
-                %user_id,
-                %session_id,
-                %error,
-                "durable agent registry restore failed; the next turn will retry"
-            );
-        }
+        let request_constraints = Self::try_request_constraints(request)?;
         // Acquire the lifecycle capability before any later await. A
         // concurrent terminal can therefore close this exact Arc even when
         // publication has not reached the registry yet.
-        let publication_capability = entry.executor.publication_capability_for_run(run_id);
-        let runtime_context_id = Uuid::new_v4().to_string();
-        for observation in entry.spawner.active_fanout_work_unit_observations().await {
-            entry.active_work_registry.observe(&observation);
-        }
-        // The process-local capability closes the publication/terminal race
-        // after this session executor exists. The indexed durable control row
-        // is the complementary fence for a terminal that committed before
-        // the executor (and therefore before this capability) existed. This
-        // is one root-wiring read, never a per-child spawn read.
-        let control = self
-            .run_engine
-            .load_run_control(user_id, run_id)
-            .await
-            .map_err(|error| {
-                format!("root run {run_id} runtime-context authority check failed: {error}")
-            })?;
-        let control_is_runnable = control.as_ref().is_some_and(|control| {
-            control.session_id == session_id
-                && control.status == STATUS_RUNNING
-                && !control.cancellation_requested
-        });
-        if !control_is_runnable {
-            entry
-                .executor
-                .retire_authoritative_runtime_run(run_id)
-                .await;
-            return Err(format!(
-                "root run {run_id} no longer has runnable durable runtime-context authority"
-            ));
-        }
-        // Validation already happened up the call chain (see
-        // `validate_request_constraints`); this re-parse is safe because the
-        // wire-level shape was checked before this point. If validation ever
-        // becomes optional on this path, the `unwrap_or_else` below logs the
-        // surprise instead of silently building corrupt constraints.
-        let request_constraints = Self::try_request_constraints(request).unwrap_or_else(|err| {
-            tracing::error!(error = %err, "request constraints failed late validation in dynamic-agent wiring");
-            RequestConstraints::default()
-        });
-        let execution_metadata = Some(executor.binding_metadata());
-        if !entry
-            .executor
-            .set_runtime_context(ServerSpawnRuntimeContext {
-                model_catalog_reader: request.model_catalog_reader.clone(),
-                parent_run_id: run_id.to_string(),
-                runtime_context_id: runtime_context_id.clone(),
-                publication_capability,
-                cancellation_binding_id: None,
-                user_id: user_id.to_string(),
-                session_id: session_id.to_string(),
-                trace_context: server_trace_context(user_id, session_id, run_id, turn_seq),
-                forward_headers: request.forward_headers.clone(),
-                admitted_model_execution: request.admitted_model_execution.clone(),
-                interaction_mode: Self::effective_requested_interaction_mode(request),
-                edge_tools: Arc::new(edge_tools.to_vec()),
-                request_constraints: request_constraints.clone(),
-                execution_metadata: execution_metadata.clone(),
-                provider_run_owner: request.provider_run_owner.clone(),
-                spawner: Arc::downgrade(&entry.spawner),
-                pause_flag,
-                cancel_token,
-                execution_owner_generation: Arc::new(ExecutionOwnerGenerationSink::preparing(0)),
-                #[cfg(feature = "harness")]
-                harness_sink,
-            })
-            .await
-        {
-            return Err(format!(
-                "root run {run_id} lost its runtime-context publication capability"
-            ));
-        }
-
-        let agent_id = request
-            .agent_id
-            .clone()
-            .unwrap_or_else(|| "root-agent".to_string());
-        let active_work_registry = entry.active_work_registry.clone();
-        executor.set_agent_tool_context(AgentToolContext {
+        let runtime_context = ServerSpawnRuntimeContext {
+            model_catalog_reader: request.model_catalog_reader.clone(),
+            parent_run_id: run_id.to_string(),
+            runtime_context_id: Uuid::new_v4().to_string(),
+            publication_capability: entry.executor.publication_capability_for_run(run_id),
+            cancellation_binding_id: None,
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            trace_context: server_trace_context(user_id, session_id, run_id, turn_seq),
+            forward_headers: request.forward_headers.clone(),
+            admitted_model_execution: request.admitted_model_execution.clone(),
+            interaction_mode: Self::effective_requested_interaction_mode(request),
+            edge_tools: Arc::new(edge_tools.to_vec()),
+            request_constraints: request_constraints.clone(),
+            execution_metadata: None,
+            provider_run_owner: request.provider_run_owner.clone(),
+            spawner: Arc::downgrade(&entry.spawner),
+            pause_flag,
+            cancel_token,
+            execution_owner_generation: Arc::new(ExecutionOwnerGenerationSink::preparing(0)),
+            #[cfg(feature = "harness")]
+            harness_sink,
+        };
+        let agent_context = AgentToolContext {
             parent_profile_authority: match request.admitted_agent_profiles.as_ref() {
                 Some(snapshot) => match snapshot.lead_agent_id.as_ref() {
                     Some(id) => {
@@ -7484,11 +7679,14 @@ impl AgenticRunLifecycleService {
                 None => crate::orchestration::spawner::ParentProfileAuthority::Unbound,
             },
             admitted_agent_profiles: request.admitted_agent_profiles.clone(),
-            fanout_admission: entry.spawner.attach_fanout_parent(run_id).await,
+            fanout_admission: entry.spawner.fanout_parent(run_id),
             reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
             run_id: run_id.to_string(),
-            agent_id,
+            agent_id: request
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "root-agent".to_string()),
             delegation_chain: Vec::new(),
             current_model: request.model.clone(),
             current_model_selection: request.model_selection.clone(),
@@ -7514,33 +7712,187 @@ impl AgenticRunLifecycleService {
             ),
             enabled_tools: request_constraints.enabled_tools.clone(),
             active_skills: Vec::new(),
-            live_event_sink: work_surface_event_tx
-                .clone()
-                .zip(work_surface_gap_tracker)
-                .map(|(tx, gap_tracker)| {
-                    Arc::new(WorkSurfaceAgentLiveEventSink::new(
-                        tx,
-                        execution_metadata.clone(),
-                        gap_tracker,
-                    )) as SharedAgentLiveEventSink
-                }),
-            client_tool_delivery_tx: work_surface_event_tx.clone(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: Some(server_trace_context(user_id, session_id, run_id, turn_seq)),
-            execution_metadata,
+            execution_metadata: None,
             execution_deadline: request.admitted_execution_deadline,
             workspace_mutation: crate::orchestration::WorkspaceMutationAuthority::default(),
             transcript_location: AgentTranscriptLocation::DurableServer,
+        };
+        self.wire_authorized_server_dynamic_agent_tools(
+            entry,
+            durable_restore,
+            executor,
+            runtime_context,
+            agent_context,
+            work_surface_event_tx,
+            work_surface_gap_tracker,
+        )
+        .await
+    }
+
+    /// Wire current authorized execution facts without admitting a new request.
+    /// Callers retain the exact publication capability before any await; this
+    /// helper never reconstructs model, permissions, obligations or deadlines.
+    #[allow(clippy::too_many_arguments)]
+    async fn wire_authorized_server_dynamic_agent_tools(
+        &self,
+        entry: &ServerAgentSpawnerEntry,
+        durable_restore: Result<(), String>,
+        executor: &mut runtime_tool_executor::RuntimeToolExecutor,
+        mut runtime_context: ServerSpawnRuntimeContext,
+        mut agent_context: AgentToolContext,
+        work_surface_event_tx: Option<mpsc::Sender<Value>>,
+        work_surface_gap_tracker: Option<WorkSurfaceAgentLiveGapTracker>,
+    ) -> Result<ServerDynamicAgentToolsWiring, String> {
+        let user_id = runtime_context.user_id.clone();
+        let session_id = runtime_context.session_id.clone();
+        let run_id = runtime_context.parent_run_id.clone();
+        if agent_context.run_id != run_id {
+            return Err("dynamic agent contexts identify different root runs".into());
+        }
+        if let Err(error) = durable_restore {
+            tracing::warn!(
+                %user_id,
+                %session_id,
+                %error,
+                "durable agent registry restore failed; the next turn will retry"
+            );
+        }
+        for observation in entry.spawner.active_fanout_work_unit_observations().await {
+            entry.active_work_registry.observe(&observation);
+        }
+        // One root-wiring read complements the process-local publication fence
+        // when a terminal committed before this session executor existed.
+        let control = self
+            .run_engine
+            .load_run_control(&user_id, &run_id)
+            .await
+            .map_err(|error| {
+                format!("root run {run_id} runtime-context authority check failed: {error}")
+            })?;
+        let control_is_runnable = control.as_ref().is_some_and(|control| {
+            control.session_id == session_id
+                && control.status == STATUS_RUNNING
+                && !control.cancellation_requested
         });
+        if !control_is_runnable {
+            entry
+                .executor
+                .retire_authoritative_runtime_run(&run_id)
+                .await;
+            return Err(format!(
+                "root run {run_id} no longer has runnable durable runtime-context authority"
+            ));
+        }
+        let execution_metadata = Some(executor.binding_metadata());
+        runtime_context.execution_metadata = execution_metadata.clone();
+        runtime_context.spawner = Arc::downgrade(&entry.spawner);
+        let runtime_context_id = runtime_context.runtime_context_id.clone();
+        if !entry.executor.set_runtime_context(runtime_context).await {
+            return Err(format!(
+                "root run {run_id} lost its runtime-context publication capability"
+            ));
+        }
+        agent_context.spawner = Arc::clone(&entry.spawner);
+        agent_context.fanout_admission = entry.spawner.attach_fanout_parent(&run_id).await;
+        agent_context.execution_metadata = execution_metadata.clone();
+        agent_context.live_event_sink = work_surface_event_tx
+            .clone()
+            .zip(work_surface_gap_tracker)
+            .map(|(tx, gap_tracker)| {
+                Arc::new(WorkSurfaceAgentLiveEventSink::new(
+                    tx,
+                    execution_metadata,
+                    gap_tracker,
+                )) as SharedAgentLiveEventSink
+            });
+        agent_context.client_tool_delivery_tx = work_surface_event_tx;
+        executor.set_agent_tool_context(agent_context);
+        let active_work_registry = entry.active_work_registry.clone();
         Ok(ServerDynamicAgentToolsWiring {
             active_work_registry,
             root_runtime_context_guard: ServerRootRuntimeContextGuard {
                 executor: entry.executor.clone(),
-                user_id: user_id.to_string(),
-                run_id: run_id.to_string(),
+                user_id,
+                run_id,
                 runtime_context_id,
                 settled: false,
             },
         })
+    }
+
+    /// Install background interaction on the existing durable gate owners.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_background_interaction_gates(
+        &self,
+        executor: &mut runtime_tool_executor::RuntimeToolExecutor,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn: u32,
+        token: Arc<CancellationToken>,
+        interactive: bool,
+        provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
+    ) {
+        let (approval_tx, approval_rx) = interactive.then(|| mpsc::channel::<Value>(64)).unzip();
+        let approval_gate = DurableRunApprovalGate::new(
+            user_id.to_owned(),
+            session_id.to_owned(),
+            run_id.to_owned(),
+            Some(turn),
+            self.run_engine.clone(),
+            self.runs_handle(),
+            approval_tx,
+            None,
+        )
+        .with_cancel_token(token.clone());
+        executor.set_approval_gate(Arc::new(approval_gate));
+        if let Some(rx) = approval_rx {
+            self.approval_channels
+                .lock()
+                .await
+                .insert(run_id.to_owned(), rx);
+        }
+
+        let (user_prompt_tx, user_prompt_rx) =
+            interactive.then(|| mpsc::channel::<Value>(64)).unzip();
+        let user_prompt_gate = Arc::new(
+            DurableRunUserPromptGate::new(
+                user_id.to_owned(),
+                session_id.to_owned(),
+                run_id.to_owned(),
+                Some(turn),
+                self.run_engine.clone(),
+                self.runs_handle(),
+                user_prompt_tx,
+                None,
+            )
+            .with_provider_run_owner(provider_run_owner)
+            .with_cancel_token(token),
+        );
+        executor.set_ask_user_gate(user_prompt_gate.clone());
+        executor.set_provider_interaction_gate(user_prompt_gate);
+        if let Some(rx) = user_prompt_rx {
+            self.user_prompt_channels
+                .lock()
+                .await
+                .insert(run_id.to_owned(), rx);
+        }
+
+        if interactive {
+            let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>(64);
+            let progress_cb =
+                astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
+                    progress_tx,
+                );
+            executor.set_progress_callback(Arc::new(progress_cb));
+            self.progress_channels
+                .lock()
+                .await
+                .insert(run_id.to_owned(), progress_rx);
+        }
     }
 
     fn build_csl_store(
@@ -11296,24 +11648,47 @@ impl AgenticRunLifecycleService {
         request_constraints: &RequestConstraints,
     ) -> Result<PreparedRuntimeCapabilities, (StatusCode, Json<ErrorResponse>)> {
         let agent_bindings = Self::requested_agent_bindings(request)?;
+        self.prepare_authorized_runtime_capabilities(
+            user_id,
+            &agent_bindings,
+            &request.runtime_mcp_bindings,
+            request.runtime_skill_binding.as_ref(),
+            request.runtime_auth.as_ref(),
+            request.capability_descriptors.as_ref(),
+            request_constraints,
+        )
+        .await
+    }
+
+    // Both fresh admission and resumed execution use current authorized runtime
+    // inputs. Saved model-visible context is not a credential or routing source.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_authorized_runtime_capabilities(
+        &self,
+        user_id: &str,
+        agent_bindings: &[&AgentBindingRuntimeRequest],
+        runtime_mcp_bindings: &[astra_services::runs::RuntimeMcpBindingRequest],
+        runtime_skill_binding: Option<&astra_services::runs::RuntimeSkillBindingRequest>,
+        runtime_auth: Option<&astra_services::runs::RuntimeAuthRequest>,
+        capability_descriptors: Option<&astra_services::runs::RuntimeCapabilityDescriptorsRequest>,
+        request_constraints: &RequestConstraints,
+    ) -> Result<PreparedRuntimeCapabilities, (StatusCode, Json<ErrorResponse>)> {
         if agent_bindings.is_empty() {
             let mcp_bundle =
-                runtime_mcp::prepare_request_scoped_runtime_bundle(&request.runtime_mcp_bindings)
-                    .await?;
-            let request_scoped_skill_resolver =
-                if let Some(skill_binding) = request.runtime_skill_binding.as_ref() {
-                    let resolver = agent_binding_skill_runtime::prepare_runtime_skill_resolver(
-                        &skill_binding.id,
-                        &skill_binding.url,
-                        &skill_binding.authorization,
-                    )
-                    .await?;
-                    apply_normalized_skill_allowlist(resolver, request_constraints)
-                        .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?
-                } else {
-                    None
-                };
-            let server_skill_resolver = if request.runtime_skill_binding.is_none() {
+                runtime_mcp::prepare_request_scoped_runtime_bundle(runtime_mcp_bindings).await?;
+            let request_scoped_skill_resolver = if let Some(skill_binding) = runtime_skill_binding {
+                let resolver = agent_binding_skill_runtime::prepare_runtime_skill_resolver(
+                    &skill_binding.id,
+                    &skill_binding.url,
+                    &skill_binding.authorization,
+                )
+                .await?;
+                apply_normalized_skill_allowlist(resolver, request_constraints)
+                    .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?
+            } else {
+                None
+            };
+            let server_skill_resolver = if runtime_skill_binding.is_none() {
                 let mut bundle =
                     build_server_skill_resolver(self.skill_service.clone(), user_id).await;
                 bundle.resolver =
@@ -11336,14 +11711,14 @@ impl AgenticRunLifecycleService {
                 .map(|binding| self.resolve_agent_binding_runtime(binding)),
         )
         .await?;
-        let runtime_auth = request.runtime_auth.as_ref().ok_or_else(|| {
+        let runtime_auth = runtime_auth.ok_or_else(|| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "runtime_auth.authorization is required when agent_binding is present",
                 "agent_binding_runtime_auth_missing",
             )
         })?;
-        let descriptors = request.capability_descriptors.as_ref().ok_or_else(|| {
+        let descriptors = capability_descriptors.ok_or_else(|| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "capability_descriptors is required when agent_binding is present",
@@ -12438,22 +12813,81 @@ impl AgenticRunLifecycleService {
     ) -> server_loop_host::ServerAgenticLoopHost {
         let generation_controls = Self::root_generation_controls(request)
             .expect("generation controls validated before host construction");
+        let constraints = Self::try_request_constraints(request)
+            .expect("request constraints validated before host construction");
+        let authorization =
+            LoopEnvironmentAuthorization::fresh(request, &constraints, execution_bindings);
+        let mut host = self.build_authorized_host(
+            user_id,
+            session_id,
+            run_id,
+            &authorization,
+            &generation_controls,
+            request.provider_run_owner.is_some(),
+            request.admitted_execution_deadline,
+            request.full_llm_capture,
+            request.execution_policy.turn_intent,
+            request.execution_policy.skill_auto_route,
+            request.interactive_client,
+            edge_tools,
+            edge_profile,
+            server_service_tool_catalog_enabled,
+            static_tool_catalog_admissible,
+            execution_bindings,
+            plan_resume_hint,
+            plan_authoring_active,
+            work_runtime_binding,
+        );
+        if let ModelSelectionMode::Auto(policy) = &request.model_selection_mode {
+            host.configure_model_routing(
+                policy.clone(),
+                self.model_service.clone(),
+                self.run_engine.clone(),
+                request.parts.is_empty() && request.attachments.is_empty(),
+            );
+        }
+        host
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_authorized_host(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        authorization: &LoopEnvironmentAuthorization,
+        generation_controls: &crate::server::run::engine::RunGenerationControls,
+        provider_scope_bound: bool,
+        execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
+        full_llm_capture: bool,
+        turn_intent_policy: astra_services::runs::TurnIntentExecutionPolicy,
+        skill_auto_route_policy: astra_services::runs::SkillAutoRouteExecutionPolicy,
+        interactive_client: bool,
+        edge_tools: Vec<Value>,
+        edge_profile: Map<String, Value>,
+        server_service_tool_catalog_enabled: bool,
+        static_tool_catalog_admissible: bool,
+        execution_bindings: Option<&ExecutionBindingSnapshot>,
+        plan_resume_hint: Option<String>,
+        plan_authoring_active: bool,
+        work_runtime_binding: Option<&ValidatedWorkRuntimeBinding>,
+    ) -> server_loop_host::ServerAgenticLoopHost {
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
             self.encryptor.clone(),
             user_id.to_string(),
             session_id.to_string(),
         )
-        .with_model(request.model.clone())
+        .with_model(authorization.model_name.clone())
         .with_initial_output_limit(generation_controls.first_output_max_tokens)
         .with_preserved_thinking(generation_controls.preserve_thinking)
         .with_model_service(Some(self.model_service.clone()))
-        .with_model_catalog_reader(request.model_catalog_reader.clone())
-        .with_provider_scope_bound(request.provider_run_owner.is_some())
-        .with_admitted_execution_deadline(request.admitted_execution_deadline)
-        .with_admitted_model_execution(request.admitted_model_execution.clone())
+        .with_model_catalog_reader(authorization.model_catalog_reader.clone())
+        .with_provider_scope_bound(provider_scope_bound)
+        .with_admitted_execution_deadline(execution_deadline)
+        .with_admitted_model_execution(authorization.model_execution.clone())
         .with_inference_owner_pod_id(self.run_engine.execution_owner_pod_id().map(str::to_string))
-        .with_full_llm_capture(request.full_llm_capture)
+        .with_full_llm_capture(full_llm_capture)
         .with_edge_tools(edge_tools)
         .with_server_service_tool_catalog_enabled(server_service_tool_catalog_enabled)
         .with_static_tool_catalog_admissible(static_tool_catalog_admissible)
@@ -12463,10 +12897,10 @@ impl AgenticRunLifecycleService {
         ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
-        .with_interaction_mode(Some(Self::effective_requested_interaction_mode(request)))
-        .with_turn_intent_policy(request.execution_policy.turn_intent)
-        .with_skill_auto_route_policy(request.execution_policy.skill_auto_route)
-        .with_interactive_client(request.interactive_client)
+        .with_interaction_mode(Some(authorization.interaction_mode))
+        .with_turn_intent_policy(turn_intent_policy)
+        .with_skill_auto_route_policy(skill_auto_route_policy)
+        .with_interactive_client(interactive_client)
         .with_plan_resume_hint(plan_resume_hint)
         .with_plan_authoring_active(plan_authoring_active)
         .with_work_planning_bound(
@@ -12511,16 +12945,7 @@ impl AgenticRunLifecycleService {
                 .with_provider_capabilities(shared_tes.provider_capabilities_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
-        let mut host = builder.build();
-        if let ModelSelectionMode::Auto(policy) = &request.model_selection_mode {
-            host.configure_model_routing(
-                policy.clone(),
-                self.model_service.clone(),
-                self.run_engine.clone(),
-                request.parts.is_empty() && request.attachments.is_empty(),
-            );
-        }
-        host
+        builder.build()
     }
 
     fn configure_host_approval_audit_context(
@@ -12820,7 +13245,7 @@ impl AgenticRunLifecycleService {
     fn assemble_loop_environment(
         &self,
         user_id: &str,
-        request: &ChatRequestData,
+        authorization: LoopEnvironmentAuthorization,
         session_id: &str,
         run_id: &str,
         execution_bindings: Option<&ExecutionBindingSnapshot>,
@@ -12846,12 +13271,8 @@ impl AgenticRunLifecycleService {
                     prepared_capabilities.server_skill_resolver.resolver.clone(),
                 )
             };
-        let root_permissions = Self::inherited_permissions_from_request(
-            request,
-            request_constraints,
-            execution_bindings,
-        );
-        let root_permission_context = Some(PermissionSyncContext::shared(root_permissions.clone()));
+        let child_permissions = authorization.permissions.for_child(false);
+        let root_permission_context = Some(authorization.permissions.into_shared());
 
         // Create harness sink early so sub-run executors can share it.
         #[cfg(feature = "harness")]
@@ -12898,21 +13319,19 @@ impl AgenticRunLifecycleService {
             &self.matrixone,
             &self.encryptor,
             Some(self.model_service.clone()),
-            request.model_catalog_reader.clone(),
+            authorization.model_catalog_reader,
             self.shared_pool.as_ref(),
-            request.model.as_deref(),
-            request.admitted_model_execution.as_ref(),
+            authorization.model_name.as_deref(),
+            authorization.model_execution.as_ref(),
             &edge_tools,
             &edge_profile,
             execution_bindings,
-            provider_effective_workspace_record(None, request.provider_run_owner.as_ref()),
-            Self::runtime_process_authorization_context(request)
-                .expect("runtime process authorization was validated before state construction"),
-            Self::runtime_edge_dispatch_authorization_context(request)
-                .expect("runtime executor authorization was validated before state construction"),
-            &request.forward_headers,
+            authorization.workspace_record,
+            authorization.runtime_process_authorization,
+            authorization.runtime_edge_dispatch_authorization,
+            &authorization.forward_headers,
             request_constraints.clone(),
-            root_permissions.clone(),
+            child_permissions,
             skill_resolver.clone(),
             Arc::clone(&self.reflect_service),
             user_id,
@@ -12920,7 +13339,7 @@ impl AgenticRunLifecycleService {
             run_id,
             execution_owner_generation,
             self.run_engine.execution_owner_pod_id(),
-            Self::effective_requested_interaction_mode(request),
+            authorization.interaction_mode,
             self.invocation_ledger.clone(),
             self.edge_connection_pool.as_ref(),
             self.edge_dispatch_service.as_ref(),
@@ -12938,17 +13357,12 @@ impl AgenticRunLifecycleService {
             user_id: user_id.to_owned(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
-            agent_id: request
-                .agent_id
-                .clone()
-                .unwrap_or_else(|| "root-agent".into()),
-            model_name: request.model.clone(),
+            agent_id: authorization.agent_id,
+            model_name: authorization.model_name,
             shared_pool: self.shared_pool.clone(),
-            thinking: Self::root_generation_controls(request)
-                .expect("generation controls validated during request admission")
-                .thinking,
-            compact_strategy: request
-                .admitted_model_execution
+            thinking: authorization.thinking,
+            compact_strategy: authorization
+                .model_execution
                 .as_ref()
                 .map(|execution| {
                     crate::turn::llm::context::compact_strategy_from_model_metadata(
@@ -13055,7 +13469,7 @@ impl AgenticRunLifecycleService {
         )?;
         let environment = self.assemble_loop_environment(
             user_id,
-            request,
+            LoopEnvironmentAuthorization::fresh(request, &request_constraints, execution_bindings),
             session_id,
             run_id,
             execution_bindings,
@@ -13203,6 +13617,7 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             harness,
         } = environment;
+        request_constraints.restrict_to(facts.request_constraints);
         request_constraints.delegated_model_requirements =
             facts.original.delegated_model_requirements.clone();
         let pipeline_session = Some(
@@ -13245,6 +13660,7 @@ impl AgenticRunLifecycleService {
             budget_is_explicit: facts.original.budget_is_explicit,
             budget_policy: facts.original.budget_policy,
             current_round_index: facts.original.current_round_index,
+            turn_event_buffer: facts.turn_event_buffer,
             loop_entry: facts.original.loop_entry,
             llm_rounds_completed: facts.original.llm_rounds_completed,
             last_request_message_count: facts.original.last_request_message_count,
@@ -13273,6 +13689,10 @@ impl AgenticRunLifecycleService {
             },
             hooks: facts.hooks,
             user_intents: facts.user_intents,
+            messaging: crate::turn::agentic_loop::host::MessagingState {
+                reply_obligations: facts.reply_obligations,
+                ..Default::default()
+            },
             error_recovery: facts.original.error_recovery,
             provider_adaptation: facts.original.provider_adaptation,
             pipeline_session,
@@ -13313,7 +13733,14 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
         run_id: &str,
-        request: &ChatRequestData,
+        model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
+        process_authorization: Option<
+            Arc<astra_services::runs::RuntimeProcessAuthorizationContext>,
+        >,
+        edge_dispatch_authorization: Option<
+            Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>,
+        >,
+        execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
         state: &AgenticLoopState,
         host: &server_loop_host::ServerAgenticLoopHost,
         runtime_capabilities: &PreparedRuntimeCapabilities,
@@ -13327,16 +13754,10 @@ impl AgenticRunLifecycleService {
             None,
         )
         .with_explain_root(self.run_engine.clone(), run_id.to_owned())
-        .with_model_catalog_reader(request.model_catalog_reader.clone())
-        .with_runtime_process_authorization(
-            Self::runtime_process_authorization_context(request)
-                .expect("runtime process authorization was validated before run start"),
-        )
-        .with_runtime_edge_dispatch_authorization(
-            Self::runtime_edge_dispatch_authorization_context(request)
-                .expect("runtime executor authorization was validated before run start"),
-        )
-        .with_admitted_execution_deadline(request.admitted_execution_deadline);
+        .with_model_catalog_reader(model_catalog_reader)
+        .with_runtime_process_authorization(process_authorization)
+        .with_runtime_edge_dispatch_authorization(edge_dispatch_authorization)
+        .with_admitted_execution_deadline(execution_deadline);
         if let Some(memoria_port) = self
             .memory_extraction_service
             .as_ref()
@@ -14927,6 +15348,7 @@ fn work_subject_invalidation_response(
 impl AgenticRunLifecycleService {
     async fn launch_owned_background_execution(&self, execution: OwnedBackgroundExecution) {
         let OwnedBackgroundExecution {
+            resumed,
             user_id,
             session_id,
             run_id,
@@ -14960,6 +15382,7 @@ impl AgenticRunLifecycleService {
             mut progress_bridge,
         } = execution;
         let mut state = loop_state;
+        let execution_start_tokens = state.provider_total_tokens();
         let streaming = event_tx.is_some();
         let terminal_metric_path = if streaming {
             "streaming_terminal"
@@ -15041,7 +15464,7 @@ impl AgenticRunLifecycleService {
                     drop(event_tx);
                     return;
                 }
-                if let Err(error) = persist_ctx.persist_turn_start(&state).await {
+                if !resumed && let Err(error) = persist_ctx.persist_turn_start(&state).await {
                     tracing::warn!(
                         session_id = %bg_session_id,
                         run_id = %bg_run_id,
@@ -15754,7 +16177,9 @@ impl AgenticRunLifecycleService {
                     // Record tokens consumed regardless of cancel — cancelled runs still
                     // consumed tokens and must count toward the daily budget.
                     if let Some(ref gov) = bg_resource_governor {
-                        let total = state.provider_total_tokens();
+                        let total = state
+                            .provider_total_tokens()
+                            .saturating_sub(execution_start_tokens);
                         if total > 0 {
                             gov.record_tokens(&bg_user_id, total).await;
                         }
@@ -16122,7 +16547,9 @@ impl AgenticRunLifecycleService {
                 }
                 if !streaming {
                     if let Some(ref gov) = bg_resource_governor {
-                        let total = state.provider_total_tokens();
+                        let total = state
+                            .provider_total_tokens()
+                            .saturating_sub(execution_start_tokens);
                         if total > 0 {
                             gov.record_tokens(&bg_user_id, total).await;
                         }
@@ -16988,7 +17415,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &user_id,
                 &session_id,
                 &run_id,
-                &request,
+                request.model_catalog_reader.clone(),
+                Self::runtime_process_authorization_context(&request)
+                    .expect("runtime process authorization was validated before run start"),
+                Self::runtime_edge_dispatch_authorization_context(&request)
+                    .expect("runtime executor authorization was validated before run start"),
+                request.admitted_execution_deadline,
                 &loop_state,
                 &host,
                 &runtime_capabilities,
@@ -17065,89 +17497,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             loop_state.attach_active_work_registry(wiring.active_work_registry);
             root_runtime_context_guard = Some(wiring.root_runtime_context_guard);
 
-            if request.interactive_client {
-                // ── Phase E: Wire WebSocket approval and ask_user gates ───
-                let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
-                let approval_gate = DurableRunApprovalGate::new(
-                    user_id.clone(),
-                    session_id.clone(),
-                    run_id.clone(),
-                    Some(loop_state.session_turn),
-                    self.run_engine.clone(),
-                    self.runs_handle(),
-                    Some(approval_tx),
-                    None,
-                )
-                .with_cancel_token(llm_cancel_token.clone());
-                executor.set_approval_gate(std::sync::Arc::new(approval_gate));
-                self.approval_channels
-                    .lock()
-                    .await
-                    .insert(run_id.clone(), approval_rx);
-
-                let (user_prompt_tx, user_prompt_rx) = mpsc::channel::<Value>(64);
-                let user_prompt_gate = DurableRunUserPromptGate::new(
-                    user_id.clone(),
-                    session_id.clone(),
-                    run_id.clone(),
-                    Some(loop_state.session_turn),
-                    self.run_engine.clone(),
-                    self.runs_handle(),
-                    Some(user_prompt_tx),
-                    None,
-                )
-                .with_provider_run_owner(request.provider_run_owner.clone())
-                .with_cancel_token(llm_cancel_token.clone());
-                let user_prompt_gate = std::sync::Arc::new(user_prompt_gate);
-                executor.set_ask_user_gate(user_prompt_gate.clone());
-                executor.set_provider_interaction_gate(user_prompt_gate);
-                self.user_prompt_channels
-                    .lock()
-                    .await
-                    .insert(run_id.clone(), user_prompt_rx);
-
-                // ── Phase F.3: Wire WebSocket progress callback ──────
-                let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>(64);
-                let progress_cb =
-                    astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
-                        progress_tx,
-                    );
-                executor.set_progress_callback(std::sync::Arc::new(progress_cb));
-                self.progress_channels
-                    .lock()
-                    .await
-                    .insert(run_id.clone(), progress_rx);
-            } else {
-                executor.set_approval_gate(std::sync::Arc::new(
-                    DurableRunApprovalGate::new(
-                        user_id.clone(),
-                        session_id.clone(),
-                        run_id.clone(),
-                        Some(loop_state.session_turn),
-                        self.run_engine.clone(),
-                        self.runs_handle(),
-                        None,
-                        None,
-                    )
-                    .with_cancel_token(llm_cancel_token.clone()),
-                ));
-                let user_prompt_gate = std::sync::Arc::new(
-                    DurableRunUserPromptGate::new(
-                        user_id.clone(),
-                        session_id.clone(),
-                        run_id.clone(),
-                        Some(loop_state.session_turn),
-                        self.run_engine.clone(),
-                        self.runs_handle(),
-                        None,
-                        None,
-                    )
-                    .with_provider_run_owner(request.provider_run_owner.clone())
-                    .with_cancel_token(llm_cancel_token.clone()),
-                );
-                executor.set_ask_user_gate(user_prompt_gate.clone());
-                executor.set_provider_interaction_gate(user_prompt_gate);
-            }
+            self.install_background_interaction_gates(
+                &mut executor,
+                &user_id,
+                &session_id,
+                &run_id,
+                loop_state.session_turn,
+                llm_cancel_token.clone(),
+                request.interactive_client,
+                request.provider_run_owner.clone(),
+            )
+            .await;
 
             wire_executor_into_state(executor, &mut loop_state);
             if let Some(event) =
@@ -17160,6 +17520,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let explain = request.explain;
         self.launch_owned_background_execution(OwnedBackgroundExecution {
+            resumed: false,
             user_id,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
@@ -18432,7 +18793,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &user_id,
                 &session_id,
                 &run_id,
-                &request,
+                request.model_catalog_reader.clone(),
+                Self::runtime_process_authorization_context(&request)
+                    .expect("runtime process authorization was validated before run start"),
+                Self::runtime_edge_dispatch_authorization_context(&request)
+                    .expect("runtime executor authorization was validated before run start"),
+                request.admitted_execution_deadline,
                 &state,
                 &host,
                 &runtime_capabilities,
@@ -18600,6 +18966,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         self.launch_owned_background_execution(OwnedBackgroundExecution {
+            resumed: false,
             user_id,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
@@ -19911,6 +20278,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if !self.run_execution_is_live(&durable).await {
+            if self.resume_execution_handoff(&durable).await? {
+                return Ok(RunMutationRecord::applied(
+                    run_id,
+                    STATUS_RUNNING,
+                    durable.status,
+                ));
+            }
             self.reconcile_orphaned_execution_for_session_continuation(&durable, "resume")
                 .await?;
             if self
@@ -23292,7 +23666,7 @@ impl ServerSubRunExecutor {
                 ));
             }
             let durable_mode =
-                crate::server::run::engine::durable_run_effective_interaction_mode(&existing);
+                crate::server::run::engine::durable_run_effective_interaction_mode(&existing)?;
             if durable_mode != config.interaction_mode {
                 return Err("durable sub-run retry changed its interaction policy".to_string());
             }

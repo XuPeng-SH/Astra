@@ -3012,7 +3012,7 @@ impl DelegationEngine {
             (None, None) => None,
         };
         let interaction_mode =
-            crate::server::run::engine::durable_run_effective_interaction_mode(&parent_run);
+            crate::server::run::engine::durable_run_effective_interaction_mode(&parent_run)?;
 
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {

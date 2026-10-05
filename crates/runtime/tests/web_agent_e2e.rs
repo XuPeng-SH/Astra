@@ -164,6 +164,7 @@ impl AuthService for StubAuth {
                     display_name: None,
                 },
                 session_id: None,
+                execution_continuation: None,
                 origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                     AuthProviderAuthorizedRequestContext {
                         provider_id: PROVIDER_ID.to_string(),
@@ -944,6 +945,7 @@ async fn create_e2e_agent_binding(
                 display_name: None,
             },
             session_id: None,
+            execution_continuation: None,
             origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 AuthProviderAuthorizedRequestContext {
                     provider_id: PROVIDER_ID.to_string(),

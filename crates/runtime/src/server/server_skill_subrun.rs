@@ -1565,6 +1565,171 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn restored_root_session_deny_reaches_skill_execution_boundary() {
+        use crate::server::model_execution_admission::inheritance_test_support::{
+            SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
+        };
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+        };
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "restored session deny reaches skill subrun",
+            |request| {
+                request.path == "/v1/chat/completions"
+                    && request.body["model"] == "genesis-wire-model"
+            },
+            vec![
+                ProviderResponse::OpenAi(json!({
+                    "id": "permission-denied-write",
+                    "model": "genesis-wire-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "blocked-write",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json!({
+                                        "path": "blocked.txt",
+                                        "content": "must not be written"
+                                    }).to_string()
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22}
+                })),
+                ProviderResponse::OpenAi(json!({
+                    "id": "permission-denied-write-followup",
+                    "model": "genesis-wire-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "The write was denied and no file was created."
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 22, "completion_tokens": 9, "total_tokens": 31}
+                })),
+            ],
+        )])
+        .await;
+
+        let mut execution = genesis_execution();
+        execution.base_url = format!("{}/v1", gateway.base_url);
+        let service = Arc::new(ServiceBackedOffering::new(execution.clone()));
+        let parent = "restored-permission-parent";
+        let engine = auto_parent_run(parent, &execution).await;
+        let parent_record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
+        let invocation_ledger =
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+                engine.clone(),
+            )
+            .unwrap();
+        let inference = InferenceLedgerFixture::default();
+
+        // Model the real root restore path: session-only state is restored on
+        // the root owner, then projected through the existing child boundary.
+        let mut restored_root = crate::orchestration::PermissionSyncContext::root(
+            crate::orchestration::PermissionMode::Auto,
+        );
+        restored_root.apply_update(&crate::orchestration::PermissionUpdate::deny(
+            crate::orchestration::PermissionRule::tool("write_file"),
+        ));
+        let continuation = restored_root.capture_continuation().unwrap();
+        let mut current_root = crate::orchestration::PermissionSyncContext::root(
+            crate::orchestration::PermissionMode::Auto,
+        );
+        current_root.restore_continuation(&continuation).unwrap();
+        let inherited_permissions = current_root.for_child(false);
+        assert!(inherited_permissions.is_denied("write_file", None));
+
+        let mut executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            USER_ID.into(),
+            SESSION_ID.into(),
+        )
+        .with_model_service(Some(service))
+        .with_run_engine(engine.clone())
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        ))
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write a file in the selected sandbox.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        })])
+        .with_admitted_model_execution(Some(execution))
+        .with_inherited_permissions(inherited_permissions)
+        .with_parent_invocation_authority(
+            parent.into(),
+            parent_record.run_generation,
+            "permission-parent-owner".into(),
+            invocation_ledger,
+        );
+        executor.test_inference_ledger = Some(inference.persistence.clone());
+
+        let allowed_tools = vec!["write_file".to_string()];
+        let result = executor
+            .execute_skill_subrun(
+                "permission-check",
+                "Use the available tool only when permitted.",
+                "Attempt the requested write, then report the result.",
+                Some(4096),
+                &allowed_tools,
+                0,
+                None,
+                None,
+                Some("permission-denied-call"),
+                Some(parent_record.last_event_idx),
+                Some("parent-chain"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.output,
+            "The write was denied and no file was created."
+        );
+        assert!(!workspace.path().join("blocked.txt").exists());
+
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let followup = requests[1].body["messages"]
+            .as_array()
+            .expect("permission-denied follow-up messages");
+        let denial = followup
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == "blocked-write")
+            .and_then(|message| message["content"].as_str())
+            .expect("production tool boundary must return the denied result to the model");
+        assert!(denial.to_ascii_lowercase().contains("denied"), "{denial}");
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(), 2);
+    }
+
     #[tokio::test]
     async fn auto_skill_fork_reauthorizes_service_backed_genesis_offering() {
         use crate::server::model_execution_admission::inheritance_test_support::{

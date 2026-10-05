@@ -423,6 +423,54 @@ pub struct RenewedTurnAuthority {
     pub turn_reservation: TurnReservationV1,
 }
 
+/// Exact parked execution; the caller supplies custody, not a new turn grant.
+pub struct ResumedExecutionTurnRequest<'a> {
+    pub user_id: &'a str,
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub expected_owner_generation: u64,
+    pub checkpoint_id: &'a str,
+    pub source: &'a TurnReservationV1,
+    pub actor: &'a ActorContextV1,
+    pub owner_pod_id: &'a str,
+    pub ttl: Duration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResumedExecutionTurnReceipt {
+    pub source: TurnReservationV1,
+    pub writer_lease: ConversationWriterLeaseV1,
+    pub turn_reservation: TurnReservationV1,
+    pub run_id: String,
+    pub run_generation: u64,
+    pub producer_generation: u64,
+    pub checkpoint_id: String,
+}
+
+/// Constructed only after the run, slot and turn authority commit together.
+/// A deserialized receipt alone cannot authorize restoration or execution.
+#[derive(Debug)]
+pub struct ResumedExecutionTurn {
+    run: crate::runs::DurableRunRecord,
+    checkpoint: crate::runs::DurableRunCheckpointRecord,
+    receipt: ResumedExecutionTurnReceipt,
+}
+
+impl ResumedExecutionTurn {
+    pub fn run(&self) -> &crate::runs::DurableRunRecord {
+        &self.run
+    }
+
+    pub fn checkpoint(&self) -> &crate::runs::DurableRunCheckpointRecord {
+        &self.checkpoint
+    }
+
+    pub fn receipt(&self) -> &ResumedExecutionTurnReceipt {
+        &self.receipt
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WriterTransferConflictV1 {
     CursorChanged,
@@ -477,6 +525,11 @@ pub struct SessionAdmissionSnapshotV1 {
 
 #[async_trait]
 pub trait SessionContextCoordinator: Send + Sync {
+    async fn resume_execution_turn(
+        &self,
+        request: ResumedExecutionTurnRequest<'_>,
+    ) -> Result<ResumedExecutionTurn, SessionContextCoordinatorError>;
+
     async fn load_head(
         &self,
         key: &SessionKeyV1,
@@ -1563,6 +1616,325 @@ impl DatabaseSessionContextCoordinator {
 
 #[async_trait]
 impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
+    async fn resume_execution_turn(
+        &self,
+        request: ResumedExecutionTurnRequest<'_>,
+    ) -> Result<ResumedExecutionTurn, SessionContextCoordinatorError> {
+        let key = &request.source.key;
+        validate_ttl(request.ttl, MAX_LEASE_TTL.min(MAX_RESERVATION_TTL))?;
+        validate_idempotency_key(request.owner_pod_id)?;
+        validate_idempotency_key(request.checkpoint_id)?;
+        request
+            .actor
+            .validate_for(key)
+            .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
+        validate_optional_cursor(key, request.source.expected_cursor.as_ref())?;
+        if key.owner_user_id != request.user_id
+            || key.session_id != request.session_id
+            || request.source.schema_version != SESSION_COORDINATION_SCHEMA_VERSION
+            || request.source.reserved_turn == 0
+        {
+            return Err(SessionContextCoordinatorError::Unauthorized);
+        }
+        let idempotency_key = format!(
+            "execution-resume:{}:{}",
+            request.run_id, request.expected_owner_generation
+        );
+        validate_idempotency_key(&idempotency_key)?;
+        let request_hash = {
+            let mut digest = Sha256::new();
+            digest.update(b"astra.resume-execution-turn.v1\0");
+            digest.update(database_to_json("execution_resume_source", request.source)?.as_bytes());
+            digest.update(database_to_json("execution_resume_actor", request.actor)?.as_bytes());
+            hash_field(&mut digest, request.owner_pod_id);
+            hash_field(&mut digest, request.checkpoint_id);
+            digest.update(request.ttl.as_millis().to_be_bytes());
+            format!("{:x}", digest.finalize())
+        };
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_execution_resume", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_execution_resume", source))?;
+        let staged =
+            async {
+                let (mut run, checkpoint) =
+                    crate::runs::lock_execution_resume_tx(&mut tx, &request)
+                        .await
+                        .map_err(execution_resume_storage_error)?;
+                #[derive(Deserialize)]
+                struct OriginalReservation {
+                    reservation: TurnReservationV1,
+                }
+                let crate::runs::DurableExecutionHandoff::V1 {
+                    producer_run_id,
+                    producer_owner_generation,
+                    heavy,
+                } = database_json::<crate::runs::DurableExecutionHandoff<OriginalReservation>>(
+                    "execution_handoff",
+                    &checkpoint.checkpoint_json,
+                )?;
+                let source = heavy.reservation;
+                if source != *request.source
+                    || producer_run_id != request.run_id
+                    || checkpoint.checkpoint_id != request.checkpoint_id
+                    || checkpoint.idempotency_key
+                        != format!(
+                            "checkpoint:{}:execution_handoff:{}",
+                            request.run_id, producer_owner_generation
+                        )
+                {
+                    return Err(SessionContextCoordinatorError::Fenced);
+                }
+                let (mut state, now) = lock_database_state_at_now(&mut tx, key).await?;
+                if state.authority_epochs != request.actor.authority_epochs {
+                    return Err(SessionContextCoordinatorError::Fenced);
+                }
+                let binding_generation = run
+                    .original_admission_data()
+                    .map_err(|source| SessionContextCoordinatorError::DatabaseJson {
+                        entity: "original_execution_admission",
+                        source,
+                    })?
+                    .get("execution_binding_generation")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .filter(|generation| *generation > 0)
+                            .ok_or_else(|| {
+                                SessionContextCoordinatorError::Invalid(
+                                    "original execution binding generation is malformed".into(),
+                                )
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or(NO_EXECUTION_BINDING_EXPECTATION);
+                validate_execution_binding_generation_in_tx(&mut tx, key, Some(binding_generation))
+                    .await?;
+                if let Some(mut receipt) = load_database_receipt::<ResumedExecutionTurnReceipt>(
+                    &mut tx,
+                    key,
+                    "resume_execution",
+                    &idempotency_key,
+                    &request_hash,
+                )
+                .await?
+                {
+                    let live_owner: bool = sqlx::query_scalar(
+                    "SELECT COALESCE(owner_pod_id = ? AND owner_lease_expires_at >= NOW(6), FALSE)
+                     FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
+                ).bind(request.owner_pod_id).bind(request.user_id).bind(request.session_id)
+                    .bind(request.run_id).fetch_one(&mut *tx).await
+                    .map_err(|source| database_error("validate_resumed_run_owner", source))?;
+                    if run.status != astra_core::STATUS_RUNNING
+                        || !live_owner
+                        || receipt.source != source
+                        || receipt.run_id != run.run_id
+                        || receipt.run_generation != run.run_generation
+                        || request.expected_owner_generation.checked_add(1)
+                            != Some(receipt.run_generation)
+                        || receipt.checkpoint_id != checkpoint.checkpoint_id
+                        || receipt.producer_generation != producer_owner_generation
+                        || state.head.as_ref().map(|head| &head.cursor)
+                            != receipt.turn_reservation.expected_cursor.as_ref()
+                    {
+                        return Err(SessionContextCoordinatorError::Fenced);
+                    }
+                    validate_active_lease(&state, &receipt.writer_lease, now)?;
+                    validate_active_reservation(&state, &receipt.turn_reservation, now)?;
+                    validate_lease_request(
+                        state
+                            .active_writer
+                            .as_ref()
+                            .ok_or(SessionContextCoordinatorError::Fenced)?,
+                        key,
+                        &receipt.writer_lease.expected_cursor,
+                        request.actor,
+                    )?;
+                    if !same_reservation_origin(
+                        state
+                            .active_reservation
+                            .as_ref()
+                            .ok_or(SessionContextCoordinatorError::Fenced)?,
+                        &receipt.turn_reservation,
+                    ) {
+                        return Err(SessionContextCoordinatorError::Fenced);
+                    }
+                    // The existing heartbeat may have renewed the pair since the
+                    // receipt was written. Return current expiry without granting
+                    // a new epoch, run generation or reservation identity.
+                    receipt.writer_lease = state
+                        .active_writer
+                        .clone()
+                        .ok_or(SessionContextCoordinatorError::Fenced)?;
+                    receipt.turn_reservation = state
+                        .active_reservation
+                        .clone()
+                        .ok_or(SessionContextCoordinatorError::Fenced)?;
+                    run.checkpoint_json = None;
+                    return Ok(ResumedExecutionTurn {
+                        run,
+                        checkpoint,
+                        receipt,
+                    });
+                }
+                if run.run_generation != request.expected_owner_generation {
+                    return Err(SessionContextCoordinatorError::Fenced);
+                }
+                // Stage activation first so a later head/receipt rejection proves
+                // rollback covers ownership and the session slot as well.
+                crate::runs::activate_execution_resume_tx(
+                    &mut tx,
+                    &mut run,
+                    &checkpoint,
+                    request.owner_pod_id,
+                )
+                .await
+                .map_err(execution_resume_storage_error)?;
+                let archived = load_database_receipt::<ReservationReceiptV1>(
+                    &mut tx,
+                    key,
+                    "reserve",
+                    &source.idempotency_key,
+                    &reservation_identity_hash(
+                        key,
+                        &source.lease_id,
+                        source.writer_epoch,
+                        source.expected_cursor.as_ref(),
+                    ),
+                )
+                .await?;
+                let original = state
+                    .active_reservation
+                    .as_ref()
+                    .filter(|reservation| same_reservation_origin(reservation, &source))
+                    .or_else(|| {
+                        archived
+                            .as_ref()
+                            .map(|receipt| &receipt.reservation)
+                            .filter(|reservation| same_reservation_origin(reservation, &source))
+                    })
+                    .or_else(|| {
+                        state
+                            .last_commit
+                            .as_ref()
+                            .map(|receipt| &receipt.reservation)
+                            .filter(|reservation| same_reservation_origin(reservation, &source))
+                    })
+                    .ok_or(SessionContextCoordinatorError::Fenced)?;
+                if !same_reservation_origin(original, &source) {
+                    return Err(SessionContextCoordinatorError::Fenced);
+                }
+                let cursor = state.head.as_ref().map(|head| &head.cursor);
+                let source_committed_here = state.last_commit.as_ref().is_some_and(|commit| {
+                    same_reservation_origin(&commit.reservation, &source)
+                        && cursor == Some(&commit.cursor)
+                        && commit.cursor.completed_turn == source.reserved_turn
+                });
+                if cursor != source.expected_cursor.as_ref() && !source_committed_here
+                    || state
+                        .active_writer
+                        .as_ref()
+                        .is_some_and(|lease| lease.expires_at_unix_ms > now)
+                    || state
+                        .active_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+                {
+                    return Err(SessionContextCoordinatorError::Fenced);
+                }
+                let expected_cursor = cursor.cloned();
+                archive_database_state_receipts(&mut tx, &state).await?;
+                state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
+                    SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
+                })?;
+                let expires_at = checked_expiry(now, request.ttl)?;
+                let writer_lease = ConversationWriterLeaseV1 {
+                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                    key: key.clone(),
+                    lease_id: Uuid::new_v4().to_string(),
+                    writer_epoch: state.writer_epoch,
+                    actor: request.actor.clone(),
+                    expected_cursor: expected_cursor.clone(),
+                    acquired_at_unix_ms: now,
+                    expires_at_unix_ms: expires_at,
+                    idempotency_key: format!("server-run:{}:writer", request.run_id),
+                };
+                let turn_reservation = TurnReservationV1 {
+                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                    key: key.clone(),
+                    reservation_id: Uuid::new_v4().to_string(),
+                    lease_id: writer_lease.lease_id.clone(),
+                    writer_epoch: writer_lease.writer_epoch,
+                    expected_cursor,
+                    reserved_turn: source.reserved_turn,
+                    created_at_unix_ms: now,
+                    expires_at_unix_ms: expires_at,
+                    idempotency_key: format!("{idempotency_key}:turn"),
+                };
+                state.active_writer = Some(writer_lease.clone());
+                state.active_reservation = Some(turn_reservation.clone());
+                let receipt = ResumedExecutionTurnReceipt {
+                    source,
+                    writer_lease,
+                    turn_reservation,
+                    run_id: run.run_id.clone(),
+                    run_generation: run.run_generation,
+                    producer_generation: producer_owner_generation,
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                };
+                update_database_state(&mut tx, &state).await?;
+                store_database_receipt(
+                    &mut tx,
+                    key,
+                    "resume_execution",
+                    &idempotency_key,
+                    &request_hash,
+                    &receipt,
+                )
+                .await?;
+                record_database_authority_event(
+                    &mut tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "resume_execution_turn",
+                        outcome: "resumed",
+                        actor: Some(request.actor),
+                        lease_id: Some(&receipt.writer_lease.lease_id),
+                        reservation_id: Some(&receipt.turn_reservation.reservation_id),
+                        expected_cursor: receipt.turn_reservation.expected_cursor.as_ref(),
+                    },
+                )
+                .await?;
+                run.checkpoint_json = None;
+                Ok(ResumedExecutionTurn {
+                    run,
+                    checkpoint,
+                    receipt,
+                })
+            }
+            .await;
+        let proof = match staged {
+            Ok(proof) => proof,
+            Err(error) => {
+                tx.rollback()
+                    .await
+                    .map_err(|source| database_error("rollback_execution_resume", source))?;
+                connection.release();
+                return Err(error);
+            }
+        };
+        // An unknown COMMIT acknowledgement does not grant execution or prove
+        // rollback. The existing receipt lets an exact retry resolve custody.
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_execution_resume", source))?;
+        connection.release();
+        Ok(proof)
+    }
+
     async fn load_head(
         &self,
         key: &SessionKeyV1,
@@ -5727,6 +6099,32 @@ fn validate_optional_cursor(
         ));
     }
     Ok(())
+}
+
+fn execution_resume_storage_error(
+    error: crate::runs::ExecutionHandoffReferenceError,
+) -> SessionContextCoordinatorError {
+    match error {
+        crate::runs::ExecutionHandoffReferenceError::Rejected(_) => {
+            SessionContextCoordinatorError::Fenced
+        }
+        crate::runs::ExecutionHandoffReferenceError::Unavailable(detail) => {
+            database_error("execution_resume_storage", sqlx::Error::Protocol(detail))
+        }
+    }
+}
+
+// Renewals change expiry, not the identity of the original reserved turn.
+fn same_reservation_origin(left: &TurnReservationV1, right: &TurnReservationV1) -> bool {
+    left.schema_version == right.schema_version
+        && left.key == right.key
+        && left.reservation_id == right.reservation_id
+        && left.lease_id == right.lease_id
+        && left.writer_epoch == right.writer_epoch
+        && left.expected_cursor == right.expected_cursor
+        && left.reserved_turn == right.reserved_turn
+        && left.created_at_unix_ms == right.created_at_unix_ms
+        && left.idempotency_key == right.idempotency_key
 }
 
 fn validate_optional_manifest_root(

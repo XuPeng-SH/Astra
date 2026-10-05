@@ -1077,6 +1077,17 @@ impl FileBackedEventStore {
         append_jsonl_line(&path, &json, step_event_write_durability(event))
     }
 
+    /// Confirm the existing event prefix before an execution handoff is committed.
+    pub(crate) fn sync_events(path: &Path) -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        file.sync_all()?;
+        sync_parent_dir(path)
+    }
+
     /// Get all events (for audit/replay).
     pub fn all_events(&self) -> &[StepEvent] {
         &self.events

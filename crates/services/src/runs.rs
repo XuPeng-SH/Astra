@@ -1169,6 +1169,9 @@ impl AgentProfileSnapshot {
 
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
+    /// Server authentication provenance; no transport may supply this field.
+    /// This is not a continuation grant or current execution authorization.
+    pub execution_authentication: Option<crate::auth::ExecutionAuthenticationProvenance>,
     /// Trusted, non-serialized observation binding. No catalog is read until
     /// the model explicitly invokes model_catalog.
     pub model_catalog_reader: Option<crate::models::AuthorizedModelCatalogReader>,
@@ -1970,7 +1973,22 @@ fn execution_handoff_claim_event(
                     && previous.claimed_from_generation.checked_add(1)
                         == Some(previous.claimed_generation)
             });
-        if !prior_claim {
+        // A reconciled handoff is deliberately parked with the recovery
+        // association as its tail.  A later explicit activation may advance
+        // that exact custody chain, but only after the association has been
+        // checked for the same checkpoint, producer generation, and current
+        // recovered generation.  This does not authorize arbitrary paused
+        // rows: the caller still has to pass the exact run/checkpoint fences.
+        let prior_recovery = tail
+            .and_then(execution_handoff_recovery_from_event)
+            .is_some_and(|recovery| {
+                recovery.checkpoint_id == checkpoint.checkpoint_id
+                    && recovery.producer_generation == *producer_owner_generation
+                    && recovery.recovered_generation == run.run_generation
+                    && recovery.claimed_from_generation.checked_add(1)
+                        == Some(recovery.recovered_generation)
+            });
+        if !prior_claim && !prior_recovery {
             return Ok(None);
         }
     }
@@ -2205,6 +2223,212 @@ pub(crate) enum ExecutionHandoffReferenceError {
     Unavailable(String),
 }
 
+/// Locks the exact recovery input. The coordinator owns the enclosing commit;
+/// this read never activates a run or manufactures current user authority.
+pub(crate) async fn lock_execution_resume_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    request: &crate::session_context_coordinator::ResumedExecutionTurnRequest<'_>,
+) -> Result<(DurableRunRecord, DurableRunCheckpointRecord), ExecutionHandoffReferenceError> {
+    use ExecutionHandoffReferenceError::{Rejected, Unavailable};
+    let mut run = load_run_metadata_for_exact_session_tx(
+        tx,
+        request.user_id,
+        request.session_id,
+        request.run_id,
+    )
+    .await
+    .map_err(|error| Unavailable(error.to_string()))?
+    .ok_or(Rejected("resume run does not belong to this session"))?;
+    let next_generation = request
+        .expected_owner_generation
+        .checked_add(1)
+        .filter(|generation| i64::try_from(*generation).is_ok())
+        .ok_or(Rejected("execution generation exhausted"))?;
+    if ![request.expected_owner_generation, next_generation].contains(&run.run_generation)
+        || lock_durable_lineage_cancellation_markers_tx(tx, &run)
+            .await
+            .map_err(Unavailable)?
+            .any()
+    {
+        return Err(Rejected("execution resume was fenced or cancelled"));
+    }
+    let row = sqlx::query(
+        "SELECT checkpoint_id, run_id, user_id, session_id, node_seq,
+         checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json,
+         DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+         FROM run_checkpoints WHERE user_id = ? AND session_id = ? AND run_id = ?
+         AND checkpoint_id = ? FOR UPDATE",
+    )
+    .bind(request.user_id)
+    .bind(request.session_id)
+    .bind(request.run_id)
+    .bind(request.checkpoint_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| Unavailable(error.to_string()))?
+    .ok_or(Rejected("execution checkpoint is missing"))?;
+    let checkpoint = decode_run_checkpoint_record_from_row(&row)
+        .map_err(|error| Unavailable(error.to_string()))?;
+    if checkpoint.checkpoint_kind != "execution_handoff"
+        || checkpoint.checkpoint_version != "execution_handoff_v1"
+        || execution_handoff_checkpoint_identity(&run)
+            .map_err(Unavailable)?
+            .as_deref()
+            != Some(checkpoint.idempotency_key.as_str())
+    {
+        return Err(Rejected("execution checkpoint identity changed"));
+    }
+    validate_run_checkpoint_size(&checkpoint.checkpoint_json).map_err(Rejected)?;
+    if run.run_generation == next_generation {
+        let tail: Option<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ?
+             AND event_idx = ? FOR UPDATE",
+        )
+        .bind(request.user_id)
+        .bind(request.run_id)
+        .bind(run.last_event_idx)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| Unavailable(error.to_string()))?;
+        let tail = tail
+            .map(|json| serde_json::from_str::<serde_json::Value>(&json))
+            .transpose()
+            .map_err(|error| Unavailable(error.to_string()))?;
+        if !tail
+            .as_ref()
+            .and_then(ExecutionHandoffClaim::from_event)
+            .is_some_and(|claim| {
+                claim.checkpoint_id == checkpoint.checkpoint_id
+                    && claim.claimed_from_generation == request.expected_owner_generation
+                    && claim.claimed_generation == next_generation
+            })
+        {
+            return Err(Rejected("execution advanced beyond its resume receipt"));
+        }
+    }
+    let starts: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ?
+         AND event_type = 'run_started' ORDER BY event_idx ASC LIMIT 2 FOR UPDATE",
+    )
+    .bind(request.user_id)
+    .bind(request.run_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| Unavailable(error.to_string()))?;
+    run.events = starts
+        .iter()
+        .map(|json| serde_json::from_str(json))
+        .collect::<Result<_, _>>()
+        .map_err(|error| Unavailable(error.to_string()))?;
+    run.original_admission_data()
+        .map_err(|_| Rejected("original execution admission is missing or conflicting"))?;
+    Ok((run, checkpoint))
+}
+
+/// Stage ownership, slot and custody in the caller's existing transaction.
+/// Nothing is committed until the coordinator also restores turn authority.
+pub(crate) async fn activate_execution_resume_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    run: &mut DurableRunRecord,
+    checkpoint: &DurableRunCheckpointRecord,
+    owner_pod_id: &str,
+) -> Result<(), ExecutionHandoffReferenceError> {
+    use ExecutionHandoffReferenceError::{Rejected, Unavailable};
+    if run.status != STATUS_PAUSED || run.waiting_for.is_some() {
+        return Err(Rejected("execution checkpoint is not parked"));
+    }
+    if run_has_open_settlement_in_tx(tx, &run.user_id, &run.run_id, run.run_generation)
+        .await
+        .map_err(|error| Unavailable(error.to_string()))?
+    {
+        return Err(Rejected("execution settlement remains open"));
+    }
+    let tail: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ?
+         AND event_idx = ? FOR UPDATE",
+    )
+    .bind(&run.user_id)
+    .bind(&run.run_id)
+    .bind(run.last_event_idx)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| Unavailable(error.to_string()))?;
+    let tail = tail
+        .map(|json| serde_json::from_str::<serde_json::Value>(&json))
+        .transpose()
+        .map_err(|error| Unavailable(error.to_string()))?;
+    let event = execution_handoff_claim_event(run, checkpoint, tail.as_ref())
+        .map_err(Unavailable)?
+        .ok_or(Rejected("execution checkpoint custody changed"))?;
+    let next_generation = run
+        .run_generation
+        .checked_add(1)
+        .and_then(|generation| i64::try_from(generation).ok())
+        .ok_or(Rejected("execution generation exhausted"))?;
+    let next_idx = run
+        .last_event_idx
+        .checked_add(1)
+        .ok_or(Rejected("execution event frontier exhausted"))?;
+    let affected = sqlx::query(
+        "UPDATE agent_runs SET status = 'running', waiting_for = NULL,
+         owner_pod_id = ?, owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND),
+         run_generation = ?, last_event_idx = ?, updated_at = NOW(6)
+         WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?
+         AND last_event_idx = ? AND status = 'paused' AND waiting_for IS NULL
+         AND cancellation_requested_at IS NULL
+         AND (owner_pod_id IS NULL OR owner_lease_expires_at IS NULL OR owner_lease_expires_at < NOW(6))",
+    ).bind(owner_pod_id)
+        .bind(DatabaseRunStateStore::DEFAULT_LEASE_TTL.as_micros() as i64)
+        .bind(next_generation).bind(next_idx).bind(&run.user_id).bind(&run.session_id)
+        .bind(&run.run_id).bind(run.run_generation as i64).bind(run.last_event_idx)
+        .execute(&mut **tx).await.map_err(|error| Unavailable(error.to_string()))?;
+    if affected.rows_affected() != 1 {
+        return Err(Rejected("execution owner remains live or changed"));
+    }
+    if run_requires_session_execution_slot(run)
+        && !DatabaseRunStateStore::acquire_session_execution_slot_in_tx(
+            tx,
+            &run.user_id,
+            &run.session_id,
+            &run.run_id,
+            None,
+            DatabaseRunStateStore::DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER,
+        )
+        .await
+        .map_err(|error| Unavailable(error.to_string()))?
+    {
+        return Err(Rejected("session execution slot is occupied"));
+    }
+    let row = build_run_event_insert_row(
+        &run.user_id,
+        &run.run_id,
+        &run.session_id,
+        run.agent_id.as_deref(),
+        next_idx,
+        owner_pod_id,
+        &event,
+    )
+    .map_err(|error| Unavailable(error.to_string()))?;
+    DatabaseRunStateStore::insert_run_event_rows_tx(
+        tx,
+        &run.run_id,
+        &[row],
+        "insert_execution_resume_custody",
+    )
+    .await
+    .map_err(Unavailable)?;
+    // Read authoritative lease time, not an application-clock approximation.
+    let resumed =
+        load_run_metadata_for_exact_session_tx(tx, &run.user_id, &run.session_id, &run.run_id)
+            .await
+            .map_err(|error| Unavailable(error.to_string()))?
+            .ok_or(Rejected("resumed execution disappeared"))?;
+    let admission = std::mem::take(&mut run.events);
+    *run = resumed;
+    run.events = admission;
+    Ok(())
+}
+
 pub(crate) async fn lock_and_validate_execution_handoff_reference_tx<T>(
     tx: &mut T,
     user_id: &str,
@@ -2386,11 +2610,40 @@ pub enum RuntimeCapabilitySource {
 }
 
 impl DurableRunRecord {
-    pub fn admission_source(&self) -> Result<Option<DurableAdmissionSource>, serde_json::Error> {
-        self.events
+    /// All admission facts must come from one original start event. A missing,
+    /// malformed or conflicting admission cannot establish execution authority.
+    pub fn original_admission_data(
+        &self,
+    ) -> Result<&serde_json::Map<String, serde_json::Value>, serde_json::Error> {
+        let invalid = <serde_json::Error as serde::de::Error>::custom;
+        let mut starts = self
+            .events
             .iter()
-            .find(|event| event["event_type"] == "run_started")
-            .and_then(|event| event.get("data")?.get("admission_source"))
+            .filter(|event| event["event_type"] == "run_started");
+        let start = starts
+            .next()
+            .ok_or_else(|| invalid("durable run has no start event"))?;
+        if starts.next().is_some() {
+            return Err(invalid("durable run has conflicting start events"));
+        }
+        start
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| invalid("durable run has malformed start data"))
+    }
+
+    pub fn execution_authentication(
+        &self,
+    ) -> Result<Option<crate::auth::ExecutionAuthenticationProvenance>, serde_json::Error> {
+        self.original_admission_data()?
+            .get("execution_authentication")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+    }
+
+    pub fn admission_source(&self) -> Result<Option<DurableAdmissionSource>, serde_json::Error> {
+        self.original_admission_data()?
+            .get("admission_source")
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()
     }
@@ -2398,10 +2651,8 @@ impl DurableRunRecord {
     pub fn execution_restrictions(
         &self,
     ) -> Result<Option<DurableExecutionRestrictions>, serde_json::Error> {
-        self.events
-            .iter()
-            .find(|event| event["event_type"] == "run_started")
-            .and_then(|event| event.get("data")?.get("execution_restrictions"))
+        self.original_admission_data()?
+            .get("execution_restrictions")
             .map(|value| {
                 let restrictions: DurableExecutionRestrictions =
                     serde_json::from_value(value.clone())?;
@@ -12693,6 +12944,25 @@ impl DatabaseRunStateStore {
         run_id: &str,
         admission_facts: Option<crate::storage::SessionExecutionAdmissionFacts>,
     ) -> DbStoreResult<bool> {
+        Self::acquire_session_execution_slot_in_tx(
+            tx,
+            user_id,
+            session_id,
+            run_id,
+            admission_facts,
+            self.session_execution_slot_stale_after,
+        )
+        .await
+    }
+
+    async fn acquire_session_execution_slot_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        admission_facts: Option<crate::storage::SessionExecutionAdmissionFacts>,
+        stale_after: Duration,
+    ) -> DbStoreResult<bool> {
         // Deletion fencing locks this same session row before proving the slot
         // empty. Execution authority exists only for the exact active,
         // owner-scoped durable session; missing, foreign, or terminal session
@@ -12772,7 +13042,7 @@ impl DatabaseRunStateStore {
                 .signed_duration_since(slot_updated_at)
                 .to_std()
                 .unwrap_or_default();
-            let slot_is_stale = slot_age >= self.session_execution_slot_stale_after;
+            let slot_is_stale = slot_age >= stale_after;
             {
                 let owner_state = sqlx::query(
                     "SELECT status, waiting_for, owner_lease_expires_at FROM agent_runs
@@ -29015,7 +29285,422 @@ mod tests {
             panic!(
                 "active database session fixture failed for user={user_id} session={session_id}: {error}"
             )
-        });
+            });
+    }
+
+    async fn parked_execution_resume_fixture(
+        store: &DatabaseRunStateStore,
+        pool: &astra_core::SharedPool,
+        user: &str,
+        session: &str,
+        run_id: &str,
+    ) -> (
+        crate::session_context_coordinator::DatabaseSessionContextCoordinator,
+        astra_turn_types::TurnReservationV1,
+        astra_turn_types::ActorContextV1,
+        RunCheckpointReceipt,
+    ) {
+        use crate::session_context_coordinator::{
+            AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator,
+        };
+        insert_active_database_session_fixture(pool, user, session).await;
+        let coordinator =
+            crate::session_context_coordinator::DatabaseSessionContextCoordinator::new(
+                pool.clone(),
+            );
+        let key = SessionKeyV1::owner_session(
+            "server",
+            user,
+            session,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            user,
+            format!("server-run:{run_id}"),
+            astra_turn_types::ActorKindV1::Server,
+            astra_turn_types::SessionSurfaceV1::Server,
+            None,
+            Default::default(),
+        );
+        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                None,
+                &actor,
+                Duration::from_secs(60),
+                &format!("server-run:{run_id}:writer"),
+                &format!("server-run:{run_id}:turn"),
+                Some(0),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("fixture admission must succeed")
+        };
+        let mut run = durable_run_record(run_id);
+        run.user_id = user.into();
+        run.session_id = session.into();
+        run.last_event_idx = 0;
+        run.events = vec![json!({"event_type":"run_started", "data":{}})];
+        store.insert_run(run).await.unwrap();
+        let generation = store
+            .load_run(user, run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_generation;
+        let payload = json!({"version":"execution_handoff_v1", "producer_run_id":run_id,
+            "producer_owner_generation":generation, "heavy":{"reservation":reservation, "retained":"original"}}).to_string();
+        let checkpoint = store
+            .save_checkpoint(RunCheckpointWriteRequest {
+                user_id: user,
+                expected_session_id: session,
+                run_id,
+                checkpoint_json: &payload,
+                authority: CheckpointWriteAuthority::ExecutionOwner {
+                    expected_owner_generation: generation,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .update_run_status(user, session, run_id, STATUS_PAUSED, None, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_owner_lease(user, session, run_id, generation)
+                .await
+                .unwrap()
+        );
+        coordinator.release_writer(&lease).await.unwrap();
+        (coordinator, reservation, actor, checkpoint)
+    }
+
+    async fn cleanup_execution_resume_fixture(
+        pool: &astra_core::SharedPool,
+        user: &str,
+        run_id: &str,
+    ) {
+        cleanup_database_run_fixture(pool, user, run_id).await;
+        for table in [
+            "agent_session_execution_slots",
+            "session_context_operation_receipts",
+            "session_context_authority_events",
+            "session_context_heads",
+            "agent_sessions",
+        ] {
+            let owner_column = if table.starts_with("session_context_") {
+                "owner_user_id"
+            } else {
+                "user_id"
+            };
+            sqlx::query(&format!("DELETE FROM {table} WHERE {owner_column} = ?"))
+                .bind(user)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_execution_resume_is_atomic_and_preserves_original_turn() {
+        use crate::session_context_coordinator::{
+            ResumedExecutionTurnRequest, SessionContextCoordinator,
+        };
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("resume-atomic-u-{nonce}");
+        let session = format!("resume-atomic-s-{nonce}");
+        let run_id = format!("resume-atomic-r-{nonce}");
+        let (coordinator, source, actor, checkpoint) =
+            parked_execution_resume_fixture(&store, &pool, &user, &session, &run_id).await;
+        let before = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        let request = |actor| ResumedExecutionTurnRequest {
+            user_id: &user,
+            session_id: &session,
+            run_id: &run_id,
+            expected_owner_generation: before.run_generation,
+            checkpoint_id: &checkpoint.checkpoint_id,
+            source: &source,
+            actor,
+            owner_pod_id: "resume-atomic-owner",
+            ttl: Duration::from_secs(60),
+        };
+        // Authority epochs are checked under lock; no stale actor may resume.
+        let mut stale_actor = actor.clone();
+        stale_actor.authority_epochs.permission_epoch += 1;
+        assert!(
+            coordinator
+                .resume_execution_turn(request(&stale_actor))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(&user, &run_id).await.unwrap().unwrap(),
+            before
+        );
+
+        // A current but independent writer must reject after run/slot staging;
+        // the transaction rolls all staged custody changes back.
+        let competing = coordinator
+            .acquire_writer_and_reserve_turn(
+                &source.key,
+                None,
+                &actor,
+                Duration::from_secs(60),
+                "competing-writer",
+                "competing-turn",
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let crate::session_context_coordinator::AcquireWriterAndReserveTurnOutcome::Ready {
+            lease,
+            reservation: _,
+        } = competing
+        else {
+            panic!("independent writer fixture must acquire")
+        };
+        assert!(
+            coordinator
+                .resume_execution_turn(request(&actor))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(&user, &run_id).await.unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            coordinator.load_active_writer(&source.key).await.unwrap(),
+            Some(lease.clone())
+        );
+        let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+            .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(slots, 0, "failed restore must roll back the acquired slot");
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_operation_receipts WHERE owner_user_id = ? AND operation_kind = 'resume_execution'")
+            .bind(&user).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            receipts, 0,
+            "failed restore must not leave a success receipt"
+        );
+        coordinator.release_writer(&lease).await.unwrap();
+        let proof = coordinator
+            .resume_execution_turn(request(&actor))
+            .await
+            .unwrap();
+        assert_eq!(proof.run().run_id, run_id);
+        assert_eq!(proof.run().status, STATUS_RUNNING);
+        assert_eq!(proof.run().run_generation, before.run_generation + 1);
+        assert_eq!(
+            proof.run().events.len(),
+            1,
+            "proof excludes execution history"
+        );
+        assert_eq!(proof.run().events[0]["event_type"], "run_started");
+        assert_eq!(
+            proof.run().original_admission_data().unwrap(),
+            before.original_admission_data().unwrap(),
+            "proof preserves every original admission field, not read-side event indexes"
+        );
+        assert_eq!(
+            proof.run().checkpoint_json,
+            None,
+            "checkpoint payload has one owner"
+        );
+        assert_eq!(proof.checkpoint().checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(
+            proof.checkpoint().checkpoint_json,
+            before.checkpoint_json.clone().unwrap()
+        );
+        assert_eq!(proof.receipt().source, source);
+        assert_eq!(
+            proof.receipt().turn_reservation.reserved_turn,
+            source.reserved_turn
+        );
+        assert_eq!(
+            proof.receipt().turn_reservation.expected_cursor,
+            source.expected_cursor
+        );
+        assert_ne!(proof.receipt().writer_lease.lease_id, source.lease_id);
+        let replay = coordinator
+            .resume_execution_turn(request(&actor))
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.receipt(),
+            proof.receipt(),
+            "exact retry cannot mint new authority"
+        );
+        let renewed = coordinator
+            .renew_turn_authority(
+                &proof.receipt().writer_lease,
+                &proof.receipt().turn_reservation,
+                Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        let replay = coordinator
+            .resume_execution_turn(request(&actor))
+            .await
+            .unwrap();
+        assert_eq!(replay.receipt().writer_lease, renewed.writer_lease);
+        assert_eq!(replay.receipt().turn_reservation, renewed.turn_reservation);
+        assert_eq!(replay.run().run_generation, proof.run().run_generation);
+        assert!(
+            store
+                .append_events_if_current_generation_and_status(
+                    &user,
+                    &session,
+                    &run_id,
+                    proof.run().run_generation,
+                    &[STATUS_RUNNING],
+                    &[json!({"event_type":"agent_progress", "idempotency_key":"resume-progress", "data":{"step":1}})],
+                )
+                .await
+                .unwrap()
+        );
+        let progressed = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                coordinator.resume_execution_turn(request(&actor)).await,
+                Err(crate::session_context_coordinator::SessionContextCoordinatorError::Fenced)
+            ),
+            "a progressed execution cannot be restored again from its old receipt"
+        );
+        assert_eq!(
+            store.load_run(&user, &run_id).await.unwrap().unwrap(),
+            progressed
+        );
+        assert_eq!(
+            coordinator.load_active_writer(&source.key).await.unwrap(),
+            Some(renewed.writer_lease)
+        );
+        cleanup_execution_resume_fixture(&pool, &user, &run_id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_execution_resume_fences_concurrent_owners_and_rejections() {
+        use crate::session_context_coordinator::{
+            ResumedExecutionTurnRequest, SessionContextCoordinator,
+        };
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("resume-fenced-u-{nonce}");
+        let session = format!("resume-fenced-s-{nonce}");
+        let run_id = format!("resume-fenced-r-{nonce}");
+        let (coordinator, source, actor, checkpoint) =
+            parked_execution_resume_fixture(&store, &pool, &user, &session, &run_id).await;
+        let before = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        let request = |owner| ResumedExecutionTurnRequest {
+            user_id: &user,
+            session_id: &session,
+            run_id: &run_id,
+            expected_owner_generation: before.run_generation,
+            checkpoint_id: &checkpoint.checkpoint_id,
+            source: &source,
+            actor: &actor,
+            owner_pod_id: owner,
+            ttl: Duration::from_secs(60),
+        };
+        for variant in 0..5 {
+            let mut rejected = request("resume-owner-a");
+            match variant {
+                0 => rejected.user_id = "foreign-owner",
+                1 => rejected.session_id = "foreign-session",
+                2 => rejected.expected_owner_generation += 9,
+                3 => rejected.checkpoint_id = "foreign-checkpoint",
+                _ => rejected.run_id = "missing-run",
+            }
+            assert!(coordinator.resume_execution_turn(rejected).await.is_err());
+            assert_eq!(
+                store.load_run(&user, &run_id).await.unwrap().unwrap(),
+                before
+            );
+        }
+        let mut mismatched_source = source.clone();
+        mismatched_source.reservation_id = "different-reservation".into();
+        let mut rejected = request("resume-owner-a");
+        rejected.source = &mismatched_source;
+        assert!(coordinator.resume_execution_turn(rejected).await.is_err());
+        assert_eq!(
+            store.load_run(&user, &run_id).await.unwrap().unwrap(),
+            before
+        );
+        // Migrate the old activation tests to the real coordinator boundary:
+        // an ordinary paused row or malformed checkpoint must never activate.
+        for (version, payload) in [
+            (None, None),
+            (Some("checkpoint_v1"), Some("{}")),
+            (Some("execution_handoff_v1"), Some("{")),
+        ] {
+            sqlx::query("UPDATE agent_runs SET checkpoint_version = ?, checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+                .bind(version).bind(payload).bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+            let parked = store.load_run(&user, &run_id).await.unwrap().unwrap();
+            assert!(
+                coordinator
+                    .resume_execution_turn(request("resume-owner-a"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store.load_run(&user, &run_id).await.unwrap().unwrap(),
+                parked
+            );
+        }
+        sqlx::query("UPDATE agent_runs SET checkpoint_version = ?, checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(&before.checkpoint_version).bind(&before.checkpoint_json)
+            .bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = 'still-live', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+        let live = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert!(
+            coordinator
+                .resume_execution_turn(request("resume-owner-a"))
+                .await
+                .is_err()
+        );
+        assert_eq!(store.load_run(&user, &run_id).await.unwrap().unwrap(), live);
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = NULL, owner_lease_expires_at = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+        let (left, right) = tokio::join!(
+            coordinator.resume_execution_turn(request("resume-owner-a")),
+            coordinator.resume_execution_turn(request("resume-owner-b")),
+        );
+        assert_ne!(
+            left.is_ok(),
+            right.is_ok(),
+            "one generation permits one owner only"
+        );
+        let winner = left.or(right).unwrap();
+        assert_eq!(winner.run().run_generation, before.run_generation + 1);
+        let current = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert_eq!(current.last_event_idx, before.last_event_idx + 1);
+        assert_eq!(current.checkpoint_json, before.checkpoint_json);
+        assert!(
+            store
+                .request_run_cancellation(&user, &run_id)
+                .await
+                .unwrap()
+        );
+        let cancelled = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert!(
+            coordinator
+                .resume_execution_turn(request(winner.run().owner_pod_id.as_deref().unwrap()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(&user, &run_id).await.unwrap().unwrap(),
+            cancelled
+        );
+        cleanup_execution_resume_fixture(&pool, &user, &run_id).await;
     }
 
     async fn database_session_lock_wait_timeout(connection: &mut sqlx::MySqlConnection) -> i64 {
@@ -39352,6 +40037,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
+            execution_authentication: None,
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
@@ -39562,6 +40248,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
+            execution_authentication: None,
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
@@ -39688,6 +40375,7 @@ mod tests {
                     stable_runtime_system_prompt: None,
                     runtime_system_prompt: None,
                     session_id: None,
+                    execution_authentication: None,
                     session_admission_facts: None,
                     work_binding: None,
                     run_start_idempotency: None,

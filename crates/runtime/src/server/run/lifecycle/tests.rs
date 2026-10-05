@@ -5574,91 +5574,107 @@ async fn normal_terminal_root_history_does_not_grow_runtime_context_indexes() {
 }
 
 #[tokio::test]
-async fn terminal_root_wiring_fails_before_installing_the_agent_provider() {
-    let service = test_service();
-    service
-        .run_engine
-        .start_run("preterminal-root", "user-a", "session-1")
-        .await
-        .unwrap();
-    assert!(
+async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
+    for invalid_constraints in [false, true] {
+        let service = test_service();
         service
             .run_engine
-            .persist_delegation_outcome_status(
+            .start_run("preterminal-root", "user-a", "session-1")
+            .await
+            .unwrap();
+        if !invalid_constraints {
+            assert!(
+                service
+                    .run_engine
+                    .persist_delegation_outcome_status(
+                        "user-a",
+                        "session-1",
+                        "preterminal-root",
+                        STATUS_COMPLETED,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "user-a".to_string(),
+            "session-1".to_string(),
+            None,
+            None,
+        );
+        let entry = service
+            .server_agent_spawner_for_session("user-a", "session-1")
+            .await;
+        let durable_restore = service
+            .restore_server_dynamic_agents(&entry, "user-a", "session-1")
+            .await;
+        let mut request = test_request("must not execute");
+        if invalid_constraints {
+            request.context = Some(Map::from_iter([(
+                "__astra_delegated_model_requirements".to_string(),
+                Value::String("malformed".to_string()),
+            )]));
+        }
+        let error = match service
+            .wire_server_dynamic_agent_tools(
+                &entry,
+                durable_restore,
+                &mut executor,
                 "user-a",
                 "session-1",
                 "preterminal-root",
-                STATUS_COMPLETED,
+                1,
+                &request,
+                &[],
                 None,
+                workspace.path(),
+                None,
+                None,
+                None,
+                Some(Arc::new(CancellationToken::new())),
+                #[cfg(feature = "harness")]
                 None,
             )
             .await
-            .unwrap()
-    );
-    let workspace = tempfile::tempdir().unwrap();
-    let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
-        workspace.path().to_path_buf(),
-        "user-a".to_string(),
-        "session-1".to_string(),
-        None,
-        None,
-    );
-    let entry = service
-        .server_agent_spawner_for_session("user-a", "session-1")
-        .await;
-    let durable_restore = service
-        .restore_server_dynamic_agents(&entry, "user-a", "session-1")
-        .await;
-    let error = match service
-        .wire_server_dynamic_agent_tools(
-            &entry,
-            durable_restore,
-            &mut executor,
-            "user-a",
-            "session-1",
-            "preterminal-root",
-            1,
-            &test_request("must not execute"),
-            &[],
-            None,
-            workspace.path(),
-            None,
-            None,
-            None,
-            Some(Arc::new(CancellationToken::new())),
-            #[cfg(feature = "harness")]
-            None,
-        )
-        .await
-    {
-        Ok(_) => panic!("a terminal durable root cannot publish a provider context"),
-        Err(error) => error,
-    };
-    assert!(error.contains("no longer has runnable durable"), "{error}");
+        {
+            Ok(_) => panic!("rejected root wiring cannot publish a provider context"),
+            Err(error) => error,
+        };
+        let expected_error = if invalid_constraints {
+            "delegated model handoff is malformed"
+        } else {
+            "no longer has runnable durable"
+        };
+        assert!(error.contains(expected_error), "{error}");
 
-    let provider_result = executor
-        .execute(
-            "agent",
-            &json!({
-                "action": "spawn",
-                "description": "fenced provider probe",
-                "prompt": "must not run"
-            }),
-        )
-        .await;
-    assert!(
-        provider_result.contains("failed") || provider_result.contains("unavailable"),
-        "fenced wiring must leave the agent provider unavailable: {provider_result}"
-    );
-    assert!(
-        entry
-            .executor
-            .runtime_context_registry
-            .read()
-            .await
-            .contexts_by_id
-            .is_empty()
-    );
+        let provider_result = executor
+            .execute(
+                "agent",
+                &json!({
+                    "action": "spawn",
+                    "description": "fenced provider probe",
+                    "prompt": "must not run"
+                }),
+            )
+            .await;
+        assert!(
+            provider_result.contains("failed") || provider_result.contains("unavailable"),
+            "fenced wiring must leave the agent provider unavailable: {provider_result}"
+        );
+        assert!(
+            entry
+                .executor
+                .runtime_context_registry
+                .read()
+                .await
+                .contexts_by_id
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
@@ -7729,6 +7745,7 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
                 display_name: None,
             },
             session_id: None,
+            execution_continuation: None,
             origin: astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 astra_services::AuthProviderAuthorizedRequestContext {
                     provider_id: "provider".into(),
@@ -12781,6 +12798,7 @@ fn test_request(message: &str) -> ChatRequestData {
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id: None,
+        execution_authentication: None,
         session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,
@@ -26295,6 +26313,7 @@ fn extract_edge_tools_from_context() {
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id: None,
+        execution_authentication: None,
         session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,
@@ -26389,6 +26408,7 @@ fn extract_edge_profile_from_context() {
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id: None,
+        execution_authentication: None,
         session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,
@@ -26747,7 +26767,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     facts.budget_wrapup_ignored_rounds = 1;
     let environment = svc.assemble_loop_environment(
         "test-user",
-        &request,
+        LoopEnvironmentAuthorization::fresh(&request, &constraints, None),
         "same-session",
         "same-run",
         None,
@@ -26924,7 +26944,7 @@ fn shared_child_assembly_preserves_restored_identity_budget_and_workspace_eviden
     assert!(facts.stall.tool_call_records.is_empty());
     let mut environment = svc.assemble_loop_environment(
         "user",
-        &request,
+        LoopEnvironmentAuthorization::fresh(&request, &constraints, None),
         "session",
         "run",
         None,

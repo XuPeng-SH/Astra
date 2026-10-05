@@ -127,6 +127,7 @@ fn principal(edge: bool) -> AuthPrincipal {
             display_name: None,
         },
         session_id: None,
+        execution_continuation: None,
         origin: if edge {
             AuthPrincipalOrigin::ProviderAuthorizedRequest(AuthProviderAuthorizedRequestContext {
                 provider_id: "provider".into(),

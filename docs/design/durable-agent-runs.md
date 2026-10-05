@@ -276,9 +276,10 @@ in another log. Its pending suffix includes the last settled tool results. Writi
 this payload neither invents an inference attempt nor commits a completed user
 turn. In particular, an absent committed conversation cursor must not be replaced
 with a fabricated cursor. The payload retains the existing WAL continuation
-and heavy snapshot for checkpoint custody. Original-run execution reconstruction
-is not implemented. The old reservation is identity evidence, not renewed
-authority.
+and heavy snapshot for checkpoint custody. The old reservation is identity
+evidence, not renewed authority. Explicit same-run resume obtains a renewed
+writer/reservation pair and checkpoint custody in one coordinator transaction
+before reconstructing execution through the existing background loop.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import
@@ -429,9 +430,15 @@ cooperative Server shutdown are connected. The recovery scanner preserves valid
 handoff material through the atomic recovery-association path; it does
 not launch an executor. Contract tests exercise checkpoint persistence,
 cross-generation custody claims, cancellation and fencing through these
-production entries. There is no original-run execution reconstruction consumer.
-Automatic execution takeover and restoration of all execution obligations remain
-unimplemented. After shutdown
+production entries. Explicit reconstruction currently supports root,
+catalog-offering, Server-managed execution without a primary Work binding.
+It reauthorizes the original session grant and offering, preserves the original
+turn, WAL continuation, deadline and loop facts, and resolves the existing
+workspace identity. Other execution providers and Work-bound continuations are
+rejected rather than given fresh admission or substituted workspace authority.
+Preparation failure preserves checkpoint custody through existing recovery
+reconciliation; an unknown commit acknowledgement is not reported as rollback.
+Automatic execution takeover remains unimplemented. After shutdown
 begins, the shared request preparation entry rejects new chat admission with a
 structured `server_shutting_down` response instead of creating a run that would
 immediately freeze.
@@ -442,9 +449,8 @@ explicit continuation path. Recovery preserves that opaque checkpoint and
 reports custody without claiming it decoded or reconstructed execution.
 Cancellation still wins. A new run may continue canonical session history under
 its own admission; custody claims do not authorize saved execution. Control
-V3 is not yet a complete reconstruction contract: ledger-verified
-tool evidence, intent and remaining execution obligations must be restored
-before an automatic executor may run.
+V3 reconstruction validates ledger-verified tool evidence, intent and remaining
+execution obligations before the supported explicit resume may dispatch.
 
 Question obligations are captured by the shared control projection, not by a
 second messaging ledger. Staged answers remain in the original loop facts'
@@ -456,7 +462,8 @@ The ordinary session warm-start entrypoint rejects same-run execution facts
 before executor wiring, including when a claim advanced the generation. It
 cannot replace execution authority/frontier validation with a fresh messaging
 owner. The recovery scanner continues to preserve and pause handoff custody;
-automatic reconstructed execution is not supplied by this contract.
+automatic reconstructed execution is not supplied by this contract; supported
+explicit resume uses the separate same-turn custody proof, not warm-start.
 
 Queued and delivery-unknown question outcomes contain the exact pending-reply
 identity, including the resolved responder even when the display target is

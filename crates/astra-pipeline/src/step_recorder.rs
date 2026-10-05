@@ -294,8 +294,33 @@ fn redact_pem_blocks(text: &mut String) -> usize {
     count
 }
 
-/// Records chat_stream execution as Step lifecycle events.
-/// Wraps the implicit state machine with explicit StepAction tracking.
+/// Recorder facts not already owned by the heavy checkpoint. A continuation
+/// carries neither historical events nor a second execution cursor.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettledRecorderContinuation {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    descriptor: StepDescriptor,
+    payload: StepPayload,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    result: Option<StepResult>,
+    status: StepStatus,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    started_at: Option<u64>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    completed_at: Option<u64>,
+    idempotency_key: String,
+    turn_number: u32,
+    round_index: u32,
+    step_sequence: u32,
+    current_step_sequence: u32,
+    slot_counter: u32,
+    tail_event_id: String,
+}
+
+/// Records execution as Step lifecycle events.
 pub struct StepRecorder {
     user_id: String,
     session_id: String,
@@ -354,10 +379,19 @@ impl StepRecorder {
         task_id: &str,
         run_id: &str,
     ) -> Self {
-        let file_store = FileBackedEventStore::empty(user_id, session_id);
         let persisted_summary = persisted_event_summary(user_id, session_id);
+        Self::with_persistent_summary(user_id, session_id, task_id, run_id, persisted_summary)
+    }
+
+    fn with_persistent_summary(
+        user_id: &str,
+        session_id: &str,
+        task_id: &str,
+        run_id: &str,
+        persisted_summary: PersistedEventSummary,
+    ) -> Self {
         Self {
-            file_store: Some(file_store),
+            file_store: Some(FileBackedEventStore::empty(user_id, session_id)),
             attach_persistence_on_session_adoption: false,
             persistence_required: true,
             invocation_run_id: Some(run_id.to_string()),
@@ -366,6 +400,177 @@ impl StepRecorder {
             persisted_tail_event_id: persisted_summary.tail_event_id,
             ..Self::new(user_id, session_id, task_id)
         }
+    }
+
+    pub fn capture_settled_continuation(
+        &self,
+        light: &LightCheckpoint,
+    ) -> Result<SettledRecorderContinuation, &'static str> {
+        let step = self
+            .current_step
+            .as_ref()
+            .ok_or("recorder has no active step")?;
+        let run_id = self
+            .invocation_run_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .ok_or("recorder has no execution identity")?;
+        if !self.persistence_required
+            || self.file_store.is_none()
+            || self.persistence_error.is_some()
+        {
+            return Err("recorder persistence is not confirmed");
+        }
+        if light.protocol_version != PROTOCOL_VERSION
+            || light.step_id != step.descriptor.step_id
+            || light.task_id != self.task_id
+            || light.cursor != step.execution.cursor
+            || !light.cursor.all_slots_done()
+        {
+            return Err("recorder and settled checkpoint frontier differ");
+        }
+        Ok(SettledRecorderContinuation {
+            user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            run_id: run_id.clone(),
+            descriptor: step.descriptor.clone(),
+            payload: step.execution.payload.clone(),
+            result: step.execution.result.clone(),
+            status: step.execution.status,
+            started_at: step.execution.started_at,
+            completed_at: step.execution.completed_at,
+            idempotency_key: step.idempotency_key.clone(),
+            turn_number: self.turn_number,
+            round_index: self.round_index,
+            step_sequence: self.step_sequence,
+            current_step_sequence: self
+                .current_step_sequence
+                .ok_or("recorder has no step sequence")?,
+            slot_counter: self.slot_counter,
+            tail_event_id: self
+                .events
+                .last()
+                .map(|event| event.event_id.clone())
+                .or_else(|| self.persisted_tail_event_id.clone())
+                .ok_or("recorder has no confirmed causal tail")?,
+        })
+    }
+
+    /// Rebuild observation state only; the caller must independently adopt the
+    /// checkpoint and authorize the current execution generation before dispatch.
+    pub fn restore_settled_continuation(
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        saved: SettledRecorderContinuation,
+        heavy: &HeavyCheckpoint,
+    ) -> Result<Self, &'static str> {
+        if saved.user_id != user_id || saved.session_id != session_id || saved.run_id != run_id {
+            return Err("recorder continuation belongs to another execution");
+        }
+        if heavy.light.protocol_version != PROTOCOL_VERSION
+            || saved.descriptor.protocol_version != PROTOCOL_VERSION
+            || saved.descriptor.step_id != heavy.light.step_id
+            || saved.descriptor.task_id != heavy.light.task_id
+            || saved.step_sequence <= saved.current_step_sequence
+            || saved.tail_event_id.is_empty()
+            || !heavy.light.cursor.all_slots_done()
+        {
+            return Err("recorder continuation has an invalid settled frontier");
+        }
+        let window = FileBackedEventStore::load_recent_events_bounded(
+            user_id,
+            session_id,
+            256 * 1024,
+            1_024,
+        )
+        .map_err(|_| "recorder successor evidence is unreadable")?;
+        let boundary = window
+            .events
+            .iter()
+            .position(|event| event.event_id == saved.tail_event_id);
+        let terminal_status = matches!(
+            saved.status,
+            StepStatus::Completed
+                | StepStatus::Failed
+                | StepStatus::TimedOut
+                | StepStatus::Cancelled
+        );
+        let terminal_event = boundary.is_some_and(|index| {
+            window.events[..=index].iter().any(|event| {
+                event.run_id == run_id
+                    && event.step_id == saved.descriptor.step_id
+                    && matches!(
+                        event.event_type,
+                        StepEventType::StepCompleted
+                            | StepEventType::StepIncomplete
+                            | StepEventType::StepFailed
+                    )
+            })
+        });
+        if saved.completed_at.is_none() && (terminal_status || terminal_event) {
+            return Err("terminal recorder continuation lacks its completion time");
+        }
+        if window.trailing_torn_line
+            || boundary.is_none()
+                && (!window.events.is_empty()
+                    || window.prefix_truncated
+                    || window.events_dropped > 0)
+            || boundary.is_some_and(|index| {
+                window.events[index + 1..]
+                    .iter()
+                    .any(|event| event.run_id == run_id)
+            })
+        {
+            return Err("recorder continuation is stale or its successor evidence is incomplete");
+        }
+        let mut recorder = Self::with_persistent_summary(
+            user_id,
+            session_id,
+            &heavy.light.task_id,
+            run_id,
+            PersistedEventSummary {
+                next_step_sequence: saved.step_sequence,
+                tail_event_id: Some(saved.tail_event_id.clone()),
+            },
+        );
+        recorder.current_step = Some(Step {
+            descriptor: saved.descriptor,
+            execution: StepExecution {
+                cursor: heavy.light.cursor.clone(),
+                payload: saved.payload,
+                result: saved.result,
+                status: saved.status,
+                memory_context: heavy.memory_context.clone(),
+                started_at: saved.started_at,
+                completed_at: saved.completed_at,
+            },
+            idempotency_key: saved.idempotency_key,
+            checkpoint: None,
+        });
+        recorder.turn_number = saved.turn_number;
+        recorder.round_index = saved.round_index;
+        recorder.step_sequence = saved.step_sequence;
+        recorder.current_step_sequence = Some(saved.current_step_sequence);
+        recorder.slot_counter = saved.slot_counter;
+        recorder.persisted_tail_event_id = Some(saved.tail_event_id);
+        Ok(recorder)
+    }
+
+    /// Pay for durability only at a handoff, never for every ordinary event.
+    pub async fn confirm_handoff_persistence(&self) -> Result<(), String> {
+        if !self.persistence_required
+            || self.file_store.is_none()
+            || self.persistence_error.is_some()
+        {
+            return Err("recorder persistence is not available for handoff".into());
+        }
+        let path = crate::step_checkpoint::events_path_for(&self.user_id, &self.session_id)
+            .map_err(|error| format!("recorder journal binding failed: {error}"))?;
+        tokio::task::spawn_blocking(move || FileBackedEventStore::sync_events(&path))
+            .await
+            .map_err(|error| format!("recorder durability task failed: {error}"))?
+            .map_err(|error| format!("recorder durability confirmation failed: {error}"))
     }
 
     /// Create an in-memory recorder whose events become durable once the
@@ -2537,6 +2742,141 @@ mod tests {
                 .get("step_sequence")
                 .and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn settled_continuation_restores_the_same_step_without_replaying_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let mut original =
+            StepRecorder::with_persistence_for_run(TEST_USER_ID, "restore-session", "task", "run");
+        original.begin_turn_with_context(7, 3);
+        original.begin_act_with_slots(vec![ExecutionSlotSpec {
+            tool_name: "read_file".into(),
+            call_id: "call-1".into(),
+            idempotency_key: None,
+            args_preview: None,
+        }]);
+        original.begin_tool_with_key("read_file", "call-1", None);
+        assert!(
+            original
+                .capture_settled_continuation(&original.build_light_checkpoint().unwrap())
+                .is_err()
+        );
+        original.complete_tool("read_file", false, 12, false);
+        original.record_verdict("continue", false, false, false, 0);
+        let unfinished_heavy = original
+            .build_heavy_checkpoint(&[], 100, 3, &[], &[])
+            .unwrap();
+        let unfinished = original
+            .capture_settled_continuation(&unfinished_heavy.light)
+            .unwrap();
+        assert!(unfinished.completed_at.is_none());
+        assert!(
+            StepRecorder::restore_settled_continuation(
+                TEST_USER_ID,
+                "restore-session",
+                "run",
+                unfinished,
+                &unfinished_heavy,
+            )
+            .is_ok(),
+            "settled tools do not imply the enclosing step has ended"
+        );
+        original.end_turn(false);
+        let heavy = original
+            .build_heavy_checkpoint(
+                &[serde_json::json!({"role":"user", "content":"Continue"})],
+                100,
+                3,
+                &[],
+                &[],
+            )
+            .unwrap();
+        let saved = original.capture_settled_continuation(&heavy.light).unwrap();
+        let serialized = serde_json::to_value(&saved).unwrap();
+        assert!(serialized.get("cursor").is_none());
+        assert!(serialized.get("events").is_none());
+        assert!(serialized.get("tool_timings").is_none());
+        assert!(serialized.get("phase_log").is_none());
+        for field in ["result", "started_at", "completed_at"] {
+            let mut missing = serialized.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<SettledRecorderContinuation>(missing).is_err());
+            let mut explicit_null = serialized.clone();
+            explicit_null[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<SettledRecorderContinuation>(explicit_null).is_ok());
+        }
+        let saved: SettledRecorderContinuation = serde_json::from_value(serialized).unwrap();
+        let tail = original.events().last().unwrap().event_id.clone();
+        let expected_step = serde_json::to_value(original.current_step()).unwrap();
+        for invalid in 0..4 {
+            let mut rejected = saved.clone();
+            match invalid {
+                0 => rejected.run_id = "another-run".into(),
+                1 => rejected.descriptor.step_id = "another-step".into(),
+                2 => rejected.step_sequence = rejected.current_step_sequence,
+                _ => rejected.completed_at = None,
+            }
+            assert!(
+                StepRecorder::restore_settled_continuation(
+                    TEST_USER_ID,
+                    "restore-session",
+                    "run",
+                    rejected,
+                    &heavy
+                )
+                .is_err()
+            );
+        }
+        let mut other = StepRecorder::with_persistence_for_run(
+            TEST_USER_ID,
+            "restore-session",
+            "other-task",
+            "other-run",
+        );
+        other.begin_turn(0);
+        other.end_turn(false);
+        let mut restored = StepRecorder::restore_settled_continuation(
+            TEST_USER_ID,
+            "restore-session",
+            "run",
+            saved.clone(),
+            &heavy,
+        )
+        .unwrap();
+        assert!(restored.events().is_empty());
+        assert_eq!(
+            serde_json::to_value(restored.current_step()).unwrap(),
+            expected_step
+        );
+        restored.end_turn(false);
+        assert!(
+            restored.events().is_empty(),
+            "already-settled step must not emit another terminal"
+        );
+        restored.begin_turn_with_context(7, 4);
+        let event = restored.events().last().unwrap();
+        assert_eq!(event.caused_by, vec![tail]);
+        assert_eq!(
+            event.payload.as_ref().unwrap()["trace_context"]["step_sequence"],
+            1
+        );
+        assert_ne!(
+            restored.current_step().unwrap().step_id(),
+            heavy.light.step_id
+        );
+        assert!(
+            StepRecorder::restore_settled_continuation(
+                TEST_USER_ID,
+                "restore-session",
+                "run",
+                saved,
+                &heavy,
+            )
+            .is_err(),
+            "same-run successor must make the old continuation stale"
         );
     }
 

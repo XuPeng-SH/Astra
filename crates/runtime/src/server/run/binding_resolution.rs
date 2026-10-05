@@ -221,6 +221,7 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
+        execution_authentication: request.execution_authentication.clone(),
         profile_authority: match request.admitted_agent_profiles.as_ref() {
             None => crate::orchestration::ParentProfileAuthority::Unbound,
             Some(snapshot) => match snapshot.lead_agent_id.as_ref() {
@@ -581,6 +582,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: None,
+            execution_authentication: None,
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
