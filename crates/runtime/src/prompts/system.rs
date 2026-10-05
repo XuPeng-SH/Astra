@@ -667,13 +667,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
             (true, true) => {
                 "Use visible `agent` with action=spawn, description, and prompt for each independent child; use `agent_fanout` with `defaults.agent_type=task` only for group-wide preflight or control"
             }
-            (true, false) => {
-                if tool_visible(tool_names, "tool_search") {
-                    "Use the visible `agent` schema directly for ordinary spawn, status, child messages, and results"
-                } else {
-                    "Use the visible `agent` schema directly for its permitted actions, including child messages and results when present"
-                }
-            }
+            (true, false) => "Use the visible `agent` schema directly for its permitted actions",
             (false, true) => {
                 "Use visible `agent_fanout` with `defaults.agent_type=task` for delegated executors"
             }
@@ -688,10 +682,10 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
 "         - Delegation fast path: when the user asks for a child and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. For absent actions or fields, follow the Tool Availability Protocol; never drop requested constraints. Default `agent_type` is bounded read-only `explore`; use `code-review` for review, `task`/`general-purpose` for mutation/full capabilities. For user model names, omit `requested_model_policy`: runtime admission resolves the authorized catalog; fixed selectors are programmatic. `model_catalog` serves requested availability/comparison, not a spawn prerequisite. Never select from workspace configuration/credentials or silently substitute unavailable/prohibited models.\n",
         );
         body.push_str(
-            "         - Spawn before task-specific checks; those belong to the child. Preserve user-assigned model/task pairs: parent work stays with the parent, never replaces child work. Use one child per objective; fanout is for group control, not duplication.\n",
+            "         - Spawn before child-specific checks. Preserve user-assigned model/task pairs: parent work stays with the parent, never replaces child work. One child per objective; fanout controls groups, not duplication.\n",
         );
         body.push_str(
-            "         - After spawn, continue only independent parent work needed for the user's request. Otherwise propose final without polling or shell sleep: the runtime waits for terminal results; synthesize when continuation is available. A get_result still-running snapshot is not failure.\n",
+            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. For a parent/peer decision, use `agent(send_message, message_type=question)` then wait; answer with the incoming `request_id`. Final prose is not a coordination message. A running snapshot is not failure.\n",
         );
     }
     if tool_visible(tool_names, "bash") {
@@ -1368,12 +1362,11 @@ mod tests {
         assert!(!agent_surface.contains("tool_search select:agent"));
         let agent_with_discovery = tool_conditional_section(&["agent", "tool_search"]);
         assert!(
-            agent_with_discovery.contains("ordinary spawn, status, child messages, and results")
+            agent_with_discovery
+                .contains("Use the visible `agent` schema directly for its permitted actions")
         );
-        assert!(agent_surface.contains("the runtime waits for terminal results"));
-        assert!(
-            agent_surface.contains("only independent parent work needed for the user's request")
-        );
+        assert!(agent_surface.contains("then await child results"));
+        assert!(agent_surface.contains("do independent requested work"));
         assert!(
             agent_with_discovery
                 .contains("the first native call is `agent(action=\"spawn\", ...)`")
@@ -1400,7 +1393,7 @@ mod tests {
         assert!(
             combined_surface.contains("the first native call is `agent(action=\"spawn\", ...)`")
         );
-        assert!(combined_surface.contains("fanout is for group control, not duplication"));
+        assert!(combined_surface.contains("fanout controls groups, not duplication"));
 
         let stable_work_surface = tool_conditional_section(&[
             "start_work",
@@ -1577,7 +1570,7 @@ mod tests {
         assert!(prompt.contains("runtime admission resolves the authorized catalog"));
         assert!(prompt.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(prompt.contains("when the user asks for a child"));
-        assert!(prompt.contains("Spawn before task-specific checks; those belong to the child"));
+        assert!(prompt.contains("Spawn before child-specific checks"));
         assert!(prompt.contains("Preserve user-assigned model/task pairs"));
         assert!(prompt.contains("parent work stays with the parent, never replaces child work"));
     }
@@ -1946,12 +1939,20 @@ mod tests {
     #[test]
     fn agent_guidance_without_discovery_uses_direct_authorized_schema() {
         let direct = tool_conditional_section(&["agent"]);
-        assert!(direct.contains("child messages and results when present"));
+        assert!(
+            direct.contains("Use the visible `agent` schema directly for its permitted actions")
+        );
+        assert!(direct.contains("message_type=question"));
+        assert!(direct.contains("answer with the incoming `request_id`"));
+        assert!(direct.contains("Final prose is not a coordination message"));
         assert!(!direct.contains("tool_search select:agent"));
         assert!(!direct.contains("select `agent` then use `invoke_tool`"));
 
         let discoverable = tool_conditional_section(&["agent", "tool_search"]);
-        assert!(discoverable.contains("ordinary spawn, status, child messages, and results"));
+        assert!(
+            discoverable
+                .contains("Use the visible `agent` schema directly for its permitted actions")
+        );
         assert!(discoverable.contains("all required arguments fit the visible schema"));
         assert!(
             discoverable
