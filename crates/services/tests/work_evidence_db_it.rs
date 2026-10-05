@@ -309,10 +309,18 @@ async fn check_admission_requires_an_explicit_revision_pinned_branch_basis() {
         WorkBranchRevision::new(3).expect("branch r3")
     );
     let replay = repository
-        .adopt_branch_basis(adoption)
+        .adopt_branch_basis(adoption.clone())
         .await
         .expect("exact adoption retry");
     assert_eq!(replay, adopted);
+    let mut conflicting = adoption;
+    conflicting.target_criteria_set_revision = CriterionSetRevision::INITIAL;
+    assert!(matches!(
+        repository.adopt_branch_basis(conflicting).await,
+        Err(WorkRepositoryError::Conflict {
+            resource: astra_services::work::WorkConflictResource::WorkEventIdentity
+        })
+    ));
     repository
         .record_check_run(candidate)
         .await

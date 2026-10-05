@@ -669,7 +669,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
             }
             (true, false) => {
                 if tool_visible(tool_names, "tool_search") {
-                    "Use the visible `agent` schema directly for ordinary spawn, status, child messages, and results; select `agent` then use `invoke_tool` only for an action or field absent from that resident schema"
+                    "Use the visible `agent` schema directly for ordinary spawn, status, child messages, and results"
                 } else {
                     "Use the visible `agent` schema directly for its permitted actions, including child messages and results when present"
                 }
@@ -680,7 +680,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
             (false, false) => unreachable!("task guidance requires an agent surface"),
         };
         body.push_str(&format!(
-            "         - `task` is an agent type, not a callable tool name. {surface_guidance}; use `start_work` for durable tracked outcomes. Never invent `task(...)` or use background task controls as the Work graph.\n"
+            "         - `task` is an agent type, not a callable tool name. {surface_guidance}; use `start_work` for durable tracked outcomes. Background task controls are not the Work graph. Child briefs preserve constraints and scope, whole-result format and alternatives; defer requested child choices only.\n"
         ));
     }
     if agent_visible {
@@ -1391,6 +1391,12 @@ mod tests {
         );
         assert!(!fanout_surface.contains("Use visible `agent` with action=spawn"));
         let combined_surface = tool_conditional_section(&["agent", "agent_fanout"]);
+        for surface in [&agent_surface, &fanout_surface, &combined_surface] {
+            assert!(surface.contains("preserve constraints and scope"));
+            assert!(surface.contains("whole-result format and alternatives"));
+            assert!(surface.contains("defer requested child choices only"));
+        }
+        assert!(!unbound.contains("Child briefs"));
         assert!(
             combined_surface.contains("the first native call is `agent(action=\"spawn\", ...)`")
         );
