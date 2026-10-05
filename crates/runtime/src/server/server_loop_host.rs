@@ -25513,6 +25513,11 @@ mod tests {
                 second.is_ok(),
                 "only one concurrent owner wins"
             );
+            let winner = if first.is_ok() {
+                "replay-test-owner-a"
+            } else {
+                "replay-test-owner-b"
+            };
             let adopted = first.or(second).unwrap();
             assert_eq!(adopted.receipt().producer_generation, 0);
             assert_eq!(adopted.run().events.len(), 1);
@@ -25646,26 +25651,27 @@ mod tests {
                 .unwrap();
             if generation < 4 {
                 assert!(
-                    store
-                        .update_run_status_with_events_if_current(
-                            &user,
-                            session,
-                            run_id,
-                            &[astra_core::STATUS_RUNNING],
-                            Some(generation),
-                            astra_core::STATUS_PAUSED,
-                            None,
-                            None,
-                            &[],
-                        )
+                    engine
+                        .park_resumed_execution(&adopted)
                         .await
                         .unwrap()
+                        .is_none(),
+                    "the previous owner cannot park the resumed execution"
                 );
-                assert!(
-                    store
-                        .release_owner_lease(&user, session, run_id, generation)
-                        .await
-                        .unwrap()
+                let winner_engine = crate::server::run::engine::RunEngine::new(Arc::new(
+                    astra_services::runs::DatabaseRunStateStore::new(pool.clone())
+                        .with_owner_pod_id(winner),
+                ));
+                let parked = winner_engine
+                    .park_resumed_execution(&adopted)
+                    .await
+                    .unwrap()
+                    .expect("the current owner must confirm checkpoint parking");
+                assert_eq!(parked.status, astra_core::STATUS_PAUSED);
+                assert_eq!(parked.run_generation, generation);
+                assert_eq!(
+                    parked.checkpoint_json.as_deref(),
+                    Some(checkpoint.checkpoint_json.as_str())
                 );
             }
         }
