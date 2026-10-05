@@ -3979,6 +3979,8 @@ pub(crate) struct RuntimeExecutionHandoff {
     pub(crate) heavy: astra_pipeline::step_protocol::HeavyCheckpoint,
     pub(crate) reservation: astra_turn_types::TurnReservationV1,
     pub(crate) continuation: astra_turn_types::ProviderCanonicalTransitionV2,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub(crate) execution_deadline: Option<astra_services::runs::ExecutionDeadlineSnapshot>,
 }
 
 fn validate_handoff_heavy(
@@ -18979,6 +18981,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 heavy,
                 reservation: context.reservation.clone(),
                 continuation: plan.transition,
+                execution_deadline: self.execution_time_budget.map(|deadline| deadline.snapshot()),
             },
         };
         let checkpoint_json =
@@ -24958,7 +24961,16 @@ mod tests {
                 .start_run("handoff-run", "handoff-user", "handoff-session")
                 .await
                 .unwrap();
-            let mut host = test_host_builder("handoff-user", "handoff-session").build();
+            let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 86_400,
+                },
+                1_000,
+            )
+            .unwrap();
+            let mut host = test_host_builder("handoff-user", "handoff-session")
+                .with_admitted_execution_deadline(Some(deadline))
+                .build();
             let mut state = create_test_state();
             state.current_run_id = Some("handoff-run".into());
             state.canonical_turn_chain_id = chain.map(str::to_owned);
@@ -25039,15 +25051,38 @@ mod tests {
                 "an unresolved delivery lease must not replace the settled checkpoint",
             );
             state.restore_volatile_attempt_lease();
-            let astra_services::runs::DurableExecutionHandoff::V1 { heavy: payload, .. } =
-                serde_json::from_str::<
+            let mut wire: serde_json::Value = serde_json::from_str(&saved.checkpoint_json).unwrap();
+            let deadline_field = wire["heavy"]
+                .as_object_mut()
+                .unwrap()
+                .remove("execution_deadline")
+                .unwrap();
+            assert!(
+                serde_json::from_value::<
                     astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
-                >(&saved.checkpoint_json)
+                >(wire.clone())
+                .is_err(),
+                "missing deadline authority must not silently become an unbounded grant",
+            );
+            wire["heavy"]["execution_deadline"] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<
+                    astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
+                >(wire.clone())
+                .is_ok(),
+                "an explicit unbounded grant remains representable",
+            );
+            wire["heavy"]["execution_deadline"] = deadline_field;
+            let astra_services::runs::DurableExecutionHandoff::V1 { heavy: payload, .. } =
+                serde_json::from_value::<
+                    astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
+                >(wire)
                 .unwrap();
             assert_eq!(
                 matches!(payload.tool_ledger, ToolLedgerContinuation::Bound { .. }),
                 accounting_available
             );
+            assert_eq!(payload.execution_deadline, Some(deadline.snapshot()));
             payload
                 .hooks
                 .clone()

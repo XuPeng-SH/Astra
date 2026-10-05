@@ -137,7 +137,12 @@ parent loop alive does not meet the multi-session scale target.
 
 The staged shared observer does not yet satisfy this whole invariant: parent
 parking, durable same-run continuation, and automatic re-admission remain
-required before claiming scale for 1,000 waiting parents. Current recovery
+required before claiming scale for 1,000 waiting parents. The execution handoff
+preserves the original absolute work and total deadlines; restoring those
+cutoffs must use the current wall clock, not grant another remaining-duration
+budget or recompute the synthesis reserve. This deadline snapshot is not an
+executable continuation or evidence of released admission capacity.
+Current recovery
 also fails explicitly when one selected set exceeds 1,024 exact IDs or its
 event projection exceeds 2,048 rows, 16 MiB total, or 2 MiB per event. These
 limits prevent silent omission and unbounded loading; they are not a substitute

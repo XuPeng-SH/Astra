@@ -416,6 +416,15 @@ pub struct ExecutionTimeBudget {
     pub remaining_seconds: u64,
 }
 
+/// Frozen wall-clock cutoffs; process-local monotonic instants are not durable.
+/// Restoration must preserve both phases, including an already expired work window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDeadlineSnapshot {
+    pub deadline_unix_ms: u64,
+    pub work_deadline_unix_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionDeadlineAuthority {
     pub deadline_unix_ms: u64,
@@ -433,15 +442,41 @@ impl ExecutionDeadlineAuthority {
             .ok_or_else(|| "execution time budget exceeds supported deadline range".to_string())?;
         let available = Duration::from_secs(budget.remaining_seconds);
         let reserve = astra_turn_types::final_synthesis_reserve(available);
-        let monotonic_deadline = tokio::time::Instant::now()
-            .into_std()
-            .checked_add(available)
-            .ok_or_else(|| "execution time budget exceeds monotonic clock range".to_string())?;
+        Self::from_snapshot_at(
+            ExecutionDeadlineSnapshot {
+                deadline_unix_ms,
+                work_deadline_unix_ms: deadline_unix_ms - reserve.as_millis() as u64,
+            },
+            now_unix_ms,
+        )
+    }
+
+    pub fn snapshot(self) -> ExecutionDeadlineSnapshot {
+        ExecutionDeadlineSnapshot {
+            deadline_unix_ms: self.deadline_unix_ms,
+            work_deadline_unix_ms: self.work_deadline_unix_ms,
+        }
+    }
+
+    /// Re-anchor the same absolute cutoffs to this process's monotonic clock.
+    /// Never turn a remaining duration into a new grant or synthesis reserve.
+    pub fn from_snapshot_at(
+        snapshot: ExecutionDeadlineSnapshot,
+        now_unix_ms: u64,
+    ) -> Result<Self, String> {
+        if snapshot.work_deadline_unix_ms > snapshot.deadline_unix_ms {
+            return Err("execution work cutoff exceeds total cutoff".into());
+        }
+        let now = tokio::time::Instant::now().into_std();
+        let anchor = |cutoff: u64| {
+            now.checked_add(Duration::from_millis(cutoff.saturating_sub(now_unix_ms)))
+                .ok_or_else(|| "execution time budget exceeds monotonic clock range".to_string())
+        };
         Ok(Self {
-            deadline_unix_ms,
-            work_deadline_unix_ms: deadline_unix_ms - reserve.as_millis() as u64,
-            monotonic_deadline,
-            monotonic_work_deadline: monotonic_deadline - reserve,
+            deadline_unix_ms: snapshot.deadline_unix_ms,
+            work_deadline_unix_ms: snapshot.work_deadline_unix_ms,
+            monotonic_deadline: anchor(snapshot.deadline_unix_ms)?,
+            monotonic_work_deadline: anchor(snapshot.work_deadline_unix_ms)?,
         })
     }
 
@@ -26870,6 +26905,51 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn execution_deadline_checkpoint_does_not_renew_expired_work_or_total_time() {
+        let admitted = super::ExecutionDeadlineAuthority::from_budget_at(
+            super::ExecutionTimeBudget {
+                remaining_seconds: 86_400,
+            },
+            1_000,
+        )
+        .unwrap();
+        let snapshot = admitted.snapshot();
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        let snapshot: super::ExecutionDeadlineSnapshot = serde_json::from_str(&wire).unwrap();
+        let mut previous_now_ms = 1_000;
+        for now_ms in [
+            snapshot.work_deadline_unix_ms,
+            snapshot.deadline_unix_ms + 1,
+        ] {
+            tokio::time::advance(std::time::Duration::from_millis(now_ms - previous_now_ms)).await;
+            previous_now_ms = now_ms;
+            let restored =
+                super::ExecutionDeadlineAuthority::from_snapshot_at(snapshot, now_ms).unwrap();
+            assert_eq!(restored.snapshot(), snapshot);
+            let remaining = restored.remaining_at(tokio::time::Instant::now().into_std());
+            assert_eq!(
+                remaining,
+                admitted.remaining_at(tokio::time::Instant::now().into_std())
+            );
+            assert_eq!(remaining.work_remaining, std::time::Duration::ZERO);
+            assert_eq!(
+                remaining.total_remaining,
+                std::time::Duration::from_millis(snapshot.deadline_unix_ms.saturating_sub(now_ms))
+            );
+            assert!(
+                restored
+                    .child_with_delivery_grace(std::time::Duration::from_secs(1))
+                    .is_none()
+            );
+        }
+        let invalid = super::ExecutionDeadlineSnapshot {
+            work_deadline_unix_ms: snapshot.deadline_unix_ms + 1,
+            ..snapshot
+        };
+        assert!(super::ExecutionDeadlineAuthority::from_snapshot_at(invalid, 1_000).is_err());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn execution_deadline_uses_one_clock_for_creation_observation_and_children() {
         let zero = super::ExecutionDeadlineAuthority::from_budget_at(
