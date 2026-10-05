@@ -1340,10 +1340,12 @@ impl BottomPane {
             return;
         }
 
-        // Slash menu: open whenever the first line starts with '/'. Empty
-        // matches still keep the menu open so users see a "no matches"
-        // message rather than silent closure.
-        if self.view_stack.is_empty() && is_open_for(&text) && !self.slash_items.is_empty() {
+        // Completion owns command names, never their arguments. Otherwise
+        // selecting a menu item would discard the user's remaining input.
+        if self.view_stack.is_empty()
+            && is_open_for(&text, &self.slash_items)
+            && !self.slash_items.is_empty()
+        {
             self.close_mention();
             self.skill_popup = None;
             match self.slash_menu.as_mut() {
@@ -2006,6 +2008,11 @@ impl BottomPane {
                 Some(BottomPaneAction::Consumed)
             }
             KeyCode::Char(digit) if key.modifiers.is_empty() && digit.is_ascii_digit() => {
+                let mut prospective = self.composer.text();
+                prospective.insert(self.composer.cursor_byte(), digit);
+                if !is_open_for(&prospective, &self.slash_items) {
+                    return None;
+                }
                 if let Some(index) = digit.to_digit(10) {
                     if index > 0 {
                         if self
