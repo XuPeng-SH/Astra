@@ -150,7 +150,7 @@ impl PtyAstra {
         self.writer.flush().expect("flush PTY input");
     }
 
-    fn paste_and_submit(&mut self, text: &str, timeout: Duration) {
+    fn paste_and_submit(&mut self, text: &str) {
         // The journey is injecting a whole message, not simulating a human
         // typing one character at a time. Use the terminal's bracketed-paste
         // protocol so the application receives the same typed event as a
@@ -160,30 +160,8 @@ impl PtyAstra {
         self.write(b"\x1b[200~");
         self.write(text.as_bytes());
         self.write(b"\x1b[201~");
-        // Long pastes scroll the composer; its visible suffix confirms delivery.
-        let suffix = text.chars().rev().take(120).collect::<Vec<_>>();
-        let expected = suffix
-            .into_iter()
-            .rev()
-            .filter(|character| !character.is_whitespace())
-            .collect::<String>();
-        let deadline = Instant::now() + timeout;
-        loop {
-            let visible = self
-                .current_screen()
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect::<String>();
-            if visible.contains(&expected) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "composer did not accept {text:?}\n{}",
-                self.screen_diagnostic()
-            );
-            self.receive(Duration::from_millis(25));
-        }
+        // Terminal input is ordered. Submit after the paste terminator and let
+        // callers wait for the actual effect, not its possibly folded rendering.
         self.write(b"\r");
     }
 
@@ -522,14 +500,14 @@ async fn team_roster_editor_opens_cancels_and_saves_through_the_real_tty() {
     let mut astra = PtyAstra::spawn(home.path(), &server.uri());
     astra.wait_for("Message Astra", Duration::from_secs(15));
     for (name, save) in [("Unsaved rename", false), ("Reviewed 团队", true)] {
-        astra.paste_and_submit("/team", UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit("/team");
         astra.wait_for("Teams · configuration", UI_TRANSITION_TIMEOUT);
         astra.write(b"\r");
         astra.wait_for("E edit roster", UI_TRANSITION_TIMEOUT);
         astra.write(b"e\r");
         astra.wait_for("Edit team name", UI_TRANSITION_TIMEOUT);
         astra.write(&[0x15]);
-        astra.paste_and_submit(name, UI_TRANSITION_TIMEOUT);
+        astra.paste_and_submit(name);
         astra.wait_for("Ctrl+S save", UI_TRANSITION_TIMEOUT);
         if save {
             astra.write(&[0x13]);
@@ -556,14 +534,14 @@ async fn team_roster_editor_opens_cancels_and_saves_through_the_real_tty() {
             "Cancel is local; Save writes once"
         );
     }
-    astra.paste_and_submit("/team create NewTeam", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/team create NewTeam");
     astra.wait_for("NewTeam · Draft", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x13]);
     astra.wait_for("Saved.", UI_TRANSITION_TIMEOUT);
     astra.wait_for("NewTeam · Revision 1", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b");
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
-    astra.paste_and_submit("/exit", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/exit");
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
     let requests = server.received_requests().await.unwrap();
     let update: serde_json::Value = requests
@@ -681,7 +659,11 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"hold this turn open\r");
+    let message = format!(
+        "{}\nHold this turn open.",
+        "保留原文，不提交折叠标签。".repeat(100)
+    );
+    astra.paste_and_submit(&message);
 
     // Synchronize on the request reaching the provider. A transient activity
     // label is presentation state, not proof that the turn is still live; on
@@ -696,10 +678,11 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
         astra.receive(Duration::from_millis(25));
         tokio::task::yield_now().await;
     }
+    assert_eq!(mock.received_requests()[0]["message"], message);
     // This goes through the real active-turn select, not an isolated reducer.
     // The provider cannot finish until explicitly released below. A completed
     // concurrent read must therefore open its browser while the turn is pending.
-    astra.paste_and_submit("/team", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/team");
     astra.wait_for("Teams · configuration", UI_TRANSITION_TIMEOUT);
     assert_eq!(team_reads.load(Ordering::SeqCst), 1);
     astra.write(b"\r");
@@ -718,7 +701,7 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
     );
     astra.write(b"\x1b");
     astra.wait_for_absent("Teams · configuration", UI_TRANSITION_TIMEOUT);
-    astra.paste_and_submit("/session", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/session");
     astra.wait_for("Session ·", UI_TRANSITION_TIMEOUT);
     astra.wait_for("session id", UI_TRANSITION_TIMEOUT);
     assert_eq!(
@@ -1185,8 +1168,8 @@ async fn assert_live_team_round(
             .enumerate()
             .filter_map(|(index, end)| {
                 if end["type"] != "tool_call_end"
-                    || end["status"] != "completed"
                     || end["success"] != true
+                    || end["transport"] != "server_local"
                 {
                     return None;
                 }
@@ -1197,9 +1180,11 @@ async fn assert_live_team_round(
                     .iter()
                     .enumerate()
                     .find(|(_, event)| {
-                        event["type"] == "tool_call_start"
+                        event["type"] == "tool_transport_started"
                             && event["call_id"] == end["call_id"]
                             && event["tool"] == tool
+                            && event["run_id"] == root_id
+                            && event["transport"] == "server_local"
                     })
                     .expect("Server Work terminal has its exact start");
                 assert!(start_index < index);
@@ -1302,7 +1287,7 @@ async fn assert_live_team_round(
         .json()
         .await
         .unwrap();
-    assert_eq!(graph["schema_version"], 1);
+    assert_eq!(graph["schema_version"], 2);
     assert_eq!(graph["scope"], "declared_work");
     assert!(graph["next_cursor"].is_null());
     assert_eq!(graph["basis"]["work_id"], work_id);
@@ -1475,7 +1460,7 @@ async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restar
     let task = format!(
         "/team run {team_name} --lead-agent-id lead \"Use durable Work for exactly two independently useful deliverables. A: builder reads customers.csv and writes customer_master.json with version=1 and customers sorted by id, each containing id, name and numeric credit_limit. Keep the first row for each customer id. B depends on completed A: reviewer independently reads invoices.csv and customer_master.json and writes invoice_exceptions.json with version=1, exceptions sorted by invoice_id, and total_amount summing exceptions. Each exception contains invoice_id, customer_id, numeric amount and reason: unknown_customer for missing customer or over_credit_limit for amount strictly above the limit. Do not report ordinary invoices. Give helpers the descriptions CSV builder and CSV reviewer, in that order. Helpers produce artifacts without Work item assignments; you own the primary tasks and settle each observed delivery. Do not invent file results.\""
     );
-    astra.paste_and_submit(&task, UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit(&task);
     let session_id = wait_for_live_session_id(&mut astra, home.path());
     let first_root = assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 1).await;
     assert_live_work_artifacts(home.path(), 1);
@@ -1492,9 +1477,9 @@ async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restar
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
     let mut astra = PtyAstra::spawn_with_config(home.path(), &api, &model, &token, &["--yes"]);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.paste_and_submit(&format!("/resume {session_id}"), UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit(&format!("/resume {session_id}"));
     astra.wait_for("Resumed", Duration::from_secs(30));
-    astra.paste_and_submit("Change the duplicate rule to keep the last customer row. Inspect and revise the existing two Work items together, keeping their identities and dependency. Use the same builder then reviewer to deliver version=2 of customer_master.json and invoice_exceptions.json with the same schemas. Recompute invoice exceptions against the revised credit limits. Each member must read its existing output before rewriting it. Settle both new primary attempts; do not create another Work.", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Change the duplicate rule to keep the last customer row. Inspect and revise the existing two Work items together, keeping their identities and dependency. Use the same builder then reviewer to deliver version=2 of customer_master.json and invoice_exceptions.json with the same schemas. Recompute invoice exceptions against the revised credit limits. Each member must read its existing output before rewriting it. Settle both new primary attempts; do not create another Work.");
     let second_root =
         assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 2).await;
     assert_ne!(first_root.root_id, second_root.root_id);
@@ -1601,10 +1586,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.paste_and_submit(
-        "delegate_one_child_and_keep_it_observable",
-        UI_TRANSITION_TIMEOUT,
-    );
+    astra.paste_and_submit("delegate_one_child_and_keep_it_observable");
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
