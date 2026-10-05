@@ -25658,10 +25658,12 @@ mod tests {
                         .is_none(),
                     "the previous owner cannot park the resumed execution"
                 );
-                let winner_engine = crate::server::run::engine::RunEngine::new(Arc::new(
+                let winner_store = Arc::new(
                     astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                         .with_owner_pod_id(winner),
-                ));
+                );
+                let winner_engine =
+                    crate::server::run::engine::RunEngine::new(winner_store.clone());
                 let parked = winner_engine
                     .park_resumed_execution(&adopted)
                     .await
@@ -25672,6 +25674,14 @@ mod tests {
                 assert_eq!(
                     parked.checkpoint_json.as_deref(),
                     Some(checkpoint.checkpoint_json.as_str())
+                );
+                // Production heartbeat releases this lease after confirmed
+                // parking. This fixture owns the pod without a heartbeat.
+                assert!(
+                    winner_store
+                        .release_owner_lease(&user, session, run_id, generation)
+                        .await
+                        .unwrap()
                 );
             }
         }
