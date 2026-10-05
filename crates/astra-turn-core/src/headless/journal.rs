@@ -11,9 +11,13 @@ pub fn journal_record_edge_tool_result(
     result: &crate::sse_stream_host::EdgeToolExecResult,
 ) -> ToolCallRecord {
     let args = result.args.to_string();
+    let content = crate::edge_ledger::tool_content_from_callback_output(
+        &result.status,
+        result.output.clone(),
+    );
     let output = crate::tool_result_sanitize::tool_result_content_for_model_unbounded(
         &result.tool,
-        &result.output,
+        &content,
     );
     let mut record = journal_record_executed_tool_call(
         result.tool.clone(),
@@ -441,6 +445,57 @@ fn bounded_journal_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_audit_matches_remote_content_for_each_terminal_status() {
+        for (status, output, expected, failed) in [
+            ("completed", "read result", "read result", false),
+            (
+                "failed",
+                "Denied by policy",
+                "status=failed\nDenied by policy",
+                true,
+            ),
+            ("cancelled", "Stopped", "status=cancelled\nStopped", true),
+            (
+                "failed",
+                r#"{"error":"denied"}"#,
+                r#"{"error":"denied"}"#,
+                true,
+            ),
+            ("failed", "", r#"{"status":"failed"}"#, true),
+        ] {
+            let result = crate::sse_stream_host::EdgeToolExecResult {
+                request_id: "call-1".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "document.txt"}),
+                output: output.into(),
+                status: status.into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+                execution_completion: None,
+            };
+            let local = journal_record_edge_tool_result(&result);
+            let remote_content = crate::edge_ledger::tool_content_from_ledger_entry(
+                &serde_json::json!({"body": {"status": status, "output": output}}),
+            );
+            let remote = journal_record_executed_tool_call(
+                "read_file".into(),
+                failed,
+                1,
+                0,
+                &remote_content,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(local.result_full.as_deref(), Some(expected));
+            assert_eq!(local.result_full, remote.result_full);
+            assert_eq!(local.error, remote.error);
+            assert_eq!(local.ok, !failed);
+            assert_eq!(local.tool_call_id.as_deref(), Some("call-1"));
+        }
+    }
 
     #[test]
     fn duplicate_record_fields() {
