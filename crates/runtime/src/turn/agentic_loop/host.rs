@@ -2039,8 +2039,6 @@ pub struct StallTrackingState {
     pub active_work_registry: Option<std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>>,
     /// Per-turn tool-call dedup signatures.
     pub turn_sigs: Vec<BTreeSet<astra_turn_core::stall::StallSignature>>,
-    /// Per-turn tool name sets.
-    pub turn_tool_names: Vec<HashSet<String>>,
     /// Stall events: `(description, turn_number)`.
     pub events: Vec<(String, u32)>,
     /// Verdict audit trail.
@@ -10436,9 +10434,8 @@ pub(crate) mod tests {
         let mut state = make_state();
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-        // turn_sigs and turn_tool_names should have entries from both tool turns
+        // Canonical signatures should have entries from both tool turns.
         assert!(state.stall.turn_sigs.len() >= 2);
-        assert!(state.stall.turn_tool_names.len() >= 2);
     }
 
     // ── Edge case: has_any_usage tracking ───────────────────────────────────

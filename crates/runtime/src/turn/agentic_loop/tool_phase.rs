@@ -2158,7 +2158,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             &attempted_logical_calls,
             &turn_result.edge_tool_round,
             &mut state.stall.turn_sigs,
-            &mut state.stall.turn_tool_names,
             &mut state.stall.events,
             &mut state.turn_guard,
         );
