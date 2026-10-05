@@ -26760,17 +26760,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         &PreparedRuntimeCapabilities::default(),
         Some(3),
     );
-    let mut state = svc.assemble_loop_state(
-        "test-user",
-        &request,
-        "same-session",
-        "same-run",
-        constraints,
-        &edge,
-        None,
-        environment,
-        facts,
-    );
+    let mut state = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
     assert_eq!(state.evaluation_thresholds.search_fanout, 37);
     assert_eq!(state.messages, messages);
     assert_eq!(state.message, "original task");
@@ -26893,28 +26883,46 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
 }
 
 #[test]
-fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
+fn shared_child_assembly_preserves_restored_identity_budget_and_workspace_evidence() {
     let svc = test_service();
     let request = test_request("continue the original turn");
     let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
     let constraints = RequestConstraints::default();
-    let mut facts = svc
-        .prepare_initial_execution_facts(
-            "user",
-            &request,
-            "session",
-            "run",
-            None,
-            &edge,
-            &constraints,
-        )
-        .unwrap();
+    let profile = subrun_task_profile_for_workspace_intent(
+        &request.message,
+        astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+    );
+    let mut facts = LoopExecutionFacts::initial(
+        request.message.clone(),
+        request.message.clone(),
+        None,
+        profile,
+        profile.agentic_turn_budget,
+        true,
+        8192,
+        None,
+        &constraints,
+        astra_config::RuntimeConfig::load().tool_policy,
+        StopHookState::default(),
+        Default::default(),
+        Default::default(),
+        StepRecorder::with_persistence_for_run("user", "session", "run", "run"),
+    );
+    assert_ne!(
+        profile,
+        astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default()
+    );
+    assert_eq!(*facts.original.turn_guard.task_profile(), profile);
     facts.hooks.workspace_root_hint = Some("/app".into());
     facts.original.canonical_turn_chain_id = Some("chain".into());
+    facts.remaining_turns = 1;
+    facts.charged_iterations = 4;
+    facts.original.llm_rounds_completed = 4;
+    facts.original.total_completion = 117;
     facts.stall.verification_frontier =
         crate::turn::agentic_loop::verification_frontier::tests::restored_workspace_barrier();
     assert!(facts.stall.tool_call_records.is_empty());
-    let environment = svc.assemble_loop_environment(
+    let mut environment = svc.assemble_loop_environment(
         "user",
         &request,
         "session",
@@ -26929,17 +26937,26 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
         &PreparedRuntimeCapabilities::default(),
         Some(3),
     );
-    let state = svc.assemble_loop_state(
-        "user",
-        &request,
-        "session",
-        "run",
-        constraints,
-        &edge,
-        None,
-        environment,
-        facts,
+    environment.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
+    environment.agent_id = "configured-member".into();
+    environment.model_name = Some("member-model".into());
+    let state = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
+    assert_eq!(state.self_agent_id, "configured-member");
+    assert_eq!(state.current_run_id.as_deref(), Some("run"));
+    assert_eq!(state.context_manifest_user_id.as_deref(), Some("user"));
+    assert_eq!(
+        state.context_manifest_model_name.as_deref(),
+        Some("member-model")
     );
+    assert_eq!(
+        state.inference_purpose,
+        astra_turn_types::InferencePurpose::SubAgent
+    );
+    assert_eq!(state.remaining_turns, 1);
+    assert_eq!(state.charged_iterations, 4);
+    assert_eq!(state.llm_rounds_completed, 4);
+    assert_eq!(state.total_completion, 117);
+    assert_eq!(*state.turn_guard.task_profile(), state.task_profile);
     assert!(state.stall.tool_call_records.is_empty());
     assert_eq!(state.hooks.workspace_root_hint.as_deref(), Some("/app"));
     assert_eq!(

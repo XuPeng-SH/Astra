@@ -17,6 +17,7 @@ pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
 pub(crate) mod task_detail_view;
+pub(crate) mod team_editor_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;
@@ -768,6 +769,47 @@ impl BottomPane {
             self.conversation_tab_order.push(tab_id);
         }
         self.view_stack.push(view);
+    }
+
+    pub(crate) fn team_editor_pending(
+        &self,
+        request: &team_editor_view::TeamEditorRequest,
+    ) -> bool {
+        self.view_stack
+            .iter()
+            .any(|view| view.team_editor_pending(request))
+    }
+
+    pub(crate) fn update_team_editor(&mut self, update: &team_editor_view::TeamEditorUpdate) {
+        let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|view| view.team_editor_pending(&update.request))
+        else {
+            return;
+        };
+        let picker = self.view_stack[index].update_team_editor(update);
+        // A background catalog must not cover an approval or another focused
+        // view. Its owner retains the draft even when the picker is dismissed.
+        if let Some(picker) = picker
+            && index + 1 == self.view_stack.len()
+        {
+            self.push_view(picker);
+        }
+    }
+
+    pub(crate) fn select_team_member_model(
+        &mut self,
+        target: &team_editor_view::TeamEditorTarget,
+        operation_id: u64,
+        agent_id: &str,
+        selection: Option<astra_turn_types::ModelSelection>,
+    ) {
+        for view in self.view_stack.iter_mut().rev() {
+            if view.select_team_member_model(target, operation_id, agent_id, selection.clone()) {
+                break;
+            }
+        }
     }
 
     pub fn enqueue_ask_user(

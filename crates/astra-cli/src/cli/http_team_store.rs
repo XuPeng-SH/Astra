@@ -159,6 +159,48 @@ impl HttpTeamStore {
             .filter(|id| !id.trim().is_empty())
     }
 
+    /// UI attachment check only; credentials still come exclusively from the
+    /// captured owner at dispatch. This never loads or re-captures a profile.
+    pub(crate) fn is_attached_owner(&self) -> bool {
+        self.owner_account_id().is_some()
+            && self.owner.owner_scope == astra_services::local_owner_scope()
+            && match (
+                &self.owner.native_binding,
+                crate::cli::native_auth::active(),
+            ) {
+                (Some(bound), Some(active)) => std::sync::Arc::ptr_eq(bound, &active),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    async fn access_token(&self) -> Result<String, TeamHttpError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(TEAM_HTTP_TIMEOUT_SECS),
+            crate::cli::session::session_runtime::owner_access_token(&self.api, &self.owner),
+        )
+        .await
+        .ok()
+        .flatten()
+        .ok_or(TeamHttpError::AuthenticationRequired)
+    }
+
+    pub(crate) async fn model_catalog(
+        &self,
+    ) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
+        let token = self
+            .access_token()
+            .await
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(TEAM_HTTP_TIMEOUT_SECS),
+            crate::cli::session::session_runtime::fetch_model_catalog(&self.api, Some(&token)),
+        )
+        .await
+        .map_err(|_| "Model catalog request timed out".to_string())?
+        .map_err(|error| error.to_string())
+    }
+
     fn require_owner(&self, requested: &str) -> Result<&str, TeamHttpError> {
         self.owner_account_id()
             .filter(|owner| requested.is_empty() || requested == *owner)
@@ -173,14 +215,7 @@ impl HttpTeamStore {
     ) -> Result<T, TeamHttpError> {
         // This bounds Team pre-delivery waiting, not the auth owner's in-flight
         // rotation settlement. No Team request is sent if credential wait ends.
-        let token = tokio::time::timeout(
-            std::time::Duration::from_secs(TEAM_HTTP_TIMEOUT_SECS),
-            crate::cli::session::session_runtime::owner_access_token(&self.api, &self.owner),
-        )
-        .await
-        .ok()
-        .flatten()
-        .ok_or(TeamHttpError::AuthenticationRequired)?;
+        let token = self.access_token().await?;
         let response = request
             .bearer_auth(token)
             .timeout(std::time::Duration::from_secs(TEAM_HTTP_TIMEOUT_SECS))

@@ -4759,8 +4759,113 @@ struct LoopExecutionFacts {
     step_recorder: StepRecorder,
 }
 
+impl LoopExecutionFacts {
+    /// Fresh admission only. Recovery supplies validated captured facts instead;
+    /// it must never call this initializer to replace consumed execution state.
+    fn initial(
+        message: String,
+        user_intent: String,
+        turn_intent: Option<astra_config::user_profile::TurnIntent>,
+        task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+        agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
+        budget_is_explicit: bool,
+        max_turn_input_tokens: u64,
+        canonical_turn_chain_id: Option<String>,
+        request_constraints: &RequestConstraints,
+        admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
+        hooks: StopHookState,
+        tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
+        session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
+        step_recorder: StepRecorder,
+    ) -> Self {
+        let max_turns = agentic_turn_budget.initial_turns;
+        Self {
+            messages: vec![json!({"role": "user", "content": message})],
+            tool_ledger_receipt: Default::default(),
+            max_turns,
+            remaining_turns: max_turns,
+            charged_iterations: 0,
+            original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts {
+                evaluation_thresholds:
+                    crate::turn::runtime_policy::evaluation_thresholds_from_policy(
+                        &admitted_tool_policy,
+                    ),
+                pending_context: Vec::new(),
+                context_compression_triggered: false,
+                skill_execution: Default::default(),
+                runtime_policy_evaluation: Default::default(),
+                turn_guard: astra_turn_core::turn_guard::TurnGuard::with_profile(task_profile),
+                message,
+                user_intent,
+                delegated_model_requirements: request_constraints
+                    .delegated_model_requirements
+                    .clone(),
+                turn_intent,
+                task_profile,
+                session_turn: 0,
+                canonical_turn_chain_id,
+                root_user_query_event_id: None,
+                total_prompt: 0,
+                total_completion: 0,
+                total_cache_read: 0,
+                total_cache_creation: 0,
+                total_tool_calls: 0,
+                total_observation_tool_calls: 0,
+                has_any_usage: false,
+                qualified_usage: None,
+                last_request_usage: None,
+                agentic_turn_budget,
+                budget_is_explicit,
+                budget_policy: None,
+                loop_entry: Default::default(),
+                current_round_index: 0,
+                llm_rounds_completed: 0,
+                last_request_message_count: None,
+                max_turn_input_tokens,
+                last_finish_reason: None,
+                final_text: String::new(),
+                final_text_model_item_id: None,
+                final_text_streamed: false,
+                final_output_ready_notified: false,
+                error_recovery: Default::default(),
+                provider_adaptation: Default::default(),
+                skill_produced_output: false,
+            },
+            stall: crate::turn::agentic_loop::host::StallTrackingState {
+                circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+                    crate::turn::runtime_policy::circuit_breaker_config_from_tool_policy(
+                        &admitted_tool_policy,
+                    ),
+                ),
+                ..Default::default()
+            },
+            admitted_tool_policy,
+            user_intents: Default::default(),
+            hooks,
+            tool_event_hooks,
+            session_event_hooks,
+            budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
+            step_recorder,
+        }
+    }
+}
+
 /// Process-local dependencies, never serialized as execution continuation.
 struct LoopEnvironment {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    agent_id: String,
+    model_name: Option<String>,
+    shared_pool: Option<SharedPool>,
+    thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    compact_strategy: astra_turn_core::microcompact::CompactStrategy,
+    inference_purpose: astra_turn_types::InferencePurpose,
+    request_constraints: RequestConstraints,
+    client_pipeline_skill_names: HashSet<String>,
+    listing_message: Option<Value>,
     skill_registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     skill_executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
@@ -12825,6 +12930,43 @@ impl AgenticRunLifecycleService {
             harness_sink_arc.as_ref(),
         );
         LoopEnvironment {
+            user_id: user_id.to_owned(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            agent_id: request
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "root-agent".into()),
+            model_name: request.model.clone(),
+            shared_pool: self.shared_pool.clone(),
+            thinking: Self::root_generation_controls(request)
+                .expect("generation controls validated during request admission")
+                .thinking,
+            compact_strategy: request
+                .admitted_model_execution
+                .as_ref()
+                .map(|execution| {
+                    crate::turn::llm::context::compact_strategy_from_model_metadata(
+                        execution.cache_capability,
+                        &execution.provider,
+                    )
+                })
+                .unwrap_or_default(),
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            request_constraints: request_constraints.clone(),
+            client_pipeline_skill_names: edge_context
+                .edge_skills
+                .iter()
+                .filter(|skill| Self::edge_skill_is_allowed(skill, request_constraints))
+                .flat_map(|skill| {
+                    std::iter::once(skill.name.clone()).chain(skill.aliases.iter().cloned())
+                })
+                .map(|name| name.trim().to_ascii_lowercase())
+                .collect(),
+            listing_message: prepared_capabilities
+                .agent_binding
+                .as_ref()
+                .map(|context| json!({ "role": "system", "content": context.prompt_section })),
             skill_registry,
             skill_resolver,
             skill_executor,
@@ -12921,17 +13063,7 @@ impl AgenticRunLifecycleService {
             runtime_capabilities,
             execution_owner_generation,
         );
-        Ok(self.assemble_loop_state(
-            user_id,
-            request,
-            session_id,
-            run_id,
-            request_constraints,
-            edge_context,
-            runtime_capabilities.agent_binding.as_ref(),
-            environment,
-            facts,
-        ))
+        Ok(Self::assemble_loop_state(environment, facts))
     }
 
     fn prepare_initial_execution_facts(
@@ -12949,8 +13081,6 @@ impl AgenticRunLifecycleService {
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
 
-        use astra_turn_core::turn_guard::TurnGuard;
-
         let prompt_user_message = request.message.trim().to_string();
         let prompt_user_intent = request
             .user_intent
@@ -12959,11 +13089,6 @@ impl AgenticRunLifecycleService {
             .unwrap_or(request.message.as_str())
             .trim()
             .to_string();
-        let user_message = json!({
-            "role": "user",
-            "content": prompt_user_message,
-        });
-
         let task_profile = infer_task_execution_profile(&prompt_user_message);
         let admitted_runtime_config = astra_config::RuntimeConfig::load();
         let runtime_turn_ceiling = admitted_runtime_config
@@ -12999,7 +13124,6 @@ impl AgenticRunLifecycleService {
                 requested_budget,
             );
         let budget_is_explicit = request.execution_budget.is_some();
-        let max_turns = agentic_turn_budget.initial_turns;
         // Use edge profile's git_root/cwd if available; fall back to provisioned
         // server workspace so web-agent sessions still load stop-hooks.yaml.
         let project_root_buf = project_root_for_stop_hooks(edge_context)
@@ -13024,69 +13148,18 @@ impl AgenticRunLifecycleService {
             request.model.as_deref(),
             request.admitted_model_execution.as_ref(),
         );
-        Ok(LoopExecutionFacts {
-            messages: vec![user_message],
-            tool_ledger_receipt: Default::default(),
-            max_turns,
-            remaining_turns: max_turns,
-            charged_iterations: 0,
-            original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts {
-                evaluation_thresholds:
-                    crate::turn::runtime_policy::evaluation_thresholds_from_policy(
-                        &admitted_runtime_config.tool_policy,
-                    ),
-                pending_context: Vec::new(),
-                context_compression_triggered: false,
-                skill_execution: Default::default(),
-                runtime_policy_evaluation: Default::default(),
-                turn_guard: TurnGuard::with_profile(task_profile),
-                message: prompt_user_message.clone(),
-                user_intent: prompt_user_intent,
-                delegated_model_requirements: request_constraints
-                    .delegated_model_requirements
-                    .clone(),
-                turn_intent: None,
-                task_profile,
-                session_turn: 0,
-                canonical_turn_chain_id: Some(format!("{}:harness", session_id)),
-                root_user_query_event_id: None,
-                total_prompt: 0,
-                total_completion: 0,
-                total_cache_read: 0,
-                total_cache_creation: 0,
-                total_tool_calls: 0,
-                total_observation_tool_calls: 0,
-                has_any_usage: false,
-                qualified_usage: None,
-                last_request_usage: None,
-                agentic_turn_budget,
-                budget_is_explicit,
-                budget_policy: None,
-                loop_entry: Default::default(),
-                current_round_index: 0,
-                llm_rounds_completed: 0,
-                last_request_message_count: None,
-                max_turn_input_tokens,
-                last_finish_reason: None,
-                final_text: String::new(),
-                final_text_model_item_id: None,
-                final_text_streamed: false,
-                final_output_ready_notified: false,
-                error_recovery: Default::default(),
-                provider_adaptation: Default::default(),
-                skill_produced_output: false,
-            },
-            stall: crate::turn::agentic_loop::host::StallTrackingState {
-                circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
-                    crate::turn::runtime_policy::circuit_breaker_config_from_tool_policy(
-                        &admitted_runtime_config.tool_policy,
-                    ),
-                ),
-                ..Default::default()
-            },
-            admitted_tool_policy: admitted_runtime_config.tool_policy,
-            user_intents: Default::default(),
-            hooks: StopHookState {
+        Ok(LoopExecutionFacts::initial(
+            prompt_user_message,
+            prompt_user_intent,
+            None,
+            task_profile,
+            agentic_turn_budget,
+            budget_is_explicit,
+            max_turn_input_tokens,
+            Some(format!("{}:harness", session_id)),
+            request_constraints,
+            admitted_runtime_config.tool_policy,
+            StopHookState {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
@@ -13096,32 +13169,28 @@ impl AgenticRunLifecycleService {
             },
             tool_event_hooks,
             session_event_hooks,
-            budget_wrapup_injected: false,
-            budget_wrapup_ignored_rounds: 0,
-            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
-            step_recorder: StepRecorder::with_persistence_for_run(
-                user_id, session_id, run_id, run_id,
-            ),
-        })
+            StepRecorder::with_persistence_for_run(user_id, session_id, run_id, run_id),
+        ))
     }
 
     /// Assemble one loop without inferring or resetting its execution facts.
     fn assemble_loop_state(
-        &self,
-        user_id: &str,
-        request: &ChatRequestData,
-        session_id: &str,
-        run_id: &str,
-        request_constraints: RequestConstraints,
-        edge_context: &EdgeContext,
-        agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         environment: LoopEnvironment,
         facts: LoopExecutionFacts,
     ) -> AgenticLoopState {
-        let mut request_constraints = request_constraints;
-        request_constraints.delegated_model_requirements =
-            facts.original.delegated_model_requirements.clone();
         let LoopEnvironment {
+            user_id,
+            session_id,
+            run_id,
+            agent_id,
+            model_name,
+            shared_pool,
+            thinking,
+            compact_strategy,
+            inference_purpose,
+            mut request_constraints,
+            client_pipeline_skill_names,
+            listing_message,
             skill_registry,
             skill_resolver,
             skill_executor,
@@ -13129,21 +13198,27 @@ impl AgenticRunLifecycleService {
             memory_extraction_service,
             harness,
         } = environment;
-        let thinking_config = Self::root_generation_controls(request)
-            .expect("generation controls validated during request admission")
-            .thinking;
+        request_constraints.delegated_model_requirements =
+            facts.original.delegated_model_requirements.clone();
+        let pipeline_session = Some(
+            astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+                crate::turn::session_current_date::resolve_session_current_date_for_user(
+                    &user_id,
+                    &session_id,
+                ),
+            ),
+        );
         AgenticLoopState {
             evaluation_thresholds: facts.original.evaluation_thresholds,
             messages: facts.messages,
             volatile_pending: facts.original.pending_context,
-            current_session_id: Some(session_id.to_string()),
-            current_run_id: Some(run_id.to_string()),
-            self_agent_id: request
-                .agent_id
-                .clone()
-                .unwrap_or_else(|| "root-agent".to_string()),
-            context_manifest_pool: self.shared_pool.clone(),
-            context_manifest_model_name: request.model.clone(),
+            current_session_id: Some(session_id),
+            current_run_id: Some(run_id),
+            self_agent_id: agent_id,
+            context_manifest_pool: shared_pool,
+            context_manifest_user_id: Some(user_id),
+            context_manifest_model_name: model_name.clone(),
             final_text: facts.original.final_text,
             final_text_model_item_id: facts.original.final_text_model_item_id,
             final_text_streamed: facts.original.final_text_streamed,
@@ -13183,22 +13258,9 @@ impl AgenticRunLifecycleService {
                 },
                 resolver: skill_resolver,
                 executor: skill_executor,
-                client_pipeline_skill_names: edge_context
-                    .edge_skills
-                    .iter()
-                    .filter(|skill| Self::edge_skill_is_allowed(skill, &request_constraints))
-                    .flat_map(|skill| {
-                        std::iter::once(skill.name.clone()).chain(skill.aliases.iter().cloned())
-                    })
-                    .map(|name| name.trim().to_ascii_lowercase())
-                    .collect(),
+                client_pipeline_skill_names,
                 request_constraints,
-                listing_message: agent_binding_context.map(|context| {
-                    json!({
-                        "role": "system",
-                        "content": context.prompt_section,
-                    })
-                }),
+                listing_message,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 tool_event_hooks: facts.tool_event_hooks,
                 session_event_hooks: facts.session_event_hooks,
@@ -13208,14 +13270,7 @@ impl AgenticRunLifecycleService {
             user_intents: facts.user_intents,
             error_recovery: facts.original.error_recovery,
             provider_adaptation: facts.original.provider_adaptation,
-            pipeline_session: Some(
-                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
-                    astra_turn_core::pipeline_config::PipelineConfig::default(),
-                    crate::turn::session_current_date::resolve_session_current_date_for_user(
-                        user_id, session_id,
-                    ),
-                ),
-            ),
+            pipeline_session,
             message: facts.original.message,
             user_intent: facts.original.user_intent,
             turn_intent: facts.original.turn_intent,
@@ -13226,19 +13281,10 @@ impl AgenticRunLifecycleService {
             context_compression_triggered: facts.original.context_compression_triggered,
             budget_wrapup_ignored_rounds: facts.budget_wrapup_ignored_rounds,
             skill_produced_output: facts.original.skill_produced_output,
-            thinking: thinking_config,
+            thinking,
             permission_context: root_permission_context,
             memory_extraction_service,
-            compact_strategy: request
-                .admitted_model_execution
-                .as_ref()
-                .map(|execution| {
-                    crate::turn::llm::context::compact_strategy_from_model_metadata(
-                        execution.cache_capability,
-                        &execution.provider,
-                    )
-                })
-                .unwrap_or_default(),
+            compact_strategy,
             session_turn: facts.original.session_turn,
             canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
             root_user_query_event_id: facts.original.root_user_query_event_id,
@@ -13247,8 +13293,8 @@ impl AgenticRunLifecycleService {
                 facts.step_recorder,
                 facts.original.agentic_turn_budget,
                 facts.admitted_tool_policy,
-                request.model.as_deref(),
-                astra_turn_types::InferencePurpose::PrimaryAgent,
+                model_name.as_deref(),
+                inference_purpose,
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         }
@@ -16806,7 +16852,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Some(execution_owner_generation),
         )?;
         install_active_personal_skills(&mut loop_state, active_personal_skills);
-        loop_state.context_manifest_user_id = Some(user_id.clone());
         bind_execution_owner_generation(&mut loop_state, execution_owner_generation);
         loop_state.runtime_manifest = Self::build_runtime_manifest(
             &request,
@@ -17908,7 +17953,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             execution_owner_generation,
         )?;
         install_active_personal_skills(&mut state, active_personal_skills);
-        state.context_manifest_user_id = Some(user_id.clone());
         state.current_run_owner_generation = execution_owner_generation;
         state.runtime_manifest = Self::build_runtime_manifest(
             &request,
@@ -24757,11 +24801,6 @@ impl ServerSubRunExecutor {
             config.task.clone()
         };
 
-        let user_message = json!({
-            "role": "user",
-            "content": full_task,
-        });
-
         let inherited_workspace_mutation = child_workspace_mutation;
         let task_profile =
             subrun_task_profile_for_workspace_intent(&full_task, inherited_workspace_mutation);
@@ -24777,7 +24816,6 @@ impl ServerSubRunExecutor {
             config.max_turns,
             config.initial_turns,
         )?;
-        let max_turns = agentic_turn_budget.initial_turns;
         let project_root_buf = project_root_from_delegation_context(&config.context);
         let hook_sets = project_root_buf
             .as_ref()
@@ -24816,32 +24854,18 @@ impl ServerSubRunExecutor {
         let permission_context =
             PermissionSyncContext::shared(effective_inherited_permissions.clone());
 
-        let mut loop_state = AgenticLoopState {
-            messages: vec![user_message],
-            current_session_id: Some(config.session_id.clone()),
-            current_run_id: Some(config.run_id.clone()),
-            current_run_owner_generation: config.execution_owner_generation,
-            context_manifest_pool: self.shared_pool.clone(),
-            context_manifest_user_id: Some(config.user_id.clone()),
-            context_manifest_model_name: child_model_name.clone(),
-            recursion_depth: config.recursion_depth,
-            max_turns,
-            remaining_turns: max_turns,
-            budget_is_explicit: true,
-            skills: SkillState {
-                registry_for_activation: if config.request_constraints.allowed_skills.is_some() {
-                    None
-                } else {
-                    skill_registry
-                },
-                resolver: skill_resolver,
-                request_constraints: config.request_constraints.clone(),
-                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                tool_event_hooks,
-                session_event_hooks,
-                ..Default::default()
-            },
-            hooks: StopHookState {
+        let facts = LoopExecutionFacts::initial(
+            full_task.clone(),
+            full_task,
+            inherited_turn_intent,
+            task_profile,
+            agentic_turn_budget,
+            true,
+            max_turn_input_tokens,
+            None,
+            &config.request_constraints,
+            admitted_tool_policy,
+            StopHookState {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
@@ -24849,36 +24873,27 @@ impl ServerSubRunExecutor {
                 admitted_model_execution: config.admitted_model_execution.clone(),
                 ..Default::default()
             },
-            cancellation: CancellationState {
-                flag: Some(local_cancel_flag.clone()),
-                pause_flag: Some(local_pause_flag.clone()),
-                token: Some(local_cancel_token.clone()),
-                execution_lease_lost: Some(local_execution_lease_lost.clone()),
-                resolved_origin: None,
-            },
-            messaging: MessagingState {
-                mailbox: config.mailbox,
-                progress_emitter: config.progress_emitter.clone(),
-                ..Default::default()
-            },
-            run_control: durable_run_control.clone(),
-            pipeline_session: Some(
-                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
-                    astra_turn_core::pipeline_config::PipelineConfig::default(),
-                    crate::turn::session_current_date::resolve_session_current_date_for_user(
-                        &config.user_id,
-                        &config.session_id,
-                    ),
-                ),
+            tool_event_hooks,
+            session_event_hooks,
+            StepRecorder::with_persistence_for_run(
+                &config.user_id, &config.session_id, &config.run_id, &config.run_id,
             ),
-            message: full_task.clone(),
-            user_intent: full_task,
-            turn_intent: inherited_turn_intent,
-            task_profile,
-            delegation_chain: config.delegation_chain.clone(),
-            self_agent_id: config.agent_profile.agent_id.clone(),
-            max_turn_input_tokens,
+        );
+        let environment = LoopEnvironment {
+            user_id: config.user_id.clone(),
+            session_id: config.session_id.clone(),
+            run_id: config.run_id.clone(),
+            agent_id: config.agent_profile.agent_id.clone(),
+            model_name: child_model_name.clone(),
+            shared_pool: self.shared_pool.clone(),
             thinking: generation_controls.thinking.clone(),
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
+            request_constraints: config.request_constraints.clone(),
+            client_pipeline_skill_names: HashSet::new(),
+            listing_message: None,
+            skill_registry,
+            skill_resolver,
+            skill_executor: None,
             permission_context: Some(permission_context),
             memory_extraction_service,
             compact_strategy,
@@ -24897,20 +24912,24 @@ impl ServerSubRunExecutor {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
-            ..AgenticLoopState::fresh(
-                StepRecorder::with_persistence_for_run(
-                    &config.user_id,
-                    &config.session_id,
-                    &config.run_id,
-                    &config.run_id,
-                ),
-                agentic_turn_budget,
-                admitted_tool_policy,
-                child_model_name.as_deref(),
-                astra_turn_types::InferencePurpose::SubAgent,
-                astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
-            )
         };
+        let mut loop_state = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
+        loop_state.current_run_owner_generation = config.execution_owner_generation;
+        loop_state.recursion_depth = config.recursion_depth;
+        loop_state.delegation_chain = config.delegation_chain.clone();
+        loop_state.cancellation = CancellationState {
+            flag: Some(local_cancel_flag.clone()),
+            pause_flag: Some(local_pause_flag.clone()),
+            token: Some(local_cancel_token.clone()),
+            execution_lease_lost: Some(local_execution_lease_lost.clone()),
+            resolved_origin: None,
+        };
+        loop_state.messaging = MessagingState {
+            mailbox: config.mailbox,
+            progress_emitter: config.progress_emitter.clone(),
+            ..Default::default()
+        };
+        loop_state.run_control = durable_run_control.clone();
         if let Some(trace_context) =
             trace_context_from_subrun_context(&config.context, &config.run_id)
         {

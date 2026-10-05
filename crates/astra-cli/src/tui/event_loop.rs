@@ -177,6 +177,7 @@ enum SlashBackgroundReadEffect {
         result: Result<Vec<crate::cli::slash::slash_team::Team>, String>,
         detail: bool,
         attachment_epoch: u64,
+        owner: bottom_pane::team_editor_view::TeamEditorOwner,
     },
     Clipboard {
         success_message: String,
@@ -845,6 +846,38 @@ struct SlashBackgroundReadCompletion {
     effect: SlashBackgroundReadEffect,
 }
 
+impl SlashBackgroundReadCompletion {
+    /// Idle and active turns consume the same read owner. Work outcomes are
+    /// cross-session facts; ordinary reads must still match their generation.
+    fn accept(
+        self,
+        generation: u64,
+        in_flight: &mut usize,
+        pending_work_retries: &mut BTreeMap<String, slash_dispatch::PendingWorkContinue>,
+        settled_work_continue_requests: &mut BTreeSet<String>,
+    ) -> Option<SlashBackgroundReadEffect> {
+        if !matches!(&self.effect, SlashBackgroundReadEffect::WorkContinue(_))
+            && self.generation != generation
+        {
+            return None;
+        }
+        *in_flight = in_flight.saturating_sub(1);
+        if let SlashBackgroundReadEffect::WorkContinue(Ok(surface)) = &self.effect {
+            settled_work_continue_requests.insert(surface.request_id.clone());
+            if matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)) {
+                if let Some(pending) = pending_work_retries.get_mut(&surface.request_id) {
+                    // Reconciliation must keep the first attempt's branch,
+                    // never turn a retry into another Run after selection changes.
+                    pending.branch_id = Some(surface.branch_id.clone());
+                }
+            } else {
+                pending_work_retries.remove(&surface.request_id);
+            }
+        }
+        Some(self.effect)
+    }
+}
+
 struct WorkStartCompletion {
     /// The Session that the Work promotion used. This is present even when
     /// promotion failed after creating a Session, so the caller can keep the
@@ -1335,6 +1368,7 @@ fn dispatch_slash_background_read(
                     result: crate::cli::slash::slash_team::load_team_configurations(&store, "", name.as_deref()).await,
                     detail: name.is_some(),
                     attachment_epoch,
+                    owner: bottom_pane::team_editor_view::TeamEditorOwner(Arc::new(store)),
                 }
             }
             slash_dispatch::SlashBackgroundRead::Clipboard {
@@ -1827,6 +1861,8 @@ fn apply_memory_read_effect(
 }
 
 fn apply_slash_background_read_effect(
+    selection_available: bool,
+    current_attachment_epoch: u64,
     effect: SlashBackgroundReadEffect,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
@@ -1836,60 +1872,75 @@ fn apply_slash_background_read_effect(
             result,
             detail,
             attachment_epoch,
-        } => match result {
-            Ok(mut teams) if detail || teams.is_empty() => {
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
-                    "Opened Team configuration",
-                ));
-                if let Some(team) = teams.pop() {
-                    bottom_pane.push_view(Box::new(slash_dispatch::team_configuration_view(
-                        std::sync::Arc::new(team),
-                        attachment_epoch,
-                    )));
-                } else {
-                    bottom_pane.push_view(Box::new(
-                        crate::tui::bottom_pane::info_view::InfoView::from_plain(
-                            "Team configuration",
-                            crate::cli::slash::slash_team::team_configuration_lines(&teams),
-                        ),
+            owner,
+        } => {
+            if attachment_epoch != current_attachment_epoch || !owner.0.is_attached_owner() {
+                return;
+            }
+            match result {
+                Ok(mut teams) if detail => {
+                    chat_widget.commit_system(history_cell::system::SystemCell::response(
+                        "Opened Team configuration",
                     ));
+                    if let Some(team) = teams.pop() {
+                        bottom_pane.push_view(Box::new(
+                            slash_dispatch::team_configuration_view(
+                                std::sync::Arc::new(team),
+                                attachment_epoch,
+                                owner,
+                            )
+                            .with_selection_available(selection_available),
+                        ));
+                    }
+                }
+                Ok(teams) => {
+                    use crate::tui::bottom_pane::list_selection_view::{
+                        ListSelectionView, SelectionItem,
+                    };
+                    let mut items: Vec<_> = teams
+                        .iter()
+                        .map(|team| SelectionItem {
+                            name: team.name.clone(),
+                            description: Some(format!(
+                                "{} · {} members",
+                                team.description,
+                                team.members.len()
+                            )),
+                            is_current: false,
+                        })
+                        .collect();
+                    let mut results: Vec<_> = teams
+                        .into_iter()
+                        .map(
+                            |team| crate::tui::bottom_pane::view::ViewResult::TeamConfiguration {
+                                team: std::sync::Arc::new(team),
+                                attachment_epoch,
+                                owner: owner.clone(),
+                            },
+                        )
+                        .collect();
+                    items.push(SelectionItem {
+                        name: "Create a team".into(),
+                        description: Some("Build a reusable roster".into()),
+                        is_current: false,
+                    });
+                    results.push(crate::tui::bottom_pane::view::ViewResult::CreateTeam {
+                        attachment_epoch,
+                        owner,
+                    });
+                    bottom_pane.push_view(Box::new(
+                        ListSelectionView::new(items, Some("Teams · configuration".into()))
+                            .with_results(results)
+                            .with_footer_hint("Type to filter · Enter inspect · Esc back"),
+                    ));
+                    chat_widget
+                        .commit_system(history_cell::system::SystemCell::response("Opened Teams"));
+                }
+                Err(error) => {
+                    chat_widget.commit_system(history_cell::system::SystemCell::error(error))
                 }
             }
-            Ok(teams) => {
-                use crate::tui::bottom_pane::list_selection_view::{
-                    ListSelectionView, SelectionItem,
-                };
-                let items = teams
-                    .iter()
-                    .map(|team| SelectionItem {
-                        name: team.name.clone(),
-                        description: Some(format!(
-                            "{} · {} members",
-                            team.description,
-                            team.members.len()
-                        )),
-                        is_current: false,
-                    })
-                    .collect();
-                let results = teams
-                    .into_iter()
-                    .map(
-                        |team| crate::tui::bottom_pane::view::ViewResult::TeamConfiguration {
-                            team: std::sync::Arc::new(team),
-                            attachment_epoch,
-                        },
-                    )
-                    .collect();
-                bottom_pane.push_view(Box::new(
-                    ListSelectionView::new(items, Some("Teams · configuration".into()))
-                        .with_results(results)
-                        .with_footer_hint("Type to filter · Enter inspect · Esc back"),
-                ));
-                chat_widget
-                    .commit_system(history_cell::system::SystemCell::response("Opened Teams"));
-            }
-            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
-        },
+        }
         SlashBackgroundReadEffect::Clipboard {
             success_message,
             result,
@@ -2579,20 +2630,24 @@ fn is_ctrl_b_background_key(key: &crossterm::event::KeyEvent) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
     Agents,
+    Team,
 }
 
 impl ReopenTarget {
     const AGENTS: &'static str = "agents";
+    const TEAM: &'static str = "/team";
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Agents => Self::AGENTS,
+            Self::Team => Self::TEAM,
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             Self::AGENTS => Some(Self::Agents),
+            Self::TEAM => Some(Self::Team),
             _ => None,
         }
     }
@@ -4764,6 +4819,7 @@ fn sync_explain_presentation(
 
 #[derive(Debug)]
 enum AgentWorkbenchOutcome {
+    TeamEditor(bottom_pane::team_editor_view::TeamEditorUpdate),
     Clipboard {
         success_message: String,
         result: Result<(), String>,
@@ -4812,6 +4868,92 @@ enum AgentWorkbenchOutcome {
     },
     TranscriptUpdate(bottom_pane::agent_transcript_view::AgentTranscriptUpdate),
     RootTranscriptUpdate(bottom_pane::root_transcript_view::RootTranscriptUpdate),
+}
+
+fn dispatch_team_editor_request(
+    request: bottom_pane::team_editor_view::TeamEditorRequest,
+    attachment_epoch: u64,
+    bottom_pane: &mut BottomPane,
+    outcome_tx: tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
+) -> bool {
+    use bottom_pane::team_editor_view::{
+        TeamEditorOperation, TeamEditorResponse, TeamEditorUpdate,
+    };
+    if request.target.attachment_epoch != attachment_epoch
+        || !bottom_pane.team_editor_pending(&request)
+    {
+        return false;
+    }
+    if !request.target.owner.0.is_attached_owner() {
+        let reason = "Sign-in changed. Reopen the editor with the intended account.".to_string();
+        let response = match &request.operation {
+            TeamEditorOperation::Save { .. } => TeamEditorResponse::Saved(Err(
+                astra_services::team_persistence::TeamWriteError::Rejected,
+            )),
+            TeamEditorOperation::Refresh { .. } => TeamEditorResponse::Refreshed(Err(reason)),
+            TeamEditorOperation::Models { .. } => TeamEditorResponse::Models(Err(reason)),
+        };
+        // Local pre-delivery rejection, not a late observation from another
+        // account. Retire only this exact pending action and keep its draft.
+        bottom_pane.update_team_editor(&TeamEditorUpdate { request, response });
+        return false;
+    }
+    tokio::spawn(async move {
+        use astra_services::team_persistence::{
+            CreateTeam, TeamPersistenceService, TeamWriteError, UpdateTeam,
+        };
+        let store = &request.target.owner.0;
+        let response = match &request.operation {
+            TeamEditorOperation::Save { definition, create } => {
+                let result = if !store.is_attached_owner() {
+                    Err(TeamWriteError::Rejected)
+                } else if *create {
+                    store
+                        .create_team(
+                            &definition.user_id,
+                            &CreateTeam {
+                                team_id: definition.team_id.clone(),
+                                name: definition.name.clone(),
+                                description: definition.description.clone(),
+                                members: definition.members.clone(),
+                                context: definition.context.clone(),
+                            },
+                        )
+                        .await
+                } else {
+                    store
+                        .update_team(
+                            &definition.user_id,
+                            &definition.team_id,
+                            &UpdateTeam::from(definition.as_ref()),
+                        )
+                        .await
+                };
+                TeamEditorResponse::Saved(result)
+            }
+            TeamEditorOperation::Refresh { team_id } => {
+                TeamEditorResponse::Refreshed(if store.is_attached_owner() {
+                    store.load_team_by_id("", team_id).await
+                } else {
+                    Err("Sign-in changed. Reopen the editor with the intended account.".into())
+                })
+            }
+            TeamEditorOperation::Models { .. } => {
+                TeamEditorResponse::Models(if store.is_attached_owner() {
+                    store.model_catalog().await
+                } else {
+                    Err("Sign-in changed. Reopen the editor with the intended account.".into())
+                })
+            }
+        };
+        let _ = outcome_tx
+            .send(AgentWorkbenchOutcome::TeamEditor(TeamEditorUpdate {
+                request,
+                response,
+            }))
+            .await;
+    });
+    true
 }
 
 /// Load the durable local-agent index without delaying input or rendering.
@@ -5044,6 +5186,13 @@ fn drain_agent_workbench_outcomes(
             continue;
         }
         match outcome {
+            AgentWorkbenchOutcome::TeamEditor(update) => {
+                if update.request.target.attachment_epoch == attachment_epoch
+                    && update.request.target.owner.0.is_attached_owner()
+                {
+                    bottom_pane.update_team_editor(&update);
+                }
+            }
             AgentWorkbenchOutcome::Clipboard {
                 success_message,
                 result,
@@ -6574,6 +6723,14 @@ async fn dispatch_bottom_pane_view_action(
     terminal_height: u16,
 ) {
     match action {
+        BottomPaneViewAction::TeamEditor(request) => {
+            dispatch_team_editor_request(
+                request,
+                backends.session_attachment_epoch,
+                bottom_pane,
+                backends.agent_workbench_tx,
+            );
+        }
         BottomPaneViewAction::OpenRootTranscript => {
             open_root_transcript_workspace(
                 chat_widget,
@@ -7880,34 +8037,18 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(completion) = slash_background_read_rx.recv() => {
-                let work_completion = matches!(
-                    &completion.effect,
-                    SlashBackgroundReadEffect::WorkContinue(_)
-                );
-                // Work is an explicit cross-session surface. Its progress and
-                // final outcome remain valid after the user switches Session
-                // or stops waiting for ordinary background reads; the output
-                // carries Work identity and never mutates the new Session.
-                if !work_completion && completion.generation != slash_background_read_generation {
+                let Some(effect) = completion.accept(
+                    slash_background_read_generation,
+                    &mut slash_background_read_count,
+                    &mut pending_work_retries,
+                    &mut settled_work_continue_requests,
+                ) else {
                     continue;
-                }
-                slash_background_read_count = slash_background_read_count.saturating_sub(1);
-                if let SlashBackgroundReadEffect::WorkContinue(Ok(surface)) = &completion.effect {
-                    settled_work_continue_requests.insert(surface.request_id.clone());
-                    if matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)) {
-                        if let Some(pending) = pending_work_retries.get_mut(&surface.request_id) {
-                            // Pin the branch resolved by the first attempt. A
-                            // later delivery selection must not turn an
-                            // explicit retry into a second Run on another
-                            // branch.
-                            pending.branch_id = Some(surface.branch_id.clone());
-                        }
-                    } else {
-                        pending_work_retries.remove(&surface.request_id);
-                    }
-                }
+                };
                 apply_slash_background_read_effect(
-                    completion.effect,
+                    true,
+                    state.session_attachment_epoch,
+                    effect,
                     &mut bottom_pane,
                     &mut chat_widget,
                 );
@@ -7932,6 +8073,8 @@ pub(crate) async fn run_tui_session(
                     continue;
                 }
                 apply_slash_background_read_effect(
+                    true,
+                    state.session_attachment_epoch,
                     SlashBackgroundReadEffect::WorkContinueProgress(progress),
                     &mut bottom_pane,
                     &mut chat_widget,
@@ -9270,6 +9413,29 @@ pub(crate) async fn run_tui_session(
                                                 _ = session_shutdown_token.cancelled() => {
                                                     break 'main Ok(());
                                                 }
+                                                Some(completion) = slash_background_read_rx.recv() => {
+                                                    let Some(effect) = completion.accept(
+                                                        slash_background_read_generation,
+                                                        &mut slash_background_read_count,
+                                                        &mut pending_work_retries,
+                                                        &mut settled_work_continue_requests,
+                                                    ) else {
+                                                        continue;
+                                                    };
+                                                    apply_slash_background_read_effect(
+                                                        false,
+                                                        turn_session_attachment_epoch,
+                                                        effect,
+                                                        &mut bottom_pane,
+                                                        &mut chat_widget,
+                                                    );
+                                                    // The active turn still owns input custody. Only
+                                                    // the idle consumer releases queued follow-ups.
+                                                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, width);
+                                                    bottom_pane.sync_popups();
+                                                    frame_requester.schedule_frame();
+                                                }
                                                 // Fair selection keeps key storms from starving a
                                                 // ready Bash handoff or runtime event.
                                                 result = &mut fut, if turn_result_ready.is_none() => {
@@ -9631,6 +9797,9 @@ pub(crate) async fn run_tui_session(
                                                                             slash_dispatch::active_run_concurrent_read(
                                                                                 &queued_text,
                                                                                 &active_session_hub_snapshot,
+                                                                                api,
+                                                                                profile,
+                                                                                turn_session_attachment_epoch,
                                                                             )
                                                                         {
                                                                             commit_submission_projection(
@@ -9639,7 +9808,7 @@ pub(crate) async fn run_tui_session(
                                                                             );
                                                                             chat_widget.commit_system(
                                                                                 history_cell::system::SystemCell::response(
-                                                                                    "Loading session overview…",
+                                                                                    "Loading requested view…",
                                                                                 ),
                                                                             );
                                                                             slash_background_read_count += 1;
@@ -9895,7 +10064,26 @@ pub(crate) async fn run_tui_session(
                                                                         }),
                                                                         ..
                                                                     } => {}
-                                                                    BottomPaneAction::ViewCompleted { result: Some(_), reopen: _ } => {}
+                                                                    BottomPaneAction::ViewCompleted { result: Some(result), reopen: _ } => {
+                                                                        slash_dispatch::handle_team_editor_result(&result, turn_session_attachment_epoch, false, &mut bottom_pane);
+                                                                        frame_requester.schedule_frame();
+                                                                    }
+                                                                    BottomPaneAction::ViewCompleted {
+                                                                        result: None,
+                                                                        reopen: Some(cmd),
+                                                                    } if ReopenTarget::parse(&cmd) == Some(ReopenTarget::Team) => {
+                                                                        let Some(action) = slash_dispatch::active_run_concurrent_read(
+                                                                            &cmd, &active_session_hub_snapshot, api, profile, turn_session_attachment_epoch,
+                                                                        ) else { continue; };
+                                                                        slash_background_read_count += 1;
+                                                                        dispatch_slash_background_read(
+                                                                            action,
+                                                                            slash_background_read_generation,
+                                                                            slash_background_read_tx.clone(),
+                                                                            &mut slash_background_read_tasks,
+                                                                        );
+                                                                        frame_requester.schedule_frame();
+                                                                    }
                                                                     BottomPaneAction::ViewCompleted {
                                                                         result: None,
                                                                         reopen: Some(cmd),
@@ -13169,6 +13357,64 @@ mod tests {
         let (_, retry_branch) =
             work_continue_branch_id(&observation, Some("branch-first")).unwrap();
         assert_eq!(retry_branch, "branch-first");
+
+        // Both UI loops share this acceptance boundary: stale ordinary reads
+        // do not consume a newer generation's count, but Work settlement does.
+        let mut in_flight = 3;
+        let mut pending = BTreeMap::from([(
+            "request-1".into(),
+            slash_dispatch::PendingWorkContinue {
+                work_id: "work-1".into(),
+                branch_id: None,
+                message: "Continue".into(),
+                request_id: "request-1".into(),
+                attachment_request_id: "attachment-1".into(),
+            },
+        )]);
+        let mut settled = BTreeSet::new();
+        for generation in [1, 2] {
+            let accepted = SlashBackgroundReadCompletion {
+                generation,
+                effect: SlashBackgroundReadEffect::Worktrees(Vec::new()),
+            }
+            .accept(2, &mut in_flight, &mut pending, &mut settled);
+            assert_eq!(accepted.is_some(), generation == 2);
+            assert_eq!(in_flight, if generation == 1 { 3 } else { 2 });
+            assert!(settled.is_empty());
+        }
+        for (outcome, remains_pending) in [
+            (WorkContinueOutcome::Unknown("ack missing".into()), true),
+            (WorkContinueOutcome::Completed, false),
+        ] {
+            let effect = SlashBackgroundReadCompletion {
+                generation: 1,
+                effect: SlashBackgroundReadEffect::WorkContinue(Ok(WorkContinueSurface {
+                    request_id: "request-1".into(),
+                    work_id: "work-1".into(),
+                    branch_id: "branch-first".into(),
+                    run_id: Some("run-1".into()),
+                    response: "retained output".into(),
+                    outcome,
+                    cleanup_error: None,
+                })),
+            }
+            .accept(2, &mut in_flight, &mut pending, &mut settled);
+            assert!(
+                matches!(effect, Some(SlashBackgroundReadEffect::WorkContinue(Ok(surface))) if surface.response == "retained output")
+            );
+            assert!(
+                settled.contains("request-1"),
+                "late progress must remain fenced"
+            );
+            assert_eq!(pending.contains_key("request-1"), remains_pending);
+            if remains_pending {
+                assert_eq!(
+                    pending["request-1"].branch_id.as_deref(),
+                    Some("branch-first")
+                );
+            }
+        }
+        assert_eq!(in_flight, 0);
     }
 
     #[tokio::test]
@@ -14702,6 +14948,9 @@ mod tests {
             "  /model",
             "/unknown-command",
             "/plan inspect it",
+            "/team create NewTeam",
+            "/team run Reviewers task",
+            "/team leave",
         ] {
             assert!(
                 active_submission_belongs_to_next_turn(command, false, false),
@@ -16440,7 +16689,7 @@ mod tests {
     /// round-trip check covers it.
     #[test]
     fn reopen_target_round_trips_through_string() {
-        let variants: &[ReopenTarget] = &[ReopenTarget::Agents];
+        let variants: &[ReopenTarget] = &[ReopenTarget::Agents, ReopenTarget::Team];
         for &target in variants {
             let encoded = target.as_str();
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
@@ -20484,7 +20733,7 @@ mod tests {
                 200,
                 serde_json::json!({"teams": [definition.clone()]}),
             ),
-            ("/teams/name/Product%20team", 200, definition),
+            ("/teams/name/Product%20team", 200, definition.clone()),
             (
                 "/teams/name/missing",
                 404,
@@ -20533,7 +20782,79 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(completion.generation, 7);
-            apply_slash_background_read_effect(completion.effect, &mut pane, &mut widget);
+            if let SlashBackgroundReadEffect::Team {
+                result,
+                detail,
+                attachment_epoch,
+                owner,
+            } = &completion.effect
+            {
+                apply_slash_background_read_effect(
+                    true,
+                    state.session_attachment_epoch,
+                    SlashBackgroundReadEffect::Team {
+                        result: result.clone(),
+                        detail: *detail,
+                        attachment_epoch: *attachment_epoch,
+                        owner: owner.clone(),
+                    },
+                    &mut pane,
+                    &mut widget,
+                );
+                assert!(
+                    !pane.has_active_view(),
+                    "another account must not receive this browser"
+                );
+                assert!(widget.history().is_empty());
+            }
+            drop(_other);
+            // A detail read admitted while idle may complete after execution
+            // starts. Availability belongs to the consuming loop, not dispatch.
+            if let SlashBackgroundReadEffect::Team {
+                result: Ok(teams),
+                detail: true,
+                attachment_epoch,
+                owner,
+            } = &completion.effect
+            {
+                let mut teams = teams.clone();
+                teams[0]
+                    .members
+                    .push(astra_services::team_persistence::TeamMemberDef {
+                        agent_id: "member".into(),
+                        role: "Lead".into(),
+                        ..Default::default()
+                    });
+                let mut active_pane = BottomPane::new();
+                apply_slash_background_read_effect(
+                    false,
+                    state.session_attachment_epoch,
+                    SlashBackgroundReadEffect::Team {
+                        result: Ok(teams),
+                        detail: true,
+                        attachment_epoch: *attachment_epoch,
+                        owner: owner.clone(),
+                    },
+                    &mut active_pane,
+                    &mut widget,
+                );
+                assert!(matches!(
+                    active_pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    BottomPaneAction::Consumed
+                ));
+                assert!(active_pane.has_active_view());
+                assert!(
+                    render_bottom_pane_text(&active_pane, 100, 24)
+                        .contains("reopen /team to choose a lead")
+                );
+            }
+            apply_slash_background_read_effect(
+                true,
+                state.session_attachment_epoch,
+                completion.effect,
+                &mut pane,
+                &mut widget,
+            );
             tasks.join_next().await.unwrap().unwrap();
             if matches!(name, Some("missing" | "offline")) {
                 assert!(!pane.has_active_view());
@@ -20561,16 +20882,17 @@ mod tests {
                 slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
             }
             let rendered = render_bottom_pane_text(&pane, 80, 24);
-            assert!(rendered.contains("not live execution status"), "{rendered}");
             assert!(rendered.contains("Draft"), "{rendered}");
-            assert!(rendered.contains("astra team add-member"), "{rendered}");
+            assert!(rendered.contains("E edit roster"), "{rendered}");
             assert!(!rendered.contains("Start:"), "an empty draft cannot run");
             assert_eq!(state.model.as_deref(), Some("parent-model"));
             if name.is_none() {
                 assert!(matches!(
                     pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-                    BottomPaneAction::ViewCompleted { result: None, reopen: Some(command) }
-                    if command == "/team"
+                    BottomPaneAction::ViewCompleted {
+                        result: None,
+                        reopen: Some(command)
+                    } if command == "/team"
                 ));
             }
         }
@@ -20603,14 +20925,484 @@ mod tests {
             server.received_requests().await.unwrap().is_empty(),
             "a queued Team read cannot borrow a replacement login"
         );
+
+        // Continue the same real browser fixture through native editor actions
+        // and its actual HTTP writer. No new editor/test transport is involved.
+        use bottom_pane::team_editor_view::{
+            TeamEditorOperation, TeamEditorOwner, TeamEditorResponse,
+        };
+        use bottom_pane::view::ViewResult;
+        credentials
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .access_token = Some("test-token".into());
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for (create, status) in [
+            (true, 200),
+            (false, 200),
+            (false, 409),
+            (false, 503),
+            (true, 503),
+        ] {
+            server.reset().await;
+            let owner = TeamEditorOwner(Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
+                &api, None,
+            )));
+            let mut pane = BottomPane::new();
+            let mut widget = chat_widget::ChatWidget::new("session-team");
+            pane.composer.set_text("Unsent objective");
+            let mut loaded: astra_services::team_persistence::TeamDefinition =
+                serde_json::from_value(definition.clone()).unwrap();
+            loaded
+                .members
+                .push(astra_services::team_persistence::TeamMemberDef {
+                    agent_id: "member-stable".into(),
+                    role: "Reviewer".into(),
+                    system_prompt: Some("Review the implementation".into()),
+                    ..Default::default()
+                });
+            let result = if create {
+                ViewResult::CreateTeam {
+                    attachment_epoch: state.session_attachment_epoch,
+                    owner,
+                }
+            } else {
+                ViewResult::TeamConfiguration {
+                    team: Arc::new(loaded),
+                    attachment_epoch: state.session_attachment_epoch,
+                    owner,
+                }
+            };
+            slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
+            if !create {
+                pane.handle_key(key(KeyCode::Char('e')));
+            }
+            pane.handle_key(key(KeyCode::Enter));
+            pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            pane.handle_paste("Renamed 团队");
+            pane.handle_key(key(KeyCode::Enter));
+            if create {
+                // An empty roster is editable, not an executable fake lead.
+                for _ in 0..2 {
+                    pane.handle_key(key(KeyCode::Down));
+                }
+                pane.handle_key(key(KeyCode::Enter));
+                pane.handle_paste("Coordinator");
+                pane.handle_key(key(KeyCode::Enter));
+                pane.handle_key(key(KeyCode::Down));
+                pane.handle_key(key(KeyCode::Enter));
+                pane.handle_paste("Coordinate the members and keep evidence.");
+                pane.handle_key(key(KeyCode::Enter));
+                for _ in 0..2 {
+                    pane.handle_key(key(KeyCode::Down));
+                }
+                pane.handle_key(key(KeyCode::Enter));
+            }
+            let pick_model = !create && status == 200;
+            if pick_model {
+                Mock::given(method("GET")).and(path("/models"))
+                    .and(wiremock::matchers::header("authorization", "Bearer test-token"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "items": [{ "offering_id": "exact-member-offering", "access_id": "self-hosted", "access_kind": "self_hosted",
+                            "access_label": "Self-hosted", "execution_placement": "server", "name": "Friendly model",
+                            "provider": "openai", "is_active": true, "context_window": 8192, "max_completion_tokens": null,
+                            "architecture": null, "thinking_capability": null }],
+                        "next_cursor": null, "limit": 50, "total": 1, "catalog_revision": "sha256:test"
+                    }))).expect(1).mount(&server).await;
+                for _ in 0..4 {
+                    pane.handle_key(key(KeyCode::Down));
+                }
+                let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(model_request)) =
+                    pane.handle_key(key(KeyCode::Enter))
+                else {
+                    panic!("member model action")
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                assert!(dispatch_team_editor_request(
+                    model_request,
+                    state.session_attachment_epoch,
+                    &mut pane,
+                    tx.clone()
+                ));
+                let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tx.send(outcome).await.unwrap();
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    Some("session-team"),
+                    state.session_attachment_epoch,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                pane.handle_key(key(KeyCode::Down));
+                let BottomPaneAction::ViewCompleted {
+                    result: Some(result),
+                    ..
+                } = pane.handle_key(key(KeyCode::Enter))
+                else {
+                    panic!("exact member result")
+                };
+                assert!(slash_dispatch::handle_team_editor_result(
+                    &result,
+                    state.session_attachment_epoch,
+                    true,
+                    &mut pane
+                ));
+                assert_eq!(state.model.as_deref(), Some("parent-model"));
+            }
+            let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(request)) =
+                pane.handle_key(save)
+            else {
+                panic!("Save keeps the editor and emits its typed request")
+            };
+            let TeamEditorOperation::Save {
+                definition: draft,
+                create: requested_create,
+            } = &request.operation
+            else {
+                panic!("save")
+            };
+            assert_eq!(*requested_create, create);
+            assert_eq!(draft.name, "Renamed 团队");
+            assert_eq!(draft.revision, 1);
+            if create {
+                assert_eq!(draft.members.len(), 1);
+                assert!(!draft.members[0].agent_id.is_empty());
+                assert_eq!(draft.members[0].role, "Coordinator");
+                assert!(draft.members[0].can_delegate);
+                assert_eq!(draft.members[0].max_delegation_depth, 1);
+                assert_eq!(
+                    draft.members[0].system_prompt.as_deref(),
+                    Some("Coordinate the members and keep evidence.")
+                );
+            }
+            if pick_model {
+                assert_eq!(
+                    draft.members[0]
+                        .model_selection
+                        .as_ref()
+                        .unwrap()
+                        .offering_id,
+                    "exact-member-offering"
+                );
+            }
+            let mut accepted = draft.as_ref().clone();
+            accepted.revision = if create { 1 } else { 2 };
+            let endpoint = if create {
+                "/teams".into()
+            } else {
+                format!("/teams/{}", draft.team_id)
+            };
+            Mock::given(method(if create { "POST" } else { "PUT" }))
+                .and(path(endpoint))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer test-token",
+                ))
+                .respond_with(ResponseTemplate::new(status).set_body_json(&accepted))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            assert!(!dispatch_team_editor_request(
+                request.clone(),
+                state.session_attachment_epoch + 1,
+                &mut pane,
+                tx.clone()
+            ));
+            {
+                let _other =
+                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                        "other",
+                        Some("owner-2"),
+                    )
+                    .unwrap();
+                assert!(!dispatch_team_editor_request(
+                    request.clone(),
+                    state.session_attachment_epoch,
+                    &mut pane,
+                    tx.clone()
+                ));
+            }
+            assert!(
+                !pane.team_editor_pending(&request),
+                "local credential rejection must not leave a false Saving status"
+            );
+            let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(request)) =
+                pane.handle_key(save)
+            else {
+                panic!("explicit save after restoring the original owner")
+            };
+            assert!(dispatch_team_editor_request(
+                request.clone(),
+                state.session_attachment_epoch,
+                &mut pane,
+                tx.clone()
+            ));
+            let AgentWorkbenchOutcome::TeamEditor(update) =
+                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("editor outcome")
+            };
+            assert!(
+                matches!(&update.response, TeamEditorResponse::Saved(result) if result.is_ok() == (status == 200))
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                if pick_model { 2 } else { 1 },
+                "one write, optional requested catalog, no readback or auth probe"
+            );
+            let body: serde_json::Value = requests.last().unwrap().body_json().unwrap();
+            assert_eq!(body["name"], "Renamed 团队");
+            if !create {
+                assert_eq!(body["expected_revision"], 1);
+            }
+            // Fences are exercised through the real reducer, using a result
+            // from the HTTP owner, before allowing the matching result through.
+            tx.send(AgentWorkbenchOutcome::TeamEditor(update.clone()))
+                .await
+                .unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session-team"),
+                state.session_attachment_epoch + 1,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert!(pane.team_editor_pending(&request));
+            let mut stale = update.clone();
+            stale.request.target.editor_id = uuid::Uuid::new_v4();
+            tx.send(AgentWorkbenchOutcome::TeamEditor(stale))
+                .await
+                .unwrap();
+            let mut stale = update.clone();
+            stale.request.operation_id += 1;
+            tx.send(AgentWorkbenchOutcome::TeamEditor(stale))
+                .await
+                .unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session-team"),
+                state.session_attachment_epoch,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert!(pane.team_editor_pending(&request));
+            {
+                let _other =
+                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                        "other",
+                        Some("owner-2"),
+                    )
+                    .unwrap();
+                tx.send(AgentWorkbenchOutcome::TeamEditor(update.clone()))
+                    .await
+                    .unwrap();
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    Some("session-team"),
+                    state.session_attachment_epoch,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                assert!(pane.team_editor_pending(&request));
+            }
+            tx.send(AgentWorkbenchOutcome::TeamEditor(update.clone()))
+                .await
+                .unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session-team"),
+                state.session_attachment_epoch,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert!(!pane.team_editor_pending(&request));
+            let rendered = render_bottom_pane_text(&pane, 100, 24);
+            assert!(rendered.starts_with("Renamed "), "{rendered}");
+            let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            pane.render(area, &mut buffer);
+            assert_eq!(buffer[(8, 0)].symbol(), "团");
+            assert_eq!(buffer[(10, 0)].symbol(), "队");
+            if status == 200 {
+                assert!(rendered.contains("Saved."), "{rendered}");
+            } else {
+                assert!(
+                    !matches!(pane.handle_key(save), BottomPaneAction::ViewAction(_)),
+                    "unconfirmed/conflicting saves are not replayed"
+                );
+                assert!(
+                    rendered.contains(if create { "Draft" } else { "Revision 1" }),
+                    "failed saves keep original revision"
+                );
+                if create {
+                    for _ in 0..5 {
+                        pane.handle_key(key(KeyCode::Up));
+                    }
+                }
+                if status == 503 {
+                    pane.handle_key(key(KeyCode::Enter));
+                    pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+                    pane.handle_paste("Later local edit");
+                    pane.handle_key(key(KeyCode::Enter));
+                }
+                let mut latest = accepted.clone();
+                latest.description = "Concurrent server purpose".into();
+                for _ in 0..10 {
+                    pane.handle_key(key(KeyCode::Down));
+                }
+                let observations = if status == 503 {
+                    vec![
+                        if create {
+                            None
+                        } else {
+                            Some(draft.as_ref().clone())
+                        },
+                        Some(latest),
+                        Some(accepted.clone()),
+                    ]
+                } else {
+                    vec![Some(latest)]
+                };
+                for (index, observation) in observations.iter().enumerate() {
+                    let reply = observation.as_ref().map_or_else(
+                        || ResponseTemplate::new(404),
+                        |definition| ResponseTemplate::new(200).set_body_json(definition),
+                    );
+                    Mock::given(method("GET"))
+                        .and(path(format!("/teams/{}", accepted.team_id)))
+                        .and(wiremock::matchers::header(
+                            "authorization",
+                            "Bearer test-token",
+                        ))
+                        .respond_with(reply)
+                        .up_to_n_times(1)
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(refresh)) =
+                        pane.handle_key(key(KeyCode::Enter))
+                    else {
+                        panic!("explicit Refresh")
+                    };
+                    assert!(
+                        matches!(&refresh.operation, TeamEditorOperation::Refresh { team_id } if team_id == &accepted.team_id)
+                    );
+                    assert!(dispatch_team_editor_request(
+                        refresh,
+                        state.session_attachment_epoch,
+                        &mut pane,
+                        tx.clone()
+                    ));
+                    let refreshed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    tx.send(refreshed).await.unwrap();
+                    drain_agent_workbench_outcomes(
+                        &mut rx,
+                        Some("session-team"),
+                        state.session_attachment_epoch,
+                        &mut widget,
+                        &mut pane,
+                        &FrameRequester::test_dummy(),
+                    );
+                    let rendered = render_bottom_pane_text(&pane, 100, 24);
+                    if status == 409 {
+                        assert!(
+                            rendered.contains("Revision 1")
+                                && rendered.contains("Concurrent server purpose"),
+                            "{rendered}"
+                        );
+                    } else if index == 2 {
+                        assert!(
+                            rendered.contains("Earlier save confirmed")
+                                && rendered.contains("Later local edit"),
+                            "{rendered}"
+                        );
+                        assert!(
+                            rendered.contains(&format!("Revision {}", accepted.revision)),
+                            "{rendered}"
+                        );
+                    } else {
+                        assert!(rendered.contains("Later local edit"), "{rendered}");
+                        assert!(
+                            !rendered.contains("Keep my complete draft"),
+                            "unknown cannot offer rebase"
+                        );
+                    }
+                    if status == 409 || index < 2 {
+                        assert!(
+                            !matches!(pane.handle_key(save), BottomPaneAction::ViewAction(_)),
+                            "unknown/conflict is not replayed after a read"
+                        );
+                    }
+                    assert_eq!(
+                        server.received_requests().await.unwrap().len(),
+                        index + 2,
+                        "one failed write plus explicit exact-ID reads only; no write replay"
+                    );
+                }
+            }
+            pane.handle_key(key(KeyCode::Esc));
+            tx.send(AgentWorkbenchOutcome::TeamEditor(update))
+                .await
+                .unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session-team"),
+                state.session_attachment_epoch,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert!(
+                !pane.has_active_view(),
+                "late acknowledgement never reopens a closed editor"
+            );
+            assert_eq!(pane.composer.text(), "Unsent objective");
+            assert_eq!(state.model.as_deref(), Some("parent-model"));
+            assert!(state.cli_context.agent_profile_selection.is_none());
+            assert!(
+                widget.history().is_empty(),
+                "configuration details stay out of the lead transcript"
+            );
+            server.verify().await;
+        }
     }
 
+    #[serial_test::serial]
     #[test]
     fn team_lead_picker_preserves_draft_and_changes_only_explicit_intent() {
         use crate::tui::bottom_pane::view::ViewResult;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let _creds = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let owner = bottom_pane::team_editor_view::TeamEditorOwner(Arc::new(
+            crate::cli::http_team_store::HttpTeamStore::new(&api, None),
+        ));
         for delegation in [[false, false], [true, false], [true, true]] {
             let team = std::sync::Arc::new(astra_services::team_persistence::TeamDefinition {
                 team_id: "exact-team".into(),
@@ -20643,6 +21435,64 @@ mod tests {
             let mut pane = BottomPane::new();
             pane.composer.set_text("My unfinished objective");
             let mut widget = chat_widget::ChatWidget::new("session-team");
+            slash_dispatch::handle_view_result(
+                ViewResult::TeamConfiguration {
+                    team: team.clone(),
+                    attachment_epoch: state.session_attachment_epoch,
+                    owner: owner.clone(),
+                },
+                &mut state,
+                &mut pane,
+                &mut widget,
+            );
+            let BottomPaneAction::ViewCompleted {
+                result: Some(old_use),
+                ..
+            } = pane.handle_key(enter)
+            else {
+                panic!("editor carries the captured owner into Team intent")
+            };
+            {
+                let _other =
+                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                        "other",
+                        Some("other-owner"),
+                    )
+                    .unwrap();
+                slash_dispatch::handle_view_result(
+                    old_use.clone(),
+                    &mut state,
+                    &mut pane,
+                    &mut widget,
+                );
+                assert_eq!(state.cli_context.agent_profile_selection, previous);
+                assert!(
+                    !pane.has_active_view(),
+                    "old owner cannot open a lead picker"
+                );
+            }
+            if delegation != [true, false] {
+                slash_dispatch::handle_view_result(old_use, &mut state, &mut pane, &mut widget);
+                let BottomPaneAction::ViewCompleted {
+                    result: Some(old_lead),
+                    ..
+                } = pane.handle_key(enter)
+                else {
+                    panic!("ambiguous lead result keeps the same captured owner")
+                };
+                let _other =
+                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                        "other",
+                        Some("other-owner"),
+                    )
+                    .unwrap();
+                slash_dispatch::handle_view_result(old_lead, &mut state, &mut pane, &mut widget);
+                assert_eq!(state.cli_context.agent_profile_selection, previous);
+                assert!(!pane.has_active_view());
+            }
+            assert_eq!(state.model.as_deref(), Some("parent-model"));
+            assert_eq!(state.perm_manager.mode(), permission);
+            assert_eq!(pane.composer.text(), "My unfinished objective");
             for dismiss in [
                 escape,
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -20651,25 +21501,32 @@ mod tests {
                     ViewResult::TeamConfiguration {
                         team: team.clone(),
                         attachment_epoch: state.session_attachment_epoch,
+                        owner: owner.clone(),
                     },
                     &mut state,
                     &mut pane,
                     &mut widget,
                 );
                 assert!(render_bottom_pane_text(&pane, 60, 30).contains("Enter use team"));
-                assert!(!matches!(
-                    pane.handle_key(dismiss),
-                    BottomPaneAction::ViewCompleted {
-                        result: Some(_),
-                        ..
-                    }
-                ));
+                let action = pane.handle_key(dismiss);
+                if dismiss == escape {
+                    assert!(matches!(
+                        action,
+                        BottomPaneAction::ViewCompleted {
+                            result: None, reopen: Some(command),
+                        } if command == "/team"
+                    ));
+                } else {
+                    assert!(matches!(action, BottomPaneAction::Consumed));
+                    assert!(!pane.has_active_view(), "Ctrl+C closes the focused view");
+                }
                 assert_eq!(state.cli_context.agent_profile_selection, previous);
             }
             slash_dispatch::handle_view_result(
                 ViewResult::TeamConfiguration {
                     team: team.clone(),
                     attachment_epoch: state.session_attachment_epoch,
+                    owner: owner.clone(),
                 },
                 &mut state,
                 &mut pane,
@@ -20696,6 +21553,7 @@ mod tests {
                     ViewResult::UseTeam {
                         team: team.clone(),
                         attachment_epoch: state.session_attachment_epoch,
+                        owner: owner.clone(),
                     },
                     &mut state,
                     &mut pane,
@@ -20735,6 +21593,7 @@ mod tests {
                     team: team.clone(),
                     lead_agent_id: "foreign-member".into(),
                     attachment_epoch: state.session_attachment_epoch,
+                    owner: owner.clone(),
                 },
                 &mut state,
                 &mut pane,
@@ -20759,6 +21618,7 @@ mod tests {
                 ViewResult::TeamConfiguration {
                     team,
                     attachment_epoch: state.session_attachment_epoch,
+                    owner: owner.clone(),
                 },
                 &mut state,
                 &mut pane,
@@ -20797,6 +21657,8 @@ mod tests {
         }];
 
         apply_slash_background_read_effect(
+            true,
+            0,
             SlashBackgroundReadEffect::Worktrees(rows),
             &mut bottom_pane,
             &mut widget,
@@ -20825,6 +21687,8 @@ mod tests {
         })];
 
         apply_slash_background_read_effect(
+            true,
+            0,
             SlashBackgroundReadEffect::Memory(MemoryReadEffect::Search {
                 query: "review preferences".into(),
                 stats_view: false,
@@ -20873,6 +21737,8 @@ mod tests {
         };
 
         apply_slash_background_read_effect(
+            true,
+            0,
             SlashBackgroundReadEffect::Memory(MemoryReadEffect::Session {
                 session_id: "session-memory".into(),
                 result: Box::new(Ok(surface)),
@@ -20907,6 +21773,8 @@ mod tests {
         let mut bottom_pane = BottomPane::new();
         let mut widget = chat_widget::ChatWidget::new("session-mcp");
         apply_slash_background_read_effect(
+            true,
+            0,
             SlashBackgroundReadEffect::Mcp(body.clone()),
             &mut bottom_pane,
             &mut widget,
@@ -20940,6 +21808,8 @@ mod tests {
         let mut analysis_pane = BottomPane::new();
         let mut analysis_widget = chat_widget::ChatWidget::new("session-123456");
         apply_slash_background_read_effect(
+            true,
+            0,
             SlashBackgroundReadEffect::SessionAnalysis {
                 session_id: "session-123456".into(),
                 result: Ok(vec![event]),
@@ -20975,6 +21845,8 @@ mod tests {
         let mut bottom_pane = BottomPane::new();
         let mut widget = chat_widget::ChatWidget::new("session-after");
         apply_slash_background_read_effect(
+            true,
+            0,
             SlashBackgroundReadEffect::SessionHub {
                 snapshot: Box::new(snapshot),
                 workspace: Box::new(Ok(None)),
@@ -21029,6 +21901,8 @@ mod tests {
         let mut widget = chat_widget::ChatWidget::new("session-reflect");
 
         apply_slash_background_read_effect(
+            true,
+            0,
             SlashBackgroundReadEffect::Reflection(Ok(
                 crate::cli::slash::slash_state::ReflectSurface::Report {
                     session_id: "session-reflect".into(),

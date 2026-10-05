@@ -71,16 +71,29 @@ pub(crate) enum ViewResult {
     TeamConfiguration {
         team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
         attachment_epoch: u64,
+        owner: super::team_editor_view::TeamEditorOwner,
+    },
+    CreateTeam {
+        attachment_epoch: u64,
+        owner: super::team_editor_view::TeamEditorOwner,
+    },
+    TeamMemberModel {
+        target: super::team_editor_view::TeamEditorTarget,
+        operation_id: u64,
+        agent_id: String,
+        selection: Option<astra_turn_types::ModelSelection>,
     },
     /// Begin choosing a lead, without starting execution or changing selection.
     UseTeam {
         team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
         attachment_epoch: u64,
+        owner: super::team_editor_view::TeamEditorOwner,
     },
     TeamLead {
         team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
         lead_agent_id: String,
         attachment_epoch: u64,
+        owner: super::team_editor_view::TeamEditorOwner,
     },
     TeamLeave {
         attachment_epoch: u64,
@@ -158,6 +171,7 @@ pub(crate) struct ViewCompletion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BottomPaneViewAction {
+    TeamEditor(super::team_editor_view::TeamEditorRequest),
     /// Open the root conversation in the same transcript browser used for
     /// delegated runs. The run navigator owns selection only; it never
     /// substitutes its summary for this conversation.
@@ -241,6 +255,27 @@ pub(crate) trait BottomPaneView: Send {
     fn desired_height(&self, width: u16) -> u16;
     fn handle_key(&mut self, key: KeyEvent);
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>;
+
+    fn team_editor_pending(&self, _request: &super::team_editor_view::TeamEditorRequest) -> bool {
+        false
+    }
+
+    fn update_team_editor(
+        &mut self,
+        _update: &super::team_editor_view::TeamEditorUpdate,
+    ) -> Option<Box<dyn BottomPaneView>> {
+        None
+    }
+
+    fn select_team_member_model(
+        &mut self,
+        _target: &super::team_editor_view::TeamEditorTarget,
+        _operation_id: u64,
+        _agent_id: &str,
+        _selection: Option<astra_turn_types::ModelSelection>,
+    ) -> bool {
+        false
+    }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         CancellationEvent::Escalate
