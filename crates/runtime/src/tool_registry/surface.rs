@@ -431,7 +431,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "Spawn: description+prompt. Runtime binds models; no substitution. Receipt≠completion. wait auto-delivers; fetch if needed.",
+            "No substitution; launch≠done; wait auto-delivers; fetch if needed.",
         ),
         "introspect" => (
             &[

@@ -1230,6 +1230,15 @@ mod tests {
             assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
             for selected in parsed["matches"].as_array().unwrap() {
                 let parameters = &selected["parameters"]["properties"];
+                let brief = if selected["name"] == "agent" {
+                    &parameters["prompt"]
+                } else {
+                    &parameters["slots"]["items"]["properties"]["prompt"]
+                };
+                let guidance = brief["description"].as_str().unwrap();
+                assert!(guidance.contains("exact output"));
+                assert!(guidance.contains("no parent-only reporting"));
+                assert!(brief.get("x-astra-discovery-summary").is_none());
                 let profiles = if selected["name"] == "agent" {
                     vec![&parameters["agent_type"]]
                 } else {

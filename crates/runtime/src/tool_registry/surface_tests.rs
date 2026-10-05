@@ -561,7 +561,13 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("Runtime binds models")
+            .contains("No substitution")
+    );
+    assert!(
+        agent["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("launch≠done")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
@@ -651,6 +657,11 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .is_some()
     );
     let full_agent = find(&full, "agent");
+    let child_brief = agent["function"]["parameters"]["properties"]["prompt"]["description"]
+        .as_str()
+        .expect("resident child brief guidance");
+    assert!(child_brief.contains("exact output"));
+    assert!(child_brief.contains("no parent-only reporting"));
     assert!(
         full_agent["function"]["parameters"]["properties"]
             .get("requested_model_policy")
