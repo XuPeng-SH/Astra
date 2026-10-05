@@ -82,8 +82,7 @@ impl SlashResult {
 /// across a network wait.
 pub(crate) enum SlashBackgroundRead {
     Team {
-        api: astra_thin_client::ThinClient,
-        profile: Option<String>,
+        store: crate::cli::http_team_store::HttpTeamStore,
         name: Option<String>,
         attachment_epoch: u64,
     },
@@ -393,8 +392,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     };
                     ctx.show_response("Loading Team configuration…".into());
                     SlashResult::background_read(SlashBackgroundRead::Team {
-                        api: ctx.api.clone(),
-                        profile: ctx.profile.map(str::to_string),
+                        store: crate::cli::http_team_store::HttpTeamStore::new(
+                            ctx.api,
+                            ctx.profile,
+                        ),
                         name,
                         attachment_epoch: ctx.state.session_attachment_epoch,
                     })

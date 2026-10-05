@@ -1963,6 +1963,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "x-astra-per-action-discovery-summaries": {
                         "spawn": "requested_model_policy: user model=omit (no catalog); fixed=Offering ID; no config reads; hard reqs bind; launched; propose final; runtime waits; no shell sleep; agent question.",
                         "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
+                        "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
                         "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
                         "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
                         "send_message": "action+to+message; child asks parent via to=parent, message_type=question (not ask_user); parent answers with the exact request_id"
@@ -2021,7 +2022,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
-                        "message": {"description": "REQUIRED for action='send_message'. Concise coordination message (at most 3000 characters); share an artifact for larger content."},
+                        "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
                     },
@@ -3052,11 +3053,10 @@ mod tests {
 
     #[test]
     fn admitted_team_profile_ids_validate_through_native_and_deferred_schemas() {
-        let team =
-            astra_services::team_persistence::builtin_teams("schema-owner", "2026-10-03T00:00:00Z")
-                .into_iter()
-                .next()
-                .expect("builtin team fixture");
+        let team = astra_services::team_persistence::builtin_teams("schema-owner")
+            .into_iter()
+            .next()
+            .expect("builtin team fixture");
         let profile_id =
             astra_services::team_persistence::resolve_member_to_profile(&team.members[0], &team)
                 .agent_id;

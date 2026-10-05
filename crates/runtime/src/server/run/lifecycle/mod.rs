@@ -20758,6 +20758,13 @@ impl ServerSpawnAgentExecutor {
                 .admit_model_selectors(parent.user_id.clone(), selectors.to_vec())
                 .await
                 .map_err(|(status, body)| {
+                    tracing::warn!(
+                        run_id = %parent.parent_run_id,
+                        selectors = ?selectors,
+                        status = status.as_u16(),
+                        error_code = body.0.error_code.as_deref().unwrap_or("unknown"),
+                        "child model admission rejected"
+                    );
                     safe_model_service_error_with_code(status, body.0.error_code.as_deref())
                 });
         }

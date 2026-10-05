@@ -14,11 +14,13 @@ pub async fn run_team_cross_user_isolation() {
     let team_name = format!("e2e_mx_iso_{}", ctx.suffix);
 
     let payload = json!({
+        "team_id": Uuid::new_v4().to_string(),
         "name": team_name,
         "description": "owner A only",
         "members": [
             {
                 "role": "a1",
+                "agent_id": "a1",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -26,6 +28,7 @@ pub async fn run_team_cross_user_isolation() {
             },
             {
                 "role": "a2",
+                "agent_id": "a2",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -35,7 +38,7 @@ pub async fn run_team_cross_user_isolation() {
         "context": {},
     });
 
-    let (st_up, _) = post_json(&ctx.app, "/teams", Some(auth_a), payload).await;
+    let (st_up, created) = post_json(&ctx.app, "/teams", Some(auth_a), payload).await;
     assert_eq!(st_up, StatusCode::OK);
 
     let b_suffix = Uuid::new_v4().simple().to_string();
@@ -67,9 +70,10 @@ pub async fn run_team_cross_user_isolation() {
     let access_b = login_j["access_token"].as_str().expect("B access_token");
     let auth_b = format!("Bearer {access_b}");
 
-    let path_t = format!("/teams/{team_name}");
+    let team_id = created["team_id"].as_str().expect("team_id");
+    let path_t = format!("/teams/{team_id}");
     let (st_g, _) = get_json(&ctx.app, &path_t, Some(&auth_b), &[]).await;
-    assert_eq!(st_g, StatusCode::NOT_FOUND, "B must not see A team by name");
+    assert_eq!(st_g, StatusCode::NOT_FOUND, "B must not see A team by ID");
 
     let (st_d, _) = delete_json(&ctx.app, &path_t, Some(&auth_b)).await;
     assert_eq!(st_d, StatusCode::NOT_FOUND, "B must not delete A team");

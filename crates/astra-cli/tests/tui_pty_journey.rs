@@ -1227,7 +1227,7 @@ async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restar
         reqwest::Method::POST,
         "/teams",
         Some(
-            serde_json::json!({"name":team_name, "description":"Dependent CSV delivery",
+            serde_json::json!({"team_id":uuid::Uuid::new_v4().to_string(),"name":team_name, "description":"Dependent CSV delivery",
             "members":members,"context":{}}),
         ),
     )
@@ -1370,7 +1370,7 @@ async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restar
         &client,
         &api,
         reqwest::Method::DELETE,
-        &format!("/teams/{team_name}"),
+        &format!("/teams/{}", team["team_id"].as_str().unwrap()),
         None,
     )
     .await;

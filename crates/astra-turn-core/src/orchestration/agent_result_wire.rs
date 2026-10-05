@@ -118,6 +118,7 @@ pub enum AgentControlReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedAgentToolResult {
     ControlReceipt(AgentControlReceipt),
+    ControlFailure(AgentFanoutControlExecutionFact),
     ChildResult(AgentToolResultStatusKind),
 }
 
@@ -125,6 +126,23 @@ pub enum DecodedAgentToolResult {
 /// receipts fail closed. The action/outcome pair must agree, and a control
 /// receipt cannot carry a child-result payload.
 pub fn decode_agent_tool_result(value: &Value) -> Option<DecodedAgentToolResult> {
+    if value
+        .get("result_family")
+        .is_none_or(|family| family.as_str() == Some("control_receipt"))
+        && value
+            .get("success")
+            .is_none_or(|success| success == &Value::Bool(false))
+        && matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("failed" | "rejected" | "blocked" | "unknown")
+        )
+        && let Some(
+            fact @ (AgentFanoutControlExecutionFact::NotExecuted
+            | AgentFanoutControlExecutionFact::Unknown),
+        ) = execution_fact_from_receipt(value)
+    {
+        return Some(DecodedAgentToolResult::ControlFailure(fact));
+    }
     let family: AgentToolResultFamily =
         serde_json::from_value(value.get("result_family")?.clone()).ok()?;
     let nonempty = |key: &str| {
@@ -262,8 +280,6 @@ pub fn agent_fanout_result_looks_like(value: &Value) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentFanoutControlReceiptKind {
     Group,
-    /// Delegation was intentionally skipped before any child was accepted.
-    SkippedBeforeAcceptance,
     RejectedBeforeAcceptance,
     /// The control envelope reached a terminal boundary, but the producer
     /// could not prove whether execution began. This is authoritative for
@@ -338,14 +354,6 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
     }
     let normalized_status = status.to_ascii_lowercase();
     if execution_fact == Some(AgentFanoutControlExecutionFact::NotExecuted)
-        && normalized_status == "completed"
-        && receipt.get("outcome").and_then(Value::as_str) == Some("delegation_skipped")
-        && receipt.get("reason_code").and_then(Value::as_str)
-            == Some("insufficient_time_to_delegate")
-    {
-        return Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance);
-    }
-    if execution_fact == Some(AgentFanoutControlExecutionFact::NotExecuted)
         && matches!(
             normalized_status.as_str(),
             "failed" | "rejected" | "blocked"
@@ -368,17 +376,7 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
         // flattened before the registry receipt arrived.
         return None;
     }
-    // Existing structured fanout errors without an explicit execution fact
-    // remain valid admission failures: the typed status+error pair proves
-    // that no group receipt exists.
-    // Plain text and incomplete JSON do not.
-    (AgentToolResultStatusKind::parse_wire(status) == AgentToolResultStatusKind::Failed
-        && execution_fact.is_none()
-        && receipt
-            .get("error")
-            .and_then(Value::as_str)
-            .is_some_and(|error| !error.trim().is_empty()))
-    .then_some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
+    None
 }
 
 /// Whether an agent-fanout control result is complete enough to cross an
@@ -391,7 +389,7 @@ pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutCont
 /// authoritative evidence that this call did not execute, even if it references
 /// an existing group. An
 /// explicit `executed=null` closes as an unknown terminal and must never be
-/// replayed. Existing status+error admission failures remain accepted.
+/// replayed. A failure without an execution fact still requires reconciliation.
 /// Arbitrary non-empty transport text is never a lifecycle result.
 pub fn agent_fanout_control_result_is_usable(output: &str) -> bool {
     agent_fanout_control_receipt_kind(output).is_some()
@@ -737,6 +735,10 @@ pub fn render_completed_agent_result(
     result: &str,
     finish_reason: Option<&str>,
 ) -> String {
+    render_child_agent_result(completed_agent_result_body(agent_id, result, finish_reason))
+}
+
+fn completed_agent_result_body(agent_id: &str, result: &str, finish_reason: Option<&str>) -> Value {
     let reason = agent_finish_reason_text(finish_reason);
     // This wire payload only reports whether the child result is complete.
     // Resume behavior belongs to the structured InterruptionRecord, where
@@ -758,7 +760,7 @@ pub fn render_completed_agent_result(
             "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly."
         );
     }
-    render_child_agent_result(body)
+    body
 }
 
 fn render_child_agent_result(mut body: Value) -> String {
@@ -776,14 +778,12 @@ pub fn render_wait_timeout_outcome(
     timeout: Duration,
 ) -> String {
     render_child_agent_result(match live_status {
-        Some(status) if !status.is_terminal() => json!({
-            "status": AgentToolResultStatusKind::StillRunning.as_str(),
-            "agent_id": agent_id,
-            "current_status": format!("{status:?}"),
-            "waited_secs": timeout.as_secs(),
-            "delivery": "asynchronous_parent_mailbox",
-            "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
-        }),
+        Some(status) if !status.is_terminal() => {
+            let mut body = wait_for_agent_status_body(agent_id, status);
+            body["waited_secs"] = json!(timeout.as_secs());
+            body["observation_timed_out"] = json!(true);
+            body
+        }
         _ => json!({
             "status": AgentToolResultStatusKind::TimedOut.as_str(),
             "agent_id": agent_id,
@@ -796,11 +796,15 @@ pub fn render_wait_timeout_outcome(
 }
 
 pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> String {
-    render_child_agent_result(match status {
+    render_child_agent_result(wait_for_agent_status_body(agent_id, status))
+}
+
+fn wait_for_agent_status_body(agent_id: &str, status: &AgentStatus) -> Value {
+    match status {
         AgentStatus::Completed {
             result,
             finish_reason,
-        } => return render_completed_agent_result(agent_id, result, finish_reason.as_deref()),
+        } => completed_agent_result_body(agent_id, result, finish_reason.as_deref()),
         AgentStatus::Interrupted {
             partial_result,
             finish_reason,
@@ -882,17 +886,15 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             "agent_id": agent_id,
             "current_status": "running",
             "activity": activity,
-            "delivery": "asynchronous_parent_mailbox",
             "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
         }),
         AgentStatus::Idle => json!({
             "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": "idle",
-            "delivery": "asynchronous_parent_mailbox",
             "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
         }),
-    })
+    }
 }
 
 pub fn render_unknown_agent_result(agent_id: &str, message: &str) -> String {
@@ -1262,6 +1264,35 @@ mod tests {
 
     #[test]
     fn fanout_start_requires_typed_identity_before_crossing_the_boundary() {
+        for (fact, expected) in [
+            (
+                Value::Bool(false),
+                Some(DecodedAgentToolResult::ControlFailure(
+                    AgentFanoutControlExecutionFact::NotExecuted,
+                )),
+            ),
+            (
+                Value::Null,
+                Some(DecodedAgentToolResult::ControlFailure(
+                    AgentFanoutControlExecutionFact::Unknown,
+                )),
+            ),
+            (Value::Bool(true), None),
+            (json!("false"), None),
+        ] {
+            let receipt = json!({"status":"rejected", "executed":fact});
+            assert_eq!(decode_agent_tool_result(&receipt), expected, "{receipt}");
+        }
+        assert!(
+            decode_agent_tool_result(&json!({"status":"failed", "error":"transport failed"}))
+                .is_none()
+        );
+        assert!(
+            decode_agent_tool_result(
+                &json!({"status":"rejected", "executed":false, "success":true})
+            )
+            .is_none()
+        );
         assert_eq!(
             agent_fanout_control_receipt_kind(
                 r#"{"status":"failed","error_kind":"fanout_group_already_started","executed":false,"group_id":"existing-group"}"#
@@ -1275,14 +1306,14 @@ mod tests {
         assert!(agent_fanout_control_result_is_usable(
             r#"{"status":"completed","group_id":"review"}"#
         ));
-        assert!(agent_fanout_control_result_is_usable(
+        assert!(!agent_fanout_control_result_is_usable(
             r#"{"status":"failed","error":"invalid target_count"}"#
         ));
         assert_eq!(
             agent_fanout_control_receipt_kind(
                 "{\"status\":\"failed\",\"error\":\"invalid target_count\"}\nRetry with valid arguments."
             ),
-            Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
+            None
         );
         assert_eq!(
             agent_fanout_control_execution_fact(
@@ -1296,10 +1327,10 @@ mod tests {
             ),
             Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
         );
-        let skipped = r#"{"status":"completed","outcome":"delegation_skipped","reason_code":"insufficient_time_to_delegate","executed":false}"#;
+        let skipped = r#"{"status":"rejected","outcome":"delegation_skipped","reason_code":"insufficient_time_to_delegate","executed":false}"#;
         assert_eq!(
             agent_fanout_control_receipt_kind(skipped),
-            Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance)
+            Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
         );
         assert!(agent_fanout_control_result_is_usable(skipped));
         assert_eq!(
@@ -1453,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn live_wait_timeout_routes_completion_to_mailbox_without_polling_advice() {
+    fn live_wait_timeout_preserves_execution_state_without_promising_transport() {
         let status = AgentStatus::Running {
             activity: "reviewing".to_string(),
         };
@@ -1463,7 +1494,8 @@ mod tests {
 
         assert_eq!(parsed["status"], "still_running");
         assert_eq!(parsed["waited_secs"], 1);
-        assert_eq!(parsed["delivery"], "asynchronous_parent_mailbox");
+        assert!(parsed.get("delivery").is_none());
+        assert_eq!(parsed["observation_timed_out"], true);
         assert_eq!(parsed["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
         assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("when continuation is available"));
         assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("Do not busy-poll"));
@@ -1482,13 +1514,20 @@ mod tests {
             Duration::from_secs(1),
         ))
         .unwrap();
-        assert!(
-            waiting["current_status"]
-                .as_str()
-                .unwrap()
-                .contains("needs user input")
-        );
-        assert_eq!(waiting["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
+        assert_eq!(waiting["status"], "waiting");
+        assert_eq!(waiting["reason"], "needs user input");
+        assert_eq!(waiting["observation_timed_out"], true);
+        let paused: Value = serde_json::from_str(&render_wait_timeout_outcome(
+            "reviewer",
+            Some(&AgentStatus::Paused {
+                reason: "approval needed".into(),
+            }),
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert_eq!(paused["status"], "paused");
+        assert_eq!(paused["reason"], "approval needed");
+        assert_eq!(paused["resumable"], true);
     }
 
     #[test]

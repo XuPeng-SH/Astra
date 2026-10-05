@@ -8,11 +8,13 @@ use super::harness::{bootstrap, delete_json, get_json, post_json};
 
 fn minimal_team_payload(name: &str, description: &str) -> Value {
     json!({
+        "team_id": uuid::Uuid::new_v4().to_string(),
         "name": name,
         "description": description,
         "members": [
             {
                 "role": "alpha",
+                "agent_id": "alpha",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -20,6 +22,7 @@ fn minimal_team_payload(name: &str, description: &str) -> Value {
             },
             {
                 "role": "beta",
+                "agent_id": "beta",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -37,7 +40,7 @@ pub async fn run_team_snapshots_db() {
 
     let team_name = format!("e2e_mx_snap_team_{}", ctx.suffix);
 
-    let (st_create, _) = post_json(
+    let (st_create, created) = post_json(
         &ctx.app,
         "/teams",
         Some(auth),
@@ -45,6 +48,7 @@ pub async fn run_team_snapshots_db() {
     )
     .await;
     assert_eq!(st_create, StatusCode::OK);
+    let team_id = created["team_id"].as_str().expect("team_id");
 
     let snap_body = json!({
         "label": "matrix-e2e-label",
@@ -52,7 +56,7 @@ pub async fn run_team_snapshots_db() {
         "git_commit": "deadbeef"
     });
 
-    let path_snap_post = format!("/teams/{team_name}/snapshots");
+    let path_snap_post = format!("/teams/{team_id}/snapshots");
     let (st_sn, sn_j) = post_json(&ctx.app, &path_snap_post, Some(auth), snap_body).await;
     assert_eq!(st_sn, StatusCode::OK, "POST snapshot: {sn_j}");
     let snapshot_id = sn_j["snapshot_id"]
@@ -60,7 +64,7 @@ pub async fn run_team_snapshots_db() {
         .expect("snapshot_id")
         .to_string();
 
-    let path_snap_list = format!("/teams/{team_name}/snapshots");
+    let path_snap_list = format!("/teams/{team_id}/snapshots");
     let (st_li, li_j) = get_json(&ctx.app, &path_snap_list, Some(auth), &[]).await;
     assert_eq!(st_li, StatusCode::OK, "GET snapshots: {li_j}");
     let snaps = li_j["snapshots"].as_array().expect("snapshots");
@@ -103,7 +107,7 @@ pub async fn run_team_snapshots_db() {
         "list empty after delete: {li2_j}"
     );
 
-    let path_team = format!("/teams/{team_name}");
+    let path_team = format!("/teams/{team_id}");
     let (st_team_del, _) = delete_json(&ctx.app, &path_team, Some(auth)).await;
     assert_eq!(st_team_del, StatusCode::OK);
 

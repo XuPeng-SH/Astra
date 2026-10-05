@@ -667,14 +667,10 @@ fn rejected_delivery_message(reason: impl Into<String>) -> String {
 fn agent_message_content(args: &Value) -> Result<String, String> {
     // Mailbox messages are coordination, not a bulk artifact channel. Keep
     // accepted model-authored guidance within the runtime's context preview.
-    let message = args
+    let content = args
         .get("message")
-        .ok_or_else(|| "send_message requires `message`".to_string())?;
-    let content = match message {
-        Value::String(content) => content.clone(),
-        other => serde_json::to_string(other)
-            .map_err(|_| "send_message could not serialize `message`".to_string())?,
-    };
+        .and_then(Value::as_str)
+        .ok_or_else(|| "send_message requires a string `message`".to_string())?;
     let content = content.trim();
     if content.is_empty() {
         return Err("send_message requires a non-empty `message`".to_string());
@@ -772,10 +768,16 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         Ok(content) => content,
         Err(error) => return rejected_agent_message(error).into(),
     };
-    let message_type = args
-        .get("message_type")
-        .and_then(Value::as_str)
-        .unwrap_or("text");
+    let message_type = match args.get("message_type") {
+        None => "text",
+        Some(Value::String(message_type)) => message_type.as_str(),
+        Some(_) => {
+            return rejected_agent_message(
+                "message_type must be a string from the advertised enum",
+            )
+            .into();
+        }
+    };
     let request_id = args
         .get("request_id")
         .and_then(Value::as_str)
@@ -2794,12 +2796,14 @@ fn derive_foreground_child_deadline(
 
 fn execution_deadline_too_short_outcome() -> String {
     json!({
-        "status": "completed",
+        "result_family": AgentToolResultFamily::ControlReceipt,
+        "success": false,
+        "status": "rejected",
         "outcome": "delegation_skipped",
         "reason_code": "insufficient_time_to_delegate",
         "retryable": false,
         "executed": false,
-        "result": "No child run was accepted within the remaining execution window. Requested child work remains unperformed.",
+        "error": "No child run was accepted within the remaining execution window. Requested child work remains unperformed.",
         "instruction": "Do not retry this rejected child launch or claim that a member performed the work. Continue only useful independent work within the remaining authority and clearly report any requested child work or checks that remain unverified.",
     })
     .to_string()
@@ -3538,11 +3542,66 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::time::Instant;
 
-    #[test]
-    fn send_message_rejects_oversized_semantic_content_before_enqueue() {
-        assert!(agent_message_content(&json!({"message": "a".repeat(3_000)})).is_ok());
-        let error = agent_message_content(&json!({"message": "a".repeat(3_001)})).unwrap_err();
-        assert!(error.contains("3000 characters"), "{error}");
+    #[tokio::test]
+    async fn send_message_rejects_invalid_input_before_enqueue_and_preserves_string_content() {
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+            Arc::new(astra_messaging::InProcessTransport::new()),
+            Arc::new(DelegationTracker::new()),
+        ));
+        let _sender = router
+            .register(
+                astra_messaging::types::AgentAddress::new("parent-run", "lead"),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut receiver = router
+            .register(
+                astra_messaging::types::AgentAddress::new("child-run", "member"),
+                Some("parent-run".into()),
+            )
+            .await
+            .unwrap();
+        let obligations = Default::default();
+        for mut args in [
+            json!({"message": {"text":"do not serialize"}}),
+            json!({"message": ["do not serialize"]}),
+            json!({"message": true}),
+            json!({"message": null}),
+            json!({"message": "   "}),
+            json!({"message": "界".repeat(3_001)}),
+            json!({"message": "valid", "message_type": false}),
+            json!({"message": "valid", "message_type": "unknown"}),
+        ] {
+            args["to"] = json!("member");
+            let output = handle_agent_send_message_with_router(
+                &args,
+                &router,
+                "parent-run",
+                "lead",
+                &obligations,
+            )
+            .await;
+            let receipt: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(receipt["status"], "rejected", "{receipt}");
+            assert_eq!(receipt["executed"], false, "{receipt}");
+            assert!(receiver.try_recv().is_none(), "{receipt}");
+        }
+        let content = "界".repeat(3_000);
+        let output = handle_agent_send_message_with_router(
+            &json!({"to":"member", "message":content}),
+            &router,
+            "parent-run",
+            "lead",
+            &obligations,
+        )
+        .await;
+        let receipt: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt["status"], "queued", "{receipt}");
+        let received = receiver.try_recv().expect("actual mailbox delivery");
+        assert!(
+            matches!(&received.payload, MessagePayload::Text { content: actual, .. } if actual == &content)
+        );
     }
 
     #[test]
@@ -4883,7 +4942,7 @@ pub(crate) mod tests {
         .await;
         let result: Value = serde_json::from_str(&result).expect("structured skip outcome");
 
-        assert_eq!(result["status"], "completed");
+        assert_eq!(result["status"], "rejected");
         assert_eq!(result["outcome"], "delegation_skipped");
         assert_eq!(result["reason_code"], "insufficient_time_to_delegate");
         assert_eq!(result["executed"], false);
@@ -8284,7 +8343,8 @@ pub(crate) mod tests {
 
         assert_eq!(value["status"], "still_running");
         assert_eq!(value["waited_secs"], 1);
-        assert_eq!(value["delivery"], "asynchronous_parent_mailbox");
+        assert!(value.get("delivery").is_none());
+        assert_eq!(value["observation_timed_out"], true);
         assert!(
             value["hint"]
                 .as_str()

@@ -186,7 +186,8 @@ pub(crate) fn save_profile_auth_tokens(
 }
 
 pub(crate) fn save_refreshed_profile_tokens(
-    profile: Option<&str>,
+    profile: &str,
+    expected: &Profile,
     tokens: &AuthTokenPayload,
 ) -> Result<(), String> {
     let user_id = tokens.user_id.clone();
@@ -194,9 +195,9 @@ pub(crate) fn save_refreshed_profile_tokens(
     let refresh = tokens.refresh_token.clone();
     credential_store()
         .mutate(|creds| {
-            let name =
-                CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
-            let entry = creds.profiles.entry(name.clone()).or_default();
+            let name = profile;
+            let entry = creds.profiles.get_mut(name)
+                .ok_or_else(|| "refresh credential source was removed".to_string())?;
             match entry.account_id.as_deref() {
                 Some(existing_account_id) if existing_account_id == user_id => {}
                 Some(existing_account_id) => {
@@ -209,6 +210,14 @@ pub(crate) fn save_refreshed_profile_tokens(
                         "profile '{name}' has no server-issued account_id; log in again instead of refreshing unbound credentials"
                     ));
                 }
+            }
+            // Account labels alone cannot distinguish a replacement login from
+            // the credential pair that authorized this refresh.
+            if entry.account_id != expected.account_id
+                || entry.access_token != expected.access_token
+                || entry.refresh_token != expected.refresh_token
+            {
+                return Err("refresh credential source was replaced".to_string());
             }
             entry.access_token = Some(access.clone());
             entry.refresh_token = Some(refresh.clone());
@@ -1746,7 +1755,8 @@ mod tests {
         save_credentials(&creds).unwrap();
 
         let error = save_refreshed_profile_tokens(
-            None,
+            "default",
+            &creds.profiles["default"],
             &AuthTokenPayload {
                 user_id: "account-b".to_string(),
                 access_token: "access-b".to_string(),

@@ -1330,8 +1330,7 @@ fn dispatch_slash_background_read(
 ) {
     tasks.spawn(async move {
         let effect = match action {
-            slash_dispatch::SlashBackgroundRead::Team { api, profile, name, attachment_epoch } => {
-                let store = crate::cli::http_team_store::HttpTeamStore::new(&api, profile.as_deref());
+            slash_dispatch::SlashBackgroundRead::Team { store, name, attachment_epoch } => {
                 SlashBackgroundReadEffect::Team {
                     result: crate::cli::slash::slash_team::load_team_configurations(&store, "", name.as_deref()).await,
                     detail: name.is_some(),
@@ -20454,16 +20453,30 @@ mod tests {
         credentials.profiles.insert(
             "default".into(),
             Profile {
+                account_id: Some("owner-1".into()),
                 access_token: Some("test-token".into()),
                 ..Default::default()
             },
         );
+        credentials.profiles.insert(
+            "other".into(),
+            Profile {
+                account_id: Some("owner-2".into()),
+                access_token: Some("other-token".into()),
+                ..Default::default()
+            },
+        );
         crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner-1"),
+        )
+        .unwrap();
         let server = MockServer::start().await;
         let definition = serde_json::json!({
             "team_id": "team-1", "user_id": "owner-1", "name": "Product team",
             "description": "Ship a small feature", "members": [],
-            "context": {}, "created_at": "2026-10-05", "updated_at": "2026-10-05"
+            "context": {}, "revision": 1
         });
         for (endpoint, status, body) in [
             (
@@ -20471,20 +20484,24 @@ mod tests {
                 200,
                 serde_json::json!({"teams": [definition.clone()]}),
             ),
-            ("/teams/Product%20team", 200, definition),
+            ("/teams/name/Product%20team", 200, definition),
             (
-                "/teams/missing",
+                "/teams/name/missing",
                 404,
                 serde_json::json!({"error": "not found"}),
             ),
             (
-                "/teams/offline",
+                "/teams/name/offline",
                 503,
                 serde_json::json!({"error": "unavailable"}),
             ),
         ] {
             Mock::given(method("GET"))
                 .and(path(endpoint))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer test-token",
+                ))
                 .respond_with(ResponseTemplate::new(status).set_body_json(body))
                 .expect(1)
                 .mount(&server)
@@ -20498,17 +20515,19 @@ mod tests {
             let mut widget = chat_widget::ChatWidget::new("session-team");
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             let mut tasks = tokio::task::JoinSet::new();
-            dispatch_slash_background_read(
-                slash_dispatch::SlashBackgroundRead::Team {
-                    api: api.clone(),
-                    profile: None,
-                    name: name.map(str::to_owned),
-                    attachment_epoch: state.session_attachment_epoch,
-                },
-                7,
-                tx,
-                &mut tasks,
-            );
+            let action = slash_dispatch::SlashBackgroundRead::Team {
+                store: crate::cli::http_team_store::HttpTeamStore::new(&api, None),
+                name: name.map(str::to_owned),
+                attachment_epoch: state.session_attachment_epoch,
+            };
+            // Selection changes after the action is queued must not change
+            // which account supplies the background read's credentials.
+            let _other = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "other",
+                Some("owner-2"),
+            )
+            .unwrap();
+            dispatch_slash_background_read(action, 7, tx, &mut tasks);
             let completion = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
                 .await
                 .unwrap()
@@ -20556,6 +20575,34 @@ mod tests {
             }
         }
         server.verify().await;
+        server.reset().await;
+        let queued = slash_dispatch::SlashBackgroundRead::Team {
+            store: crate::cli::http_team_store::HttpTeamStore::new(&api, None),
+            name: None,
+            attachment_epoch: state.session_attachment_epoch,
+        };
+        credentials
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .access_token = Some("replacement-login-token".into());
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        dispatch_slash_background_read(queued, 8, tx, &mut tasks);
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            completion.effect,
+            SlashBackgroundReadEffect::Team { result: Err(_), .. }
+        ));
+        tasks.join_next().await.unwrap().unwrap();
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a queued Team read cannot borrow a replacement login"
+        );
     }
 
     #[test]
@@ -20571,15 +20618,14 @@ mod tests {
                 name: "Product team".into(),
                 description: "A reusable team".into(),
                 context: Default::default(),
-                created_at: "2026-10-05".into(),
-                updated_at: "2026-10-05".into(),
+                revision: 1,
                 members: ["Research", "Delivery"]
                     .into_iter()
                     .enumerate()
                     .map(
                         |(index, role)| astra_services::team_persistence::TeamMemberDef {
                             role: role.into(),
-                            agent_id: Some(format!("opaque-member-{index}")),
+                            agent_id: format!("opaque-member-{index}"),
                             can_delegate: delegation[index],
                             ..Default::default()
                         },

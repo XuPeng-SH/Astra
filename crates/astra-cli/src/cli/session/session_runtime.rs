@@ -1083,10 +1083,12 @@ pub(crate) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
     }
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
-    let prof = creds.profiles.get(&name);
+    let Some(prof) = creds.profiles.get(&name) else {
+        return;
+    };
 
     // Try existing access_token
-    if let Some(token) = prof.and_then(|p| p.access_token.as_ref()) {
+    if let Some(token) = prof.access_token.as_ref() {
         match api
             .get_auth_me_text_timeout(token, std::time::Duration::from_secs(3))
             .await
@@ -1101,13 +1103,13 @@ pub(crate) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
         return;
     }
 
-    let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref()) else {
+    let Some(refresh) = prof.refresh_token.as_ref() else {
         return;
     };
     let refresh_str = refresh.as_str();
 
-    match try_refresh_token(api, profile, refresh_str).await {
-        Ok(()) => {
+    match try_refresh_token(api, &name, prof, None).await {
+        Ok(_) => {
             eprintln!("  {} Token refreshed", theme::icon_ok());
         }
         Err(err) => {
@@ -1159,7 +1161,7 @@ async fn recover_credentials_after_refresh_race(
     }
     if let Some(r) = prof.refresh_token.as_ref()
         && r.as_str() != attempted_refresh
-        && try_refresh_token(api, profile, r.as_str()).await.is_ok()
+        && try_refresh_token(api, &name, prof, None).await.is_ok()
     {
         eprintln!("  {} Token refreshed", theme::icon_ok());
         return true;
@@ -1170,17 +1172,67 @@ async fn recover_credentials_after_refresh_race(
 /// Try to refresh an expired access token using the stored refresh_token.
 async fn try_refresh_token(
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    refresh_token: &str,
-) -> Result<(), SilentRefreshError> {
-    let body = api
-        .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
-        .await
-        .map_err(SilentRefreshError::Thin)?;
-    let tokens = parse_auth_tokens(&body)
-        .map_err(|error| SilentRefreshError::BadResponse(format!("refresh response: {error}")))?;
-    save_refreshed_profile_tokens(profile, &tokens).map_err(SilentRefreshError::SaveFailed)?;
-    Ok(())
+    profile: &str,
+    expected: &astra_credentials::Profile,
+    mut owner_pair: Option<tokio::sync::OwnedMutexGuard<(Option<String>, Option<String>)>>,
+) -> Result<crate::cli::auth_flow::AuthTokenPayload, SilentRefreshError> {
+    // The credential owner retains settlement once refresh starts. A timed-out
+    // Team operation may stop waiting, but cannot abandon a rotated token pair
+    // before checked persistence. Dropping this join handle never resends HTTP.
+    let api = api.clone();
+    let profile = profile.to_owned();
+    let expected = expected.clone();
+    tokio::spawn(async move {
+        let current = crate::cli::cli_config::cli_utils::credential_store()
+            .load()
+            .map_err(|error| SilentRefreshError::SaveFailed(error.to_string()))?;
+        let account = expected
+            .account_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty());
+        let refresh_token = expected
+            .refresh_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+        if account.is_none()
+            || refresh_token.is_none()
+            || owner_pair.as_ref().is_some_and(|pair| {
+                pair.0 != expected.access_token || pair.1 != expected.refresh_token
+            })
+            || !current.profiles.get(&profile).is_some_and(|current| {
+                current.account_id == expected.account_id
+                    && current.access_token == expected.access_token
+                    && current.refresh_token == expected.refresh_token
+            })
+        {
+            return Err(SilentRefreshError::SaveFailed(
+                "refresh credential source changed or is unbound".into(),
+            ));
+        }
+        let body = api
+            .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+            .await
+            .map_err(SilentRefreshError::Thin)?;
+        let tokens = parse_auth_tokens(&body).map_err(|error| {
+            SilentRefreshError::BadResponse(format!("refresh response: {error}"))
+        })?;
+        if Some(tokens.user_id.as_str()) != account {
+            return Err(SilentRefreshError::BadResponse(
+                "refresh response account changed".into(),
+            ));
+        }
+        save_refreshed_profile_tokens(&profile, &expected, &tokens)
+            .map_err(SilentRefreshError::SaveFailed)?;
+        // The same settlement owns both disk persistence and binding progress.
+        // Keep the auth lock here even if its original Team waiter timed out.
+        if let Some(pair) = owner_pair.as_mut() {
+            pair.0 = Some(tokens.access_token.clone());
+            pair.1 = Some(tokens.refresh_token.clone());
+        }
+        Ok(tokens)
+    })
+    .await
+    .map_err(|_| SilentRefreshError::SaveFailed("refresh settlement interrupted".into()))?
 }
 
 /// Attempt to refresh an expired token mid-session.
@@ -1212,9 +1264,8 @@ pub(crate) async fn attempt_token_refresh(
         return false;
     };
     let refresh_str = refresh.clone();
-    drop(creds);
-    match try_refresh_token(api, profile, &refresh_str).await {
-        Ok(()) => true,
+    match try_refresh_token(api, &name, &creds.profiles[&name], None).await {
+        Ok(_) => true,
         Err(err) => {
             if err.keep_credentials() {
                 astra_core::agent_warn!(
@@ -1322,6 +1373,53 @@ pub(crate) async fn fresh_access_token(
 }
 
 pub(crate) use astra_credentials::native::AccessMiss;
+
+/// Credentials for a queued owner-bound operation. Never reselect the active
+/// native binding, current legacy profile, or environment bearer at dispatch.
+pub(crate) async fn owner_access_token(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Option<String> {
+    let account = owner
+        .server_account_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())?;
+    let profile = owner.profile_name.as_deref()?;
+    if let Some(binding) = &owner.native_binding {
+        if binding.endpoint().trim_end_matches('/') != api.api_origin().trim_end_matches('/') {
+            return None;
+        }
+        return binding.access_token().await.ok();
+    }
+    let pair = owner.legacy_pair.clone().lock_owned().await;
+    let credentials = crate::cli::cli_config::cli_utils::credential_store()
+        .load()
+        .ok()?;
+    let expected = credentials.profiles.get(profile).filter(|entry| {
+        entry.account_id.as_deref() == Some(account)
+            && entry.access_token == pair.0
+            && entry.refresh_token == pair.1
+    })?;
+    if let Some(token) = crate::cli::cli_config::cli_utils::bound_profile_access_token(expected)
+        && !access_token_needs_refresh(token, chrono::Utc::now().timestamp())
+    {
+        return Some(token.to_owned());
+    }
+    // One refresh only. Do not borrow a concurrent replacement via the ordinary
+    // interactive auth race-recovery path or follow current_profile afterward.
+    let refreshed = try_refresh_token(api, profile, expected, Some(pair))
+        .await
+        .ok()?;
+    let credentials = crate::cli::cli_config::cli_utils::credential_store()
+        .load()
+        .ok()?;
+    let saved = credentials.profiles.get(profile)?;
+    (saved.account_id.as_deref() == Some(account)
+        && saved.access_token.as_deref() == Some(refreshed.access_token.as_str())
+        && saved.refresh_token.as_deref() == Some(refreshed.refresh_token.as_str())
+        && !access_token_needs_refresh(&refreshed.access_token, chrono::Utc::now().timestamp()))
+    .then_some(refreshed.access_token)
+}
 
 /// Token for a user-visible turn. Unlike `fresh_access_token`, a failure stays
 /// typed so the TUI can distinguish "not logged in" from a network blip or an

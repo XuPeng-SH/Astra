@@ -298,7 +298,8 @@ mod tests {
             v["status"],
             AgentToolResultStatusKind::StillRunning.as_str()
         );
-        assert_eq!(v["delivery"], "asynchronous_parent_mailbox");
+        assert!(v.get("delivery").is_none());
+        assert_eq!(v["observation_timed_out"], true);
         assert!(
             v["hint"]
                 .as_str()

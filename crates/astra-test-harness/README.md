@@ -52,6 +52,37 @@ code is correct. Branch acceptance requires the deterministic HTTP system
 matrix against the current binary/DB wiring; a deployment smoke additionally
 needs the target Server revision recorded by the release workflow.
 
+Cases may select the native `team run` entrypoint with `team: {name: my-team}`
+and an optional exact `lead_agent_id`. The owner must already have that Team
+definition; fixture provisioning uses the ordinary authenticated Team API/CLI.
+The model matrix selects the lead's model, not every member's model. Follow-up
+turns retain the same Team selection and server-issued session. Capture,
+watchdogs, criteria, Explain and cache accounting are shared with ordinary Chat;
+no separate Team executor or lifecycle is installed by the harness. External
+command executors reject these native cases rather than silently running Chat.
+A completed lead turn alone does not prove child launch, result adoption, or whole-Team cost
+coverage: require the corresponding child evidence and retain unknown coverage.
+
+The opt-in `cases/team_shared_agent_journey/native_member_context.yaml` uses a
+small shared-context handoff, not an expensive code-review task. Provision its
+definition through the same authenticated CLI and profile used by the harness:
+
+```sh
+astra --profile "$ASTRA_PROFILE" team create harness-shared-agent
+astra --profile "$ASTRA_PROFILE" team add-member harness-shared-agent lead --can-delegate -- Coordinate the configured members and adopt their observed results
+astra --profile "$ASTRA_PROFILE" team add-member harness-shared-agent reader --model glm-5.2 -- Read requested values from the team shared context and return them faithfully
+astra --profile "$ASTRA_PROFILE" team context harness-shared-agent delivery_code BLUE-17
+```
+
+Use a dedicated test owner and an available `glm-5.2` offering. Select the lead's
+model through the harness model matrix, for example `deepseek-v4-flash`. Do not
+repeat provisioning blindly after an uncertain write. This case requires a
+physical GLM child round linked to the launch, completed child state, exact result
+adoption and the final value. Missing Server child evidence fails the case; a
+manual observation or parent-only journal cannot substitute for it. Cache and
+cost coverage remain separate reported measurements, not inferred from this
+behavioral pass. Remove only this owner's fixture when finished.
+
 For a revision-bound comparison, set `ASTRA_EXPECTED_BUILD_GIT_SHA` to the full
 40-character commit SHA. Before any model probe, preflight requires the harness,
 selected CLI and Server to report that exact revision and an explicitly clean

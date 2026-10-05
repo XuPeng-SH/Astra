@@ -548,13 +548,21 @@ pub async fn run(
                 .ok_or_else(|| format!("no profile '{name}'"))?;
             let refresh_token = saved_profile
                 .refresh_token
+                .as_ref()
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
+            if saved_profile
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("refresh requires a server-issued account_id; log in again".into());
+            }
             let body = api
                 .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
             let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
+            save_refreshed_profile_tokens(&name, &saved_profile, &tokens)?;
             stdout_println!("token refreshed");
             Ok(())
         }

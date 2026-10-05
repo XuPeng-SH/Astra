@@ -1108,18 +1108,30 @@ mod token_refresh_error_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn public_team_run_registers_after_canonical_lead_validation() {
+        use crate::cli::cli_config::cli_utils;
+
         let _creds = crate::tests::isolate_credentials();
         let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "team-token");
         let _registry = EnvVarGuard::remove("ASTRA_EDGE_REGISTRY");
+        let mut credentials = astra_credentials::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            astra_credentials::Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("team-token".into()),
+                ..Default::default()
+            },
+        );
+        cli_utils::save_credentials(&credentials).unwrap();
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
         let server = MockServer::start().await;
-        let mut team =
-            astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
-                .remove(0);
+        let mut team = astra_services::team_persistence::builtin_teams("owner").remove(0);
         team.team_id = "server-team-id".into();
         team.name = "dev".into();
-        team.members[0].agent_id = Some("lead".into());
+        team.members[0].agent_id = "lead".into();
         Mock::given(method("GET"))
-            .and(path("/teams/dev"))
+            .and(path("/teams/name/dev"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&team))
             .expect(2)
             .mount(&server)
@@ -1161,7 +1173,7 @@ mod token_refresh_error_tests {
         );
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 2, "chat and child admission must not start");
-        assert_eq!(requests[0].url.path(), "/teams/dev");
+        assert_eq!(requests[0].url.path(), "/teams/name/dev");
         assert_eq!(requests[1].url.path(), "/agents/edge");
 
         let error = execute_repl_bridge_command(
@@ -1180,28 +1192,19 @@ mod token_refresh_error_tests {
         );
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 4);
-        assert_eq!(requests[2].url.path(), "/teams/dev");
+        assert_eq!(requests[2].url.path(), "/teams/name/dev");
         assert_eq!(requests[3].url.path(), "/agents/edge");
 
         server.reset().await;
-        Mock::given(method("GET"))
-            .and(path("/teams"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "teams": []
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut accepted =
-            astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
-                .remove(0);
-        accepted.team_id = "server-team-id".into();
-        accepted.name = "draft".into();
-        accepted.description = "description".into();
-        accepted.members.clear();
         Mock::given(method("POST"))
             .and(path("/teams"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&accepted))
+            .respond_with(|request: &wiremock::Request| {
+                let mut accepted: serde_json::Value = request.body_json().unwrap();
+                assert!(!accepted["team_id"].as_str().unwrap().is_empty());
+                accepted["user_id"] = serde_json::json!("owner");
+                accepted["revision"] = serde_json::json!(1);
+                ResponseTemplate::new(200).set_body_json(accepted)
+            })
             .expect(1)
             .mount(&server)
             .await;
@@ -1219,9 +1222,12 @@ mod token_refresh_error_tests {
 
         assert_eq!(result, crate::cli::exit_code::ExitCode::Success);
         let requests = server.received_requests().await.expect("requests");
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].method.as_str(), "GET");
-        assert_eq!(requests[1].method.as_str(), "POST");
+        assert_eq!(
+            requests.len(),
+            1,
+            "create must not hydrate or reread a collection"
+        );
+        assert_eq!(requests[0].method.as_str(), "POST");
         assert!(
             requests
                 .iter()
@@ -1653,13 +1659,21 @@ async fn execute_cli_command_impl(
                 .ok_or_else(|| format!("no profile '{name}'"))?;
             let refresh_token = saved_profile
                 .refresh_token
+                .as_ref()
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
+            if saved_profile
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("refresh requires a server-issued account_id; log in again".into());
+            }
             let body = api
                 .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
             let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
+            save_refreshed_profile_tokens(&name, &saved_profile, &tokens)?;
             stdout_println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }

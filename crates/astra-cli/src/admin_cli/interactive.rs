@@ -209,13 +209,21 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
                 .ok_or_else(|| format!("no profile '{name}'"))?;
             let refresh_token = saved
                 .refresh_token
+                .as_ref()
                 .ok_or_else(|| "no refresh token".to_string())?;
+            if saved
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("refresh requires a server-issued account_id; log in again".into());
+            }
             let body = api
                 .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
             let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(profile, &tokens)?;
+            save_refreshed_profile_tokens(&name, &saved, &tokens)?;
             eprintln!("{}", "✓ Token refreshed".green());
             Ok(())
         } else if line.eq("logout") {

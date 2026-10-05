@@ -1178,7 +1178,7 @@ async fn try_drain_sync_outbox_for_snapshot(
     let token = if let Some(binding) = &auth_snapshot.native_binding {
         binding.access_token().await.ok()
     } else {
-        auth_snapshot.access_token.clone()
+        auth_snapshot.access_token().await
     };
     let Some(token) = token else {
         report.blocker = Some(SyncOutboxDrainBlocker::MissingAccessToken);

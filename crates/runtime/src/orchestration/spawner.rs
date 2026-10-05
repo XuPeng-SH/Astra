@@ -14556,8 +14556,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn builtin_team_leads_spawn_members_through_shared_admission() {
-        for team in astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
-        {
+        for team in astra_services::team_persistence::builtin_teams("owner") {
             let profiles: Vec<_> = team
                 .members
                 .iter()

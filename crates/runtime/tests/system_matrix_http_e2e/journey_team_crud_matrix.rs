@@ -6,15 +6,17 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use super::harness::{bootstrap, delete_json, get_json, post_json};
+use super::harness::{bootstrap, delete_json, get_json, post_json, put_json};
 
 fn minimal_team_payload(name: &str, description: &str) -> Value {
     json!({
+        "team_id": uuid::Uuid::new_v4().to_string(),
         "name": name,
         "description": description,
         "members": [
             {
                 "role": "coder",
+                "agent_id": "coder",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -22,6 +24,7 @@ fn minimal_team_payload(name: &str, description: &str) -> Value {
             },
             {
                 "role": "reviewer",
+                "agent_id": "reviewer",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -56,7 +59,7 @@ pub async fn run_team_crud_db() {
         "list should include our team: {list_j}"
     );
 
-    let path_detail = format!("/teams/{team_name}");
+    let path_detail = format!("/teams/{team_id}");
     let (st_get, get_j) = get_json(&ctx.app, &path_detail, Some(auth), &[]).await;
     assert_eq!(st_get, StatusCode::OK, "GET team: {get_j}");
     assert_eq!(get_j["team_id"].as_str(), Some(team_id.as_str()));
@@ -73,17 +76,20 @@ pub async fn run_team_crud_db() {
     assert_eq!(row.get::<String, _>("team_id"), team_id);
     assert_eq!(row.get::<String, _>("user_id"), ctx.user_id);
 
-    let payload_v2 = minimal_team_payload(&team_name, "matrix e2e team crud v2 upsert");
-    let (st2, body2) = post_json(&ctx.app, "/teams", Some(auth), payload_v2).await;
-    assert_eq!(st2, StatusCode::OK, "POST /teams upsert: {body2}");
+    let mut payload_v2 = payload_v1;
+    payload_v2.as_object_mut().unwrap().remove("team_id");
+    payload_v2["expected_revision"] = body["revision"].clone();
+    payload_v2["description"] = json!("matrix e2e team crud v2 CAS");
+    let (st2, body2) = put_json(&ctx.app, &path_detail, Some(auth), payload_v2).await;
+    assert_eq!(st2, StatusCode::OK, "PUT Team CAS: {body2}");
     assert_eq!(
         body2["team_id"].as_str(),
         Some(team_id.as_str()),
-        "upsert keeps logical team_id from first create"
+        "CAS preserves immutable team identity"
     );
     assert_eq!(
         body2["description"].as_str(),
-        Some("matrix e2e team crud v2 upsert")
+        Some("matrix e2e team crud v2 CAS")
     );
 
     let desc_db: String = sqlx::query_scalar(
@@ -93,8 +99,8 @@ pub async fn run_team_crud_db() {
     .bind(&team_name)
     .fetch_one(&ctx.pool)
     .await
-    .expect("description after upsert");
-    assert_eq!(desc_db, "matrix e2e team crud v2 upsert");
+    .expect("description after CAS");
+    assert_eq!(desc_db, "matrix e2e team crud v2 CAS");
 
     let (st_del, del_j) = delete_json(&ctx.app, &path_detail, Some(auth)).await;
     assert_eq!(st_del, StatusCode::OK, "DELETE team: {del_j}");

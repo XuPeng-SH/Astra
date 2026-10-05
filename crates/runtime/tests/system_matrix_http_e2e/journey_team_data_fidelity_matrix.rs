@@ -9,6 +9,7 @@ use super::harness::{bootstrap, delete_json, get_json, post_json};
 
 fn fidelity_team_payload(name: &str) -> Value {
     json!({
+        "team_id": uuid::Uuid::new_v4().to_string(),
         "name": name,
         "description": "data fidelity probe",
         "members": [
@@ -18,7 +19,7 @@ fn fidelity_team_payload(name: &str) -> Value {
                 "skills": ["read"],
                 "model_selection": null,
                 "mcp_servers": [],
-                "agent_id": null,
+                "agent_id": "coder",
                 "can_delegate": false,
                 "max_delegation_depth": 0
             },
@@ -47,7 +48,8 @@ pub async fn run_team_http_db_fidelity() {
     let (st, detail) = post_json(&ctx.app, "/teams", Some(auth), payload).await;
     assert_eq!(st, StatusCode::OK, "POST team: {detail}");
 
-    let path_detail = format!("/teams/{team_name}");
+    let team_id = detail["team_id"].as_str().expect("team_id");
+    let path_detail = format!("/teams/{team_id}");
     let (st_get, get_j) = get_json(&ctx.app, &path_detail, Some(auth), &[]).await;
     assert_eq!(st_get, StatusCode::OK, "GET detail: {get_j}");
 
@@ -109,7 +111,7 @@ pub async fn run_team_http_db_fidelity() {
     });
     let (st_sn, sn_j) = post_json(
         &ctx.app,
-        &format!("/teams/{team_name}/snapshots"),
+        &format!("/teams/{team_id}/snapshots"),
         Some(auth),
         snap_body,
     )
@@ -144,7 +146,7 @@ pub async fn run_team_http_db_fidelity() {
         "snapshot blob user_id matches JWT subject"
     );
 
-    let path_snaps = format!("/teams/{team_name}/snapshots");
+    let path_snaps = format!("/teams/{team_id}/snapshots");
     let (st_sn_list, snaps_j) = get_json(&ctx.app, &path_snaps, Some(auth), &[]).await;
     assert_eq!(st_sn_list, StatusCode::OK);
     let snaps = snaps_j["snapshots"].as_array().expect("snapshots");

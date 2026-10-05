@@ -644,7 +644,6 @@ fn normalized_fanout_start_status(event: &Value, output: &str) -> String {
         output,
     ) {
         Some(AgentFanoutControlReceiptKind::Group) => "completed".to_string(),
-        Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance) => "skipped".to_string(),
         Some(
             AgentFanoutControlReceiptKind::RejectedBeforeAcceptance
             | AgentFanoutControlReceiptKind::ExecutionUnknown,
@@ -13494,6 +13493,11 @@ mod tests {
     #[tokio::test]
     async fn edge_tool_result_refresh_failure_returns_terminal_auth_error() {
         let _creds_guard = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "test",
+            Some("user-id-1"),
+        )
+        .unwrap();
 
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),
@@ -13502,6 +13506,7 @@ mod tests {
         creds.profiles.insert(
             "test".to_string(),
             Profile {
+                account_id: Some("user-id-1".to_string()),
                 access_token: Some("expired-token".to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()

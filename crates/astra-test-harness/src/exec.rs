@@ -125,36 +125,49 @@ impl CaseExecutor for AstraCliExecutor {
     }
 
     fn reproducer(&self, case: &Case, model: &str) -> String {
-        // Mirrors the args assembled below. Quote the prompt so it
-        // survives a copy-paste.
-        let has_session_id_in_extras = has_session_id(&case.extra_cli_args);
-        let mut parts = vec![
-            shell_escape(self.cfg.astra_bin.display().to_string()),
-            "chat".into(),
-            "-m".into(),
-            shell_escape(case.prompt.clone()),
-        ];
-        if !has_session_id_in_extras {
-            parts.push("--no-resume".into());
+        let mut parts = vec![shell_escape(self.cfg.astra_bin.display().to_string())];
+        if let Some(profile) = &self.cfg.profile {
+            parts.extend(["--profile".into(), shell_escape(profile.clone())]);
         }
-        parts.extend([
-            "--model".into(),
-            shell_escape(model.to_string()),
-            "--json".into(),
-            "--explain=on".into(),
-            "--stream-events".into(),
-            "\"$(mktemp -d)/events.jsonl\"".into(),
-            "-y".into(),
-        ]);
-        if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
-            parts.push("--max-wall-time-seconds".into());
-            parts.push(shell_escape(cli_wall_time_seconds.to_string()));
-        }
-        for extra in &case.extra_cli_args {
-            parts.push(shell_escape(extra.clone()));
-        }
+        parts.extend(
+            case_cli_arguments(case, model, "events.jsonl")
+                .into_iter()
+                .map(shell_escape),
+        );
         parts.join(" ")
     }
+}
+
+/// One argument owner for execution and reproductions. Team changes only the
+/// public entrypoint; capture, isolation, deadlines and continuation stay shared.
+fn case_cli_arguments(case: &Case, model: &str, events_path: &str) -> Vec<String> {
+    let mut args = vec!["--model".into(), model.into(), "-y".into()];
+    if let Some(team) = &case.team {
+        args.extend(["team".into(), "run".into(), team.name.clone()]);
+        if let Some(lead) = &team.lead_agent_id {
+            args.extend(["--lead-agent-id".into(), lead.clone()]);
+        }
+    } else {
+        args.push("chat".into());
+    }
+    args.extend([
+        "--json".into(),
+        "--explain=on".into(),
+        "--stream-events".into(),
+        events_path.into(),
+    ]);
+    if !has_session_id(&case.extra_cli_args) {
+        args.push("--no-resume".into());
+    }
+    if let Some(seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
+        args.extend(["--max-wall-time-seconds".into(), seconds.to_string()]);
+    }
+    args.extend(case.extra_cli_args.clone());
+    args.extend([
+        if case.team.is_some() { "--" } else { "-m" }.into(),
+        case.prompt.clone(),
+    ]);
+    args
 }
 
 fn shell_escape(s: String) -> String {
@@ -584,7 +597,6 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     if let Some(ref profile) = cfg.profile {
         cmd.arg("--profile").arg(profile);
     }
-    cmd.arg("chat").arg("-m").arg(&case.prompt);
     // A missing --session-id deliberately means "create a session".  The
     // server, not the harness, owns session identity: inventing a UUID here
     // turns the first turn into an explicit resume request, which a correctly
@@ -597,26 +609,13 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     // `astra chat` normally resumes the most recent one-shot session, so make
     // the root run explicitly isolated as well.  Do not add this on follow-up
     // turns: there `--session-id` is the authoritative continuation request.
-    if !has_session_id(&case.extra_cli_args) {
-        cmd.arg("--no-resume");
-    }
-    cmd.arg("--model")
-        .arg(model)
-        .arg("--json")
-        .arg("--explain=on")
-        // Exact lifecycle evidence used only for safe timeout convergence.
-        .arg("--stream-events")
-        .arg(&stream_event_path)
-        .arg("-y");
-    if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
-        cmd.arg("--max-wall-time-seconds")
-            .arg(cli_wall_time_seconds.to_string());
-    }
+    cmd.args(case_cli_arguments(
+        case,
+        model,
+        &stream_event_path.to_string_lossy(),
+    ));
     if let Some(ref wd) = cfg.working_dir {
         cmd.current_dir(wd);
-    }
-    for extra in &case.extra_cli_args {
-        cmd.arg(extra);
     }
     for (k, v) in &case.cli_env {
         cmd.env(k, v);
@@ -1057,6 +1056,16 @@ impl ExternalCmdExecutor {
 impl CaseExecutor for ExternalCmdExecutor {
     async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
         use tokio::process::Command;
+
+        if case.team.is_some() {
+            return RunOutcome {
+                model: model.into(),
+                exit_code: 2,
+                text: "Native Team entrypoints require the Astra CLI executor".into(),
+                error_kind: Some("invalid_request".into()),
+                ..Default::default()
+            };
+        }
 
         let input = serde_json::json!({
             "protocol_version": "1.1",
@@ -1745,6 +1754,7 @@ mod tests {
             description: None,
             prompt: "say 'hello'".into(),
             prompt_variants: vec![],
+            team: None,
             models: None,
             criteria: vec![],
             debug_log: false,
@@ -1772,7 +1782,7 @@ mod tests {
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--verbose"));
-        assert!(repro.contains("--max-wall-time-seconds '150'"));
+        assert!(repro.contains("'--max-wall-time-seconds' '150'"));
         let mut default_case = simple_case();
         assert!(
             !exec
@@ -1829,47 +1839,78 @@ mod tests {
             args_path.to_string_lossy().into_owned(),
         );
         let exec = AstraCliExecutor::new(RunnerConfig::new(shim));
-        let root = exec.execute(&case, "m").await;
-        let root_args = std::fs::read_to_string(&args_path).expect("root args");
-        assert_eq!(
-            root.session_id.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000"),
-            "root outcome: {root:?}; args={root_args:?}"
-        );
-        assert!(
-            !root_args.lines().any(|arg| arg == "--session-id"),
-            "root turn must not fabricate a resumable id: {root_args:?}"
-        );
-        assert!(root_args.lines().any(|arg| arg == "--no-resume"));
-        assert!(
-            !root_args
-                .lines()
-                .any(|arg| arg == "--max-wall-time-seconds"),
-            "unconfigured cases must preserve the outer watchdog budget: {root_args:?}"
-        );
+        for team in [
+            None,
+            Some(crate::case::TeamEntrypoint {
+                name: "fixture-team".into(),
+                lead_agent_id: Some("fixture-lead".into()),
+            }),
+        ] {
+            case.team = team;
+            case.extra_cli_args.clear();
+            let root = exec.execute(&case, "m").await;
+            let root_args = std::fs::read_to_string(&args_path).expect("root args");
+            let args: Vec<_> = root_args.lines().collect();
+            assert_eq!(&args[..3], &["--model", "m", "-y"]);
+            if case.team.is_some() {
+                assert_eq!(
+                    &args[3..8],
+                    &[
+                        "team",
+                        "run",
+                        "fixture-team",
+                        "--lead-agent-id",
+                        "fixture-lead"
+                    ]
+                );
+                assert_eq!(args[args.len() - 2], "--");
+            } else {
+                assert_eq!(args[3], "chat");
+                assert_eq!(args[args.len() - 2], "-m");
+            }
+            assert_eq!(args.last().copied(), Some(case.prompt.as_str()));
+            assert_eq!(
+                root.session_id.as_deref(),
+                Some("550e8400-e29b-41d4-a716-446655440000"),
+                "root outcome: {root:?}; args={root_args:?}"
+            );
+            assert!(
+                !root_args.lines().any(|arg| arg == "--session-id"),
+                "root turn must not fabricate a resumable id: {root_args:?}"
+            );
+            assert!(root_args.lines().any(|arg| arg == "--no-resume"));
+            assert!(
+                !root_args
+                    .lines()
+                    .any(|arg| arg == "--max-wall-time-seconds"),
+                "unconfigured cases must preserve the outer watchdog budget: {root_args:?}"
+            );
 
-        case.extra_cli_args = vec![
-            "--session-id".into(),
-            "550e8400-e29b-41d4-a716-446655440000".into(),
-        ];
-        let follow_up = exec.execute(&case, "m").await;
-        assert_eq!(
-            follow_up.session_id.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
-        let follow_up_args = std::fs::read_to_string(&args_path).expect("follow-up args");
-        assert!(
-            follow_up_args
-                .lines()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|pair| { pair == ["--session-id", "550e8400-e29b-41d4-a716-446655440000"] }),
-            "follow-up must preserve the server-issued id: {follow_up_args:?}"
-        );
-        assert!(
-            !follow_up_args.lines().any(|arg| arg == "--no-resume"),
-            "follow-up must use the explicit server session, not disable resume: {follow_up_args:?}"
-        );
+            case.extra_cli_args = vec![
+                "--session-id".into(),
+                "550e8400-e29b-41d4-a716-446655440000".into(),
+            ];
+            let follow_up = exec.execute(&case, "m").await;
+            assert_eq!(
+                follow_up.session_id.as_deref(),
+                Some("550e8400-e29b-41d4-a716-446655440000")
+            );
+            let follow_up_args = std::fs::read_to_string(&args_path).expect("follow-up args");
+            assert!(
+                follow_up_args
+                    .lines()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| {
+                        pair == ["--session-id", "550e8400-e29b-41d4-a716-446655440000"]
+                    }),
+                "follow-up must preserve the server-issued id: {follow_up_args:?}"
+            );
+            assert!(
+                !follow_up_args.lines().any(|arg| arg == "--no-resume"),
+                "follow-up must use the explicit server session, not disable resume: {follow_up_args:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2033,6 +2074,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             description: None,
             prompt: "ignored by the shim — just needs to be non-empty".into(),
             prompt_variants: vec![],
+            team: None,
             models: Some(vec!["ignored".into()]),
             criteria: vec![],
             debug_log: false,
@@ -2373,6 +2415,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             description: None,
             prompt: "p".into(),
             prompt_variants: vec![],
+            team: None,
             models: None,
             criteria: vec![],
             debug_log: false,
@@ -2408,6 +2451,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             description: None,
             prompt: "test prompt".into(),
             prompt_variants: vec![],
+            team: None,
             models: Some(vec!["m".into()]),
             criteria: vec![],
             debug_log: false,

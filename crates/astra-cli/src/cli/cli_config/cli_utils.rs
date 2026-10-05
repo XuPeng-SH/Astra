@@ -95,11 +95,33 @@ pub(crate) struct CliProfileIdentity {
     local_owner_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct CliOwnerAuthSnapshot {
     pub(crate) owner_scope: astra_services::OwnerScope,
-    pub(crate) access_token: Option<String>,
+    pub(crate) profile_name: Option<String>,
+    pub(crate) server_account_id: Option<String>,
+    // Only this owner's confirmed refresh settlement may advance the pair.
+    // Clones share its auth lock; a fresh login cannot retarget an old owner.
+    pub(crate) legacy_pair: std::sync::Arc<tokio::sync::Mutex<(Option<String>, Option<String>)>>,
     pub(crate) native_binding: Option<std::sync::Arc<crate::cli::native_auth::Binding>>,
+}
+
+impl CliOwnerAuthSnapshot {
+    pub(crate) async fn access_token(&self) -> Option<String> {
+        self.legacy_pair.lock().await.0.clone()
+    }
+}
+
+impl std::fmt::Debug for CliOwnerAuthSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliOwnerAuthSnapshot")
+            .field("owner_scope", &self.owner_scope)
+            .field("profile_name", &self.profile_name)
+            .field("server_account_id", &self.server_account_id)
+            .field("legacy_pair", &"[redacted]")
+            .field("native_binding", &self.native_binding)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,7 +183,9 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
     let Some(identity) = current_cli_profile_identity() else {
         return CliOwnerAuthSnapshot {
             owner_scope: astra_services::local_owner_scope(),
-            access_token: None,
+            profile_name: None,
+            server_account_id: None,
+            legacy_pair: Default::default(),
             native_binding: None,
         };
     };
@@ -175,19 +199,28 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
                 .is_ok_and(|account_id| Some(account_id) == identity.account_id);
         return CliOwnerAuthSnapshot {
             owner_scope,
-            access_token: None,
+            profile_name: Some(identity.profile_name),
+            server_account_id: identity.account_id.filter(|_| matches_owner),
+            legacy_pair: Default::default(),
             native_binding: matches_owner.then(|| binding.clone()),
         };
     }
-    let access_token = load_credentials()
-        .profiles
-        .get(&identity.profile_name)
-        .filter(|profile| profile.account_id == identity.account_id)
+    let credentials = credential_store().load().ok();
+    let profile = credentials
+        .as_ref()
+        .and_then(|credentials| credentials.profiles.get(&identity.profile_name))
+        .filter(|profile| profile.account_id == identity.account_id);
+    let access_token = profile
         .and_then(bound_profile_access_token)
         .map(ToString::to_string);
     CliOwnerAuthSnapshot {
         owner_scope,
-        access_token,
+        profile_name: Some(identity.profile_name),
+        server_account_id: identity.account_id,
+        legacy_pair: std::sync::Arc::new(tokio::sync::Mutex::new((
+            access_token,
+            profile.and_then(|profile| profile.refresh_token.clone()),
+        ))),
         native_binding: None,
     }
 }
@@ -1064,13 +1097,28 @@ mod tests {
             Profile {
                 account_id: Some("account-a".to_string()),
                 access_token: Some("token-a".to_string()),
+                refresh_token: Some("refresh-a".to_string()),
                 ..Default::default()
             },
         );
         save_credentials(&credentials).unwrap();
 
         let before = cli_owner_auth_snapshot();
-        assert_eq!(before.access_token.as_deref(), Some("token-a"));
+        assert_eq!(
+            before.legacy_pair.try_lock().unwrap().0.as_deref(),
+            Some("token-a")
+        );
+        assert_eq!(
+            before.legacy_pair.try_lock().unwrap().1.as_deref(),
+            Some("refresh-a")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &before.legacy_pair,
+            &before.clone().legacy_pair
+        ));
+        let debug = format!("{before:?}");
+        assert!(!debug.contains("token-a"));
+        assert!(!debug.contains("refresh-a"));
 
         credentials.profiles.insert(
             "profile-a".to_string(),
@@ -1085,7 +1133,8 @@ mod tests {
         let transition_window = cli_owner_auth_snapshot();
         assert_eq!(transition_window.owner_scope, before.owner_scope);
         assert_eq!(
-            transition_window.access_token, None,
+            transition_window.legacy_pair.try_lock().unwrap().0,
+            None,
             "an account mismatch must pause delivery instead of borrowing the replacement token"
         );
 
@@ -1093,7 +1142,10 @@ mod tests {
             install_cli_profile_identity_for_test("profile-a", Some("account-b")).unwrap();
         let after = cli_owner_auth_snapshot();
         assert_ne!(after.owner_scope, before.owner_scope);
-        assert_eq!(after.access_token.as_deref(), Some("token-b"));
+        assert_eq!(
+            after.legacy_pair.try_lock().unwrap().0.as_deref(),
+            Some("token-b")
+        );
     }
 
     #[serial_test::serial]
@@ -1124,7 +1176,7 @@ mod tests {
         configure_cli_profile_identity(None, CliProfileIdentityAdmission::AuthenticationBootstrap)
             .expect("login/register must reach the server to obtain account_id");
         assert_eq!(
-            cli_owner_auth_snapshot().access_token,
+            cli_owner_auth_snapshot().legacy_pair.try_lock().unwrap().0,
             None,
             "anonymous bootstrap state must never inherit an unbound credential"
         );

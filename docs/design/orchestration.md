@@ -68,13 +68,22 @@ preserve actual terminal outcomes or explicitly unfinished recovery state.
 ### Team configuration ownership
 
 Team definitions have one owner-scoped persistence contract. CLI commands use
-the existing HTTP adapter; their registry is a display projection, not a second
-configuration store or template authority. An empty roster is a valid draft,
+the existing HTTP adapter directly; no client registry is a second configuration
+store or template authority. An empty roster is a valid draft,
 but execution rejects it before admitting children. Configuration edits retain
 the complete definition, including member profiles, capabilities and shared context.
-The accepted save response supplies the persisted identity without a follow-up
-read. Failed reads or writes must not publish success or a locally committed
+Team and member identities are immutable and independent of editable names.
+Creation supplies a caller-generated Team ID; updates compare the exact Team ID
+and expected positive revision, incrementing the revision on acceptance. A stale
+revision, conflicting name or missing Team rejects the write without upserting
+another definition. The accepted response supplies the exact identity, revision
+and complete configuration without a follow-up read. Transport failures and
+invalid acknowledgements leave the write unconfirmed, not rejected or saved;
+clients retain the requested identity and must inspect it before another write.
+Failed reads or writes must not publish success or a locally committed
 configuration, and standalone commands must return a failing exit status.
+Collection reads are for browsing. Name lookup uses `/teams/name/{name}`;
+`/teams/{team_id}` addresses an immutable identity for reads, updates and deletion.
 Native configuration commands carry typed arguments to this owner rather than
 rendering a command string and parsing it again. Names, context keys, and literal
 descriptions retain their parsed identity; listing is not a help operation.
@@ -101,9 +110,11 @@ Shared Team context is required factual input to the admitted lead and members,
 not system instructions or a source of execution permissions. It is frozen in
 the admitted profile snapshot and uses the existing required-context projection;
 configuration edits affect later admissions, not already running members.
-Snapshot restore uses the complete saved configuration and preserves the current
-Team identity. It requires the exact returned snapshot ID, publishes only the
-accepted save response, and never checks out Git or changes running tasks.
+Snapshot restore uses the complete saved configuration, requires the same owner
+and immutable Team ID, and compares the current revision, not the historical
+revision. Renaming does not detach snapshots or replace member identities. It
+requires the exact returned snapshot ID, publishes only the accepted response,
+and never checks out Git or changes running tasks.
 
 ### Team user journey (target, not yet a proven runtime guarantee)
 
