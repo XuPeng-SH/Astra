@@ -679,6 +679,8 @@ pub fn submit_task_resolution_schema() -> Value {
 }
 
 fn start_work_schema() -> Value {
+    let tasks = "Known acceptance units, including dependent outcomes; honor counts. Keep observation/verification/report together; omit later decisions/additions/replacements.";
+    let prerequisites = "1-based prerequisites that must deliver first. Reference consumed task outputs here: list order and objective text create no edges. Omit if independent.";
     json!({
         "type": "function",
         "function": {
@@ -704,7 +706,8 @@ fn start_work_schema() -> Value {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 8,
-                        "description": "Known acceptance units, including dependent outcomes; honor counts. Keep observation/verification/report together; omit later decisions/additions/replacements.",
+                        "description": tasks,
+                        "x-astra-discovery-summary": tasks,
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
@@ -714,7 +717,8 @@ fn start_work_schema() -> Value {
                                 "after_initial_tasks": {
                                     "type": "array", "maxItems": 8, "uniqueItems": true,
                                     "items": {"type": "integer", "minimum": 1, "maximum": 8},
-                                    "description": "Explicit prerequisite indices (1-based). A task consuming another task's output must reference it here. List order or objective text does not create edges; omit only for independent tasks."
+                                    "description": prerequisites,
+                                    "x-astra-discovery-summary": prerequisites
                                 }
                             },
                             "required": ["objective", "expected_result"]
@@ -3259,6 +3263,13 @@ mod tests {
                 && summary.contains("Omit later decisions/additions/replacements")
                 && summary.contains("exactly N named initial tracks")
         }));
+        let prerequisite_path =
+            "/properties/tasks/items/properties/after_initial_tasks/description";
+        assert_eq!(
+            selection["parameters"].pointer(prerequisite_path),
+            parameters.pointer(prerequisite_path),
+            "selected tools must retain the same dependency guidance as resident tools"
+        );
         let task_properties = parameters["properties"]["tasks"]["items"]["properties"]
             .as_object()
             .expect("task fields must be structurally declared");

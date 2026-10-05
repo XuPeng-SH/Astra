@@ -99,6 +99,7 @@ fn without_descriptions(mut value: Value) -> Value {
         match value {
             Value::Object(object) => {
                 object.remove("description");
+                object.remove("x-astra-discovery-summary");
                 for child in object.values_mut() {
                     strip(child);
                 }
@@ -382,15 +383,9 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
             .iter()
             .find(|schema| tool_schema_name(schema) == Some(name))
             .unwrap_or_else(|| panic!("resident schema {name}"));
-        let mut full_structure = without_descriptions(full.clone());
+        let full_structure = without_descriptions(full.clone());
         if name == "start_work" {
-            assert!(
-                full_structure["function"]["parameters"]["x-astra-discovery-summary"].is_string()
-            );
-            full_structure["function"]["parameters"]
-                .as_object_mut()
-                .unwrap()
-                .remove("x-astra-discovery-summary");
+            assert!(full["function"]["parameters"]["x-astra-discovery-summary"].is_string());
         }
         assert_eq!(
             without_descriptions(compact.clone()),
@@ -419,6 +414,18 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
     assert_eq!(
         start["function"]["parameters"]["properties"]["tasks"]["description"], *task_description,
         "resident projection must retain the canonical distinction between outcomes and procedural steps"
+    );
+    let prerequisite_path =
+        "/function/parameters/properties/tasks/items/properties/after_initial_tasks/description";
+    assert!(
+        full_start
+            .pointer(prerequisite_path)
+            .is_some_and(Value::is_string)
+    );
+    assert_eq!(
+        start.pointer(prerequisite_path),
+        full_start.pointer(prerequisite_path),
+        "resident input must explain how to declare dependencies, not only name the field"
     );
     assert!(description.contains("One Work graph"));
     assert!(description.contains("no repeat start"));
@@ -939,15 +946,8 @@ fn resident_schemas_keep_structure_but_drop_catalog_prose() {
             .as_object()
             .unwrap_or_else(|| panic!("resident schema {name} properties"));
         for (field, property) in properties {
-            let mut compact_property = property.clone();
-            if name == "start_work" && field == "tasks" {
-                compact_property
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("description");
-            }
             assert_only_producer_parameter_descriptions(
-                &compact_property,
+                property,
                 &canonical_parameters[field],
                 &format!("{name}.{field}"),
             );

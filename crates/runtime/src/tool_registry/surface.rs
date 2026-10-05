@@ -591,19 +591,8 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         }
         question_items.insert("additionalProperties".to_string(), Value::Bool(false));
     }
-    // Outcome granularity is part of the start_work argument contract, not
-    // optional catalog prose. Preserve its canonical definition rather than
-    // maintaining a second explanation in this projection.
-    let task_outcome_description = (name == "start_work")
-        .then(|| properties.get("tasks")?.get("description").cloned())
-        .flatten();
     for property in properties.values_mut() {
         astra_tools::tool_search::compact_parameter_descriptions(property, true);
-    }
-    if let Some(description) = task_outcome_description {
-        properties
-            .get_mut("tasks")
-            .expect("canonical tasks property")["description"] = description;
     }
     // A managed edge Bash schema is a real executable contract, not a rare
     // catalog-only option: without these fields the model cannot keep a
