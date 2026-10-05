@@ -167,7 +167,7 @@ impl ToolArgumentValidationError {
                     "kind": "malformed_tool_arguments",
                     "tool": self.tool_name,
                     "executed": false,
-                    "next_step": "Retry the same native tool once with one complete JSON argument object matching the advertised schema.",
+                    "next_step": "If the task permits another call, retry with one complete JSON argument object matching this invocation's advertised schema.",
                 },
             });
             let mut metadata = Map::new();
@@ -192,7 +192,7 @@ impl ToolArgumentValidationError {
             return body.to_string();
         }
         format!(
-            "Error: {self}. Correct the arguments and issue one new call matching the advertised schema."
+            "Error: {self}. Match this invocation's advertised schema. A tool_search selection never adds fields to a native call; follow its invoke_tool instructions for selected-only arguments. Correct and retry only if the task permits another call."
         )
     }
 
@@ -4421,6 +4421,16 @@ mod tests {
             error.failure_evidence().kind,
             astra_core::ErrorKind::ToolInvalidArgs
         );
+        assert!(
+            error
+                .output()
+                .contains("never adds fields to a native call")
+        );
+        assert!(
+            error
+                .output()
+                .contains("only if the task permits another call")
+        );
     }
 
     #[test]
@@ -4444,6 +4454,12 @@ mod tests {
         assert_eq!(output["advisory"]["executed"], false);
         assert_eq!(output["advisory"]["parse_error"]["column"], 106);
         assert!(output["advisory"]["parse_error"].get("raw").is_none());
+        assert!(
+            output["advisory"]["next_step"]
+                .as_str()
+                .unwrap()
+                .starts_with("If the task permits another call")
+        );
     }
 
     #[test]

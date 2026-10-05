@@ -56,6 +56,10 @@ visible `agent` instead carries its full owner-authorized contract directly;
 filtering discovery must not strand child messaging or result retrieval.
 The resident projection must remain inside the fixed tool
 schema budget, so ordinary delegation does not add a large repeated prompt.
+It must preserve guidance required for ordinary calls: user-named models are
+bound by runtime admission, without model-policy arguments or a prerequisite
+`model_catalog` tool call. Same-name discovery does not expand native parameters. Argument
+errors explain that boundary; retry advice does not override task constraints.
 Child completion notifications contain bounded previews, not execution failures
 when output is truncated. The executing parent retains the complete terminal
 result until settlement; `agent.get_result` reads that retained result before

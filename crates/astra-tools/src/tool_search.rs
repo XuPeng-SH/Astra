@@ -114,7 +114,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             "status": TOOL_RESULT_STATUS_COMPLETED,
             "selection_status": outcome,
             "query": query,
-            "invocation": "Selection never changes tools[]. Use a selected shape directly only when tools[] advertises it; otherwise call invoke_tool with the match name and arguments. Resident agent supports ordinary spawn, status, results, and messages; do not copy extra selected fields into a native call.",
+            "invocation": "Selection never changes tools[], even when the tool name is already resident. Native calls must match their current tools[] schema. If the tool is absent from tools[] or needs selected-only arguments, call invoke_tool with name=matches[].name and arguments=the selected tool's arguments.",
             "requested": requested,
             "resolved": resolved,
             "matches": found,
@@ -634,9 +634,11 @@ mod tests {
             "select mode must return schema entries, not relevance scores: {parsed}"
         );
         assert!(
-            parsed["invocation"].as_str().is_some_and(
-                |guidance| guidance.contains("invoke_tool") && guidance.contains("tools[]")
-            ),
+            parsed["invocation"]
+                .as_str()
+                .is_some_and(|guidance| guidance.contains("invoke_tool")
+                    && guidance.contains("tools[]")
+                    && guidance.contains("even when the tool name is already resident")),
             "selection must explain the carrier path without changing native tools: {parsed}"
         );
     }

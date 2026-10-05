@@ -481,8 +481,9 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let agent_description = find(&resident, "agent")["function"]["description"]
         .as_str()
         .expect("resident agent description");
-    assert!(agent_description.contains("wait auto-delivers"));
+    assert!(agent_description.contains("Wait"));
     assert!(agent_description.contains("fetch if needed"));
+    assert!(agent_description.contains("Runtime binds exact user model"));
     let full = catalog_schemas();
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
@@ -557,12 +558,6 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     ] {
         assert!(profile.contains(constraint), "{profile}");
     }
-    assert!(
-        agent["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("No substitution")
-    );
     assert!(
         agent["function"]["description"]
             .as_str()

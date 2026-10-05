@@ -963,7 +963,7 @@ pub fn render_agent_tool_malformed_arguments_error(
             "kind": "malformed_tool_arguments",
             "tool": tool_name,
             "executed": false,
-            "next_step": "Retry the same native tool once with one complete JSON argument object matching the advertised schema; do not write function-call text or markup in the arguments field.",
+            "next_step": "If the task permits another call, retry with one complete JSON argument object matching this invocation's advertised schema; do not write function-call text or markup in the arguments field.",
         },
     });
     if let Some(parse_error) = parse_error.and_then(sanitized_parse_error_metadata) {
@@ -1620,6 +1620,14 @@ mod tests {
             })),
         );
         let value: Value = serde_json::from_str(&rendered).expect("structured receipt");
+        assert_eq!(value["error_kind"], "tool_invalid_args");
+        assert_eq!(value["advisory"]["executed"], false);
+        assert!(
+            value["advisory"]["next_step"]
+                .as_str()
+                .unwrap()
+                .starts_with("If the task permits another call")
+        );
         assert_eq!(
             value["advisory"]["parse_error"],
             json!({

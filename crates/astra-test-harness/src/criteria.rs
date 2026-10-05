@@ -2257,14 +2257,32 @@ fn evaluate_one_with_primary_cache(
                 criterion: c.clone(),
                 severity: CriterionSeverity::Hard,
                 passed,
-                detail: if *allow_get_result {
+                detail: if !passed
+                    && (1..=4096).contains(&outcome.text.len())
+                    && child_result_adoption_proven(
+                        session,
+                        &outcome.text,
+                        spawn_match.as_ref(),
+                        *allow_get_result,
+                    ) {
                     format!(
-                        "same completed child result through parent adoption or exact parent get_result: {passed}"
+                        "actual child result proven via parent adoption{}; expected result differs (expected_sha256={:x}, observed_sha256={:x})",
+                        if *allow_get_result {
+                            " or exact parent get_result"
+                        } else {
+                            ""
+                        },
+                        Sha256::digest(expected_result.as_bytes()),
+                        Sha256::digest(outcome.text.as_bytes()),
+                    )
+                } else if *allow_get_result {
+                    format!(
+                        "expected completed child result through parent adoption or exact parent get_result: {passed}"
                     )
                 } else if passed {
                     "same child result adopted by its parent before finalization".into()
                 } else {
-                    "missing same-child result hash, parent adoption, or later finalization".into()
+                    "expected-result adoption not proven: missing or mismatched child identity, result hash, parent adoption, or later finalization".into()
                 },
                 full_detail: None,
                 score: Some(if passed { 1.0 } else { 0.0 }),
@@ -5963,6 +5981,19 @@ mod tests {
             None,
             false
         ));
+        let mismatch = Criterion::SessionChildResultAdopted {
+            expected_result: "OTHER-RESULT".into(),
+            spawn_match: None,
+            allow_get_result: false,
+        };
+        let mut observed = outcome.clone();
+        observed.text = result.into();
+        let mismatched = evaluate_one(&mismatch, &observed, Some(&session));
+        assert!(!mismatched.passed);
+        assert!(mismatched.detail.contains("actual child result proven"));
+        let unproven = evaluate_one(&mismatch, &observed, Some(&mk_session(&[])));
+        assert!(!unproven.passed);
+        assert!(!unproven.detail.contains("actual child result proven"));
         let model_match = SessionEventFieldMatch {
             path: "/metadata/model_configuration/prepared_selection/model_name".into(),
             equals: serde_json::json!("required-model"),
@@ -6135,6 +6166,15 @@ mod tests {
             "healthy foreground retrieval does not need background adoption"
         );
         assert!(!check(&healthy), "adoption-only default remains strict");
+        let foreground_mismatch = Criterion::SessionChildResultAdopted {
+            expected_result: "OTHER-RESULT".into(),
+            spawn_match: None,
+            allow_get_result: true,
+        };
+        let retrieved = evaluate_one(&foreground_mismatch, &observed, Some(&healthy));
+        assert!(!retrieved.passed);
+        assert!(retrieved.detail.contains("actual child result proven"));
+        assert!(retrieved.detail.contains("exact parent get_result"));
         assert!(!handoff_check(&foreground(
             "other-parent",
             arguments.clone(),
