@@ -72,6 +72,17 @@ Checkpoint must include enough information to resume safely:
 - last durable event cursor;
 - cancellation/resume policy.
 
+The run checkpoint owner limits each complete JSON checkpoint to 8 MiB,
+including all sections and encoding overhead. A bounded handoff encoder is
+available; production storage and recovery check the budget before parsing.
+Writer integration of bounded encoding remains part of the recovery work.
+Exceeding the budget
+rejects the whole continuation:
+never trim deny rules, messages, or obligations, replace the last valid
+checkpoint, or release unconfirmed execution custody. These are snapshot
+retention limits, not task deadlines, total-history or process-memory bounds,
+or evidence that same-run recovery is implemented.
+
 ## Lease and ownership
 
 - Only the owner may advance active execution.

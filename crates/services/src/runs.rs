@@ -1899,6 +1899,9 @@ fn execution_handoff_checkpoint_identity(run: &DurableRunRecord) -> Result<Optio
     let Some(json) = run.checkpoint_json.as_deref() else {
         return Ok(None);
     };
+    if validate_run_checkpoint_size(json).is_err() {
+        return Ok(None);
+    }
     let Ok(DurableExecutionHandoff::V1 {
         producer_run_id,
         producer_owner_generation,
@@ -1929,6 +1932,9 @@ fn execution_handoff_claim_event(
     {
         return Ok(None);
     }
+    if validate_run_checkpoint_size(&checkpoint.checkpoint_json).is_err() {
+        return Ok(None);
+    }
     let Ok(persisted) = serde_json::from_str::<DurableExecutionHandoff<serde_json::Value>>(
         &checkpoint.checkpoint_json,
     ) else {
@@ -1938,6 +1944,9 @@ fn execution_handoff_claim_event(
     let Some(json) = run.checkpoint_json.as_deref() else {
         return Ok(None);
     };
+    if validate_run_checkpoint_size(json).is_err() {
+        return Ok(None);
+    }
     let Ok(current) = serde_json::from_str::<DurableExecutionHandoff<serde_json::Value>>(json)
     else {
         tracing::warn!(run_id = %run.run_id, "invalid current checkpoint cannot establish recovery custody");
@@ -2045,6 +2054,16 @@ fn execution_handoff_recovery_association(
     let Some(current_json) = current.checkpoint_json.as_deref() else {
         return Ok(None);
     };
+    let handoff_claim = if recovery_frontier_matches(claim, current) {
+        let Some(receipt) = tail.and_then(ExecutionHandoffClaim::from_event) else {
+            return Ok(None);
+        };
+        Some(receipt)
+    } else {
+        None
+    };
+    validate_run_checkpoint_size(&checkpoint.checkpoint_json).map_err(str::to_owned)?;
+    validate_run_checkpoint_size(current_json).map_err(str::to_owned)?;
     let persisted: DurableExecutionHandoff<serde_json::Value> =
         serde_json::from_str(&checkpoint.checkpoint_json).map_err(|error| error.to_string())?;
     let current_payload: DurableExecutionHandoff<serde_json::Value> =
@@ -2057,14 +2076,14 @@ fn execution_handoff_recovery_association(
     if persisted != current_payload || producer_run_id != &current.run_id {
         return Ok(None);
     }
-    if recovery_frontier_matches(claim, current) {
+    if let Some(actual) = handoff_claim {
         let expected = ExecutionHandoffClaim {
             checkpoint_id: checkpoint.checkpoint_id.clone(),
             producer_generation: *producer_owner_generation,
             claimed_from_generation: claim.claimed_from_generation,
             claimed_generation: current.run_generation,
         };
-        if tail.and_then(ExecutionHandoffClaim::from_event).as_ref() != Some(&expected) {
+        if actual != expected {
             return Ok(None);
         }
     }
@@ -2235,6 +2254,8 @@ where
     let payload: String = row
         .try_get("checkpoint_json")
         .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?;
+    validate_run_checkpoint_size(&payload)
+        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_owned()))?;
     let DurableExecutionHandoff::V1 {
         producer_run_id,
         producer_owner_generation,
@@ -6978,10 +6999,46 @@ fn session_execution_slot_owner_reclaimable(
         && slot_is_stale
 }
 
+/// Whole-checkpoint budget; no individual section may bypass the cumulative
+/// bound. Oversized state must retain its execution owner, never be truncated.
+pub const MAX_RUN_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+
+pub fn validate_run_checkpoint_size(json: &str) -> Result<(), &'static str> {
+    if json.len() > MAX_RUN_CHECKPOINT_BYTES {
+        return Err("run checkpoint exceeds byte budget");
+    }
+    Ok(())
+}
+
+/// Encode the existing handoff protocol without allocating an unbounded JSON
+/// string first. Errors never include checkpoint contents.
+pub fn encode_execution_handoff<T: Serialize>(
+    handoff: &DurableExecutionHandoff<T>,
+) -> Result<String, &'static str> {
+    struct BoundedCheckpoint(Vec<u8>);
+    impl std::io::Write for BoundedCheckpoint {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_RUN_CHECKPOINT_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("run checkpoint exceeds byte budget"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = BoundedCheckpoint(Vec::new());
+    serde_json::to_writer(&mut output, handoff)
+        .map_err(|_| "run checkpoint could not be encoded within byte budget")?;
+    String::from_utf8(output.0).map_err(|_| "run checkpoint encoding is invalid")
+}
+
 pub(crate) fn checkpoint_metadata(
     run_id: &str,
     checkpoint_json: &str,
 ) -> Result<(String, String, String), String> {
+    validate_run_checkpoint_size(checkpoint_json).map_err(str::to_owned)?;
     let value: serde_json::Value =
         serde_json::from_str(checkpoint_json).map_err(|error| error.to_string())?;
     let object = value
@@ -37594,10 +37651,51 @@ mod tests {
         assert_eq!(version, "phase_checkpoint_v1");
     }
 
+    #[test]
+    fn execution_handoff_budget_is_cumulative_and_checked_before_parsing() {
+        let section = "x".repeat(MAX_RUN_CHECKPOINT_BYTES / 2);
+        let handoff = DurableExecutionHandoff::V1 {
+            producer_run_id: "run".into(),
+            producer_owner_generation: 0,
+            heavy: json!({"messages": section, "obligations": section}),
+        };
+        assert!(encode_execution_handoff(&handoff).is_err());
+        assert!(
+            checkpoint_metadata("run", &"x".repeat(MAX_RUN_CHECKPOINT_BYTES + 1))
+                .unwrap_err()
+                .contains("byte budget")
+        );
+        let mut run = durable_run_record("run");
+        run.checkpoint_version = Some("execution_handoff_v1".into());
+        run.checkpoint_json = Some(serde_json::to_string(&handoff).unwrap());
+        assert!(
+            execution_handoff_checkpoint_identity(&run)
+                .unwrap()
+                .is_none()
+        );
+        let small = DurableExecutionHandoff::V1 {
+            producer_run_id: "run".into(),
+            producer_owner_generation: 0,
+            heavy: json!({"messages": ["observed"], "obligations": ["pending"]}),
+        };
+        let encoded = encode_execution_handoff(&small).unwrap();
+        run.checkpoint_json = Some(encoded.clone());
+        assert!(
+            execution_handoff_checkpoint_identity(&run)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(encoded, serde_json::to_string(&small).unwrap());
+        assert_eq!(
+            checkpoint_metadata("run", &encoded).unwrap().0,
+            "execution_handoff"
+        );
+    }
+
     #[tokio::test]
     async fn recovery_claim_batch_isolates_invalid_checkpoint_content() {
         let store = InMemoryRunStateStore::new();
-        for run_id in ["broken", "healthy", "cancelled"] {
+        for run_id in ["broken", "healthy", "cancelled", "oversized"] {
             let mut run = durable_run_record(run_id);
             run.session_id = run_id.to_owned();
             store.insert_run(run).await.unwrap();
@@ -37628,14 +37726,19 @@ mod tests {
             .get_mut("broken")
             .unwrap()
             .checkpoint_json = Some("{".into());
+        store.runs.write().await.get_mut("oversized").unwrap().checkpoint_json = Some(
+            json!({"version":"execution_handoff_v1", "producer_run_id":"oversized",
+                "producer_owner_generation":0, "heavy":{"messages":"x".repeat(MAX_RUN_CHECKPOINT_BYTES)}})
+                .to_string(),
+        );
         assert!(
             store
                 .request_run_cancellation("u1", "cancelled")
                 .await
                 .unwrap()
         );
-        let claims = store.claim_recoverable_active_runs(3).await.unwrap();
-        assert_eq!(claims.len(), 3);
+        let claims = store.claim_recoverable_active_runs(4).await.unwrap();
+        assert_eq!(claims.len(), 4);
         for claim in &claims {
             assert_eq!(claim.run.run_generation, 1);
             let before = store
