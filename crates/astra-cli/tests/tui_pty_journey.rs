@@ -165,19 +165,27 @@ impl PtyAstra {
         self.write(b"\r");
     }
 
-    fn select_conversation(&mut self, name: &str) {
+    fn select_completed_conversation(&mut self, name: &str) {
         self.write(&[0x07]);
         self.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-        self.wait_for(name, UI_TRANSITION_TIMEOUT);
+        self.wait_for("H ", UI_TRANSITION_TIMEOUT);
+        if !self.current_screen().contains("H active only") {
+            self.wait_for("H history", UI_TRANSITION_TIMEOUT);
+            self.write(b"h");
+        }
+        let row = format!(". {name}");
+        self.wait_for(&row, UI_TRANSITION_TIMEOUT);
         let choice = self
             .current_screen()
             .lines()
             .find_map(|line| {
-                let (prefix, _) = line.split_once(&format!(". {name}"))?;
+                let (prefix, _) = line.split_once(&row)?;
                 prefix.split_whitespace().last()?.parse::<usize>().ok()
             })
             .expect("conversation is selectable in the picker");
-        self.write(format!("{choice}\r").as_bytes());
+        self.write(choice.to_string().as_bytes());
+        self.wait_for(&format!("› {choice}. {name}"), UI_TRANSITION_TIMEOUT);
+        self.write(b"\r");
     }
 
     fn signal(&self, signal: nix::sys::signal::Signal) {
@@ -1465,12 +1473,12 @@ async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restar
     let first_root = assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 1).await;
     assert_live_work_artifacts(home.path(), 1);
     // Completed children retain their transcripts across conversation switches.
-    astra.select_conversation("CSV builder");
+    astra.select_completed_conversation("CSV builder");
     astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("customers.csv", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x0f]);
     astra.wait_for("Main conversation ·", UI_TRANSITION_TIMEOUT);
-    astra.select_conversation("CSV builder");
+    astra.select_completed_conversation("CSV builder");
     astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("customers.csv", UI_TRANSITION_TIMEOUT);
     astra.signal(nix::sys::signal::Signal::SIGHUP);
@@ -1600,14 +1608,12 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     mock.release_held_response();
     astra.write(&[0x0f]);
     astra.wait_for("Agent completed", UI_TRANSITION_TIMEOUT);
-    astra.write(&[0x07]);
-    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-    astra.write(b"h");
-    astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
-    astra.write(b"1");
-    astra.wait_for("› 1. Mock child review", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\r");
-    astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    for _ in 0..2 {
+        astra.select_completed_conversation("Mock child review");
+        astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+        astra.write(&[0x0f]);
+        astra.wait_for("Main conversation ·", UI_TRANSITION_TIMEOUT);
+    }
     assert_eq!(
         mock.received_requests().len(),
         1,
