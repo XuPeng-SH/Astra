@@ -20932,6 +20932,23 @@ mod tests {
             TeamEditorOperation, TeamEditorOwner, TeamEditorResponse,
         };
         use bottom_pane::view::ViewResult;
+        fn apply_editor_outcome(
+            outcome: AgentWorkbenchOutcome,
+            epoch: u64,
+            widget: &mut chat_widget::ChatWidget,
+            pane: &mut BottomPane,
+        ) {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(outcome).unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session-team"),
+                epoch,
+                widget,
+                pane,
+                &FrameRequester::test_dummy(),
+            );
+        }
         credentials
             .profiles
             .get_mut("default")
@@ -21031,14 +21048,11 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                tx.send(outcome).await.unwrap();
-                drain_agent_workbench_outcomes(
-                    &mut rx,
-                    Some("session-team"),
+                apply_editor_outcome(
+                    outcome,
                     state.session_attachment_epoch,
                     &mut widget,
                     &mut pane,
-                    &FrameRequester::test_dummy(),
                 );
                 pane.handle_key(key(KeyCode::Down));
                 let BottomPaneAction::ViewCompleted {
@@ -21110,13 +21124,16 @@ mod tests {
                 .mount(&server)
                 .await;
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            assert!(!dispatch_team_editor_request(
-                request.clone(),
-                state.session_attachment_epoch + 1,
-                &mut pane,
-                tx.clone()
-            ));
-            {
+            // Identity fencing is independent of create/update and HTTP status.
+            // Exercise it on accepted and unconfirmed writes, not every matrix cell.
+            let check_fences = !create && matches!(status, 200 | 503);
+            if check_fences {
+                assert!(!dispatch_team_editor_request(
+                    request.clone(),
+                    state.session_attachment_epoch + 1,
+                    &mut pane,
+                    tx.clone()
+                ));
                 let _other =
                     crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
                         "other",
@@ -21130,14 +21147,19 @@ mod tests {
                     tx.clone()
                 ));
             }
-            assert!(
-                !pane.team_editor_pending(&request),
-                "local credential rejection must not leave a false Saving status"
-            );
-            let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(request)) =
-                pane.handle_key(save)
-            else {
-                panic!("explicit save after restoring the original owner")
+            let request = if check_fences {
+                assert!(
+                    !pane.team_editor_pending(&request),
+                    "local credential rejection must not leave a false Saving status"
+                );
+                let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(retry)) =
+                    pane.handle_key(save)
+                else {
+                    panic!("explicit save after restoring the original owner")
+                };
+                retry
+            } else {
+                request.clone()
             };
             assert!(dispatch_team_editor_request(
                 request.clone(),
@@ -21167,69 +21189,43 @@ mod tests {
             if !create {
                 assert_eq!(body["expected_revision"], 1);
             }
-            // Fences are exercised through the real reducer, using a result
-            // from the HTTP owner, before allowing the matching result through.
-            tx.send(AgentWorkbenchOutcome::TeamEditor(update.clone()))
-                .await
-                .unwrap();
-            drain_agent_workbench_outcomes(
-                &mut rx,
-                Some("session-team"),
-                state.session_attachment_epoch + 1,
-                &mut widget,
-                &mut pane,
-                &FrameRequester::test_dummy(),
-            );
-            assert!(pane.team_editor_pending(&request));
-            let mut stale = update.clone();
-            stale.request.target.editor_id = uuid::Uuid::new_v4();
-            tx.send(AgentWorkbenchOutcome::TeamEditor(stale))
-                .await
-                .unwrap();
-            let mut stale = update.clone();
-            stale.request.operation_id += 1;
-            tx.send(AgentWorkbenchOutcome::TeamEditor(stale))
-                .await
-                .unwrap();
-            drain_agent_workbench_outcomes(
-                &mut rx,
-                Some("session-team"),
-                state.session_attachment_epoch,
-                &mut widget,
-                &mut pane,
-                &FrameRequester::test_dummy(),
-            );
-            assert!(pane.team_editor_pending(&request));
-            {
+            if check_fences {
+                let mut stale_editor = update.clone();
+                stale_editor.request.target.editor_id = uuid::Uuid::new_v4();
+                let mut stale_operation = update.clone();
+                stale_operation.request.operation_id += 1;
+                for (stale, epoch) in [
+                    (update.clone(), state.session_attachment_epoch + 1),
+                    (stale_editor, state.session_attachment_epoch),
+                    (stale_operation, state.session_attachment_epoch),
+                ] {
+                    apply_editor_outcome(
+                        AgentWorkbenchOutcome::TeamEditor(stale),
+                        epoch,
+                        &mut widget,
+                        &mut pane,
+                    );
+                    assert!(pane.team_editor_pending(&request));
+                }
                 let _other =
                     crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
                         "other",
                         Some("owner-2"),
                     )
                     .unwrap();
-                tx.send(AgentWorkbenchOutcome::TeamEditor(update.clone()))
-                    .await
-                    .unwrap();
-                drain_agent_workbench_outcomes(
-                    &mut rx,
-                    Some("session-team"),
+                apply_editor_outcome(
+                    AgentWorkbenchOutcome::TeamEditor(update.clone()),
                     state.session_attachment_epoch,
                     &mut widget,
                     &mut pane,
-                    &FrameRequester::test_dummy(),
                 );
                 assert!(pane.team_editor_pending(&request));
             }
-            tx.send(AgentWorkbenchOutcome::TeamEditor(update.clone()))
-                .await
-                .unwrap();
-            drain_agent_workbench_outcomes(
-                &mut rx,
-                Some("session-team"),
+            apply_editor_outcome(
+                AgentWorkbenchOutcome::TeamEditor(update.clone()),
                 state.session_attachment_epoch,
                 &mut widget,
                 &mut pane,
-                &FrameRequester::test_dummy(),
             );
             assert!(!pane.team_editor_pending(&request));
             let rendered = render_bottom_pane_text(&pane, 100, 24);
@@ -21313,14 +21309,11 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                    tx.send(refreshed).await.unwrap();
-                    drain_agent_workbench_outcomes(
-                        &mut rx,
-                        Some("session-team"),
+                    apply_editor_outcome(
+                        refreshed,
                         state.session_attachment_epoch,
                         &mut widget,
                         &mut pane,
-                        &FrameRequester::test_dummy(),
                     );
                     let rendered = render_bottom_pane_text(&pane, 100, 24);
                     if status == 409 {
@@ -21360,16 +21353,11 @@ mod tests {
                 }
             }
             pane.handle_key(key(KeyCode::Esc));
-            tx.send(AgentWorkbenchOutcome::TeamEditor(update))
-                .await
-                .unwrap();
-            drain_agent_workbench_outcomes(
-                &mut rx,
-                Some("session-team"),
+            apply_editor_outcome(
+                AgentWorkbenchOutcome::TeamEditor(update),
                 state.session_attachment_epoch,
                 &mut widget,
                 &mut pane,
-                &FrameRequester::test_dummy(),
             );
             assert!(
                 !pane.has_active_view(),

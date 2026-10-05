@@ -842,7 +842,11 @@ mod tests {
         ]
         .into_iter()
         .flat_map(|(access, status, token)| {
-            ["snapshot", "context"].map(move |operation| (access, status, token, operation))
+            ["snapshot", "context"]
+                // A failed refresh never reaches either write operation.
+                .into_iter()
+                .take(if token.is_some() { 2 } else { 1 })
+                .map(move |operation| (access, status, token, operation))
         }) {
             let mut credentials = CredentialsFile::default();
             credentials.profiles.insert(

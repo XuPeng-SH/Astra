@@ -102,8 +102,9 @@ changing history, model, permissions, or running work. It is an interactive TUI
 control, not a standalone command that edits durable conversation state.
 The status line labels the exact selected intent; unavailable friendly labels
 remain generic rather than guessed. Root admission reauthorizes configuration.
-Configuration editing still uses native CLI commands; this does not yet implement
-the complete workbench below.
+Both native CLI commands and the TUI roster editor use the same configuration
+owner. The editor supports members, responsibilities, exact models and shared
+context; this does not yet establish the complete execution workbench below.
 Team execution remains with ordinary Chat, not the configuration command owner.
 Native `team run` forwards ordinary Explain capture and wall-clock limits.
 Shared Team context is required factual input to the admitted lead and members,
@@ -133,8 +134,11 @@ astra team add-member delivery developer -- Describe the member's responsibiliti
 astra team run delivery <task>
 ```
 
-In the TUI, use `/team run delivery <task>`;
-configuration remains in the CLI. Subsequent ordinary input retains that selection. Canonical turn commit atomically
+In the TUI, use `/team` to inspect or edit configuration and select a lead,
+then enter an objective; `/team run delivery <task>` is also available.
+Selection changes are unavailable during an active turn, while configuration
+can still be inspected or edited for future admissions.
+Subsequent ordinary input retains that selection. Canonical turn commit atomically
 retains the admitted Team/lead selection as intent for the next root.
 Authenticated CLI resume reads the Server-owned generation even when a local
 replica exists; local-only restore is reserved for an unauthenticated session.
