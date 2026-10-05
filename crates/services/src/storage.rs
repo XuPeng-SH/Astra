@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-05-v94";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-05-v97";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -5697,31 +5697,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // ── Plan step runs: append-only attempt chain for every subtask ──
-    core_schema_create!(
-        pool,
-        "plan_step_runs",
-        "CREATE TABLE IF NOT EXISTS plan_step_runs (
-            run_id       VARCHAR(64) NOT NULL,
-            user_id      VARCHAR(128) NOT NULL,
-            plan_id      VARCHAR(64) NOT NULL,
-            subtask_id   VARCHAR(64) NOT NULL,
-            attempt      INT NOT NULL,
-            status       VARCHAR(16) NOT NULL,
-            session_id   VARCHAR(64) NOT NULL,
-            started_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            finished_at  DATETIME(6) NULL,
-            request_id   VARCHAR(64) NOT NULL,
-            error        TEXT NULL,
-            artifact_ref VARCHAR(255) NULL,
-            PRIMARY KEY (user_id, run_id),
-            INDEX idx_step_runs_plan_started (user_id, plan_id, started_at DESC),
-            UNIQUE KEY uq_step_runs_subtask_attempt (user_id, plan_id, subtask_id, attempt)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(
         pool,
         "session_checkpoints",
@@ -6168,24 +6143,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    // ─── Content-addressed config versions (Step 4a) ────────────────────────────
-    //
-    // One row per unique RuntimeConfig hash per tenant. Populated by
-    // the CLI via enqueue_journal_events → IngestionEvent::ConfigVersionSaved,
-    // consumed by `astra config sync pull` on new machines. See
-    // `crate::config_version_cloud` for the DDL string and bind helpers
-    // that the push / pull pipeline uses.
-
-    let config_version_schema = pool.owned_by("config_version_cloud");
-    config_version_schema.authority.declare(
-        config_version_schema.owner,
-        "config_versions",
-        crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL,
-    );
-    query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
-        .execute(&config_version_schema)
-        .await?;
-
     verify_core_schema_shape(&pool, &settings.database).await?;
     let declarations = pool.authority.declarations()?;
     publish_core_schema_table_contracts(&pool, &declarations).await?;
@@ -7404,18 +7361,6 @@ async fn verify_core_schema_shape(
         "plans",
         "idx_plans_owner_session_updated",
         &["user_id", "session_id", "updated_at"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "plan_step_runs",
-        "PRIMARY",
-        &["user_id", "run_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "plan_step_runs",
-        "idx_step_runs_plan_started",
-        &["user_id", "plan_id", "started_at"],
     )?;
     ensure_index_shape(
         &indexes,

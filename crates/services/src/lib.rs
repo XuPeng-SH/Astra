@@ -9,7 +9,6 @@ pub mod byok_endpoint;
 mod cancellation_safe_db;
 pub(crate) use cancellation_safe_db::CancellationSafeTransaction;
 pub use cancellation_safe_db::{CancellationSafePoolConnection, TransactionConnection};
-pub mod config_version_cloud;
 pub mod context;
 pub mod context_manifest;
 pub mod coordination;
@@ -150,9 +149,8 @@ pub use auth::{
     DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
     DatabaseAuthService, DatabaseSessionService, EdgeTokenBinding, ExternalAuthProviderConfig,
     ExternalAuthorizeRequestData, ExternalAuthorizedRequest, ExternalCatalogResponse,
-    ExternalLoginRequestData, ExternalProviderClient, ExternalProviderPublicRecord,
-    ExternalRequestDescriptor, ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse,
-    ExternalSessionRecord, FernetTokenEncryptor, HttpExternalProviderClient,
+    ExternalProviderClient, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
+    ExternalRuntimeContextResponse, FernetTokenEncryptor, HttpExternalProviderClient,
     ProviderRequestDescriptor, ProviderSessionCreationIdentity, ReauthenticationProofRecord,
     ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
     SessionCreationResult, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
@@ -228,8 +226,8 @@ pub use marketplace_stats::{
 pub use mcp_registry::{
     DatabaseMcpRegistryService, McpBindingRequestData, McpDiscoveredToolData, McpRegisterRecord,
     McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
-    McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
-    UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
+    McpRegistryService, McpServerRequestData, UnconfiguredMcpRegistryService,
+    mcp_binding_tool_namespace, mcp_schema_hash,
 };
 pub use model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,

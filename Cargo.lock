@@ -424,7 +424,6 @@ dependencies = [
  "astra-tools",
  "astra-turn-types",
  "async-trait",
- "chrono",
  "dotenvy",
  "serde",
  "serde_json",
@@ -441,7 +440,6 @@ name = "astra-prompts"
 version = "0.2.10"
 dependencies = [
  "astra-core",
- "chrono",
  "serde",
  "serde_json",
  "tokio",
@@ -693,7 +691,6 @@ name = "astra-text-utils"
 version = "0.2.10"
 dependencies = [
  "regex",
- "serde",
  "serde_json",
  "sha2",
  "uuid",

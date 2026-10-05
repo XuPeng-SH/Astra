@@ -47,6 +47,20 @@ The execution checkpoint reader accepts only the exact current protocol version.
 Same-major versions are not implicitly compatible; a mismatch fails restoration
 before execution. There is no version-negotiation or migration path.
 
+Checkpoint scheduling belongs to the actual execution hooks. The unused
+`CheckpointTrigger` source API has been retired; it did not drive scheduling.
+The unused per-file `delete_step_checkpoint` API has also been retired; composite
+index retention and session deletion continue to own checkpoint cleanup.
+Local persistence accepts heavy recovery checkpoints only. Tool completion is
+recorded in the event journal; its cursor remains embedded in the next heavy
+checkpoint. Standalone light files, their reader and pruning have been retired.
+The unused Step Protocol retry-policy APIs have also been retired. Provider retry
+and tool idempotency remain owned by their actual execution paths.
+Step scheduling retains the headless tool-round budget, checked between batches.
+Unused priority,
+per-tool timeout, backoff and retry-attempt fields have been retired; they did not
+control current execution. This changes source-level Step JSON, not heavy checkpoints.
+
 Checkpoint must include enough information to resume safely:
 
 - current stage;
@@ -306,11 +320,10 @@ custody but is explicitly unavailable for execution. A process-global environmen
 overlay is not an authorized reconstruction source for another user or session.
 Actual recovery activation must restore these facts before starting the executor;
 the production recovery activation path remains unfinished. Contract tests
-exercise real checkpoint persistence and database custody adoption across owner
-generations; they do not implement a separate execution replay entrypoint.
-The atomic adoption API returns the
-locked checkpoint with its committed receipt, binding both producer and current
-owner generations; a serialized receipt alone is not fresh execution authority.
+exercise real checkpoint persistence, consecutive recovery claims, owner fencing,
+and canonical pause reconciliation. These paths preserve the immutable producer
+checkpoint without installing new turn execution authority or reconstructing the
+original executor.
 
 Completion evidence is summarized by one incremental frontier. Explicit
 verification retains the latest source mutation and at most one subsequent
@@ -390,7 +403,7 @@ Implementation boundary: owner-fenced storage, fresh snapshot construction and
 cooperative Server shutdown are connected. The recovery scanner preserves valid
 handoff material through the atomic recovery-association path; it does
 not launch an executor. Contract tests exercise checkpoint persistence,
-cross-generation custody adoption, cancellation and fencing through these
+cross-generation custody claims, cancellation and fencing through these
 production entries. There is no original-run execution reconstruction consumer.
 Automatic execution takeover and restoration of all execution obligations remain
 unimplemented. After shutdown
@@ -403,7 +416,7 @@ inner control schema is unsupported still retains its original bytes and the
 explicit continuation path. Recovery preserves that opaque checkpoint and
 reports custody without claiming it decoded or reconstructed execution.
 Cancellation still wins. A new run may continue canonical session history under
-its own admission; custody adoption does not authorize saved execution. Control
+its own admission; custody claims do not authorize saved execution. Control
 V3 is not yet a complete reconstruction contract: ledger-verified
 tool evidence, intent and remaining execution obligations must be restored
 before an automatic executor may run.
@@ -416,7 +429,7 @@ successful provider decision consuming that exact context lease clears the
 obligation; failed attempts, staging and transport acknowledgement do not.
 The ordinary session warm-start entrypoint rejects same-run execution facts
 before executor wiring, including when a claim advanced the generation. It
-cannot replace execution adoption/frontier validation with a fresh messaging
+cannot replace execution authority/frontier validation with a fresh messaging
 owner. The recovery scanner continues to preserve and pause handoff custody;
 automatic reconstructed execution is not supplied by this contract.
 

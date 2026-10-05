@@ -5,6 +5,10 @@
 
 The feedback control loop turns user feedback, trace facts, eval results, and operational signals into controlled product improvement. It is the upstream system for tuning jobs and evaluation.
 
+The unused source-public online-progress policy, signals, and decision prototype
+has been retired. Runtime feedback continues through the existing authoritative
+execution path; shared turn-evaluation thresholds and telemetry remain intact.
+
 ## Principles
 
 - Feedback is evidence, not automatic truth.
@@ -12,6 +16,10 @@ The feedback control loop turns user feedback, trace facts, eval results, and op
 - Implicit feedback requires conservative interpretation.
 - Improvement proposals must pass evaluation before activation.
 - Feedback must respect privacy, consent, and deletion.
+
+The retired public learning routes retain no request/response projections or
+trigger defaults. Their absence remains an HTTP contract; real evaluation,
+lesson storage, and feedback admission keep their existing owners.
 
 ## Feedback sources
 

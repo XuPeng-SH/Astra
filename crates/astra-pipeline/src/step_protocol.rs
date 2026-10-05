@@ -1,17 +1,17 @@
-//! Step Protocol v2: Slot-based execution, tiered checkpoints, DB-first events.
+//! Step Protocol v2: Slot-based execution, recovery checkpoints, DB-first events.
 //!
 //! # Architecture: 3 Concerns, 3 Types
 //!
 //! ```text
-//! ┌─ StepDescriptor ──────────────┐  Scheduling layer (who/when/retry)
-//! │  step_id, task_id, action,    │  Immutable after creation
-//! │  scheduling, retry_policy     │
+//! ┌─ StepDescriptor ──────────────┐  Identity and timeout metadata
+//! │  step_id, task_id, action,    │  Rebound on session adoption
+//! │  scheduling                  │
 //! ├─ StepExecution ───────────────┤  Runtime layer (cursor/progress)
 //! │  cursor, execution_slots,     │  Mutable during execution
 //! │  result, memory_context       │
-//! ├─ StepCheckpoint ──────────────┤  Persistence layer (2-tier)
-//! │  Light: cursor + metadata     │  Frequent, cheap
-//! │  Heavy: + messages + results  │  Infrequent, full recovery
+//! ├─ StepCheckpoint ──────────────┤  Persistence layer
+//! │  Light: cursor + metadata     │  Embedded cursor
+//! │  Heavy: + messages + results  │  Durable, full recovery
 //! └───────────────────────────────┘
 //! ```
 //!
@@ -19,19 +19,16 @@
 //!
 //! - **Versioned**: checkpoints must match the current protocol exactly.
 //! - **Slot-based cursor**: `ExecutionSlot` per tool (state machine), not sequential index.
-//! - **Tiered checkpoints**: `LightCheckpoint` (frequent) + `HeavyCheckpoint` (full recovery).
-//! - **Checkpoint strategy**: `CheckpointTrigger` maps events to Light/Heavy tier.
+//! - **Recovery checkpoints**: `HeavyCheckpoint` embeds the `LightCheckpoint` cursor.
 //! - **Semantic idempotency**: Keys optionally include `workspace_version` + `memory_snapshot_id`.
 //! - **IdempotencyCache trait**: pluggable backends (InMemory, MatrixOne).
 //! - **Wait triggers**: `WaitTrigger` (User/Webhook/Timer) with `continuation_token`.
 //! - **DB-first events**: `StepEventStore` trait (in-memory or MatrixOne).
-//! - **Tool-level retry**: `ToolRetryPolicy` per tool classification.
 //! - **Memory governance**: `MemoryGovernanceAction` for retrieval/promotion/purge tracking.
 //! # Hardening additions
 //!
 //! - **Memory governance**: `MemoryGovernanceAction` enum carried in `MemoryContext` for lifecycle tracking.
 //! - **IdempotencyCache trait**: Abstraction over in-memory and MatrixOne-backed caches.
-//! - **Checkpoint triggers**: `CheckpointTrigger` / `CheckpointTier` for strategy-driven checkpointing.
 //! - **Canonical idempotency keys**: `compute_idempotency_key` uses `canonical_json` for determinism.
 
 use serde::{Deserialize, Serialize};
@@ -82,61 +79,22 @@ impl std::error::Error for ProtocolError {}
 
 // ─── Step: Layered Structure ─────────────────────────────────────────────────
 
-/// Scheduling contract — immutable policy governing a step's execution.
-/// Attached to StepDescriptor at creation, enforced by the runtime.
+/// Headless tool-round budget, attached to the descriptor and checked between batches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulingContract {
-    /// Execution priority (0=background, 5=normal, 10=urgent).
-    /// Higher priority steps execute first when multiple are queued.
-    pub priority: u32,
-    /// Maximum wall-clock time for the entire step (all tools combined).
+    /// Wall-clock budget checked before admitting another tool batch.
     pub timeout_ms: u64,
-    /// Per-tool timeout (0 = inherit from step timeout / tool_count).
-    pub per_tool_timeout_ms: u64,
-    /// Maximum retry attempts for transient failures.
-    pub max_retries: u32,
-    /// Initial backoff delay for retries (exponential: base * 2^attempt).
-    pub backoff_base_ms: u64,
-    /// Maximum backoff delay cap.
-    pub backoff_max_ms: u64,
 }
 
 impl Default for SchedulingContract {
     fn default() -> Self {
         Self {
-            priority: 5,
             timeout_ms: 300_000,
-            per_tool_timeout_ms: 0,
-            max_retries: 2,
-            backoff_base_ms: 500,
-            backoff_max_ms: 5_000,
         }
     }
 }
 
-impl SchedulingContract {
-    /// Compute backoff delay for retry attempt N (exponential with cap).
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        let delay = self.backoff_base_ms.saturating_mul(1u64 << attempt.min(10));
-        delay.min(self.backoff_max_ms)
-    }
-
-    /// Effective per-tool timeout: explicit value, or step timeout / tool_count.
-    /// Floor: never less than 30s (30_000ms) to avoid starving individual tools
-    /// when many tools share a step budget.
-    pub fn effective_tool_timeout_ms(&self, tool_count: usize) -> u64 {
-        const MIN_TOOL_TIMEOUT_MS: u64 = 30_000;
-        if self.per_tool_timeout_ms > 0 {
-            self.per_tool_timeout_ms
-        } else if tool_count > 0 {
-            (self.timeout_ms / tool_count as u64).max(MIN_TOOL_TIMEOUT_MS)
-        } else {
-            self.timeout_ms
-        }
-    }
-}
-
-/// Scheduling descriptor (immutable after creation, owned by Scheduler).
+/// Step identity and timeout; session adoption may rebind identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDescriptor {
     pub step_id: String,
@@ -145,7 +103,7 @@ pub struct StepDescriptor {
     pub parent_step_id: Option<String>,
     pub action: StepAction,
     pub agent_id: Option<String>,
-    /// Scheduling contract governing this step's execution policy.
+    /// Execution timeout consumed by the headless step deadline.
     pub scheduling: SchedulingContract,
     pub protocol_version: u32,
     pub created_at: u64,
@@ -158,8 +116,6 @@ pub struct StepExecution {
     pub payload: StepPayload,
     pub result: Option<StepResult>,
     pub status: StepStatus,
-    pub attempt: u32,
-    pub max_attempts: u32,
     /// Memory context flowing through step lifecycle
     pub memory_context: Option<MemoryContext>,
     pub started_at: Option<u64>,
@@ -205,7 +161,7 @@ pub enum MemoryGovernanceAction {
 }
 
 /// Composite Step = descriptor + execution + idempotency key.
-/// This is the full Step passed between Scheduler and Agent.
+/// The recorder updates execution progress and captures recovery state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub descriptor: StepDescriptor,
@@ -240,8 +196,6 @@ impl Step {
                 payload,
                 result: None,
                 status: StepStatus::Pending,
-                attempt: 1,
-                max_attempts: 3,
                 memory_context: None,
                 started_at: None,
                 completed_at: None,
@@ -274,14 +228,6 @@ impl Step {
             self.execution.status,
             StepStatus::Completed | StepStatus::Failed | StepStatus::Cancelled
         )
-    }
-
-    pub fn is_retriable(&self) -> bool {
-        self.execution.attempt < self.execution.max_attempts
-            && !matches!(
-                self.execution.status,
-                StepStatus::Completed | StepStatus::Cancelled
-            )
     }
 
     pub fn mark_started(&mut self, agent_id: &str) {
@@ -607,7 +553,7 @@ impl ExecutionCursor {
 // ─── Checkpoint (Tiered: Light / Heavy) ──────────────────────────────────────
 
 /// Light checkpoint: cursor + metadata only.
-/// Written frequently (every tool completion), cheap to serialize.
+/// Embedded in heavy recovery checkpoints; not persisted as a standalone file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightCheckpoint {
     pub protocol_version: u32,
@@ -1032,32 +978,7 @@ impl StepCheckpoint {
     }
 }
 
-// ─── Checkpoint Trigger Strategy ─────────────────────────────────────────────
-
-/// When to write checkpoints. Enforced by the execution engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CheckpointTrigger {
-    /// After every slot completion → LightCheckpoint
-    SlotCompleted,
-    /// On phase transition (Perceive→Plan→Act→Evaluate) → HeavyCheckpoint
-    PhaseTransition,
-    /// Before expensive operations (LLM call, bash) → LightCheckpoint
-    BeforeExpensiveOp,
-    /// Explicit user/system request → HeavyCheckpoint
-    Explicit,
-}
-
-impl CheckpointTrigger {
-    /// What tier of checkpoint should this trigger produce?
-    pub fn checkpoint_tier(&self) -> CheckpointTier {
-        match self {
-            Self::SlotCompleted | Self::BeforeExpensiveOp => CheckpointTier::Light,
-            Self::PhaseTransition | Self::Explicit => CheckpointTier::Heavy,
-        }
-    }
-}
-
-/// Tier of checkpoint produced by a trigger.
+/// Tier of a persisted checkpoint artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckpointTier {
     Light,
@@ -1133,128 +1054,6 @@ pub enum StepVerdict {
     Complete,
     Failed,
     BudgetExhausted,
-}
-
-// ─── Retry Policy ────────────────────────────────────────────────────────────
-
-/// Default absolute ceiling for automatic retries (step + tool policies, serde default).
-pub const DEFAULT_RETRY_MAX_ATTEMPTS_CEILING: u32 = 5;
-
-/// Step-level retry policy (fallback when tool-level not specified).
-fn default_retry_max_retries() -> u32 {
-    DEFAULT_RETRY_MAX_ATTEMPTS_CEILING
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,
-    /// Absolute ceiling on step-level retry attempts (defense in depth vs misconfigured `max_attempts`).
-    #[serde(default = "default_retry_max_retries")]
-    pub max_retries: u32,
-    pub backoff_base_ms: u64,
-    pub backoff_max_ms: u64,
-    pub retry_on: Vec<ErrorCategory>,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 500,
-            backoff_max_ms: 30_000,
-            retry_on: vec![ErrorCategory::Transient, ErrorCategory::Timeout],
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Compute backoff delay for attempt N (exponential with jitter cap)
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        let delay = self.backoff_base_ms.saturating_mul(1u64 << attempt.min(10));
-        delay.min(self.backoff_max_ms)
-    }
-
-    pub fn should_retry(&self, attempt: u32, category: &ErrorCategory) -> bool {
-        let limit = self.max_attempts.min(self.max_retries.max(1));
-        attempt < limit && self.retry_on.contains(category)
-    }
-}
-
-/// Tool-level retry policy (more granular than step-level).
-/// A single tool failure doesn't force whole-step retry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRetryPolicy {
-    pub max_attempts: u32,
-    #[serde(default = "default_retry_max_retries")]
-    pub max_retries: u32,
-    pub backoff_base_ms: u64,
-    pub backoff_max_ms: u64,
-}
-
-impl Default for ToolRetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 2,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 300,
-            backoff_max_ms: 5_000,
-        }
-    }
-}
-
-impl ToolRetryPolicy {
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        self.backoff_base_ms
-            .saturating_mul(1u64 << attempt.min(10))
-            .min(self.backoff_max_ms)
-    }
-
-    pub fn should_retry(&self, attempt: u32) -> bool {
-        let limit = self.max_attempts.min(self.max_retries.max(1));
-        attempt < limit
-    }
-}
-
-/// Get tool-level retry policy based on idempotency classification.
-///
-/// `args` is optional because most tools dispatch on name alone; action-sensitive
-/// tools (e.g. `memory`) inspect `args["action"]` to distinguish read vs write.
-pub fn tool_retry_policy(tool_name: &str, args: Option<&serde_json::Value>) -> ToolRetryPolicy {
-    match classify_tool_idempotency(tool_name, args) {
-        // Pure reads: retry aggressively (no side effects)
-        ToolIdempotency::PureRead => ToolRetryPolicy {
-            max_attempts: 3,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 200,
-            backoff_max_ms: 2_000,
-        },
-        // Idempotent writes: retry cautiously
-        ToolIdempotency::IdempotentWrite => ToolRetryPolicy {
-            max_attempts: 2,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 500,
-            backoff_max_ms: 5_000,
-        },
-        // Non-idempotent: do NOT auto-retry (let LLM decide)
-        ToolIdempotency::NonIdempotent => ToolRetryPolicy {
-            max_attempts: 1, // no retry
-            max_retries: 1,
-            backoff_base_ms: 0,
-            backoff_max_ms: 0,
-        },
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorCategory {
-    Transient,
-    Timeout,
-    RateLimit,
-    AuthFailure,
-    InvalidInput,
-    ToolNotFound,
-    InternalError,
 }
 
 // ─── Idempotency ─────────────────────────────────────────────────────────────
@@ -1818,11 +1617,8 @@ mod tests {
         );
         assert_eq!(step.status(), StepStatus::Pending);
         assert_eq!(step.descriptor.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(step.execution.attempt, 1);
-        assert_eq!(step.execution.max_attempts, 3);
         assert!(!step.idempotency_key.is_empty());
         assert!(!step.is_terminal());
-        assert!(step.is_retriable());
         assert!(step.descriptor.agent_id.is_none());
         assert!(step.execution.result.is_none());
         assert!(step.checkpoint.is_none());
@@ -1880,12 +1676,11 @@ mod tests {
             tokens_out: 50,
         });
         assert!(step.is_terminal());
-        assert!(!step.is_retriable());
         assert!(step.execution.completed_at.is_some());
     }
 
     #[test]
-    fn step_lifecycle_failed_retriable() {
+    fn step_lifecycle_failed() {
         let mut step = Step::new(
             "s1".into(),
             "t1".into(),
@@ -1898,8 +1693,11 @@ mod tests {
         );
         step.mark_started("agent-01");
         step.mark_failed("timeout");
+        assert_eq!(step.status(), StepStatus::Failed);
         assert!(step.is_terminal());
-        assert!(step.is_retriable()); // attempt=1, max=3, scheduler decides
+        assert!(
+            matches!(&step.execution.result, Some(StepResult::Error { message }) if message == "timeout")
+        );
     }
 
     // ── Execution Slots (Cursor v3) ──
@@ -2351,74 +2149,6 @@ mod tests {
                 "Expected NonIdempotent for {tool}"
             );
         }
-    }
-
-    // ── Retry Policy ──
-
-    #[test]
-    fn retry_policy() {
-        let policy = RetryPolicy::default();
-
-        // Exponential backoff
-        let backoff_expected = [(0, 500), (1, 1000), (2, 2000), (3, 4000)];
-        for (attempt, expected_ms) in backoff_expected {
-            assert_eq!(
-                policy.backoff_ms(attempt),
-                expected_ms,
-                "backoff at attempt {attempt}"
-            );
-        }
-
-        // Capped backoff
-        let capped = RetryPolicy {
-            backoff_max_ms: 5000,
-            ..RetryPolicy::default()
-        };
-        assert_eq!(capped.backoff_ms(10), 5000, "backoff capped at max");
-
-        // Should retry logic
-        assert!(policy.should_retry(1, &ErrorCategory::Transient));
-        assert!(policy.should_retry(2, &ErrorCategory::Timeout));
-        assert!(
-            !policy.should_retry(3, &ErrorCategory::Transient),
-            "max_attempts=3"
-        );
-        assert!(
-            !policy.should_retry(1, &ErrorCategory::AuthFailure),
-            "not in retry_on"
-        );
-
-        // max_retries caps retries
-        let limited = RetryPolicy {
-            max_attempts: 100,
-            max_retries: 5,
-            ..RetryPolicy::default()
-        };
-        assert!(limited.should_retry(0, &ErrorCategory::Transient));
-        assert!(limited.should_retry(4, &ErrorCategory::Transient));
-        assert!(
-            !limited.should_retry(5, &ErrorCategory::Transient),
-            "max_retries=5"
-        );
-    }
-
-    // ── Tool Retry Policy ──
-
-    #[test]
-    fn tool_retry_policy_by_tool_type() {
-        // PureRead tools get 3 retries with 200ms base
-        let policy = tool_retry_policy("grep", None);
-        assert_eq!(policy.max_attempts, 3);
-        assert_eq!(policy.backoff_base_ms, 200);
-
-        // IdempotentWrite gets 2 retries with 500ms base
-        let policy = tool_retry_policy("write_file", None);
-        assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.backoff_base_ms, 500);
-
-        // NonIdempotent gets 1 attempt (no retry)
-        let policy = tool_retry_policy("bash", None);
-        assert_eq!(policy.max_attempts, 1);
     }
 
     // ── Canonical JSON ──
@@ -2909,43 +2639,6 @@ mod tests {
         assert_eq!(cache.check(&new).unwrap().output, "new");
     }
 
-    // ── Checkpoint Trigger Strategy ──
-
-    #[test]
-    fn checkpoint_trigger_tier_mapping() {
-        assert_eq!(
-            CheckpointTrigger::SlotCompleted.checkpoint_tier(),
-            CheckpointTier::Light
-        );
-        assert_eq!(
-            CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(),
-            CheckpointTier::Light
-        );
-        assert_eq!(
-            CheckpointTrigger::PhaseTransition.checkpoint_tier(),
-            CheckpointTier::Heavy
-        );
-        assert_eq!(
-            CheckpointTrigger::Explicit.checkpoint_tier(),
-            CheckpointTier::Heavy
-        );
-    }
-
-    #[test]
-    fn checkpoint_trigger_serde_roundtrip() {
-        let triggers = [
-            CheckpointTrigger::SlotCompleted,
-            CheckpointTrigger::PhaseTransition,
-            CheckpointTrigger::BeforeExpensiveOp,
-            CheckpointTrigger::Explicit,
-        ];
-        for t in &triggers {
-            let json = serde_json::to_string(t).unwrap();
-            let restored: CheckpointTrigger = serde_json::from_str(&json).unwrap();
-            assert_eq!(&restored, t);
-        }
-    }
-
     // ── Canonical JSON Consistency ──
 
     #[test]
@@ -3346,70 +3039,15 @@ mod tests {
     #[test]
     fn scheduling_contract_defaults() {
         let c = SchedulingContract::default();
-        assert_eq!(c.priority, 5);
         assert_eq!(c.timeout_ms, 300_000);
-        assert_eq!(c.per_tool_timeout_ms, 0);
-        assert_eq!(c.max_retries, 2);
-        assert_eq!(c.backoff_base_ms, 500);
-        assert_eq!(c.backoff_max_ms, 5_000);
-    }
-
-    #[test]
-    fn scheduling_contract_backoff_exponential() {
-        let c = SchedulingContract::default();
-        assert_eq!(c.backoff_ms(0), 500); // 500 * 2^0
-        assert_eq!(c.backoff_ms(1), 1000); // 500 * 2^1
-        assert_eq!(c.backoff_ms(2), 2000); // 500 * 2^2
-        assert_eq!(c.backoff_ms(3), 4000); // 500 * 2^3
-        assert_eq!(c.backoff_ms(4), 5000); // capped at max
-    }
-
-    #[test]
-    fn scheduling_contract_effective_tool_timeout() {
-        let c = SchedulingContract::default(); // 300s step, 0 per-tool
-        // With 3 tools: 300_000 / 3 = 100_000ms per tool (above 30s floor)
-        assert_eq!(c.effective_tool_timeout_ms(3), 100_000);
-        // With 1 tool: full step timeout
-        assert_eq!(c.effective_tool_timeout_ms(1), 300_000);
-        // With 0 tools: full step timeout (edge case)
-        assert_eq!(c.effective_tool_timeout_ms(0), 300_000);
-
-        // Explicit per-tool timeout overrides
-        let c2 = SchedulingContract {
-            per_tool_timeout_ms: 30_000,
-            ..Default::default()
-        };
-        assert_eq!(c2.effective_tool_timeout_ms(3), 30_000);
-        assert_eq!(c2.effective_tool_timeout_ms(1), 30_000);
-
-        // Floor: many tools should not starve individual tools below 30s
-        let c3 = SchedulingContract {
-            timeout_ms: 60_000, // 60s step
-            ..Default::default()
-        };
-        // 60_000 / 5 = 12_000 which is below floor → clamp to 30_000
-        assert_eq!(c3.effective_tool_timeout_ms(5), 30_000);
-        // 60_000 / 2 = 30_000 which equals floor → OK
-        assert_eq!(c3.effective_tool_timeout_ms(2), 30_000);
-        // 60_000 / 1 = 60_000 which is above floor → unchanged
-        assert_eq!(c3.effective_tool_timeout_ms(1), 60_000);
     }
 
     #[test]
     fn scheduling_contract_serde_roundtrip() {
-        let c = SchedulingContract {
-            priority: 8,
-            timeout_ms: 60_000,
-            per_tool_timeout_ms: 10_000,
-            max_retries: 5,
-            backoff_base_ms: 200,
-            backoff_max_ms: 10_000,
-        };
+        let c = SchedulingContract { timeout_ms: 60_000 };
         let json = serde_json::to_string(&c).unwrap();
         let c2: SchedulingContract = serde_json::from_str(&json).unwrap();
-        assert_eq!(c2.priority, 8);
         assert_eq!(c2.timeout_ms, 60_000);
-        assert_eq!(c2.max_retries, 5);
     }
 
     #[test]
@@ -3424,19 +3062,12 @@ mod tests {
                 tool_calls: vec![],
             },
         )
-        .with_scheduling(SchedulingContract {
-            priority: 10,
-            timeout_ms: 60_000,
-            ..Default::default()
-        });
-        assert_eq!(step.descriptor.scheduling.priority, 10);
+        .with_scheduling(SchedulingContract { timeout_ms: 60_000 });
         assert_eq!(step.descriptor.scheduling.timeout_ms, 60_000);
-        assert_eq!(step.descriptor.scheduling.max_retries, 2); // default
     }
 
     #[test]
-    fn step_backward_compat_with_timeout() {
-        // with_timeout_ms still works (sets scheduling.timeout_ms)
+    fn step_timeout_override() {
         let step = Step::new(
             "step-1".into(),
             "task-1".into(),

@@ -182,3 +182,45 @@ pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
             .unwrap_or_else(|error| panic!("clean {table}: {error}"));
     }
 }
+
+/// Builds an acceptance using the exact identity and basis returned by the real proposal entrypoint.
+pub fn criteria_acceptance(
+    proposed: &astra_services::work::RecordedWorkCriteriaProposal,
+    resolution_ref: &str,
+) -> astra_services::work::WorkCriteriaProposalAcceptance {
+    use astra_services::work::{WorkChangeRef, WorkCriteriaProposalAcceptance};
+    WorkCriteriaProposalAcceptance {
+        owner_id: proposed.proposal.owner_id.clone(),
+        work_id: proposed.proposal.work_id.clone(),
+        branch_id: proposed.proposal.branch_id.clone(),
+        proposal_id: proposed.proposal.proposal_id.clone(),
+        payload_hash: proposed.payload_hash.clone(),
+        expected_work_revision: proposed.proposal.expected_work_revision,
+        expected_goal_revision: proposed.proposal.expected_goal_revision,
+        expected_criteria_set_revision: proposed.proposal.expected_criteria_set_revision,
+        expected_branch_revision: proposed.proposal.expected_branch_revision,
+        expected_graph_revision: proposed.proposal.expected_graph_revision,
+        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
+    }
+}
+
+/// Repeats the immutable identity and basis of a recorded graph proposal.
+pub fn plan_acceptance(
+    recorded: &astra_services::work::RecordedWorkPlanProposal,
+    resolution_ref: &str,
+) -> astra_services::work::WorkPlanProposalAcceptance {
+    use astra_services::work::{WorkChangeRef, WorkPlanProposalAcceptance};
+    WorkPlanProposalAcceptance {
+        owner_id: recorded.proposal.owner_id.clone(),
+        work_id: recorded.proposal.work_id.clone(),
+        branch_id: recorded.proposal.branch_id.clone(),
+        proposal_id: recorded.proposal.proposal_id.clone(),
+        payload_hash: recorded.payload_hash.clone(),
+        expected_work_revision: recorded.proposal.expected_work_revision,
+        expected_goal_revision: recorded.proposal.expected_goal_revision,
+        expected_criteria_set_revision: recorded.proposal.expected_criteria_set_revision,
+        expected_branch_revision: recorded.proposal.expected_branch_revision,
+        expected_graph_revision: recorded.proposal.expected_graph_revision,
+        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
+    }
+}
