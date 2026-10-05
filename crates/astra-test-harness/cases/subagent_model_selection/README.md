@@ -126,6 +126,14 @@ probe. This is one test of a general selector, not a
 license to add an alias for that string. Run alongside ambiguous, unavailable,
 and source-qualified controls before claiming semantic-selection quality.
 
+`flash_scoped_child_and_parent` uses a family-only model reference and separately
+assigns work to the child and primary agent, without tool syntax or instructions
+forbidding discovery. Run it only with exactly one authorized GLM candidate
+identity. Its oracle checks actual child inference, adoption, both results,
+zero discovery/file/network tools, and at most three primary rounds. Explicit
+version cases do not establish family-reference quality; this case must pass
+alongside ambiguous and unavailable candidate controls, not replace them.
+
 `flash_discover_then_delegate_glm` exercises the on-demand authorized Chat
 catalog as a user-facing journey. It requires a real `model_catalog` tool
 result with no catalog error or failed discovery calls, a GLM child provider

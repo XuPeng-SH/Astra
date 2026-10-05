@@ -552,9 +552,9 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .as_str()
         .unwrap();
     for constraint in [
-        "Exact directory ID",
-        "explore=no shell(default)",
-        "task requests shell",
+        "Directory: exact ID required",
+        "absent: omit (read-only)",
+        "No file discovery",
     ] {
         assert!(profile.contains(constraint), "{profile}");
     }

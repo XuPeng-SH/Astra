@@ -12756,6 +12756,11 @@ impl AgenticRunLifecycleService {
                     Value::Array(members)
                 ),
             );
+        } else {
+            Self::append_runtime_stable_prompt_text(
+                edge_profile,
+                "This run has no admitted agent profile directory. For delegation, omit agent_type for the bounded read-only default, or select a builtin persona when needed. No profile discovery or workspace configuration lookup is needed; runtime permissions remain authoritative.".to_string(),
+            );
         }
         if let Some(snapshot) = admitted_profiles
             && let Some(lead) = snapshot.lead_agent_id.as_ref().and_then(|id| {

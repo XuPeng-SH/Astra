@@ -200,7 +200,10 @@
 
 # Optional memory and request judgments (not a chat/reasoning/extraction model).
 # Set judgment_default: true on one model to enable it automatically after
-# model load (including make dev-seed). Load checks connectivity before binding.
+# model load (including make dev-seed). All entries load before binding.
+# If this optional model is unavailable, loading finishes with a warning and
+# keeps the existing judgment binding; it does not select a replacement model.
+# Registry errors and rejected binding writes still fail the command.
 # To switch an already active model manually:
 #   astra admin config set judgment_model jev-1.13.0
 #   astra admin config get judgment_model

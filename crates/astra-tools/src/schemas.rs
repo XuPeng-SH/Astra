@@ -1300,12 +1300,12 @@ macro_rules! heap_schema_vec {
 }
 
 fn delegation_agent_type_schema() -> Value {
-    let selection = "With an admitted directory, use its exact profile ID. Otherwise omitted/explore/code-review are read-only (no shell); choose task/general-purpose for shell or mutation, within parent permissions.";
+    let selection = "If runtime context supplies an admitted profile directory, use its exact profile ID; never search workspace files for profiles. Without a directory, omit for the bounded read-only default or choose explore/code-review (no shell); choose task/general-purpose for shell or mutation, within parent permissions.";
     json!({
         "type": "string",
         "minLength": 1,
         "description": selection,
-        "x-astra-discovery-summary": "Exact directory ID; else explore=no shell(default), task requests shell.",
+        "x-astra-discovery-summary": "Directory: exact ID required; absent: omit (read-only). No file discovery.",
     })
 }
 

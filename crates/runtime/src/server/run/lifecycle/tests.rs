@@ -17455,6 +17455,37 @@ fn lead_model_snapshot(
     })
 }
 
+#[test]
+fn delegation_context_distinguishes_absent_and_admitted_profile_directories() {
+    let snapshot = lead_model_snapshot("u1", None);
+    for profiles in [None, Some(snapshot.as_ref())] {
+        let mut context = Map::new();
+        AgenticRunLifecycleService::apply_agent_binding_prompt_context(
+            &mut context,
+            None,
+            None,
+            None,
+            None,
+            profiles,
+        )
+        .unwrap();
+        let texts = context
+            [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS]
+            .as_array()
+            .unwrap();
+        let text = texts[0].as_str().unwrap();
+        if profiles.is_some() {
+            assert!(text.contains("\"agent_type\":\"lead\""));
+            assert!(text.contains("do not omit agent_type"));
+            assert!(!text.contains("no admitted agent profile directory"));
+        } else {
+            assert!(text.contains("no admitted agent profile directory"));
+            assert!(text.contains("omit agent_type"));
+            assert!(text.contains("runtime permissions remain authoritative"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn prepare_chat_request_rejects_malformed_profile_context_before_model_admission() {
     let models = Arc::new(ActiveTestModelService::default());

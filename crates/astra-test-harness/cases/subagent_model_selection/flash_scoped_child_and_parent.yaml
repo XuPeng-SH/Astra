@@ -1,11 +1,11 @@
 name: flash_scoped_child_and_parent
 description: |
-  Natural named-model delegation with independent primary work. Verify actual
+  Natural family-name delegation with independent primary work. The fixture
+  must authorize exactly one GLM candidate identity. Verify actual
   child inference and result adoption, not model self-reporting. Unnecessary
   discovery, filesystem/network access and excessive primary rounds fail.
 prompt: |
-  请让 glm5.2 子代理独立计算 17×19，最终只回复整数。它运行时你独立计算
-  9×11，最后汇总两份结果。不要访问文件或网络。
+  让 glm 算一下 17×19，只回复整数。它运行时你算一下 9×11，最后汇总两份结果。
 debug_log: true
 capability: delegation
 timeout_seconds: 120
