@@ -86,6 +86,7 @@ pub(crate) struct TerminalGuard {
     is_zellij: bool,
     pub(crate) resize_pending: Arc<AtomicBool>,
     clipped_reflow_below_cursor: Option<u16>,
+    unreconciled_width: bool,
     /// Scrollback is deliberately drained over several frames for very long
     /// replies. This keeps terminal writes from monopolising the same event
     /// loop that owns keyboard input and the composer.
@@ -193,6 +194,7 @@ impl TerminalGuard {
             is_zellij,
             resize_pending: Arc::new(AtomicBool::new(false)),
             clipped_reflow_below_cursor: None,
+            unreconciled_width: false,
             history_drain_requester: None,
             keyboard_enhancement_supported,
         };
@@ -319,8 +321,13 @@ impl TerminalGuard {
         let size = self.terminal.size()?;
         // Treat out-of-screen replies as missing, never as scroll distances.
         let cursor = cursor.filter(|&(x, y)| x < queried_size.0 && y < queried_size.1);
+        self.unreconciled_width |= size.width != self.terminal.last_known_screen_size.width
+            || queried_size.0 != self.terminal.last_known_screen_size.width;
         self.resize_pending.store(
-            interrupted || size.width != queried_size.0 || size.height != queried_size.1,
+            interrupted
+                || size.width != queried_size.0
+                || size.height != queried_size.1
+                || (self.unreconciled_width && cursor.is_none()),
             Ordering::Release,
         );
         if self.resize_pending.load(Ordering::Acquire) {
@@ -335,7 +342,9 @@ impl TerminalGuard {
             }
             return Ok(());
         }
-        if self.clipped_reflow_below_cursor.is_none()
+        let unreconciled_width = std::mem::take(&mut self.unreconciled_width);
+        if !unreconciled_width
+            && self.clipped_reflow_below_cursor.is_none()
             && size == self.terminal.last_known_screen_size
             && cursor.is_none_or(|(_, y)| y == self.terminal.last_known_cursor_pos.y)
         {

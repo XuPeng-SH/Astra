@@ -147,18 +147,24 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       tracingResize = true;
       holdCursorReply = true;
       const before = cursorReports;
-      await resize(100, 15);
+      await resize(expiredReply === 'width' ? 40 : 100, 15);
       await waitFor(() => cursorReports > before);
       const expired = heldCursorReply;
+      if (expiredReply === 'width') await settle();
       await resize(100, 30);
       // Outlast the query deadline. A terminal with no response must remain
       // usable, but another indistinguishable DSR must not overlap this one.
       await settle();
       send({ input: '\x1b[200~ PENDING_INPUT\x1b[201~' });
-      await waitFor(() => lines().join('').includes('PENDING_INPUT'));
+      if (expiredReply !== 'width') await waitFor(() => lines().join('').includes('PENDING_INPUT'));
       await settle();
       assert.equal(cursorReports, before + 1, 'issued another cursor query before the expired reply was consumed');
-      check('cursor reply deadline; paste remains responsive');
+      if (expiredReply === 'width') {
+        assert.equal(lines().filter(line => line.includes('Workspace trusted')).length, 1,
+          'width query timeout erased committed history:\n' + lines().join('\n'));
+      } else {
+        check('cursor reply deadline; paste remains responsive');
+      }
       holdCursorReply = false;
       send({ input: expired });
       send({ input: '\x1b[200~ RECOVERED_INPUT\x1b[201~' });
@@ -166,6 +172,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       await resize(160, 30);
       await waitFor(() => cursorReports > before + 1);
       await settle();
+      assert(lines().join('').includes('PENDING_INPUT'), 'input was lost during cursor reply quarantine');
       check('late cursor reply quarantined; fresh resize recovered');
       return;
     }
@@ -218,4 +225,5 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   await journey(rapidSizes, true, true);
   await journey(rapidSizes, true, true, true);
   await journey([], true, true, false, true);
+  await journey([], true, true, false, 'width');
 })().catch(error => { console.error(error); process.exitCode = 1; });
