@@ -1611,7 +1611,8 @@ async fn retryable_group_failure_retains_only_that_session_and_commits_its_peer_
         loop {
             let healthy_rows: i64 = event_count(&pool, &user_id, &healthy_event_id).await;
             let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats).clone();
-            if healthy_rows == 1 && snapshot.errors == 1 {
+            // DB visibility can precede the worker's commit acknowledgement.
+            if healthy_rows == 1 && snapshot.errors == 1 && snapshot.events_flushed > 0 {
                 assert_eq!(snapshot.events_flushed, 1, "{snapshot:?}");
                 assert_eq!(snapshot.flush_count, 1, "{snapshot:?}");
                 break;

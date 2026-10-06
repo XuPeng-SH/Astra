@@ -40,6 +40,9 @@ struct PtyTiming {
     da1_written_ms: Option<u128>,
     startup_ready_seen_ms: Option<u128>,
     input_ready_seen_ms: Option<u128>,
+    resize_applied_ms: Option<u128>,
+    cursor_query_seen_ms: Vec<u128>,
+    cursor_response_write_end_ms: Vec<Option<u128>>,
 }
 
 fn terminal_modes_restored(
@@ -222,11 +225,13 @@ fn probe_child() {
         } else {
             Duration::from_secs(2)
         };
-        let deadline = tokio::time::Instant::now() + budget;
+        let mut deadline = tokio::time::Instant::now() + budget;
         while events.len() < expected_events(&case).len() {
             let event = tokio::time::timeout_at(deadline, stream.next())
                 .await
-                .expect("input was not preserved")
+                .unwrap_or_else(|error| {
+                    panic!("input was not preserved: {error:?}; collected={events:?}")
+                })
                 .expect("input stream ended");
             if let crate::tui::event::TuiEvent::Resize {
                 cursor,
@@ -238,6 +243,7 @@ fn probe_child() {
                     .reconcile_resize(*cursor, *size, *interrupted)
                     .unwrap();
             }
+            let observed_before = events.len();
             match event {
                 crate::tui::event::TuiEvent::Key(key) => {
                     events.push(format!("key:{:?}:{:?}", key.code, key.modifiers))
@@ -269,6 +275,11 @@ fn probe_child() {
                     }
                 }
                 _ => {}
+            }
+            // Keep the original per-input budget, but retries are not
+            // progress and cannot extend the wait for missing input.
+            if events.len() > observed_before {
+                deadline = tokio::time::Instant::now() + budget;
             }
         }
         // A late OSC reply must not become a fourth keyboard event.
@@ -573,6 +584,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                         unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
                         0
                     );
+                    timing.resize_applied_ms = Some(parent_started.elapsed().as_millis());
                 }
                 "arrow" => master.write_all(b"\x1b[A").unwrap(),
                 "alt" => master.write_all(b"\x1bf").unwrap(),
@@ -600,6 +612,9 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             .filter(|bytes| *bytes == b"\x1b[6n")
             .count();
         if queries > cursor_replies {
+            timing
+                .cursor_query_seen_ms
+                .push(parent_started.elapsed().as_millis());
             cursor_replies += 1;
             if cursor_replies == 1 {
                 master.write_all(b"\x1b[8;1R").unwrap();
@@ -626,6 +641,14 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                     master.write_all(b"\x1b[200~resize paste\x1b[201~").unwrap();
                 }
             }
+            timing.cursor_response_write_end_ms.push(
+                if cursor_replies == 1 || (case.starts_with("resize_") && case != "resize_timeout")
+                {
+                    Some(parent_started.elapsed().as_millis())
+                } else {
+                    None
+                },
+            );
         }
         if child.try_wait().unwrap().is_some() {
             // Read remaining output on the next poll; the slave closes at exit.
