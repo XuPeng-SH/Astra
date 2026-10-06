@@ -65,6 +65,7 @@ try:
                 command = json.loads(line)
                 if "resize" in command:
                     resize(fd, *command["resize"])
+                    print(json.dumps({"resize": command["resize"]}), flush=True)
                 elif "input" in command:
                     os.write(fd, command["input"].encode())
                 elif "stop" in command:
