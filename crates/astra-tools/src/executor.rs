@@ -96,6 +96,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024; // 64 KB
 #[derive(Clone)]
 pub struct DefaultToolExecutor {
     ctx: ToolContext,
+    fetch_transport: crate::web_fetch::FetchTransport,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
 
@@ -107,6 +108,7 @@ impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
         Self {
             ctx,
+            fetch_transport: Default::default(),
             approval_gate: None,
             progress_callback: None,
 
@@ -138,6 +140,13 @@ impl DefaultToolExecutor {
 
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
         self.ctx.cancel_token = token;
+        self
+    }
+
+    /// Install the network authority of a user-owned execution boundary.
+    /// Server constructors intentionally retain the pinned-direct default.
+    pub fn with_local_network(mut self) -> Self {
+        self.fetch_transport = crate::web_fetch::FetchTransport::LocalEnvironment;
         self
     }
 
@@ -628,7 +637,7 @@ impl DefaultToolExecutor {
             // ── Web search ───────────────────────────────────────────
             "web_search" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                crate::web_search::perform_web_search(args, &cache_scope).await
+                crate::web_search::perform_web_search(args, &cache_scope, self.fetch_transport).await
             }
 
             // ── Utility tools ────────────────────────────────────────
@@ -661,8 +670,7 @@ impl DefaultToolExecutor {
             // ── Web fetch (HTTP GET) ─────────────────────────────────
             "web_fetch" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                let output = crate::web_fetch::fetch_with_cache_scope(args, &cache_scope).await;
-                string_to_result(output)
+                crate::web_fetch::fetch_with_cache_scope(args, &cache_scope, self.fetch_transport).await
             }
 
             // ── Display sixel (terminal image rendering) ──────────────
