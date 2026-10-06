@@ -1328,6 +1328,8 @@ fn delegation_agent_type_schema() -> Value {
 }
 
 fn requested_model_policy_schema() -> Value {
+    let source_guidance =
+        "Exact catalog provider/access_label only; omit unless user specifies one.";
     json!({
         "type": "object",
         "x-astra-discovery-summary": "Not task/output text; omit unless asked.",
@@ -1356,7 +1358,9 @@ fn requested_model_policy_schema() -> Value {
                                 "properties": {
                                     "kind": {"const": "configured_name"},
                                     "model_name": {"type": "string", "minLength": 1, "maxLength": 256},
-                                    "source": {"type": "string", "minLength": 1, "maxLength": 128}
+                                    "source": {"type": "string", "minLength": 1, "maxLength": 128,
+                                        "description": source_guidance,
+                                        "x-astra-discovery-summary": "Exact provider/access_label."}
                                 },
                                 "required": ["kind", "model_name"],
                                 "additionalProperties": false

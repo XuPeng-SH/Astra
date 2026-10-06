@@ -641,6 +641,11 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .get("requested_model_policy")
             .is_some()
     );
+    assert_eq!(
+        agent_params["properties"]["requested_model_policy"]["oneOf"][1]["properties"]["selector"]
+            ["oneOf"][1]["properties"]["source"]["description"],
+        "Exact provider/access_label."
+    );
     assert!(agent_params["properties"].get("agent_id").is_some());
     assert!(
         agent_params

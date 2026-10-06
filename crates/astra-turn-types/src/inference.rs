@@ -51,6 +51,8 @@ pub enum ModelSelector {
     },
     ConfiguredName {
         model_name: String,
+        /// Optional exact authorized catalog provider or access label, not
+        /// the selector kind or the catalog entry's configuration origin.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },

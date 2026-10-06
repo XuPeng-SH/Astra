@@ -676,6 +676,29 @@ mod tests {
             model_name: "glm-5.2".into(),
             source: Some("provider-a".into()),
         };
+        assert!(
+            resolve_model_selector(
+                &ModelSelector::ConfiguredName {
+                    model_name: "canonical-name".into(),
+                    source: Some("unlisted-source".into()),
+                },
+                &catalog
+            )
+            .is_err(),
+            "an unknown source must not be ignored even for an exact name"
+        );
+        assert_eq!(
+            resolve_model_selector(
+                &ModelSelector::ConfiguredName {
+                    model_name: "canonical-name".into(),
+                    source: None,
+                },
+                &catalog
+            )
+            .unwrap()
+            .offering_id,
+            "offer-id-is-not-a-name"
+        );
         assert_eq!(
             resolve_model_selector(&source_qualified, &catalog)
                 .unwrap()

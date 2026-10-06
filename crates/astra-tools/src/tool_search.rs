@@ -1257,6 +1257,20 @@ mod tests {
                     assert_eq!(control["description"], "Omit outside user-requested scope.");
                     assert!(control.get("x-astra-discovery-summary").is_none());
                 }
+                let policies = if selected["name"] == "agent" {
+                    vec![&parameters["requested_model_policy"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["requested_model_policy"],
+                        &parameters["slots"]["items"]["properties"]["requested_model_policy"],
+                    ]
+                };
+                for policy in policies {
+                    let source = &policy["oneOf"][1]["properties"]["selector"]["oneOf"][1]["properties"]
+                        ["source"];
+                    assert_eq!(source["description"], "Exact provider/access_label.");
+                    assert!(source.get("x-astra-discovery-summary").is_none());
+                }
                 let profiles = if selected["name"] == "agent" {
                     vec![&parameters["agent_type"]]
                 } else {
