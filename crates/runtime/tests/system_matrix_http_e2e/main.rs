@@ -53,14 +53,14 @@ use harness::require_system_e2e_env;
 macro_rules! matrix_test {
     (
         $(#[$extra:meta])*
-        $name:ident, $workers:literal, $reason:literal, $runner:path
+        $name:ident, $workers:literal, $reason:literal, $runner:path $(, $arg:expr)*
     ) => {
         $(#[$extra])*
         #[tokio::test(flavor = "multi_thread", worker_threads = $workers)]
         #[ignore = $reason]
         async fn $name() {
             require_system_e2e_env();
-            $runner().await;
+            $runner($($arg),*).await;
         }
     };
 }
@@ -83,7 +83,13 @@ macro_rules! current_thread_matrix_test {
 matrix_test! {
     e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution, 2,
     "live MatrixOne + scripted provider; real schema rejection and corrected child execution",
-    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution
+    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, false
+}
+
+matrix_test! {
+    e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution_explain, 2,
+    "live MatrixOne + scripted provider; same correction/child contract with Explain enabled",
+    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, true
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

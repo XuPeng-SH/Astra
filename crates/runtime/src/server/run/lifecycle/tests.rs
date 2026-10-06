@@ -29294,7 +29294,13 @@ async fn db_explain_publication_is_discoverable_and_readable() {
     .expect("corrupt the existing Explain snapshot payload");
     let (corrupt, corrupt_fetches) =
         crate::server::explain_analyze_artifact::count_explain_artifact_fetches(
-            executor.execute("introspect", &json!({"explain": {"target": "previous"}})),
+            // This test owns snapshot integrity, not prior-root selection.
+            // Its executor has no persisted current root; use the exact run
+            // so the request reaches the corrupted artifact boundary.
+            executor.execute(
+                "introspect",
+                &json!({"explain": {"target": "run", "run_id": run}}),
+            ),
         )
         .await;
     assert!(corrupt.starts_with("Error:"), "{corrupt}");
