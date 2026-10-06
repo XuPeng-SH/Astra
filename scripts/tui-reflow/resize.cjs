@@ -20,6 +20,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   });
   const exited = once(child, 'exit');
   const trace = [];
+  const started = Date.now();
   let tracingResize = false;
   let cursorReports = 0;
   let holdCursorReply = false;
@@ -70,7 +71,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   };
   function snapshot(label) {
     const b = terminal.buffer.active;
-    trace.push({label, size: [terminal.cols, terminal.rows], base: b.baseY,
+    trace.push({label, elapsedMs: Date.now() - started, size: [terminal.cols, terminal.rows], base: b.baseY,
       cursor: [b.cursorX, b.cursorY],
       ui: lines().map((v, row) => ({row, v})).filter(x => /DRAFT_SENTINEL|Message Astra|resize-model.*Ask/.test(x.v))});
   }

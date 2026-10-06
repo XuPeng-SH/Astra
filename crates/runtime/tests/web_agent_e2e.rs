@@ -1896,7 +1896,8 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let events = tokio::time::timeout(std::time::Duration::from_secs(30), stream)
         .await.unwrap().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while directory_lifetime.upgrade().is_some() {
+        // The last Arc becomes un-upgradeable before TempDir::drop finishes.
+        while directory_lifetime.upgrade().is_some() || workspace_base.exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }).await.expect("workspace fixture must be released after real execution drain");
