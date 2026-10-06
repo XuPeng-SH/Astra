@@ -6904,11 +6904,13 @@ impl ServerAgenticLoopHost {
                 self.provider_scope_bound,
             )
             .is_ok();
+        // This is an observation, not a second model-selection instruction.
+        // Execution-vs-content interpretation belongs to the tool contract.
         let context = json!({
             "catalog": page,
             "child_model_selection_allowed": child_model_selection_allowed,
-            "instruction": "These are the authorized model candidates observed for this request. If child_model_selection_allowed is true, choose the requested model's exact offering_id and pass requested_model_policy to agent or agent_fanout directly; do not discover the same complete catalog again. If false, this scope only supports inherited-model children; an explicit different-model request cannot be fulfilled by silently inheriting. Do not substitute a different version. Ambiguity requires clarification; a partial catalog requires model_catalog continuation before asserting a model is missing. Unavailable observation is not permission to read local model configuration. Execution rechecks authorization and capabilities."
-        }).to_string();
+        })
+        .to_string();
         crate::turn::wire_assembly::required_runtime_preamble_message(
             &context,
             crate::turn::wire_assembly::RuntimeAuthorityKind::AuthorizedModelCatalog,

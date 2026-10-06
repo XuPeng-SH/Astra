@@ -316,6 +316,10 @@ async fn catalog_context_projects_safe_stable_candidates_and_partial_coverage() 
     ));
     let content = first["content"].as_str().unwrap();
     let projected: Value = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        projected.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["catalog", "child_model_selection_allowed"]
+    );
     assert_eq!(projected["catalog"]["coverage"], "complete");
     assert_eq!(projected["child_model_selection_allowed"], true);
     assert_eq!(projected["catalog"]["items"][0]["offering_id"], "id-000");

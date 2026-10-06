@@ -442,7 +442,9 @@ Preserve the user's requested family, version, variant and source. Do not
 substitute a nearby model when the requested one is unavailable.
 
 The first provider request includes a bounded, structured observation of the
-authorized model candidates, outside the stable system/tool prefix. A cold
+authorized model candidates, outside the stable system/tool prefix.
+This context carries observations, not a second selection instruction; the
+canonical tool contract owns execution-versus-content interpretation. A cold
 request loads this catalog once, including ordinary conversation; subsequent
 requests reuse the same principal-isolated cache (60-second freshness, at most
 1,024 entries and 64 KiB serialized content per cached entry). Concurrent cold

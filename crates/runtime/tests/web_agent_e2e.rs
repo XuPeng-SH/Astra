@@ -795,6 +795,16 @@ async fn assert_native_delegation_without_auxiliary_selector(
         "cold parent request must carry one candidate context"
     );
     assert_eq!(candidates[0].0["role"], "user");
+    assert_eq!(
+        candidates[0]
+            .1
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["catalog", "child_model_selection_allowed"],
+        "candidate context carries observations, not another selection policy"
+    );
     let items = candidates[0].1["catalog"]["items"].as_array().unwrap();
     let selected = items
         .iter()
