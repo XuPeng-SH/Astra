@@ -3,7 +3,7 @@ description: |
   A quoted model name is the requested child output, not an execution selector.
   Verify default inheritance through actual child inference and parent adoption.
 prompt: |
-  请让一个子代理只返回字符串“glm-5.2”，最后原样转述它的回答。
+  请让一个子代理只返回字符串“glm-5.2”，等它完成后你也只返回这个字符串。
 debug_log: true
 capability: delegation
 timeout_seconds: 120
