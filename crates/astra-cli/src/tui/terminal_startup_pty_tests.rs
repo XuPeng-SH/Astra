@@ -213,16 +213,18 @@ fn probe_child() {
     let events = runtime.block_on(async {
         use tokio_stream::StreamExt;
         let mut events = Vec::new();
+        let mut resize_observed = false;
+        let budget = if matches!(
+            case.as_str(),
+            "escape" | "escape_then_f" | "arrow" | "alt" | "query_escape"
+        ) {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(2)
+        };
+        let deadline = tokio::time::Instant::now() + budget;
         while events.len() < expected_events(&case).len() {
-            let budget = if matches!(
-                case.as_str(),
-                "escape" | "escape_then_f" | "arrow" | "alt" | "query_escape"
-            ) {
-                Duration::from_millis(200)
-            } else {
-                Duration::from_secs(2)
-            };
-            let event = tokio::time::timeout(budget, stream.next())
+            let event = tokio::time::timeout_at(deadline, stream.next())
                 .await
                 .expect("input was not preserved")
                 .expect("input stream ended");
@@ -259,7 +261,12 @@ fn probe_child() {
                     interrupted: false,
                 } if case.starts_with("resize_") => {
                     assert!(guard.terminal.viewport_area.y < size.1);
-                    events.push(format!("resize:{cursor:?}"));
+                    // One requested resize may produce OS notifications and
+                    // watchdog retries. They must not stand in for input.
+                    if !resize_observed {
+                        resize_observed = true;
+                        events.push(format!("resize:{cursor:?}"));
+                    }
                 }
                 _ => {}
             }
