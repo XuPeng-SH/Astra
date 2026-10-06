@@ -95,6 +95,12 @@ evidence, not proof of a provider call; the child `LlmRoundCompleted` event
 linked by run ID remains the execution check. A subsequent `agent.get_result`
 is normal retrieval and must not count as a second spawn.
 
+`flash_model_name_is_output` is a negative intent control: a quoted model name
+is the child's requested output, not its executor. It requires an actual
+inherited-model child request and adoption of that child's exact result. Run
+it alongside natural family-name assignment and unavailable-version cases;
+matching an answer string alone is not evidence of correct model binding.
+
 `direct_simple_no_spawn` and `flash_delegate_simple_glm` are the primary
 paired efficiency control. Both ask for the same trivial arithmetic answer;
 the delegated request naturally names GLM 5.2. Run the direct case once with
