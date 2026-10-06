@@ -433,42 +433,45 @@ adds no receipt persistence, sender sweep, or status-query database I/O.
 
 Per-agent model override is an orchestration decision, but it must still respect budget, policy, and trace requirements.
 
-When a user names a delegated model in natural language, one candidate-aware
-judgment resolves the request against the current authorized Chat catalog.
-It must preserve the requested family, version, variant, namespace and source;
-an unavailable or ambiguous model stops the child before execution. A family
-plus version can identify a unique model in that snapshot when the user omitted
-a variant; multiple matching variants or sources require clarification. Runtime
-checks exact quoted text, candidate membership, canonical IDs/names, scope,
-authorization and capability, but does not run a second lexical parser over
-model aliases. Semantic alias interpretation can still be wrong; its accuracy
-needs live evaluation and the chosen identity remains visible in Explain.
-Explicit structured selectors retain their exact-match contract. The judgment
-reuses the admission catalog snapshot without a second catalog read.
+The primary model interprets natural-language delegation requests and proposes
+the child's model through the canonical `requested_model_policy` control.
+Both resident and discovered schemas expose that same control. Fixed selectors
+use an exact authorized Offering ID or configured name; names inside task
+content, quoted text, or requested output do not select an execution model.
+Preserve the user's requested family, version, variant and source. Do not
+substitute a nearby model when the requested one is unavailable.
 
-The auxiliary interpretation of one user turn covers all proposed children in
-one bounded judgment. Its compact output identifies exact user evidence,
-eligible candidate IDs, optional task scopes, and reasoning controls. Runtime
-verifies the deterministic facts and binds them to the original user text and
-catalog snapshot; semantic accuracy is evaluated separately. An invalid or
-uncertain judgment cannot silently choose a nearby model, relax a hard
-requirement, or authorize Auto. A tool's proposed selector is matching context,
-never user authority. This interpretation adds no separate catalog query or
-database write. The validated ambiguity reason is returned to the caller, while
-Explain retains only its bounded structured summary. A non-retryable delegation
-rejection blocks that operation, not independent parent work. Frozen admission
-results, stall limits and turn budgets prevent repeated paid interpretation;
-active Work attempts retain their existing typed settlement boundary.
+Model discovery uses the existing authenticated `model_catalog` boundary.
+A caller that does not know the available choices discovers them there, never
+through workspace configuration or credentials. Its request-scoped snapshot
+is shared with child admission. A cold ordinary conversation does not load
+the catalog merely to support hypothetical delegation. Discovery pages are
+observations, not execution grants, and incomplete pages cannot prove a choice
+unique across the complete catalog.
 
-A model-only request does not imply a reasoning level. The same judgment must
-distinguish a request to *use* a reasoning control from a phrase the child is
-asked to explain, compare, quote or output, and must account for negations and
-later corrections. Its typed reasoning and exact source quote travel together.
-Runtime checks that pairing, positive budgets, slot conflicts and provider
-support; it no longer guesses semantic intent from a fixed phrase, negation or
-sentence-separator list. Ambiguous intent is unresolved. A plausible but wrong
-semantic judgment remains a measurable risk, not a deterministic guarantee.
-The runtime never downgrades an unsupported exact effort into generic thinking.
+Runtime validates exact selectors, authorization, capability, lineage, profile,
+batch capacity, and independently supplied typed user constraints before any
+child starts. A proposal is not user authority and cannot weaken a hard typed
+requirement. Ordinary delegation does not invoke a second auxiliary interpreter
+to generate hard model or reasoning requirements from the same user text.
+Existing scoped typed constraints may still use bounded scope binding; that
+judgment only establishes applicability and cannot create execution controls.
+Jev/Jev-like assistance is not required for fixed model selection; Auto remains
+unavailable until its own evidence and routing contract are implemented.
+
+Frozen invocation decisions retain their original identity and constraints
+during retries and replay. A correction is a new proposal, not permission to
+rewrite a prepared invocation. Missing, malformed or stale typed authority
+fails closed. Existing semantic-derived records are not silently relabelled or
+downgraded during replay. Selected model identity, exact control, admission
+failure and provider usage remain visible through the existing execution
+trace and Explain paths; removed auxiliary calls produce no synthetic usage.
+
+A model-only request does not imply a reasoning level. The primary proposes
+reasoning only when requested; runtime validates its supported exact protocol
+and effort. It never downgrades unsupported effort into generic thinking.
+Natural-language fidelity remains a live-evaluation obligation: exact catalog
+membership proves authorization, not that a model correctly understood intent.
 
 Dynamic spawn and fanout resolve reasoning separately from the Offering.
 After per-slot and shared defaults, an omitted reasoning control inherits the

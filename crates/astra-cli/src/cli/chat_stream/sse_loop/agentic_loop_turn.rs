@@ -3758,8 +3758,8 @@ mod tests {
 
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
         // Use a capability classified as Deferred by the canonical ToolSpec
-        // registry. `memory` is intentionally AlwaysLoad, so using it here
-        // would test the resident-surface policy rather than activation.
+        // registry; its invocation follows activation rather than a
+        // model-visible native schema.
         executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
         let selected = executor
             .execute("tool_search", &json!({"query": "select:web_fetch"}))

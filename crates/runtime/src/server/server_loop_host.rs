@@ -2560,17 +2560,6 @@ fn scoped_inference_operation_id(stage: &str, identity: &str) -> String {
     )
 }
 
-fn delegation_intent_assessment_operation_id(
-    source_digest: &str,
-    input_digest: &str,
-    candidate_snapshot_digest: &str,
-) -> String {
-    scoped_inference_operation_id(
-        "intent",
-        &format!("{source_digest}|{input_digest}|{candidate_snapshot_digest}"),
-    )
-}
-
 fn inherited_delegation_source_from_state(
     state: &AgenticLoopState,
     origin: &astra_turn_types::DelegationUserRequirementSource,
@@ -3607,7 +3596,6 @@ pub struct ServerAgenticLoopHost {
     /// One-turn, in-memory repair evidence for a fused delegation scope.
     /// Reuse is allowed only when the complete source and slot inputs match;
     /// a new batch establishes its own scope.
-    delegation_scope_retry_cache: Option<DelegationScopeRetryCache>,
     /// One monotonic auxiliary-inference identity namespace for this host.
     /// Independently reconstructed summary clients must never restart at zero
     /// for the same durable run scope.
@@ -5918,7 +5906,6 @@ impl ServerAgenticLoopHostBuilder {
             resolved_llm_config: None,
             resolved_llm_config_at: None,
             judgment_route_cache: None,
-            delegation_scope_retry_cache: None,
             summary_attempt_allocator: DurableSummaryAttemptAllocator::default(),
             execution_time_budget: self.execution_time_budget,
             canonical_transition_hydrated: false,
@@ -6831,10 +6818,9 @@ impl ServerAgenticLoopHost {
         response
     }
 
-    /// Resolve the one bounded, candidate-aware selector call used by
-    /// delegation. A Jev/Jev-like route is optional; native TypeSafe Choice
-    /// is not used here because it cannot carry the rich scope and reasoning
-    /// evidence required by this contract.
+    /// Resolve the bounded judgment route for mapping existing typed task
+    /// scopes onto child slots. Fresh model proposals do not use this route.
+    /// Native TypeSafe Choice cannot carry the required scope assignments.
     async fn delegation_judgment_client(
         &mut self,
         state: &AgenticLoopState,
@@ -6879,181 +6865,23 @@ impl ServerAgenticLoopHost {
             .map(|client| (client, false))
     }
 
-    async fn assess_root_delegation_intent(
-        &mut self,
-        state: &mut AgenticLoopState,
-        source: &DelegationIntentSource,
-        user_text: &str,
-        slots: &[astra_services::delegation_model_requirement::DelegationSlotBrief],
-        presence: Option<astra_services::WorkAdmissionTruth>,
-        attempt: u8,
-    ) -> (
-        astra_turn_types::DelegationIntentRequirements,
-        Option<astra_services::delegation_model_requirement::DelegationScopeBinding>,
-    ) {
-        let started_at = Instant::now();
-        let mut summary = None;
-        let mut assessment_operation_id = None;
-        let (assessed, binding) = self
-            .assess_root_delegation_intent_with_evidence(
-                state,
-                source,
-                user_text,
-                slots,
-                presence,
-                attempt,
-                &mut summary,
-                &mut assessment_operation_id,
-            )
-            .await;
-        self.record_delegation_model_assessment(
-            state,
-            started_at,
-            attempt,
-            &assessed,
-            summary.as_ref(),
-            assessment_operation_id.as_deref(),
-        );
-        (assessed, binding)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn assess_root_delegation_intent_with_evidence(
-        &mut self,
-        state: &AgenticLoopState,
-        source: &DelegationIntentSource,
-        user_text: &str,
-        slots: &[astra_services::delegation_model_requirement::DelegationSlotBrief],
-        presence: Option<astra_services::WorkAdmissionTruth>,
-        attempt: u8,
-        summary: &mut Option<
-            astra_services::delegation_model_requirement::DelegationCandidateJudgmentSummary,
-        >,
-        assessment_operation_id: &mut Option<String>,
-    ) -> (
-        astra_turn_types::DelegationIntentRequirements,
-        Option<astra_services::delegation_model_requirement::DelegationScopeBinding>,
-    ) {
-        use astra_services::delegation_model_requirement::delegation_model_candidates;
-        use astra_turn_types::DelegationIntentRequirements;
-
-        let origin = delegation_requirement_source(source);
-        let unresolved = |reason: &str| DelegationIntentRequirements::Unresolved {
-            source: origin.clone(),
-            reason: reason.to_string(),
-        };
-        let unavailable = |reason: &str| DelegationIntentRequirements::Unavailable {
-            source: origin.clone(),
-            reason: reason.to_string(),
-            attempts: attempt,
-        };
-        let catalog = self.read_authorized_model_catalog().await.map(|items| {
-            astra_services::models::model_catalog_for_purpose(
-                items,
-                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-            )
-        });
-        let Some(catalog) = catalog else {
-            return (
-                unavailable("The authorized model catalog is unavailable."),
-                None,
-            );
-        };
-        let candidates = delegation_model_candidates(&catalog);
-        let assessment_request =
-            match astra_services::delegation_model_requirement::delegation_intent_assessment_request(
-                user_text,
-                &candidates,
-                Some(slots),
-            ) {
-                Ok(request) => request,
-                Err(_) => {
-                    return (
-                        unresolved(
-                            "The user model requirement or candidate catalog exceeds the bounded interpretation contract.",
-                        ),
-                        None,
-                    );
-                }
-            };
-        let operation_id = delegation_intent_assessment_operation_id(
-            &source.user_intent_digest,
-            &assessment_request.input_digest,
-            &assessment_request.candidate_snapshot_digest,
-        );
-        *assessment_operation_id = Some(operation_id.clone());
-        let explicit_requirement_presence =
-            presence == Some(astra_services::WorkAdmissionTruth::Yes);
-        let Some(response) = self
-            .call_delegation_judgment(
-                state,
-                &operation_id,
-                "delegation_candidate_assessment",
-                assessment_request.max_output_tokens,
-                &assessment_request.messages,
-                |raw| astra_services::delegation_model_requirement::parse_delegation_intent_requirements_with_request(
-                    raw, explicit_requirement_presence, &assessment_request,
-                ).map(|_| ()),
-            )
+    /// Shared authenticated snapshot for model routing. Ordinary fixed child
+    /// proposals do not load it; their executor owns exact selector admission.
+    async fn read_authorized_model_catalog(&self) -> Option<Vec<astra_services::ModelListItem>> {
+        if let Some(reader) = self.model_catalog_reader.as_ref() {
+            return tokio::time::timeout(Duration::from_secs(5), reader.read_snapshot())
+                .await
+                .ok()
+                .and_then(Result::ok);
+        }
+        if self.provider_scope_bound {
+            return None;
+        }
+        self.model_service
+            .as_ref()?
+            .list_models(self.user_id.clone(), false)
             .await
-        else {
-            return (
-                unavailable("Model requirements could not be checked."),
-                None,
-            );
-        };
-        let response = match response {
-            Ok(response)
-                if !response.is_ptl_error && response.finish_reason.as_deref() == Some("stop") =>
-            {
-                response
-            }
-            Err(_) => {
-                return (
-                    unavailable("Model requirement assessment provider call failed."),
-                    None,
-                );
-            }
-            Ok(response) if response.is_ptl_error => {
-                return (
-                    unavailable("Model requirement assessment returned a provider error."),
-                    None,
-                );
-            }
-            Ok(_) => {
-                return (
-                    unavailable("Model requirement assessment did not complete."),
-                    None,
-                );
-            }
-        };
-        let extracted =
-            match astra_services::delegation_model_requirement::parse_delegation_intent_requirements_with_request(
-                &response.text,
-                explicit_requirement_presence,
-                &assessment_request,
-            ) {
-                Ok(extracted) => extracted,
-                Err(error) => {
-                    tracing::warn!(
-                        operation_id,
-                        error = %error,
-                        "delegation model assessment response was rejected"
-                    );
-                    return (
-                        unavailable("The model-selection service returned invalid evidence; no child was started. Changing spawn arguments or inspecting local configuration cannot repair this internal response."),
-                        None,
-                    );
-                }
-            };
-        *summary = Some(extracted.summary.clone());
-        let assessed = match astra_services::delegation_model_requirement::materialize_delegation_intent_requirements(
-            &extracted, origin.clone(),
-        ) {
-            Ok(assessed) => assessed,
-            Err(reason) => return (unresolved(&reason), None),
-        };
-        (assessed, extracted.scope_binding)
+            .ok()
     }
 
     async fn judge_delegation_scope_binding(
@@ -7096,322 +6924,6 @@ impl ServerAgenticLoopHost {
             scoped,
             slots.len(),
         )
-    }
-
-    async fn rebind_changed_delegation_scope_batch(
-        &mut self,
-        state: &mut AgenticLoopState,
-        source: &DelegationIntentSource,
-        user_text: &str,
-        pending: &[PendingDelegationCall],
-        assessed: &astra_turn_types::DelegationIntentRequirements,
-        cache: &DelegationScopeRetryCache,
-    ) -> Result<
-        (
-            astra_services::delegation_model_requirement::DelegationScopeBinding,
-            BTreeSet<String>,
-        ),
-        String,
-    > {
-        use astra_turn_types::DelegationIntentRequirements;
-
-        assessed.validate().map_err(str::to_string)?;
-        let requirements = match assessed {
-            DelegationIntentRequirements::Requirements { requirements, .. } => requirements,
-            _ => return Err("Delegation scope ledger requires resolved requirements.".into()),
-        };
-        let scoped = requirements
-            .iter()
-            .filter(|item| item.task_scope_quote.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        if scoped.is_empty() {
-            return Err("Delegation scope ledger has no scoped requirements.".into());
-        }
-
-        let previous_assignments = cache.binding.validated_assignments(
-            scoped.iter().map(|item| item.requirement_id.as_str()),
-            cache.slots.len(),
-        )?;
-
-        let current_slots = pending
-            .iter()
-            .flat_map(|item| item.slots.iter().cloned())
-            .collect::<Vec<_>>();
-        if current_slots.is_empty() {
-            return Err("Delegation task slot count is invalid.".into());
-        }
-        let mut used_current = HashSet::new();
-        let old_to_current = cache
-            .slots
-            .iter()
-            .map(|old| {
-                current_slots
-                    .iter()
-                    .enumerate()
-                    .find(|(index, current)| {
-                        !used_current.contains(index) && delegation_scope_inputs_match(old, current)
-                    })
-                    .map(|(index, _)| {
-                        used_current.insert(index);
-                        index
-                    })
-            })
-            .collect::<Vec<_>>();
-        let new_slot_indices = current_slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, _)| (!used_current.contains(&index)).then_some(index))
-            .collect::<Vec<_>>();
-
-        let mut consumed = cache.consumed_requirement_ids.clone();
-        for (requirement_id, slot_indices) in &previous_assignments {
-            if consumed.contains(*requirement_id) || slot_indices.is_empty() {
-                continue;
-            }
-            let fully_executed = slot_indices.iter().all(|&index| {
-                cache
-                    .slots
-                    .get(index)
-                    .is_some_and(|slot| delegation_scope_slot_succeeded(state, slot))
-            });
-            if fully_executed {
-                consumed.insert((*requirement_id).to_owned());
-            }
-        }
-
-        let mut assignments = scoped
-            .iter()
-            .map(|requirement| (requirement.requirement_id.clone(), Vec::new()))
-            .collect::<BTreeMap<_, _>>();
-        for requirement in &scoped {
-            if consumed.contains(&requirement.requirement_id) {
-                continue;
-            }
-            let Some(previous) = previous_assignments.get(requirement.requirement_id.as_str())
-            else {
-                return Err("Delegation scope ledger is missing a requirement assignment.".into());
-            };
-            let current = assignments
-                .get_mut(&requirement.requirement_id)
-                .expect("assignment initialized from scoped requirements");
-            for &old_index in previous {
-                if let Some(current_index) = old_to_current[old_index] {
-                    current.push(current_index);
-                }
-            }
-        }
-
-        let remaining = scoped
-            .iter()
-            .filter(|requirement| !consumed.contains(&requirement.requirement_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !remaining.is_empty() && !new_slot_indices.is_empty() {
-            let new_slots = new_slot_indices
-                .iter()
-                .map(|&index| current_slots[index].clone())
-                .collect::<Vec<_>>();
-            let identity = new_slots
-                .iter()
-                .map(|slot| {
-                    slot.invocation.as_ref().map_or_else(
-                        || format!("{}:{}", slot.description, slot.prompt),
-                        |invocation| {
-                            format!(
-                                "{}:{}:{}:{}",
-                                invocation.tool_call_id,
-                                invocation.tool_name,
-                                invocation.group_id.as_deref().unwrap_or_default(),
-                                invocation.slot_index
-                            )
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("|");
-            let judged = self
-                .judge_delegation_scope_binding(
-                    state, source, user_text, &remaining, &new_slots, &identity,
-                )
-                .await?;
-            for assignment in judged.assignments {
-                let Some(target) = assignments.get_mut(&assignment.requirement_id) else {
-                    return Err("Delegation scope judgment returned an unknown requirement.".into());
-                };
-                for local_index in assignment.slot_indices {
-                    let Some(&current_index) = new_slot_indices.get(local_index) else {
-                        return Err("Delegation scope judgment returned an invalid slot.".into());
-                    };
-                    if target.contains(&current_index) {
-                        return Err("Delegation scope judgment duplicated a slot.".into());
-                    }
-                    target.push(current_index);
-                }
-            }
-        }
-
-        Ok((
-            astra_services::delegation_model_requirement::DelegationScopeBinding {
-                assignments: scoped
-                    .iter()
-                    .map(|requirement| {
-                        let mut slot_indices = assignments
-                            .remove(&requirement.requirement_id)
-                            .expect("assignment initialized from scoped requirements");
-                        slot_indices.sort_unstable();
-                        astra_services::delegation_model_requirement::DelegationScopeAssignment {
-                            requirement_id: requirement.requirement_id.clone(),
-                            slot_indices,
-                        }
-                    })
-                    .collect(),
-                unresolved: Vec::new(),
-            },
-            consumed,
-        ))
-    }
-
-    /// Share the authenticated request snapshot with every model-dependent
-    /// decision in this run. The reader caches only within this request and
-    /// its descendants; a failed read is never replaced by an unscoped direct
-    /// query, and execution still revalidates the selected Offering.
-    async fn read_authorized_model_catalog(&self) -> Option<Vec<astra_services::ModelListItem>> {
-        if let Some(reader) = self.model_catalog_reader.as_ref() {
-            return tokio::time::timeout(Duration::from_secs(5), reader.read_snapshot())
-                .await
-                .ok()
-                .and_then(Result::ok);
-        }
-        if self.provider_scope_bound {
-            return None;
-        }
-        self.model_service
-            .as_ref()?
-            .list_models(self.user_id.clone(), false)
-            .await
-            .ok()
-    }
-
-    /// Enrich the existing journal/Explain lanes without consulting storage or
-    /// changing admission. Only the shared safe summary crosses this boundary;
-    /// requirement reasons, source quotes and catalog/provider payloads do not.
-    fn record_delegation_model_assessment(
-        &mut self,
-        state: &mut AgenticLoopState,
-        started_at: Instant,
-        attempt: u8,
-        assessed: &astra_turn_types::DelegationIntentRequirements,
-        summary: Option<
-            &astra_services::delegation_model_requirement::DelegationCandidateJudgmentSummary,
-        >,
-        assessment_operation_id: Option<&str>,
-    ) {
-        use astra_turn_types::{
-            DelegationIntentRequirements as Requirements, ExplainAnalyzeOutcomeV1 as Outcome,
-        };
-
-        let (source, outcome, error_kind, label) = match assessed {
-            Requirements::Unassessed => return,
-            Requirements::Unconstrained { source } => (
-                source,
-                Outcome::Resolved,
-                None,
-                "No delegated model requirement",
-            ),
-            Requirements::Requirements { source, .. } => {
-                (source, Outcome::Resolved, None, "Select delegated models")
-            }
-            Requirements::Unresolved { source, .. } => (
-                source,
-                Outcome::Blocked,
-                Some("delegation_model_scope_unresolved"),
-                "Delegated model requirements unresolved",
-            ),
-            Requirements::Unavailable { source, .. } => (
-                source,
-                Outcome::Unavailable,
-                Some("delegation_model_assessment_unavailable"),
-                "Delegated model assessment unavailable",
-            ),
-            Requirements::CatalogResolutionFailed { source, .. } => (
-                source,
-                Outcome::Blocked,
-                Some("delegation_model_catalog_resolution_failed"),
-                "Delegated model selection unresolved",
-            ),
-        };
-        let finished_at = Instant::now();
-        let duration = finished_at.saturating_duration_since(started_at);
-        let span_id = format!(
-            "delegation_intent_assessment-{}-{}-{attempt}",
-            source.session_turn, state.current_round_index,
-        );
-        let method = summary.map_or(
-            astra_services::delegation_model_requirement::DelegationRequirementJudgmentMethod::CandidateAwareOneCallV1,
-            |summary| summary.method,
-        );
-        if let Some(buffer) = state.turn_event_buffer.as_mut() {
-            let attrs = HashMap::from([(
-                "delegation_model_assessment".to_string(),
-                json!({
-                    "schema_version": 1,
-                    "method": method,
-                    "source_digest": source.user_intent_digest,
-                    "operation_id": assessment_operation_id,
-                    "round_index": state.current_round_index,
-                    "attempt_index": attempt,
-                    "outcome": outcome,
-                    "error_kind": error_kind,
-                    "assessment": summary,
-                })
-                .to_string(),
-            )]);
-            let end_us = chrono::Utc::now().timestamp_micros().max(0) as u64;
-            buffer.record_trace_span_v2(
-                astra_services::session_journal::TraceSpanBuilder::default()
-                    .span_id(span_id.clone())
-                    .name("delegation_model_assessment".to_string())
-                    .trace_id(state.current_run_id.clone())
-                    .turn(Some(source.session_turn))
-                    .start_us(end_us.saturating_sub(duration.as_micros() as u64))
-                    .end_us(end_us)
-                    .attrs(Some(&attrs)),
-            );
-        }
-        if let Some(context) = self.explain_analyze_context.clone() {
-            let label = summary.map_or_else(
-                || label.to_string(),
-                |summary| {
-                    format!(
-                        "{label} (candidates: {}, requirements: {})",
-                        summary.candidate_count,
-                        summary.selections.len(),
-                    )
-                },
-            );
-            let node = ExplainAnalyzeNode::new(
-                &context,
-                format!("{}/delegation/{span_id}", context.root_node_id),
-                Some(context.root_node_id.clone()),
-                astra_turn_types::ExplainAnalyzeNodeKindV1::Admission,
-                label,
-                started_at,
-                Some(state.current_round_index),
-                Some(u32::from(attempt)),
-            );
-            let node_id = node.node_id.clone();
-            self.start_explain_analyze_node(node);
-            self.finish_explain_analyze_node_at(
-                &node_id,
-                duration.as_millis() as u64,
-                outcome,
-                None,
-                finished_at,
-                None,
-                delegation_catalog_resolution_explain_detail(assessed),
-            );
-        }
     }
 
     async fn bind_assessed_delegation_models(
@@ -7489,6 +7001,7 @@ impl ServerAgenticLoopHost {
         }
         let mut admissions = std::collections::HashMap::new();
         let mut blocked = Vec::new();
+        let mut catalog_snapshot = None;
         let mut offset = 0;
         for item in pending {
             let end = offset + item.slots.len();
@@ -7513,11 +7026,61 @@ impl ServerAgenticLoopHost {
                 }
             });
             offset += item.slots.len();
-            let (slots, child_requirements) = match astra_services::delegation_model_requirement::bind_delegation_requirements_to_slots(
-                assessed,
-                local_binding.as_ref(),
-                &item.slots,
-            ) {
+            let bound =
+                astra_services::delegation_model_requirement::bind_delegation_requirements_to_slots(
+                    assessed,
+                    local_binding.as_ref(),
+                    &item.slots,
+                );
+            let bound = match bound {
+                Ok((mut slots, child_requirements)) => {
+                    let named = slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, slot)| {
+                            if slot.model_selection.is_none()
+                                && slot.model_strength
+                                    == Some(astra_turn_types::DelegationRequirementStrength::Hard)
+                                && let Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                                    selector:
+                                        selector @ astra_turn_types::ModelSelector::ConfiguredName {
+                                            ..
+                                        },
+                                }) = slot.requested_model_policy.as_ref()
+                            {
+                                Some((index, selector.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let resolved = if named.is_empty() {
+                        Ok(())
+                    } else {
+                        if catalog_snapshot.is_none() {
+                            catalog_snapshot = Some(self.read_authorized_model_catalog().await);
+                        }
+                        match catalog_snapshot.as_ref().and_then(Option::as_ref) {
+                            Some(catalog) => {
+                                let selectors = named
+                                    .iter()
+                                    .map(|(_, selector)| selector.clone())
+                                    .collect::<Vec<_>>();
+                                astra_services::delegation_model_requirement::resolve_model_selectors(&selectors, catalog)
+                                    .map(|selections| {
+                                        for ((index, _), selection) in named.into_iter().zip(selections) {
+                                            slots[index].model_selection = Some(selection);
+                                        }
+                                    })
+                            }
+                            None => Err("The authorized model catalog is unavailable.".into()),
+                        }
+                    };
+                    resolved.map(|()| (slots, child_requirements))
+                }
+                Err(reason) => Err(reason),
+            };
+            let (slots, child_requirements) = match bound {
                 Ok(bound) => bound,
                 Err(reason) => {
                     let error_kind = if [
@@ -18228,108 +17791,6 @@ struct PendingDelegationCall {
     valid_shape: bool,
 }
 
-#[derive(Clone)]
-struct DelegationScopeRetryCache {
-    source_digest: String,
-    binding: astra_services::delegation_model_requirement::DelegationScopeBinding,
-    slots: Vec<astra_services::delegation_model_requirement::DelegationSlotBrief>,
-    call_ids: Vec<String>,
-    /// Requirements whose previously assigned slots have completed
-    /// successfully. This is turn-local ledger state; it is never persisted
-    /// and is carried forward only so a later batch cannot reapply a consumed
-    /// hard scope to an unrelated slot.
-    consumed_requirement_ids: BTreeSet<String>,
-}
-
-fn delegation_scope_inputs_match(
-    left: &astra_services::delegation_model_requirement::DelegationSlotBrief,
-    right: &astra_services::delegation_model_requirement::DelegationSlotBrief,
-) -> bool {
-    left.description == right.description
-        && left.prompt == right.prompt
-        && left.requested_model_policy == right.requested_model_policy
-        && left.reasoning == right.reasoning
-        && match (&left.invocation, &right.invocation) {
-            (Some(left), Some(right)) => {
-                left.tool_name == right.tool_name
-                    && left.group_id == right.group_id
-                    && left.slot_index == right.slot_index
-            }
-            (None, None) => true,
-            _ => false,
-        }
-}
-
-fn delegation_scope_slot_succeeded(
-    state: &AgenticLoopState,
-    slot: &astra_services::delegation_model_requirement::DelegationSlotBrief,
-) -> bool {
-    let Some(tool_call_id) = slot
-        .invocation
-        .as_ref()
-        .map(|invocation| invocation.tool_call_id.as_str())
-    else {
-        return false;
-    };
-    state.stall.tool_call_records.iter().any(|record| {
-        record.tool_call_id.as_deref() == Some(tool_call_id) && record.was_executed() && record.ok
-    })
-}
-
-fn delegation_scope_batch_matches(
-    pending: &[PendingDelegationCall],
-    cached_slots: &[astra_services::delegation_model_requirement::DelegationSlotBrief],
-) -> bool {
-    let current_slots = pending
-        .iter()
-        .flat_map(|item| item.slots.iter())
-        .collect::<Vec<_>>();
-    current_slots.len() == cached_slots.len()
-        && current_slots
-            .iter()
-            .zip(cached_slots.iter())
-            .all(|(current, cached)| delegation_scope_inputs_match(current, cached))
-}
-
-fn reusable_delegation_scope_binding(
-    state: &AgenticLoopState,
-    source: &DelegationIntentSource,
-    pending: &[PendingDelegationCall],
-    cache: &DelegationScopeRetryCache,
-) -> Option<astra_services::delegation_model_requirement::DelegationScopeBinding> {
-    if cache.source_digest != source.user_intent_digest {
-        return None;
-    }
-
-    // A cached binding is repair evidence only after the original invocation
-    // actually failed. A successful first batch must not silently authorize a
-    // later, independent task in the same user turn.
-    let all_original_failed = !cache.call_ids.is_empty()
-        && cache.call_ids.iter().all(|call_id| {
-            state.stall.tool_call_records.iter().any(|record| {
-                record.tool_call_id.as_deref() == Some(call_id.as_str())
-                    && !record.ok
-                    && matches!(
-                        record.effective_disposition(),
-                        astra_services::session_journal::ToolCallDisposition::Executed
-                            | astra_services::session_journal::ToolCallDisposition::Rejected
-                    )
-            })
-        });
-    if !all_original_failed {
-        return None;
-    }
-
-    // Reuse only when the entire scoped input batch is unchanged. Matching a
-    // retry by model identity or by one failed slot can leak a prior task's
-    // scope into a new task in the same turn.
-    if !delegation_scope_batch_matches(pending, &cache.slots) {
-        return None;
-    }
-
-    Some(cache.binding.clone())
-}
-
 fn annotate_delegation_slots(
     slots: &mut [astra_services::delegation_model_requirement::DelegationSlotBrief],
     tool_call_id: &str,
@@ -18697,178 +18158,58 @@ impl ServerAgenticLoopHost {
                 None,
             ).await);
         };
-        let user_text = authoritative_delegation_user_text(state).expect("source has user text");
-        let presence = self
-            .pending_work_admission
-            .as_ref()
-            .filter(|assessment| assessment.source.as_ref() == Some(&source))
-            .and_then(|assessment| assessment.delegation_model_requirement);
+        // The proposal owns natural-language interpretation, not user authority.
+        // Runtime retains typed hard constraints and frozen invocation decisions;
+        // exact identity, authorization and capability checks still precede start.
+        use astra_turn_types::DelegationIntentRequirements;
+        let origin = delegation_requirement_source(&source);
         let current = &state
             .skills
             .request_constraints
             .delegated_model_requirements;
-        let current_source = match current {
-            astra_turn_types::DelegationIntentRequirements::Unassessed => None,
-            astra_turn_types::DelegationIntentRequirements::Unconstrained { source }
-            | astra_turn_types::DelegationIntentRequirements::Unresolved { source, .. }
-            | astra_turn_types::DelegationIntentRequirements::Unavailable { source, .. }
-            | astra_turn_types::DelegationIntentRequirements::CatalogResolutionFailed {
-                source,
-                ..
+        let assessed = match current {
+            DelegationIntentRequirements::Unassessed
+            | DelegationIntentRequirements::Unconstrained { .. } => {
+                DelegationIntentRequirements::Unconstrained {
+                    source: origin.clone(),
+                }
             }
-            | astra_turn_types::DelegationIntentRequirements::Requirements { source, .. } => {
-                Some(source)
+            DelegationIntentRequirements::Requirements { source, .. }
+            | DelegationIntentRequirements::Unresolved { source, .. }
+            | DelegationIntentRequirements::Unavailable { source, .. }
+            | DelegationIntentRequirements::CatalogResolutionFailed { source, .. }
+                if *source == origin =>
+            {
+                current.clone()
             }
-        };
-        let matches_source = current_source.is_some_and(|current| {
-            current.user_id == source.user_id
-                && current.session_id == source.session_id
-                && current.session_turn == source.session_turn
-                && current.applied_intent_id == source.applied_intent_id
-                && current.user_intent_digest == source.user_intent_digest
-        });
-        // Keep one bounded, in-memory scope ledger for this authenticated
-        // source. Exact failed retries reuse it; a changed batch advances it
-        // incrementally instead of re-running candidate assessment or reading
-        // the authorized catalog again.
-        let cached_scope = matches_source
-            .then(|| self.delegation_scope_retry_cache.clone())
-            .flatten();
-        let retry_binding = cached_scope
-            .as_ref()
-            .and_then(|cache| reusable_delegation_scope_binding(state, &source, &pending, cache));
-        let needs_assessment = !matches_source;
-        let binding_result: Result<
-            Option<(
-                astra_services::delegation_model_requirement::DelegationScopeBinding,
-                BTreeSet<String>,
-            )>,
-            String,
-        > = if needs_assessment {
-            let slots = pending
-                .iter()
-                .flat_map(|item| item.slots.iter().cloned())
-                .collect::<Vec<_>>();
-            // The rich selector preserves scoped requirements beyond the
-            // current batch. The authenticated source and slot snapshot are
-            // retained only for a bounded, exact retry reuse.
-            // The Work classifier's model-requirement field is a cheap
-            // presence signal, not the model-selection authority. A negative
-            // result may be wrong for natural-language requests such as
-            // "use glm 5.2"; treating it as final would silently inherit the
-            // parent Offering. The candidate-aware selector is the single
-            // authority that can bind user text to this authorized catalog
-            // snapshot, and it must run for every new delegated batch.
-            let (assessed, binding) = self
-                .assess_root_delegation_intent(state, &source, &user_text, &slots, presence, 1)
-                .await;
-            state
-                .skills
-                .request_constraints
-                .delegated_model_requirements = assessed;
-            Ok(binding.map(|binding| (binding, BTreeSet::new())))
-        } else if let Some(cache) = cached_scope.as_ref() {
-            if let Some(binding) = retry_binding {
-                Ok(Some((binding, cache.consumed_requirement_ids.clone())))
-            } else if !delegation_scope_batch_matches(&pending, &cache.slots) {
-                let assessed_for_scope = state
-                    .skills
-                    .request_constraints
-                    .delegated_model_requirements
-                    .clone();
-                self.rebind_changed_delegation_scope_batch(
-                    state,
-                    &source,
-                    &user_text,
-                    &pending,
-                    &assessed_for_scope,
-                    cache,
-                )
-                .await
-                .map(Some)
-            } else {
-                // The same semantic batch was already successfully admitted
-                // (or has no repair evidence). Let the canonical binder judge
-                // this genuinely new invocation instead of reusing a prior
-                // successful task's scope.
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        };
-        let first_batch_binding = match binding_result {
-            Ok(Some((binding, consumed_requirement_ids))) => {
-                let slots = pending
-                    .iter()
-                    .flat_map(|item| item.slots.iter().cloned())
-                    .collect::<Vec<_>>();
-                let call_ids = pending.iter().map(|item| item.id.clone()).collect();
-                self.delegation_scope_retry_cache = Some(DelegationScopeRetryCache {
-                    source_digest: source.user_intent_digest.clone(),
-                    binding: binding.clone(),
-                    slots,
-                    call_ids,
-                    consumed_requirement_ids,
-                });
-                Some(binding)
-            }
-            Ok(None) => None,
-            Err(reason) => {
-                return merge(
-                    self.recover_existing_or_block_new_delegation_calls(
-                        state,
-                        &pending,
-                        "delegation_model_scope_unresolved",
-                        &reason,
-                        None,
-                    )
-                    .await,
-                );
+            _ => {
+                return merge(self.recover_existing_or_block_new_delegation_calls(
+                    state, &pending, "delegation_model_scope_unresolved",
+                    "The structured model constraints belong to a different user source; no child was started.",
+                    None,
+                ).await);
             }
         };
-        let assessed = state
+        state
             .skills
             .request_constraints
-            .delegated_model_requirements
-            .clone();
-        let decision_detail = delegation_catalog_resolution_explain_detail(&assessed);
+            .delegated_model_requirements = assessed.clone();
+        let user_text = authoritative_delegation_user_text(state).expect("source has user text");
         merge(
             match self
                 .bind_assessed_delegation_models(
-                    state,
-                    &source,
-                    &user_text,
-                    &pending,
-                    &assessed,
-                    first_batch_binding.as_ref(),
+                    state, &source, &user_text, &pending, &assessed, None,
                 )
                 .await
             {
                 Ok(outcome) => outcome,
                 Err(reason) => {
-                    let error_kind = if matches!(
-                        assessed,
-                        astra_turn_types::DelegationIntentRequirements::Unavailable { .. }
-                    ) {
-                        "delegation_model_assessment_unavailable"
-                    } else if [
-                        astra_turn_types::AutoModelStrategy::Balanced,
-                        astra_turn_types::AutoModelStrategy::CostPriority,
-                    ]
-                    .into_iter()
-                    .any(|strategy| {
-                        reason == astra_services::delegation_model_requirement::automatic_model_routing_unavailable_reason(strategy)
-                    }) {
-                        "delegation_model_unavailable"
-                    } else {
-                        "delegation_model_scope_unresolved"
-                    };
                     self.recover_existing_or_block_new_delegation_calls(
                         state,
                         &pending,
-                        error_kind,
+                        "delegation_model_scope_unresolved",
                         &reason,
-                        decision_detail,
+                        delegation_catalog_resolution_explain_detail(&assessed),
                     )
                     .await
                 }
@@ -24128,35 +23469,6 @@ mod tests {
             server_context_manifest_identity("session-server", Some("run-server"), None),
             Some(("session-server".to_string(), "run-server".to_string()))
         );
-    }
-
-    #[test]
-    fn delegation_scope_retry_matches_semantics_not_attempt_ids() {
-        use astra_services::delegation_model_requirement::DelegationSlotBrief;
-
-        let slot = |call_id: &str, group_id: Option<&str>| DelegationSlotBrief {
-            description: "review".into(),
-            prompt: "Review the change".into(),
-            requested_model_policy: None,
-            reasoning: None,
-            invocation: Some(
-                astra_services::delegation_model_requirement::DelegationSlotInvocation {
-                    tool_call_id: call_id.into(),
-                    tool_name: "agent".into(),
-                    group_id: group_id.map(str::to_owned),
-                    slot_index: 0,
-                },
-            ),
-        };
-
-        assert!(delegation_scope_inputs_match(
-            &slot("first", Some("group-a")),
-            &slot("retry", Some("group-a")),
-        ));
-        assert!(!delegation_scope_inputs_match(
-            &slot("retry", Some("group-a")),
-            &slot("retry", Some("group-b")),
-        ));
     }
 
     #[test]
@@ -31362,7 +30674,7 @@ mod tests {
             .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in ["ask_user", "notify", "tool_search", "introspect"] {
+        for expected in ["ask_user", "tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible when server-service capacity is disabled: {names:?}"
@@ -33200,7 +32512,7 @@ mod tests {
             names.contains("bash"),
             "edge-declared runtime tools should remain visible"
         );
-        for expected in ["notify", "tool_search", "introspect"] {
+        for expected in ["tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible with edge tools: {names:?}"
@@ -33922,7 +33234,7 @@ mod tests {
 
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
-        for expected in ["notify", "tool_search", "introspect"] {
+        for expected in ["tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid with server-service capacity disabled: {:?}",
@@ -41502,19 +40814,6 @@ mod tests {
             intent,
             scoped_inference_operation_id("intent", &"b".repeat(64))
         );
-        let snapshot_a = delegation_intent_assessment_operation_id(
-            &digest,
-            "sha256:input-a",
-            "sha256:snapshot-a",
-        );
-        let snapshot_b = delegation_intent_assessment_operation_id(
-            &digest,
-            "sha256:input-a",
-            "sha256:snapshot-b",
-        );
-        assert_eq!(snapshot_a.len(), 64);
-        assert_ne!(snapshot_a, snapshot_b);
-        assert_ne!(snapshot_a, intent);
     }
 
     #[tokio::test]
@@ -41628,169 +40927,6 @@ mod tests {
                 .delegation_model_requirement,
             Some(astra_services::WorkAdmissionTruth::No)
         );
-    }
-
-    #[test]
-    fn delegation_model_assessment_records_safe_summary_and_typed_explain_outcomes() {
-        use astra_services::delegation_model_requirement::{
-            DelegationModelCandidate, DelegationSlotBrief,
-            materialize_delegation_intent_requirements, parse_delegation_intent_requirements,
-        };
-
-        let user_text = "Use PrivateModel for review. Private task details.";
-        let candidates = vec![DelegationModelCandidate {
-            candidate_id: "offer-selected".into(),
-            model_name: "PrivateModel".into(),
-            provider: "private-provider".into(),
-            access_label: "private-access-label".into(),
-        }];
-        let slots = vec![DelegationSlotBrief {
-            description: "private-description".into(),
-            prompt: "private-slot-prompt".into(),
-            ..Default::default()
-        }];
-        let resolved = json!({
-            "disposition": "resolved",
-            "requirements": [{
-                "candidate_index": 0,
-                "model_quote": "PrivateModel",
-                "scope_quote": "review",
-                "slots": [0]
-            }]
-        });
-        for (response, outcome, error_kind) in [
-            (resolved, "resolved", Value::Null),
-            (
-                json!({"disposition":"not_applicable"}),
-                "resolved",
-                Value::Null,
-            ),
-            (
-                json!({"disposition":"unresolved","reason":
-                    "Ambiguous PrivateModel: private provider payload sk-test-do-not-record"
-                }),
-                "blocked",
-                json!("delegation_model_scope_unresolved"),
-            ),
-            (
-                json!({"disposition":"unresolved","reason":
-                    "Unavailable PrivateModel at https://private.invalid sk-test-do-not-record"
-                }),
-                "blocked",
-                json!("delegation_model_scope_unresolved"),
-            ),
-        ] {
-            let mut host = test_host_builder("user", "session").build();
-            let mut state = create_test_state();
-            state.current_run_id = Some("run-assessment".into());
-            state.session_turn = 3;
-            state.current_round_index = 2;
-            state.turn_event_buffer = Some(
-                astra_services::session_journal::TurnEventBuffer::begin_turn(Some("session"), 3),
-            );
-            host.on_turn_started(&state);
-            let assessment = parse_delegation_intent_requirements(
-                &response.to_string(),
-                user_text,
-                &candidates,
-                Some(&slots),
-                false,
-            )
-            .unwrap();
-            let source = astra_turn_types::DelegationUserRequirementSource {
-                user_id: "user".into(),
-                session_id: "session".into(),
-                session_turn: 3,
-                applied_intent_id: None,
-                command_intent_id: None,
-                user_intent_digest: "source-digest".into(),
-            };
-            let assessed = materialize_delegation_intent_requirements(&assessment, source).unwrap();
-            let operation_id =
-                (response["disposition"] == "resolved").then_some("sha256:assessment-operation");
-            host.record_delegation_model_assessment(
-                &mut state,
-                Instant::now(),
-                1,
-                &assessed,
-                Some(&assessment.summary),
-                operation_id,
-            );
-
-            let trace = state.turn_event_buffer.as_mut().unwrap().drain();
-            assert_eq!(trace.len(), 1);
-            assert_eq!(trace[0].session_id.as_deref(), Some("session"));
-            assert_eq!(trace[0].turn, Some(3));
-            let ingestion = astra_services::event_ingestion::IngestionEvent::from_journal_event(
-                &trace[0], "user",
-            )
-            .expect("assessment reaches the existing durable ingestion projection");
-            assert_eq!(ingestion.event_type, "trace_span");
-            let metadata = ingestion.metadata.as_ref().unwrap();
-            assert_eq!(metadata["name"], "delegation_model_assessment");
-            assert_eq!(metadata["trace_id"], "run-assessment");
-            let evidence: Value = serde_json::from_str(
-                metadata["attrs"]["delegation_model_assessment"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(evidence["assessment"], json!(assessment.summary));
-            assert_eq!(evidence["method"], "candidate_aware_one_call_v1");
-            assert_eq!(evidence["source_digest"], "source-digest");
-            assert_eq!(evidence["operation_id"], json!(operation_id));
-            assert_eq!(evidence["round_index"], 2);
-            assert_eq!(evidence["attempt_index"], 1);
-            assert_eq!(evidence["outcome"], outcome);
-            assert_eq!(evidence["error_kind"], error_kind);
-            if response["disposition"] == "resolved" {
-                assert_eq!(
-                    evidence["assessment"]["selections"][0]["candidate_id"],
-                    "offer-selected"
-                );
-                assert_eq!(
-                    evidence["assessment"]["selections"][0]["slot_indices"],
-                    json!([0])
-                );
-            }
-
-            let events = host.take_emitted_events();
-            let facts = events
-                .iter()
-                .map(|event| astra_turn_types::decode_explain_analyze_wire(event).unwrap())
-                .collect::<Vec<_>>();
-            assert!(facts.iter().all(|fact| fact.is_valid()));
-            assert_eq!(facts.len(), 3, "root and one assessment start/finish pair");
-            assert_eq!(facts[1].node_id, facts[2].node_id);
-            assert!(
-                facts[2]
-                    .node_id
-                    .ends_with(metadata["span_id"].as_str().unwrap())
-            );
-            assert_eq!(serde_json::to_value(facts[2].outcome).unwrap(), outcome);
-            assert!(facts[2].label.contains("candidates: 1"));
-            assert!(
-                facts[2].usage.is_none(),
-                "assessment must not duplicate inference usage"
-            );
-            let recorded = format!("{metadata}{}", json!(events));
-            for private in [
-                user_text,
-                "PrivateModel",
-                "private-provider",
-                "private-access-label",
-                "private-description",
-                "private-slot-prompt",
-                "private provider payload",
-                "https://private.invalid",
-                "sk-test-do-not-record",
-            ] {
-                assert!(
-                    !recorded.contains(private),
-                    "private assessment input leaked: {private}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -41951,25 +41087,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fused_delegation_assessment_reuses_intent_without_catalog_or_judge_read() {
+    async fn proposed_delegation_controls_do_not_create_auxiliary_user_constraints() {
         let reads = Arc::new(std::sync::Mutex::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let response = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A","slots":[0]
-        }]})
-        .to_string();
-        let client = |response: String| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
         let mut host = test_host_builder("catalog-user", "catalog-session")
             .with_model_service(Some(Arc::new(DelegationCatalogSpy {
                 reads: reads.clone(),
             })))
-            .with_test_judgment_clients([client(response.clone()), client(response)])
+            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                requests: requests.clone(),
+            })
+                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
             .build();
         let mut state = create_test_state();
         state.context_manifest_user_id = Some("catalog-user".into());
@@ -41977,31 +41107,209 @@ mod tests {
         state.current_run_id = Some("catalog-run".into());
         state.canonical_turn_chain_id = Some("catalog-chain".into());
         state.current_run_owner_generation = Some(1);
-        let make_call = |id: &str| {
-            json!({"id":id,"type":"function","function":{
-                "name":"agent", "arguments":json!({
-                    "action":"spawn","description":"Independent","prompt":"Reply OK"
-                }).to_string()
-            }})
-        };
-        for (text, id, expected_calls) in [
-            ("Use Model-A for every delegated child.", "first", 1),
-            ("Use Model-A for every delegated child.", "second", 1),
-            ("Use Model-A for each delegated child.", "third", 2),
+        for (text, policy) in [
+            (
+                "Use the requested model for this child.",
+                json!({"mode":"fixed","selector":{
+                "kind":"configured_name","model_name":"Model-A"}}),
+            ),
+            ("Ask a child to quote a model name.", Value::Null),
         ] {
             state.user_intent = text.into();
-            let (admitted, blocked) = host
-                .admitted_delegation_models(&mut state, &[make_call(id)])
-                .await;
-            assert!(blocked.is_empty(), "{id}: {blocked:?}");
+            let mut args =
+                json!({"action":"spawn","description":"Independent","prompt":"Reply OK"});
+            if !policy.is_null() {
+                args["requested_model_policy"] = policy.clone();
+            }
+            let call = json!({"id":"proposal","type":"function","function":{
+                "name":"agent","arguments":args.to_string()
+            }});
+            let (admitted, blocked) = host.admitted_delegation_models(&mut state, &[call]).await;
+            assert!(blocked.is_empty(), "{blocked:?}");
+            let admission = &admitted["proposal"];
+            if policy.is_null() {
+                assert!(matches!(
+                    admission.outcome,
+                    astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+                        slot_count: 1
+                    }
+                ));
+            } else {
+                let astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots } =
+                    &admission.outcome
+                else {
+                    panic!("proposal was dropped")
+                };
+                assert_eq!(json!(slots[0].requested_model_policy), policy);
+                assert!(slots[0].model_selection.is_none());
+                assert!(slots[0].reasoning.is_none());
+                assert_eq!(
+                    slots[0].model_strength,
+                    Some(astra_turn_types::DelegationRequirementStrength::Default)
+                );
+            }
             assert!(matches!(
-                &admitted[id].outcome,
-                astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                    if slots.len() == 1 && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
+                admission.child_requirements.as_slice(),
+                [astra_turn_types::DelegationIntentRequirements::Unconstrained { .. }]
             ));
-            assert_eq!(*reads.lock().unwrap(), expected_calls);
-            assert_eq!(requests.lock().unwrap().len(), expected_calls);
         }
+        assert_eq!(
+            *reads.lock().unwrap(),
+            0,
+            "the child executor owns exact selector admission"
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no competing semantic judgment"
+        );
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements =
+            astra_turn_types::DelegationIntentRequirements::Requirements {
+                source: delegation_requirement_source(
+                    &delegation_intent_source_from_state(&state).unwrap(),
+                ),
+                requirements: vec![astra_turn_types::DelegationIntentRequirement {
+                    requirement_id: "typed-model".into(),
+                    model_selection: Some(astra_turn_types::ModelSelection {
+                        offering_id: "required-offer".into(),
+                    }),
+                    requested_model_policy: None,
+                    reasoning: None,
+                    task_scope_quote: None,
+                    propagation: astra_turn_types::DelegationRequirementPropagation::Descendants,
+                    strength: astra_turn_types::DelegationRequirementStrength::Hard,
+                }],
+            };
+        let proposed = |policy: Value| {
+            json!({"id":"typed-proposal","type":"function","function":{
+                "name":"agent","arguments":json!({"action":"spawn","description":"Independent","prompt":"Reply OK",
+                    "requested_model_policy":policy}).to_string()
+            }})
+        };
+        let conflict = proposed(
+            json!({"mode":"fixed","selector":{"kind":"offering_id","offering_id":"other-offer"}}),
+        );
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[conflict])
+            .await;
+        assert!(admitted.is_empty());
+        assert_eq!(blocked.len(), 1);
+        assert!(
+            blocked[0]
+                .output
+                .contains("conflicts with hard delegation requirement")
+        );
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[proposed(Value::Null)])
+            .await;
+        assert!(blocked.is_empty());
+        let astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots } =
+            &admitted["typed-proposal"].outcome
+        else {
+            panic!("typed authority was lost")
+        };
+        assert_eq!(
+            slots[0].model_selection.as_ref().unwrap().offering_id,
+            "required-offer"
+        );
+        state.user_intent = "A different authenticated instruction".into();
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[proposed(Value::Null)])
+            .await;
+        assert!(admitted.is_empty());
+        assert_eq!(blocked.len(), 1);
+        assert!(blocked[0].output.contains("different user source"));
+        assert_eq!(*reads.lock().unwrap(), 0);
+        assert!(requests.lock().unwrap().is_empty());
+        for (name, allowed) in [("Model-A", true), ("Unavailable Model", false)] {
+            let origin = delegation_requirement_source(
+                &delegation_intent_source_from_state(&state).unwrap(),
+            );
+            let astra_turn_types::DelegationIntentRequirements::Requirements {
+                source,
+                requirements,
+            } = &mut state
+                .skills
+                .request_constraints
+                .delegated_model_requirements
+            else {
+                unreachable!()
+            };
+            *source = origin;
+            requirements[0].model_selection = None;
+            requirements[0].requested_model_policy =
+                Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                    selector: astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name: name.into(),
+                        source: None,
+                    },
+                });
+            let call = proposed(
+                json!({"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-a"}}),
+            );
+            let (admitted, blocked) = host.admitted_delegation_models(&mut state, &[call]).await;
+            assert_eq!(admitted.len(), usize::from(allowed));
+            assert_eq!(blocked.len(), usize::from(!allowed));
+            if allowed {
+                let astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots } =
+                    &admitted["typed-proposal"].outcome
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    slots[0].model_selection.as_ref().unwrap().offering_id,
+                    "offer-a"
+                );
+            }
+        }
+        assert_eq!(
+            *reads.lock().unwrap(),
+            2,
+            "only actual typed named constraints load a catalog"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        let astra_turn_types::DelegationIntentRequirements::Requirements { requirements, .. } =
+            &mut state
+                .skills
+                .request_constraints
+                .delegated_model_requirements
+        else {
+            unreachable!()
+        };
+        requirements[0].task_scope_quote = Some("authenticated instruction".into());
+        host.test_judgment_clients.clear();
+        host.test_judgment_clients.push_back(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                json!({"assignments":[{"requirement_id":"typed-model","slot_indices":[]}],"unresolved":[]}).to_string()
+            ])),
+            requests: requests.clone(),
+        }));
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[proposed(Value::Null)])
+            .await;
+        assert!(blocked.is_empty(), "{blocked:?}");
+        assert!(matches!(
+            admitted["typed-proposal"].outcome,
+            astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { .. }
+        ));
+        assert!(
+            matches!(admitted["typed-proposal"].child_requirements.as_slice(),
+            [astra_turn_types::DelegationIntentRequirements::Requirements { requirements, .. }]
+                if requirements.len() == 1 && requirements[0].task_scope_quote.is_some())
+        );
+        assert_eq!(
+            *reads.lock().unwrap(),
+            2,
+            "unmatched descendant names must not block or load the catalog"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "only existing typed scope needed judgment"
+        );
     }
 
     #[tokio::test]
@@ -42029,6 +41337,16 @@ mod tests {
         state.current_run_owner_generation = Some(1);
         state.user_intent =
             "Delegate review to Model-A-Pro; independently inspect the catalog.".into();
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements =
+            astra_turn_types::DelegationIntentRequirements::Unresolved {
+                source: delegation_requirement_source(
+                    &delegation_intent_source_from_state(&state).unwrap(),
+                ),
+                reason: reason.into(),
+            };
         for id in ["first-spawn", "repeated-spawn"] {
             let call = json!({"id":id,"type":"function","function":{
                 "name":"agent","arguments":json!({"action":"spawn","description":"Review",
@@ -42082,13 +41400,13 @@ mod tests {
         }
         assert_eq!(
             *reads.lock().unwrap(),
-            1,
-            "reuse the authorized catalog snapshot"
+            0,
+            "a structured rejection needs no catalog lookup"
         );
         assert_eq!(
             requests.lock().unwrap().len(),
-            1,
-            "never pay to reinterpret the same intent"
+            0,
+            "never reinterpret independently supplied constraints"
         );
         assert_eq!(state.stall.turn_sigs[0], state.stall.turn_sigs[1]);
         state.agentic_turn_budget =
@@ -42110,469 +41428,6 @@ mod tests {
         assert_eq!(
             state.max_turns, old_limit,
             "rejected repetition cannot renew execution indefinitely"
-        );
-    }
-
-    #[tokio::test]
-    async fn delegation_response_recovery_is_bounded_and_does_not_cache_user_ambiguity() {
-        let valid = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A","slots":[0]
-        }]})
-        .to_string();
-        let unresolved =
-            json!({"disposition":"unresolved","reason":"The user must choose a variant."})
-                .to_string();
-        for (responses, expected_kind, expected_calls) in [
-            (vec!["invalid".to_string(), valid], None, 2),
-            (
-                vec!["invalid".to_string(), "invalid".to_string()],
-                Some("delegation_model_assessment_unavailable"),
-                2,
-            ),
-            (
-                vec![unresolved],
-                Some("delegation_model_scope_unresolved"),
-                1,
-            ),
-        ] {
-            let reads = Arc::new(std::sync::Mutex::new(0));
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut host = test_host_builder("user", "session")
-                .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                    reads: reads.clone(),
-                })))
-                .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                    provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                    responses: std::sync::Mutex::new(responses.into()),
-                    requests: requests.clone(),
-                }) as Box<dyn SummaryLlmClient>])
-                .build();
-            let mut state = create_test_state();
-            state.context_manifest_user_id = Some("user".into());
-            state.current_session_id = Some("session".into());
-            state.current_run_id = Some("root-run".into());
-            state.canonical_turn_chain_id = Some("chain".into());
-            state.current_run_owner_generation = Some(1);
-            state.user_intent = "Use Model-A for the delegated child.".into();
-            for id in ["first", "retry"] {
-                let call = json!({"id":id,"type":"function","function":{
-                    "name":"agent","arguments":json!({"action":"spawn", "description":"Independent", "prompt":"Reply OK"}).to_string()
-                }});
-                let (admitted, blocked) =
-                    host.admitted_delegation_models(&mut state, &[call]).await;
-                if let Some(kind) = expected_kind {
-                    assert!(admitted.is_empty());
-                    assert_eq!(blocked.len(), 1);
-                    assert_eq!(
-                        blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
-                        kind
-                    );
-                    let fields = blocked[0].tool_result_fields.as_ref().unwrap();
-                    assert_eq!(fields["retryable"], false);
-                    assert_eq!(fields["executed"], false);
-                } else {
-                    assert!(blocked.is_empty(), "{blocked:?}");
-                    assert!(matches!(&admitted[id].outcome,
-                        astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                        if slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"));
-                    break;
-                }
-            }
-            assert_eq!(*reads.lock().unwrap(), 1);
-            let requests = requests.lock().unwrap();
-            assert_eq!(requests.len(), expected_calls);
-            if expected_calls == 2 {
-                assert_eq!(
-                    &requests[1][..requests[0].len()],
-                    requests[0].as_slice(),
-                    "recovery must preserve the original source and candidate/slot snapshot"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn negative_model_presence_does_not_skip_natural_model_selection() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let response = json!({
-            "disposition": "resolved",
-            "requirements": [{"candidate_index": 0, "model_quote": "Model-A", "slots": [0]}]
-        })
-        .to_string();
-        let mut host = test_host_builder("negative-presence-user", "negative-presence-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("negative-presence-user".into());
-        state.current_session_id = Some("negative-presence-session".into());
-        state.current_run_id = Some("negative-presence-run".into());
-        state.canonical_turn_chain_id = Some("negative-presence-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for this delegated child.".into();
-        let source = delegation_intent_source_from_state(&state).expect("user source");
-        host.apply_classified_work_admission(ClassifiedWorkAdmission {
-            decision: astra_services::WorkAdmissionDecision::NotRequired {
-                assessment: None,
-                domain: None,
-                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
-                mutation_completion_scope:
-                    astra_config::user_profile::MutationCompletionScope::Unknown,
-                execution_topology: astra_services::WorkExecutionTopology::Primary,
-                required_capabilities: Vec::new(),
-            },
-            delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::No),
-            source: Some(source),
-            work_handoff_pending: true,
-        });
-
-        let call = json!({
-            "id": "marker-child",
-            "type": "function",
-            "function": {
-                "name": "agent",
-                "arguments": json!({
-                    "action": "spawn",
-                    "description": "Deterministic marker",
-                    "prompt": "Reply exactly DEFAULT-CHILD-MARKER-OK"
-                })
-                .to_string()
-            }
-        });
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&call))
-            .await;
-
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(
-            &admitted["marker-child"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().is_some_and(|selection| {
-                        selection.offering_id == "offer-a"
-                    })
-        ));
-        assert_eq!(
-            *reads.lock().unwrap(),
-            1,
-            "the candidate-aware selector owns natural-language model binding"
-        );
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        assert!(matches!(
-            state
-                .skills
-                .request_constraints
-                .delegated_model_requirements,
-            astra_turn_types::DelegationIntentRequirements::Requirements { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn scoped_auto_rejects_only_its_invocation_not_an_independent_fixed_child() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let response = json!({"disposition":"resolved","requirements":[
-            {"model_quote":"auto balanced","automatic_strategy":"balanced",
-             "scope_quote":"group X","slots":[0]},
-            {"candidate_index":0,"model_quote":"Model-A","scope_quote":"group Y","slots":[1]}
-        ]})
-        .to_string();
-        let mut host = test_host_builder("mixed-user", "mixed-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("mixed-user".into());
-        state.current_session_id = Some("mixed-session".into());
-        state.current_run_id = Some("mixed-run".into());
-        state.canonical_turn_chain_id = Some("mixed-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use auto balanced for group X and Model-A for group Y".into();
-        let call = |id: &str, description: &str| {
-            json!({"id":id,"type":"function","function":{
-                "name":"agent","arguments":json!({
-                    "action":"spawn","description":description,"prompt":"Reply OK"
-                }).to_string()
-            }})
-        };
-        let (admitted, blocked) = host
-            .admitted_delegation_models(
-                &mut state,
-                &[call("auto-x", "group X"), call("fixed-y", "group Y")],
-            )
-            .await;
-        assert_eq!(*reads.lock().unwrap(), 1);
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        assert_eq!(blocked.len(), 1, "{blocked:?}");
-        assert_eq!(blocked[0].request_id, "auto-x");
-        assert_eq!(
-            blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
-            "delegation_model_unavailable"
-        );
-        assert_eq!(admitted.len(), 1);
-        assert!(matches!(
-            &admitted["fixed-y"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1 && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-    }
-
-    #[tokio::test]
-    async fn scoped_fixed_binding_is_local_to_each_invocation_and_reused_later() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let first = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A",
-            "scope_quote":"review","slots":[0,2]
-        }]})
-        .to_string();
-        let later = json!({"assignments":[{"requirement_id":"0","slot_indices":[0]}],
-            "unresolved":[]})
-        .to_string();
-        let client = |response: String| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
-        let mut host = test_host_builder("scoped-user", "scoped-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([client(first), client(later)])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("scoped-user".into());
-        state.current_session_id = Some("scoped-session".into());
-        state.current_run_id = Some("scoped-run".into());
-        state.canonical_turn_chain_id = Some("scoped-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for review.".into();
-        let fanout = json!({"id":"fanout","type":"function","function":{
-            "name":"agent_fanout","arguments":json!({
-                "action":"start","group_id":"scoped-group","target_count":2,
-                "slots":[{"description":"review","prompt":"Review"},
-                         {"description":"plan","prompt":"Plan"}]
-            }).to_string()
-        }});
-        let spawn = |id: &str, policy: Option<Value>| {
-            let mut args = json!({"action":"spawn","description":"review","prompt":"Review"});
-            if let Some(policy) = policy {
-                args["requested_model_policy"] = policy;
-            }
-            json!({"id":id,"type":"function","function":{
-                "name":"agent","arguments":args.to_string()
-            }})
-        };
-        let bad = spawn(
-            "bad",
-            Some(json!({"mode":"fixed","selector":{
-                "kind":"offering_id","offering_id":"wrong-offering"
-            }})),
-        );
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[fanout, bad])
-            .await;
-        assert_eq!(blocked.len(), 1, "{blocked:?}");
-        assert_eq!(blocked[0].request_id, "bad");
-        assert_eq!(admitted.len(), 1);
-        assert!(matches!(&admitted["fanout"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 2
-                    && slots[0].slot_index == 0
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-                    && slots[1].slot_index == 1
-                    && slots[1].model_selection.is_none()
-        ));
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[spawn("later", None)])
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(&admitted["later"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].slot_index == 0
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        assert_eq!(*reads.lock().unwrap(), 1);
-        assert_eq!(requests.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn successful_scope_batch_advances_without_reassessing_candidates() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let first = json!({"disposition":"resolved","requirements":[
-            {"candidate_index":0,"model_quote":"Model-A",
-             "scope_quote":"review","slots":[0]},
-            {"candidate_index":0,"model_quote":"Model-A",
-             "scope_quote":"testing","slots":[]}
-        ]})
-        .to_string();
-        let later = json!({"assignments":[
-            {"requirement_id":"1","slot_indices":[0]}
-        ],"unresolved":[]})
-        .to_string();
-        let client = |response: String| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
-        let mut host = test_host_builder("scope-ledger-user", "scope-ledger-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([client(first), client(later)])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("scope-ledger-user".into());
-        state.current_session_id = Some("scope-ledger-session".into());
-        state.current_run_id = Some("scope-ledger-run".into());
-        state.canonical_turn_chain_id = Some("scope-ledger-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for review and testing".into();
-        let call = |id: &str, description: &str, prompt: &str| {
-            json!({"id":id,"type":"function","function":{
-                "name":"agent", "arguments":json!({
-                    "action":"spawn","description":description,"prompt":prompt
-                }).to_string()
-            }})
-        };
-
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[call("first", "review", "Review")])
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(
-            &admitted["first"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        state.stall.tool_call_records.push(ToolCallRecord {
-            tool_call_id: Some("first".into()),
-            name: "agent".into(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[call("second", "testing", "Test")])
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(
-            &admitted["second"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        assert_eq!(*reads.lock().unwrap(), 1, "candidate catalog is turn-local");
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            2,
-            "one fused candidate assessment plus one incremental scope judgment"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_fused_scope_reuses_one_slot_repair_without_a_second_judgment() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut host = test_host_builder("scope-repair-user", "scope-repair-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    json!({"disposition":"resolved","requirements":[{
-                        "candidate_index":0,"model_quote":"Model-A",
-                        "scope_quote":"delegated child","slots":[0]
-                    }]})
-                    .to_string(),
-                ])),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("scope-repair-user".into());
-        state.current_session_id = Some("scope-repair-session".into());
-        state.current_run_id = Some("scope-repair-run".into());
-        state.canonical_turn_chain_id = Some("scope-repair-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for this delegated child.".into();
-
-        let first = json!({"id":"first","type":"function","function":{
-            "name":"agent", "arguments":json!({
-                "action":"spawn","description":"first","prompt":"Do the task",
-                "requested_model_policy":{"mode":"fixed","selector":{
-                    "kind":"configured_name","model_name":"Model A"}}
-            }).to_string()
-        }});
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&first))
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert_eq!(admitted.len(), 1);
-
-        // The child admission is rejected after preparation (for example by
-        // the provider identity boundary). The next model round repeats the
-        // same semantic slot with a new tool-call ID, so its frozen scope can
-        // be reused without another judgment.
-        state
-            .stall
-            .tool_call_records
-            .push(astra_services::session_journal::ToolCallRecord {
-                tool_call_id: Some("first".into()),
-                name: "agent".into(),
-                ok: false,
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                error: Some("model selection rejected".into()),
-                ..Default::default()
-            });
-        let retry = json!({"id":"retry","type":"function","function":{
-            "name":"agent", "arguments":json!({
-                "action":"spawn","description":"first","prompt":"Do the task",
-                "requested_model_policy":{"mode":"fixed","selector":{
-                    "kind":"configured_name","model_name":"Model A"}}
-            }).to_string()
-        }});
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&retry))
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert_eq!(admitted.len(), 1);
-        assert!(matches!(
-            &admitted["retry"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        assert_eq!(*reads.lock().unwrap(), 1);
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            1,
-            "the failed repair reused the fused scope binding"
         );
     }
 
@@ -42636,8 +41491,8 @@ mod tests {
             vec![fixed.clone(), call.clone()],
         ] {
             let (admitted, blocked) = host.admitted_delegation_models(&mut state, &calls).await;
-            assert!(admitted.is_empty());
-            assert_eq!(blocked.len(), 2);
+            assert!(admitted.contains_key("fixed-call"));
+            assert_eq!(blocked.len(), 1);
             let error_for = |id: &str| {
                 blocked
                     .iter()
@@ -42649,10 +41504,6 @@ mod tests {
                     .clone()
             };
             assert_eq!(error_for("auto-call"), "delegation_model_unavailable");
-            assert_eq!(
-                error_for("fixed-call"),
-                "delegation_model_assessment_unavailable"
-            );
             assert!(requests.lock().unwrap().is_empty());
         }
     }
@@ -42709,64 +41560,6 @@ mod tests {
             assert_eq!(diagnostic_json["validation_error"], "界".repeat(256));
             assert!(!content.contains("still-invalid"));
         }
-    }
-
-    #[tokio::test]
-    async fn invalid_delegation_repair_cannot_produce_an_admission() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let invalid = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A","slots":[0,0]
-        }]})
-        .to_string();
-        let mut host = test_host_builder("user", "session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy { reads })))
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    invalid.clone(),
-                    invalid,
-                ])),
-                requests: requests.clone(),
-            }) as Box<dyn SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("user".into());
-        state.current_session_id = Some("session".into());
-        state.current_run_id = Some("run".into());
-        state.canonical_turn_chain_id = Some("chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for this child".into();
-        let call = json!({"id":"spawn","type":"function","function":{
-            "name":"agent","arguments":json!({"action":"spawn",
-                "description":"Inspect","prompt":"Inspect the proposal"}).to_string()
-        }});
-        for _ in 0..2 {
-            let (admitted, blocked) = host
-                .admitted_delegation_models(&mut state, std::slice::from_ref(&call))
-                .await;
-            assert!(admitted.is_empty());
-            assert_eq!(blocked.len(), 1);
-            let fields = blocked[0].tool_result_fields.as_ref().unwrap();
-            assert_eq!(
-                fields["error_kind"],
-                "delegation_model_assessment_unavailable"
-            );
-            assert_eq!(fields["retryable"], false);
-        }
-        let requests = requests.lock().unwrap();
-        assert_eq!(
-            requests.len(),
-            2,
-            "reusing the failure must not call the model again"
-        );
-        assert_eq!(&requests[1][..requests[0].len()], requests[0].as_slice());
-        assert!(
-            requests[1].last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .contains("candidate delegation scope contains duplicate slot indices")
-        );
     }
 
     #[tokio::test]
@@ -42864,94 +41657,6 @@ mod tests {
                 calls.load(std::sync::atomic::Ordering::Relaxed),
                 expected_calls
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn delegation_model_assessment_unavailable_is_recorded_before_inference() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut host = test_host_builder("user", "session")
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.current_session_id = Some("session".into());
-        state.current_run_id = Some("run-assessment".into());
-        state.context_manifest_user_id = Some("user".into());
-        state.canonical_turn_chain_id = Some("chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use private-model with private-task-text".into();
-        state.turn_event_buffer =
-            Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some("session"), 1));
-        host.on_turn_started(&state);
-        let call = json!({"id":"spawn-assessment","type":"function","function":{
-            "name":"agent", "arguments":json!({"action":"spawn","description":"Review",
-            "prompt":"private-slot-prompt"}).to_string()
-        }});
-        let (admissions, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&call))
-            .await;
-        assert!(admissions.is_empty());
-        assert_eq!(blocked.len(), 1);
-        assert_eq!(
-            blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
-            "delegation_model_assessment_unavailable"
-        );
-        assert_eq!(
-            blocked[0].tool_result_fields.as_ref().unwrap()["retryable"],
-            false
-        );
-        assert!(requests.lock().unwrap().is_empty());
-        assert!(matches!(
-            state
-                .skills
-                .request_constraints
-                .delegated_model_requirements,
-            astra_turn_types::DelegationIntentRequirements::Unavailable { .. }
-        ));
-        let (_, blocked_again) = host.admitted_delegation_models(&mut state, &[call]).await;
-        assert_eq!(blocked_again.len(), 1);
-        let trace = state.turn_event_buffer.as_mut().unwrap().drain();
-        assert_eq!(
-            trace.len(),
-            1,
-            "reused intent must not invent another assessment"
-        );
-        let metadata = trace[0].metadata.as_ref().unwrap();
-        let evidence: Value = serde_json::from_str(
-            metadata["attrs"]["delegation_model_assessment"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(evidence["outcome"], "unavailable");
-        assert_eq!(
-            evidence["error_kind"],
-            "delegation_model_assessment_unavailable"
-        );
-        assert!(evidence["operation_id"].is_null());
-        assert!(
-            evidence["assessment"].is_null(),
-            "missing evidence must remain unknown"
-        );
-        let events = host.take_emitted_events();
-        let terminal = events
-            .iter()
-            .find(|event| event["kind"] == "admission" && event["transition"] == "finished")
-            .unwrap();
-        assert_eq!(terminal["outcome"], "unavailable");
-        assert!(
-            astra_turn_types::decode_explain_analyze_wire(terminal)
-                .unwrap()
-                .is_valid()
-        );
-        let recorded = format!("{metadata}{}", json!(events));
-        for private in ["private-model", "private-task-text", "private-slot-prompt"] {
-            assert!(!recorded.contains(private));
         }
     }
 

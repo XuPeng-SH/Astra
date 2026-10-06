@@ -49,46 +49,25 @@ run the same command:
 astra admin config unset judgment_model
 ```
 
-The no-Jev trace should show `judgment admission=not_dispatched` and exactly
-one `delegation_candidate_assessment` on the primary model on the healthy path.
-It must produce the same authorized child bindings. A typed provider deadline
-may receive one runtime-owned retry when a full auxiliary slice remains after
-the parent convergence reserve. A configured-route fallback consumes that same
-second-call allowance; there is never a third logical judgment call. Physical
-provider attempts remain separately attributable. Restore the
-optional binding after the run when the shared database is used by other
-tests. General memory/request judgment remains unavailable in this mode; only
-the bounded delegated-model selector uses the primary model as its Jev-like
-implementation.
+Fixed model selection has the same runtime contract with and without Jev.
+The primary proposes the selected model using the canonical tool control;
+runtime authorizes that exact identity and reasoning capability. There is no
+mandatory auxiliary model-selection call, so the trace must not attribute a
+removed selector's synthetic usage. Restore optional bindings after tests
+against a database shared with other callers.
 
 Follow the harness preflight instructions in
-`crates/astra-test-harness/README.md`. The valid case asserts exactly two
-spawn events, one per fanout slot, and checks that both expose the prepared
-`deepseek-v4-flash` selection identity in the journal. It also checks that the
-prepared child run IDs are distinct and match the `/agents` launch list returned
-by `agent_fanout.start`. This does not require a later `get_results` call when
-canonical adoption delivers the results. The live cases intentionally do not
-require a parent model to echo an
-internal `requested_model_policy` selector. When a user names a model, the
-canonical contract is to omit that field and let one candidate-aware admission
-bind the request. Structured selector shapes are covered by the offline tool
-and admission tests; requiring them in a probabilistic live prompt would test
-model compliance with an implementation detail and conflict with the canonical
-system instruction. The invalid final-slot case must show zero
-`agent_spawned` events, not just a failed terminal answer.
+`crates/astra-test-harness/README.md`. The fanout oracle checks prepared model
+identity and distinct child run IDs against the launch list. Discovery and
+configured-name resolution use the authenticated catalog, never local files.
+Cold discovery may add a catalog tool round; keep the strict zero-discovery
+efficiency cases as separate acceptance evidence, rather than weakening them
+or presenting a functional pass as an efficiency pass.
 
-`flash_spawn_natural_language_glm` is a scripted intent-binding check: it
-explicitly asks the parent to leave `requested_model_policy` unset (omitted or
-`null`) while stating a hard `glm-5.2` requirement. It is not a natural user
-journey; `flash_semantic_model_reference_glm` and
-`flash_natural_parallel_models_high` cover that boundary.
-The child must still be admitted and make its provider request using GLM. This
-distinguishes server-side extraction of authenticated user intent from merely
-echoing a model selector supplied by the parent model. The server's offline
-regression tests additionally verify that one user-intent source is assessed
-once; after bounded provider recovery is exhausted, its failed assessment is
-cached and is not reissued by later tool rounds for the same intent. Cancellation,
-lease loss, or insufficient remaining budget prevents the extra judgment call.
+The retired scripted case that instructed the primary to omit
+`requested_model_policy` tested the old auxiliary interpreter, not a natural
+user journey. The family, version, content-role and actual-child oracles remain
+unchanged. A correct parent answer alone never proves correct child execution.
 The spawn receipt exposes `prepared_model` so the parent can identify the
 runtime-selected model without another lookup. That field is pre-execution
 evidence, not proof of a provider call; the child `LlmRoundCompleted` event
@@ -121,7 +100,7 @@ case also reports a soft primary-round bound of four: automatic delivery should
 avoid re-fetching sufficient observed results, while inspection, missing or
 truncated output, pagination and recovery remain valid reasons to read results.
 
-`flash_semantic_model_reference_glm` isolates candidate-aware semantic
+`flash_semantic_model_reference_glm` isolates natural-language model
 selection from live websites. The user says `5.2glm` without tool syntax;
 the case requires the authorized `glm-5.2` child to make a real provider call
 and deliver the exact completed marker through parent adoption or a successful
@@ -197,17 +176,17 @@ round count, cache usage, and total cost in the trace.
 The adoption criterion's `spawn_match` links each result to its required
 model (or its fixed fanout slot), so swapping the children's tasks cannot pass.
 
-`flash_reasoning_phrase_is_subject` and `flash_reasoning_correction` test the
-single semantic judgment rather than a second keyword parser. The former
+`flash_reasoning_phrase_is_subject` and `flash_reasoning_correction` test
+interpretation through the primary's typed proposal, without a keyword parser. The former
 asks a child to explain a quoted phrase about high reasoning and verifies that
 no high-effort child is started; the latter changes high to medium before
 execution and verifies the actual child configuration. Both require a real
 child model round and zero Bash, grep or file-read probes. These are samples of a
 probabilistic interpretation, not proof that every paraphrase is understood;
 run independent variants before claiming reliability. The former's external
-oracle cannot by itself distinguish a correct judge result from a parent that
-later independently chooses the same effective child settings; inspect the
-typed judgment evidence in the session trace before attributing the result.
+oracle establishes the actual child configuration, not the primary's private
+reasoning. Inspect proposal, admission and run-linked provider facts before
+attributing the result; no auxiliary interpretation is required.
 
 `flash_fanout_auto_balanced` is a negative control, not evidence that the
 router works: it asks for Auto Balanced and verifies that the current product

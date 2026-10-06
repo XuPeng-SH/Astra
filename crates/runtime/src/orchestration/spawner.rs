@@ -2087,6 +2087,25 @@ pub(crate) fn apply_delegation_model_admission(
             .get(slot_index)
             .ok_or_else(|| invalid("slot missing"))?,
     };
+    if slot.model_selection.is_none()
+        && let Some(required_policy) = slot.requested_model_policy.as_ref()
+    {
+        if slot.model_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard)
+            && input
+                .requested_model_policy
+                .as_ref()
+                .is_some_and(|policy| policy != required_policy)
+        {
+            return Err(invalid(
+                "tool model policy conflicts with hard user requirement",
+            ));
+        }
+        // A hard configured name can remain unresolved until canonical batch
+        // admission. Omitting it must not fall through to the parent/profile.
+        if input.requested_model_policy.is_none() {
+            input.requested_model_policy = Some(required_policy.clone());
+        }
+    }
     if let Some(required) = &slot.model_selection {
         let hard =
             slot.model_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard);
@@ -2102,14 +2121,12 @@ pub(crate) fn apply_delegation_model_admission(
                     selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
                 })
             ) && input.resolved_model_selection.is_none();
-            let fixed_name_resolves_to_requirement = matches!(
+            let fixed_selector_resolves_to_requirement = matches!(
                 slot.requested_model_policy,
                 Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
             ) && matches!(
                 input.requested_model_policy,
-                Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                    selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
-                })
+                Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
             ) && input
                 .resolved_model_selection
                 .as_ref()
@@ -2120,7 +2137,7 @@ pub(crate) fn apply_delegation_model_admission(
                 .is_some_and(|required_policy| {
                     input.requested_model_policy.as_ref() != Some(required_policy)
                 })
-                && !fixed_name_resolves_to_requirement
+                && !fixed_selector_resolves_to_requirement
                 && !configured_name_is_pending
             {
                 return Err(invalid(
@@ -2171,7 +2188,7 @@ pub(crate) fn apply_delegation_model_admission(
                     })
                 )
             ) && hard
-                && fixed_name_resolves_to_requirement
+                && fixed_selector_resolves_to_requirement
             {
                 input.requested_model_policy = slot.requested_model_policy.clone();
                 input.resolved_model_selection = Some(required.clone());
@@ -19178,6 +19195,96 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn hard_configured_name_is_applied_before_selector_admission() {
+        use astra_turn_types::{
+            DelegationModelAdmissionOutcome, ModelSelector, RequestedModelPolicy,
+        };
+        let mut admission = fixed_model_admission("unused");
+        let DelegationModelAdmissionOutcome::Constrained { slots } = &mut admission.outcome else {
+            unreachable!()
+        };
+        let required = RequestedModelPolicy::Fixed {
+            selector: ModelSelector::ConfiguredName {
+                model_name: "Required Model".into(),
+                source: Some("required-source".into()),
+            },
+        };
+        slots[0].model_selection = None;
+        slots[0].requested_model_policy = Some(required.clone());
+        let mut omitted = make_spawn_input();
+        apply_delegation_model_admission(&mut omitted, &admission, "parent-run", Some("call"))
+            .unwrap();
+        assert_eq!(omitted.requested_model_policy, Some(required.clone()));
+        assert!(omitted.resolved_model_selection.is_none());
+        assert_eq!(
+            selector_for_admitted_spawn_input(&omitted, None).unwrap(),
+            Some(ModelSelector::ConfiguredName {
+                model_name: "Required Model".into(),
+                source: Some("required-source".into())
+            })
+        );
+        for policy in [
+            RequestedModelPolicy::Inherit,
+            RequestedModelPolicy::Fixed {
+                selector: ModelSelector::ConfiguredName {
+                    model_name: "Other Model".into(),
+                    source: None,
+                },
+            },
+        ] {
+            let mut conflicting = make_spawn_input();
+            conflicting.requested_model_policy = Some(policy);
+            assert!(
+                apply_delegation_model_admission(
+                    &mut conflicting,
+                    &admission,
+                    "parent-run",
+                    Some("call")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_offering_can_satisfy_a_hard_configured_name() {
+        use astra_turn_types::{
+            DelegationModelAdmissionOutcome, ModelSelection, ModelSelector, RequestedModelPolicy,
+        };
+        let mut admission = fixed_model_admission("required-offer");
+        let DelegationModelAdmissionOutcome::Constrained { slots } = &mut admission.outcome else {
+            unreachable!()
+        };
+        slots[0].requested_model_policy = Some(RequestedModelPolicy::Fixed {
+            selector: ModelSelector::ConfiguredName {
+                model_name: "Required Model".into(),
+                source: None,
+            },
+        });
+        for (offering_id, allowed) in [("required-offer", true), ("other-offer", false)] {
+            let mut proposed = make_spawn_input();
+            proposed.requested_model_policy = Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: offering_id.into(),
+                },
+            });
+            proposed.resolved_model_selection = Some(ModelSelection {
+                offering_id: offering_id.into(),
+            });
+            assert_eq!(
+                apply_delegation_model_admission(
+                    &mut proposed,
+                    &admission,
+                    "parent-run",
+                    Some("call")
+                )
+                .is_ok(),
+                allowed
+            );
+        }
     }
 
     fn fixed_model_admission(offering_id: &str) -> astra_turn_types::DelegationModelAdmission {

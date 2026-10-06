@@ -418,6 +418,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "agent_type",
                 "description",
                 "prompt",
+                "requested_model_policy",
                 // Reasoning is a first-class child execution control. Keep it
                 // on the resident spawn contract so ordinary language such as
                 // “use high reasoning” cannot produce a valid canonical field
@@ -431,7 +432,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "User model: omit model fields. Call directly; launch≠done. Wait.",
+            "Model: requested_model_policy; exact authorized ID/name. Unknown: select:model_catalog. Content names≠model. No substitution. launch≠done. Wait.",
         ),
         "introspect" => (
             &[
