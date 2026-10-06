@@ -432,7 +432,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "Omit unasked model policy. No substitution. launch≠done. Wait.",
+            "No substitution. launch≠done. Wait.",
         ),
         "introspect" => (
             &[
@@ -443,7 +443,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "offset",
                 "max_bytes",
             ][..],
-            "Explain: explain.target=previous|run; run needs run_id. question=label OR artifact=handle; never both. History=reflect; select:model_catalog.",
+            "explain.target=previous|run; run needs run_id. question=label OR artifact=handle; not both. History=reflect.",
         ),
         "reflect" => (
             &["question"][..],

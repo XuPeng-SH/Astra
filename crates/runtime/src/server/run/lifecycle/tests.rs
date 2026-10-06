@@ -23002,9 +23002,15 @@ async fn get_run_status_returns_state() {
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
     assert_eq!(status.events_count, 1);
-    assert!(status.workspace.is_none());
-    assert!(status.executor.is_none());
-    assert!(status.transport.is_none());
+    let workspace = status.workspace.expect("explicit no-file environment");
+    assert_eq!(workspace["kind"], "none");
+    assert_eq!(workspace["authority"], "none");
+    assert!(workspace["cwd"].is_null());
+    let executor = status.executor.expect("explicit control-plane executor");
+    assert_eq!(executor["kind"], "server_local");
+    assert_eq!(executor["executor_id"], "server-control-plane");
+    assert_eq!(executor["transport"], "server_local");
+    assert_eq!(status.transport.as_deref(), Some("server_local"));
 }
 
 #[tokio::test]
@@ -25387,9 +25393,14 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
     assert_eq!(durable.events[0]["event_type"], "run_started");
     assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
     assert_eq!(durable.events[0]["data"]["interactive_client"], true);
-    assert!(durable.events[0]["data"]["workspace"].is_null());
-    assert!(durable.events[0]["data"]["executor"].is_null());
-    assert!(durable.events[0]["data"]["transport"].is_null());
+    let start = &durable.events[0]["data"];
+    assert_eq!(start["workspace"]["kind"], "none");
+    assert_eq!(start["workspace"]["authority"], "none");
+    assert!(start["workspace"]["cwd"].is_null());
+    assert_eq!(start["executor"]["kind"], "server_local");
+    assert_eq!(start["executor"]["executor_id"], "server-control-plane");
+    assert_eq!(start["executor"]["transport"], "server_local");
+    assert_eq!(start["transport"], "server_local");
 }
 
 #[tokio::test]

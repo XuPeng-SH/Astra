@@ -205,10 +205,11 @@ fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
         .find(|schema| tool_schema_name(schema) == Some("introspect"))
         .unwrap();
     assert!(
-        introspect["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("select:model_catalog")
+        surface
+            .deferred_manifest_with_context_window(None)
+            .expect("deferred catalog discovery")
+            .names
+            .contains(&"model_catalog".to_string())
     );
     let description = introspect["function"]["description"].as_str().unwrap();
     assert!(!description.contains("facet=models"));
@@ -491,7 +492,6 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .expect("resident agent description");
     assert!(agent_description.contains("Wait"));
     assert!(agent_description.contains("No substitution"));
-    assert!(agent_description.contains("Omit unasked model policy"));
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
@@ -502,8 +502,19 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         "resident projection must retain model-control semantics"
     );
     let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
-    assert!(summary.contains("Model override, not task/output text"));
-    assert!(summary.contains("Omit for defaults"));
+    assert!(summary.contains("User-requested override, not task/output text"));
+    assert!(summary.contains("Else omit"));
+    let reasoning = &find(&full, "agent")["function"]["parameters"]["properties"]["reasoning"];
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["reasoning"]["description"],
+        reasoning["x-astra-discovery-summary"]
+    );
+    assert!(
+        reasoning["x-astra-discovery-summary"]
+            .as_str()
+            .unwrap()
+            .contains("User-requested scope only")
+    );
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],
         find(&full, "agent")["function"]["parameters"]["properties"]["prompt"]["x-astra-discovery-summary"]
@@ -1470,7 +1481,7 @@ fn observation_recovery_is_eager_and_reflection_can_be_pinned() {
     );
     let description = introspect["function"]["description"].as_str().unwrap();
     assert!(description.contains("question=label"));
-    assert!(description.contains("artifact=handle; never both"));
+    assert!(description.contains("artifact=handle; not both"));
     for field in ["explain", "artifact", "offset", "max_bytes"] {
         assert!(
             properties.get(field).is_some(),

@@ -1245,6 +1245,21 @@ mod tests {
                 );
                 assert!(guidance.contains("parent uses model/status receipts"));
                 assert!(brief.get("x-astra-discovery-summary").is_none());
+                let reasoning = if selected["name"] == "agent" {
+                    vec![&parameters["reasoning"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["reasoning"],
+                        &parameters["slots"]["items"]["properties"]["reasoning"],
+                    ]
+                };
+                for control in reasoning {
+                    assert_eq!(
+                        control["description"],
+                        "User-requested scope only; otherwise omit."
+                    );
+                    assert!(control.get("x-astra-discovery-summary").is_none());
+                }
                 let profiles = if selected["name"] == "agent" {
                     vec![&parameters["agent_type"]]
                 } else {
