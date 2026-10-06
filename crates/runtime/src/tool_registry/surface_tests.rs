@@ -491,7 +491,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .expect("resident agent description");
     assert!(agent_description.contains("Wait"));
     assert!(agent_description.contains("No substitution"));
-    assert!(agent_description.contains("Omit unrequested model overrides"));
+    assert!(agent_description.contains("Omit unasked model policy"));
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
@@ -504,6 +504,10 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
     assert!(summary.contains("Model override, not task/output text"));
     assert!(summary.contains("Omit for defaults"));
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],
+        find(&full, "agent")["function"]["parameters"]["properties"]["prompt"]["x-astra-discovery-summary"]
+    );
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
             .iter()
@@ -674,8 +678,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let child_brief = agent["function"]["parameters"]["properties"]["prompt"]["description"]
         .as_str()
         .expect("resident child brief guidance");
-    assert!(child_brief.contains("exact output"));
-    assert!(child_brief.contains("no parent-only reporting"));
+    assert!(child_brief.contains("Exact output"));
+    assert!(child_brief.contains("parent uses model/status receipts"));
     assert!(
         full_agent["function"]["parameters"]["properties"]
             .get("requested_model_policy")

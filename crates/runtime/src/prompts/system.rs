@@ -674,18 +674,18 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
             (false, false) => unreachable!("task guidance requires an agent surface"),
         };
         body.push_str(&format!(
-            "         - `task` is an agent type, not a callable tool name. {surface_guidance}; use `start_work` for durable tracked outcomes. Background task controls are not the Work graph. Child briefs preserve constraints and scope, whole-result format and alternatives; defer requested child choices only.\n"
+            "         - `task` is an agent type, not a callable tool name. {surface_guidance}; use `start_work` for durable tracked outcomes. Task controls are not Work. Child briefs preserve constraints and scope, whole-result format and alternatives; defer requested child choices only.\n"
         ));
     }
     if agent_visible {
         body.push_str(
-"         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Absent fields/actions: Tool Availability Protocol; preserve constraints. Default `agent_type`: read-only `explore`; review: `code-review`; mutation: `task`/`general-purpose`. Model policy is an optional override: omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, set an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not execution controls; never invent reasoning requirements, read configuration/credentials, or substitute unavailable/prohibited models.\n",
+"         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Absent fields/actions: Tool Availability Protocol; preserve constraints. Default `agent_type`: read-only `explore`; review: `code-review`; mutation: `task`/`general-purpose`. Optional override: omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, set an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not execution controls; never invent reasoning requirements, read configuration/credentials, or substitute unavailable/prohibited models.\n",
         );
         body.push_str(
-            "         - Spawn before child-specific checks. Preserve user-assigned model/task pairs: parent work stays with the parent, never replaces child work. One child per objective; fanout controls groups, not duplication.\n",
+            "         - Spawn before child-specific checks. Preserve user-assigned model/task pairs and exact child output. Use runtime model/status receipts, not child self-report. Parent work never replaces child work. One child per objective; fanout controls groups, not duplication.\n",
         );
         body.push_str(
-            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. For a parent/peer decision, use `agent(send_message, message_type=question)` then wait; answer with the incoming `request_id`. Final prose is not a coordination message. A running snapshot is not failure.\n",
+            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Decisions: `agent(send_message, message_type=question)` then wait; answer with the incoming `request_id`. Final prose is not a coordination message; running is not failure.\n",
         );
     }
     if tool_visible(tool_names, "bash") {
@@ -1578,7 +1578,8 @@ mod tests {
         assert!(prompt.contains("when the user asks for a child"));
         assert!(prompt.contains("Spawn before child-specific checks"));
         assert!(prompt.contains("Preserve user-assigned model/task pairs"));
-        assert!(prompt.contains("parent work stays with the parent, never replaces child work"));
+        assert!(prompt.contains("Parent work never replaces child work"));
+        assert!(prompt.contains("runtime model/status receipts, not child self-report"));
     }
 
     #[test]

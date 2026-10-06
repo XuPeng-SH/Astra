@@ -1238,8 +1238,12 @@ mod tests {
                     &parameters["slots"]["items"]["properties"]["prompt"]
                 };
                 let guidance = brief["description"].as_str().unwrap();
-                assert!(guidance.contains("exact output"));
-                assert!(guidance.contains("no parent-only reporting"));
+                let normalized = guidance.to_ascii_lowercase();
+                assert!(
+                    normalized.contains("exact output")
+                        || normalized.contains("exact child output")
+                );
+                assert!(guidance.contains("parent uses model/status receipts"));
                 assert!(brief.get("x-astra-discovery-summary").is_none());
                 let profiles = if selected["name"] == "agent" {
                     vec![&parameters["agent_type"]]

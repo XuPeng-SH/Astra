@@ -432,7 +432,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "Omit unrequested model overrides. No substitution. launch≠done. Wait.",
+            "Omit unasked model policy. No substitution. launch≠done. Wait.",
         ),
         "introspect" => (
             &[

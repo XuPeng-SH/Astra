@@ -124,11 +124,13 @@ zero discovery/file/network tools, and at most three primary rounds. Explicit
 version cases do not establish family-reference quality; this case must pass
 alongside ambiguous and unavailable candidate controls, not replace them.
 
-`flash_discover_then_delegate_glm` exercises the on-demand authorized Chat
-catalog as a user-facing journey. It requires a real `model_catalog` tool
-result with no catalog error or failed discovery calls, a GLM child provider
-round, and the exact completed child result through adoption or parent-owned
-retrieval. The current oracle does not prove that catalog discovery preceded
+`flash_discover_then_delegate_glm` exercises authorized Chat availability and
+delegation. A complete supplied catalog can avoid another `model_catalog` call.
+The oracle retains zero failed discovery calls, a real GLM child provider
+round, and exact completed child-result adoption or parent-owned retrieval.
+The explicit-query journey is covered separately by
+`flash_rejected_delegation_preserves_parent_tools`. This availability oracle
+does not prove catalog discovery preceded
 launch or that the observed page contained the selected offering: existing
 tool-name ordering checks cannot bind that specific spawn, and fixed array
 indices would overfit catalog pagination. Those remain coverage gaps, not

@@ -1994,7 +1994,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
-                        "prompt": {"type": "string", "description": "Full self-contained child brief: preserve constraints, conditional mappings and exact output requirements. Do not add output for parent-only reporting. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "exact output; no parent-only reporting."},
+                        "prompt": {"type": "string", "description": "Full self-contained child brief: preserve constraints, conditional mappings and exact output requirements. Keep parent-only reporting outside the brief: the parent reports execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; parent uses model/status receipts."},
                         "agent_type": delegation_agent_type_schema(),
                         "requested_model_policy": requested_model_policy_schema(),
                         "reasoning": fanout_reasoning_schema(),
@@ -2086,7 +2086,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "properties": {
                                     "id": {"type": "string", "description": "Optional stable caller-facing label for this slot. Returned in start/results/fanout projections. Not the runtime agent_id."},
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
-                                    "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Preserve user constraints and exact output in each brief, not parent-only reporting. Inherits provider bindings; use only exposed tools. Never paste files, diffs, or prior tool output.", "x-astra-discovery-summary": "Preserve constraints/exact output; no parent-only reporting."},
+                                    "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Preserve user constraints and exact output in each brief. Keep parent-only reporting outside: use runtime model/status receipts, not child self-report. Inherits provider bindings; use only exposed tools. Never paste files, diffs, or prior tool output.", "x-astra-discovery-summary": "Preserve exact child output; parent uses model/status receipts."},
                                     "agent_type": delegation_agent_type_schema(),
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                     "max_output_tokens": {"type": "integer", "minimum": 1},
