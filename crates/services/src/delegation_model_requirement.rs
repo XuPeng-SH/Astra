@@ -400,6 +400,8 @@ Resolved reasoning-only example: {{"disposition":"resolved","requirements":[{rea
 
 Model selection and reasoning are independent. A model-only assignment needs no reasoning evidence: omit reasoning and reasoning_quote when the user does not request a reasoning control. Their absence imposes no new reasoning requirement; runtime inheritance/default rules still apply. It does not mean reasoning off, a prohibition, or an unresolved requirement.
 
+The runtime supplies candidates[] as the complete eligible authorized selection scope for this request, not a search result or a partial catalog page. Resolve uniqueness within this supplied scope only. Models outside it are not selectable: do not invent unseen candidates or require a version solely because other versions might exist elsewhere. An empty scope cannot satisfy a model request.
+
 A negative-only example: user_text "Do not use Model 7 for this child" is not
 not_applicable; return {{"disposition":"unresolved","reason":"the user prohibited a model without selecting an allowed replacement"}}.
 
