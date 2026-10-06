@@ -5179,15 +5179,6 @@ pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
     })
 }
 
-/// Root-only counterpart used by `target=previous` discovery.
-///
-/// Exact `target=run` selection is valid for a delegated run as well. Root
-/// discovery keeps its historical meaning and must not accidentally choose a
-/// child merely because a child completed more recently.
-pub fn root_run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
-    run.depth == 0 && run_requested_explain_analyze(run)
-}
-
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
     async fn request_permission_mode(
@@ -5328,16 +5319,18 @@ pub trait RunStateStore: Send + Sync {
         kind: DurableRunInteractionKind,
     ) -> Result<Option<DurableRunInteractionProjection>, String>;
 
-    /// Find the newest root run that explicitly requested Explain Analyze,
-    /// excluding the caller's trusted current root when supplied.
+    /// Find the latest admitted root run for this user and session. When a
+    /// current root is supplied, select strictly before its (created_at, run_id)
+    /// admission key; a missing, foreign, or non-root current yields no selection.
+    /// Without a current root, select the latest. Order by created_at, then run_id,
+    /// descending, regardless of later updates or Explain capture.
     /// Shared stores must answer this from their durable indexed
     /// authority; callers must never infer it from a bounded UI run tree.
-    ///
-    async fn find_latest_explain_analyze_root(
+    async fn find_latest_root_run(
         &self,
         user_id: &str,
         session_id: &str,
-        excluded_root: Option<&str>,
+        current_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String>;
 
     /// Read only the newest typed terminal cancellation origin.
@@ -7863,34 +7856,35 @@ impl RunStateStore for InMemoryRunStateStore {
             .cloned())
     }
 
-    async fn find_latest_explain_analyze_root(
+    async fn find_latest_root_run(
         &self,
         user_id: &str,
         session_id: &str,
-        excluded_root: Option<&str>,
+        current_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         let runs = self.runs.read().await;
-        let mut candidates = runs
+        let current = current_root
+            .and_then(|run_id| runs.get(run_id))
+            .filter(|run| run.user_id == user_id && run.session_id == session_id && run.depth == 0);
+        if current_root.is_some() && current.is_none() {
+            return Ok(None);
+        }
+        Ok(runs
             .values()
             .filter(|run| {
                 run.user_id == user_id
                     && run.session_id == session_id
-                    && excluded_root != Some(run.run_id.as_str())
-                    && root_run_requested_explain_analyze(run)
+                    && run.depth == 0
+                    && current.is_none_or(|current| {
+                        (&run.created_at, &run.run_id) < (&current.created_at, &current.run_id)
+                    })
             })
-            .cloned()
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| right.created_at.cmp(&left.created_at))
-                .then_with(|| right.run_id.cmp(&left.run_id))
-        });
-        Ok(candidates
-            .into_iter()
-            .next()
-            .map(|run| (run.run_id, run.run_generation)))
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.run_id.cmp(&right.run_id))
+            })
+            .map(|run| (run.run_id.clone(), run.run_generation)))
     }
 
     async fn load_latest_terminal_cancellation_origin(
@@ -17030,37 +17024,36 @@ impl RunStateStore for DatabaseRunStateStore {
         }))
     }
 
-    async fn find_latest_explain_analyze_root(
+    async fn find_latest_root_run(
         &self,
         user_id: &str,
         session_id: &str,
-        excluded_root: Option<&str>,
+        current_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         let row = sqlx::query(
             "SELECT runs.run_id, runs.run_generation FROM agent_runs runs \
-             WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 AND (? IS NULL OR runs.run_id <> ?) \
-               AND EXISTS ( \
-                   SELECT 1 FROM agent_run_events events \
-                   WHERE events.user_id = runs.user_id AND events.run_id = runs.run_id \
-                     AND events.event_type = 'run_started' \
-                     AND JSON_UNQUOTE(JSON_EXTRACT(events.payload_json, '$.data.explain_analyze_requested')) = 'true' \
-               ) \
-             ORDER BY runs.updated_at DESC, runs.created_at DESC, runs.run_id DESC \
+             LEFT JOIN agent_runs current_run \
+               ON current_run.user_id = runs.user_id AND current_run.session_id = runs.session_id \
+               AND current_run.run_id = ? AND current_run.depth = 0 \
+             WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 \
+               AND (? IS NULL OR runs.created_at < current_run.created_at \
+                    OR (runs.created_at = current_run.created_at AND runs.run_id < current_run.run_id)) \
+             ORDER BY runs.created_at DESC, runs.run_id DESC \
              LIMIT 1",
         )
+            .bind(current_root)
             .bind(user_id)
             .bind(session_id)
-            .bind(excluded_root)
-            .bind(excluded_root)
+            .bind(current_root)
             .fetch_optional(self.pool.get())
             .await
             .map_err(|source| {
-                db_error("find_latest_explain_analyze_root", session_id, source).to_string()
+                db_error("find_latest_root_run", session_id, source).to_string()
             })?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let operation = "find_latest_explain_analyze_root";
+        let operation = "find_latest_root_run";
         let run_id = run_row_string(&row, operation, "agent_runs", "run_id")
             .map_err(|error| error.to_string())?;
         let run_generation = run_row_u64(&row, operation, "agent_runs", "run_generation")
@@ -28306,65 +28299,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_explain_discovery_is_not_limited_by_the_session_tree_page() {
+    async fn in_memory_root_discovery_uses_admission_order_outside_session_tree_page() {
         let store = InMemoryRunStateStore::new();
         for index in 0..101 {
             let mut run = durable_run_record(&format!("history-{index:03}"));
             run.status = STATUS_COMPLETED.to_string();
+            run.created_at = "1999-01-01T00:00:00Z".to_string();
             run.updated_at = "9999-01-01T00:00:00Z".to_string();
             store.insert_run(run).await.unwrap();
         }
-        let mut explain = durable_run_record("explain-target");
-        explain.status = STATUS_COMPLETED.to_string();
-        explain.updated_at = "2000-01-01T00:00:00Z".to_string();
-        explain.events = vec![json!({
-            "event_type": "run_started",
-            "data": {"explain_analyze_requested": true}
-        })];
-        store.insert_run(explain).await.unwrap();
+        for (run_id, day) in [
+            ("older-explain", 1),
+            ("ordinary-a", 2),
+            ("ordinary-z", 2),
+            ("current-root", 3),
+            ("later-root", 4),
+            ("child", 5),
+            ("other-user", 5),
+            ("other-session", 5),
+        ] {
+            let mut run = if run_id == "child" {
+                durable_child_run_record(run_id, "ordinary-z")
+            } else {
+                durable_run_record(run_id)
+            };
+            run.status = STATUS_COMPLETED.to_string();
+            run.run_generation = 7;
+            run.created_at = format!("2000-01-{day:02}T00:00:00Z");
+            run.updated_at = run.created_at.clone();
+            match run_id {
+                "older-explain" => {
+                    run.updated_at = "9999-01-02T00:00:00Z".into();
+                    run.events = vec![json!({
+                        "event_type": "run_started",
+                        "data": {"explain_analyze_requested": true}
+                    })];
+                }
+                "ordinary-z" => run.status = STATUS_PAUSED.to_string(),
+                "other-user" => run.user_id = "u2".into(),
+                "other-session" => run.session_id = "s2".into(),
+                _ => {}
+            }
+            store.insert_run(run).await.unwrap();
+        }
 
         assert_eq!(
-            store
-                .find_latest_explain_analyze_root("u1", "s1", None)
-                .await
-                .unwrap()
-                .map(|(run_id, _)| run_id),
-            Some("explain-target".to_string())
+            store.find_latest_root_run("u1", "s1", None).await.unwrap(),
+            Some(("later-root".into(), 7))
         );
-
         assert_eq!(
             store
-                .find_latest_explain_analyze_root("u1", "s1", Some("explain-target"))
+                .find_latest_root_run("u1", "s1", Some("current-root"))
                 .await
                 .unwrap(),
-            None,
-        );
-
-        let mut newer_paused = durable_run_record("explain-paused");
-        newer_paused.status = STATUS_PAUSED.to_string();
-        newer_paused.updated_at = "9999-01-02T00:00:00Z".to_string();
-        newer_paused.events = vec![json!({
-            "event_type": "run_started",
-            "data": {"explain_analyze_requested": true}
-        })];
-        store.insert_run(newer_paused).await.unwrap();
-
-        assert_eq!(
-            store
-                .find_latest_explain_analyze_root("u1", "s1", None)
-                .await
-                .unwrap()
-                .map(|(run_id, _)| run_id),
-            Some("explain-paused".to_string())
+            Some(("ordinary-z".into(), 7)),
+            "previous must precede current admission, ignoring later roots, updates, Explain, status, and child/foreign roots"
         );
         assert_eq!(
             store
-                .find_latest_explain_analyze_root("u1", "s1", Some("explain-paused"))
+                .find_latest_root_run("u1", "s1", Some("ordinary-z"))
                 .await
-                .unwrap()
-                .map(|(run, _)| run),
-            Some("explain-target".into()),
+                .unwrap(),
+            Some(("ordinary-a".into(), 7)),
+            "the strict upper bound includes run ID when admission timestamps tie"
         );
+        for current_root in [
+            "history-000",
+            "missing-root",
+            "other-user",
+            "other-session",
+            "child",
+        ] {
+            assert_eq!(
+                store
+                    .find_latest_root_run("u1", "s1", Some(current_root))
+                    .await
+                    .unwrap(),
+                None,
+                "earliest or invalid current root must not select a later root or older Explain: {current_root}"
+            );
+        }
+        for (user_id, session_id) in [("missing-user", "s1"), ("u1", "missing-session")] {
+            assert_eq!(
+                store
+                    .find_latest_root_run(user_id, session_id, None)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[tokio::test]

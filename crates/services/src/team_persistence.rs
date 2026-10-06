@@ -17,6 +17,7 @@ use crate::coordination::{AgentProfile, AgentTier};
 const MAX_TEAM_LIST_ROWS: usize = 200;
 const MAX_TEAM_SNAPSHOT_LIST_ROWS: u32 = 200;
 const BUILTIN_OWNER_INIT_CACHE_CAPACITY: usize = 4096;
+const BUILTIN_TEAM_ID_PREFIX: &str = "bt-";
 const TEAM_LIST_SELECT_SQL: &str = "\
     SELECT team_id, user_id, name, description, \
            members_json, context_json, revision \
@@ -151,6 +152,13 @@ impl std::error::Error for TeamWriteError {}
 
 impl CreateTeam {
     fn definition(&self, user_id: &str) -> Result<TeamDefinition, TeamWriteError> {
+        if self.team_id.starts_with(BUILTIN_TEAM_ID_PREFIX) {
+            return Err(TeamWriteError::Validation(vec![
+                TeamValidationError::InvalidDefinition(format!(
+                    "team_id prefix '{BUILTIN_TEAM_ID_PREFIX}' is reserved for built-in Teams"
+                )),
+            ]));
+        }
         let team = TeamDefinition {
             team_id: self.team_id.clone(),
             user_id: user_id.to_string(),
@@ -176,15 +184,16 @@ impl UpdateTeam {
                     "expected_revision must be positive and incrementable".to_string(),
                 )])
             })?;
-        let mut team = CreateTeam {
+        let team = TeamDefinition {
             team_id: team_id.to_string(),
+            user_id: user_id.to_string(),
+            revision,
             name: self.name.clone(),
             description: self.description.clone(),
             members: self.members.clone(),
             context: self.context.clone(),
-        }
-        .definition(user_id)?;
-        team.revision = revision;
+        };
+        validate_team(&team).map_err(TeamWriteError::Validation)?;
         Ok(team)
     }
 }
@@ -1333,7 +1342,7 @@ pub struct TeamSnapshotRecord {
 pub fn builtin_teams(user_id: &str) -> Vec<TeamDefinition> {
     vec![
         TeamDefinition {
-            team_id: format!("bt-rev-{user_id}"),
+            team_id: format!("{BUILTIN_TEAM_ID_PREFIX}rev-{user_id}"),
             user_id: user_id.to_string(),
             name: "review".to_string(),
             description: "Independent code reviews with aggregated findings".to_string(),
@@ -1372,7 +1381,7 @@ pub fn builtin_teams(user_id: &str) -> Vec<TeamDefinition> {
             revision: 1,
         },
         TeamDefinition {
-            team_id: format!("bt-res-{user_id}"),
+            team_id: format!("{BUILTIN_TEAM_ID_PREFIX}res-{user_id}"),
             user_id: user_id.to_string(),
             name: "research".to_string(),
             description: "Deep research: explorer gathers info, synthesizer produces report"
@@ -1411,7 +1420,7 @@ pub fn builtin_teams(user_id: &str) -> Vec<TeamDefinition> {
             revision: 1,
         },
         TeamDefinition {
-            team_id: format!("bt-dev-{user_id}"),
+            team_id: format!("{BUILTIN_TEAM_ID_PREFIX}dev-{user_id}"),
             user_id: user_id.to_string(),
             name: "dev".to_string(),
             description:
@@ -1788,6 +1797,12 @@ mod tests {
     #[test]
     fn team_write_validation_and_uncertain_delivery_remain_distinct() {
         let team = test_team();
+        let mut reserved = create_input(&team);
+        reserved.team_id = format!("{BUILTIN_TEAM_ID_PREFIX}custom");
+        assert!(matches!(
+            reserved.definition(&team.user_id),
+            Err(TeamWriteError::Validation(_))
+        ));
         for revision in [0, u64::MAX] {
             let mut input = UpdateTeam::from(&team);
             input.expected_revision = revision;
@@ -1800,6 +1815,12 @@ mod tests {
         input.members[0].agent_id.clear();
         assert!(matches!(
             input.definition(&team.user_id),
+            Err(TeamWriteError::Validation(_))
+        ));
+        let mut update = UpdateTeam::from(&team);
+        update.members[0].agent_id.clear();
+        assert!(matches!(
+            update.definition(&team.user_id, &team.team_id),
             Err(TeamWriteError::Validation(_))
         ));
         let mut wire = serde_json::to_value(&team.members[0]).unwrap();
@@ -1847,6 +1868,23 @@ mod tests {
             .await
             .unwrap();
 
+        let bob_builtins = builtin_teams("bob");
+        for builtin in &bob_builtins {
+            let mut claim = create_input(builtin);
+            claim.name = format!("claim-{}", builtin.name);
+            assert!(matches!(
+                store.create_team("alice", &claim).await,
+                Err(TeamWriteError::Validation(_))
+            ));
+            assert!(
+                store
+                    .load_team_by_id("alice", &builtin.team_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(store.list_teams("bob").await.unwrap().is_empty());
         store.ensure_builtins("alice").await.unwrap();
         store.ensure_builtins("alice").await.unwrap();
         store.ensure_builtins("bob").await.unwrap();
@@ -1869,6 +1907,7 @@ mod tests {
                 .all(|team| team.user_id == "alice" && !team.team_id.contains("bob"))
         );
         assert!(bob.iter().all(|team| team.user_id == "bob"));
+        assert!(bob_builtins.iter().all(|builtin| bob.contains(builtin)));
 
         let dev = store.load_team("alice", "dev").await.unwrap().unwrap();
         let mut renamed = UpdateTeam::from(&dev);
@@ -1877,6 +1916,8 @@ mod tests {
             .update_team("alice", &dev.team_id, &renamed)
             .await
             .unwrap();
+        assert_eq!(accepted.team_id, dev.team_id);
+        assert_eq!(accepted.revision, dev.revision + 1);
         store.ensure_builtins("alice").await.unwrap();
         assert_eq!(
             store.load_team_by_id("alice", &dev.team_id).await.unwrap(),

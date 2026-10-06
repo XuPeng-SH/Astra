@@ -7874,14 +7874,7 @@ impl ServerAgenticLoopHost {
                         .rejected
                         .push(crate::turn::agentic_loop::host::RejectedToolCall {
                             invocation,
-                            result: json!({
-                                "status": "rejected",
-                                "error_kind": "tool_invalid_args",
-                                "retryable": true,
-                                "executed": false,
-                                "error": error.output(),
-                            })
-                            .to_string(),
+                            result: error.rejection_output().to_string(),
                         })
                 }
             }

@@ -415,13 +415,19 @@ Server chat preparation performs no Explain discovery, artifact fetch, or
 recovery. The canonical tool schema and catalog advertise the explicit selector:
 
 - `introspect(explain={target:"previous"}, offset=0, max_bytes=65536)` selects
-  the latest Explain root in the active session, excluding the current root
-  installed by the trusted lifecycle owner. Durable ordering remains
-  updated time, created time, then run ID, all descending.
+  the latest root strictly before the trusted current root's `(created_at, run_id)`
+  admission key for the authenticated user in the active session. Roots admitted
+  after current are not previous. A missing, foreign, or non-root current fails
+  closed with no selection. The store lookup without a current root selects the
+  latest root. Durable ordering is created time, then run ID, both descending;
+  later updates, run status, and whether Explain was requested do not affect selection.
+  Child runs and other users/sessions are excluded. The selected identity never
+  silently falls back to an older Explain capture.
 - `introspect(explain={target:"run",run_id:"…"}, offset=0, max_bytes=65536)`
   selects that exact run after authenticated owner and active-session checks.
-  It never widens scope to another session. When Explain was not enabled,
-  it returns a durable event projection rather than an Explain artifact.
+  It never widens scope to another session. Both selectors share the same
+  exact-run read: when Explain was not enabled, they return a durable event
+  projection rather than an Explain artifact, without creating a new artifact.
   This projection reads at most 256 events across opening and latest windows,
   bounded by the observed durable cursor, without reading checkpoint payloads.
   The event window has a 1 MiB transfer bound, shared equally across requested

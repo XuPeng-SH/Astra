@@ -73,7 +73,13 @@ store or template authority. An empty roster is a valid draft,
 but execution rejects it before admitting children. Configuration edits retain
 the complete definition, including member profiles, capabilities and shared context.
 Team and member identities are immutable and independent of editable names.
-Creation supplies a caller-generated Team ID; updates compare the exact Team ID
+Creation supplies a caller-generated Team ID outside the reserved `bt-` namespace.
+Public `POST /teams` rejects that prefix with `400 team_validation_failed`, so
+one owner cannot reserve another owner's built-in Team ID before its first
+template initialization. Only the existing owner-scoped builtin factory creates
+these IDs. Their owners can still edit or rename built-in Teams through the
+normal revision-checked update contract; creation restrictions do not prohibit
+those updates. Updates compare the exact Team ID
 and expected positive revision, incrementing the revision on acceptance. A stale
 revision, conflicting name or missing Team rejects the write without upserting
 another definition. The accepted response supplies the exact identity, revision

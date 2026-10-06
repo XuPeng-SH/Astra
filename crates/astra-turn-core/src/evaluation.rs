@@ -1708,6 +1708,8 @@ pub struct ToolEvaluationFact {
     effective_result_class: Option<String>,
     non_failure_outcome: bool,
     is_rejected_attempt: bool,
+    /// A terminal rejection prevents repair; invalid arguments instead need
+    /// a corrected invocation, even though the original call is not retryable.
     rejection_non_retryable: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub round: Option<u32>,
@@ -1882,6 +1884,7 @@ impl ToolEvaluationFact {
             non_failure_outcome: record_is_non_failure_outcome(record),
             is_rejected_attempt: record_is_rejected_attempt(record),
             rejection_non_retryable: record_is_rejected_attempt(record)
+                && record.error_kind != Some(astra_core::ErrorKind::ToolInvalidArgs)
                 && record
                     .runtime_model_result_full
                     .as_deref()

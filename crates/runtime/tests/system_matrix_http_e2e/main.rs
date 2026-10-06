@@ -80,6 +80,12 @@ macro_rules! current_thread_matrix_test {
     };
 }
 
+matrix_test! {
+    e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution, 2,
+    "live MatrixOne + scripted provider; real schema rejection and corrected child execution",
+    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn product_matrix_api_journey_hits_multiple_tables() {

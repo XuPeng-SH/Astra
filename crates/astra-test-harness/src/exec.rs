@@ -150,12 +150,15 @@ fn case_cli_arguments(case: &Case, model: &str, events_path: &str) -> Vec<String
     } else {
         args.push("chat".into());
     }
-    args.extend([
-        "--json".into(),
-        "--explain=on".into(),
-        "--stream-events".into(),
-        events_path.into(),
-    ]);
+    args.push("--json".into());
+    if !case
+        .extra_cli_args
+        .iter()
+        .any(|arg| arg == "--explain" || arg.starts_with("--explain="))
+    {
+        args.push("--explain=on".into());
+    }
+    args.extend(["--stream-events".into(), events_path.into()]);
     if !has_session_id(&case.extra_cli_args) {
         args.push("--no-resume".into());
     }
@@ -1805,6 +1808,25 @@ mod tests {
             repro.contains(r"'say '\''hello'\'''"),
             "POSIX single-quote escape expected: {repro}"
         );
+    }
+
+    #[test]
+    fn explicit_explain_mode_overrides_capture_default() {
+        for explicit in [vec![], vec!["--explain=off"], vec!["--explain", "off"]] {
+            let mut case = simple_case();
+            case.extra_cli_args = explicit.iter().map(|arg| (*arg).into()).collect();
+            let args = case_cli_arguments(&case, "test-model", "events.jsonl");
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| *arg == "--explain" || arg.starts_with("--explain="))
+                    .count(),
+                1
+            );
+            assert_eq!(args.contains(&"--explain=on".into()), explicit.is_empty());
+            for arg in explicit {
+                assert!(args.contains(&arg.to_string()));
+            }
+        }
     }
 
     #[tokio::test]

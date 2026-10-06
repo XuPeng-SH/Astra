@@ -10005,15 +10005,15 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.inner.load_run_projection(user_id, run_id).await
     }
 
-    async fn find_latest_explain_analyze_root(
+    async fn find_latest_root_run(
         &self,
         user_id: &str,
         session_id: &str,
-        excluded_root: Option<&str>,
+        current_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         self.counters.lock().unwrap().explain_lookup_calls += 1;
         self.inner
-            .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
+            .find_latest_root_run(user_id, session_id, current_root)
             .await
     }
 

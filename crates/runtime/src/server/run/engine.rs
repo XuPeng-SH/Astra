@@ -4615,16 +4615,18 @@ impl RunEngine {
             .await
     }
 
-    /// Find the latest root Explain Analyze run from the store's
-    /// durable authority. This deliberately bypasses the bounded UI tree.
-    pub async fn find_latest_explain_analyze_root(
+    /// Find the latest admitted root run from the store's durable authority.
+    /// A supplied current root is a strict admission-order upper bound and
+    /// must belong to this user and session; invalid bounds yield no selection.
+    /// This deliberately bypasses the bounded UI tree and Explain eligibility.
+    pub async fn find_latest_root_run(
         &self,
         user_id: &str,
         session_id: &str,
-        excluded_root: Option<&str>,
+        current_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         self.store
-            .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
+            .find_latest_root_run(user_id, session_id, current_root)
             .await
     }
 
@@ -8127,14 +8129,14 @@ mod tests {
                 .await
         }
 
-        async fn find_latest_explain_analyze_root(
+        async fn find_latest_root_run(
             &self,
             user_id: &str,
             session_id: &str,
-            excluded_root: Option<&str>,
+            current_root: Option<&str>,
         ) -> Result<Option<(String, u64)>, String> {
             self.inner
-                .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
+                .find_latest_root_run(user_id, session_id, current_root)
                 .await
         }
 

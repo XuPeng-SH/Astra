@@ -949,6 +949,198 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
     first.ctx.close().await;
 }
 
+pub async fn run_stream_corrects_invalid_model_policy_before_child_execution() {
+    for explain in [false, true] {
+        let b = bootstrap().await;
+        let ctx = &b.ctx;
+        let user_text =
+            "Use the specified model for a child to calculate a value and report its result.";
+        let child_task = "Calculate 13 times 17 and return only the integer.";
+        let model = format!("mock-{}", ctx.suffix);
+        let policy =
+            json!({"mode":"fixed","selector":{"kind":"configured_name","model_name":model}});
+        let corrected = json!({"action":"spawn","description":"Calculate a value","prompt":child_task,"requested_model_policy":policy});
+        let mut invalid = corrected.clone();
+        invalid["requested_model_policy"] = json!(policy.to_string());
+        ctx.install_native_provider(
+            &b.auth_header,
+            vec![
+                ProviderScript::new(
+                    "parent argument correction",
+                    move |request| {
+                        request.path == "/v1/chat/completions"
+                            && request.body["stream"] == true
+                            && request.body["messages"].as_array().is_some_and(|messages| {
+                                messages
+                                    .iter()
+                                    .any(|m| m["role"] == "user" && m["content"] == user_text)
+                            })
+                    },
+                    vec![
+                        native_tool_response(provider_tool_call(
+                            "invalid-policy",
+                            "agent",
+                            invalid,
+                        )),
+                        native_tool_response(provider_tool_call(
+                            "corrected-policy",
+                            "agent",
+                            corrected,
+                        )),
+                        native_tool_response(provider_tool_call(
+                            "wait-for-result",
+                            "agent",
+                            json!({"action":"wait","timeout_ms":10000}),
+                        )),
+                        native_text_response("The observed child result is 221."),
+                    ],
+                ),
+                native_child_script(
+                    model.clone(),
+                    user_text,
+                    child_task,
+                    native_text_response("221"),
+                ),
+            ],
+        )
+        .await;
+        let (status, raw) = stream_chat_full(
+            &ctx.app,
+            &b.auth_header,
+            json!({
+                "message":user_text,
+                "explain":explain,
+                "model_selection":seeded_model_selection(ctx),
+                "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        let events = parse_sse_events(&raw);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "agent_spawned")
+                .count(),
+            1,
+            "{raw}"
+        );
+        let requests = ctx.native_provider_requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.body["messages"].as_array().is_some_and(|messages| {
+                        messages
+                            .iter()
+                            .any(|m| m["role"] == "user" && m["content"] == user_text)
+                    })
+                })
+                .count(),
+            4,
+            "Explain capture must not change the correction/spawn/wait/final execution sequence"
+        );
+        let children: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                r.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|m| m["role"] == "user" && m["content"] == child_task)
+                })
+            })
+            .collect();
+        assert_eq!(
+            children.len(),
+            1,
+            "only the corrected call may start a child"
+        );
+        assert_eq!(children[0].body["model"], model);
+        let final_request = requests
+            .iter()
+            .find(|request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["tool_call_id"] == "wait-for-result")
+                })
+            })
+            .expect("wait receipt must reach the final provider request");
+        let final_messages = final_request.body["messages"].as_array().unwrap();
+        let wait: Value = final_messages
+            .iter()
+            .find(|message| message["tool_call_id"] == "wait-for-result")
+            .and_then(|message| message["content"].as_str())
+            .and_then(|content| serde_json::from_str(content).ok())
+            .expect("typed wait receipt");
+        assert_eq!(wait["success"], true);
+        assert!(
+            final_messages
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .flat_map(str::lines)
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(
+                    |payload| payload["context"]["schema"] == "direct_child_completion.v1"
+                        && payload["context"]["children"]
+                            .as_array()
+                            .is_some_and(|children| {
+                                children.iter().any(|child| {
+                                    child["status"] == "completed" && child["result"] == "221"
+                                })
+                            })
+                ),
+            "the final provider request must observe the actual completed child result"
+        );
+        let repair_request = requests
+            .iter()
+            .find(|r| {
+                r.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|m| m["tool_call_id"] == "invalid-policy")
+                })
+            })
+            .expect("rejection must reach the next actual provider request");
+        let receipt: Value = repair_request.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tool_call_id"] == "invalid-policy")
+            .and_then(|m| m["content"].as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .expect("typed model-facing rejection");
+        assert_eq!(receipt["executed"], false);
+        assert_eq!(receipt["retryable"], false);
+        assert_eq!(receipt["error_kind"], "tool_invalid_args");
+        assert_eq!(
+            receipt["recovery_evidence"]["recovery_actions"],
+            json!(["correct_arguments"])
+        );
+        let agent_schema = repair_request.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "agent")
+            .expect("actual provider schema");
+        assert_eq!(
+            agent_schema["function"]["parameters"]["properties"]["requested_model_policy"]["type"],
+            "object"
+        );
+        assert!(
+            events.iter().any(|e| e["type"] == "text_delta"
+                && e["content"].as_str().is_some_and(|s| s.contains("221"))),
+            "{raw}"
+        );
+        let session_id = sse_first_data_json_with_type(&raw, "session_info").unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
+        ctx.close().await;
+    }
+}
+
 /// B1: Session row persists, chat/stream completes, run status is queryable.
 pub async fn run_stream_session_and_run_status() {
     let b = bootstrap().await;
