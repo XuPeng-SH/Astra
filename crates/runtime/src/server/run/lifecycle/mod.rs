@@ -5871,6 +5871,7 @@ pub struct AgenticRunLifecycleService {
     /// Exact model catalog used to resolve client-visible Offering IDs.
     model_service: Arc<dyn ModelService>,
     auth_service: Arc<dyn astra_services::AuthService>,
+    model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
     /// Registry-backed MCP bindings available to server-side chat loops.
     mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     /// Immutable Agent Binding snapshots for binding-backed chat loops.
@@ -6012,6 +6013,7 @@ impl AgenticRunLifecycleService {
             skill_service: None,
             model_service: Arc::new(astra_services::UnconfiguredModelService),
             auth_service: Arc::new(astra_services::auth::UnconfiguredAuthService),
+            model_catalog_cache: Default::default(),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -6807,6 +6809,14 @@ impl AgenticRunLifecycleService {
 
     pub fn with_auth_service(mut self, service: Arc<dyn astra_services::AuthService>) -> Self {
         self.auth_service = service;
+        self
+    }
+
+    pub fn with_model_catalog_cache(
+        mut self,
+        cache: astra_services::models::AuthorizedModelCatalogCache,
+    ) -> Self {
+        self.model_catalog_cache = cache;
         self
     }
 
@@ -20563,7 +20573,7 @@ fn safe_model_error_code(error_code: Option<&str>) -> Option<&str> {
     error_code.filter(|code| SAFE_MODEL_ERROR_CODES.contains(code))
 }
 
-fn ensure_child_model_selection_scope(
+pub(crate) fn ensure_child_model_selection_scope(
     reader: Option<&astra_services::models::AuthorizedModelCatalogReader>,
     provider_scoped: bool,
 ) -> Result<(), String> {
@@ -20615,6 +20625,44 @@ pub(crate) fn safe_model_service_error_with_code(
     let code = safe_model_error_code(error_code);
     let message = safe_model_service_error(status, code);
     code.map_or_else(|| message.to_string(), |code| format!("[{code}] {message}"))
+}
+
+/// Preserve machine-authored admission evidence without classifying display text.
+pub(crate) fn safe_model_spawn_error(
+    status: StatusCode,
+    error_code: Option<&str>,
+) -> crate::orchestration::SpawnError {
+    use astra_core::ErrorKind;
+
+    let kind = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some(ErrorKind::Auth),
+        StatusCode::TOO_MANY_REQUESTS => Some(ErrorKind::RateLimit),
+        _ => match safe_model_error_code(error_code) {
+            Some(
+                "model_selection_invalid"
+                | "model_admission_batch_invalid"
+                | "model_admission_batch_too_large"
+                | "model_reasoning_unsupported"
+                | "model_purpose_unsupported",
+            ) => Some(ErrorKind::InvalidRequest),
+            Some(
+                "model_not_available"
+                | "model_offering_not_found"
+                | "model_offering_unavailable"
+                | "model_selection_changed",
+            ) => Some(ErrorKind::ToolUnavailable),
+            Some("model_admission_incomplete") => Some(ErrorKind::ContractViolation),
+            Some("model_catalog_unavailable") => Some(ErrorKind::ServerError),
+            _ => None,
+        },
+    };
+    let message = safe_model_service_error_with_code(status, error_code);
+    match kind {
+        Some(kind) => crate::orchestration::SpawnError::Admission(
+            astra_core::ClassifiedError::new(kind, message),
+        ),
+        None => crate::orchestration::SpawnError::DelegationFailed(message),
+    }
 }
 
 pub(crate) fn safe_model_offering_error(
@@ -21165,7 +21213,7 @@ impl ServerSpawnAgentExecutor {
         &self,
         parent: &ServerSpawnRuntimeContext,
         selectors: &[astra_turn_types::ModelSelector],
-    ) -> Result<Vec<astra_services::AdmittedModelExecution>, String> {
+    ) -> Result<Vec<astra_services::AdmittedModelExecution>, crate::orchestration::SpawnError> {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
@@ -21196,7 +21244,7 @@ impl ServerSpawnAgentExecutor {
                 )
                 .await
                 .map_err(|(status, body)| {
-                    safe_model_service_error_with_code(status, body.0.error_code.as_deref())
+                    safe_model_spawn_error(status, body.0.error_code.as_deref())
                 });
         }
 
@@ -21218,7 +21266,7 @@ impl ServerSpawnAgentExecutor {
                         error_code = body.0.error_code.as_deref().unwrap_or("unknown"),
                         "child model admission rejected"
                     );
-                    safe_model_service_error_with_code(status, body.0.error_code.as_deref())
+                    safe_model_spawn_error(status, body.0.error_code.as_deref())
                 });
         }
         if selectors
@@ -21242,7 +21290,8 @@ impl ServerSpawnAgentExecutor {
                 self.shared_pool.as_ref(),
                 &offering_ids,
             )
-            .await;
+            .await
+            .map_err(crate::orchestration::SpawnError::from);
         }
         Err("configured model names require the authenticated model catalog service".into())
     }
@@ -22471,7 +22520,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         inputs: &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput],
         context: &SpawnContext,
         _parent_selection: Option<&ModelSelection>,
-    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, crate::orchestration::SpawnError> {
         if inputs.iter().any(|input| input.isolated) {
             return Err("agent execution does not support isolated Git workspaces".into());
         }
@@ -22513,8 +22562,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             }
             if selector.is_none() && selection.is_none() {
                 return Err(
-                    "server dynamic child cannot inherit a missing parent model admission"
-                        .to_string(),
+                    "server dynamic child cannot inherit a missing parent model admission".into(),
                 );
             }
             let requires_admission = match selector.as_ref() {
@@ -22646,7 +22694,9 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 &execution,
                 astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
             )
-            .map_err(|(_, body)| body.0.detail)?;
+            .map_err(|(status, body)| {
+                safe_model_spawn_error(status, body.0.error_code.as_deref())
+            })?;
             crate::server::model_execution_admission::validate_reasoning_control(
                 &execution, &thinking,
             )?;

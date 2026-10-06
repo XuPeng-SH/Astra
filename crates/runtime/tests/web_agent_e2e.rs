@@ -748,32 +748,95 @@ fn delegation_assessment(body: &Value) -> Option<Value> {
     })
 }
 
-async fn assert_native_delegation_judgment(
+async fn assert_native_delegation_without_auxiliary_selector(
     gateway: &ProviderGateway,
     user_text: &str,
     slots: &[(&str, &str)],
 ) {
     let requests = gateway.requests.lock().await;
-    let judgments = requests
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| delegation_assessment(&request.body).is_some())
+            .count(),
+        0,
+        "ordinary delegation must not make an auxiliary selector request"
+    );
+    let request = requests
         .iter()
-        .filter_map(|request| delegation_assessment(&request.body).map(|input| (request, input)))
-        .collect::<Vec<_>>();
-    assert_eq!(judgments.len(), 1);
-    let (request, input) = &judgments[0];
+        .rfind(|request| primary_request_for(request, user_text))
+        .expect("parent must reach the provider");
     assert_eq!(request.body["model"], "test-model");
     assert_eq!(request.body["stream"], true);
-    assert_eq!(input["user_text"], user_text);
-    let candidates = input["candidates"].as_array().unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0]["offering_id"], DEFAULT_MODEL_OFFERING_ID);
-    assert_eq!(candidates[0]["model_name"], "test-model");
-    assert_eq!(candidates[0]["provider"], "openai");
-    let actual = input["slots"].as_array().unwrap();
+    let first = requests
+        .iter()
+        .find(|request| primary_request_for(request, user_text))
+        .unwrap();
+    let candidates: Vec<_> = first.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| {
+            let text = message["content"].as_str()?;
+            let text = text
+                .strip_prefix("<astra-runtime-context>\n")
+                .and_then(|text| text.strip_suffix("\n</astra-runtime-context>"))
+                .unwrap_or(text);
+            let payload: Value = serde_json::from_str(text).ok()?;
+            payload
+                .get("catalog")
+                .is_some()
+                .then_some((message, payload))
+        })
+        .collect();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "cold parent request must carry one candidate context"
+    );
+    assert_eq!(candidates[0].0["role"], "user");
+    let items = candidates[0].1["catalog"]["items"].as_array().unwrap();
+    let selected = items
+        .iter()
+        .find(|item| item["offering_id"] == DEFAULT_MODEL_OFFERING_ID)
+        .expect("authorized parent Offering must be visible on the wire");
+    assert_eq!(selected["name"], "test-model");
+    assert_eq!(selected["provider"], "openai");
+    let mut actual = Vec::new();
+    for call in request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+    {
+        let name = call["function"]["name"].as_str().unwrap();
+        let args: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        let (name, args) = if name == "invoke_tool" {
+            (args["name"].as_str().unwrap(), &args["arguments"])
+        } else {
+            (name, &args)
+        };
+        match (name, args["action"].as_str()) {
+            ("agent", Some("spawn")) => actual.push(args.clone()),
+            ("agent_fanout", Some("start")) => {
+                actual.extend(args["slots"].as_array().unwrap().iter().cloned())
+            }
+            _ => {}
+        }
+    }
     assert_eq!(actual.len(), slots.len());
     for (index, (description, prompt)) in slots.iter().enumerate() {
-        assert_eq!(actual[index]["index"], index);
         assert_eq!(actual[index]["description"], *description);
         assert_eq!(actual[index]["prompt"], *prompt);
+        let child = requests
+            .iter()
+            .find(|request| primary_request_for(request, prompt))
+            .expect("each declared child must reach the provider with its complete task");
+        assert_eq!(child.body["model"], "test-model");
+        assert_eq!(child.body["stream"], true);
     }
 }
 
@@ -1705,12 +1768,6 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
             if matches { entered.notify_one(); }
             matches
         }, vec![child_response]),
-        ProviderScript::new("actual delegation judgment", |request|
-            request.path == "/v1/chat/completions" && request.body["model"] == "test-model" && assessment(&request.body).is_some(),
-            vec![ProviderResponse::OpenAi(json!({"id":"native-web-judgment","model":"test-model",
-                "choices":[{"index":0,"message":{"role":"assistant","content":"{\"disposition\":\"not_applicable\"}"},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":32,"completion_tokens":8,"total_tokens":40}
-            }))]),
     ]).await;
     let models = Arc::new(TestModelService {
         judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -1815,31 +1872,12 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     assert!(!workspace_base.exists());
     gateway.assert_complete();
     inference.assert_quiescent();
-    assert_eq!(inference.attempt_count(), 6);
+    assert_eq!(inference.attempt_count(), 5);
+    assert_native_delegation_without_auxiliary_selector(
+        &gateway, ROOT, &[("structured child review", TASK)],
+    ).await;
     let requests = gateway.requests.lock().await;
-    assert_eq!(requests.len(), 6);
-    let judgment = requests
-        .iter()
-        .filter_map(|request| assessment(&request.body))
-        .collect::<Vec<_>>();
-    assert_eq!(judgment.len(), 1);
-    assert_eq!(judgment[0]["user_text"], ROOT);
-    let candidates = judgment[0]["candidates"].as_array().unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0]["offering_id"], DEFAULT_MODEL_OFFERING_ID);
-    assert_eq!(candidates[0]["model_name"], "test-model");
-    assert_eq!(candidates[0]["provider"], "openai");
-    let slots = judgment[0]["slots"].as_array().unwrap();
-    assert_eq!(slots.len(), 1);
-    assert_eq!(slots[0]["index"], 0);
-    assert_eq!(slots[0]["description"], "structured child review");
-    assert_eq!(slots[0]["prompt"], TASK);
-    let judgment_wire = requests
-        .iter()
-        .find(|request| assessment(&request.body).is_some())
-        .unwrap();
-    assert_eq!(judgment_wire.body["model"], "test-model");
-    assert_eq!(judgment_wire.body["stream"], true);
+    assert_eq!(requests.len(), 5);
     let child_wire = requests
         .iter()
         .find(|request| assessment(&request.body).is_none() && !root_request(&request.body))
@@ -2103,7 +2141,7 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
                                     ]
                                 }
                             }))
-                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("call-join-fanout","invoke_tool",json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"combined findings from both children","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("delegated child actual execution", |request| request.path=="/v1/chat/completions" && request.body["model"]=="test-model" && delegation_assessment(&request.body).is_none() && !primary_request_for(request,"Use two independent child agents and combine their findings."),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"child review completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"child review completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("canonical delegation assessment", |request| request.path=="/v1/chat/completions" && delegation_assessment(&request.body).is_some(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"{\"disposition\":\"not_applicable\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":8,"total_tokens":40}}))])]).await;
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("call-join-fanout","invoke_tool",json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"combined findings from both children","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("delegated child actual execution", |request| request.path=="/v1/chat/completions" && request.body["model"]=="test-model" && delegation_assessment(&request.body).is_none() && !primary_request_for(request,"Use two independent child agents and combine their findings."),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"child review completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"child review completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let events = chat_stream_collect(
         &app,
@@ -2116,7 +2154,7 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
         }),
     )
     .await;
-    assert_native_delegation_judgment(
+    assert_native_delegation_without_auxiliary_selector(
         &gateway,
         "Use two independent child agents and combine their findings.",
         &[
@@ -2132,8 +2170,7 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .expect("fanout must return structured launch receipts");
-    // No separate auxiliary Offering is configured. The admitted primary
-    // route still performs the canonical candidate judgment through HTTP.
+    // Primary-model proposals use canonical admission without an auxiliary selector.
     assert_eq!(result["status"], "started");
     let agents = result["agents"]
         .as_array()
@@ -2166,12 +2203,12 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
 
     gateway.assert_complete();
     inference.assert_quiescent();
-    assert_eq!(gateway.requests.lock().await.len(), 7);
-    assert_eq!(inference.attempt_count(), 7);
+    assert_eq!(gateway.requests.lock().await.len(), 6);
+    assert_eq!(inference.attempt_count(), 6);
 }
 
 #[tokio::test]
-async fn web_agent_parallel_direct_spawns_with_invalid_assessment_fail_closed() {
+async fn web_agent_parallel_direct_spawns_with_unavailable_model_policy_fail_closed() {
     init_env();
 
     let calls: Vec<Value> = ["direct-a", "direct-b"]
@@ -2186,14 +2223,14 @@ async fn web_agent_parallel_direct_spawns_with_invalid_assessment_fail_closed() 
                         "action": "spawn",
                         "description": format!("Independent review {id}"),
                         "agent_type": "code-review",
+                        "requested_model_policy": {"mode": "auto", "strategy": "balanced"},
                         "prompt": "Review one independent concern."
                     }
                 }),
             )
         })
         .collect();
-    let invalid_assessment = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"invalid assessment"},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":8,"total_tokens":40}});
-    let (app,gateway,inference)=build_native_test_app(vec![ProviderScript::new("parent actual execution", |request| primary_request_for(request,"Use two independent child agents and combine their findings.") && delegation_assessment(&request.body).is_none(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("select-agent", "tool_search", json!({"query": "select:agent"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Continuing without unauthorized parallel children.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("canonical delegation assessment", |request| request.path=="/v1/chat/completions" && delegation_assessment(&request.body).is_some(),(0..2).map(|_| ProviderResponse::OpenAi(invalid_assessment.clone())).collect())]).await;
+    let (app,gateway,inference)=build_native_test_app(vec![ProviderScript::new("parent actual execution", |request| primary_request_for(request,"Use two independent child agents and combine their findings.") && delegation_assessment(&request.body).is_none(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("select-agent", "tool_search", json!({"query": "select:agent"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Continuing without unauthorized parallel children.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let events = chat_stream_collect(&app, json!({
         "message": "Use two independent child agents and combine their findings.","execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
@@ -2208,10 +2245,7 @@ async fn web_agent_parallel_direct_spawns_with_invalid_assessment_fail_closed() 
             .and_then(|result| serde_json::from_str::<Value>(result).ok())
             .expect("direct spawn must return a structured rejection");
         assert_eq!(result["status"], "failed");
-        assert_eq!(
-            result["error_kind"],
-            "delegation_model_assessment_unavailable"
-        );
+        assert_eq!(result["error_kind"], "delegation_model_unavailable");
         assert_eq!(result["advisory"]["executed"], false);
     }
     assert!(find_event_type(&events, "agent_spawned").is_empty());
@@ -2227,16 +2261,16 @@ async fn web_agent_parallel_direct_spawns_with_invalid_assessment_fail_closed() 
     gateway.assert_complete();
     inference.assert_quiescent();
     let requests = gateway.requests.lock().await;
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 3);
     assert_eq!(
         requests
             .iter()
             .filter(|request| delegation_assessment(&request.body).is_some())
             .count(),
-        2,
-        "the whole spawn batch shares one assessment and one bounded repair"
+        0,
+        "unsupported typed model policy must fail before any auxiliary or child request"
     );
-    assert_eq!(inference.attempt_count(), 5);
+    assert_eq!(inference.attempt_count(), 3);
 }
 
 #[tokio::test]
@@ -2264,7 +2298,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                                 "read_file",
                                 json!({"path": "/workspace/astra/src/lib.rs"})
                             )
-                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"edge child reviewed concrete file evidence: pub fn run()","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("canonical delegation assessment", |request| request.path=="/v1/chat/completions" && delegation_assessment(&request.body).is_some(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"{\"disposition\":\"not_applicable\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":8,"total_tokens":40}}))])]).await;
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"edge child reviewed concrete file evidence: pub fn run()","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let response = chat_stream_start(
         &app,
@@ -2315,7 +2349,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .await
         .expect("edge child stream timed out")
         .expect("edge child stream reader failed");
-    assert_native_delegation_judgment(
+    assert_native_delegation_without_auxiliary_selector(
         &gateway,
         "Use a child agent to review the edge workspace.",
         &[(
@@ -2452,8 +2486,8 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
 
     gateway.assert_complete();
     inference.assert_quiescent();
-    assert_eq!(gateway.requests.lock().await.len(), 7);
-    assert_eq!(inference.attempt_count(), 7);
+    assert_eq!(gateway.requests.lock().await.len(), 6);
+    assert_eq!(inference.attempt_count(), 6);
 }
 
 #[tokio::test]
@@ -2482,9 +2516,6 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
         ProviderScript::new("discovery child", |request| primary_request_for(request, CHILD) && delegation_assessment(&request.body).is_none(), vec![
             response(vec![tool_call("child-select-github", "tool_search", json!({"query":"select:github"}))], ""),
             response(vec![], MARKER),
-        ]),
-        ProviderScript::new("delegation assessment", |request| delegation_assessment(&request.body).is_some(), vec![
-            response(vec![], "{\"disposition\":\"not_applicable\"}"),
         ]),
     ]).await;
     let response = chat_stream_start(&app, json!({
@@ -2584,9 +2615,14 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
     assert_eq!(paired_calls, 1);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["missing"], json!(["github"]));
-    assert_eq!(requests.len(), 7);
+    assert_eq!(requests.len(), 6);
+    assert!(
+        requests
+            .iter()
+            .all(|request| delegation_assessment(&request.body).is_none())
+    );
     drop(requests);
-    assert_eq!(inference.attempt_count(), 7);
+    assert_eq!(inference.attempt_count(), 6);
     inference.assert_quiescent();
     gateway.assert_complete();
 }

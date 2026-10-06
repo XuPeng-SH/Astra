@@ -441,13 +441,22 @@ content, quoted text, or requested output do not select an execution model.
 Preserve the user's requested family, version, variant and source. Do not
 substitute a nearby model when the requested one is unavailable.
 
-Model discovery uses the existing authenticated `model_catalog` boundary.
-A caller that does not know the available choices discovers them there, never
-through workspace configuration or credentials. Its request-scoped snapshot
-is shared with child admission. A cold ordinary conversation does not load
-the catalog merely to support hypothetical delegation. Discovery pages are
-observations, not execution grants, and incomplete pages cannot prove a choice
-unique across the complete catalog.
+The first provider request includes a bounded, structured observation of the
+authorized model candidates, outside the stable system/tool prefix. A cold
+request loads this catalog once, including ordinary conversation; subsequent
+requests reuse the same principal-isolated cache (60-second freshness, at most
+1,024 entries and 64 KiB serialized content per cached entry). Concurrent cold
+reads for the same principal coalesce. Request descendants reuse the observed
+generation; failures are retained for that request, not retried every round.
+The complete authentication principal, including provider/request scope, and
+service identities form the cache key. This intentionally does not share a
+provider request's observation with a different authorization.
+
+Explicit refresh and pagination use the existing authenticated `model_catalog`
+boundary, never workspace configuration or credentials. Oversized catalogs
+are not retained across requests. Discovery pages are observations, not
+execution grants: execution authorization remains fresh. Incomplete pages
+cannot prove a choice unique or absent across the complete catalog.
 
 Runtime validates exact selectors, authorization, capability, lineage, profile,
 batch capacity, and independently supplied typed user constraints before any

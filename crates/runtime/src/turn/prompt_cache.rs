@@ -464,8 +464,8 @@ mod tests {
         let mut tools = vec![
             json!({"type": "function", "function": {"name": "bash"}}), // always_load
             json!({"type": "function", "function": {"name": "lsp"}}),  // dynamic
-            json!({"type": "function", "function": {"name": "memory"}}), // always_load
-            json!({"type": "function", "function": {"name": "worktree"}}), // always_load name in dynamic tail
+            json!({"type": "function", "function": {"name": "introspect"}}), // always_load
+            json!({"type": "function", "function": {"name": "agent"}}), // always_load name in dynamic tail
         ];
         annotate_test_tool_schemas_for_caching(
             &mut tools,
@@ -732,22 +732,10 @@ mod cache_stability_regression {
     /// `default_test_always_load_tool_names()` so the marker-placement logic exercises
     /// the real always_load set, not a local fixture.
     fn always_load_prefix_fixture() -> Vec<Value> {
-        vec![
-            schema("bash"),
-            schema("read_file"),
-            schema("write_file"),
-            schema("str_replace"),
-            schema("list_dir"),
-            schema("grep"),
-            schema("glob"),
-            schema("worktree"),
-            schema("worktree"),
-            schema("memory"),
-            schema("memory"),
-            schema("memory"),
-            schema("memory"),
-            schema("skill"),
-        ]
+        crate::tool_registry::surface::default_always_load_names()
+            .iter()
+            .map(|name| schema(name))
+            .collect()
     }
 
     fn cfg_anthropic() -> PromptCacheConfig {
@@ -765,7 +753,7 @@ mod cache_stability_regression {
     /// count shrinks or dynamic tools are interleaved by a buggy caller.
 
     /// The default cached prefix keeps ordinary first-request primitives and
-    /// hot Work transitions and the compact observation entrypoints while
+    /// hot Work transitions and compact live observation while
     /// excluding optional workflows whose full schemas load on demand.
     #[test]
     fn default_always_load_set_contains_primitives_not_optional_workflows() {
@@ -780,7 +768,6 @@ mod cache_stability_regression {
             "tool_search",
             "introspect",
             "agent",
-            "memory",
             "start_work",
             "run_next_work_item",
             "settle_work_item",
@@ -794,7 +781,14 @@ mod cache_stability_regression {
             !always_load.contains("glob"),
             "specialized glob navigation must remain deferred from the default prefix"
         );
-        for name in ["skill", "agent_fanout", "worktree"] {
+        for name in [
+            "skill",
+            "agent_fanout",
+            "worktree",
+            "memory",
+            "reflect",
+            "notify",
+        ] {
             assert!(
                 !always_load.contains(name),
                 "{name} must load on demand instead of extending the default cache prefix"

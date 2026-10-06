@@ -348,11 +348,14 @@ impl AgenticRunLifecycleService {
                 "the original model identity is no longer available",
             ));
         }
-        let catalog = Some(astra_services::models::AuthorizedModelCatalogReader::new(
-            self.model_service.clone(),
-            self.auth_service.clone(),
-            principal,
-        ));
+        let catalog = Some(
+            astra_services::models::AuthorizedModelCatalogReader::with_cache(
+                self.model_service.clone(),
+                self.auth_service.clone(),
+                principal,
+                self.model_catalog_cache.clone(),
+            ),
+        );
         let profiles = crate::server::run::engine::durable_run_agent_profiles(run, &run.user_id)
             .map_err(invalid_resume)?;
         let profile_authority =

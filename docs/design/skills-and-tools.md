@@ -58,8 +58,11 @@ The resident projection must remain inside the fixed tool
 schema budget, so ordinary delegation does not add a large repeated prompt.
 It preserves the complete model-policy and reasoning controls for ordinary
 delegation. The primary interprets user-named models and proposes an exact
-authorized selector; runtime validates it. Unknown choices use the existing
-authenticated `model_catalog`, never local configuration or guessed substitutes.
+authorized selector from the structured catalog supplied in current runtime
+context; runtime validates it with fresh execution authorization. A complete
+observation does not require a discovery round. Partial or unavailable choices
+use the existing authenticated `model_catalog`, never local configuration or
+guessed substitutes.
 Same-name discovery does not expand native parameters. Argument
 errors explain that boundary; retry advice does not override task constraints.
 Child completion notifications contain bounded previews, not execution failures

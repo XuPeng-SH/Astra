@@ -22,7 +22,9 @@ use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
     classify_model_resolution_error_message, error_response, error_response_coded, internal_error,
 };
-pub use catalog_reader::{AuthorizedModelCatalogReader, read_authorized_model_catalog};
+pub use catalog_reader::{
+    AuthorizedModelCatalogCache, AuthorizedModelCatalogReader, read_authorized_model_catalog,
+};
 use thinking_probe::{
     ThinkingProbeSnapshot, cached_capability, probe_chat_protocol, probe_identity,
 };

@@ -2718,7 +2718,7 @@ pub trait SpawnAgentExecutor: Send + Sync {
         inputs: &[SpawnAgentInput],
         context: &SpawnContext,
         parent_selection: Option<&astra_turn_types::ModelSelection>,
-    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String>
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError>
     where
         Self: 'static;
 
@@ -2734,7 +2734,7 @@ pub trait SpawnAgentExecutor: Send + Sync {
         inputs: &[SpawnAgentInput],
         _context: &SpawnContext,
         parent_selection: Option<&astra_turn_types::ModelSelection>,
-    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String>
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError>
     where
         Self: 'static,
     {
@@ -2752,7 +2752,7 @@ pub trait SpawnAgentExecutor: Send + Sync {
                 .iter()
                 .any(|input| input.reasoning.is_some() || input.max_output_tokens.is_some())
         {
-            return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".to_string());
+            return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".into());
         }
         for input in inputs {
             selector_for_admitted_spawn_input(input, parent_selection)
@@ -6762,8 +6762,7 @@ impl DynamicAgentSpawner {
             .ok_or(SpawnError::ExecutorUnavailable)?;
         let preparations = Arc::clone(executor)
             .prepare_batch(inputs, context, parent_selection)
-            .await
-            .map_err(SpawnError::DelegationFailed)?;
+            .await?;
         if preparations.len() != inputs.len() {
             return Err(SpawnError::DelegationFailed(format!(
                 "spawn executor prepared {} slots for {} requested slots",
@@ -10576,6 +10575,10 @@ pub enum SpawnError {
     #[error("Delegation failed: {0}")]
     DelegationFailed(String),
 
+    /// Classified by the admission producer, never recovered from display text.
+    #[error("Delegation failed: {0}")]
+    Admission(astra_core::ClassifiedError),
+
     #[error("Agent executor unavailable: spawned agents cannot run in this context")]
     ExecutorUnavailable,
 
@@ -10629,6 +10632,27 @@ pub enum SpawnError {
          Wait for an existing agent to finish or cancel one before spawning more."
     )]
     ConcurrencyLimitExceeded { active: usize, limit: usize },
+}
+
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self::DelegationFailed(message)
+    }
+}
+
+impl From<&str> for SpawnError {
+    fn from(message: &str) -> Self {
+        Self::DelegationFailed(message.to_string())
+    }
+}
+
+impl SpawnError {
+    pub fn error_kind(&self) -> Option<astra_core::ErrorKind> {
+        match self {
+            Self::Admission(error) => Some(error.kind),
+            _ => None,
+        }
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -15721,7 +15745,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
             Ok(prepare_fixture_batch(self, inputs.len()))
         }
 
@@ -15859,7 +15883,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
             Ok(prepare_fixture_batch(self, inputs.len()))
         }
 
@@ -16190,7 +16214,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
             Ok(prepare_fixture_batch(self, inputs.len()))
         }
 
@@ -21544,7 +21568,7 @@ pub(crate) mod tests {
                 inputs: &[SpawnAgentInput],
                 _: &SpawnContext,
                 _: Option<&astra_turn_types::ModelSelection>,
-            ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+            ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
                 Ok(inputs
                     .iter()
                     .map(|_| Box::new(Preparation(self.clone())) as Box<dyn PreparedSpawn>)
@@ -21631,7 +21655,7 @@ pub(crate) mod tests {
                 inputs: &[SpawnAgentInput],
                 _: &SpawnContext,
                 _: Option<&astra_turn_types::ModelSelection>,
-            ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+            ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
                 Ok(inputs
                     .iter()
                     .map(|_| Box::new(LaunchFailure(self.0)) as Box<dyn PreparedSpawn>)

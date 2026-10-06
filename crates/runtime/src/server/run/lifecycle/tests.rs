@@ -7558,7 +7558,9 @@ async fn server_spawn_cannot_inherit_when_parent_has_no_model_admission() {
             None,
         )
         .await;
-    assert!(matches!(result, Err(error) if error.contains("missing parent model admission")));
+    assert!(
+        matches!(result, Err(crate::orchestration::SpawnError::DelegationFailed(message)) if message.contains("missing parent model admission"))
+    );
 }
 
 #[test]
@@ -7781,7 +7783,7 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         .await;
     assert!(matches!(
         edge_selection_result,
-        Err(error) if error.contains("provider-scoped child model selection")
+        Err(crate::orchestration::SpawnError::DelegationFailed(message)) if message.contains("provider-scoped child model selection")
     ));
 
     let mut child = test_spawn_run_config(vec!["read_file"], false);
@@ -7825,7 +7827,7 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         )
         .await;
     assert!(
-        matches!(readerless_edge_switch, Err(error) if error.contains("provider-scoped child model selection"))
+        matches!(readerless_edge_switch, Err(crate::orchestration::SpawnError::DelegationFailed(message)) if message.contains("provider-scoped child model selection"))
     );
 
     let (child_context, _child_generation_guard) = executor
@@ -8054,7 +8056,9 @@ async fn server_spawn_runtime_context_requires_parent_lineage() {
             None,
         )
         .await;
-    assert!(matches!(result, Err(error) if error.contains("no runtime context for parent run")));
+    assert!(
+        matches!(result, Err(crate::orchestration::SpawnError::DelegationFailed(message)) if message.contains("no runtime context for parent run"))
+    );
 }
 
 #[test]
@@ -27345,11 +27349,8 @@ async fn db_team_context_reaches_root_and_spawned_member_provider_requests() {
             }]})
         };
         let expected_root = root_model.clone();
-        let expected_selector = root_model.clone();
         let expected_child = child_model.clone();
         let gateway = ProviderGateway::start(vec![
-            ProviderScript::new("selector", move |r| r.body["model"] == expected_selector && r.body["tool_choice"] == "none",
-                vec![response(json!({"role":"assistant","content":"{\"disposition\":\"not_applicable\"}"}), "stop")]),
             ProviderScript::new("root", move |r| r.body["model"] == expected_root && r.body["tool_choice"] != "none", vec![
                 response(tool_call("spawn-member", json!({"action":"spawn","agent_type":"worker","description":"Read admitted context","prompt":"Return the delivery code from your admitted team context."})), "tool_calls"),
                 response(tool_call("await-member", json!({"action":"wait","timeout_ms":10000})), "tool_calls"),
@@ -27429,6 +27430,15 @@ async fn db_team_context_reaches_root_and_spawned_member_provider_requests() {
             .unwrap();
         assert_eq!(durable.status, STATUS_COMPLETED, "{durable:?}");
         let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 4, "three root rounds and one member round");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.body["tool_choice"] == "none")
+                .count(),
+            0,
+            "profile model defaults must not invoke an auxiliary selector"
+        );
         let tool_results: Vec<_> = requests
             .iter()
             .flat_map(|request| {
@@ -27450,7 +27460,7 @@ async fn db_team_context_reaches_root_and_spawned_member_provider_requests() {
         );
         gateway.assert_complete();
         let mut root_system = None;
-        for captured in requests.iter().filter(|r| r.body["tool_choice"] != "none") {
+        for captured in requests.iter() {
             let messages = captured.body["messages"].as_array().unwrap();
             let system: Vec<_> = messages.iter().filter(|m| m["role"] == "system").collect();
             assert!(!serde_json::to_string(&system).unwrap().contains("BLUE-17"));

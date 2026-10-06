@@ -3955,11 +3955,14 @@ pub(super) async fn post_work_branch_turn_handler(
         execution_authentication: principal.execution_authentication_provenance(),
         agent_profile_selection: None,
         admitted_agent_profiles: None,
-        model_catalog_reader: Some(astra_services::models::AuthorizedModelCatalogReader::new(
-            state.model_service.clone(),
-            state.auth_service.clone(),
-            principal,
-        )),
+        model_catalog_reader: Some(
+            astra_services::models::AuthorizedModelCatalogReader::with_cache(
+                state.model_service.clone(),
+                state.auth_service.clone(),
+                principal,
+                state.model_catalog_cache.clone(),
+            ),
+        ),
         message: turn.message,
         user_intent: None,
         parts: Vec::new(),

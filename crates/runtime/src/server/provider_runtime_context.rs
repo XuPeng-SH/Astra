@@ -6,11 +6,14 @@ pub(crate) async fn inject_effective_runtime_context(
     request: &mut astra_services::runs::ChatRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     request.execution_authentication = principal.execution_authentication_provenance();
-    request.model_catalog_reader = Some(astra_services::models::AuthorizedModelCatalogReader::new(
-        state.model_service.clone(),
-        state.auth_service.clone(),
-        principal.clone(),
-    ));
+    request.model_catalog_reader = Some(
+        astra_services::models::AuthorizedModelCatalogReader::with_cache(
+            state.model_service.clone(),
+            state.auth_service.clone(),
+            principal.clone(),
+            state.model_catalog_cache.clone(),
+        ),
+    );
     if principal.is_provider_authorized_request() {
         request.provider_runtime_authorized = true;
         if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {

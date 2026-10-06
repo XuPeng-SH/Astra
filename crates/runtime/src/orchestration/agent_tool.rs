@@ -1616,7 +1616,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
     } {
         Ok(preparations) => preparations,
         Err(error) => {
-            return render_agent_tool_admission_error(&format!("fanout admission failed: {error}"));
+            return render_agent_tool_admission_error_with_kind(
+                &format!("fanout admission failed: {error}"),
+                error.error_kind(),
+            );
         }
     };
     for (index, preparation) in preparations.iter().enumerate() {
@@ -2975,9 +2978,10 @@ async fn handle_agent_spawn_input_with_controls(
                 );
             }
             Err(error) => {
-                return render_agent_tool_admission_error(&format!(
-                    "spawn admission failed: {error}"
-                ));
+                return render_agent_tool_admission_error_with_kind(
+                    &format!("spawn admission failed: {error}"),
+                    error.error_kind(),
+                );
             }
         };
     }
@@ -3694,6 +3698,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn untyped_spawn_errors_do_not_classify_display_tags() {
+        let error = SpawnError::from("[invalid_request] untrusted display text".to_string());
+        assert!(matches!(error, SpawnError::DelegationFailed(_)));
+        assert_eq!(error.error_kind(), None);
+    }
+
+    #[test]
     fn malformed_and_structured_spawn_errors_are_bounded_utf8_safe_json() {
         let raw = format!("{{not-json \"{}", "错".repeat(3_000));
         let raw_bytes = raw.len();
@@ -3981,7 +3992,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _context: &SpawnContext,
             parent_selection: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, SpawnError> {
             for input in inputs {
                 astra_turn_types::resolve_requested_model_selection(
                     input.requested_model_policy.as_ref(),
@@ -4046,6 +4057,7 @@ pub(crate) mod tests {
 
     struct RejectingBatchExecutor {
         preparations: std::sync::atomic::AtomicUsize,
+        model_error: Option<(axum::http::StatusCode, &'static str)>,
     }
 
     #[async_trait::async_trait]
@@ -4071,10 +4083,15 @@ pub(crate) mod tests {
             _: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, SpawnError> {
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err("catalog unavailable".into())
+            Err(match self.model_error {
+                Some((status, code)) => {
+                    crate::server::run::lifecycle::safe_model_spawn_error(status, Some(code))
+                }
+                None => "catalog unavailable".into(),
+            })
         }
     }
 
@@ -4177,7 +4194,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _context: &SpawnContext,
             _parent_selection: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, SpawnError> {
             Ok(inputs
                 .iter()
                 .map(|_| {
@@ -7498,6 +7515,7 @@ pub(crate) mod tests {
     async fn single_spawn_preparation_failure_does_not_create_child_work() {
         let executor = Arc::new(RejectingBatchExecutor {
             preparations: std::sync::atomic::AtomicUsize::new(0),
+            model_error: None,
         });
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
@@ -7511,6 +7529,7 @@ pub(crate) mod tests {
         let result: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(result["status"], "failed", "{result}");
         assert_eq!(result["executed"], false, "{result}");
+        assert!(result.get("error_kind").is_none(), "{result}");
         assert_eq!(
             executor
                 .preparations
@@ -7524,6 +7543,7 @@ pub(crate) mod tests {
     async fn fanout_capacity_rejection_skips_admission_and_failed_admission_releases_capacity() {
         let executor = Arc::new(RejectingBatchExecutor {
             preparations: std::sync::atomic::AtomicUsize::new(0),
+            model_error: None,
         });
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
@@ -7560,6 +7580,82 @@ pub(crate) mod tests {
             if expected_preparations > 0 {
                 assert_eq!(value["executed"], false, "{value}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_admission_error_kind_survives_prepare_to_agent_and_fanout_wire() {
+        use axum::http::StatusCode;
+
+        for (status, code, expected_kind) in [
+            (
+                StatusCode::BAD_REQUEST,
+                "model_selection_invalid",
+                Some("invalid_request"),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "model_reasoning_unsupported",
+                Some("invalid_request"),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "model_offering_not_found",
+                Some("tool_unavailable"),
+            ),
+            (StatusCode::FORBIDDEN, "unknown_code", Some("auth")),
+            (StatusCode::BAD_REQUEST, "unknown_code", None),
+        ] {
+            let executor = Arc::new(RejectingBatchExecutor {
+                preparations: std::sync::atomic::AtomicUsize::new(0),
+                model_error: Some((status, code)),
+            });
+            let spawner = test_spawner(executor.clone());
+            let ctx = test_spawn_context(spawner.clone(), Some("parent-model"));
+            let requested_model_policy = json!({
+                "mode": "fixed",
+                "selector": {"kind": "offering_id", "offering_id": "offer-unavailable"}
+            });
+            let single = handle_agent_tool(
+                &json!({
+                    "action": "spawn", "description": "review", "prompt": "review",
+                    "requested_model_policy": requested_model_policy.clone()
+                }),
+                Some(&ctx),
+            )
+            .await;
+            let batch = handle_agent_fanout_tool(
+                &json!({
+                    "action": "start", "group_id": "typed-admission", "target_count": 2,
+                    "slots": [
+                        {"description": "inherit", "prompt": "review"},
+                        {"description": "select", "prompt": "review",
+                         "requested_model_policy": requested_model_policy}
+                    ]
+                }),
+                Some(&ctx),
+            )
+            .await;
+            for output in [single, batch] {
+                let value: Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(value["result_family"], "control_receipt", "{value}");
+                assert_eq!(value["success"], false, "{value}");
+                assert_eq!(value["status"], "failed", "{value}");
+                assert_eq!(value["executed"], false, "{value}");
+                assert_eq!(
+                    value.get("error_kind").and_then(Value::as_str),
+                    expected_kind,
+                    "{value}"
+                );
+            }
+            assert_eq!(
+                executor
+                    .preparations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                2
+            );
+            assert!(spawner.list_agents(&ctx.run_id).await.is_empty());
+            assert!(spawner.fanout_group("typed-admission").await.is_none());
         }
     }
 

@@ -6865,8 +6865,8 @@ impl ServerAgenticLoopHost {
             .map(|client| (client, false))
     }
 
-    /// Shared authenticated snapshot for model routing. Ordinary fixed child
-    /// proposals do not load it; their executor owns exact selector admission.
+    /// Shared authenticated observation for candidate visibility and routing.
+    /// The executor still owns fresh authorization of an exact proposal.
     async fn read_authorized_model_catalog(&self) -> Option<Vec<astra_services::ModelListItem>> {
         if let Some(reader) = self.model_catalog_reader.as_ref() {
             return tokio::time::timeout(Duration::from_secs(5), reader.read_snapshot())
@@ -6882,6 +6882,38 @@ impl ServerAgenticLoopHost {
             .list_models(self.user_id.clone(), false)
             .await
             .ok()
+    }
+
+    pub(crate) async fn model_catalog_context(&self) -> Option<Value> {
+        use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page, unavailable_page};
+        let reader = self.model_catalog_reader.as_ref()?;
+        let mut page = match reader.read_snapshot().await {
+            Ok(items) => catalog_page(items, &ModelCatalogRequest::default(), reader.scope())
+                .unwrap_or_else(|error| unavailable_page(error, reader.scope())),
+            Err((status, _)) => unavailable_page(
+                super::tool_model_catalog::catalog_read_error(status),
+                reader.scope(),
+            ),
+        };
+        // A changing wall clock is not a new catalog generation. Keep the
+        // request/descendant observation byte-stable outside the system prefix.
+        page.observed_at = None;
+        let child_model_selection_allowed =
+            crate::server::run::lifecycle::ensure_child_model_selection_scope(
+                Some(reader),
+                self.provider_scope_bound,
+            )
+            .is_ok();
+        let context = json!({
+            "catalog": page,
+            "child_model_selection_allowed": child_model_selection_allowed,
+            "instruction": "These are the authorized model candidates observed for this request. If child_model_selection_allowed is true, choose the requested model's exact offering_id and pass requested_model_policy to agent or agent_fanout directly; do not discover the same complete catalog again. If false, this scope only supports inherited-model children; an explicit different-model request cannot be fulfilled by silently inheriting. Do not substitute a different version. Ambiguity requires clarification; a partial catalog requires model_catalog continuation before asserting a model is missing. Unavailable observation is not permission to read local model configuration. Execution rechecks authorization and capabilities."
+        }).to_string();
+        crate::turn::wire_assembly::required_runtime_preamble_message(
+            &context,
+            crate::turn::wire_assembly::RuntimeAuthorityKind::AuthorizedModelCatalog,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
     }
 
     async fn judge_delegation_scope_binding(
@@ -19873,6 +19905,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Runtime no longer re-derives any of these.
         let context_assembly_node_id =
             self.start_explain_analyze_context_assembly(state, Instant::now());
+        let model_catalog_context = self.model_catalog_context().await;
         let (prompt_memory_recall, initial_session_memory_entry) = self
             .memory_context_for_turn(
                 state.session_turn,
@@ -19935,6 +19968,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut final_context_assembly = initial_context_assembly;
         let mut final_system_messages = system_messages;
         let mut final_volatile_preamble = volatile_preamble;
+        if let Some(context) = model_catalog_context.as_ref() {
+            final_volatile_preamble.push(context.clone());
+        }
         let mut final_system_prompt_breakdown = system_prompt_breakdown;
         let mut final_pipeline_tool_schemas = pipeline_tool_schemas;
         let mut final_manifest_trace = manifest_trace;
@@ -20045,6 +20081,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             final_system_messages = rerun.system_messages;
             final_volatile_preamble = rerun.volatile_preamble;
+            if let Some(context) = model_catalog_context {
+                final_volatile_preamble.push(context);
+            }
             final_system_prompt_breakdown = rerun.breakdown;
             final_pipeline_tool_schemas = rerun.tool_schemas;
             final_manifest_trace = rerun.manifest_trace;
@@ -30126,15 +30165,7 @@ mod tests {
         state.sticky_tool_schemas = host.visible_turn_tools(&mut state);
         let before = state.sticky_tool_schemas.clone();
         let args = json!({"facet":"overview","depth":"diagnostic","horizon":"session"});
-        let direct = json!({"id":"direct-reflect","type":"function","function":{
-            "name":"reflect","arguments":args.to_string()
-        }});
-        assert!(
-            host.admit_terminal_tool_calls(&state, &[direct], Some("tool_calls"))
-                .is_empty()
-        );
-        let rejected = host.pending_tool_call_admission.take().unwrap();
-        assert!(rejected.rejected[0].result.contains("tool_invalid_args"));
+        assert!(!schema_names(&before).contains("reflect"));
 
         let carrier = |arguments: Value| {
             json!({"id":"typed-reflect","type":"function","function":{
@@ -30158,8 +30189,8 @@ mod tests {
             admit(&host, &state, json!({"question":"Current progress?"}))
                 .admitted
                 .len(),
-            1,
-            "ordinary resident reflection does not require selection"
+            0,
+            "deferred reflection requires a selected carrier even for ordinary questions"
         );
         let contracts = host.current_deferred_tool_contract_schemas(&state);
         let selected =
@@ -32454,7 +32485,7 @@ mod tests {
             .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in ["bash", "read_file", "memory", "notify", "tool_search"] {
+        for expected in ["bash", "read_file", "tool_search"] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible in the composed server+edge surface: {names:?}"
@@ -32465,7 +32496,7 @@ mod tests {
             );
         }
         let deferred = schema_names(&host.deferred_tool_schemas);
-        for expected in ["session", "web_search"] {
+        for expected in ["session", "web_search", "memory", "notify"] {
             assert!(
                 deferred.contains(expected),
                 "{expected} should remain available through deferred discovery: {deferred:?}"
@@ -33278,13 +33309,14 @@ mod tests {
             !names.contains("bash"),
             "prompt-visible edge runtime tools must mirror the advertised offer set"
         );
-        for expected in ["notify", "tool_search", "introspect"] {
+        for expected in ["tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid while runtime tools are provider-scoped"
             );
         }
         assert!(schema_names(&host.deferred_tool_schemas).contains("session"));
+        assert!(schema_names(&host.deferred_tool_schemas).contains("notify"));
     }
 
     #[test]
@@ -46909,8 +46941,8 @@ mod tests {
             .build();
         let raw_names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.tool_schemas);
         assert!(
-            raw_names.contains("reflect"),
-            "reflect is a first-class observation contract on the resident surface"
+            raw_names.contains("introspect") && !raw_names.contains("reflect"),
+            "introspection is resident; reflection uses the selected deferred contract"
         );
 
         let mut state = create_test_state();
@@ -46927,8 +46959,8 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible);
         assert!(
-            names.contains("reflect"),
-            "reflect remains directly callable when the runtime executor is ready: {names:?}"
+            !names.contains("reflect"),
+            "executor readiness must not widen the default wire surface: {names:?}"
         );
         assert!(
             schema_names(&host.deferred_tool_schemas).contains("reflect"),
@@ -47656,7 +47688,7 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
-        for required in ["bash", "read_file", "introspect", "notify", "tool_search"] {
+        for required in ["bash", "read_file", "introspect", "tool_search"] {
             assert!(
                 policy
                     .visible_tool_names
@@ -47672,11 +47704,7 @@ mod tests {
                 .observation_tool_names
                 .contains(&"read_file".to_string())
         );
-        assert!(
-            policy
-                .observation_tool_names
-                .contains(&"notify".to_string())
-        );
+        assert!(schema_names(&host.deferred_tool_schemas).contains("notify"));
         assert!(!policy.allow_ask_user);
         assert!(
             policy
@@ -47719,7 +47747,7 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(host.turn_interaction_mode(), &final_tools);
 
-        for required in ["bash", "read_file", "introspect", "notify", "tool_search"] {
+        for required in ["bash", "read_file", "introspect", "tool_search"] {
             assert!(
                 policy
                     .visible_tool_names
@@ -47735,11 +47763,7 @@ mod tests {
                 .observation_tool_names
                 .contains(&"read_file".to_string())
         );
-        assert!(
-            policy
-                .observation_tool_names
-                .contains(&"notify".to_string())
-        );
+        assert!(schema_names(&host.deferred_tool_schemas).contains("notify"));
         assert!(
             policy
                 .visible_tool_names
