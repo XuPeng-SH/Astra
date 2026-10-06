@@ -431,7 +431,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "Runtime binds exact user model; launch≠done. Wait; fetch if needed.",
+            "User model: omit model fields. Call directly; launch≠done. Wait.",
         ),
         "introspect" => (
             &[

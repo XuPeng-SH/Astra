@@ -1252,9 +1252,9 @@ mod tests {
                 for profile in profiles {
                     let description = profile["description"].as_str().unwrap();
                     for constraint in [
-                        "Exact directory ID",
-                        "explore=no shell(default)",
-                        "task requests shell",
+                        "Directory: exact ID required",
+                        "absent: omit (read-only)",
+                        "No file discovery",
                     ] {
                         assert!(description.contains(constraint), "{query}: {description}");
                     }

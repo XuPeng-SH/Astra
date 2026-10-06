@@ -578,12 +578,17 @@ pub fn parse_delegation_intent_requirements_with_request(
                     .iter()
                     .copied()
                     .collect::<std::collections::BTreeSet<_>>();
-                if unique.len() != indices.len()
-                    || unique.iter().any(|&index| index >= slots.len())
-                    || (evidence.task_scope_quote.is_none() && unique.len() != slots.len())
-                {
+                if unique.len() != indices.len() {
+                    return Err("candidate delegation scope contains duplicate slot indices".into());
+                }
+                if unique.iter().any(|&index| index >= slots.len()) {
                     return Err(
-                        "candidate delegation scope has duplicate, invalid or missing slots".into(),
+                        "candidate delegation scope contains an out-of-range slot index".into(),
+                    );
+                }
+                if evidence.task_scope_quote.is_none() && unique.len() != slots.len() {
+                    return Err(
+                        "unscoped delegation requirement must enumerate every supplied slot".into(),
                     );
                 }
             }
@@ -2060,12 +2065,12 @@ mod tests {
             universal.response.requirements[0].slot_indices,
             Some(vec![0, 1])
         );
-        for indices in [
-            json!([]),
-            json!([0]),
-            json!([0, 0]),
-            json!([0, 2]),
-            json!([-1]),
+        for (indices, diagnostic) in [
+            (json!([]), "must enumerate every supplied slot"),
+            (json!([0]), "must enumerate every supplied slot"),
+            (json!([0, 0]), "duplicate slot indices"),
+            (json!([0, 2]), "out-of-range slot index"),
+            (json!([-1]), "invalid schema"),
         ] {
             raw["requirements"][0]["slots"] = indices;
             assert!(
@@ -2076,7 +2081,8 @@ mod tests {
                     Some(&slots),
                     true
                 )
-                .is_err()
+                .unwrap_err()
+                .contains(diagnostic)
             );
         }
         raw["requirements"][0]["slots"] = json!([1, 0]);

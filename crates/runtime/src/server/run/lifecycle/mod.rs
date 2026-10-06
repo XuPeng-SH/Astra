@@ -12739,6 +12739,10 @@ impl AgenticRunLifecycleService {
         request_context: Option<&Map<String, Value>>,
         admitted_profiles: Option<&astra_services::runs::AgentProfileSnapshot>,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let turn_context_section = match (agent_binding_context, request_context) {
+            (Some(_), Some(context)) => Self::agent_binding_turn_context_section(context)?,
+            _ => None,
+        };
         if let Some(snapshot) = admitted_profiles {
             let members: Vec<Value> = snapshot.profiles.iter().map(|profile| json!({
                 "agent_type": profile.agent_id,
@@ -12775,10 +12779,6 @@ impl AgenticRunLifecycleService {
             }
             Self::append_agent_profile_context(edge_profile, lead)?;
         }
-        let turn_context_section = match (agent_binding_context, request_context) {
-            (Some(_), Some(context)) => Self::agent_binding_turn_context_section(context)?,
-            _ => None,
-        };
         if let Some(stable_runtime_system_prompt) = stable_runtime_system_prompt {
             Self::append_runtime_stable_prompt_text(
                 edge_profile,

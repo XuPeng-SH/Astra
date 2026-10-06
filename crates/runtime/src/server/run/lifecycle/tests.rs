@@ -27983,12 +27983,14 @@ fn agent_binding_prompt_context_keeps_stable_prompt_identical_when_turn_context_
         first_stable, second_stable,
         "per-turn runtime context must not churn the session-stable prompt prefix"
     );
-    assert_eq!(
-        first_stable,
-        &[Value::String(
-            "Session-level runtime system prompt.".to_string()
-        )]
+    assert_eq!(first_stable.len(), 2);
+    assert!(
+        first_stable[0]
+            .as_str()
+            .unwrap()
+            .contains("no admitted agent profile directory")
     );
+    assert_eq!(first_stable[1], "Session-level runtime system prompt.");
 
     let first_volatile = first_profile
         .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
@@ -29297,7 +29299,19 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
     let session = format!("explain-discovery-perf-{}", Uuid::new_v4());
     let run = Uuid::new_v4().to_string();
     let svc = db_backed_test_service(&pool, "explain-discovery-perf-it");
-    seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
+    crate::server::run::insert_active_run_session_fixture(&pool, user, &session).await;
+    svc.run_engine
+        .start_run_with_context(
+            &run,
+            user,
+            &session,
+            RunStartContext {
+                explain_analyze_requested: true,
+                ..RunStartContext::default()
+            },
+        )
+        .await
+        .expect("start Explain benchmark run with one canonical admission");
     let generation = svc
         .run_engine
         .load_run(user, &run)
@@ -29305,18 +29319,6 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
         .expect("load Explain benchmark run")
         .expect("Explain benchmark run exists")
         .run_generation;
-    svc.run_engine
-        .append_event(
-            user,
-            &session,
-            &run,
-            json!({
-                "event_type": "run_started",
-                "data": {"explain_analyze_requested": true}
-            }),
-        )
-        .await
-        .expect("mark Explain benchmark request");
     let event = json!({
         "type":"explain_analyze", "schema_version":1,
         "event_id":"large-finished", "run_id":run, "turn_id":"turn-1",
@@ -29347,17 +29349,14 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
         .await
         .expect("complete prior Explain run before starting the next root");
     svc.run_engine
-        .start_run(&current, user, &session)
-        .await
-        .unwrap();
-    svc.run_engine
-        .append_event(
+        .start_run_with_context(
+            &current,
             user,
             &session,
-            &current,
-            json!({
-                "event_type": "run_started", "data": {"explain_analyze_requested": true}
-            }),
+            RunStartContext {
+                explain_analyze_requested: true,
+                ..RunStartContext::default()
+            },
         )
         .await
         .unwrap();

@@ -42765,7 +42765,7 @@ mod tests {
             requests[1].last().unwrap()["content"]
                 .as_str()
                 .unwrap()
-                .contains("candidate delegation scope has duplicate, invalid or missing slots")
+                .contains("candidate delegation scope contains duplicate slot indices")
         );
     }
 
