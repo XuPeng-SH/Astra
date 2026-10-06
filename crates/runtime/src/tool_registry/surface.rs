@@ -432,7 +432,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "Model: requested_model_policy; exact authorized ID/name. Unknown: select:model_catalog. Content names≠model. No substitution. launch≠done. Wait.",
+            "Exact ID/name; unknown:model_catalog. No substitution. launch≠done. Wait.",
         ),
         "introspect" => (
             &[

@@ -772,6 +772,27 @@ async fn assert_native_delegation_without_auxiliary_selector(
         .iter()
         .find(|request| primary_request_for(request, user_text))
         .unwrap();
+    let agent = first.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "agent")
+        .expect("resident agent contract");
+    let schemas = astra_tools::schemas::all_tool_schemas();
+    let canonical = schemas
+        .iter()
+        .find(|tool| tool["function"]["name"] == "agent")
+        .unwrap();
+    assert_eq!(
+        agent["function"]["parameters"]["properties"]["requested_model_policy"]["description"]
+            .as_str()
+            .expect("provider must receive model-control semantics"),
+        canonical["function"]["parameters"]["properties"]["requested_model_policy"]
+            ["x-astra-discovery-summary"]
+            .as_str()
+            .expect("canonical model-control semantics"),
+        "model-control semantics must reach the provider, not only the full catalog"
+    );
     let candidates: Vec<_> = first.body["messages"]
         .as_array()
         .unwrap()

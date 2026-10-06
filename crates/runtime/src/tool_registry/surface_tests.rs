@@ -275,7 +275,7 @@ fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
         contract["description"]
             .as_str()
             .unwrap()
-            .contains("Authorized Chat model availability/comparison")
+            .contains("Authorized Chat availability/comparison or unknown choices")
     );
     assert!(contract["parameters"]["properties"]["limit"].is_object());
     assert_eq!(contract["parameters"]["properties"]["limit"]["maximum"], 32);
@@ -490,9 +490,19 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .as_str()
         .expect("resident agent description");
     assert!(agent_description.contains("Wait"));
-    assert!(agent_description.contains("requested_model_policy"));
     assert!(agent_description.contains("No substitution"));
     let full = catalog_schemas();
+    let policy =
+        &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["requested_model_policy"]
+            ["description"],
+        policy["x-astra-discovery-summary"],
+        "resident projection must retain model-control semantics"
+    );
+    let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
+    assert!(summary.contains("Execution model only"));
+    assert!(summary.contains("Omit for task or output names"));
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
             .iter()

@@ -60,14 +60,19 @@ Follow the harness preflight instructions in
 `crates/astra-test-harness/README.md`. The fanout oracle checks prepared model
 identity and distinct child run IDs against the launch list. Discovery and
 configured-name resolution use the authenticated catalog, never local files.
-Cold discovery may add a catalog tool round; keep the strict zero-discovery
+Cold initialization loads and caches the authorized catalog, including ordinary
+turns. The primary receives a bounded page outside the stable system/tool prefix;
+execution still checks authorization. Partial/unknown choices may require
+discovery; keep the strict zero-discovery
 efficiency cases as separate acceptance evidence, rather than weakening them
 or presenting a functional pass as an efficiency pass.
 
-The retired scripted case that instructed the primary to omit
-`requested_model_policy` tested the old auxiliary interpreter, not a natural
-user journey. The family, version, content-role and actual-child oracles remain
-unchanged. A correct parent answer alone never proves correct child execution.
+Retired scripted cases that required rejection despite leaving model policy
+unset tested the old auxiliary interpreter, not the current inheritance contract.
+A prohibition of a different model does not itself prohibit the parent's model.
+The family, version, content-role and actual-child oracles remain; unavailable
+fixed selectors require the canonical typed `invalid_request` receipt and zero
+children. A correct parent answer alone never proves correct child execution.
 The spawn receipt exposes `prepared_model` so the parent can identify the
 runtime-selected model without another lookup. That field is pre-execution
 evidence, not proof of a provider call; the child `LlmRoundCompleted` event
@@ -131,11 +136,6 @@ claims made by a passing case. The prompt is plain English; it never supplies an
 ID or tool syntax. Run it only where GLM 5.2 is authorized. The no-file-probe
 checks are an additional UX guard, not proof that every possible probe is
 covered.
-
-`flash_spawn_prohibited_model_fail_closed` is an unhappy-path intent check. A
-user prohibition such as “do not use `glm-5.2`” is not a positive model choice;
-the runtime must keep it unresolved and block the child rather than silently
-inheriting DeepSeek Flash or substituting another model.
 
 `flash_versioned_model_with_independent_parent_task` requires a catalog with a
 unique Qwen 3.7 identity (`qwen3.7-max`). It checks the actual child model,
