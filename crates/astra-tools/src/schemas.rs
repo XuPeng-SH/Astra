@@ -1311,7 +1311,7 @@ fn delegation_agent_type_schema() -> Value {
 
 fn requested_model_policy_schema() -> Value {
     json!({
-        "x-astra-discovery-summary": "User-requested override, not task/output text. Else omit.",
+        "x-astra-discovery-summary": "Not task/output text; omit unless asked.",
         "description": "Optional execution-model override, distinct from the resolved Offering. Omit to use the admitted profile's model default, otherwise the parent Offering. Set a fixed selector only when the user requests an execution-model override, using an exact authorized Offering ID or configured name. If those choices are unknown, use model_catalog, never workspace configuration. Preserve requested versions and sources; never substitute a nearby model or invent an Offering ID. Names in quoted output or task content are not overrides. Runtime validates the selector against the authorized catalog before any child starts. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
         "oneOf": [
             {
@@ -1367,7 +1367,7 @@ fn requested_model_policy_schema() -> Value {
 fn fanout_reasoning_schema() -> Value {
     json!({
         "description": "Optional reasoning override only for the children the user requests it for; never copy one child's control to another. Shared defaults apply only to requirements common to all slots. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
-        "x-astra-discovery-summary": "User-requested scope only; otherwise omit.",
+        "x-astra-discovery-summary": "Omit outside user-requested scope.",
         "type": "object",
         "required": ["mode"],
         "oneOf": [

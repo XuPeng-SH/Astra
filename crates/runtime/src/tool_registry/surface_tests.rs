@@ -492,6 +492,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .expect("resident agent description");
     assert!(agent_description.contains("Wait"));
     assert!(agent_description.contains("No substitution"));
+    assert!(agent_description.contains("Omit unasked model policy"));
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
@@ -502,8 +503,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         "resident projection must retain model-control semantics"
     );
     let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
-    assert!(summary.contains("User-requested override, not task/output text"));
-    assert!(summary.contains("Else omit"));
+    assert!(summary.contains("Not task/output text"));
+    assert!(summary.contains("omit unless asked"));
     let reasoning = &find(&full, "agent")["function"]["parameters"]["properties"]["reasoning"];
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["reasoning"]["description"],
@@ -513,7 +514,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         reasoning["x-astra-discovery-summary"]
             .as_str()
             .unwrap()
-            .contains("User-requested scope only")
+            .contains("Omit outside user-requested scope")
     );
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],

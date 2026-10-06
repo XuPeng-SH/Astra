@@ -1254,10 +1254,7 @@ mod tests {
                     ]
                 };
                 for control in reasoning {
-                    assert_eq!(
-                        control["description"],
-                        "User-requested scope only; otherwise omit."
-                    );
+                    assert_eq!(control["description"], "Omit outside user-requested scope.");
                     assert!(control.get("x-astra-discovery-summary").is_none());
                 }
                 let profiles = if selected["name"] == "agent" {
