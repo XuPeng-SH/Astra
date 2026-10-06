@@ -1812,9 +1812,20 @@ mod tests {
 
     #[test]
     fn explicit_explain_mode_overrides_capture_default() {
+        let ordinary = Case::from_path(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/cases/runtime_observation_recovery/ordinary_previous_run.yaml"
+        )))
+        .unwrap();
+        assert_eq!(ordinary.extra_cli_args, ["--explain=off"]);
+        assert!(
+            !case_cli_arguments(&ordinary, "test-model", "events.jsonl")
+                .contains(&"--explain=on".into())
+        );
         for explicit in [vec![], vec!["--explain=off"], vec!["--explain", "off"]] {
             let mut case = simple_case();
             case.extra_cli_args = explicit.iter().map(|arg| (*arg).into()).collect();
+            crate::case::validate_extra_cli_args(&case.extra_cli_args).unwrap();
             let args = case_cli_arguments(&case, "test-model", "events.jsonl");
             assert_eq!(
                 args.iter()

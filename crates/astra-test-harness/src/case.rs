@@ -442,7 +442,7 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
     // Session ID — the harness manages --session-id for multi-turn
     // steps; a case overriding it would break session continuation.
     "--session-id",
-    // Required to archive primary/auxiliary usage before session cleanup.
+    // Defaults to on; only a validated on/off observation override is allowed.
     "--explain",
     // Cases may opt into an earlier CLI deadline via
     // `cli_wall_time_seconds`; the harness retains the outer watchdog.
@@ -454,8 +454,20 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
 /// exact form (`--model`) and `=` syntax (`--model=gpt-4`) so the
 /// denylist cannot be bypassed by appending `=value`.
 pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
-    for a in args {
+    let mut explain_seen = false;
+    for (index, a) in args.iter().enumerate() {
         let flag_part = a.split('=').next().unwrap_or(a);
+        if flag_part == "--explain" {
+            let value = a
+                .split_once('=')
+                .map(|(_, value)| value)
+                .or_else(|| args.get(index + 1).map(String::as_str));
+            if explain_seen || !matches!(value, Some("on" | "off")) {
+                return Err("--explain requires exactly one on/off observation mode".into());
+            }
+            explain_seen = true;
+            continue;
+        }
         for r in RESERVED_CLI_ARGS {
             if flag_part == *r {
                 return Err(format!(
@@ -1556,7 +1568,6 @@ steps:
             "--permission-mode=auto",
             "--system-prompt=override",
             "--session-id=hijack",
-            "--explain=off",
         ] {
             let err = validate_extra_cli_args(&[bypass.into()]);
             assert!(
@@ -1569,7 +1580,17 @@ steps:
     #[test]
     fn non_reserved_flag_with_equals_accepted() {
         assert!(validate_extra_cli_args(&["--verbose=true".into()]).is_ok());
-        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_err());
+        for args in [
+            vec!["--explain=yes"],
+            vec!["--explain"],
+            vec!["--explain=off", "--explain=on"],
+            vec!["--explain", "--model=other"],
+        ] {
+            assert!(
+                validate_extra_cli_args(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
     }
 
     #[test]
