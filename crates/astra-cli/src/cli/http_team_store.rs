@@ -1133,6 +1133,136 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn frozen_refresh_source_rejects_replacement_before_http() {
+        use crate::cli::cli_config::cli_utils::{credential_store, save_credentials};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _identity = write_test_profile();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        for explicit_login in [false, true] {
+            let credentials = credential_store().load().unwrap();
+            let expected = credentials.profiles["default"].clone();
+            let store = HttpTeamStore::new(&api, None);
+            if explicit_login {
+                crate::cli::auth_flow::save_profile_auth_tokens(
+                    Some("default"),
+                    "user",
+                    &crate::cli::auth_flow::AuthTokenPayload {
+                        user_id: "user-1".into(),
+                        access_token: "replacement-login".into(),
+                        refresh_token: "replacement-refresh".into(),
+                    },
+                )
+                .unwrap();
+            } else {
+                let mut credentials = credentials;
+                let profile = credentials.profiles.get_mut("default").unwrap();
+                profile.account_id = Some("replacement-owner".into());
+                profile.access_token = Some("replacement-access".into());
+                save_credentials(&credentials).unwrap();
+            }
+            let replacement_credentials = credential_store().load().unwrap();
+            let replacement = &replacement_credentials.profiles["default"];
+            let replacement_binding = crate::cli::cli_config::cli_utils::legacy_auth_binding(
+                "default",
+                replacement.account_id.as_deref(),
+            )
+            .unwrap();
+            assert!(
+                crate::cli::session::session_runtime::try_refresh_token(
+                    &api, "default", &expected, None,
+                )
+                .await
+                .is_err()
+            );
+            assert!(store.owner.access_token().await.is_none());
+            assert!(!store.owner.legacy_binding.as_ref().unwrap().is_active());
+            assert!(replacement_binding.is_active());
+            assert_eq!(
+                replacement_binding.pair.lock().await.0,
+                replacement.access_token
+            );
+            // Restore only for the next independent replacement scenario.
+            let mut credentials = credential_store().load().unwrap();
+            credentials.profiles.insert("default".into(), expected);
+            save_credentials(&credentials).unwrap();
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn ordinary_refresh_preserves_independent_open_team_bindings() {
+        use crate::cli::cli_config::cli_utils::{credential_store, save_credentials};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _identity = write_test_profile();
+        let mut credentials = credential_store().load().unwrap();
+        let profile = credentials.profiles.get_mut("default").unwrap();
+        profile.access_token = Some("eyJhbGciOiJub25lIn0.eyJleHAiOjF9.sig".into());
+        profile.refresh_token = Some("refresh-before".into());
+        save_credentials(&credentials).unwrap();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let first = HttpTeamStore::new(&api, None);
+        let second = HttpTeamStore::new(&api, None);
+        assert!(std::sync::Arc::ptr_eq(
+            first.owner.legacy_binding.as_ref().unwrap(),
+            second.owner.legacy_binding.as_ref().unwrap()
+        ));
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id":"user-1", "access_token":"fresh-access", "refresh_token":"fresh-refresh"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut requested = astra_services::team_persistence::builtin_teams("user-1").remove(0);
+        requested.team_id = "ordinary-refresh-team".into();
+        Mock::given(method("POST"))
+            .and(path("/teams"))
+            .and(header("authorization", "Bearer fresh-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&requested))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (rotated, first_saved, second_saved) = tokio::join!(
+            crate::cli::session::session_runtime::attempt_token_refresh(&api, None),
+            write_team(&first, &requested, false),
+            write_team(&second, &requested, false)
+        );
+        assert!(rotated);
+        assert_eq!(first_saved, Ok(requested.clone()));
+        assert_eq!(second_saved, Ok(requested.clone()));
+        server.verify().await;
+        server.reset().await;
+        // Even an explicit replacement login returning the same credentials
+        // must retire the original generation rather than resurrect its editors.
+        let saved = credential_store().load().unwrap();
+        let profile = &saved.profiles["default"];
+        crate::cli::auth_flow::save_profile_auth_tokens(
+            Some("default"),
+            "user",
+            &crate::cli::auth_flow::AuthTokenPayload {
+                user_id: "user-1".into(),
+                access_token: profile.access_token.clone().unwrap(),
+                refresh_token: profile.refresh_token.clone().unwrap(),
+            },
+        )
+        .unwrap();
+        for store in [&first, &second] {
+            assert_eq!(
+                write_team(store, &requested, false).await,
+                Err(TeamWriteError::Rejected)
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn team_refresh_barrier_never_borrows_or_overwrites_replacement_credentials() {
         use crate::cli::cli_config::cli_utils::{
             credential_store, install_cli_profile_identity_for_test, save_credentials,
@@ -1275,7 +1405,14 @@ mod tests {
                     "timed-out request was never posted"
                 );
                 assert!(
-                    store.owner.legacy_pair.try_lock().is_err(),
+                    store
+                        .owner
+                        .legacy_binding
+                        .as_ref()
+                        .unwrap()
+                        .pair
+                        .try_lock()
+                        .is_err(),
                     "settlement retains the auth lock"
                 );
                 // An explicit new request shares the same owner and must wait
@@ -1300,7 +1437,10 @@ mod tests {
             let rotated = matches!(scenario, "selection" | "timeout");
             let pair = store
                 .owner
-                .legacy_pair
+                .legacy_binding
+                .as_ref()
+                .unwrap()
+                .pair
                 .try_lock()
                 .expect("auth lock ends before Team completion");
             assert_eq!(

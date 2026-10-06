@@ -4,7 +4,6 @@ use crate::cli::arg_render::{
 };
 use crate::cli::auth_flow::{
     clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
-    parse_auth_tokens, save_refreshed_profile_tokens,
 };
 use crate::cli::cli_config::cli_args::{
     AuditCmd, ChatArgs, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd,
@@ -1657,10 +1656,6 @@ async fn execute_cli_command_impl(
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = saved_profile
-                .refresh_token
-                .as_ref()
-                .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             if saved_profile
                 .account_id
                 .as_deref()
@@ -1668,12 +1663,9 @@ async fn execute_cli_command_impl(
             {
                 return Err("refresh requires a server-issued account_id; log in again".into());
             }
-            let body = api
-                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+            session_runtime::try_refresh_token(api, &name, &saved_profile, None)
                 .await
-                .map_err(map_thin_err)?;
-            let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(&name, &saved_profile, &tokens)?;
+                .map_err(|error| format!("refresh failed: {error:?}"))?;
             stdout_println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }

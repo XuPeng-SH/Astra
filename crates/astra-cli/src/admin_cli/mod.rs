@@ -1,11 +1,8 @@
 use std::fs;
 
-use crate::cli::auth_flow::{
-    parse_auth_tokens, save_profile_auth_tokens, save_refreshed_profile_tokens,
-};
+use crate::cli::auth_flow::{clear_profile_auth, parse_auth_tokens, save_profile_auth_tokens};
 use crate::cli::cli_config::cli_utils::{
-    bound_profile_access_token, credential_store, get_profile_and_token, load_credentials,
-    profile_name,
+    bound_profile_access_token, get_profile_and_token, load_credentials, profile_name,
 };
 use crate::cli::session::session_runtime;
 use astra_thin_client::ThinClient;
@@ -546,10 +543,6 @@ pub async fn run(
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = saved_profile
-                .refresh_token
-                .as_ref()
-                .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             if saved_profile
                 .account_id
                 .as_deref()
@@ -557,12 +550,9 @@ pub async fn run(
             {
                 return Err("refresh requires a server-issued account_id; log in again".into());
             }
-            let body = api
-                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+            session_runtime::try_refresh_token(&api, &name, &saved_profile, None)
                 .await
-                .map_err(map_thin_err)?;
-            let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(&name, &saved_profile, &tokens)?;
+                .map_err(|error| format!("refresh failed: {error:?}"))?;
             stdout_println!("token refreshed");
             Ok(())
         }
@@ -581,16 +571,7 @@ pub async fn run(
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            let cli_profile = profile.clone();
-            credential_store()
-                .mutate(|creds| {
-                    let name = profile_name(cli_profile.as_deref(), creds);
-                    if let Some(entry) = creds.profiles.get_mut(&name) {
-                        entry.access_token = None;
-                        entry.refresh_token = None;
-                    }
-                })
-                .map_err(|e| e.to_string())?;
+            clear_profile_auth(profile.as_deref())?;
             print_json_or_raw(&body);
             Ok(())
         }

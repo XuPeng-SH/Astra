@@ -115,16 +115,20 @@ pub(crate) fn is_llm_provider_auth_error(error: &str) -> bool {
 }
 
 pub(crate) fn clear_profile_auth(profile: Option<&str>) -> Result<(), String> {
-    credential_store()
-        .mutate(|creds| {
-            let name = profile_name(profile, creds);
-            if let Some(entry) = creds.profiles.get_mut(&name) {
-                entry.access_token = None;
-                entry.refresh_token = None;
-                entry.last_session_id = None;
-            }
-        })
-        .map_err(|e| e.to_string())
+    crate::cli::cli_config::cli_utils::replace_profile_auth(|| {
+        credential_store()
+            .mutate(|creds| {
+                let name = profile_name(profile, creds);
+                if let Some(entry) = creds.profiles.get_mut(&name) {
+                    entry.access_token = None;
+                    entry.refresh_token = None;
+                    entry.last_session_id = None;
+                }
+                name
+            })
+            .map_err(|e| e.to_string())
+    })
+    .map(|_| ())
 }
 
 #[derive(Deserialize)]
@@ -156,29 +160,34 @@ pub(crate) fn save_profile_auth_tokens(
     let username = username.to_string();
     let access = tokens.access_token.clone();
     let refresh = tokens.refresh_token.clone();
-    let name = credential_store()
-        .mutate(|creds| {
-            let name =
-                CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
-            let existing = creds.profiles.get(&name).cloned().unwrap_or_default();
-            let prev_session = if existing.account_id.as_deref() == Some(tokens.user_id.as_str()) {
-                existing.last_session_id
-            } else {
-                None
-            };
-            let updated = Profile {
-                username: Some(username.clone()),
-                account_id: Some(tokens.user_id.clone()),
-                access_token: Some(access.clone()),
-                refresh_token: Some(refresh.clone()),
-                last_session_id: prev_session,
-                memoria_api_key: existing.memoria_api_key,
-            };
-            creds.current_profile = Some(name.clone());
-            creds.profiles.insert(name.clone(), updated);
-            name
-        })
-        .map_err(|e| e.to_string())?;
+    let name = crate::cli::cli_config::cli_utils::replace_profile_auth(|| {
+        credential_store()
+            .mutate(|creds| {
+                let name = CredentialStore::resolve_profile_name(
+                    profile,
+                    creds.current_profile.as_deref(),
+                );
+                let existing = creds.profiles.get(&name).cloned().unwrap_or_default();
+                let prev_session =
+                    if existing.account_id.as_deref() == Some(tokens.user_id.as_str()) {
+                        existing.last_session_id
+                    } else {
+                        None
+                    };
+                let updated = Profile {
+                    username: Some(username.clone()),
+                    account_id: Some(tokens.user_id.clone()),
+                    access_token: Some(access.clone()),
+                    refresh_token: Some(refresh.clone()),
+                    last_session_id: prev_session,
+                    memoria_api_key: existing.memoria_api_key,
+                };
+                creds.current_profile = Some(name.clone());
+                creds.profiles.insert(name.clone(), updated);
+                name
+            })
+            .map_err(|e| e.to_string())
+    })?;
     crate::cli::cli_config::cli_utils::install_cli_profile_identity(
         name,
         Some(tokens.user_id.clone()),
@@ -189,11 +198,16 @@ pub(crate) fn save_refreshed_profile_tokens(
     profile: &str,
     expected: &Profile,
     tokens: &AuthTokenPayload,
+    binding: &crate::cli::cli_config::cli_utils::LegacyAuthBinding,
+    pair: &mut (Option<String>, Option<String>),
 ) -> Result<(), String> {
+    if !binding.matches_profile(profile) {
+        return Err("refresh login binding was replaced".into());
+    }
     let user_id = tokens.user_id.clone();
     let access = tokens.access_token.clone();
     let refresh = tokens.refresh_token.clone();
-    credential_store()
+    binding.commit_rotation(expected, pair, (Some(access.clone()), Some(refresh.clone())), || credential_store()
         .mutate(|creds| {
             let name = profile;
             let entry = creds.profiles.get_mut(name)
@@ -223,7 +237,7 @@ pub(crate) fn save_refreshed_profile_tokens(
             entry.refresh_token = Some(refresh.clone());
             Ok(())
         })
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?)
 }
 
 pub(crate) async fn do_login(
@@ -1754,6 +1768,10 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
+        let binding =
+            crate::cli::cli_config::cli_utils::legacy_auth_binding("default", Some("account-a"))
+                .unwrap();
+        let mut pair = binding.pair.try_lock().unwrap();
         let error = save_refreshed_profile_tokens(
             "default",
             &creds.profiles["default"],
@@ -1762,6 +1780,8 @@ mod tests {
                 access_token: "access-b".to_string(),
                 refresh_token: "refresh-b".to_string(),
             },
+            &binding,
+            &mut pair,
         )
         .expect_err("refresh must not move a profile to another account");
         assert!(error.contains("does not match"), "{error}");
