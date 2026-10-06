@@ -2087,6 +2087,25 @@ pub(crate) fn apply_delegation_model_admission(
             .get(slot_index)
             .ok_or_else(|| invalid("slot missing"))?,
     };
+    if slot.model_selection.is_none()
+        && let Some(required_policy) = slot.requested_model_policy.as_ref()
+    {
+        if slot.model_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard)
+            && input
+                .requested_model_policy
+                .as_ref()
+                .is_some_and(|policy| policy != required_policy)
+        {
+            return Err(invalid(
+                "tool model policy conflicts with hard user requirement",
+            ));
+        }
+        // A hard configured name can remain unresolved until canonical batch
+        // admission. Omitting it must not fall through to the parent/profile.
+        if input.requested_model_policy.is_none() {
+            input.requested_model_policy = Some(required_policy.clone());
+        }
+    }
     if let Some(required) = &slot.model_selection {
         let hard =
             slot.model_strength == Some(astra_turn_types::DelegationRequirementStrength::Hard);
@@ -2102,14 +2121,12 @@ pub(crate) fn apply_delegation_model_admission(
                     selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
                 })
             ) && input.resolved_model_selection.is_none();
-            let fixed_name_resolves_to_requirement = matches!(
+            let fixed_selector_resolves_to_requirement = matches!(
                 slot.requested_model_policy,
                 Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
             ) && matches!(
                 input.requested_model_policy,
-                Some(astra_turn_types::RequestedModelPolicy::Fixed {
-                    selector: astra_turn_types::ModelSelector::ConfiguredName { .. }
-                })
+                Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
             ) && input
                 .resolved_model_selection
                 .as_ref()
@@ -2120,7 +2137,7 @@ pub(crate) fn apply_delegation_model_admission(
                 .is_some_and(|required_policy| {
                     input.requested_model_policy.as_ref() != Some(required_policy)
                 })
-                && !fixed_name_resolves_to_requirement
+                && !fixed_selector_resolves_to_requirement
                 && !configured_name_is_pending
             {
                 return Err(invalid(
@@ -2171,7 +2188,7 @@ pub(crate) fn apply_delegation_model_admission(
                     })
                 )
             ) && hard
-                && fixed_name_resolves_to_requirement
+                && fixed_selector_resolves_to_requirement
             {
                 input.requested_model_policy = slot.requested_model_policy.clone();
                 input.resolved_model_selection = Some(required.clone());
@@ -2701,7 +2718,7 @@ pub trait SpawnAgentExecutor: Send + Sync {
         inputs: &[SpawnAgentInput],
         context: &SpawnContext,
         parent_selection: Option<&astra_turn_types::ModelSelection>,
-    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String>
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError>
     where
         Self: 'static;
 
@@ -2717,7 +2734,7 @@ pub trait SpawnAgentExecutor: Send + Sync {
         inputs: &[SpawnAgentInput],
         _context: &SpawnContext,
         parent_selection: Option<&astra_turn_types::ModelSelection>,
-    ) -> Result<Vec<Box<dyn PreparedSpawn>>, String>
+    ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError>
     where
         Self: 'static,
     {
@@ -2735,7 +2752,7 @@ pub trait SpawnAgentExecutor: Send + Sync {
                 .iter()
                 .any(|input| input.reasoning.is_some() || input.max_output_tokens.is_some())
         {
-            return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".to_string());
+            return Err("this execution boundary cannot pre-admit per-slot model or reasoning selections for an atomic fanout".into());
         }
         for input in inputs {
             selector_for_admitted_spawn_input(input, parent_selection)
@@ -3015,8 +3032,6 @@ pub struct DynamicAgentSpawner {
     /// Explicit test/local journal root captured at the session ownership
     /// boundary. Tokio blocking workers do not inherit thread-local guards.
     journal_dir_override: Arc<std::sync::RwLock<Option<PathBuf>>>,
-    /// Agent type registry (builtins + user-defined).
-    agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry,
     /// Completed agents archive for history queries.
     completed_agents: Arc<RwLock<VecDeque<SpawnedAgentState>>>,
     /// Strong ownership of the task supervisor exists only on the
@@ -3171,10 +3186,7 @@ struct CancellationRetryBatchGuard {
 fn foreground_child_has_work_time(
     deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
 ) -> bool {
-    deadline.is_none_or(|deadline| {
-        deadline.remaining()
-            >= astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET
-    })
+    deadline.is_none_or(|deadline| deadline.remaining_at(std::time::Instant::now()).has_work())
 }
 
 impl CancellationRetryBatchGuard {
@@ -3247,8 +3259,6 @@ impl DynamicAgentSpawner {
             journal_dir_override: Arc::new(std::sync::RwLock::new(
                 astra_services::session_journal::current_journal_dir_override(),
             )),
-            agent_registry:
-                astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(VecDeque::new())),
             background_tasks: Arc::downgrade(&background_task_owner),
             _background_task_owner: Some(background_task_owner),
@@ -6284,11 +6294,6 @@ impl DynamicAgentSpawner {
         event.metadata = metadata;
         self.write_trace_event(event).await;
     }
-    /// Get a reference to the agent registry.
-    pub fn agent_registry(&self) -> &astra_turn_core::orchestration_team_config::AgentRegistry {
-        &self.agent_registry
-    }
-
     /// Check if an executor is configured.
     pub fn has_executor(&self) -> bool {
         self.executor.is_some()
@@ -6613,7 +6618,11 @@ impl DynamicAgentSpawner {
         let agent_def = admitted_profile
             .as_ref()
             .map(Self::agent_definition_from_admitted_profile)
-            .or_else(|| self.agent_registry.get(&input.agent_type))
+            .or_else(|| {
+                astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types()
+                    .into_iter()
+                    .find(|definition| definition.agent_type == input.agent_type)
+            })
             .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
         // An isolated child requires filesystem/process work to provision a
         // worktree. Decide that capability before allocating IDs, reserving
@@ -6753,8 +6762,7 @@ impl DynamicAgentSpawner {
             .ok_or(SpawnError::ExecutorUnavailable)?;
         let preparations = Arc::clone(executor)
             .prepare_batch(inputs, context, parent_selection)
-            .await
-            .map_err(SpawnError::DelegationFailed)?;
+            .await?;
         if preparations.len() != inputs.len() {
             return Err(SpawnError::DelegationFailed(format!(
                 "spawn executor prepared {} slots for {} requested slots",
@@ -9904,7 +9912,6 @@ impl DynamicAgentSpawner {
             executor: self.executor.clone(),
             session_id: self.session_id.clone(),
             journal_dir_override: Arc::clone(&self.journal_dir_override),
-            agent_registry: self.agent_registry.clone(),
             completed_agents: Arc::clone(&self.completed_agents),
             _background_task_owner: None,
             background_tasks: self.background_tasks.clone(),
@@ -10568,6 +10575,10 @@ pub enum SpawnError {
     #[error("Delegation failed: {0}")]
     DelegationFailed(String),
 
+    /// Classified by the admission producer, never recovered from display text.
+    #[error("Delegation failed: {0}")]
+    Admission(astra_core::ClassifiedError),
+
     #[error("Agent executor unavailable: spawned agents cannot run in this context")]
     ExecutorUnavailable,
 
@@ -10621,6 +10632,27 @@ pub enum SpawnError {
          Wait for an existing agent to finish or cancel one before spawning more."
     )]
     ConcurrencyLimitExceeded { active: usize, limit: usize },
+}
+
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self::DelegationFailed(message)
+    }
+}
+
+impl From<&str> for SpawnError {
+    fn from(message: &str) -> Self {
+        Self::DelegationFailed(message.to_string())
+    }
+}
+
+impl SpawnError {
+    pub fn error_kind(&self) -> Option<astra_core::ErrorKind> {
+        match self {
+            Self::Admission(error) => Some(error.kind),
+            _ => None,
+        }
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -11568,7 +11600,12 @@ pub(crate) mod tests {
             host.direct_child_owner = Some(parent);
             let mut state = make_state();
             if deadline {
-                host = host.with_execution_time_budget_remaining(Duration::from_secs(30));
+                host = host.with_execution_time_budget_remaining(
+                    astra_turn_types::ExecutionTimeRemaining {
+                        work_remaining: Duration::ZERO,
+                        total_remaining: Duration::from_secs(30),
+                    },
+                );
             } else {
                 state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(1);
             }
@@ -14560,8 +14597,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn builtin_team_leads_spawn_members_through_shared_admission() {
-        for team in astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
-        {
+        for team in astra_services::team_persistence::builtin_teams("owner") {
             let profiles: Vec<_> = team
                 .members
                 .iter()
@@ -15168,12 +15204,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_unknown_agent_type() {
         let spawner = DynamicAgentSpawner::new(mock_router());
-        let input = SpawnAgentInput {
-            description: "Test".to_string(),
-            prompt: "Test".to_string(),
-            agent_type: "unknown-type".to_string(),
-            ..Default::default()
-        };
         let context = SpawnContext {
             parent_profile_authority: ParentProfileAuthority::Unbound,
             admitted_agent_profiles: None,
@@ -15196,8 +15226,35 @@ pub(crate) mod tests {
             delegation_chain: Vec::new(),
         };
 
-        let result = spawner.spawn(input, &context).await;
-        assert!(matches!(result, Err(SpawnError::UnknownAgentType(_))));
+        for agent_type in [
+            "unknown-type",
+            "code_review",
+            "codereview",
+            "general_purpose",
+            "generalpurpose",
+            "general",
+            "EXPLORE",
+            "CODE-REVIEW",
+            "TASK",
+            "GENERAL-PURPOSE",
+            " explore",
+            "explore ",
+            " code-review ",
+            " task ",
+            "general-purpose\t",
+        ] {
+            let input = SpawnAgentInput {
+                description: "Test".to_string(),
+                prompt: "Test".to_string(),
+                agent_type: agent_type.to_string(),
+                ..Default::default()
+            };
+            let result = spawner.spawn(input, &context).await;
+            assert!(
+                matches!(result, Err(SpawnError::UnknownAgentType(ref rejected)) if rejected == agent_type),
+                "noncanonical built-in name {agent_type:?} must be rejected unchanged, got {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -15688,7 +15745,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
             Ok(prepare_fixture_batch(self, inputs.len()))
         }
 
@@ -15826,7 +15883,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
             Ok(prepare_fixture_batch(self, inputs.len()))
         }
 
@@ -16157,7 +16214,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
             Ok(prepare_fixture_batch(self, inputs.len()))
         }
 
@@ -19164,6 +19221,96 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn hard_configured_name_is_applied_before_selector_admission() {
+        use astra_turn_types::{
+            DelegationModelAdmissionOutcome, ModelSelector, RequestedModelPolicy,
+        };
+        let mut admission = fixed_model_admission("unused");
+        let DelegationModelAdmissionOutcome::Constrained { slots } = &mut admission.outcome else {
+            unreachable!()
+        };
+        let required = RequestedModelPolicy::Fixed {
+            selector: ModelSelector::ConfiguredName {
+                model_name: "Required Model".into(),
+                source: Some("required-source".into()),
+            },
+        };
+        slots[0].model_selection = None;
+        slots[0].requested_model_policy = Some(required.clone());
+        let mut omitted = make_spawn_input();
+        apply_delegation_model_admission(&mut omitted, &admission, "parent-run", Some("call"))
+            .unwrap();
+        assert_eq!(omitted.requested_model_policy, Some(required.clone()));
+        assert!(omitted.resolved_model_selection.is_none());
+        assert_eq!(
+            selector_for_admitted_spawn_input(&omitted, None).unwrap(),
+            Some(ModelSelector::ConfiguredName {
+                model_name: "Required Model".into(),
+                source: Some("required-source".into())
+            })
+        );
+        for policy in [
+            RequestedModelPolicy::Inherit,
+            RequestedModelPolicy::Fixed {
+                selector: ModelSelector::ConfiguredName {
+                    model_name: "Other Model".into(),
+                    source: None,
+                },
+            },
+        ] {
+            let mut conflicting = make_spawn_input();
+            conflicting.requested_model_policy = Some(policy);
+            assert!(
+                apply_delegation_model_admission(
+                    &mut conflicting,
+                    &admission,
+                    "parent-run",
+                    Some("call")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_offering_can_satisfy_a_hard_configured_name() {
+        use astra_turn_types::{
+            DelegationModelAdmissionOutcome, ModelSelection, ModelSelector, RequestedModelPolicy,
+        };
+        let mut admission = fixed_model_admission("required-offer");
+        let DelegationModelAdmissionOutcome::Constrained { slots } = &mut admission.outcome else {
+            unreachable!()
+        };
+        slots[0].requested_model_policy = Some(RequestedModelPolicy::Fixed {
+            selector: ModelSelector::ConfiguredName {
+                model_name: "Required Model".into(),
+                source: None,
+            },
+        });
+        for (offering_id, allowed) in [("required-offer", true), ("other-offer", false)] {
+            let mut proposed = make_spawn_input();
+            proposed.requested_model_policy = Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: offering_id.into(),
+                },
+            });
+            proposed.resolved_model_selection = Some(ModelSelection {
+                offering_id: offering_id.into(),
+            });
+            assert_eq!(
+                apply_delegation_model_admission(
+                    &mut proposed,
+                    &admission,
+                    "parent-run",
+                    Some("call")
+                )
+                .is_ok(),
+                allowed
+            );
+        }
+    }
+
     fn fixed_model_admission(offering_id: &str) -> astra_turn_types::DelegationModelAdmission {
         use astra_turn_types::{
             DelegationModelAdmission, DelegationModelAdmissionOutcome,
@@ -21421,7 +21568,7 @@ pub(crate) mod tests {
                 inputs: &[SpawnAgentInput],
                 _: &SpawnContext,
                 _: Option<&astra_turn_types::ModelSelection>,
-            ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+            ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
                 Ok(inputs
                     .iter()
                     .map(|_| Box::new(Preparation(self.clone())) as Box<dyn PreparedSpawn>)
@@ -21508,7 +21655,7 @@ pub(crate) mod tests {
                 inputs: &[SpawnAgentInput],
                 _: &SpawnContext,
                 _: Option<&astra_turn_types::ModelSelection>,
-            ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+            ) -> Result<Vec<Box<dyn PreparedSpawn>>, SpawnError> {
                 Ok(inputs
                     .iter()
                     .map(|_| Box::new(LaunchFailure(self.0)) as Box<dyn PreparedSpawn>)
@@ -21629,23 +21776,25 @@ pub(crate) mod tests {
     async fn wait_for_agent_returns_immediately_when_completed() {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+        let context = make_bg_context();
 
-        let result = spawner
-            .spawn(make_bg_input(), &make_bg_context())
-            .await
-            .unwrap();
-        let agent_id = match result {
-            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-        };
+        for agent_type in ["explore", "code-review", "task", "general-purpose"] {
+            let mut input = make_bg_input();
+            input.agent_type = agent_type.to_string();
+            let result = spawner.spawn(input, &context).await.unwrap();
+            let agent_id = match result {
+                SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            };
 
-        // Wait for background task to complete via the notifier.
-        let status = spawner
-            .wait_for_agent(&agent_id, std::time::Duration::from_secs(5))
-            .await;
-        assert!(
-            matches!(status, Some(AgentStatus::Completed { .. })),
-            "wait_for_agent must return Completed, got {status:?}"
-        );
+            // Wait for background task to complete via the notifier.
+            let status = spawner
+                .wait_for_agent(&agent_id, std::time::Duration::from_secs(5))
+                .await;
+            assert!(
+                matches!(status, Some(AgentStatus::Completed { .. })),
+                "wait_for_agent must return Completed for {agent_type}, got {status:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -22214,11 +22363,7 @@ pub(crate) mod tests {
         };
 
         let early = spawner
-            .spawn_with_execution_deadline(
-                make_slot(0),
-                &make_bg_context(),
-                Some(make_deadline(30)),
-            )
+            .spawn_with_execution_deadline(make_slot(0), &make_bg_context(), Some(make_deadline(1)))
             .await;
         assert!(matches!(early, Err(SpawnError::ExecutionDeadlineElapsed)));
 
@@ -22230,13 +22375,13 @@ pub(crate) mod tests {
                     .spawn_with_execution_deadline(
                         make_slot(1),
                         &make_bg_context(),
-                        Some(make_deadline(66)),
+                        Some(make_deadline(4)),
                     )
                     .await
             })
         };
         wait_for_spawn_reservation(&reservation_entered, &release_reservation).await;
-        tokio::time::sleep(Duration::from_millis(6_100)).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         release_reservation
             .send(())
             .expect("spawn hook is waiting for its release signal");

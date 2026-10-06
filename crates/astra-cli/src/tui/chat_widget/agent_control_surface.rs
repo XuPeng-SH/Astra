@@ -206,7 +206,7 @@ mod tests {
         );
         assert_eq!(
             surface.failure_message().as_deref(),
-            Some("Needs continuation: The run reached its turn budget.")
+            Some("Needs continuation: The run reached its execution budget.")
         );
     }
 

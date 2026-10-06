@@ -514,6 +514,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Keep the shared loop's large suspended state out of every caller's
     // future. This remains the same task and cancellation/drop boundary.
     let result = Box::pin(run_agentic_loop_impl(host, state)).await;
+    let input_wait_continuation = matches!(result, Ok(AgenticLoopOutcome::Waiting(_)))
+        && matches!(state.loop_entry, super::host::LoopEntry::InputWait { .. });
     let cancellation_exit = matches!(result, Ok(AgenticLoopOutcome::Cancelled))
         || matches!(
             result,
@@ -559,7 +561,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
     #[cfg(feature = "harness")]
-    if !state.harness.session_ended {
+    if !input_wait_continuation && !state.harness.session_ended {
         state.harness.session_ended = true;
         super::super::harness_adapter::harness_at!(
             &state.harness,
@@ -642,10 +644,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     }
 
     record_loop_completion_feedback(state, &result);
-    // A returned loop is no longer an unfinished execution. Reusing the state
-    // for another user turn must enter its preamble; a frozen handoff never
-    // reaches this reset.
-    state.loop_entry = super::host::LoopEntry::BeforePreamble;
+    // A paused input synchronization remains the same unfinished execution.
+    // Only terminal/reused turns start another preamble and budget slice.
+    if !input_wait_continuation {
+        state.loop_entry = super::host::LoopEntry::BeforePreamble;
+    }
     result
 }
 
@@ -1549,10 +1552,12 @@ mod tests {
 
         finalize_and_render(&mut host, &mut state).await;
 
-        assert!(
-            state.final_text.contains("turn budget"),
+        assert_eq!(
+            state.final_text,
+            state.interruption.as_ref().unwrap().user_message,
             "interrupted tool-only turns must not persist an empty or success-shaped final answer"
         );
+        assert!(!state.final_text.is_empty());
         assert!(!state.final_text.contains("budget_exhausted"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }

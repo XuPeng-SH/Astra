@@ -644,7 +644,6 @@ fn normalized_fanout_start_status(event: &Value, output: &str) -> String {
         output,
     ) {
         Some(AgentFanoutControlReceiptKind::Group) => "completed".to_string(),
-        Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance) => "skipped".to_string(),
         Some(
             AgentFanoutControlReceiptKind::RejectedBeforeAcceptance
             | AgentFanoutControlReceiptKind::ExecutionUnknown,
@@ -8193,6 +8192,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     let admission_source_for_blocking = invocation.admission_source;
     let blocking_outcome = tokio::task::spawn_blocking(move || {
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
+            admission_deadline: invocation.admission_deadline,
             task_resolution_authority: None,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
@@ -13493,6 +13493,11 @@ mod tests {
     #[tokio::test]
     async fn edge_tool_result_refresh_failure_returns_terminal_auth_error() {
         let _creds_guard = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "test",
+            Some("user-id-1"),
+        )
+        .unwrap();
 
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),
@@ -13501,6 +13506,7 @@ mod tests {
         creds.profiles.insert(
             "test".to_string(),
             Profile {
+                account_id: Some("user-id-1".to_string()),
                 access_token: Some("expired-token".to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()
@@ -17677,7 +17683,14 @@ mod tests {
         assert!(!snap.tool_call_records[0].ok);
         assert_eq!(
             snap.tool_call_records[0].error.as_deref(),
-            Some("Permission denied")
+            Some("status=permission_denied\nPermission denied")
+        );
+        let record = &snap.tool_call_records[0];
+        assert_eq!(record.result_full.as_deref(), record.error.as_deref());
+        assert_eq!(record.result_preview.as_deref(), record.error.as_deref());
+        assert_eq!(
+            record.output_bytes,
+            Some("status=permission_denied\nPermission denied".len() as u32)
         );
         assert_eq!(snap.tools_used, vec!["bash"]);
 

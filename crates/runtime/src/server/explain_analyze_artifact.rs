@@ -876,23 +876,26 @@ pub(crate) async fn resolve_selector(
     ) {
         return Err("server Explain snapshots require a durable server source".into());
     }
-    let (run_id, generation) = match selector {
+    let (run_id, selected_generation) = match selector {
         ExplainSelector::Previous {} => engine
-            .find_latest_explain_analyze_root(user_id, session_id, Some(current_root))
+            .find_latest_root_run(user_id, session_id, Some(current_root))
             .await?
-            .ok_or("no previous Explain Analyze root exists in this session")?,
-        ExplainSelector::Run { run_id } => {
-            let observation = engine
-                .load_run_observation(user_id, &run_id, EXACT_RUN_OBSERVATION_EVENTS)
-                .await?
-                .filter(|observation| observation.run.session_id == session_id)
-                .ok_or("Explain Analyze run was not found in the active session")?;
-            if !astra_services::runs::run_requested_explain_analyze(&observation.run) {
-                return render_exact_run_projection(&observation, args, max_bytes);
-            }
-            (observation.run.run_id, observation.run.run_generation)
-        }
+            .map(|(run_id, generation)| (run_id, Some(generation)))
+            .ok_or("no previous root run exists in this session")?,
+        ExplainSelector::Run { run_id } => (run_id, None),
     };
+    let observation = engine
+        .load_run_observation(user_id, &run_id, EXACT_RUN_OBSERVATION_EVENTS)
+        .await?
+        .filter(|observation| observation.run.session_id == session_id)
+        .ok_or("selected run was not found in the active session")?;
+    let generation = observation.run.run_generation;
+    if selected_generation.is_some_and(|selected| selected != generation) {
+        return Err("selected run identity changed or is unavailable".into());
+    }
+    if !astra_services::runs::run_requested_explain_analyze(&observation.run) {
+        return render_exact_run_projection(&observation, args, max_bytes);
+    }
     let store = store.ok_or("server Explain Analyze artifact reader is unavailable")?;
     let id = artifact_id(&run_id);
     record_artifact_fetch(ArtifactFetchPurpose::Discovery);
@@ -1147,7 +1150,7 @@ fn render_window(
 /// Render exact durable run evidence when the run did not opt into the full
 /// Explain Analyze capture.
 ///
-/// `introspect(explain={target:"run"})` promises exact active-session
+/// Both `previous` and `run` selectors promise exact active-session
 /// execution evidence, not only an Explain artifact. A normal run already
 /// owns a bounded, server-authorized event projection; using it here avoids
 /// turning every run into an artifact-writing run and avoids a second run
@@ -1908,7 +1911,7 @@ pub(crate) mod tests {
         assert!(first.output.contains("Run: run-1"));
         assert!(!first.output.contains("current-root"));
         assert_eq!(fetches.total, 1);
-        // Advance durable selection after page one; the returned handle remains fixed.
+        // Later admission cannot change this current root's previous selection or handle.
         engine
             .persist_status(
                 "user-a",
@@ -1935,6 +1938,12 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        let still_previous = executor
+            .execute_with_metadata("introspect", &json!({"explain": {"target": "previous"}}))
+            .await;
+        assert!(!still_previous.is_error, "{still_previous:?}");
+        let still_previous: Value = serde_json::from_str(&still_previous.output).unwrap();
+        assert_eq!(still_previous["run_id"], "run-1");
         let page = executor
             .execute_with_metadata(
                 "introspect",
@@ -1967,7 +1976,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn exact_run_returns_durable_projection_without_explain_artifact() {
+    async fn previous_and_exact_run_return_durable_projection_without_explain_artifact() {
         let (executor, store, engine) = handler_fixture().await;
         engine
             .persist_status(
@@ -2081,6 +2090,11 @@ pub(crate) mod tests {
             .persist_status("user-a", "session-a", "plain-run", "completed", None, None)
             .await
             .unwrap();
+        engine
+            .start_run("projection-current-root", "user-a", "session-a")
+            .await
+            .unwrap();
+        let executor = executor.with_explain_root(engine.clone(), "projection-current-root".into());
 
         let output = executor
             .execute_with_metadata(
@@ -2136,6 +2150,19 @@ pub(crate) mod tests {
                 .unwrap_or_default()
                 > 0
         );
+        let (previous, fetches) = count_explain_artifact_fetches(executor.execute_with_metadata(
+            "introspect",
+            &json!({"explain": {"target": "previous"}, "format": "json"}),
+        ))
+        .await;
+        assert!(!previous.is_error, "{previous:?}");
+        assert_eq!(previous.output, output.output);
+        assert_eq!(
+            fetches.total, 0,
+            "ordinary previous must not fetch the older Explain artifact"
+        );
+        assert_eq!(projection["explain_analyze_requested"], false);
+        assert!(projection.get("artifact").is_none());
 
         let compact = executor
             .execute_with_metadata(
@@ -2155,6 +2182,14 @@ pub(crate) mod tests {
         );
         let compact_projection: Value = serde_json::from_str(&compact.output).unwrap();
         assert_eq!(compact_projection["run"]["run_id"], "plain-run");
+        let previous_compact = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({"explain": {"target": "previous"}, "format": "json", "max_bytes": 512}),
+            )
+            .await;
+        assert!(!previous_compact.is_error, "{previous_compact:?}");
+        assert_eq!(previous_compact.output, compact.output);
         let default_text = executor
             .execute_with_metadata(
                 "introspect",
@@ -2194,6 +2229,18 @@ pub(crate) mod tests {
             )
             .await;
         assert!(too_small.is_error);
+        let (previous_too_small, fetches) =
+            count_explain_artifact_fetches(executor.execute_with_metadata(
+                "introspect",
+                &json!({"explain": {"target": "previous"}, "max_bytes": 1}),
+            ))
+            .await;
+        assert!(previous_too_small.is_error, "{previous_too_small:?}");
+        assert_eq!(previous_too_small.output, too_small.output);
+        assert_eq!(
+            fetches.total, 0,
+            "projection failure must not select an older Explain artifact"
+        );
         let minimum: usize = too_small
             .output
             .split("minimum ")
@@ -2225,22 +2272,35 @@ pub(crate) mod tests {
                 .is_none()
         );
 
-        let foreign = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
-            std::env::temp_dir(),
-            "other-user".into(),
-            "session-a".into(),
-            None,
-            None,
-        )
-        .with_explain_root(engine, "current-root".into())
-        .with_test_session_artifact_store(store);
-        let denied = foreign
-            .execute_with_metadata(
-                "introspect",
-                &json!({"explain": {"target": "run", "run_id": "plain-run"}}),
+        for (user, session) in [("other-user", "session-a"), ("user-a", "other-session")] {
+            let foreign = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                std::env::temp_dir(),
+                user.into(),
+                session.into(),
+                None,
+                None,
             )
-            .await;
-        assert!(denied.is_error, "{denied:?}");
+            .with_explain_root(engine.clone(), "projection-current-root".into())
+            .with_test_session_artifact_store(store.clone());
+            for selector in [
+                json!({"target": "run", "run_id": "plain-run"}),
+                json!({"target": "previous"}),
+            ] {
+                let (denied, fetches) = count_explain_artifact_fetches(
+                    foreign.execute_with_metadata("introspect", &json!({"explain": selector})),
+                )
+                .await;
+                assert!(denied.is_error, "{denied:?}");
+                assert_eq!(fetches.total, 0);
+                if selector["target"] == "previous" {
+                    assert!(
+                        denied
+                            .output
+                            .contains("no previous root run exists in this session")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2313,6 +2373,12 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
             }
+            engine
+                .start_run("capture-current-root", "user-a", "session-a")
+                .await
+                .unwrap();
+            let executor =
+                executor.with_explain_root(engine.clone(), "capture-current-root".into());
             if !matches!(failure, "missing" | "cancelled") {
                 let mut artifact = stored(explain_record(
                     &artifact_id("new-root"),

@@ -2481,6 +2481,38 @@ mod tests {
                 admitted["context"]["thinking"],
                 expected_thinking.to_payload_value()
             );
+            if explicit.is_none() {
+                // The TUI owner tests its Leave action separately. Verify the
+                // actual preparation/projection of the resulting absent intent
+                // here without exposing private UI internals to the CLI layer.
+                context.agent_profile_selection = None;
+                let (payload, _) = prepare_payload_with_reasoning_for_test(
+                    vec![json!({"role":"user", "content":"Explain this."})],
+                    &[],
+                    &[],
+                    "Explain this.",
+                    None,
+                    Some((
+                        "offer-parent",
+                        "model-a(thinking:high)",
+                        &intent,
+                        Some(&context),
+                    )),
+                )
+                .await;
+                let admitted = server_loop_admission_payload_with_execution_time_budget(
+                    &payload,
+                    "Explain this.",
+                    false,
+                    None,
+                )
+                .unwrap();
+                assert!(
+                    admitted["agent_profile_selection"].is_null(),
+                    "leaving must reach actual root admission, not only UI state"
+                );
+                assert_eq!(admitted["model_selection"]["offering_id"], "offer-parent");
+            }
         }
     }
 
@@ -3726,8 +3758,8 @@ mod tests {
 
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
         // Use a capability classified as Deferred by the canonical ToolSpec
-        // registry. `memory` is intentionally AlwaysLoad, so using it here
-        // would test the resident-surface policy rather than activation.
+        // registry; its invocation follows activation rather than a
+        // model-visible native schema.
         executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
         let selected = executor
             .execute("tool_search", &json!({"query": "select:web_fetch"}))

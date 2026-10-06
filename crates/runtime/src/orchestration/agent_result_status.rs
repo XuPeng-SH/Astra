@@ -257,7 +257,7 @@ mod tests {
     fn interrupted_message_uses_shared_wait_copy_for_get_result() {
         assert_eq!(
             agent_tool_interrupted_message(true, Some("budget_exhausted")),
-            "Needs continuation: The run reached its turn budget."
+            "Needs continuation: The run reached its execution budget."
         );
         assert_eq!(
             agent_tool_interrupted_message(false, Some("context_overflow")),
@@ -298,7 +298,8 @@ mod tests {
             v["status"],
             AgentToolResultStatusKind::StillRunning.as_str()
         );
-        assert_eq!(v["delivery"], "asynchronous_parent_mailbox");
+        assert!(v.get("delivery").is_none());
+        assert_eq!(v["observation_timed_out"], true);
         assert!(
             v["hint"]
                 .as_str()

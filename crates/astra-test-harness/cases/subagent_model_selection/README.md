@@ -49,51 +49,41 @@ run the same command:
 astra admin config unset judgment_model
 ```
 
-The no-Jev trace should show `judgment admission=not_dispatched` and exactly
-one `delegation_candidate_assessment` on the primary model on the healthy path.
-It must produce the same authorized child bindings. A typed provider deadline
-may receive one runtime-owned retry when a full auxiliary slice remains after
-the parent convergence reserve. A configured-route fallback consumes that same
-second-call allowance; there is never a third logical judgment call. Physical
-provider attempts remain separately attributable. Restore the
-optional binding after the run when the shared database is used by other
-tests. General memory/request judgment remains unavailable in this mode; only
-the bounded delegated-model selector uses the primary model as its Jev-like
-implementation.
+Fixed model selection has the same runtime contract with and without Jev.
+The primary proposes the selected model using the canonical tool control;
+runtime authorizes that exact identity and reasoning capability. There is no
+mandatory auxiliary model-selection call, so the trace must not attribute a
+removed selector's synthetic usage. Restore optional bindings after tests
+against a database shared with other callers.
 
 Follow the harness preflight instructions in
-`crates/astra-test-harness/README.md`. The valid case asserts exactly two
-spawn events, one per fanout slot, and checks that both expose the prepared
-`deepseek-v4-flash` selection identity in the journal. It also checks that the
-prepared child run IDs are distinct and match the `/agents` launch list returned
-by `agent_fanout.start`. This does not require a later `get_results` call when
-canonical adoption delivers the results. The live cases intentionally do not
-require a parent model to echo an
-internal `requested_model_policy` selector. When a user names a model, the
-canonical contract is to omit that field and let one candidate-aware admission
-bind the request. Structured selector shapes are covered by the offline tool
-and admission tests; requiring them in a probabilistic live prompt would test
-model compliance with an implementation detail and conflict with the canonical
-system instruction. The invalid final-slot case must show zero
-`agent_spawned` events, not just a failed terminal answer.
+`crates/astra-test-harness/README.md`. The fanout oracle checks prepared model
+identity and distinct child run IDs against the launch list. Discovery and
+configured-name resolution use the authenticated catalog, never local files.
+Cold initialization loads and caches the authorized catalog, including ordinary
+turns. The primary receives a bounded page outside the stable system/tool prefix;
+execution still checks authorization. Partial/unknown choices may require
+discovery; keep the strict zero-discovery
+efficiency cases as separate acceptance evidence, rather than weakening them
+or presenting a functional pass as an efficiency pass.
 
-`flash_spawn_natural_language_glm` is a scripted intent-binding check: it
-explicitly asks the parent to leave `requested_model_policy` unset (omitted or
-`null`) while stating a hard `glm-5.2` requirement. It is not a natural user
-journey; `flash_semantic_model_reference_glm` and
-`flash_natural_parallel_models_high` cover that boundary.
-The child must still be admitted and make its provider request using GLM. This
-distinguishes server-side extraction of authenticated user intent from merely
-echoing a model selector supplied by the parent model. The server's offline
-regression tests additionally verify that one user-intent source is assessed
-once; after bounded provider recovery is exhausted, its failed assessment is
-cached and is not reissued by later tool rounds for the same intent. Cancellation,
-lease loss, or insufficient remaining budget prevents the extra judgment call.
+Retired scripted cases that required rejection despite leaving model policy
+unset tested the old auxiliary interpreter, not the current inheritance contract.
+A prohibition of a different model does not itself prohibit the parent's model.
+The family, version, content-role and actual-child oracles remain; unavailable
+fixed selectors require the canonical typed `invalid_request` receipt and zero
+children. A correct parent answer alone never proves correct child execution.
 The spawn receipt exposes `prepared_model` so the parent can identify the
 runtime-selected model without another lookup. That field is pre-execution
 evidence, not proof of a provider call; the child `LlmRoundCompleted` event
 linked by run ID remains the execution check. A subsequent `agent.get_result`
 is normal retrieval and must not count as a second spawn.
+
+`flash_model_name_is_output` is a negative intent control: a quoted model name
+is the child's requested output, not its executor. It requires an actual
+inherited-model child request and adoption of that child's exact result. Run
+it alongside natural family-name assignment and unavailable-version cases;
+matching an answer string alone is not evidence of correct model binding.
 
 `direct_simple_no_spawn` and `flash_delegate_simple_glm` are the primary
 paired efficiency control. Both ask for the same trivial arithmetic answer;
@@ -115,7 +105,7 @@ case also reports a soft primary-round bound of four: automatic delivery should
 avoid re-fetching sufficient observed results, while inspection, missing or
 truncated output, pagination and recovery remain valid reasons to read results.
 
-`flash_semantic_model_reference_glm` isolates candidate-aware semantic
+`flash_semantic_model_reference_glm` isolates natural-language model
 selection from live websites. The user says `5.2glm` without tool syntax;
 the case requires the authorized `glm-5.2` child to make a real provider call
 and deliver the exact completed marker through parent adoption or a successful
@@ -126,11 +116,21 @@ probe. This is one test of a general selector, not a
 license to add an alias for that string. Run alongside ambiguous, unavailable,
 and source-qualified controls before claiming semantic-selection quality.
 
-`flash_discover_then_delegate_glm` exercises the on-demand authorized Chat
-catalog as a user-facing journey. It requires a real `model_catalog` tool
-result with no catalog error or failed discovery calls, a GLM child provider
-round, and the exact completed child result through adoption or parent-owned
-retrieval. The current oracle does not prove that catalog discovery preceded
+`flash_scoped_child_and_parent` uses a family-only model reference and separately
+assigns work to the child and primary agent, without tool syntax or instructions
+forbidding discovery. Run it only with exactly one authorized GLM candidate
+identity. Its oracle checks actual child inference, adoption, both results,
+zero discovery/file/network tools, and at most three primary rounds. Explicit
+version cases do not establish family-reference quality; this case must pass
+alongside ambiguous and unavailable candidate controls, not replace them.
+
+`flash_discover_then_delegate_glm` exercises authorized Chat availability and
+delegation. A complete supplied catalog can avoid another `model_catalog` call.
+The oracle retains zero failed discovery calls, a real GLM child provider
+round, and exact completed child-result adoption or parent-owned retrieval.
+The explicit-query journey is covered separately by
+`flash_rejected_delegation_preserves_parent_tools`. This availability oracle
+does not prove catalog discovery preceded
 launch or that the observed page contained the selected offering: existing
 tool-name ordering checks cannot bind that specific spawn, and fixed array
 indices would overfit catalog pagination. Those remain coverage gaps, not
@@ -138,11 +138,6 @@ claims made by a passing case. The prompt is plain English; it never supplies an
 ID or tool syntax. Run it only where GLM 5.2 is authorized. The no-file-probe
 checks are an additional UX guard, not proof that every possible probe is
 covered.
-
-`flash_spawn_prohibited_model_fail_closed` is an unhappy-path intent check. A
-user prohibition such as “do not use `glm-5.2`” is not a positive model choice;
-the runtime must keep it unresolved and block the child rather than silently
-inheriting DeepSeek Flash or substituting another model.
 
 `flash_versioned_model_with_independent_parent_task` requires a catalog with a
 unique Qwen 3.7 identity (`qwen3.7-max`). It checks the actual child model,
@@ -183,17 +178,17 @@ round count, cache usage, and total cost in the trace.
 The adoption criterion's `spawn_match` links each result to its required
 model (or its fixed fanout slot), so swapping the children's tasks cannot pass.
 
-`flash_reasoning_phrase_is_subject` and `flash_reasoning_correction` test the
-single semantic judgment rather than a second keyword parser. The former
+`flash_reasoning_phrase_is_subject` and `flash_reasoning_correction` test
+interpretation through the primary's typed proposal, without a keyword parser. The former
 asks a child to explain a quoted phrase about high reasoning and verifies that
 no high-effort child is started; the latter changes high to medium before
 execution and verifies the actual child configuration. Both require a real
 child model round and zero Bash, grep or file-read probes. These are samples of a
 probabilistic interpretation, not proof that every paraphrase is understood;
 run independent variants before claiming reliability. The former's external
-oracle cannot by itself distinguish a correct judge result from a parent that
-later independently chooses the same effective child settings; inspect the
-typed judgment evidence in the session trace before attributing the result.
+oracle establishes the actual child configuration, not the primary's private
+reasoning. Inspect proposal, admission and run-linked provider facts before
+attributing the result; no auxiliary interpretation is required.
 
 `flash_fanout_auto_balanced` is a negative control, not evidence that the
 router works: it asks for Auto Balanced and verifies that the current product

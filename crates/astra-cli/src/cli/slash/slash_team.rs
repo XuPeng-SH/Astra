@@ -1,7 +1,10 @@
 use crate::cli::{
-    cli_config::cli_utils::truncate_str, session::session_state::SessionState, theme,
+    cli_config::cli_args::{TeamArgs, TeamSubcommand},
+    cli_config::cli_utils::truncate_str,
+    session::session_state::SessionState,
+    theme,
 };
-use astra_services::team_persistence::TeamPersistenceService;
+use astra_services::team_persistence::{CreateTeam, TeamPersistenceService, UpdateTeam};
 use crossterm::style::Stylize;
 use std::collections::HashMap;
 
@@ -17,7 +20,7 @@ pub(crate) struct TeamChatRequest {
 pub(crate) async fn resolve_team_run_chat_request(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    team_name_or_id: &str,
+    team_name: &str,
     lead_agent_id: Option<&str>,
     task: &str,
 ) -> Result<TeamChatRequest, String> {
@@ -25,10 +28,25 @@ pub(crate) async fn resolve_team_run_chat_request(
         return Err("Team run task cannot be empty".into());
     }
     let store = crate::cli::http_team_store::HttpTeamStore::new(api, profile);
-    let team = TeamPersistenceService::load_team(&store, "", team_name_or_id)
+    let team = TeamPersistenceService::load_team(&store, "", team_name)
         .await
-        .map_err(|error| format!("failed to load team '{team_name_or_id}': {error}"))?
-        .ok_or_else(|| format!("Team '{team_name_or_id}' not found"))?;
+        .map_err(|error| format!("failed to load team '{team_name}': {error}"))?
+        .ok_or_else(|| format!("Team '{team_name}' not found"))?;
+    let lead = resolve_team_lead_profile(&team, lead_agent_id)?;
+    Ok(TeamChatRequest {
+        message: task.trim().to_string(),
+        selection: astra_services::runs::AgentProfileSelection {
+            team_id: team.team_id,
+            lead_agent_id: Some(lead.agent_id),
+        },
+    })
+}
+
+/// Resolve configuration intent only. Root admission owns current authority.
+pub(crate) fn resolve_team_lead_profile(
+    team: &Team,
+    lead_agent_id: Option<&str>,
+) -> Result<astra_services::coordination::AgentProfile, String> {
     if team.members.is_empty() {
         return Err(format!(
             "Team '{}' has no members. Add a member before starting a lead turn.",
@@ -39,7 +57,7 @@ pub(crate) async fn resolve_team_run_chat_request(
         .members
         .iter()
         .map(|member| astra_services::team_persistence::resolve_member_to_profile(member, &team));
-    let lead = match lead_agent_id {
+    match lead_agent_id {
         Some(id) => profiles
             .find(|profile| profile.agent_id == id.trim())
             .ok_or_else(|| {
@@ -47,7 +65,7 @@ pub(crate) async fn resolve_team_run_chat_request(
                     "lead '{}' is not a member of Team '{}'; use an Agent ID shown by `team info`",
                     id, team.name
                 )
-            })?,
+            }),
         None => {
             let mut coordinators = profiles.filter(|profile| profile.can_delegate);
             let lead = coordinators.next().ok_or_else(|| {
@@ -59,78 +77,15 @@ pub(crate) async fn resolve_team_run_chat_request(
                     team.name
                 ));
             }
-            lead
+            Ok(lead)
         }
-    };
-    Ok(TeamChatRequest {
-        message: task.trim().to_string(),
-        selection: astra_services::runs::AgentProfileSelection {
-            team_id: team.team_id,
-            lead_agent_id: Some(lead.agent_id),
-        },
-    })
+    }
 }
 
-// ── Team Registry ───────────────────────────────────────────────────────
-
-/// The CLI registry stores the persistence owner's canonical definition
-/// directly. There is no second lossy Team/TeamMember schema in the CLI.
+/// Reuse the persistence owner's canonical configuration; the CLI has no
+/// second lossy Team/TeamMember schema or configuration registry.
 pub(crate) type Team = astra_services::team_persistence::TeamDefinition;
 pub(crate) type TeamMember = astra_services::team_persistence::TeamMemberDef;
-
-/// Registry of all defined teams (stored in SessionState).
-#[derive(Clone, Debug)]
-pub(crate) struct TeamRegistry {
-    teams: HashMap<String, Team>,
-    /// Whether we've loaded teams from the persistence store yet.
-    pub store_loaded: bool,
-}
-
-impl Default for TeamRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TeamRegistry {
-    pub fn new() -> Self {
-        Self {
-            teams: HashMap::new(),
-            store_loaded: false,
-        }
-    }
-
-    /// Merge the owner-scoped persistence projection into the registry.
-    ///
-    /// Persistence is authoritative: a remote definition with the same name
-    /// replaces any stale in-process projection, including a definition that
-    /// was present before hydration.
-    pub fn merge_from_store(
-        &mut self,
-        teams: Vec<astra_services::team_persistence::TeamDefinition>,
-    ) {
-        for def in teams {
-            self.teams.insert(def.name.clone(), def);
-        }
-    }
-
-    pub fn get(&self, name: &str) -> Option<&Team> {
-        self.teams.get(name)
-    }
-
-    pub fn list(&self) -> Vec<&Team> {
-        let mut teams: Vec<_> = self.teams.values().collect();
-        teams.sort_by_key(|t| &t.name);
-        teams
-    }
-
-    pub fn remove(&mut self, name: &str) -> Result<(), String> {
-        if self.teams.remove(name).is_none() {
-            return Err(format!("Team '{name}' not found"));
-        }
-        Ok(())
-    }
-}
 
 /// Get current git HEAD commit SHA (best-effort).
 fn git_head_sha() -> Option<String> {
@@ -149,132 +104,128 @@ fn team_member_description(member: &TeamMember) -> String {
         .unwrap_or_else(|| format!("{} agent", member.role))
 }
 
+/// Configuration observations, not execution or completion evidence.
+pub(crate) async fn load_team_configurations(
+    store: &dyn TeamPersistenceService,
+    user_id: &str,
+    name: Option<&str>,
+) -> Result<Vec<Team>, String> {
+    match name {
+        Some(name) => Ok(vec![load_named_team(store, user_id, name).await?]),
+        None => store.list_teams(user_id).await,
+    }
+}
+
+async fn load_named_team(
+    store: &dyn TeamPersistenceService,
+    user_id: &str,
+    name: &str,
+) -> Result<Team, String> {
+    store
+        .load_team(user_id, name)
+        .await?
+        .ok_or_else(|| format!("Team '{name}' not found"))
+}
+
+pub(crate) fn team_configuration_lines<'a>(
+    teams: impl IntoIterator<Item = &'a Team>,
+) -> Vec<String> {
+    let mut teams = teams.into_iter().peekable();
+    let mut lines = vec!["Team definitions · not live execution status".into()];
+    if teams.peek().is_none() {
+        lines.push("No teams defined. Create one with astra team create <name>.".into());
+    }
+    for team in teams {
+        lines.push(String::new());
+        lines.push(format!("{} · {}", team.name, team.description));
+        lines.push(format!("Revision {}", team.revision));
+        if team.members.is_empty() {
+            lines.push("Draft · add members before starting a task.".into());
+        }
+        for member in &team.members {
+            let profile = astra_services::team_persistence::resolve_member_to_profile(member, team);
+            lines.push(format!(
+                "{} · {}",
+                member.role,
+                team_member_description(member)
+            ));
+            lines.push(format!("  Profile ID: {}", profile.agent_id));
+            lines.push(format!(
+                "  Can delegate: {} · read-only: {} · max depth: {}",
+                member.can_delegate, member.read_only, profile.max_delegation_depth
+            ));
+            lines.push(format!(
+                "  Configured model: {}",
+                member
+                    .model_selection
+                    .as_ref()
+                    .map(|model| model.offering_id.as_str())
+                    .unwrap_or("inherit parent")
+            ));
+            if let Some(tools) = &member.allow_tools {
+                lines.push(format!(
+                    "  Allowed tools: {}",
+                    if tools.is_empty() {
+                        "none".into()
+                    } else {
+                        tools.join(", ")
+                    }
+                ));
+            }
+            if !member.skills.is_empty() {
+                lines.push(format!("  Skills: {}", member.skills.join(", ")));
+            }
+            if !member.mcp_servers.is_empty() {
+                lines.push(format!(
+                    "  MCP selection: {} (unsupported at run admission)",
+                    member.mcp_servers.join(", ")
+                ));
+            }
+        }
+        let mut context: Vec<_> = team.context.iter().collect();
+        context.sort_by(|left, right| left.0.cmp(right.0));
+        for (key, value) in context {
+            lines.push(format!("  {key} = {}", truncate_str(value, 60)));
+        }
+        let name = shell_words::quote(&team.name);
+        lines.push(if team.members.is_empty() {
+            format!("Next: astra team add-member {name} <role>")
+        } else {
+            format!("Start: /team run {name} <task>")
+        });
+    }
+    lines
+}
+
 // ── Slash Command Handler ───────────────────────────────────────────────
 
 pub(crate) async fn handle_team_command(
-    arg: &str,
+    args: TeamArgs,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     state: &mut SessionState,
 ) -> Result<(), String> {
-    // Hydrate registry from persistence store on first command
-    if !state.team_registry.store_loaded {
-        let user_id = state
-            .ingestion_user_id
-            .clone()
-            .unwrap_or_else(|| "local".into());
-        let teams = state
-            .team_store
-            .list_teams(&user_id)
-            .await
-            .map_err(|error| format!("failed to hydrate teams: {error}"))?;
-        state.team_registry.merge_from_store(teams);
-        state.team_registry.store_loaded = true;
+    if matches!(args.command, Some(TeamSubcommand::Run(_))) {
+        return Err("Team execution must use the ordinary Chat entrypoint".into());
     }
+    if matches!(args.command, Some(TeamSubcommand::Leave)) {
+        return Err("Use /team leave in the interactive workbench; this one-shot command cannot change a conversation's next-turn selection.".into());
+    }
+    // HTTP persistence binds its authenticated owner; there is no local
+    // collection hydration or second mutable configuration registry.
+    let user_id = state.ingestion_user_id.as_deref().unwrap_or("");
 
-    let mut parts = arg.splitn(2, ' ');
-    let sub = parts.next().unwrap_or("").trim();
-    let sub_arg = parts.next().unwrap_or("").trim();
-
-    match sub {
-        "" | "help" => {
-            eprintln!(
-                "\n{}",
-                "─── Team ───────────────────────────────────────"
-                    .bold()
-                    .magenta()
-            );
-            let teams = state.team_registry.list();
-            let names = teams
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!(
-                "  {:<16} {}",
-                "teams:".dim(),
-                if names.is_empty() {
-                    "(none)".dim().to_string()
-                } else {
-                    names.magenta().to_string()
-                }
-            );
-            eprintln!(
-                "  {:<16} {}",
-                "built-ins:".dim(),
-                "owner-scoped team service".magenta()
-            );
-            eprintln!();
-            eprintln!("  {}", team_subcommands_hint().dim());
-            eprintln!("  {}", "Examples:".dim());
-            eprintln!("    {}", "/team info review".magenta());
-            eprintln!(
-                "    {}",
-                "/team run review --lead-agent-id team-review-reviewer review the latest diff"
-                    .magenta()
-            );
-            eprintln!("    {}", "/team snapshot dev before-refactor".magenta());
-            eprintln!();
+    match args.command {
+        None | Some(TeamSubcommand::List) => {
+            let teams = load_team_configurations(state.team_store.as_ref(), user_id, None).await?;
+            eprintln!("{}", team_configuration_lines(&teams).join("\n"));
+            eprintln!("{}", team_subcommands_hint());
         }
 
-        "list" => {
-            let teams = state.team_registry.list();
-            if teams.is_empty() {
-                eprintln!(
-                    "  {}",
-                    "No teams defined. Use /team create <name> <description>".dim()
-                );
-                return Ok(());
-            }
-            eprintln!(
-                "\n{}",
-                "─── Teams ───────────────────────────────────────────────"
-                    .bold()
-                    .magenta()
-            );
-            for t in &teams {
-                eprintln!(
-                    "\n  {} {}",
-                    t.name.as_str().magenta().bold(),
-                    format!("({})", t.description).dim()
-                );
-                if t.members.is_empty() {
-                    eprintln!("    {}", "No members. Use /team add-member".dim());
-                } else {
-                    for m in &t.members {
-                        let agent_id =
-                            astra_services::team_persistence::resolve_member_to_profile(m, t)
-                                .agent_id;
-                        eprintln!(
-                            "    {} {} [{}] {}",
-                            "•".dim(),
-                            m.role.as_str().green(),
-                            agent_id.dim(),
-                            format!("— {}", team_member_description(m)).dim()
-                        );
-                    }
-                }
-                if !t.context.is_empty() {
-                    eprintln!(
-                        "    {} shared keys: {}",
-                        "📎".to_string().dim(),
-                        t.context
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                            .dim()
-                    );
-                }
-            }
-            eprintln!();
-        }
-
-        "create" => {
-            // /team create <name> [description]
-            let mut parts = sub_arg.splitn(2, ' ');
-            let name = parts.next().unwrap_or("").trim();
-            let rest = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Create(command)) => {
+            let name = command.name.as_str();
+            let description = command.description.join(" ");
+            let rest = description.as_str();
             if name.is_empty() {
                 return Err("Usage: /team create <name> [description]".into());
             }
@@ -283,30 +234,23 @@ pub(crate) async fn handle_team_command(
             } else {
                 rest.to_string()
             };
-            let user_id = state
-                .ingestion_user_id
-                .clone()
-                .unwrap_or_else(|| "local".into());
-            if state.team_registry.get(name).is_some() {
-                return Err(format!("Team '{name}' already exists"));
-            }
-            let now = chrono::Utc::now().to_rfc3339();
-            let definition = Team {
+            let definition = CreateTeam {
                 team_id: uuid::Uuid::new_v4().to_string(),
-                user_id,
                 name: name.to_string(),
                 description,
                 members: Vec::new(),
                 context: HashMap::new(),
-                created_at: now.clone(),
-                updated_at: now,
             };
-            let persisted = state
+            state
                 .team_store
-                .save_team(&definition)
+                .create_team(user_id, &definition)
                 .await
-                .map_err(|error| format!("failed to persist team '{name}': {error}"))?;
-            state.team_registry.merge_from_store(vec![persisted]);
+                .map_err(|error| {
+                    format!(
+                        "failed to persist team '{name}' (ID {}): {error}",
+                        definition.team_id
+                    )
+                })?;
             eprintln!(
                 "  {} Team '{}' created. Add members with /team add-member {} <role> <description>",
                 theme::icon_ok(),
@@ -315,17 +259,7 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        "add-member" => {
-            let crate::cli::cli_config::cli_args::Command::Team(args) =
-                crate::cli::command_router::parse_team_bridge_command(arg)?
-            else {
-                return Err("expected a Team command".into());
-            };
-            let Some(crate::cli::cli_config::cli_args::TeamSubcommand::AddMember(member_args)) =
-                args.command
-            else {
-                return Err("expected add-member arguments".into());
-            };
+        Some(TeamSubcommand::AddMember(member_args)) => {
             let team = member_args.team.as_str();
             let role = member_args.role.as_str();
             let desc = member_args.description.join(" ");
@@ -349,7 +283,7 @@ pub(crate) async fn handle_team_command(
             };
             let member = TeamMember {
                 role: role.to_string(),
-                agent_id: None,
+                agent_id: uuid::Uuid::new_v4().to_string(),
                 system_prompt: Some(if desc.is_empty() {
                     format!("{role} agent")
                 } else {
@@ -362,11 +296,7 @@ pub(crate) async fn handle_team_command(
                 max_delegation_depth: member_args.max_delegation_depth.unwrap_or(0),
                 ..Default::default()
             };
-            let mut definition = state
-                .team_registry
-                .get(team)
-                .cloned()
-                .ok_or_else(|| format!("Team '{team}' not found"))?;
+            let mut definition = load_named_team(state.team_store.as_ref(), user_id, team).await?;
             if definition
                 .members
                 .iter()
@@ -375,12 +305,11 @@ pub(crate) async fn handle_team_command(
                 return Err(format!("Role '{}' already exists in team '{team}'", role));
             }
             definition.members.push(member);
-            let persisted = state
+            state
                 .team_store
-                .save_team(&definition)
+                .update_team(user_id, &definition.team_id, &UpdateTeam::from(&definition))
                 .await
                 .map_err(|error| format!("failed to persist team '{team}': {error}"))?;
-            state.team_registry.merge_from_store(vec![persisted]);
             eprintln!(
                 "  {} Added role '{}' to team '{}'",
                 theme::icon_ok(),
@@ -389,99 +318,45 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        "info" => {
-            let name = sub_arg.trim();
-            if name.is_empty() {
-                return Err("Usage: /team info <name>".into());
-            }
-            match state.team_registry.get(name) {
-                Some(t) => {
-                    eprintln!(
-                        "\n  {} {}",
-                        "Team:".bold(),
-                        t.name.as_str().magenta().bold()
-                    );
-                    eprintln!("  {} {}", "Description:".dim(), t.description);
-                    eprintln!("  {} {}", "Created:".dim(), t.created_at);
-                    eprintln!("\n  {}", "Members:".bold());
-                    for m in &t.members {
-                        let agent_id =
-                            astra_services::team_persistence::resolve_member_to_profile(m, t)
-                                .agent_id;
-                        eprintln!(
-                            "    {} {} [{}] — {}",
-                            "•".dim(),
-                            m.role.as_str().green(),
-                            agent_id.dim(),
-                            team_member_description(m)
-                        );
-                        if !m.skills.is_empty() {
-                            eprintln!("      {} {}", "Skills:".dim(), m.skills.join(", "));
-                        }
-                        if let Some(ref model) = m.model_selection {
-                            eprintln!("      {} {}", "Offering:".dim(), model.offering_id);
-                        }
-                    }
-                    if !t.context.is_empty() {
-                        eprintln!("\n  {}", "Shared Context:".bold());
-                        for (k, v) in &t.context {
-                            let preview = truncate_str(v, 60);
-                            eprintln!("    {} = {}", k.as_str().magenta(), preview);
-                        }
-                    }
-                    eprintln!();
-                }
-                None => {
-                    return Err(format!("Team '{name}' not found"));
-                }
-            }
+        Some(TeamSubcommand::Info(command)) => {
+            let teams =
+                load_team_configurations(state.team_store.as_ref(), user_id, Some(&command.name))
+                    .await?;
+            eprintln!("{}", team_configuration_lines(&teams).join("\n"));
         }
 
-        "delete" => {
-            let name = sub_arg.trim();
+        Some(TeamSubcommand::Delete(command)) => {
+            let name = command.name.as_str();
             if name.is_empty() {
                 return Err("Usage: /team delete <name>".into());
             }
-            if state.team_registry.get(name).is_none() {
-                return Err(format!("Team '{name}' not found"));
-            }
-            let user_id = state
-                .ingestion_user_id
-                .clone()
-                .unwrap_or_else(|| "local".into());
+            let team = load_named_team(state.team_store.as_ref(), user_id, name).await?;
             let deleted = state
                 .team_store
-                .delete_team(&user_id, name)
+                .delete_team(user_id, &team.team_id)
                 .await
                 .map_err(|error| format!("failed to delete team '{name}': {error}"))?;
             if !deleted {
                 return Err(format!("Team '{name}' was not found in persistence store"));
             }
-            state.team_registry.remove(name)?;
             eprintln!("  {} Team '{}' deleted", theme::icon_ok(), name);
         }
 
-        "context" => {
-            // /team context <team> <key> <value>
-            let mut parts = sub_arg.splitn(3, ' ');
-            let team = parts.next().unwrap_or("").trim();
-            let key = parts.next().unwrap_or("").trim();
-            let value = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Context(command)) => {
+            let team = command.team.as_str();
+            let key = command.key.as_str();
+            let context_value = command.value.join(" ");
+            let value = context_value.as_str();
             if team.is_empty() || key.is_empty() {
                 return Err("Usage: /team context <team> <key> <value>".into());
             }
-            let mut candidate = state
-                .team_registry
-                .get(team)
-                .cloned()
-                .ok_or_else(|| format!("Team '{team}' not found"))?;
+            let mut candidate = load_named_team(state.team_store.as_ref(), user_id, team).await?;
             candidate.context.insert(key.to_string(), value.to_string());
-            let persisted = state
+            state
                 .team_store
-                .save_team(&candidate)
+                .update_team(user_id, &candidate.team_id, &UpdateTeam::from(&candidate))
                 .await
                 .map_err(|error| format!("failed to persist team '{team}': {error}"))?;
-            state.team_registry.merge_from_store(vec![persisted]);
             eprintln!(
                 "  {} Set context '{}'='{}' on team '{}'",
                 theme::icon_ok(),
@@ -491,19 +366,14 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        "snapshot" => {
-            // /team snapshot <team> [label]
-            let mut parts = sub_arg.splitn(2, ' ');
-            let name = parts.next().unwrap_or("").trim();
-            let label = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Snapshot(command)) => {
+            let name = command.team.as_str();
+            let snapshot_label = command.label.join(" ");
+            let label = snapshot_label.as_str();
             if name.is_empty() {
                 return Err("Usage: /team snapshot <team> [label]".into());
             }
-            let team_definition = state
-                .team_registry
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("Team '{name}' not found"))?;
+            let team_definition = load_named_team(state.team_store.as_ref(), user_id, name).await?;
 
             let snapshot_id = format!("team-{}-{}", name, chrono::Utc::now().timestamp());
             let git_sha = git_head_sha();
@@ -524,6 +394,7 @@ pub(crate) async fn handle_team_command(
             );
             let snap_record = astra_services::team_persistence::TeamSnapshotRecord {
                 snapshot_id: snapshot_id.clone(),
+                team_id: team_definition.team_id.clone(),
                 team_name: name.to_string(),
                 user_id: team_definition.user_id.clone(),
                 label: snap_label.clone(),
@@ -555,25 +426,23 @@ pub(crate) async fn handle_team_command(
             eprintln!();
         }
 
-        "restore" => {
-            let mut parts = sub_arg.splitn(2, ' ');
-            let name = parts.next().unwrap_or("").trim();
-            let snapshot_id = parts.next().unwrap_or("").trim();
+        Some(TeamSubcommand::Restore(command)) => {
+            let name = command.team.as_str();
+            let snapshot_id = command.snapshot_id.as_str();
             if name.is_empty() || snapshot_id.is_empty() {
                 return Err("Usage: /team restore <team> <snapshot-id>".into());
             }
-            let current = state
-                .team_registry
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("Team '{name}' not found"))?;
+            let current = load_named_team(state.team_store.as_ref(), user_id, name).await?;
             let snap = state
                 .team_store
                 .find_snapshot(snapshot_id, &current.user_id)
                 .await
                 .map_err(|error| format!("failed to load snapshot '{snapshot_id}': {error}"))?
                 .ok_or_else(|| format!("Snapshot '{snapshot_id}' not found"))?;
-            if snap.team_name != name {
+            if snap.snapshot_id != snapshot_id {
+                return Err("Snapshot response does not match the requested identity".into());
+            }
+            if snap.team_id != current.team_id {
                 return Err(format!(
                     "Snapshot '{}' belongs to team '{}', not '{}'",
                     snap.snapshot_id, snap.team_name, name
@@ -583,30 +452,30 @@ pub(crate) async fn handle_team_command(
                 .team_definition_json
                 .as_deref()
                 .ok_or_else(|| "Snapshot has no Team configuration".to_string())?;
-            let mut definition: Team = serde_json::from_str(definition_json)
+            let definition: Team = serde_json::from_str(definition_json)
                 .map_err(|error| format!("invalid snapshot configuration: {error}"))?;
-            if definition.name != current.name || definition.user_id != current.user_id {
+            if definition.team_id != current.team_id || definition.user_id != current.user_id {
                 return Err("Snapshot configuration belongs to another Team or owner".into());
             }
             astra_services::team_persistence::validate_team(&definition)
                 .map_err(|errors| format!("invalid snapshot configuration: {errors:?}"))?;
             // Restore configuration, never historical identity or Git state.
-            definition.team_id = current.team_id;
-            definition.created_at = current.created_at;
-            definition.updated_at = chrono::Utc::now().to_rfc3339();
-            let accepted = state
+            let mut update = UpdateTeam::from(&definition);
+            update.expected_revision = current.revision;
+            state
                 .team_store
-                .save_team(&definition)
+                .update_team(user_id, &current.team_id, &update)
                 .await
                 .map_err(|error| format!("failed to restore Team configuration: {error}"))?;
-            state.team_registry.merge_from_store(vec![accepted]);
             eprintln!(
                 "  {} Team configuration restored; Git and running tasks unchanged.\n",
                 theme::icon_ok()
             );
         }
 
-        _ => return Err(format!("Unknown /team subcommand: '{sub}'")),
+        Some(TeamSubcommand::Run(_) | TeamSubcommand::Leave) => {
+            return Err("Team execution must use the ordinary Chat entrypoint".into());
+        }
     }
     Ok(())
 }
@@ -619,282 +488,351 @@ fn team_subcommands_hint() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Team, TeamMember, TeamRegistry, git_head_sha, team_subcommands_hint};
-    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use super::{Team, TeamMember, git_head_sha, team_subcommands_hint};
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, TestCliProfileIdentityGuard,
+        install_cli_profile_identity_for_test, save_credentials,
+    };
     use crate::cli::session::session_state::SessionState;
+    use astra_services::team_persistence::{CreateTeam, UpdateTeam};
     use std::collections::HashMap;
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-    #[test]
-    fn registry_starts_empty_until_remote_hydration() {
-        let reg = TeamRegistry::new();
-        assert!(reg.list().is_empty());
-        assert!(!reg.store_loaded);
+    async fn handle_team_command(
+        command: &str,
+        api: &astra_thin_client::ThinClient,
+        profile: Option<&str>,
+        state: &mut SessionState,
+    ) -> Result<(), String> {
+        let crate::cli::cli_config::cli_args::Command::Team(args) =
+            crate::cli::command_router::parse_team_bridge_command(command)?
+        else {
+            unreachable!("the Team parser only returns Team commands")
+        };
+        super::handle_team_command(args, api, profile, state).await
     }
 
-    #[test]
-    fn remote_projection_can_be_published_and_deleted() {
-        let mut reg = TeamRegistry::new();
-        reg.merge_from_store(vec![make_team(&["coder"])]);
-        assert!(reg.get("test").is_some());
-        assert_eq!(reg.list().len(), 1);
-
-        reg.remove("test").unwrap();
-        assert!(reg.get("test").is_none());
-    }
-
-    #[test]
-    fn canonical_projection_preserves_member_and_team_fields() {
-        let mut team = make_team(&["coder"]);
-        team.members[0].agent_id = Some("stable-coder".into());
-        team.members[0].mcp_servers = vec!["docs".into()];
-        team.members[0].can_delegate = true;
-        team.members[0].max_delegation_depth = 2;
-
-        let mut reg = TeamRegistry::new();
-        reg.merge_from_store(vec![team.clone()]);
-        let stored = reg.get("test").unwrap();
-        assert_eq!(stored.team_id, team.team_id);
-        assert_eq!(stored.members[0].agent_id, team.members[0].agent_id);
-        assert_eq!(stored.members[0].mcp_servers, team.members[0].mcp_servers);
-        assert_eq!(stored.members[0].can_delegate, team.members[0].can_delegate);
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn failed_team_http_commands_leave_the_published_projection_unchanged() {
-        let _creds_guard = crate::tests::isolate_credentials();
+    fn http_session(
+        server: &MockServer,
+    ) -> (
+        astra_thin_client::ThinClient,
+        SessionState,
+        TestCliProfileIdentityGuard,
+    ) {
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
             "default".into(),
             Profile {
+                account_id: Some("u".into()),
                 access_token: Some("test-token".into()),
                 ..Default::default()
             },
         );
         save_credentials(&creds).unwrap();
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/teams"))
-            .respond_with(wiremock::ResponseTemplate::new(503))
-            .expect(3)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/teams"))
-            .respond_with(wiremock::ResponseTemplate::new(503))
-            .expect(1)
-            .mount(&server)
-            .await;
+        let identity = install_cli_profile_identity_for_test("default", Some("u")).unwrap();
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let original = make_team(&["first"]);
-        let expected = serde_json::to_value(&original).unwrap();
         let mut state = SessionState::default();
+        state.ingestion_user_id = Some("u".into());
         state.team_store =
             std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(&api, None));
-        state.team_registry.merge_from_store(vec![original]);
-        state.team_registry.store_loaded = true;
-        for command in [
-            "create fresh",
-            "add-member test second",
-            "context test key value",
+        (api, state, identity)
+    }
+
+    async fn mock_named_team(server: &MockServer, team: &Team) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/teams/name/{}",
+                urlencoding::encode(&team.name)
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(team))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn team_http_commands_preserve_literals_and_fail_without_retry() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _env_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        let (api, mut state, _identity) = http_session(&server);
+        let mut current = make_team(&["first"]);
+        current.team_id = "stable-team-id".into();
+        current.revision = 7;
+        for (command, verb, endpoint, reads) in [
+            ("create fresh", "POST", "/teams", 0),
+            ("add-member test second", "PUT", "/teams/stable-team-id", 1),
+            ("context test key value", "PUT", "/teams/stable-team-id", 1),
+            ("list", "GET", "/teams", 0),
         ] {
+            if reads != 0 {
+                mock_named_team(&server, &current).await;
+            }
+            Mock::given(method(verb))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
             assert!(
-                super::handle_team_command(command, &api, None, &mut state)
+                handle_team_command(command, &api, None, &mut state)
                     .await
                     .is_err()
             );
-            assert_eq!(
-                serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
-                expected
-            );
-            assert!(state.team_registry.get("fresh").is_none());
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), reads + 1);
+            let request = requests.last().unwrap();
+            assert_eq!(request.method.as_str(), verb);
+            if verb == "PUT" {
+                let input: UpdateTeam = request.body_json().unwrap();
+                assert_eq!(input.expected_revision, current.revision);
+                assert_eq!(input.members[0], current.members[0]);
+            }
+            server.verify().await;
+            server.reset().await;
         }
-        state.team_registry.store_loaded = false;
-        assert!(
-            super::handle_team_command("list", &api, None, &mut state)
-                .await
-                .is_err()
-        );
-        assert!(!state.team_registry.store_loaded);
-        assert_eq!(
-            serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
-            expected
-        );
-        assert_eq!(server.received_requests().await.unwrap().len(), 4);
-    }
 
-    #[test]
-    fn remove_nonexistent_fails() {
-        let mut reg = TeamRegistry::new();
-        assert!(reg.remove("ghost").is_err());
+        current.members.clear();
+        current.name = "fresh team's".into();
+        current.description = "Keep user's exact words".into();
+        for (index, (command, expected)) in [
+            ("create \"fresh team's\" \"Keep user's exact words\"", serde_json::json!({
+                "name": "fresh team's", "description": "Keep user's exact words"
+            })),
+            ("context \"fresh team's\" \"acceptance criteria\" \"Don't change --flags\"", serde_json::json!({
+                "context": {"acceptance criteria": "Don't change --flags"}
+            })),
+            ("add-member \"fresh team's\" \"delivery lead\" --can-delegate --max-delegation-depth 3 -- --can-delegate \"literal description\"", serde_json::json!({
+                "members": [{"role": "delivery lead", "system_prompt": "--can-delegate literal description",
+                    "skills": [], "mcp_servers": [], "can_delegate": true, "max_delegation_depth": 3}]
+            })),
+        ].into_iter().enumerate() {
+            let updating = index != 0;
+            if updating { mock_named_team(&server, &current).await; }
+            let immutable_id = current.team_id.clone();
+            Mock::given(method(if updating { "PUT" } else { "POST" }))
+                .and(path(if updating { format!("/teams/{immutable_id}") } else { "/teams".into() }))
+                .and(body_partial_json(expected))
+                .respond_with(move |request: &Request| {
+                    let mut accepted: serde_json::Value = request.body_json().unwrap();
+                    if updating {
+                        accepted["team_id"] = serde_json::json!(immutable_id);
+                        accepted["revision"] = serde_json::json!(accepted["expected_revision"].as_u64().unwrap() + 1);
+                        accepted.as_object_mut().unwrap().remove("expected_revision");
+                    } else {
+                        accepted["revision"] = serde_json::json!(1);
+                    }
+                    accepted["user_id"] = serde_json::json!("u");
+                    ResponseTemplate::new(200).set_body_json(accepted)
+                }).expect(1).mount(&server).await;
+            handle_team_command(command, &api, None, &mut state).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), if updating { 2 } else { 1 });
+            if updating {
+                let input: UpdateTeam = requests[1].body_json().unwrap();
+                assert_eq!(input.expected_revision, current.revision);
+                assert_eq!(input.name, current.name);
+                assert_eq!(input.description, current.description);
+                if index == 1 { assert_eq!(input.members, current.members); }
+                else {
+                    assert_eq!(input.context, current.context);
+                    assert_eq!(input.members.len(), 1);
+                    assert!(uuid::Uuid::parse_str(&input.members[0].agent_id).is_ok());
+                }
+                current.context = input.context;
+                current.members = input.members;
+                current.revision += 1;
+            } else {
+                let input: CreateTeam = requests[0].body_json().unwrap();
+                assert!(uuid::Uuid::parse_str(&input.team_id).is_ok());
+                assert!(input.members.is_empty());
+                assert!(input.context.is_empty());
+                current.team_id = input.team_id;
+                current.revision = 1;
+            }
+            server.verify().await;
+            server.reset().await;
+        }
+        for command in [
+            "add-member test lead --max-delegation-depth 0",
+            "add-member test lead --max-delegation-depth 3",
+        ] {
+            assert!(crate::cli::command_router::parse_team_bridge_command(command).is_err());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn snapshot_and_cold_restore_preserve_owner_and_configuration() {
+    async fn snapshot_and_cold_restore_preserve_owner_identity_and_current_revision() {
         let _creds_guard = crate::tests::isolate_credentials();
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".into(),
-            Profile {
-                access_token: Some("test-token".into()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-        let server = wiremock::MockServer::start().await;
+        let _env_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        let (api, mut state, _identity) = http_session(&server);
         let mut saved = make_team(&["first"]);
         saved.context.insert("contract".into(), "before".into());
         saved.members[0].mcp_servers = vec!["fixture-mcp".into()];
         saved.members[0].can_delegate = true;
         saved.members[0].max_delegation_depth = 2;
         let snapshot = serde_json::json!({
-            "snapshot_id": "snap-server-identity", "team_name": "test",
+            "snapshot_id": "snap-server-identity", "team_id": saved.team_id, "team_name": saved.name,
             "label": "accepted-label", "git_commit": "not-a-checkout-target",
             "session_id": null, "team_definition_json": serde_json::to_string(&saved).unwrap(),
-            "created_at": "2026-10-03T00:00:00Z",
+            "created_at": "2026-10-03T00:00:00Z"
         });
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/teams"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"teams": [&saved]})),
-            )
+        let snapshot_path = format!("/teams/{}/snapshots", saved.team_id);
+        mock_named_team(&server, &saved).await;
+        Mock::given(method("POST"))
+            .and(path(&snapshot_path))
+            .and(body_partial_json(
+                serde_json::json!({"label": "local-label"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&snapshot))
             .expect(1)
             .mount(&server)
             .await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/teams/test/snapshots"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&snapshot))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let store =
-            std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(&api, None));
-        let mut initial = SessionState::default();
-        initial.team_store = store.clone();
-        super::handle_team_command("snapshot test local-label", &api, None, &mut initial)
+        let head_before = git_head_sha();
+        handle_team_command("snapshot test local-label", &api, None, &mut state)
             .await
             .unwrap();
-        assert_eq!(initial.team_registry.get("test").unwrap().user_id, "u");
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        server.verify().await;
         server.reset().await;
 
-        let mut current = make_team(&["second"]);
+        let mut current = saved.clone();
+        current.name = "renamed".into();
+        current.revision = 9;
+        current.members = make_team(&["second"]).members;
         current.context.insert("contract".into(), "after".into());
-        let mut expected = saved.clone();
-        expected.team_id = current.team_id.clone();
-        expected.created_at = current.created_at.clone();
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/teams"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"teams": [&current]})),
+        let mut update = UpdateTeam::from(&saved);
+        update.expected_revision = current.revision;
+        let mut accepted = saved.clone();
+        accepted.revision = current.revision + 1;
+        // A cold session reads current configuration once; historical revision is not the CAS.
+        let (_, mut cold_state, _cold_identity) = http_session(&server);
+        for status in [200, 409, 503] {
+            mock_named_team(&server, &current).await;
+            Mock::given(method("GET"))
+                .and(path("/teams/snapshots/snap-server-identity"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&snapshot))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path(format!("/teams/{}", current.team_id)))
+                .and(body_json(serde_json::to_value(&update).unwrap()))
+                .respond_with(ResponseTemplate::new(status).set_body_json(&accepted))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = handle_team_command(
+                "restore renamed snap-server-identity",
+                &api,
+                None,
+                &mut cold_state,
             )
-            .expect(1)
-            .mount(&server)
             .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/teams/snapshots/snap-server-identity",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&snapshot))
-            .expect(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/teams"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({
-                "context": saved.context, "members": saved.members,
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&expected))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut state = SessionState::default();
-        state.team_store = store;
-        super::handle_team_command("restore test snap-server-identity", &api, None, &mut state)
-            .await
-            .unwrap();
-        let expected_json = serde_json::to_value(&expected).unwrap();
-        assert_eq!(
-            serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
-            expected_json
-        );
-        assert_ne!(expected.team_id, saved.team_id);
-        assert_eq!(server.received_requests().await.unwrap().len(), 3);
-        server.reset().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/teams/snapshots/snap-server-identity",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&snapshot))
-            .expect(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(503))
-            .expect(2)
-            .mount(&server)
-            .await;
-        for command in ["restore test snap-server-identity", "snapshot test failed"] {
-            assert!(
-                super::handle_team_command(command, &api, None, &mut state)
-                    .await
-                    .is_err()
+            assert_eq!(result.is_ok(), status == 200, "status={status}");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                3,
+                "no retry or readback"
             );
             assert_eq!(
-                serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
-                expected_json
+                git_head_sha(),
+                head_before,
+                "restore must not check out snapshot Git state"
             );
+            server.verify().await;
+            server.reset().await;
         }
-        assert_eq!(server.received_requests().await.unwrap().len(), 3);
-        server.reset().await;
 
-        let mut wrong_owner = saved.clone();
-        wrong_owner.user_id = "another-owner".into();
-        for (team_name, definition_json) in [
-            ("test", None),
-            ("test", Some("{".into())),
-            ("test", Some(serde_json::to_string(&wrong_owner).unwrap())),
-            ("another-team", Some(serde_json::to_string(&saved).unwrap())),
+        // Same-name recreation / foreign snapshots / malformed saved definitions never write.
+        let mut foreign = saved.clone();
+        foreign.user_id = "another-owner".into();
+        let mut recreated = saved.clone();
+        recreated.team_id = "deleted-team-id".into();
+        for (returned_id, envelope_id, definition) in [
+            (
+                "different-snapshot",
+                current.team_id.as_str(),
+                Some(serde_json::to_string(&saved).unwrap()),
+            ),
+            ("snap-server-identity", current.team_id.as_str(), None),
+            (
+                "snap-server-identity",
+                current.team_id.as_str(),
+                Some("{".into()),
+            ),
+            (
+                "snap-server-identity",
+                current.team_id.as_str(),
+                Some(serde_json::to_string(&foreign).unwrap()),
+            ),
+            (
+                "snap-server-identity",
+                current.team_id.as_str(),
+                Some(serde_json::to_string(&recreated).unwrap()),
+            ),
+            (
+                "snap-server-identity",
+                "deleted-team-id",
+                Some(serde_json::to_string(&saved).unwrap()),
+            ),
         ] {
             let mut invalid = snapshot.clone();
-            invalid["team_name"] = serde_json::json!(team_name);
-            invalid["team_definition_json"] = serde_json::json!(definition_json);
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path(
-                    "/teams/snapshots/snap-server-identity",
-                ))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&invalid))
+            invalid["snapshot_id"] = serde_json::json!(returned_id);
+            invalid["team_id"] = serde_json::json!(envelope_id);
+            invalid["team_definition_json"] = serde_json::json!(definition);
+            mock_named_team(&server, &current).await;
+            Mock::given(method("GET"))
+                .and(path("/teams/snapshots/snap-server-identity"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(invalid))
                 .expect(1)
                 .mount(&server)
                 .await;
             assert!(
-                super::handle_team_command(
-                    "restore test snap-server-identity",
+                handle_team_command(
+                    "restore renamed snap-server-identity",
                     &api,
                     None,
-                    &mut state
+                    &mut cold_state
                 )
                 .await
                 .is_err()
             );
-            assert_eq!(
-                serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
-                expected_json
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method.as_str() == "GET")
             );
-            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            server.verify().await;
             server.reset().await;
         }
+
+        mock_named_team(&server, &current).await;
+        Mock::given(method("POST"))
+            .and(path(&snapshot_path))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            handle_team_command("snapshot renamed failed", &api, None, &mut cold_state)
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        server.verify().await;
     }
 
     // ── Coordination tests ──────────────────────────────────────────
 
     fn make_team(roles: &[&str]) -> Team {
-        let now = "2024-01-01T00:00:00Z".to_string();
         Team {
             team_id: uuid::Uuid::new_v4().to_string(),
             user_id: "u".into(),
@@ -904,7 +842,7 @@ mod tests {
                 .iter()
                 .map(|r| TeamMember {
                     role: r.to_string(),
-                    agent_id: None,
+                    agent_id: format!("member-{r}"),
                     system_prompt: Some(format!("{r} agent")),
                     skills: vec![],
                     model_selection: None,
@@ -915,8 +853,7 @@ mod tests {
                 })
                 .collect(),
             context: HashMap::new(),
-            created_at: now.clone(),
-            updated_at: now,
+            revision: 1,
         }
     }
 
@@ -946,17 +883,8 @@ mod tests {
     #[tokio::test]
     async fn native_team_lead_selection_uses_permissions_and_one_configuration_read() {
         let _creds_guard = crate::tests::isolate_credentials();
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".into(),
-            Profile {
-                access_token: Some("test-token".into()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
         let server = wiremock::MockServer::start().await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (api, _state, _identity) = http_session(&server);
         for (permissions, requested, expected) in [
             ([false, true], None, Some("member-1")),
             ([false, false], None, None),
@@ -968,12 +896,12 @@ mod tests {
         ] {
             let mut team = make_team(&["coordinator-looking", "ordinary-looking"]);
             for (index, member) in team.members.iter_mut().enumerate() {
-                member.agent_id = Some(format!("member-{index}"));
+                member.agent_id = format!("member-{index}");
                 member.can_delegate = permissions[index];
                 member.max_delegation_depth = u32::from(permissions[index]);
             }
             wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path("/teams/test"))
+                .and(wiremock::matchers::path("/teams/name/test"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&team))
                 .expect(1)
                 .mount(&server)
@@ -995,67 +923,5 @@ mod tests {
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
             server.reset().await;
         }
-    }
-
-    #[test]
-    fn merge_from_store_replaces_stale_same_name() {
-        use astra_services::team_persistence::{TeamDefinition, TeamMemberDef};
-        let mut reg = TeamRegistry::new();
-
-        let foreign = TeamDefinition {
-            team_id: "foreign-id".into(),
-            user_id: "u".into(),
-            name: "review".into(),
-            description: "foreign review".into(),
-            members: vec![],
-            context: HashMap::new(),
-            created_at: "2025-01-01T00:00:00Z".into(),
-            updated_at: "2025-01-01T00:00:00Z".into(),
-        };
-        let mut stale = foreign.clone();
-        stale.team_id = "stale-id".into();
-        stale.description = "stale local projection".into();
-        reg.merge_from_store(vec![stale]);
-        let custom = TeamDefinition {
-            team_id: "custom-id".into(),
-            user_id: "u".into(),
-            name: "from-store".into(),
-            description: "loaded from store".into(),
-            members: vec![TeamMemberDef {
-                role: "worker".into(),
-                agent_id: None,
-                system_prompt: Some("does work".into()),
-                skills: vec![],
-                model_selection: None,
-                mcp_servers: vec![],
-                can_delegate: false,
-                max_delegation_depth: 0,
-                ..Default::default()
-            }],
-            context: HashMap::new(),
-            created_at: "2025-01-01T00:00:00Z".into(),
-            updated_at: "2025-01-01T00:00:00Z".into(),
-        };
-
-        reg.merge_from_store(vec![foreign, custom]);
-
-        // Remote persistence is authoritative over the stale projection.
-        let review = reg.get("review").unwrap();
-        assert_eq!(review.team_id, "foreign-id");
-
-        // "from-store" should be loaded
-        let loaded = reg.get("from-store").unwrap();
-        assert_eq!(loaded.team_id, "custom-id");
-        assert_eq!(loaded.members.len(), 1);
-        assert_eq!(
-            loaded.members[0].system_prompt.as_deref(),
-            Some("does work")
-        );
-    }
-
-    #[test]
-    fn store_loaded_flag_default_false() {
-        let reg = TeamRegistry::new();
-        assert!(!reg.store_loaded);
     }
 }

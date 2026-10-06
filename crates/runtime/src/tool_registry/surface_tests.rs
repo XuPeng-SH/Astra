@@ -99,6 +99,7 @@ fn without_descriptions(mut value: Value) -> Value {
         match value {
             Value::Object(object) => {
                 object.remove("description");
+                object.remove("x-astra-discovery-summary");
                 for child in object.values_mut() {
                     strip(child);
                 }
@@ -204,10 +205,11 @@ fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
         .find(|schema| tool_schema_name(schema) == Some("introspect"))
         .unwrap();
     assert!(
-        introspect["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("select:model_catalog")
+        surface
+            .deferred_manifest_with_context_window(None)
+            .expect("deferred catalog discovery")
+            .names
+            .contains(&"model_catalog".to_string())
     );
     let description = introspect["function"]["description"].as_str().unwrap();
     assert!(!description.contains("facet=models"));
@@ -274,7 +276,7 @@ fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
         contract["description"]
             .as_str()
             .unwrap()
-            .contains("Authorized Chat model availability/comparison")
+            .contains("Authorized Chat availability/comparison or unknown choices")
     );
     assert!(contract["parameters"]["properties"]["limit"].is_object());
     assert_eq!(contract["parameters"]["properties"]["limit"]["maximum"], 32);
@@ -312,7 +314,6 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
         "ask_user",
         "tool_search",
         "introspect",
-        "memory",
         "bash",
         "read_file",
         "write_file",
@@ -325,6 +326,9 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
     }
     for name in [
         "agent_fanout",
+        "memory",
+        "reflect",
+        "notify",
         "glob",
         "worktree",
         "inspect_work_plan",
@@ -382,15 +386,9 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
             .iter()
             .find(|schema| tool_schema_name(schema) == Some(name))
             .unwrap_or_else(|| panic!("resident schema {name}"));
-        let mut full_structure = without_descriptions(full.clone());
+        let full_structure = without_descriptions(full.clone());
         if name == "start_work" {
-            assert!(
-                full_structure["function"]["parameters"]["x-astra-discovery-summary"].is_string()
-            );
-            full_structure["function"]["parameters"]
-                .as_object_mut()
-                .unwrap()
-                .remove("x-astra-discovery-summary");
+            assert!(full["function"]["parameters"]["x-astra-discovery-summary"].is_string());
         }
         assert_eq!(
             without_descriptions(compact.clone()),
@@ -419,6 +417,18 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
     assert_eq!(
         start["function"]["parameters"]["properties"]["tasks"]["description"], *task_description,
         "resident projection must retain the canonical distinction between outcomes and procedural steps"
+    );
+    let prerequisite_path =
+        "/function/parameters/properties/tasks/items/properties/after_initial_tasks/description";
+    assert!(
+        full_start
+            .pointer(prerequisite_path)
+            .is_some_and(Value::is_string)
+    );
+    assert_eq!(
+        start.pointer(prerequisite_path),
+        full_start.pointer(prerequisite_path),
+        "resident input must explain how to declare dependencies, not only name the field"
     );
     assert!(description.contains("One Work graph"));
     assert!(description.contains("no repeat start"));
@@ -469,14 +479,47 @@ fn resident_settlement_schema_accepts_typed_direct_input_and_rejects_stale_shape
 
 #[test]
 fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
-    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let surface = ToolSurface::build(
+        catalog_schemas(),
+        &ToolSurfaceConfig {
+            pinned_tools: vec!["memory".into()],
+        },
+        &[],
+    );
     let resident = surface.always_load_schemas();
     let agent_description = find(&resident, "agent")["function"]["description"]
         .as_str()
         .expect("resident agent description");
-    assert!(agent_description.contains("agent(wait) yields for automatic results"));
-    assert!(agent_description.contains("no re-fetch if sufficient"));
+    assert!(agent_description.contains("Wait"));
+    assert!(agent_description.contains("No substitution"));
+    assert!(agent_description.contains("Omit unasked model policy"));
     let full = catalog_schemas();
+    let policy =
+        &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["requested_model_policy"]
+            ["description"],
+        policy["x-astra-discovery-summary"],
+        "resident projection must retain model-control semantics"
+    );
+    let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
+    assert!(summary.contains("Not task/output text"));
+    assert!(summary.contains("omit unless asked"));
+    let reasoning = &find(&full, "agent")["function"]["parameters"]["properties"]["reasoning"];
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["reasoning"]["description"],
+        reasoning["x-astra-discovery-summary"]
+    );
+    assert!(
+        reasoning["x-astra-discovery-summary"]
+            .as_str()
+            .unwrap()
+            .contains("Omit outside user-requested scope")
+    );
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],
+        find(&full, "agent")["function"]["parameters"]["properties"]["prompt"]["x-astra-discovery-summary"]
+    );
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
             .iter()
@@ -544,9 +587,9 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .as_str()
         .unwrap();
     for constraint in [
-        "Exact directory ID",
-        "explore=no shell(default)",
-        "task requests shell",
+        "Directory: exact ID required",
+        "absent: omit (read-only)",
+        "No file discovery",
     ] {
         assert!(profile.contains(constraint), "{profile}");
     }
@@ -554,7 +597,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("runtime binds requested models")
+            .contains("launch≠done")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
@@ -575,7 +618,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     }
     for (field, value) in [
         ("model", json!("arbitrary-model")),
-        ("requested_model_policy", json!({"mode": "inherit"})),
+        ("unknown_model_policy", json!({"mode": "inherit"})),
     ] {
         let mut arguments = json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"});
         arguments[field] = value;
@@ -596,7 +639,12 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     assert!(
         agent_params["properties"]
             .get("requested_model_policy")
-            .is_none()
+            .is_some()
+    );
+    assert_eq!(
+        agent_params["properties"]["requested_model_policy"]["oneOf"][1]["properties"]["selector"]
+            ["oneOf"][1]["properties"]["source"]["description"],
+        "Exact provider/access_label."
     );
     assert!(agent_params["properties"].get("agent_id").is_some());
     assert!(
@@ -644,6 +692,11 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .is_some()
     );
     let full_agent = find(&full, "agent");
+    let child_brief = agent["function"]["parameters"]["properties"]["prompt"]["description"]
+        .as_str()
+        .expect("resident child brief guidance");
+    assert!(child_brief.contains("Exact output"));
+    assert!(child_brief.contains("parent uses model/status receipts"));
     assert!(
         full_agent["function"]["parameters"]["properties"]
             .get("requested_model_policy")
@@ -700,7 +753,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             &advanced_spawn,
             agent,
         )
-        .is_err()
+        .is_ok()
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent",
@@ -781,7 +834,13 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
 
 #[test]
 fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_them() {
-    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let surface = ToolSurface::build(
+        catalog_schemas(),
+        &ToolSurfaceConfig {
+            pinned_tools: vec!["memory".into(), "reflect".into()],
+        },
+        &[],
+    );
     let resident = surface.always_load_schemas();
     let full = catalog_schemas();
     fn find<'a>(schemas: &'a [Value], name: &str) -> &'a Value {
@@ -939,15 +998,8 @@ fn resident_schemas_keep_structure_but_drop_catalog_prose() {
             .as_object()
             .unwrap_or_else(|| panic!("resident schema {name} properties"));
         for (field, property) in properties {
-            let mut compact_property = property.clone();
-            if name == "start_work" && field == "tasks" {
-                compact_property
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("description");
-            }
             assert_only_producer_parameter_descriptions(
-                &compact_property,
+                property,
                 &canonical_parameters[field],
                 &format!("{name}.{field}"),
             );
@@ -1191,7 +1243,7 @@ fn web_without_file_environment_provider_filters_workspace_executor_candidates()
         );
     let final_names: std::collections::BTreeSet<String> = names(&filtered).into_iter().collect();
 
-    for visible in ["ask_user", "memory", "tool_search"] {
+    for visible in ["ask_user", "introspect", "tool_search"] {
         assert!(
             final_names.contains(visible),
             "{visible} should remain visible without a file-environment provider"
@@ -1400,7 +1452,7 @@ fn surface_partitions_static_tools_and_excludes_request_scoped_tools() {
 }
 
 #[test]
-fn observation_recovery_and_reflection_are_eager() {
+fn observation_recovery_is_eager_and_reflection_can_be_pinned() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
@@ -1414,8 +1466,8 @@ fn observation_recovery_and_reflection_are_eager() {
 
     assert!(always_load.contains("introspect"));
     assert!(!deferred.contains("introspect"));
-    assert!(always_load.contains("reflect"));
-    assert!(!deferred.contains("reflect"));
+    assert!(!always_load.contains("reflect"));
+    assert!(deferred.contains("reflect"));
 
     let introspect = surface
         .always_load_schemas()
@@ -1435,7 +1487,7 @@ fn observation_recovery_and_reflection_are_eager() {
     );
     let description = introspect["function"]["description"].as_str().unwrap();
     assert!(description.contains("question=label"));
-    assert!(description.contains("artifact=handle; never both"));
+    assert!(description.contains("artifact=handle; not both"));
     for field in ["explain", "artifact", "offset", "max_bytes"] {
         assert!(
             properties.get(field).is_some(),
@@ -1443,11 +1495,18 @@ fn observation_recovery_and_reflection_are_eager() {
         );
     }
 
-    let reflect = surface
+    let pinned = ToolSurface::build(
+        catalog_schemas(),
+        &ToolSurfaceConfig {
+            pinned_tools: vec!["reflect".into()],
+        },
+        &[],
+    );
+    let reflect = pinned
         .always_load_schemas()
         .into_iter()
         .find(|schema| schema["function"]["name"] == "reflect")
-        .expect("reflect observation schema must be eager");
+        .expect("pinned reflect observation schema must be eager");
     let description = reflect["function"]["description"].as_str().unwrap();
     assert!(description.contains("Session history"));
     assert!(description.contains("Exact run: Explain"));
@@ -1463,7 +1522,7 @@ fn observation_recovery_and_reflection_are_eager() {
         .deferred_manifest_with_context_window(Some(200_000))
         .expect("default surface should still have other deferred tools");
     assert!(!manifest.names.iter().any(|name| name == "introspect"));
-    assert!(!manifest.names.iter().any(|name| name == "reflect"));
+    assert!(manifest.names.iter().any(|name| name == "reflect"));
 }
 
 #[test]

@@ -424,7 +424,7 @@ impl BottomPaneView for InfoView {
                 self.scroll =
                     (self.scroll + max_visible).min(self.lines.len().saturating_sub(max_visible));
             }
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Esc => {
                 self.completed = true;
             }
             _ => {}

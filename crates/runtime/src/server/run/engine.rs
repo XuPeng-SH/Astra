@@ -551,6 +551,8 @@ pub struct RunStartContext {
     pub(crate) child_runtime_id: Option<String>,
     pub execution_restrictions: Option<astra_services::runs::DurableExecutionRestrictions>,
     pub admission_source: Option<astra_services::runs::DurableAdmissionSource>,
+    pub(crate) execution_authentication:
+        Option<astra_services::auth::ExecutionAuthenticationProvenance>,
     pub agent_binding_ids: Vec<String>,
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
@@ -602,6 +604,7 @@ impl Default for RunStartContext {
             child_runtime_id: None,
             execution_restrictions: None,
             admission_source: None,
+            execution_authentication: None,
             agent_binding_ids: Vec::new(),
             agent_binding_id: None,
             agent_binding_name: None,
@@ -637,18 +640,11 @@ pub(crate) struct RunGenerationControls {
 pub(crate) fn durable_run_generation_controls(
     run: &DurableRunRecord,
 ) -> Result<RunGenerationControls, String> {
-    let mut started = run
-        .events
-        .iter()
-        .filter(|event| event["event_type"] == "run_started");
-    let event = started
-        .next()
-        .ok_or_else(|| "durable run has no start event".to_string())?;
-    if started.next().is_some() {
-        return Err("durable run has conflicting start events".to_string());
-    }
-    let value = event
-        .pointer("/data/generation_controls")
+    let admission = run
+        .original_admission_data()
+        .map_err(|error| error.to_string())?;
+    let value = admission
+        .get("generation_controls")
         .ok_or_else(|| "durable run is missing generation controls".to_string())?;
     if !value
         .as_object()
@@ -676,17 +672,10 @@ pub(crate) fn durable_run_agent_profiles(
     run: &DurableRunRecord,
     owner_user_id: &str,
 ) -> Result<Option<Arc<astra_services::runs::AgentProfileSnapshot>>, String> {
-    let mut started = run
-        .events
-        .iter()
-        .filter(|event| event["event_type"] == "run_started");
-    let event = started
-        .next()
-        .ok_or_else(|| "durable run has no start event".to_string())?;
-    if started.next().is_some() {
-        return Err("durable run has conflicting start events".into());
-    }
-    let Some(value) = event.pointer("/data/admitted_agent_profiles") else {
+    let admission = run
+        .original_admission_data()
+        .map_err(|error| error.to_string())?;
+    let Some(value) = admission.get("admitted_agent_profiles") else {
         return Ok(None);
     };
     let snapshot: astra_services::runs::AgentProfileSnapshot =
@@ -705,12 +694,10 @@ pub(crate) fn durable_run_profile_authority(
         return Err("profile authority belongs to another run owner".into());
     }
     let snapshot = durable_run_agent_profiles(run, owner_user_id)?;
-    let event = run
-        .events
-        .iter()
-        .find(|event| event["event_type"] == "run_started")
-        .ok_or("durable run has no start event")?;
-    let authority: ParentProfileAuthority = match event.pointer("/data/profile_authority") {
+    let admission = run
+        .original_admission_data()
+        .map_err(|error| error.to_string())?;
+    let authority: ParentProfileAuthority = match admission.get("profile_authority") {
         Some(value) => serde_json::from_value(value.clone())
             .map_err(|_| "durable profile authority is malformed")?,
         None => return Err("durable run is missing profile authority".into()),
@@ -776,18 +763,11 @@ pub(crate) fn durable_run_profile_authority(
 pub(crate) fn durable_run_requested_model_policy(
     run: &DurableRunRecord,
 ) -> Result<Option<astra_turn_types::RequestedModelPolicy>, String> {
-    let mut started = run
-        .events
-        .iter()
-        .filter(|event| event["event_type"] == "run_started");
-    let event = started
-        .next()
-        .ok_or_else(|| "durable run has no start event".to_string())?;
-    if started.next().is_some() {
-        return Err("durable run has conflicting start events".into());
-    }
-    let value = event
-        .pointer("/data/requested_model_policy")
+    let admission = run
+        .original_admission_data()
+        .map_err(|error| error.to_string())?;
+    let value = admission
+        .get("requested_model_policy")
         .ok_or_else(|| "durable run is missing requested model policy".to_string())?;
     if value.is_null() {
         return Ok(None);
@@ -800,18 +780,9 @@ pub(crate) fn durable_run_requested_model_policy(
 pub(crate) fn durable_run_delegated_model_requirements(
     run: &DurableRunRecord,
 ) -> Result<Option<astra_turn_types::DelegationIntentRequirements>, String> {
-    let mut started = run
-        .events
-        .iter()
-        .filter(|event| event["event_type"] == "run_started");
-    let event = started
-        .next()
-        .ok_or_else(|| "durable run has no start event".to_string())?;
-    if started.next().is_some() {
-        return Err("durable run has conflicting start events".into());
-    }
-    event
-        .pointer("/data/delegated_model_requirements")
+    run.original_admission_data()
+        .map_err(|error| error.to_string())?
+        .get("delegated_model_requirements")
         .map(|value| {
             let requirements: astra_turn_types::DelegationIntentRequirements =
                 serde_json::from_value(value.clone())
@@ -884,11 +855,18 @@ fn inherit_parent_run_identity(
         _ => Err("durable parent run contains an incomplete model identity".to_string()),
     }?;
 
+    let parent_authentication = parent
+        .execution_authentication()
+        .map_err(|_| "durable parent authentication provenance is malformed")?;
+    match (&context.execution_authentication, parent_authentication) {
+        (None, parent_authentication) => context.execution_authentication = parent_authentication,
+        (Some(child), Some(parent)) if child == &parent => {}
+        _ => return Err("child authentication provenance must match its durable parent".into()),
+    }
     let parent_provider_run_owner = parent
-        .events
-        .iter()
-        .find(|event| event["event_type"] == "run_started")
-        .and_then(|event| event.pointer("/data/provider_run_owner"))
+        .original_admission_data()
+        .map_err(|error| error.to_string())?
+        .get("provider_run_owner")
         .cloned()
         .map(serde_json::from_value::<astra_services::runs::ProviderRunOwner>)
         .transpose()
@@ -981,23 +959,19 @@ pub(crate) fn effective_requested_interaction_mode(
     })
 }
 
-/// Read the immutable interaction authority recorded at run start. Records
-/// created before the field became mandatory, and malformed records, close to
-/// explicit Headless rather than borrowing a newer parent's approval owner.
+/// Read the immutable interaction authority recorded at run start. Missing or
+/// malformed facts cannot borrow another run's approval owner or default mode.
 pub(crate) fn durable_run_effective_interaction_mode(
     run: &DurableRunRecord,
-) -> RequestedTurnInteractionMode {
-    run.events
-        .iter()
-        .rev()
-        .find(|event| {
-            event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_started")
-        })
-        .and_then(|event| event.pointer("/data/interaction_mode"))
-        .and_then(|value| {
-            serde_json::from_value::<RequestedTurnInteractionMode>(value.clone()).ok()
-        })
-        .unwrap_or(RequestedTurnInteractionMode::Headless)
+) -> Result<RequestedTurnInteractionMode, String> {
+    let admission = run
+        .original_admission_data()
+        .map_err(|error| error.to_string())?;
+    let value = admission
+        .get("interaction_mode")
+        .ok_or("durable run is missing its interaction mode")?;
+    serde_json::from_value(value.clone())
+        .map_err(|_| "durable run has an invalid interaction mode".into())
 }
 
 fn runtime_profile_label(profile: RuntimeProfileRequest) -> &'static str {
@@ -1162,6 +1136,7 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         for (key, value) in metadata {
             if key != "execution_restrictions"
                 && key != "admission_source"
+                && key != "execution_authentication"
                 && key != "generation_controls"
                 && key != "delegated_model_requirements"
                 && key != "child_runtime_id"
@@ -1198,6 +1173,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         data.insert(
             "admission_source".into(),
             serde_json::to_value(source).expect("typed admission source serializes"),
+        );
+    }
+    if let Some(authentication) = context.execution_authentication.as_ref() {
+        data.insert(
+            "execution_authentication".into(),
+            serde_json::to_value(authentication).expect("authentication provenance serializes"),
         );
     }
     if let Some(controls) = context.generation_controls.as_ref() {
@@ -2041,6 +2022,13 @@ impl RunEngine {
         } else {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
+        if context
+            .execution_authentication
+            .as_ref()
+            .is_some_and(|authentication| authentication.user_id() != user_id)
+        {
+            return Err("execution authentication provenance does not own the run".into());
+        }
         let (model_offering_id, resolved_model_name) = durable_model_identity(&context)?;
         let runtime_profile = context
             .runtime_profile
@@ -3496,6 +3484,29 @@ impl RunEngine {
             .await
     }
 
+    /// Preparation failed before dispatch. Preserve the exact continuation
+    /// using the existing recovery reconciliation, not a new terminal claim.
+    pub(crate) async fn park_resumed_execution(
+        &self,
+        resumed: &astra_services::session_context_coordinator::ResumedExecutionTurn,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        let mut run = resumed.run().clone();
+        run.checkpoint_json = Some(resumed.checkpoint().checkpoint_json.clone());
+        let claimed_from_generation = resumed
+            .receipt()
+            .run_generation
+            .checked_sub(1)
+            .ok_or_else(|| "invalid resumed execution generation".to_string())?;
+        self.store
+            .reconcile_execution_handoff(&astra_services::runs::RecoveryClaim {
+                run,
+                claimed_from_generation,
+                has_graceful_resume_checkpoint: false,
+            })
+            .await
+            .map(|outcome| outcome.map(|outcome| outcome.run))
+    }
+
     /// Load the current durable display projection for a run.
     pub async fn load_run_projection(
         &self,
@@ -4604,16 +4615,18 @@ impl RunEngine {
             .await
     }
 
-    /// Find the latest root Explain Analyze run from the store's
-    /// durable authority. This deliberately bypasses the bounded UI tree.
-    pub async fn find_latest_explain_analyze_root(
+    /// Find the latest admitted root run from the store's durable authority.
+    /// A supplied current root is a strict admission-order upper bound and
+    /// must belong to this user and session; invalid bounds yield no selection.
+    /// This deliberately bypasses the bounded UI tree and Explain eligibility.
+    pub async fn find_latest_root_run(
         &self,
         user_id: &str,
         session_id: &str,
-        excluded_root: Option<&str>,
+        current_root: Option<&str>,
     ) -> Result<Option<(String, u64)>, String> {
         self.store
-            .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
+            .find_latest_root_run(user_id, session_id, current_root)
             .await
     }
 
@@ -8116,14 +8129,14 @@ mod tests {
                 .await
         }
 
-        async fn find_latest_explain_analyze_root(
+        async fn find_latest_root_run(
             &self,
             user_id: &str,
             session_id: &str,
-            excluded_root: Option<&str>,
+            current_root: Option<&str>,
         ) -> Result<Option<(String, u64)>, String> {
             self.inner
-                .find_latest_explain_analyze_root(user_id, session_id, excluded_root)
+                .find_latest_root_run(user_id, session_id, current_root)
                 .await
         }
 
@@ -8252,28 +8265,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_or_malformed_durable_mode_fails_closed_to_headless() {
+    async fn missing_or_malformed_durable_mode_is_rejected() {
         let engine = test_engine();
         engine
-            .start_run("legacy", "user-1", "sess-1")
+            .start_run("mode-run", "user-1", "sess-1")
             .await
             .unwrap();
-        let mut run = engine.load_run("user-1", "legacy").await.unwrap().unwrap();
+        let mut run = engine
+            .load_run("user-1", "mode-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable_run_effective_interaction_mode(&run).unwrap(),
+            RequestedTurnInteractionMode::Headless
+        );
 
         run.events[0]["data"]
             .as_object_mut()
             .unwrap()
             .remove("interaction_mode");
-        assert_eq!(
-            durable_run_effective_interaction_mode(&run),
-            RequestedTurnInteractionMode::Headless
-        );
+        assert!(durable_run_effective_interaction_mode(&run).is_err());
 
         run.events[0]["data"]["interaction_mode"] = serde_json::json!("unknown");
-        assert_eq!(
-            durable_run_effective_interaction_mode(&run),
-            RequestedTurnInteractionMode::Headless
-        );
+        assert!(durable_run_effective_interaction_mode(&run).is_err());
+        run.events[0]["data"]["interaction_mode"] = serde_json::json!("headless");
+        run.events.push(run.events[0].clone());
+        assert!(durable_run_effective_interaction_mode(&run).is_err());
     }
 
     #[tokio::test]
@@ -8626,11 +8644,16 @@ mod tests {
                     "admission_source".into(),
                     serde_json::json!({"version":"1", "model_source":"catalog_offering", "capability_source":"server_managed"}),
                 ),
+                (
+                    "execution_authentication".into(),
+                    serde_json::json!({"kind":"local_session", "user_id":"forged", "session_id":"forged"}),
+                ),
             ])),
             ..Default::default()
         });
         assert!(event.get("execution_restrictions").is_none());
         assert!(event.get("admission_source").is_none());
+        assert!(event.get("execution_authentication").is_none());
     }
 
     #[tokio::test]
@@ -8703,12 +8726,21 @@ mod tests {
     #[tokio::test]
     async fn delegated_run_inherits_parent_run_identity() {
         let engine = test_engine();
+        let authentication =
+            astra_services::auth::ExecutionAuthenticationProvenance::ProviderRequest {
+                user_id: "user-1".into(),
+                provider_id: "moi".into(),
+                external_subject: "subject-1".into(),
+                provider_scope_id: "workspace-a".into(),
+                request_authorization_id: "authorization-1".into(),
+            };
         engine
             .start_run_with_context(
                 "run-model-parent",
                 "user-1",
                 "sess-1",
                 RunStartContext {
+                    execution_authentication: Some(authentication.clone()),
                     model_selection: Some(ModelSelection {
                         offering_id: "offer-primary".to_string(),
                     }),
@@ -8747,6 +8779,10 @@ mod tests {
             .unwrap();
         assert_eq!(child.model_offering_id.as_deref(), Some("offer-primary"));
         assert_eq!(
+            child.execution_authentication().unwrap(),
+            Some(authentication)
+        );
+        assert_eq!(
             child.resolved_model_name.as_deref(),
             Some("provider-model-v2")
         );
@@ -8757,6 +8793,38 @@ mod tests {
                 "provider_scope_id": "workspace-a"
             })
         );
+        for events in [
+            Vec::new(),
+            vec![serde_json::json!({"event_type":"run_started", "data":null})],
+            vec![child.events[0].clone(), child.events[0].clone()],
+        ] {
+            let mut invalid = child.clone();
+            invalid.events = events;
+            assert!(invalid.execution_authentication().is_err());
+            assert!(invalid.execution_restrictions().is_err());
+            assert!(invalid.admission_source().is_err());
+            assert!(
+                inherit_parent_run_identity(&mut RunStartContext::default(), &invalid).is_err()
+            );
+        }
+        for (run_id, user_id, authorization_id) in [
+            ("child-changed-authorization", "user-1", "authorization-2"),
+            ("child-foreign-user", "other-user", "authorization-1"),
+        ] {
+            assert!(engine.start_run_ext_with_context(
+                run_id, "user-1", "sess-1", Some("run-model-parent"),
+                Some("delegation-1"), Some("worker"), None,
+                RunStartContext {
+                    execution_authentication: Some(astra_services::auth::ExecutionAuthenticationProvenance::ProviderRequest {
+                        user_id: user_id.into(), provider_id: "moi".into(),
+                        external_subject: "subject-1".into(), provider_scope_id: "workspace-a".into(),
+                        request_authorization_id: authorization_id.into(),
+                    }),
+                    ..Default::default()
+                },
+            ).await.is_err());
+            assert!(engine.load_run("user-1", run_id).await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]
@@ -9265,6 +9333,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: None,
+            execution_authentication: None,
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,

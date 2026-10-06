@@ -970,13 +970,13 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         ))
     }
 
-    fn execution_time_budget_remaining(&self) -> Option<Duration> {
+    fn execution_time_budget_remaining(&self) -> Option<astra_turn_types::ExecutionTimeRemaining> {
         Some(
             self.executor
                 .spawn_context
                 .as_ref()?
                 .execution_deadline?
-                .remaining(),
+                .remaining_at(std::time::Instant::now()),
         )
     }
 

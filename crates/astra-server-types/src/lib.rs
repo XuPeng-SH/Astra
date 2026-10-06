@@ -2467,6 +2467,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         stable_runtime_system_prompt: request.stable_runtime_system_prompt,
         runtime_system_prompt: request.runtime_system_prompt,
         session_id: request.session_id,
+        execution_authentication: None,
         session_admission_facts: None,
         work_binding: request.work_binding,
         run_start_idempotency: None,

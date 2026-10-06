@@ -40,6 +40,22 @@ FanOut and Fork admit one absolute deadline before model preparation and pass
 it unchanged through queuing into Server loops, tools and nested children.
 Sequential retains its explicit per-stage timeout policy; a zero timeout adds
 no deadline. Invalid deadline ranges fail before child admission.
+Admission freezes separate ordinary-work and total execution cutoffs. Final
+synthesis reserves half the admitted interval, capped at 30 seconds; elapsed
+time and retries never repartition or renew either cutoff. Ordinary model and
+tool admission use the work cutoff, while final synthesis and result draining
+use the total cutoff. A foreground child's total cutoff precedes its parent's
+work cutoff by the existing delivery grace, and its own work/synthesis split
+is frozen once. Short usable child intervals do not require a fixed 60-second
+minimum; insufficient intervals reject launch without claiming member work.
+Tool dispatch rechecks that same admitted cutoff after asynchronous preparation
+and waits. Only exact runtime-owned Work settlement uses the total cutoff;
+ordinary calls and completion-action work retain the work cutoff. The selected
+invocation-local admission deadline is not serialized or supplied by providers.
+A claimed invocation that expires before dispatch still settles once as not
+executed. If an MCP call already started, expiry prevents another call without
+claiming prior execution was side-effect-free or settled. Acknowledged results
+retain their existing completion custody and total-time drain.
 The scheduler does not parse task output into a second findings store or copy
 it into ancestor state rows. Sequential execution stops at a paused or waiting
 stage instead of launching a successor without a settled predecessor. Active
@@ -52,16 +68,60 @@ preserve actual terminal outcomes or explicitly unfinished recovery state.
 ### Team configuration ownership
 
 Team definitions have one owner-scoped persistence contract. CLI commands use
-the existing HTTP adapter; their registry is a display projection, not a second
-configuration store or template authority. An empty roster is a valid draft,
+the existing HTTP adapter directly; no client registry is a second configuration
+store or template authority. An empty roster is a valid draft,
 but execution rejects it before admitting children. Configuration edits retain
 the complete definition, including member profiles, capabilities and shared context.
-The accepted save response supplies the persisted identity without a follow-up
-read. Failed reads or writes must not publish success or a locally committed
+Team and member identities are immutable and independent of editable names.
+Creation supplies a caller-generated Team ID outside the reserved `bt-` namespace.
+Public `POST /teams` rejects that prefix with `400 team_validation_failed`, so
+one owner cannot reserve another owner's built-in Team ID before its first
+template initialization. Only the existing owner-scoped builtin factory creates
+these IDs. Their owners can still edit or rename built-in Teams through the
+normal revision-checked update contract; creation restrictions do not prohibit
+those updates. Updates compare the exact Team ID
+and expected positive revision, incrementing the revision on acceptance. A stale
+revision, conflicting name or missing Team rejects the write without upserting
+another definition. The accepted response supplies the exact identity, revision
+and complete configuration without a follow-up read. Transport failures and
+invalid acknowledgements leave the write unconfirmed, not rejected or saved;
+clients retain the requested identity and must inspect it before another write.
+Failed reads or writes must not publish success or a locally committed
 configuration, and standalone commands must return a failing exit status.
-Snapshot restore uses the complete saved configuration and preserves the current
-Team identity. It requires the exact returned snapshot ID, publishes only the
-accepted save response, and never checks out Git or changes running tasks.
+Collection reads are for browsing. Name lookup uses `/teams/name/{name}`;
+`/teams/{team_id}` addresses an immutable identity for reads, updates and deletion.
+Native configuration commands carry typed arguments to this owner rather than
+rendering a command string and parsing it again. Names, context keys, and literal
+descriptions retain their parsed identity; listing is not a help operation.
+The TUI's `/team` and `/team list` open a searchable configuration picker;
+`/team info <name>` inspects one exact definition. Both use the same persistence
+reader as CLI configuration. Inspecting a picker row reuses its loaded definition
+without another read or changing the active agent. These are configuration
+observations, not live execution status. Enter in a populated detail view
+explicitly chooses the Team for future messages in the current conversation;
+it does not start a run or discard existing context. The sole delegation-capable
+member is the default lead; otherwise the TUI presents typed member choices by
+name with delegation permissions visible. Dismissal never accepts a selection.
+Retained views carry the existing attachment epoch and cannot change a different
+conversation after a rebind. `/team leave` clears future selection locally without
+changing history, model, permissions, or running work. It is an interactive TUI
+control, not a standalone command that edits durable conversation state.
+The status line labels the exact selected intent; unavailable friendly labels
+remain generic rather than guessed. Root admission reauthorizes configuration.
+Both native CLI commands and the TUI roster editor use the same configuration
+owner. The editor supports members, responsibilities, exact models and shared
+context; this does not yet establish the complete execution workbench below.
+Team execution remains with ordinary Chat, not the configuration command owner.
+Native `team run` forwards ordinary Explain capture and wall-clock limits.
+Shared Team context is required factual input to the admitted lead and members,
+not system instructions or a source of execution permissions. It is frozen in
+the admitted profile snapshot and uses the existing required-context projection;
+configuration edits affect later admissions, not already running members.
+Snapshot restore uses the complete saved configuration, requires the same owner
+and immutable Team ID, and compares the current revision, not the historical
+revision. Renaming does not detach snapshots or replace member identities. It
+requires the exact returned snapshot ID, publishes only the accepted response,
+and never checks out Git or changes running tasks.
 
 ### Team user journey (target, not yet a proven runtime guarantee)
 
@@ -80,8 +140,11 @@ astra team add-member delivery developer -- Describe the member's responsibiliti
 astra team run delivery <task>
 ```
 
-In the TUI, use `/team run delivery <task>`;
-configuration remains in the CLI. Subsequent ordinary input retains that selection. Canonical turn commit atomically
+In the TUI, use `/team` to inspect or edit configuration and select a lead,
+then enter an objective; `/team run delivery <task>` is also available.
+Selection changes are unavailable during an active turn, while configuration
+can still be inspected or edited for future admissions.
+Subsequent ordinary input retains that selection. Canonical turn commit atomically
 retains the admitted Team/lead selection as intent for the next root.
 Authenticated CLI resume reads the Server-owned generation even when a local
 replica exists; local-only restore is reserved for an unauthenticated session.
@@ -90,9 +153,10 @@ current owner-scoped configuration. Switching or clearing a session drops the
 previous selection, while an explicit Team launch overrides restored intent.
 Same-run recovery continues to use its frozen admitted profiles.
 Native entrypoints select the sole delegation-capable member from the already
-loaded configuration. With zero or multiple such members, use `team info` and
-`--lead-agent-id <agent_id>` to choose explicitly; role names and member order
-never choose a lead or grant permission. Server admission authorizes and freezes
+loaded configuration. With zero or multiple such members, the TUI offers a
+member picker; one-shot CLI uses `team info` and `--lead-agent-id <agent_id>` to
+choose explicitly. Role names and member order never choose a lead or grant
+permission. Server admission authorizes and freezes
 the explicit resolved identity. This UI default does not change the protocol's
 `lead_agent_id: null` meaning: an ordinary root with an admitted member directory.
 Native `team run --json` reuses the ordinary turn's terminal JSON; its hidden
@@ -375,42 +439,56 @@ adds no receipt persistence, sender sweep, or status-query database I/O.
 
 Per-agent model override is an orchestration decision, but it must still respect budget, policy, and trace requirements.
 
-When a user names a delegated model in natural language, one candidate-aware
-judgment resolves the request against the current authorized Chat catalog.
-It must preserve the requested family, version, variant, namespace and source;
-an unavailable or ambiguous model stops the child before execution. A family
-plus version can identify a unique model in that snapshot when the user omitted
-a variant; multiple matching variants or sources require clarification. Runtime
-checks exact quoted text, candidate membership, canonical IDs/names, scope,
-authorization and capability, but does not run a second lexical parser over
-model aliases. Semantic alias interpretation can still be wrong; its accuracy
-needs live evaluation and the chosen identity remains visible in Explain.
-Explicit structured selectors retain their exact-match contract. The judgment
-reuses the admission catalog snapshot without a second catalog read.
+The primary model interprets natural-language delegation requests and proposes
+the child's model through the canonical `requested_model_policy` control.
+Both resident and discovered schemas expose that same control. Fixed selectors
+use an exact authorized Offering ID or configured name; names inside task
+content, quoted text, or requested output do not select an execution model.
+Preserve the user's requested family, version, variant and source. Do not
+substitute a nearby model when the requested one is unavailable.
 
-The auxiliary interpretation of one user turn covers all proposed children in
-one bounded judgment. Its compact output identifies exact user evidence,
-eligible candidate IDs, optional task scopes, and reasoning controls. Runtime
-verifies the deterministic facts and binds them to the original user text and
-catalog snapshot; semantic accuracy is evaluated separately. An invalid or
-uncertain judgment cannot silently choose a nearby model, relax a hard
-requirement, or authorize Auto. A tool's proposed selector is matching context,
-never user authority. This interpretation adds no separate catalog query or
-database write. The validated ambiguity reason is returned to the caller, while
-Explain retains only its bounded structured summary. A non-retryable delegation
-rejection blocks that operation, not independent parent work. Frozen admission
-results, stall limits and turn budgets prevent repeated paid interpretation;
-active Work attempts retain their existing typed settlement boundary.
+The first provider request includes a bounded, structured observation of the
+authorized model candidates, outside the stable system/tool prefix.
+This context carries observations, not a second selection instruction; the
+canonical tool contract owns execution-versus-content interpretation. A cold
+request loads this catalog once, including ordinary conversation; subsequent
+requests reuse the same principal-isolated cache (60-second freshness, at most
+1,024 entries and 64 KiB serialized content per cached entry). Concurrent cold
+reads for the same principal coalesce. Request descendants reuse the observed
+generation; failures are retained for that request, not retried every round.
+The complete authentication principal, including provider/request scope, and
+service identities form the cache key. This intentionally does not share a
+provider request's observation with a different authorization.
 
-A model-only request does not imply a reasoning level. The same judgment must
-distinguish a request to *use* a reasoning control from a phrase the child is
-asked to explain, compare, quote or output, and must account for negations and
-later corrections. Its typed reasoning and exact source quote travel together.
-Runtime checks that pairing, positive budgets, slot conflicts and provider
-support; it no longer guesses semantic intent from a fixed phrase, negation or
-sentence-separator list. Ambiguous intent is unresolved. A plausible but wrong
-semantic judgment remains a measurable risk, not a deterministic guarantee.
-The runtime never downgrades an unsupported exact effort into generic thinking.
+Explicit refresh and pagination use the existing authenticated `model_catalog`
+boundary, never workspace configuration or credentials. Oversized catalogs
+are not retained across requests. Discovery pages are observations, not
+execution grants: execution authorization remains fresh. Incomplete pages
+cannot prove a choice unique or absent across the complete catalog.
+
+Runtime validates exact selectors, authorization, capability, lineage, profile,
+batch capacity, and independently supplied typed user constraints before any
+child starts. A proposal is not user authority and cannot weaken a hard typed
+requirement. Ordinary delegation does not invoke a second auxiliary interpreter
+to generate hard model or reasoning requirements from the same user text.
+Existing scoped typed constraints may still use bounded scope binding; that
+judgment only establishes applicability and cannot create execution controls.
+Jev/Jev-like assistance is not required for fixed model selection; Auto remains
+unavailable until its own evidence and routing contract are implemented.
+
+Frozen invocation decisions retain their original identity and constraints
+during retries and replay. A correction is a new proposal, not permission to
+rewrite a prepared invocation. Missing, malformed or stale typed authority
+fails closed. Existing semantic-derived records are not silently relabelled or
+downgraded during replay. Selected model identity, exact control, admission
+failure and provider usage remain visible through the existing execution
+trace and Explain paths; removed auxiliary calls produce no synthetic usage.
+
+A model-only request does not imply a reasoning level. The primary proposes
+reasoning only when requested; runtime validates its supported exact protocol
+and effort. It never downgrades unsupported effort into generic thinking.
+Natural-language fidelity remains a live-evaluation obligation: exact catalog
+membership proves authorization, not that a model correctly understood intent.
 
 Dynamic spawn and fanout resolve reasoning separately from the Offering.
 After per-slot and shared defaults, an omitted reasoning control inherits the

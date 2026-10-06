@@ -76,7 +76,9 @@ impl TuiEventStream {
                 }
             }
             let pending = self.resize_pending.load(Ordering::Acquire);
-            if pending || self.size_check.poll_tick(cx).is_ready() {
+            // A quarantined CPR can leave reconciliation pending. Retry on
+            // the existing watchdog tick, not before every keyboard poll.
+            if self.size_check.poll_tick(cx).is_ready() {
                 let size = crossterm::terminal::size().ok();
                 if let Some(size) = size
                     && (pending || self.observed_size != Some(size))

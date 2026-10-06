@@ -6093,8 +6093,7 @@ async fn ensure_core_schema_while_leased(
             description   TEXT,
             members_json  TEXT         NOT NULL,
             context_json  TEXT,
-            created_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            revision      BIGINT UNSIGNED NOT NULL,
             UNIQUE KEY uq_team_user_name (user_id, name)
         )",
     )
@@ -6108,6 +6107,7 @@ async fn ensure_core_schema_while_leased(
         "team_snapshots",
         "CREATE TABLE IF NOT EXISTS team_snapshots (
             snapshot_id          VARCHAR(64)  PRIMARY KEY,
+            team_id              VARCHAR(64)  NOT NULL,
             team_name            VARCHAR(128) NOT NULL,
             user_id              VARCHAR(128)  NOT NULL,
             label                VARCHAR(255) DEFAULT '',
@@ -6115,7 +6115,7 @@ async fn ensure_core_schema_while_leased(
             session_id           VARCHAR(64),
             team_definition_json LONGTEXT,
             created_at           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_ts_user_team (user_id, team_name, created_at)
+            INDEX idx_ts_user_team (user_id, team_id, created_at)
         )",
     )
     .execute(&pool)

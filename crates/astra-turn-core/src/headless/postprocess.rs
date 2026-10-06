@@ -584,6 +584,49 @@ mod tests {
     }
 
     #[test]
+    fn queued_coordination_is_not_empty_or_child_completion() {
+        let receipt = json!({
+            "result_family":"control_receipt", "action":"send_message",
+            "status":"queued", "success":true, "run_id":"child",
+            "message_id":"question-id", "target":"parent",
+            "message_type":"question", "recipients":null
+        });
+        let mut malformed = receipt.clone();
+        malformed.as_object_mut().unwrap().remove("message_id");
+        for (name, value, failed, expected) in [
+            ("agent", &receipt, false, ResultQuality::Success),
+            ("agent", &malformed, false, ResultQuality::Empty),
+            ("read_file", &receipt, false, ResultQuality::Empty),
+            ("agent", &receipt, true, ResultQuality::Error),
+        ] {
+            let mut guard = TurnGuard::new();
+            let mut advisories = Vec::new();
+            let quality = append_headless_result_quality_feedback(
+                HeadlessResultQualityRequest {
+                    name,
+                    result_str: &value.to_string(),
+                    source_error_kind: None,
+                    execution_failed: failed,
+                    execution_disposition: HeadlessExecutionDisposition::Executed,
+                    resource_limit_recorded: false,
+                },
+                &mut guard,
+                &mut advisories,
+            );
+            assert_eq!(quality, expected);
+            if expected == ResultQuality::Success {
+                assert!(advisories.is_empty());
+                assert!(
+                    crate::orchestration::agent_result_wire::agent_tool_structured_result_class(
+                        value
+                    )
+                    .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn successful_execution_keeps_error_shaped_content_as_content() {
         for out in [
             "Error: this is a line from the inspected file".to_string(),

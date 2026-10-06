@@ -96,6 +96,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024; // 64 KB
 #[derive(Clone)]
 pub struct DefaultToolExecutor {
     ctx: ToolContext,
+    fetch_transport: crate::web_fetch::FetchTransport,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
 
@@ -107,6 +108,7 @@ impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
         Self {
             ctx,
+            fetch_transport: Default::default(),
             approval_gate: None,
             progress_callback: None,
 
@@ -141,6 +143,13 @@ impl DefaultToolExecutor {
         self
     }
 
+    /// Install the network authority of a user-owned execution boundary.
+    /// Server constructors intentionally retain the pinned-direct default.
+    pub fn with_local_network(mut self) -> Self {
+        self.fetch_transport = crate::web_fetch::FetchTransport::LocalEnvironment;
+        self
+    }
+
     /// Access the underlying context.
     pub fn context(&self) -> &ToolContext {
         &self.ctx
@@ -152,9 +161,13 @@ impl DefaultToolExecutor {
     }
 }
 
-#[async_trait]
-impl ToolExecutor for DefaultToolExecutor {
-    async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+impl DefaultToolExecutor {
+    async fn execute_admitted(
+        &self,
+        name: &str,
+        args: &Value,
+        admission_deadline: Option<std::time::Instant>,
+    ) -> ToolResult {
         if let Err(error) = crate::schemas::validate_tool_arguments(name, args) {
             return error.into_tool_result();
         }
@@ -294,6 +307,12 @@ impl ToolExecutor for DefaultToolExecutor {
         } else {
             None
         };
+        if let Some(result) = crate::dispatch_deadline_result(admission_deadline, false) {
+            if let Some(cb) = &self.progress_callback {
+                cb.tool_completed(&call_id, &result.output, false).await;
+            }
+            return result;
+        }
         let dispatch = self.dispatch(name, args, bash_workdir.as_ref());
         // Bash and run_script own their child timeout/cancellation paths. Do
         // not wrap either in the generic 60s future timeout: dropping one can
@@ -487,6 +506,13 @@ impl ToolExecutor for DefaultToolExecutor {
 
         result
     }
+}
+
+#[async_trait]
+impl ToolExecutor for DefaultToolExecutor {
+    async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+        self.execute_admitted(name, args, None).await
+    }
 
     async fn execute_with_cancel(
         &self,
@@ -541,14 +567,23 @@ impl DefaultToolExecutor {
         name: &str,
         args: &Value,
         convergence_tracker: &crate::workspace_observation::DesiredStateConvergenceTracker,
-        convergence_authority: &str,
+        convergence_authority: Option<&str>,
         cancel_token: Option<&CancellationToken>,
+        admission_deadline: Option<std::time::Instant>,
     ) -> ToolResult {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return crate::cancelled_tool_result(name, false);
+        }
         let mut delegated = self.clone();
-        delegated.convergence_tracker = convergence_tracker.clone();
-        delegated.convergence_authority = Arc::from(convergence_authority);
+        if let Some(authority) = convergence_authority {
+            delegated.convergence_tracker = convergence_tracker.clone();
+            delegated.convergence_authority = Arc::from(authority);
+        }
+        if let Some(cancel_token) = cancel_token {
+            delegated.ctx.cancel_token = Some(Arc::new(cancel_token.clone()));
+        }
         delegated
-            .execute_with_cancel(name, args, cancel_token)
+            .execute_admitted(name, args, admission_deadline)
             .await
     }
 
@@ -602,7 +637,7 @@ impl DefaultToolExecutor {
             // ── Web search ───────────────────────────────────────────
             "web_search" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                crate::web_search::perform_web_search(args, &cache_scope).await
+                crate::web_search::perform_web_search(args, &cache_scope, self.fetch_transport).await
             }
 
             // ── Utility tools ────────────────────────────────────────
@@ -635,8 +670,7 @@ impl DefaultToolExecutor {
             // ── Web fetch (HTTP GET) ─────────────────────────────────
             "web_fetch" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                let output = crate::web_fetch::fetch_with_cache_scope(args, &cache_scope).await;
-                string_to_result(output)
+                crate::web_fetch::fetch_with_cache_scope(args, &cache_scope, self.fetch_transport).await
             }
 
             // ── Display sixel (terminal image rendering) ──────────────
@@ -790,6 +824,83 @@ pub fn requires_workspace_serialization(name: &str, args: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    struct AdmissionWaitProgress(tokio::sync::Notify);
+
+    #[async_trait]
+    impl crate::ToolProgressCallback for AdmissionWaitProgress {
+        async fn tool_started(&self, _id: &str, _name: &str, _args: &Value) {
+            self.0.notify_one();
+        }
+        async fn tool_output_delta(&self, _id: &str, _delta: &str) {}
+        async fn tool_completed(&self, _id: &str, _result: &str, _success: bool) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_default_dispatch_rechecks_after_both_workspace_guards() {
+        for (name, args) in [
+            (
+                "write_file",
+                serde_json::json!({"path": "never-written", "content": "late"}),
+            ),
+            (
+                "run_script",
+                serde_json::json!({"script": "raise AssertionError('must not execute')"}),
+            ),
+        ] {
+            let (root, mut executor) = test_executor();
+            let progress = Arc::new(AdmissionWaitProgress(tokio::sync::Notify::new()));
+            executor.progress_callback = Some(progress.clone());
+            let blocker =
+                crate::workspace_observation::acquire_workspace_observation_lease_with_options(
+                    root.path(),
+                    None,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let deadline =
+                tokio::time::Instant::now().into_std() + std::time::Duration::from_secs(1);
+            let tracker = Default::default();
+            let waiting = executor.execute_with_workspace_convergence_authority(
+                name,
+                &args,
+                &tracker,
+                None,
+                None,
+                Some(deadline),
+            );
+            tokio::pin!(waiting);
+            tokio::select! {
+                biased;
+                result = &mut waiting => panic!("must block on the real workspace owner: {result:?}"),
+                () = progress.0.notified() => {}
+            }
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            drop(blocker);
+            let result = waiting.await;
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["execution_started"],
+                false,
+                "{name}: {result:?}"
+            );
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["rejection_code"],
+                "execution_time_budget_exhausted"
+            );
+            assert!(!root.path().join("never-written").exists());
+            // A rejection releases its real ownership guard; later work must
+            // not remain quarantined or blocked behind an abandoned lease.
+            let released =
+                crate::workspace_observation::acquire_workspace_observation_lease_with_options(
+                    root.path(),
+                    None,
+                    std::time::Duration::from_millis(1),
+                )
+                .await;
+            assert!(released.is_some(), "{name} leaked its workspace guard");
+        }
+    }
+
     #[tokio::test]
     async fn removed_repository_tools_are_unknown_before_execution() {
         let dir = tempfile::tempdir().unwrap();

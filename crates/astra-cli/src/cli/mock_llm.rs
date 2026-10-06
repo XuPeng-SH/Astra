@@ -1502,7 +1502,7 @@ pub struct MockLlmServer {
 impl MockLlmServer {
     /// Start the mock server on a random free port. Returns immediately.
     pub async fn start(scenario: MockScenario) -> Result<Self, String> {
-        Self::start_inner(scenario, false).await
+        Self::start_inner(scenario, false, Router::new()).await
     }
 
     /// Hold a Server orchestration stream until the test releases its terminal
@@ -1516,17 +1516,21 @@ impl MockLlmServer {
         ) {
             return Err("held orchestration requires an agent or fanout scenario".to_string());
         }
-        Self::start_inner(scenario, true).await
+        Self::start_inner(scenario, true, Router::new()).await
     }
 
     /// Start the slow-response fixture at an explicit provider boundary.
     /// The test releases the response only after it has observed the UI state
     /// under test, so cancellation coverage cannot race a fixed sleep.
-    pub async fn start_with_held_slow_response() -> Result<Self, String> {
-        Self::start_inner(MockScenario::Slow, true).await
+    pub async fn start_with_held_slow_response(read_routes: Router) -> Result<Self, String> {
+        Self::start_inner(MockScenario::Slow, true, read_routes).await
     }
 
-    async fn start_inner(scenario: MockScenario, hold_response: bool) -> Result<Self, String> {
+    async fn start_inner(
+        scenario: MockScenario,
+        hold_response: bool,
+        read_routes: Router,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| format!("mock server bind failed: {e}"))?;
@@ -1563,7 +1567,8 @@ impl MockLlmServer {
             .route("/model-access", get(handle_model_access))
             .route("/model-access/admit", post(handle_model_admission))
             .fallback(handle_unimplemented_mock_route)
-            .with_state(state);
+            .with_state(state)
+            .merge(read_routes);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1826,7 +1831,7 @@ mod tests {
             MockScenario::FanoutThenComplete,
             MockScenario::FanoutPartialThenComplete,
         ] {
-            let server = super::MockLlmServer::start_inner(scenario, true)
+            let server = super::MockLlmServer::start_inner(scenario, true, axum::Router::new())
                 .await
                 .unwrap();
             let mut response = reqwest::Client::new()

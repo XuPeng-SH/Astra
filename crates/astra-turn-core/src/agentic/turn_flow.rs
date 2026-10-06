@@ -1,6 +1,6 @@
 //! Glue between ingest, stall preflight, and explain-turn aggregation (CLI agentic loop).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
@@ -16,7 +16,6 @@ pub fn agentic_round_stall_preflight<T: EdgeToolRoundRow>(
     server_tool_calls: &[Value],
     edge_round: &[T],
     turn_sigs: &mut Vec<BTreeSet<crate::stall::StallSignature>>,
-    turn_tool_names: &mut Vec<HashSet<String>>,
     stall_events: &mut Vec<(String, u32)>,
     turn_guard: &mut TurnGuard,
 ) {
@@ -25,7 +24,6 @@ pub fn agentic_round_stall_preflight<T: EdgeToolRoundRow>(
         turn_index: turn_index as u32,
         tool_calls_for_guard: tool_calls_for_guard.as_slice(),
         turn_sigs,
-        turn_tool_names,
         stall_events,
         turn_guard,
     });
@@ -64,7 +62,6 @@ mod tests {
         })];
         let edge: Vec<Row> = vec![];
         let mut turn_sigs = Vec::new();
-        let mut turn_tool_names = Vec::new();
         let mut stall_events = Vec::new();
         let mut turn_guard = TurnGuard::new();
         agentic_round_stall_preflight(
@@ -72,12 +69,10 @@ mod tests {
             &server,
             &edge,
             &mut turn_sigs,
-            &mut turn_tool_names,
             &mut stall_events,
             &mut turn_guard,
         );
         assert_eq!(turn_sigs.len(), 1);
         assert_eq!(turn_sigs[0].len(), 1);
-        assert!(turn_tool_names[0].contains("bash"));
     }
 }

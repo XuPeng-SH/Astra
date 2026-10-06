@@ -25,11 +25,13 @@ pub async fn run_team_http_negative_paths() {
     assert_eq!(st_404_del, StatusCode::NOT_FOUND);
 
     let dup_roles: Value = json!({
+        "team_id": uuid::Uuid::new_v4().to_string(),
         "name": format!("bad_dup_roles_{}", ctx.suffix),
         "description": "duplicate roles",
         "members": [
             {
                 "role": "twin",
+                "agent_id": "first",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -37,6 +39,7 @@ pub async fn run_team_http_negative_paths() {
             },
             {
                 "role": "twin",
+                "agent_id": "second",
                 "skills": [],
                 "mcp_servers": [],
                 "can_delegate": false,
@@ -46,5 +49,6 @@ pub async fn run_team_http_negative_paths() {
     });
     let (st_dup, dup_j) = post_json(&ctx.app, "/teams", Some(auth), dup_roles).await;
     assert_eq!(st_dup, StatusCode::BAD_REQUEST, "duplicate roles: {dup_j}");
+    assert_eq!(dup_j["error_code"], "team_validation_failed");
     b.ctx.close().await;
 }

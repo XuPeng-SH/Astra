@@ -5,7 +5,6 @@
 
 use crate::cli::cli_config::cli_context::CliContext;
 use crate::cli::permission_manager::PermissionManager;
-use crate::cli::slash::slash_team;
 use crate::mcp_client;
 use astra_config::runtime_config::ExplainReportFormat;
 use astra_runtime::plan as runtime_plan;
@@ -429,8 +428,6 @@ pub(crate) struct SessionState {
     /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
-    /// Team coordination registry for multi-agent team patterns.
-    pub team_registry: slash_team::TeamRegistry,
     /// Shared team persistence service (in-memory or API-backed).
     /// Used for execution history and snapshot persistence.
     pub team_store: std::sync::Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
@@ -644,7 +641,6 @@ impl Default for SessionState {
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
-            team_registry: slash_team::TeamRegistry::new(),
             team_store: std::sync::Arc::new(
                 astra_services::team_persistence::InMemoryTeamStore::new(),
             ),

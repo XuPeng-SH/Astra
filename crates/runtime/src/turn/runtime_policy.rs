@@ -2197,6 +2197,35 @@ mod tests {
     }
 
     #[test]
+    fn invalid_arguments_require_repair_not_terminal_rejection_diagnosis() {
+        let mut state = RuntimePolicyEvaluationState::default();
+        let record = ToolCallRecord {
+            name: "agent".into(),
+            args_full: Some(r#"{"action":"spawn","requested_model_policy":"{}"}"#.into()),
+            round: Some(1),
+            disposition: Some(ToolCallDisposition::Rejected),
+            error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+            result_full: Some(
+                serde_json::json!({"error_kind":"tool_invalid_args","retryable":false}).to_string(),
+            ),
+            ..Default::default()
+        };
+        let feedback = evaluate_tool_boundary(&mut state, work_subject("item-1"), &[record], 1)
+            .unwrap()
+            .unwrap();
+        assert!(entries(&feedback).iter().any(|entry| entry.signal
+            == RuntimePolicySignal::RejectedToolRequests
+            && entry.recommendation == RuntimePolicyRecommendation::RepairToolRequest));
+        let restored: RuntimePolicyEvaluationState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert!(
+            !astra_turn_core::evaluation::has_active_non_retryable_rejection(
+                &restored.record_window.into_iter().collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[test]
     fn non_retryable_rejection_guidance_survives_recovery_until_exact_success() {
         for retryable in [None, Some(true), Some(false)] {
             let mut state = RuntimePolicyEvaluationState::default();

@@ -56,6 +56,15 @@ visible `agent` instead carries its full owner-authorized contract directly;
 filtering discovery must not strand child messaging or result retrieval.
 The resident projection must remain inside the fixed tool
 schema budget, so ordinary delegation does not add a large repeated prompt.
+It preserves the complete model-policy and reasoning controls for ordinary
+delegation. The primary interprets user-named models and proposes an exact
+authorized selector from the structured catalog supplied in current runtime
+context; runtime validates it with fresh execution authorization. A complete
+observation does not require a discovery round. Partial or unavailable choices
+use the existing authenticated `model_catalog`, never local configuration or
+guessed substitutes.
+Same-name discovery does not expand native parameters. Argument
+errors explain that boundary; retry advice does not override task constraints.
 Child completion notifications contain bounded previews, not execution failures
 when output is truncated. The executing parent retains the complete terminal
 result until settlement; `agent.get_result` reads that retained result before
@@ -73,6 +82,13 @@ pagination using the canonical summary/current-turn defaults. Select its full
 contract for custom topic, depth, horizon, source policy, context inclusion or
 format; these advanced options remain supported without repeating their schemas
 in every request.
+
+`memory`, `reflect`, and `notify` use existing deferred activation by default;
+their execution and authorization contracts remain unchanged. `introspect`
+stays resident for immediate execution and artifact recovery. This allocation
+keeps complete delegation controls within the unchanged 8 KiB default schema
+budget. It adds activation when a utility is first needed; it does not imply
+that every workload is cheaper. Explicitly pinned utility tools remain supported.
 
 ## Relationship
 

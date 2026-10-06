@@ -215,6 +215,7 @@ fn publish_live_snapshot_for_introspection_calls<H: AgenticLoopHost + ?Sized>(
 
 pub(crate) enum TurnToolPhaseControl {
     ContinueLoop,
+    WaitForInput(super::host::RuntimeInputWait),
     Return(AgenticLoopOutcome),
 }
 
@@ -250,6 +251,10 @@ fn all_requested_calls_rejected_non_retryable(
             };
             matches.next().is_none()
                 && !record.ok
+                // Invalid arguments forbid an unchanged retry, not a new
+                // invocation with corrected arguments. Keep the existing
+                // repair path open instead of forcing text-only settlement.
+                && record.error_kind != Some(astra_core::ErrorKind::ToolInvalidArgs)
                 && record.disposition
                     == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
                 && record
@@ -2157,7 +2162,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             &attempted_logical_calls,
             &turn_result.edge_tool_round,
             &mut state.stall.turn_sigs,
-            &mut state.stall.turn_tool_names,
             &mut state.stall.events,
             &mut state.turn_guard,
         );
@@ -3182,25 +3186,15 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             .min_by_key(|receipt| receipt.timeout_ms);
         let reply_pending = state.messaging.reply_obligations.has_pending(run_id);
         if reply_pending || admitted_wait.is_some() {
-            let continue_after_reply = super::execution_phase::await_runtime_activity(
-                host,
-                state,
-                super::host::ContinuationAuthority::Runtime,
-                // An unanswered exact question retains its synchronization
-                // obligation; a sibling observation timeout cannot bypass it.
-                admitted_wait.as_ref().filter(|_| !reply_pending),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            try_write_heavy_checkpoint(state);
-            return Ok(match continue_after_reply {
-                super::execution_phase::RuntimeActivityOutcome::ExecutionPaused(reason) => {
-                    finalize_turn_trace(state).await;
-                    TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(reason))
-                }
-                outcome if outcome.should_continue() => TurnToolPhaseControl::ContinueLoop,
-                _ => TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed),
-            });
+            // Finish the host's PostToolBatch/PostTurn before the shared loop
+            // waits. A correlated question cannot be bypassed by a sibling's
+            // observation timeout.
+            return Ok(TurnToolPhaseControl::WaitForInput(
+                super::host::RuntimeInputWait::from_observation(
+                    admitted_wait.filter(|_| !reply_pending),
+                )
+                .map_err(|error| error.to_string())?,
+            ));
         }
         Ok(TurnToolPhaseControl::ContinueLoop)
     })
@@ -4565,6 +4559,32 @@ mod tests {
         let aggregate = state.tool_ledger_receipt.canonical_aggregate();
         assert_eq!(aggregate.attempted, 0);
         assert_eq!(aggregate.terminal, 0);
+    }
+
+    #[test]
+    fn argument_rejection_preserves_kind_and_keeps_correction_open() {
+        let mut state = make_state();
+        let args = json!({"action":"spawn","description":"Read a value","prompt":"Return the value","requested_model_policy":"{}"});
+        let call =
+            json!({"id":"invalid-object","function":{"name":"agent","arguments":args.to_string()}});
+        let rejection = astra_tools::schemas::validate_tool_arguments("agent", &args).unwrap_err();
+        let (_, results) = crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            vec![super::super::host::RejectedToolCall::ordinary(
+                call.clone(),
+                rejection.rejection_output().to_string(),
+            )],
+        );
+        let record = &state.stall.tool_call_records[0];
+        assert_eq!(
+            record.error_kind,
+            Some(astra_core::ErrorKind::ToolInvalidArgs)
+        );
+        assert!(!record.was_executed());
+        assert_eq!(results[0].content, rejection.rejection_output().to_string());
+        settle_non_retryable_tool_rejections(&mut state, &[call], 0, false, false, false);
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
     }
 
     #[test]

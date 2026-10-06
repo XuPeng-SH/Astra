@@ -1334,9 +1334,6 @@ fn fanout_completion_is_authoritative(output_summary: Option<&str>, output: Opti
 fn fanout_start_summary(output_summary: Option<&str>, output: Option<&str>) -> Option<String> {
     [output, output_summary].into_iter().flatten().find_map(|text| {
         match agent_fanout_control_receipt_kind(text)? {
-            AgentFanoutControlReceiptKind::SkippedBeforeAcceptance => {
-                return Some("Parallel work wasn’t started because there wasn’t enough time to safely finish it · Astra will continue here and flag anything it cannot verify.".to_string());
-            }
             AgentFanoutControlReceiptKind::RejectedBeforeAcceptance => {}
             _ => return None,
         }
@@ -8907,32 +8904,23 @@ mod tests {
 
     #[test]
     fn malformed_fanout_payload_becomes_an_actionable_rejection_without_raw_json() {
-        let payload = serde_json::json!({
-            "status": "failed",
-            "error_kind": "tool_invalid_args",
-            "error": "Tool arguments were not valid JSON",
-            "advisory": {
-                "kind": "malformed_tool_arguments",
-                "next_step": "Create one new complete JSON tool call that matches the advertised schema."
-            }
-        })
-        .to_string();
+        let payload = astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error("agent_fanout", None);
 
         let summary = fanout_start_summary(None, Some(&payload))
             .expect("typed fanout admission failure should have a user surface");
-        assert_eq!(
-            summary,
-            "Fanout did not start · its arguments were invalid, so no agents were launched. Create one new complete JSON tool call that matches the advertised schema."
-        );
+        assert!(summary.starts_with(
+            "Fanout did not start · its arguments were invalid, so no agents were launched."
+        ));
+        assert!(summary.contains("one complete JSON argument object"));
     }
 
     #[test]
     fn typed_deadline_skip_has_a_user_facing_summary_without_raw_json() {
-        let payload = r#"{"status":"completed","outcome":"delegation_skipped","reason_code":"insufficient_time_to_delegate","executed":false}"#;
+        let payload = r#"{"status":"rejected","error":"No child run was accepted within the remaining execution window.","reason_code":"insufficient_time_to_delegate","executed":false}"#;
         let summary = fanout_start_summary(None, Some(payload))
             .expect("typed deadline skip should have a user surface");
-        assert!(summary.contains("Parallel work wasn’t started"));
-        assert!(summary.contains("continue here"));
+        assert!(summary.contains("Fanout request was rejected"));
+        assert!(summary.contains("No child run was accepted"));
         assert!(!summary.contains("delegation_skipped"));
     }
 
@@ -8950,16 +8938,21 @@ mod tests {
             None,
             Some(r#"{"status":"started","group_id":"review-42"}"#),
         ));
-        assert!(fanout_completion_is_authoritative(
+        assert!(!fanout_completion_is_authoritative(
             None,
             Some(r#"{"status":"failed","error":"capacity unavailable"}"#),
         ));
-        assert!(fanout_completion_is_authoritative(
+        assert!(!fanout_completion_is_authoritative(
             None,
             Some(
                 "{\"status\":\"failed\",\"error\":\"capacity unavailable\"}\nRetry after capacity returns."
             ),
         ));
+        let rejection =
+            astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error(
+                "capacity unavailable",
+            );
+        assert!(fanout_completion_is_authoritative(None, Some(&rejection)));
     }
 
     #[test]
@@ -8978,12 +8971,7 @@ mod tests {
             duration_ms: 3,
             output_summary: None,
             output: Some(
-                serde_json::json!({
-                    "status": "failed",
-                    "error_kind": "capacity_unavailable",
-                    "error": "No execution slots are available."
-                })
-                .to_string(),
+                astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error("No execution slots are available."),
             ),
             tool_use_id: "fanout-rejected".into(),
             parent_tool_use_id: None,
@@ -9200,7 +9188,7 @@ mod tests {
         ));
         assert_eq!(
             detail.error.as_deref(),
-            Some("Needs continuation: The run reached its turn budget.")
+            Some("Needs continuation: The run reached its execution budget.")
         );
     }
 
@@ -9230,7 +9218,7 @@ mod tests {
         assert_eq!(detail.output_summary.as_deref(), Some("partial draft"));
         assert_eq!(
             detail.error.as_deref(),
-            Some("Needs continuation: The run reached its turn budget.")
+            Some("Needs continuation: The run reached its execution budget.")
         );
     }
 

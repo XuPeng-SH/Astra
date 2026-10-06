@@ -114,7 +114,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             "status": TOOL_RESULT_STATUS_COMPLETED,
             "selection_status": outcome,
             "query": query,
-            "invocation": "Selection never changes tools[]. Use a selected shape directly only when tools[] advertises it; otherwise call invoke_tool with the match name and arguments. Resident agent supports ordinary spawn, status, results, and messages; do not copy extra selected fields into a native call.",
+            "invocation": "Selection never changes tools[], even when the tool name is already resident. Native calls must match their current tools[] schema. If the tool is absent from tools[] or needs selected-only arguments, call invoke_tool with name=matches[].name and arguments=the selected tool's arguments.",
             "requested": requested,
             "resolved": resolved,
             "matches": found,
@@ -634,9 +634,11 @@ mod tests {
             "select mode must return schema entries, not relevance scores: {parsed}"
         );
         assert!(
-            parsed["invocation"].as_str().is_some_and(
-                |guidance| guidance.contains("invoke_tool") && guidance.contains("tools[]")
-            ),
+            parsed["invocation"]
+                .as_str()
+                .is_some_and(|guidance| guidance.contains("invoke_tool")
+                    && guidance.contains("tools[]")
+                    && guidance.contains("even when the tool name is already resident")),
             "selection must explain the carrier path without changing native tools: {parsed}"
         );
     }
@@ -1230,6 +1232,45 @@ mod tests {
             assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
             for selected in parsed["matches"].as_array().unwrap() {
                 let parameters = &selected["parameters"]["properties"];
+                let brief = if selected["name"] == "agent" {
+                    &parameters["prompt"]
+                } else {
+                    &parameters["slots"]["items"]["properties"]["prompt"]
+                };
+                let guidance = brief["description"].as_str().unwrap();
+                let normalized = guidance.to_ascii_lowercase();
+                assert!(
+                    normalized.contains("exact output")
+                        || normalized.contains("exact child output")
+                );
+                assert!(guidance.contains("parent uses model/status receipts"));
+                assert!(brief.get("x-astra-discovery-summary").is_none());
+                let reasoning = if selected["name"] == "agent" {
+                    vec![&parameters["reasoning"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["reasoning"],
+                        &parameters["slots"]["items"]["properties"]["reasoning"],
+                    ]
+                };
+                for control in reasoning {
+                    assert_eq!(control["description"], "Omit outside user-requested scope.");
+                    assert!(control.get("x-astra-discovery-summary").is_none());
+                }
+                let policies = if selected["name"] == "agent" {
+                    vec![&parameters["requested_model_policy"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["requested_model_policy"],
+                        &parameters["slots"]["items"]["properties"]["requested_model_policy"],
+                    ]
+                };
+                for policy in policies {
+                    let source = &policy["oneOf"][1]["properties"]["selector"]["oneOf"][1]["properties"]
+                        ["source"];
+                    assert_eq!(source["description"], "Exact provider/access_label.");
+                    assert!(source.get("x-astra-discovery-summary").is_none());
+                }
                 let profiles = if selected["name"] == "agent" {
                     vec![&parameters["agent_type"]]
                 } else {
@@ -1241,9 +1282,9 @@ mod tests {
                 for profile in profiles {
                     let description = profile["description"].as_str().unwrap();
                     for constraint in [
-                        "Exact directory ID",
-                        "explore=no shell(default)",
-                        "task requests shell",
+                        "Directory: exact ID required",
+                        "absent: omit (read-only)",
+                        "No file discovery",
                     ] {
                         assert!(description.contains(constraint), "{query}: {description}");
                     }

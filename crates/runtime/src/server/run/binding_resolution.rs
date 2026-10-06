@@ -39,13 +39,13 @@ pub(crate) fn request_uses_server_workspace(
 
 pub(crate) fn resolve_request_execution_bindings_without_server_workspace(
     request: &astra_services::runs::ChatRequestData,
-    edge_profile: &Map<String, Value>,
+    edge_profile: &astra_services::edge_context::EdgeProfile,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
     // An entirely absent execution profile is the safe, explicit no-file
     // control-plane case.  Do not treat a populated legacy edge profile as
     // authority to infer a workspace or executor: those require typed request
     // bindings in the canonical architecture.
-    if edge_profile.is_empty()
+    if edge_profile == &astra_services::edge_context::EdgeProfile::default()
         && request.workspace_binding.is_none()
         && request.executor_binding.is_none()
     {
@@ -221,6 +221,7 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
+        execution_authentication: request.execution_authentication.clone(),
         profile_authority: match request.admitted_agent_profiles.as_ref() {
             None => crate::orchestration::ParentProfileAuthority::Unbound,
             Some(snapshot) => match snapshot.lead_agent_id.as_ref() {
@@ -581,6 +582,7 @@ mod tests {
             stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: None,
+            execution_authentication: None,
             session_admission_facts: None,
             work_binding: None,
             run_start_idempotency: None,
@@ -893,6 +895,7 @@ mod tests {
             Value::String("edge-1".to_string()),
         );
         edge_profile.insert("hostname".to_string(), Value::String("devbox".to_string()));
+        let edge_profile = serde_json::from_value(Value::Object(edge_profile)).unwrap();
         let request = test_request("hello");
 
         assert!(
@@ -913,7 +916,7 @@ mod tests {
         assert!(
             resolve_request_execution_bindings_without_server_workspace(
                 &request,
-                edge_profile.as_object().unwrap(),
+                &serde_json::from_value(edge_profile).unwrap(),
             )
             .is_none()
         );
@@ -931,8 +934,11 @@ mod tests {
         });
 
         assert!(
-            resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
-                .is_none()
+            resolve_request_execution_bindings_without_server_workspace(
+                &request,
+                &Default::default()
+            )
+            .is_none()
         );
     }
 
@@ -940,9 +946,11 @@ mod tests {
     fn edge_tools_without_profile_do_not_create_provider_binding() {
         let request = test_request("use client tools");
 
-        let (workspace, executor) =
-            resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
-                .expect("missing profile should resolve to no-file control-plane bindings");
+        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
+            &request,
+            &Default::default(),
+        )
+        .expect("missing profile should resolve to no-file control-plane bindings");
 
         assert_eq!(workspace.kind, WorkspaceBindingKind::None);
         assert_eq!(workspace.display_name, "No file environment");

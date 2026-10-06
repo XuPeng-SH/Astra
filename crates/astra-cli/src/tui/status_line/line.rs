@@ -14,6 +14,7 @@ pub(crate) use crate::cli::permission_manager::PermissionMode;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StatusContext {
     pub model: Option<String>,
+    pub team: Option<String>,
     pub cwd: Option<String>,
     pub permission_mode: PermissionMode,
     /// A requested policy, pending until execution acknowledges application.
@@ -305,6 +306,13 @@ impl StatusLine {
             out.left.push(Segment::styled(
                 format_model_label(model, MODEL_MAX_WIDTH),
                 Style::default().fg(theme.path_file),
+            ));
+        }
+
+        if let Some(team) = ctx.team.as_deref() {
+            out.left.push(Segment::styled(
+                truncate_end(team, 28),
+                Style::default().fg(theme.accent),
             ));
         }
 

@@ -164,7 +164,7 @@ impl InterruptionKind {
     #[must_use]
     pub fn user_description(self) -> &'static str {
         match self {
-            Self::BudgetExhausted => "The run reached its turn budget.",
+            Self::BudgetExhausted => "The run reached its execution budget.",
             Self::EmptyCompletion => "The run stopped before producing a final answer.",
             Self::TokenBudgetExceeded => "The current request exceeded its input token budget.",
             Self::RateLimited => "The model provider is temporarily rate limited.",

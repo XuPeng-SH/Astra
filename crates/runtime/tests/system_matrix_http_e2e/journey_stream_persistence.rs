@@ -226,48 +226,75 @@ fn native_child_script(
     )
 }
 
-async fn assert_native_delegation_judgment(
+async fn assert_native_delegation_without_auxiliary_selector(
     ctx: &super::harness::MatrixE2eCtx,
     user_text: &str,
     slots: &[(&str, &str)],
 ) {
     let requests = ctx.native_provider_requests().await;
-    let inputs = requests
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| delegation_assessment(&request.body).is_some())
+            .count(),
+        0,
+        "ordinary delegation must not make an auxiliary selector request"
+    );
+    let request = requests
         .iter()
-        .filter_map(|request| {
-            let input = delegation_assessment(&request.body)?;
-            (input["user_text"] == user_text).then_some((request, input))
+        .rfind(|request| {
+            request.body["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "user" && message["content"] == user_text)
+            })
         })
-        .collect::<Vec<_>>();
-    assert_eq!(inputs.len(), 1, "one canonical judgment per root batch");
-    let (request, input) = &inputs[0];
+        .expect("parent must reach the provider");
     assert_eq!(request.body["model"], format!("mock-{}", ctx.suffix));
     assert_eq!(request.body["stream"], true);
-    let candidates = input["candidates"].as_array().unwrap();
-    let selected = candidates
+    let mut actual = Vec::new();
+    for call in request.body["messages"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|candidate| candidate["offering_id"] == ctx.model_offering_id)
-        .collect::<Vec<_>>();
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0]["model_name"], format!("mock-{}", ctx.suffix));
-    assert_eq!(selected[0]["provider"], "openai");
-    let actual = input["slots"].as_array().unwrap();
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+    {
+        let name = call["function"]["name"].as_str().unwrap();
+        let args: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        let (name, args) = if name == "invoke_tool" {
+            (args["name"].as_str().unwrap(), &args["arguments"])
+        } else {
+            (name, &args)
+        };
+        match (name, args["action"].as_str()) {
+            ("agent", Some("spawn")) => actual.push(args.clone()),
+            ("agent_fanout", Some("start")) => {
+                actual.extend(args["slots"].as_array().unwrap().iter().cloned())
+            }
+            _ => {}
+        }
+    }
     assert_eq!(actual.len(), slots.len());
     for (index, (description, prompt)) in slots.iter().enumerate() {
-        assert_eq!(actual[index]["index"], index);
         assert_eq!(actual[index]["description"], *description);
         assert_eq!(actual[index]["prompt"], *prompt);
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.body["stream"] == true
-                    && delegation_assessment(&request.body).is_none()
-                    && request.body["messages"]
-                        .as_array()
-                        .is_some_and(|messages| messages
-                            .iter()
-                            .any(|message| message["role"] == "user"
-                                && message["content"] == *prompt)))
+                .filter(
+                    |request| request.body["model"] == format!("mock-{}", ctx.suffix)
+                        && request.body["stream"] == true
+                        && delegation_assessment(&request.body).is_none()
+                        && request.body["messages"]
+                            .as_array()
+                            .is_some_and(|messages| messages
+                                .iter()
+                                .any(|message| message["role"] == "user"
+                                    && message["content"] == *prompt))
+                )
                 .count(),
             1,
             "each declared slot must issue exactly one actual child request with its complete task"
@@ -922,6 +949,254 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
     first.ctx.close().await;
 }
 
+pub async fn run_stream_corrects_invalid_model_policy_before_child_execution(explain: bool) {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let user_text =
+        "Use the specified model for a child to calculate a value and report its result.";
+    let child_task = "Calculate 13 times 17 and return only the integer.";
+    let releases =
+        ReleaseProviderGatesOnDrop(vec![std::sync::Arc::new(tokio::sync::Notify::new())]);
+    let model = format!("mock-{}", ctx.suffix);
+    let policy = json!({"mode":"fixed","selector":{"kind":"configured_name","model_name":model}});
+    let corrected = json!({"action":"spawn","description":"Calculate a value","prompt":child_task,"requested_model_policy":policy});
+    let mut invalid = corrected.clone();
+    invalid["requested_model_policy"] = json!(policy.to_string());
+    ctx.install_native_provider(
+        &b.auth_header,
+        vec![
+            ProviderScript::new(
+                "parent argument correction",
+                move |request| {
+                    request.path == "/v1/chat/completions"
+                        && request.body["stream"] == true
+                        && request.body["messages"].as_array().is_some_and(|messages| {
+                            messages
+                                .iter()
+                                .any(|m| m["role"] == "user" && m["content"] == user_text)
+                        })
+                },
+                vec![
+                    native_tool_response(provider_tool_call("invalid-policy", "agent", invalid)),
+                    native_tool_response(provider_tool_call(
+                        "corrected-policy",
+                        "agent",
+                        corrected,
+                    )),
+                    native_tool_response(provider_tool_call(
+                        "wait-for-result",
+                        "agent",
+                        json!({"action":"wait","timeout_ms":10000}),
+                    )),
+                    native_text_response("The observed child result is 221."),
+                ],
+            ),
+            native_child_script(
+                model.clone(),
+                user_text,
+                child_task,
+                gated_native_delta(json!({"content":"221"}), "stop", releases.0[0].clone()),
+            ),
+        ],
+    )
+    .await;
+    let payload = json!({
+        "message":user_text,
+        "explain":explain,
+        "model_selection":seeded_model_selection(ctx),
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let response = tokio::time::timeout_at(
+        deadline,
+        ctx.app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", &b.auth_header)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("bounded stream admission")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    let mut wait_observed = false;
+    // This scenario requires an admitted wait. Hold the child response
+    // until that receipt is published; a child arriving during inference
+    // correctly supersedes the stale response at the Action fence.
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .expect("bounded correction/wait/final sequence")
+    {
+        bytes.extend_from_slice(&chunk.unwrap());
+        if !wait_observed
+            && parse_sse_events(&String::from_utf8_lossy(&bytes))
+                .iter()
+                .any(|event| {
+                    event["type"] == "tool_call_end"
+                        && event["call_id"] == "wait-for-result"
+                        && event["success"] == true
+                })
+        {
+            wait_observed = true;
+            releases.0[0].notify_one();
+        }
+    }
+    assert!(
+        wait_observed,
+        "the wait must be admitted before releasing the child"
+    );
+    let raw = String::from_utf8(bytes).unwrap();
+    let events = parse_sse_events(&raw);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "agent_spawned")
+            .count(),
+        1,
+        "{raw}"
+    );
+    let requests = ctx.native_provider_requests().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|m| m["role"] == "user" && m["content"] == user_text)
+                })
+            })
+            .count(),
+        4,
+        "Explain capture must not change the correction/spawn/wait/final execution sequence"
+    );
+    let children: Vec<_> = requests
+        .iter()
+        .filter(|r| {
+            r.body["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m["role"] == "user" && m["content"] == child_task)
+            })
+        })
+        .collect();
+    assert_eq!(
+        children.len(),
+        1,
+        "only the corrected call may start a child"
+    );
+    assert_eq!(children[0].body["model"], model);
+    let final_request = requests
+            .iter()
+            .find(|request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["tool_call_id"] == "wait-for-result")
+                })
+            })
+            .unwrap_or_else(|| {
+                let message_shapes: Vec<_> = requests
+                    .iter()
+                    .map(|request| {
+                        request.body["messages"].as_array().map(|messages| {
+                            messages
+                                .iter()
+                                .map(|message| {
+                                    serde_json::json!({
+                                        "role": message["role"],
+                                        "tool_call_id": message["tool_call_id"],
+                                        "tool_calls": message["tool_calls"],
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                panic!(
+                    "wait receipt must reach the final provider request; explain={explain}; messages={message_shapes:?}; events={raw}"
+                );
+            });
+    let final_messages = final_request.body["messages"].as_array().unwrap();
+    let wait: Value = final_messages
+        .iter()
+        .find(|message| message["tool_call_id"] == "wait-for-result")
+        .and_then(|message| message["content"].as_str())
+        .and_then(|content| serde_json::from_str(content).ok())
+        .expect("typed wait receipt");
+    assert_eq!(wait["success"], true);
+    assert!(
+        final_messages
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .flat_map(str::lines)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(
+                |payload| payload["context"]["schema"] == "direct_child_completion.v1"
+                    && payload["context"]["children"]
+                        .as_array()
+                        .is_some_and(|children| {
+                            children.iter().any(|child| {
+                                child["status"] == "completed" && child["result"] == "221"
+                            })
+                        })
+            ),
+        "the final provider request must observe the actual completed child result"
+    );
+    let repair_request = requests
+        .iter()
+        .find(|r| {
+            r.body["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m["tool_call_id"] == "invalid-policy")
+            })
+        })
+        .expect("rejection must reach the next actual provider request");
+    let receipt: Value = repair_request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["tool_call_id"] == "invalid-policy")
+        .and_then(|m| m["content"].as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .expect("typed model-facing rejection");
+    assert_eq!(receipt["executed"], false);
+    assert_eq!(receipt["retryable"], false);
+    assert_eq!(receipt["error_kind"], "tool_invalid_args");
+    assert_eq!(
+        receipt["recovery_evidence"]["recovery_actions"],
+        json!(["correct_arguments"])
+    );
+    let agent_schema = repair_request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "agent")
+        .expect("actual provider schema");
+    assert_eq!(
+        agent_schema["function"]["parameters"]["properties"]["requested_model_policy"]["type"],
+        "object"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == "text_delta"
+            && e["content"].as_str().is_some_and(|s| s.contains("221"))),
+        "{raw}"
+    );
+    let session_id = sse_first_data_json_with_type(&raw, "session_info").unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
+    ctx.close().await;
+}
+
 /// B1: Session row persists, chat/stream completes, run status is queryable.
 pub async fn run_stream_session_and_run_status() {
     let b = bootstrap().await;
@@ -1132,16 +1407,6 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
                 "Inspect the user journey and return one finding.",
                 gated_native_delta(json!({"content":child_markers[2]}), "stop", releases.0[2].clone()),
             ),
-            ProviderScript::new(
-                "actual canonical delegation assessment",
-                move |request| {
-                    request.path == "/v1/chat/completions"
-                        && request.body["model"] == fixture_model
-                        && request.body["stream"] == true
-                        && delegation_assessment(&request.body).is_some()
-                },
-                vec![native_text_response("{\"disposition\":\"not_applicable\"}")],
-            ),
         ],
     )
     .await;
@@ -1254,7 +1519,7 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
             "final request must include {marker}"
         );
     }
-    assert_native_delegation_judgment(
+    assert_native_delegation_without_auxiliary_selector(
         ctx,
         "Run three reviews as one structured work group.",
         &[
@@ -1602,23 +1867,10 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         },
     ];
     let shared_group_id = "same-group-label-across-four-live-roots";
-    let mut scripts = cases
+    let scripts = cases
         .iter()
         .flat_map(|case| concurrent_fanout_scripts(ctx, case, shared_group_id))
         .collect::<Vec<_>>();
-    let fixture_model = format!("mock-{}", ctx.suffix);
-    scripts.push(ProviderScript::new(
-        "four canonical delegation assessments",
-        move |request| {
-            request.path == "/v1/chat/completions"
-                && request.body["model"] == fixture_model
-                && request.body["stream"] == true
-                && delegation_assessment(&request.body).is_some()
-        },
-        (0..4)
-            .map(|_| native_text_response("{\"disposition\":\"not_applicable\"}"))
-            .collect(),
-    ));
     ctx.install_native_provider(&b.auth_header, scripts).await;
     let payloads = cases
         .iter()
@@ -1636,7 +1888,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
     );
 
     for case in &cases {
-        assert_native_delegation_judgment(
+        assert_native_delegation_without_auxiliary_selector(
             ctx,
             &format!("Run the isolated fanout scenario {}.", case.name),
             &[
@@ -1769,7 +2021,6 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
         native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding one.",child_responses.remove(0)),
 native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding two.",child_responses.remove(0)),
 native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding three.",child_responses.remove(0)),
-        ProviderScript::new("cancel root canonical delegation assessment",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && delegation_assessment(&request.body).is_some(),vec![native_text_response("{\"disposition\":\"not_applicable\"}")])
     ]).await;
     let payload = json!({
         "message": "Start three slow reviews; the user will cancel the live root.","execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
@@ -1875,7 +2126,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert_native_delegation_judgment(
+    assert_native_delegation_without_auxiliary_selector(
         ctx,
         "Start three slow reviews; the user will cancel the live root.",
         &[
@@ -2583,7 +2834,6 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect storage.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
 native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect runtime.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
 native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect journey.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
-        ProviderScript::new("actual canonical delegation assessment",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && delegation_assessment(&request.body).is_some(),vec![native_text_response("{\"disposition\":\"not_applicable\"}")])
     ]).await;
     let payload = json!({
         "message": "Run three reviews and preserve every failure cause.",
@@ -2638,7 +2888,7 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
         bytes.extend_from_slice(&chunk.unwrap());
     }
     let raw_sse = String::from_utf8(bytes).unwrap();
-    assert_native_delegation_judgment(
+    assert_native_delegation_without_auxiliary_selector(
         ctx,
         "Run three reviews and preserve every failure cause.",
         &[

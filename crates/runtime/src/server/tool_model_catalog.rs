@@ -1,4 +1,4 @@
-//! Authenticated on-demand Chat model discovery. No ordinary-turn catalog I/O.
+//! Explicit refresh/pagination of the same authenticated catalog observation.
 
 use serde_json::Value;
 
@@ -9,6 +9,18 @@ use astra_turn_core::model_catalog::{
 #[cfg(test)]
 #[path = "tool_model_catalog_tests.rs"]
 mod tests;
+
+pub(super) fn catalog_read_error(status: axum::http::StatusCode) -> CatalogError {
+    use axum::http::StatusCode;
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => CatalogError::Unauthorized,
+        StatusCode::NOT_IMPLEMENTED => CatalogError::Unsupported,
+        status if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS => {
+            CatalogError::Unavailable
+        }
+        _ => CatalogError::InvalidCatalog,
+    }
+}
 
 pub(crate) async fn handle_model_catalog(
     args: &Value,
@@ -28,18 +40,7 @@ pub(crate) async fn handle_model_catalog(
                 .await
                 {
                     Ok(Ok(items)) => catalog_page(items, &request, scope),
-                    Ok(Err((status, _))) => Err(match status {
-                        axum::http::StatusCode::UNAUTHORIZED
-                        | axum::http::StatusCode::FORBIDDEN => CatalogError::Unauthorized,
-                        axum::http::StatusCode::NOT_IMPLEMENTED => CatalogError::Unsupported,
-                        status
-                            if status.is_server_error()
-                                || status == axum::http::StatusCode::TOO_MANY_REQUESTS =>
-                        {
-                            CatalogError::Unavailable
-                        }
-                        _ => CatalogError::InvalidCatalog,
-                    }),
+                    Ok(Err((status, _))) => Err(catalog_read_error(status)),
                     Err(_) => Err(CatalogError::Unavailable),
                 }
             }

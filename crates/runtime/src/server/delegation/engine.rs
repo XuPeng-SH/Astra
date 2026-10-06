@@ -2421,6 +2421,7 @@ impl DelegationEngine {
         retry_of: Option<&str>,
         interaction_mode: RequestedTurnInteractionMode,
         request_constraints: &RequestConstraints,
+        execution_restrictions: astra_services::runs::DurableExecutionRestrictions,
         execution_metadata: Option<&serde_json::Value>,
         admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
         profile_authority: &ParentProfileAuthority,
@@ -2452,6 +2453,7 @@ impl DelegationEngine {
                 retry_of,
                 crate::server::run::engine::RunStartContext {
                     interaction_mode,
+                    execution_restrictions: Some(execution_restrictions),
                     execution_metadata: execution_metadata
                         .and_then(serde_json::Value::as_object)
                         .cloned(),
@@ -3010,7 +3012,7 @@ impl DelegationEngine {
             (None, None) => None,
         };
         let interaction_mode =
-            crate::server::run::engine::durable_run_effective_interaction_mode(&parent_run);
+            crate::server::run::engine::durable_run_effective_interaction_mode(&parent_run)?;
 
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
@@ -3612,6 +3614,15 @@ impl DelegationEngine {
                     None,
                     interaction_mode,
                     &slot_constraints,
+                    slot_constraints.durable_execution_restrictions(
+                        admitted_execution_deadline,
+                        (profile.initial_turns.is_some() || profile.max_turns.is_some()).then_some(
+                            astra_services::runs::ExecutionBudget {
+                                initial_turns: profile.initial_turns,
+                                hard_turn_limit: profile.max_turns,
+                            },
+                        ),
+                    ),
                     execution_metadata.as_ref(),
                     admitted_agent_profiles,
                     &profile_authority,
@@ -3987,6 +3998,15 @@ impl DelegationEngine {
                     None,
                     interaction_mode,
                     &slot_constraints,
+                    slot_constraints.durable_execution_restrictions(
+                        stage_execution_deadline,
+                        (profile.initial_turns.is_some() || profile.max_turns.is_some()).then_some(
+                            astra_services::runs::ExecutionBudget {
+                                initial_turns: profile.initial_turns,
+                                hard_turn_limit: profile.max_turns,
+                            },
+                        ),
+                    ),
                     execution_metadata.as_ref(),
                     admitted_agent_profiles,
                     &profile_authority,
@@ -4362,6 +4382,15 @@ impl DelegationEngine {
                     None,
                     interaction_mode,
                     &request_constraints,
+                    request_constraints.durable_execution_restrictions(
+                        admitted_execution_deadline,
+                        (profile.initial_turns.is_some() || profile.max_turns.is_some()).then_some(
+                            astra_services::runs::ExecutionBudget {
+                                initial_turns: profile.initial_turns,
+                                hard_turn_limit: profile.max_turns,
+                            },
+                        ),
+                    ),
                     execution_metadata.as_ref(),
                     admitted_agent_profiles,
                     &profile_authority,
@@ -5301,6 +5330,7 @@ mod tests {
                 None,
                 RequestedTurnInteractionMode::Auto,
                 &RequestConstraints::default(),
+                RequestConstraints::default().durable_execution_restrictions(None, None),
                 None,
                 None,
                 &ParentProfileAuthority::Unbound,
@@ -5655,6 +5685,15 @@ mod tests {
                 strength: DelegationRequirementStrength::Hard,
             }],
         };
+        constraints.allowed_tools = Some(HashSet::from(["read_file".into()]));
+        constraints.enabled_tools = Some(HashSet::new());
+        let restrictions = constraints.durable_execution_restrictions(
+            execution_deadline_authority(60).unwrap(),
+            Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(2),
+                hard_turn_limit: Some(5),
+            }),
+        );
         let delegation = DelegationEngine::new(registry, run_engine.clone(), tracker);
         delegation
             .start_delegated_run(
@@ -5667,6 +5706,7 @@ mod tests {
                 None,
                 RequestedTurnInteractionMode::Auto,
                 &constraints,
+                restrictions.clone(),
                 None,
                 None,
                 &ParentProfileAuthority::Unbound,
@@ -5678,6 +5718,7 @@ mod tests {
             .await
             .unwrap();
         let child = run_engine.load_run("user", "child").await.unwrap().unwrap();
+        assert_eq!(child.execution_restrictions().unwrap(), Some(restrictions));
         assert_eq!(
             crate::server::run::engine::durable_run_delegated_model_requirements(&child).unwrap(),
             Some(constraints.delegated_model_requirements)
@@ -6812,6 +6853,22 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
+                let restrictions =
+                    serde_json::to_value(child.execution_restrictions().unwrap().unwrap()).unwrap();
+                assert_eq!(
+                    restrictions["allow_tools"],
+                    serde_json::json!(["read_file"])
+                );
+                assert_eq!(
+                    restrictions["allow_skills"],
+                    serde_json::json!(["analysis"])
+                );
+                assert_eq!(
+                    restrictions["execution_budget"],
+                    serde_json::json!({"initial_turns": 2, "hard_turn_limit": 5})
+                );
+                assert!(restrictions["execution_deadline_unix_ms"].is_null());
+                assert!(restrictions["execution_work_deadline_unix_ms"].is_null());
                 assert_eq!(
                     crate::server::run::engine::durable_run_profile_authority(
                         &child,

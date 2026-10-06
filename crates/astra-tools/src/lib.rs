@@ -333,6 +333,44 @@ pub const TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE: &str = "workspace_bindi
 pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED: &str = "workspace_effect_unsettled";
 pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED: &str = "workspace_effect_undeclared";
 
+/// Fence the next physical dispatch using a caller-selected monotonic cutoff.
+/// An acknowledged interaction is not a terminal result: if a prior call
+/// started, retain uncertainty instead of claiming the whole invocation never ran.
+pub fn dispatch_deadline_result(
+    deadline: Option<std::time::Instant>,
+    execution_started: bool,
+) -> Option<ToolResult> {
+    deadline.filter(|deadline| tokio::time::Instant::now().into_std() >= *deadline)?;
+    let mut fields = Map::from_iter([
+        (
+            "error_kind".into(),
+            json!(astra_core::ErrorKind::BudgetExhausted.as_str()),
+        ),
+        ("execution_started".into(), json!(execution_started)),
+        ("side_effects_maybe".into(), json!(execution_started)),
+        ("retryable".into(), json!(false)),
+    ]);
+    let message = if execution_started {
+        fields.insert("executed".into(), Value::Null);
+        "The run admission deadline expired before a continuation. An earlier call started; its outcome remains unresolved and no further call was dispatched."
+    } else {
+        fields.insert("executed".into(), json!(false));
+        fields.insert(
+            "rejection_code".into(),
+            json!("execution_time_budget_exhausted"),
+        );
+        "The run admission deadline expired before dispatch; the tool was not executed."
+    };
+    let mut output = fields.clone();
+    output.insert("error".into(), json!(message));
+    Some(ToolResult {
+        output: Value::Object(output).to_string(),
+        metadata: Some(fields),
+        is_error: true,
+        exit_semantics: None,
+    })
+}
+
 pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult {
     let message = if execution_started {
         format!("Tool '{name}' cancelled before completion")

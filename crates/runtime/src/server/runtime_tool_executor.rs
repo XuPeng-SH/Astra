@@ -140,8 +140,8 @@ use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
 };
 use crate::server::tool_route_runtime::{
-    ToolRouteObserver, ToolRouteRuntimeContext, emit_tool_route_completion_events,
-    execute_tool_route_before_completion_events,
+    ExecutedToolRoute, ToolRouteObserver, ToolRouteRuntimeContext,
+    emit_tool_route_completion_events, execute_tool_route_before_completion_events,
 };
 use crate::server::tool_route_selection::{ToolExecutionClass, tool_execution_class};
 use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
@@ -806,14 +806,15 @@ pub struct RuntimeToolExecutor {
     tool_engine: ToolEngine<RuntimeToolExecutor>,
     /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
-    /// Immutable request-admission deadline for durable tool-result writes.
+    /// Immutable request authority: WORK admits ordinary dispatch, TOTAL
+    /// bounds settlement and durable tool-result writes.
     ///
     /// Large results are not acknowledged until their artifact is durable. A
     /// short storage-local timeout would turn temporary database latency into
     /// a false terminal failure, while an unbounded write could outlive the
     /// admitted turn. The request deadline and run cancellation token are the
     /// authoritative bounds for this operation.
-    durable_operation_deadline: Option<tokio::time::Instant>,
+    admitted_execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     /// Explicit workspace, executor, runtime, and provisioned workspace record
     /// used for routing, tool visibility, and runtime preparation.
     execution_binding: ExecutionBindingState,
@@ -1052,7 +1053,7 @@ impl RuntimeToolExecutor {
             model_catalog_reader: None,
             session_config: SessionConfigState::new(),
             cancel_token: None,
-            durable_operation_deadline: None,
+            admitted_execution_deadline: None,
             session_artifact_store: None,
             context_manifest_pool: None,
             work_binding: std::sync::OnceLock::new(),
@@ -1756,10 +1757,41 @@ impl RuntimeToolExecutor {
         tool_call_id: Option<&str>,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
         prepared: Option<&astra_mcp::PreparedMcpToolCall>,
+        admission_deadline: Option<std::time::Instant>,
     ) -> astra_tools::ToolResult {
+        let prepared = if self.agent_binding_mcp.is_none() {
+            let Some(mgr) = &self.mcp_manager else {
+                return astra_tools::ToolResult::error(format!(
+                    "Error: Tool '{name}' is not available — no MCP manager configured."
+                ));
+            };
+            Some(match prepared {
+                Some(prepared) => prepared.clone(),
+                None => match mgr.read().await.prepare_tool_call_by_mcp_name(name) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        return astra_tools::ToolResult::error(format!(
+                            "Error: MCP tool '{name}' cannot be prepared: {error}"
+                        ));
+                    }
+                },
+            })
+        } else {
+            None
+        };
         let mut interaction_response: Option<ProviderInteractionResponse> = None;
         let mut seen_interaction_ids = HashSet::new();
         loop {
+            let prior_dispatch = !seen_interaction_ids.is_empty();
+            if let Some(result) =
+                astra_tools::dispatch_deadline_result(admission_deadline, prior_dispatch)
+            {
+                return if prior_dispatch {
+                    mark_mcp_call_dispatched(result)
+                } else {
+                    result
+                };
+            }
             let result = if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
                 let Some(tool_call_id) = tool_call_id else {
                     return astra_tools::ToolResult::error(format!(
@@ -1786,22 +1818,6 @@ impl RuntimeToolExecutor {
                         )
                     })
             } else {
-                let Some(mgr) = &self.mcp_manager else {
-                    return astra_tools::ToolResult::error(format!(
-                        "Error: Tool '{name}' is not available — no MCP manager configured."
-                    ));
-                };
-                let prepared = match prepared {
-                    Some(prepared) => prepared.clone(),
-                    None => match mgr.read().await.prepare_tool_call_by_mcp_name(name) {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            return astra_tools::ToolResult::error(format!(
-                                "Error: MCP tool '{name}' cannot be prepared: {error}"
-                            ));
-                        }
-                    },
-                };
                 let protocol_metadata = interaction_response.as_ref().map(|response| {
                     Map::from_iter([(
                         PROVIDER_INTERACTION_RESPONSE_METADATA_KEY.to_string(),
@@ -1810,6 +1826,8 @@ impl RuntimeToolExecutor {
                     )])
                 });
                 prepared
+                    .as_ref()
+                    .expect("non-Agent-Binding MCP call was prepared before admission")
                     .call(args.clone(), protocol_metadata)
                     .await
                     .map(|result| {
@@ -2827,8 +2845,7 @@ impl RuntimeToolExecutor {
         mut self,
         deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Self {
-        self.durable_operation_deadline =
-            deadline.map(|deadline| tokio::time::Instant::from_std(deadline.monotonic_deadline()));
+        self.admitted_execution_deadline = deadline;
         self
     }
 
@@ -3186,6 +3203,9 @@ impl RuntimeToolExecutor {
             name,
             args,
         );
+        request.policy.admission_deadline = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.monotonic_work_deadline());
         if let Some(offer) = self.selected_offer_for_request(&request, None) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -3217,6 +3237,9 @@ impl RuntimeToolExecutor {
         let mut request = self
             .execution_binding
             .tool_execution_request_for_invocation(identity, name, args);
+        request.policy.admission_deadline = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.monotonic_work_deadline());
         if let Some(offer) = self.selected_offer_for_request(&request, resolved_provider_policy) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -3479,7 +3502,17 @@ impl RuntimeToolExecutor {
         task_resolution_authority: Option<
             &astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority,
         >,
+        runtime_control_kind: Option<
+            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind,
+        >,
     ) -> GovernableRuntimeToolResult {
+        if runtime_control_kind.is_some_and(|kind| kind.tool_name() != name) {
+            return GovernableRuntimeToolResult::completed(
+                tool_invocation_decision_rejected_result(
+                    "runtime control provenance does not match the canonical tool name".into(),
+                ),
+            );
+        }
         let identity = match astra_turn_types::ToolInvocationIdentity::new(
             &self.user_id,
             &self.session_id,
@@ -3513,6 +3546,13 @@ impl RuntimeToolExecutor {
         request.policy.task_resolution_authority = task_resolution_authority
             .and_then(|authority| authority.for_call(invocation_id))
             .cloned();
+        if runtime_control_kind
+            == Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement)
+        {
+            request.policy.admission_deadline = self
+                .admitted_execution_deadline
+                .map(|deadline| deadline.monotonic_deadline());
+        }
         // This path owns the full durable admission/route state machine. Keep
         // that large future out of the caller future's inline state: server
         // SSE runs on a bounded Tokio worker stack, and embedding all route
@@ -3767,6 +3807,7 @@ impl RuntimeToolExecutor {
                 .invocation_admission_snapshot(&request)
                 .await,
         );
+        let mut dispatch_rejection = None;
         let durable_invocation = if request.policy.permission_grant.is_some() {
             let identity = match astra_turn_types::ToolInvocationIdentity::new(
                 &request.user_id,
@@ -3876,6 +3917,28 @@ impl RuntimeToolExecutor {
                         );
                     }
                 };
+                // A hot-probe miss is not absence: compaction may have moved
+                // a terminal result to the archive. Only an archive-aware
+                // lookup may prove an expired call was never reserved.
+                let delegation_preparation = if let Some(rejection) =
+                    request.policy.dispatch_deadline_rejection()
+                {
+                    let probe = match delegation_preparation {
+                        Some(probe @ crate::server::tool_invocation_runtime::InvocationPreparationProbe::Existing(_)) => probe,
+                        _ => match ledger.get(&identity).await {
+                            Ok(Some(record)) => crate::server::tool_invocation_runtime::InvocationPreparationProbe::Existing(Box::new(record)),
+                            Ok(None) => return GovernableRuntimeToolResult::completed(rejection),
+                            Err(error) => return GovernableRuntimeToolResult::completed(
+                                crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                                    &identity, error,
+                                ),
+                            ),
+                        },
+                    };
+                    Some(probe)
+                } else {
+                    delegation_preparation
+                };
                 match delegation_preparation {
                     Some(probe) => {
                         ledger
@@ -3954,7 +4017,9 @@ impl RuntimeToolExecutor {
                     tool_invocation_decision_rejected_result(error.to_string()),
                 );
             }
+            let admission_deadline = request.policy.admission_deadline;
             frozen.apply_to_request(&mut request);
+            request.policy.admission_deadline = admission_deadline;
             let semantic_read_preparation = self
                 .prepare_semantic_read(&frozen, &identity, &request.args)
                 .await;
@@ -4034,6 +4099,10 @@ impl RuntimeToolExecutor {
             let admitted_control_epoch = durable_dispatch_admission
                 .as_ref()
                 .map(|admission| admission.expected_control_epoch);
+            // Preparation can cross the cutoff. Retain the refusal through
+            // the existing claim/completion owner, so Prepared never strands
+            // and replay observes the same executed=false terminal outcome.
+            dispatch_rejection = request.policy.dispatch_deadline_rejection();
             match ledger
                 .dispatch_prepared_with_admission(&identity, durable_dispatch_admission)
                 .await
@@ -4131,8 +4200,22 @@ impl RuntimeToolExecutor {
                 .map(|(ledger, identity, _, owner_id, _, _)| {
                     ledger.start_lease_heartbeat(identity.clone(), owner_id.clone())
                 });
-        let mut executed =
-            execute_tool_route_before_completion_events(&route_context, request, route).await;
+        let mut executed = if let Some(mut result) =
+            dispatch_rejection.or_else(|| request.policy.dispatch_deadline_rejection())
+        {
+            let boundary =
+                crate::server::tool_route_boundary::ToolRouteBoundary::new(request, route);
+            boundary
+                .attach_binding_metadata(&mut result, self.tool_execution_service.tool_registry());
+            ExecutedToolRoute {
+                boundary,
+                result,
+                accepted_send: None,
+                duration_ms: 0,
+            }
+        } else {
+            execute_tool_route_before_completion_events(&route_context, request, route).await
+        };
         // This field is reserved for the runtime argument-preflight branch
         // above. Tool handlers and callback results cannot claim that their
         // own work was rejected before dispatch.
@@ -4427,7 +4510,8 @@ impl RuntimeToolExecutor {
         tokio::pin!(persist);
         let persist_result = match (
             self.cancel_token.as_deref(),
-            self.durable_operation_deadline,
+            self.admitted_execution_deadline
+                .map(|deadline| tokio::time::Instant::from_std(deadline.monotonic_deadline())),
         ) {
             (Some(cancel_token), Some(deadline)) => tokio::select! {
                 biased;
@@ -4757,6 +4841,10 @@ impl RuntimeToolExecutor {
                 .into();
         }
 
+        if let Some(result) = request.policy.dispatch_deadline_rejection() {
+            return lifecycle.finish(name, &call_id, result).await.into();
+        }
+
         // The agent handler carries private execution facts through the same
         // local policy, cancellation and workspace authority boundary.
         let mut accepted_send = None;
@@ -4786,6 +4874,7 @@ impl RuntimeToolExecutor {
                         self,
                         args,
                         astra_tools::tool_engine::ToolInvocationMetadata {
+                            admission_deadline: request.policy.admission_deadline,
                             run_id: non_empty_identity(&request.run_id),
                             turn_chain_id: non_empty_identity(&request.turn_chain_id),
                             tool_call_id: non_empty_identity(&request.tool_call_id),
@@ -5379,6 +5468,7 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
                     non_empty_identity(&request.tool_call_id),
                     request.policy.semantic_read_condition.as_ref(),
                     prepared.as_ref(),
+                    request.policy.admission_deadline,
                 )
                 .await;
             let result = finalize_mcp_workspace_effect(
@@ -5865,6 +5955,7 @@ pub(crate) mod tests {
                 &json!({"city": 42}),
                 None,
                 Some(&grant),
+                None,
                 None,
                 None,
                 None,
@@ -8722,6 +8813,550 @@ esac
             ExecutorBinding::server_local(),
         );
         (exec, dir)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_dispatch_is_settled_once_and_replayed_without_execution() {
+        let (mut exec, dir) = test_executor();
+        exec.enable_durable_invocations();
+        let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 2,
+            },
+            0,
+        )
+        .unwrap();
+        exec = exec.with_admitted_execution_deadline(Some(deadline));
+        let progress = Arc::new(ToolLifecycleProgressCallback::default());
+        exec.set_progress_callback(progress.clone());
+        let grant = crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+            reason: None,
+            updates_hash: None,
+        };
+        let args = json!({"path": "never-written", "content": "must not execute"});
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "expired",
+        )
+        .unwrap();
+        let mut request =
+            exec.tool_execution_request_for_invocation(&identity, "write_file", &args, None);
+        request.policy.permission_grant = Some(grant.clone());
+        request.policy.admission_snapshot = Some(
+            exec.tool_execution_service
+                .invocation_admission_snapshot(&request)
+                .await,
+        );
+        let snapshot =
+            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                exec.tool_execution_service.routing_decision(&request),
+                exec.tool_execution_service.tool_registry(),
+            )
+            .unwrap();
+        let ledger = exec.invocation_ledger.as_ref().unwrap();
+        ledger
+            .prepare_for_execution(
+                &identity,
+                &snapshot.fingerprint(&args).unwrap(),
+                &snapshot.durable().unwrap(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().state,
+            astra_turn_types::ToolInvocationState::Prepared
+        );
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            deadline.monotonic_work_deadline(),
+        ))
+        .await;
+        let mut record = None;
+        for replay in [false, true] {
+            let result = exec
+                .execute_invocation_with_metadata(
+                    "run",
+                    "chain",
+                    "expired",
+                    "write_file",
+                    &args,
+                    None,
+                    Some(&grant),
+                )
+                .await;
+            let fields = result.metadata.as_ref().unwrap();
+            assert_eq!(fields["execution_started"], false, "{result:?}");
+            assert_eq!(fields["rejection_code"], "execution_time_budget_exhausted");
+            let current = exec
+                .invocation_ledger
+                .as_ref()
+                .unwrap()
+                .get(&identity)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.state,
+                astra_turn_types::ToolInvocationState::Rejected
+            );
+            if replay {
+                assert_eq!(record.as_ref(), Some(&current));
+            }
+            record = Some(current);
+        }
+        assert_eq!(progress.started.load(Ordering::Relaxed), 0);
+        assert!(!dir.path().join("never-written").exists());
+
+        let fresh = exec
+            .execute_invocation_with_metadata(
+                "run",
+                "chain",
+                "fresh-expired",
+                "write_file",
+                &args,
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert_eq!(fresh.metadata.as_ref().unwrap()["execution_started"], false);
+        let fresh_identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "fresh-expired",
+        )
+        .unwrap();
+        assert!(
+            ledger.get(&fresh_identity).await.unwrap().is_none(),
+            "no fresh Prepared row after expiry"
+        );
+
+        // A known terminal acknowledgement is delivery, not new dispatch:
+        // exhausting WORK must not replace the authoritative replay.
+        let acknowledged = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "acknowledged",
+        )
+        .unwrap();
+        ledger
+            .prepare_for_execution(
+                &acknowledged,
+                &snapshot.fingerprint(&args).unwrap(),
+                &snapshot.durable().unwrap(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+            owner_id,
+            ..
+        } = ledger.dispatch_prepared(&acknowledged).await.unwrap()
+        else {
+            panic!("claim acknowledged invocation")
+        };
+        ledger
+            .finish(
+                &acknowledged,
+                &owner_id,
+                astra_tools::ToolResult::text("retained acknowledgement".into()),
+            )
+            .await;
+        let ack = exec
+            .execute_invocation_with_metadata(
+                "run",
+                "chain",
+                "acknowledged",
+                "write_file",
+                &args,
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert!(!ack.is_error, "{ack:?}");
+        assert_eq!(ack.output, "retained acknowledgement");
+        assert_eq!(progress.started.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+    async fn expired_dispatch_replays_archived_ack_and_rejects_changed_arguments() {
+        use crate::server::tool_invocation_runtime::{
+            DurableDispatchAdmission, InvocationPreparationProbe, RuntimeToolInvocationLedger,
+        };
+        use astra_services::tool_invocation_ledger::{
+            DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
+        };
+        use astra_turn_types::{
+            ToolInvocationIdentity, ToolInvocationResultPayload, ToolInvocationState,
+            ToolInvocationTerminalOutcome,
+        };
+
+        let shared = crate::turn::services::setup_live_pool_for_test().await;
+        let pool = shared.get();
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let identity = ToolInvocationIdentity::new(
+            format!("archive-user-{prefix}"),
+            format!("archive-session-{prefix}"),
+            format!("archive-run-{prefix}"),
+            "chain",
+            "acknowledged",
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut exec = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            identity.user_id.clone(),
+            identity.session_id.clone(),
+            None,
+            None,
+        );
+        exec.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(dir.path()),
+            ExecutorBinding::server_local(),
+        );
+        exec.set_invocation_ledger(RuntimeToolInvocationLedger::new_database(
+            shared.clone(),
+            "archive-test-owner".into(),
+        ));
+        let progress = Arc::new(ToolLifecycleProgressCallback::default());
+        exec.set_progress_callback(progress.clone());
+        let args = json!({"path": "never-written", "content": "original"});
+        let mut request =
+            exec.tool_execution_request_for_invocation(&identity, "write_file", &args, None);
+        request.policy.permission_grant = Some(
+            crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+                source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+                reason: None,
+                updates_hash: None,
+            },
+        );
+        request.policy.admission_snapshot = Some(
+            exec.tool_execution_service
+                .invocation_admission_snapshot(&request)
+                .await,
+        );
+        let snapshot =
+            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                exec.tool_execution_service.routing_decision(&request),
+                exec.tool_execution_service.tool_registry(),
+            )
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+             VALUES (?, ?, 'archived invocation replay', 'active', 0)",
+        )
+        .bind(&identity.session_id)
+        .bind(&identity.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+              owner_pod_id, owner_lease_expires_at, run_generation)
+             VALUES (?, ?, ?, ?, ?, 'running', 'archive-test-owner',
+                     TIMESTAMPADD(MINUTE, 10, NOW(6)), 0)",
+        )
+        .bind(&identity.run_id)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let ledger = DatabaseToolInvocationLedger::new(shared.clone());
+        ledger
+            .prepare(
+                &identity,
+                &snapshot.fingerprint(&args).unwrap(),
+                &snapshot.durable().unwrap(),
+            )
+            .await
+            .unwrap();
+        ledger
+            .claim_dispatch(
+                &identity,
+                "archive-worker",
+                90_000,
+                ToolInvocationDispatchAdmission {
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                    expected_owner_pod_id: "archive-test-owner".into(),
+                    expected_execution_binding_generation: None,
+                },
+            )
+            .await
+            .unwrap();
+        ledger
+            .compare_and_complete(
+                &identity,
+                ToolInvocationState::Dispatched,
+                Some("archive-worker"),
+                &ToolInvocationTerminalOutcome::Succeeded {
+                    result: ToolInvocationResultPayload {
+                        output: "retained archived acknowledgement".into(),
+                        metadata: [("ack_kind".into(), json!("original"))].into(),
+                        exit_semantics: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let original = ledger.get(&identity).await.unwrap().unwrap();
+        sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+            .bind(&identity.user_id)
+            .bind(&identity.run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let compacted = ledger
+            .compact_terminal_run_batch(&identity.user_id, &identity.session_id, &identity.run_id)
+            .await
+            .unwrap();
+        assert_eq!(compacted.archived_records, 1);
+        assert_eq!(compacted.remaining_records, 0);
+        assert!(compacted.artifact_id.is_some());
+
+        // Cross the real authority's WORK cutoff without pausing any DB await.
+        tokio::time::pause();
+        let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 120,
+            },
+            0,
+        )
+        .unwrap();
+        tokio::time::advance(
+            deadline.monotonic_work_deadline() - tokio::time::Instant::now().into_std(),
+        )
+        .await;
+        tokio::time::resume();
+        assert!(deadline.remaining() > Duration::ZERO);
+        exec = exec.with_admitted_execution_deadline(Some(deadline));
+        for supplied_miss in [false, true] {
+            for changed_arguments in [false, true] {
+                let mut replay_args = args.clone();
+                if changed_arguments {
+                    replay_args["content"] = json!("changed");
+                }
+                let mut replay = exec.tool_execution_request_for_invocation(
+                    &identity,
+                    "write_file",
+                    &replay_args,
+                    None,
+                );
+                replay.policy.permission_grant = request.policy.permission_grant.clone();
+                replay.policy.admission_snapshot = request.policy.admission_snapshot.clone();
+                assert!(replay.policy.dispatch_deadline_rejection().is_some());
+                let probe = exec
+                    .invocation_ledger
+                    .as_ref()
+                    .unwrap()
+                    .probe_for_prepare(&identity, &snapshot.fingerprint(&replay_args).unwrap())
+                    .await
+                    .unwrap();
+                assert!(matches!(probe, InvocationPreparationProbe::Missing(_)));
+                let replay = exec
+                    .execute_request_before_governance(
+                        replay,
+                        None,
+                        Some(DurableDispatchAdmission {
+                            expected_control_epoch: -1,
+                            expected_owner_generation: 0,
+                            expected_execution_binding_generation: None,
+                        }),
+                        supplied_miss.then_some(probe),
+                    )
+                    .await;
+                assert!(replay.pending.is_none());
+                assert_eq!(
+                    replay.result.is_error, changed_arguments,
+                    "{:?}",
+                    replay.result
+                );
+                let fields = replay.result.metadata.as_ref().unwrap();
+                assert!(
+                    !fields.contains_key("rejection_code"),
+                    "{:?}",
+                    replay.result
+                );
+                if changed_arguments {
+                    assert_eq!(fields["error_kind"], "tool_invocation_ledger");
+                    assert!(replay.result.output.contains("changed tool or arguments"));
+                    assert!(replay.confirmed_invocation.is_none());
+                } else {
+                    assert_eq!(replay.result.output, "retained archived acknowledgement");
+                    assert_eq!(fields["ack_kind"], "original");
+                    assert_eq!(replay.confirmed_invocation.as_deref(), Some(&original));
+                }
+                assert_eq!(
+                    ledger.get(&identity).await.unwrap().as_ref(),
+                    Some(&original)
+                );
+                let hot_rows: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM tool_invocation_ledger
+                     WHERE user_id = ? AND session_id = ? AND run_id = ?",
+                )
+                .bind(&identity.user_id)
+                .bind(&identity.session_id)
+                .bind(&identity.run_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    hot_rows, 0,
+                    "archived replay must not recreate Prepared custody"
+                );
+            }
+        }
+        assert_eq!(progress.started.load(Ordering::Relaxed), 0);
+        assert!(!dir.path().join("never-written").exists());
+        for table in [
+            "agent_run_events",
+            "tool_invocation_ledger",
+            "tool_invocation_archive_chunks",
+            "session_artifact_references",
+            "session_artifacts",
+            "agent_runs",
+            "agent_sessions",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            ))
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_control_deadline_requires_exact_provenance_and_preserves_total_for_settlement()
+    {
+        use astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind;
+        let (exec, _dir) = test_executor();
+        let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 2,
+            },
+            0,
+        )
+        .unwrap();
+        let mut exec = exec.with_admitted_execution_deadline(Some(deadline));
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            deadline.monotonic_work_deadline(),
+        ))
+        .await;
+        let settlement = json!({"outcome": "failed", "summary": "Known work failed"});
+        let resolution = json!({"verification_target": "check", "failed_call_ids": ["failed"],
+            "evidence_call_ids": [], "conclusion": "unknown", "rationale": "No evidence",
+            "remaining_gaps": ["check"]});
+        for (name, args, kind, expected_budget_rejection) in [
+            (
+                "settle_work_item",
+                &settlement,
+                Some(RuntimeControlInvocationKind::WorkSettlement),
+                false,
+            ),
+            ("settle_work_item", &settlement, None, true),
+            (
+                "submit_task_resolution",
+                &resolution,
+                Some(RuntimeControlInvocationKind::OutcomeReconciliation),
+                true,
+            ),
+        ] {
+            let outcome = exec
+                .execute_invocation_before_governance(
+                    "run", "chain", "call", name, args, None, None, None, None, None, kind,
+                )
+                .await;
+            assert_eq!(
+                outcome
+                    .result
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("rejection_code"))
+                    == Some(&json!("execution_time_budget_exhausted")),
+                expected_budget_rejection,
+                "{name}: {:?}",
+                outcome.result
+            );
+            if !expected_budget_rejection {
+                // Deadline admission does not bypass the real Work binding guard.
+                assert!(outcome.result.is_error);
+            }
+        }
+        let wrong_kind = exec
+            .execute_invocation_before_governance(
+                "run",
+                "chain",
+                "wrong",
+                "submit_task_resolution",
+                &resolution,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(RuntimeControlInvocationKind::WorkSettlement),
+            )
+            .await;
+        assert_eq!(
+            wrong_kind.result.metadata.as_ref().unwrap()["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+        exec.admitted_execution_deadline = Some(
+            astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 0,
+                },
+                0,
+            )
+            .unwrap(),
+        );
+        let expired = exec
+            .execute_invocation_before_governance(
+                "run",
+                "chain",
+                "total-expired",
+                "settle_work_item",
+                &settlement,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(RuntimeControlInvocationKind::WorkSettlement),
+            )
+            .await;
+        assert_eq!(
+            expired.result.metadata.as_ref().unwrap()["execution_started"],
+            false
+        );
+        assert_eq!(
+            expired.result.metadata.as_ref().unwrap()["rejection_code"],
+            "execution_time_budget_exhausted"
+        );
+        exec.admitted_execution_deadline = None;
+        assert!(
+            exec.tool_execution_request("write_file", &json!({}))
+                .policy
+                .admission_deadline
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -13094,6 +13729,7 @@ esac
     struct FixedProviderInteractionGate {
         calls: Arc<AtomicUsize>,
         decision: astra_tools::ProviderInteractionDecision,
+        wait: Option<ProjectionWriteBarrier>,
     }
 
     #[async_trait]
@@ -13103,6 +13739,10 @@ esac
             _request: &astra_turn_types::ProviderInteractionRequest,
         ) -> astra_tools::ProviderInteractionDecision {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(wait) = &self.wait {
+                wait.entered.notify_one();
+                wait.release.notified().await;
+            }
             self.decision.clone()
         }
     }
@@ -13110,6 +13750,7 @@ esac
     async fn execute_provider_interaction_sequence(
         unique_request_ids: bool,
         decision: astra_tools::ProviderInteractionDecision,
+        cross_cutoff: Option<bool>,
     ) -> (astra_tools::ToolResult, usize, usize) {
         let provider_calls = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new()
@@ -13175,18 +13816,43 @@ esac
             )
             .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::ReadOnly),
         ));
+        let wait = cross_cutoff.map(|_| ProjectionWriteBarrier {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        });
         exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
             calls: Arc::clone(&gate_calls),
             decision,
+            wait: wait.clone(),
         }));
         let mut request = exec.tool_execution_request("mcp__mail__send", &json!({}));
         request.tool_call_id = "call-provider-interaction".to_string();
+        request.policy.admission_deadline =
+            cross_cutoff.map(|_| tokio::time::Instant::now().into_std() + Duration::from_secs(60));
 
-        let result = <RuntimeToolExecutor as ServerLocalToolTransport<
+        let execution = <RuntimeToolExecutor as ServerLocalToolTransport<
             crate::server::tool_local_transport::RuntimeToolExecutionResult,
-        >>::execute_server_local_tool(&exec, &request, None)
-        .await
-        .result;
+        >>::execute_server_local_tool(&exec, &request, None);
+        tokio::pin!(execution);
+        if let Some(wait) = &wait {
+            tokio::select! {
+                result = &mut execution => panic!("must reach real MCP interaction gate: {:?}", result.result),
+                () = wait.entered.notified() => {}
+            }
+            // The loopback exchange reaches the gate before pausing. Advance
+            // against the admitted cutoff, not an assumed wall-clock origin.
+            tokio::time::pause();
+            if cross_cutoff == Some(true) {
+                let remaining =
+                    tokio::time::Instant::from_std(request.policy.admission_deadline.unwrap())
+                        .saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::advance(remaining + Duration::from_millis(1)).await;
+            }
+            tokio::time::resume();
+            wait.release.notify_one();
+        }
+        let result = execution.await.result;
 
         server.abort();
         (
@@ -13203,6 +13869,7 @@ esac
             astra_tools::ProviderInteractionDecision::Submitted(json!({
                 "selected": "primary"
             })),
+            None,
         )
         .await;
         assert!(result.is_error, "{result:?}");
@@ -13218,6 +13885,7 @@ esac
             astra_tools::ProviderInteractionDecision::Submitted(json!({
                 "selected": "primary"
             })),
+            None,
         )
         .await;
         assert!(result.is_error, "{result:?}");
@@ -13232,6 +13900,42 @@ esac
     }
 
     #[tokio::test]
+    async fn mcp_interaction_deadline_stops_continuation_without_erasing_prior_dispatch() {
+        for (cross_cutoff, cancel) in [(true, false), (false, false), (false, true)] {
+            let decision = if cancel {
+                astra_tools::ProviderInteractionDecision::Cancelled
+            } else {
+                astra_tools::ProviderInteractionDecision::Submitted(json!({"selected": "primary"}))
+            };
+            let (result, provider_calls, gate_calls) =
+                execute_provider_interaction_sequence(false, decision, Some(cross_cutoff)).await;
+            assert_eq!(gate_calls, 1);
+            assert_eq!(provider_calls, if cross_cutoff || cancel { 1 } else { 2 });
+            assert!(result.is_error, "{result:?}");
+            let fields = result.metadata.as_ref().unwrap();
+            assert_eq!(fields["mcp_call_dispatched"], true);
+            if cross_cutoff {
+                assert_eq!(fields["execution_started"], true);
+                assert_eq!(fields["side_effects_maybe"], true);
+                assert_eq!(fields["retryable"], false);
+                assert!(fields["executed"].is_null());
+                assert!(!fields.contains_key("rejection_code"));
+                let output: Value = serde_json::from_str(&result.output).unwrap();
+                assert!(output["executed"].is_null());
+            } else {
+                assert!(
+                    result.output.contains(if cancel {
+                        "cancelled"
+                    } else {
+                        "made no progress"
+                    }),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn rejected_provider_submission_does_not_continue_the_mcp_call() {
         let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
             true,
@@ -13239,6 +13943,7 @@ esac
                 "provider interaction response was recorded without durable resume authority"
                     .to_string(),
             ),
+            None,
         )
         .await;
 
@@ -13252,6 +13957,137 @@ esac
     }
 
     struct AlwaysTimeoutGate;
+
+    struct ApproveAfterDeadline {
+        deadline: std::time::Instant,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl astra_tools::ToolApprovalGate for ApproveAfterDeadline {
+        async fn request_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            _args: &Value,
+        ) -> astra_tools::ApprovalDecision {
+            self.entered.notify_one();
+            tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)).await;
+            astra_tools::ApprovalDecision::Approved
+        }
+
+        fn requires_approval(&self, _tool_name: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_crossed_during_approval_settles_durable_claim_without_execution() {
+        let (mut exec, dir) = test_executor();
+        exec.enable_durable_invocations();
+        let deadline = tokio::time::Instant::now().into_std() + Duration::from_millis(100);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        exec.set_approval_gate(Arc::new(ApproveAfterDeadline {
+            deadline,
+            entered: entered.clone(),
+        }));
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "late-approved",
+        )
+        .unwrap();
+        let mut request = exec.tool_execution_request_for_invocation(
+            &identity,
+            "write_file",
+            &json!({"path": "never-written", "content": "late"}),
+            None,
+        );
+        request.policy.admission_deadline = Some(deadline);
+        request.policy.permission_grant = Some(
+            crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+                source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+                reason: None,
+                updates_hash: None,
+            },
+        );
+        let waiting = exec.execute_request_with_metadata(request);
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            result = &mut waiting => panic!("must reach approval wait: {result:?}"),
+            () = entered.notified() => {}
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let result = waiting.await;
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_started"],
+            false,
+            "{result:?}"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["rejection_code"],
+            "execution_time_budget_exhausted"
+        );
+        assert!(!dir.path().join("never-written").exists());
+        assert_eq!(
+            exec.invocation_ledger
+                .as_ref()
+                .unwrap()
+                .get(&identity)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            astra_turn_types::ToolInvocationState::Rejected
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_crossed_during_workspace_wait_does_not_invoke_handler() {
+        let (mut exec, dir) = test_executor();
+        let progress = Arc::new(ToolLifecycleProgressCallback::default());
+        exec.set_progress_callback(progress.clone());
+        let blocker =
+            astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
+                dir.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now().into_std() + Duration::from_millis(100);
+        let mut request = exec.tool_execution_request(
+            "run_script",
+            &json!({"script": "raise AssertionError('must not execute')"}),
+        );
+        request.policy.admission_deadline = Some(deadline);
+        let waiting = exec.execute_request_with_metadata(request);
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            result = &mut waiting => panic!("workspace owner should block invocation: {result:?}"),
+            () = progress.started_signal.notified() => {}
+        }
+        assert_eq!(progress.started.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        drop(blocker);
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_started"],
+            false,
+            "{result:?}"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["rejection_code"],
+            "execution_time_budget_exhausted"
+        );
+        assert_eq!(progress.completed.load(Ordering::Relaxed), 1);
+    }
 
     #[async_trait]
     impl astra_tools::ToolApprovalGate for AlwaysTimeoutGate {
@@ -13310,6 +14146,7 @@ esac
     #[derive(Debug, Default)]
     struct ToolLifecycleProgressCallback {
         started: std::sync::atomic::AtomicUsize,
+        started_signal: tokio::sync::Notify,
         completed: std::sync::atomic::AtomicUsize,
         completed_success: std::sync::Mutex<Vec<bool>>,
     }
@@ -13319,6 +14156,7 @@ esac
         async fn tool_started(&self, _call_id: &str, _tool_name: &str, _args: &Value) {
             self.started
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.started_signal.notify_one();
         }
 
         async fn tool_output_delta(&self, _call_id: &str, _delta: &str) {}

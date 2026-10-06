@@ -1988,6 +1988,7 @@ mod edge_callback_insert_tests {
                     display_name: None,
                 },
                 session_id: None,
+                execution_continuation: None,
                 origin: astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(
                     astra_services::AuthProviderAuthorizedRequestContext {
                         provider_id: self.provider_id.clone(),

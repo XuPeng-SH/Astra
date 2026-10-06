@@ -72,6 +72,17 @@ Checkpoint must include enough information to resume safely:
 - last durable event cursor;
 - cancellation/resume policy.
 
+The run checkpoint owner limits each complete JSON checkpoint to 8 MiB,
+including all sections and encoding overhead. A bounded handoff encoder is
+available; production storage and recovery check the budget before parsing.
+Writer integration of bounded encoding remains part of the recovery work.
+Exceeding the budget
+rejects the whole continuation:
+never trim deny rules, messages, or obligations, replace the last valid
+checkpoint, or release unconfirmed execution custody. These are snapshot
+retention limits, not task deadlines, total-history or process-memory bounds,
+or evidence that same-run recovery is implemented.
+
 ## Lease and ownership
 
 - Only the owner may advance active execution.
@@ -250,6 +261,14 @@ terminal settlement must not run merely because the process is stopping.
 An unresolved tool, failed snapshot construction, or unconfirmed write cannot
 produce an exact handoff. A previously cached snapshot is not a substitute.
 
+For roots bound to cooperative handoff, the same shutdown token wakes an idle
+agent-input or capacity wait, rather than
+waiting for another child/message event. Explicit cancellation and wait deadlines
+retain their precedence. An in-flight durable input transaction is not interrupted
+by that wake; its existing settlement completes before the next handoff boundary.
+This improves checkpoint capture during shutdown, not durable parking or restart
+execution admission.
+
 The handoff's runtime payload pairs the heavy snapshot with the original turn
 reservation and a canonical WAL continuation transition. The existing transition
 already identifies its committed base and parent result; these are not duplicated
@@ -257,9 +276,13 @@ in another log. Its pending suffix includes the last settled tool results. Writi
 this payload neither invents an inference attempt nor commits a completed user
 turn. In particular, an absent committed conversation cursor must not be replaced
 with a fabricated cursor. The payload retains the existing WAL continuation
-and heavy snapshot for checkpoint custody. Original-run execution reconstruction
-is not implemented. The old reservation is identity evidence, not renewed
-authority.
+and heavy snapshot for checkpoint custody. The old reservation is identity
+evidence, not renewed authority. Explicit same-run resume obtains a renewed
+writer/reservation pair and checkpoint custody in one coordinator transaction
+before reconstructing execution through the existing background loop.
+The payload preserves the raw submitted user text and original audit timestamp,
+separately from the loop's current input, which steering may replace. Restoration
+must not reconstruct either immutable audit fact from the mutable prompt state.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import
@@ -293,12 +316,18 @@ constraints. Reassembly installs those facts without activating the skill again
 or replacing delivered instructions with a newer catalog version. A saved sandbox
 does not authorize a different workspace or restore environment variable values.
 
-The shared loop owns an explicit entry cursor: before its preamble, or at an
-iteration boundary with the next round identity and consumed harness recovery
-count. Neither the last tool step nor charged budget can reconstruct this cursor.
-A restored iteration boundary skips SessionStart effects and preserves compression
-tracking; every new host still installs its local skill schema. A returned loop
-resets the entry for a subsequent user turn; a frozen handoff does not return.
+The shared loop owns an explicit entry cursor: before its preamble, at an
+iteration boundary, or waiting for runtime input after the previous round's
+existing postlude. The latter two preserve the next round identity and consumed
+harness recovery count. Neither the last tool step nor charged budget can
+reconstruct this cursor. Input wait uses the common message/child barrier before
+preparation or another budget charge; observation waits retain their original
+absolute cutoff. A paused input wait retains this entry when the same live state
+is continued, without replaying the postlude. This is not durable parking or
+same-run reconstruction after restart. A restored boundary skips SessionStart
+effects and preserves compression tracking; every new host still installs its
+local skill schema. Terminal returns reset the entry for a subsequent user turn;
+a frozen handoff does not return.
 This does not authorize a preamble checkpoint with no current step or with a step
 left over from another logical turn; actual recovery must verify the reservation
 and frontier together.
@@ -404,9 +433,15 @@ cooperative Server shutdown are connected. The recovery scanner preserves valid
 handoff material through the atomic recovery-association path; it does
 not launch an executor. Contract tests exercise checkpoint persistence,
 cross-generation custody claims, cancellation and fencing through these
-production entries. There is no original-run execution reconstruction consumer.
-Automatic execution takeover and restoration of all execution obligations remain
-unimplemented. After shutdown
+production entries. Explicit reconstruction currently supports root,
+catalog-offering, Server-managed execution without a primary Work binding.
+It reauthorizes the original session grant and offering, preserves the original
+turn, WAL continuation, deadline and loop facts, and resolves the existing
+workspace identity. Other execution providers and Work-bound continuations are
+rejected rather than given fresh admission or substituted workspace authority.
+Preparation failure preserves checkpoint custody through existing recovery
+reconciliation; an unknown commit acknowledgement is not reported as rollback.
+Automatic execution takeover remains unimplemented. After shutdown
 begins, the shared request preparation entry rejects new chat admission with a
 structured `server_shutting_down` response instead of creating a run that would
 immediately freeze.
@@ -417,9 +452,8 @@ explicit continuation path. Recovery preserves that opaque checkpoint and
 reports custody without claiming it decoded or reconstructed execution.
 Cancellation still wins. A new run may continue canonical session history under
 its own admission; custody claims do not authorize saved execution. Control
-V3 is not yet a complete reconstruction contract: ledger-verified
-tool evidence, intent and remaining execution obligations must be restored
-before an automatic executor may run.
+V3 reconstruction validates ledger-verified tool evidence, intent and remaining
+execution obligations before the supported explicit resume may dispatch.
 
 Question obligations are captured by the shared control projection, not by a
 second messaging ledger. Staged answers remain in the original loop facts'
@@ -431,7 +465,8 @@ The ordinary session warm-start entrypoint rejects same-run execution facts
 before executor wiring, including when a claim advanced the generation. It
 cannot replace execution authority/frontier validation with a fresh messaging
 owner. The recovery scanner continues to preserve and pause handoff custody;
-automatic reconstructed execution is not supplied by this contract.
+automatic reconstructed execution is not supplied by this contract; supported
+explicit resume uses the separate same-turn custody proof, not warm-start.
 
 Queued and delivery-unknown question outcomes contain the exact pending-reply
 identity, including the resolved responder even when the display target is

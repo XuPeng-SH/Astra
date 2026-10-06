@@ -81,6 +81,11 @@ impl SlashResult {
 /// can complete after the user keeps composing without borrowing UI state
 /// across a network wait.
 pub(crate) enum SlashBackgroundRead {
+    Team {
+        store: crate::cli::http_team_store::HttpTeamStore,
+        name: Option<String>,
+        attachment_epoch: u64,
+    },
     Clipboard {
         text: String,
         success_message: String,
@@ -361,8 +366,69 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
     match resolved {
         "/team" => {
-            ctx.show_info("Use /team run <team> --lead-agent-id <agent_id> <task>. Configure teams with astra team.".to_string());
-            SlashResult::Handled
+            let parsed = crate::cli::command_router::parse_team_bridge_command(args);
+            match parsed {
+                Ok(crate::cli::cli_config::cli_args::Command::Team(command)) => {
+                    let name = match command.command {
+                        None | Some(crate::cli::cli_config::cli_args::TeamSubcommand::List) => None,
+                        Some(crate::cli::cli_config::cli_args::TeamSubcommand::Info(command)) => {
+                            Some(command.name)
+                        }
+                        Some(crate::cli::cli_config::cli_args::TeamSubcommand::Leave) => {
+                            handle_view_result(
+                                ViewResult::TeamLeave {
+                                    attachment_epoch: ctx.state.session_attachment_epoch,
+                                },
+                                ctx.state,
+                                ctx.bottom_pane,
+                                ctx.chat_widget,
+                            );
+                            return SlashResult::Handled;
+                        }
+                        Some(crate::cli::cli_config::cli_args::TeamSubcommand::Create(command)) => {
+                            let owner = crate::tui::bottom_pane::team_editor_view::TeamEditorOwner(
+                                std::sync::Arc::new(
+                                    crate::cli::http_team_store::HttpTeamStore::new(
+                                        ctx.api,
+                                        ctx.profile,
+                                    ),
+                                ),
+                            );
+                            if !owner.0.is_attached_owner() {
+                                ctx.show_error("Sign in before creating a Team.".into());
+                                return SlashResult::Handled;
+                            }
+                            let mut editor =
+                                crate::tui::bottom_pane::team_editor_view::TeamEditorView::new(
+                                    None,
+                                    owner,
+                                    ctx.state.session_attachment_epoch,
+                                );
+                            editor.set_initial_name(command.name, command.description.join(" "));
+                            ctx.bottom_pane.push_view(Box::new(editor));
+                            return SlashResult::Handled;
+                        }
+                        _ => {
+                            ctx.show_info("Open /team, choose a roster, then E to edit members and models. Use /team run <team> <task> to start work.".into());
+                            return SlashResult::Handled;
+                        }
+                    };
+                    ctx.show_response("Loading Team configuration…".into());
+                    SlashResult::background_read(SlashBackgroundRead::Team {
+                        store: crate::cli::http_team_store::HttpTeamStore::new(
+                            ctx.api,
+                            ctx.profile,
+                        ),
+                        name,
+                        attachment_epoch: ctx.state.session_attachment_epoch,
+                    })
+                }
+                Err(error) => {
+                    ctx.show_error(error);
+                    SlashResult::Handled
+                }
+                Ok(_) => unreachable!("the Team parser only returns Team commands"),
+            }
         }
         // ── Exit ────────────────────────────────────────────────────
         "/exit" => SlashResult::Exit,
@@ -1581,14 +1647,153 @@ pub(crate) fn looks_like_session_id(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
-/// Handle a ViewCompleted result from a BottomPaneView.
+/// Observe saved configuration; accepting selects intent, not execution.
+pub(crate) fn team_configuration_view(
+    team: std::sync::Arc<crate::cli::slash::slash_team::Team>,
+    attachment_epoch: u64,
+    owner: crate::tui::bottom_pane::team_editor_view::TeamEditorOwner,
+) -> crate::tui::bottom_pane::team_editor_view::TeamEditorView {
+    crate::tui::bottom_pane::team_editor_view::TeamEditorView::new(
+        Some((*team).clone()),
+        owner,
+        attachment_epoch,
+    )
+    .with_reopen("/team")
+}
+
+fn apply_team_lead_selection(
+    team: &crate::cli::slash::slash_team::Team,
+    lead: Result<astra_services::coordination::AgentProfile, String>,
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) {
+    match lead {
+        Ok(lead) => {
+            state.cli_context.agent_profile_selection =
+                Some(astra_turn_types::AgentProfileSelection {
+                    team_id: team.team_id.clone(),
+                    lead_agent_id: Some(lead.agent_id),
+                });
+            bottom_pane.footer.set_team_selection(
+                state
+                    .cli_context
+                    .agent_profile_selection
+                    .clone()
+                    .expect("selection just installed"),
+                format!("{} · {}", team.name, lead.name),
+            );
+            chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::response(
+                format!(
+                    "Using {} · {} in this conversation. Enter an objective to start; /team leave returns to the default agent.",
+                    team.name, lead.name
+                ),
+            ));
+        }
+        Err(error) => {
+            chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::error(error))
+        }
+    }
+}
+
+/// Configuration views can complete while the lead is running. They never
+/// borrow or modify its SessionState, model, or admitted Team selection.
+pub(crate) fn handle_team_editor_result(
+    result: &ViewResult,
+    attachment_epoch: u64,
+    selection_available: bool,
+    bottom_pane: &mut BottomPane,
+) -> bool {
+    match result {
+        ViewResult::TeamConfiguration {
+            team,
+            attachment_epoch: epoch,
+            owner,
+        } => {
+            if *epoch == attachment_epoch && owner.0.is_attached_owner() {
+                bottom_pane.push_view(Box::new(
+                    team_configuration_view(team.clone(), *epoch, owner.clone())
+                        .with_selection_available(selection_available),
+                ));
+            }
+        }
+        ViewResult::CreateTeam {
+            attachment_epoch: epoch,
+            owner,
+        } => {
+            if *epoch == attachment_epoch && owner.0.is_attached_owner() {
+                bottom_pane.push_view(Box::new(
+                    crate::tui::bottom_pane::team_editor_view::TeamEditorView::new(
+                        None,
+                        owner.clone(),
+                        *epoch,
+                    )
+                    .with_selection_available(selection_available),
+                ));
+            }
+        }
+        ViewResult::TeamMemberModel {
+            target,
+            operation_id,
+            agent_id,
+            selection,
+        } => {
+            if target.attachment_epoch == attachment_epoch && target.owner.0.is_attached_owner() {
+                bottom_pane.select_team_member_model(
+                    target,
+                    *operation_id,
+                    agent_id,
+                    selection.clone(),
+                );
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Interpret typed view intent; root admission still owns execution authority.
 pub(crate) fn handle_view_result(
     result: ViewResult,
     state: &mut SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) {
+    if handle_team_editor_result(&result, state.session_attachment_epoch, true, bottom_pane) {
+        return;
+    }
+    let attachment_epoch = match &result {
+        ViewResult::UseTeam {
+            attachment_epoch, ..
+        }
+        | ViewResult::TeamLead {
+            attachment_epoch, ..
+        }
+        | ViewResult::TeamLeave { attachment_epoch } => Some(*attachment_epoch),
+        _ => None,
+    };
+    if attachment_epoch.is_some_and(|epoch| epoch != state.session_attachment_epoch) {
+        chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::error(
+            "This Team view belongs to a previous conversation. Reopen /team.",
+        ));
+        return;
+    }
+    if matches!(&result, ViewResult::UseTeam { owner, .. } | ViewResult::TeamLead { owner, .. }
+        if !owner.0.is_attached_owner())
+    {
+        chat_widget.commit_system(SystemCell::error(
+            "Sign-in changed. Reopen /team with the intended account.",
+        ));
+        return;
+    }
     match result {
+        ViewResult::TeamLeave { .. } => {
+            state.cli_context.agent_profile_selection = None;
+            bottom_pane.footer.sync_team_selection(None);
+            chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::response(
+                "Using the default agent for future messages. Conversation and running tasks are unchanged.",
+            ));
+        }
         ViewResult::Stats(panel) => {
             let sub = match panel {
                 StatsPanel::Overview => "",
@@ -1659,6 +1864,72 @@ pub(crate) fn handle_view_result(
                 .with_reopen("/memory"),
             ));
         }
+        ViewResult::UseTeam {
+            team,
+            attachment_epoch,
+            owner,
+        } => {
+            let lead = crate::cli::slash::slash_team::resolve_team_lead_profile(&team, None);
+            if team.members.is_empty() || lead.is_ok() {
+                apply_team_lead_selection(&team, lead, state, bottom_pane, chat_widget);
+            } else {
+                use crate::tui::bottom_pane::list_selection_view::{
+                    ListSelectionView, SelectionItem,
+                };
+                let profiles: Vec<_> = team
+                    .members
+                    .iter()
+                    .map(|member| {
+                        astra_services::team_persistence::resolve_member_to_profile(member, &team)
+                    })
+                    .collect();
+                let items = profiles
+                    .iter()
+                    .map(|profile| SelectionItem {
+                        name: profile.name.clone(),
+                        description: Some(
+                            if profile.can_delegate {
+                                "Can coordinate members"
+                            } else {
+                                "Cannot delegate"
+                            }
+                            .into(),
+                        ),
+                        is_current: false,
+                    })
+                    .collect();
+                let results = profiles
+                    .into_iter()
+                    .map(|profile| ViewResult::TeamLead {
+                        team: team.clone(),
+                        lead_agent_id: profile.agent_id,
+                        attachment_epoch,
+                        owner: owner.clone(),
+                    })
+                    .collect();
+                bottom_pane.push_view(Box::new(
+                    ListSelectionView::new(items, Some(format!("{} · choose a lead", team.name)))
+                        .with_results(results)
+                        .with_footer_hint("Type to filter · Enter use lead · Esc cancel"),
+                ));
+            }
+        }
+        ViewResult::TeamLead {
+            team,
+            lead_agent_id,
+            ..
+        } => {
+            apply_team_lead_selection(
+                &team,
+                crate::cli::slash::slash_team::resolve_team_lead_profile(
+                    &team,
+                    Some(&lead_agent_id),
+                ),
+                state,
+                bottom_pane,
+                chat_widget,
+            );
+        }
         ViewResult::InsertCommand(command) => {
             bottom_pane.composer.set_text(&format!("{command} "));
         }
@@ -1666,6 +1937,9 @@ pub(crate) fn handle_view_result(
         // loop. Keeping them explicit prevents a future picker from silently
         // falling through based on its rendered label.
         ViewResult::Login { .. }
+        | ViewResult::TeamConfiguration { .. }
+        | ViewResult::CreateTeam { .. }
+        | ViewResult::TeamMemberModel { .. }
         | ViewResult::Register { .. }
         | ViewResult::ConfigEdit { .. }
         | ViewResult::Model { .. }
@@ -3339,10 +3613,21 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
 pub(crate) fn active_run_concurrent_read(
     text: &str,
     session_snapshot: &SessionHubSnapshot,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    attachment_epoch: u64,
 ) -> Option<SlashBackgroundRead> {
-    (text.trim() == "/session").then(|| SlashBackgroundRead::SessionHub {
-        snapshot: Box::new(session_snapshot.clone()),
-    })
+    match text.trim() {
+        "/session" => Some(SlashBackgroundRead::SessionHub {
+            snapshot: Box::new(session_snapshot.clone()),
+        }),
+        "/team" => Some(SlashBackgroundRead::Team {
+            store: crate::cli::http_team_store::HttpTeamStore::new(api, profile),
+            name: None,
+            attachment_epoch,
+        }),
+        _ => None,
+    }
 }
 
 /// `/tasks` is a local navigation action and remains safe while a model turn
@@ -4859,22 +5144,36 @@ mod session_hub_tests {
     }
 
     #[test]
-    fn active_run_executes_only_snapshot_safe_session_overview() {
+    fn active_run_executes_only_snapshot_safe_local_reads() {
         let state = SessionState::default();
         let snapshot = super::session_hub_snapshot(&state);
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         assert!(matches!(
-            active_run_concurrent_read(" /session ", &snapshot),
+            active_run_concurrent_read(" /session ", &snapshot, &api, None, 7),
             Some(SlashBackgroundRead::SessionHub { .. })
+        ));
+        assert!(matches!(
+            active_run_concurrent_read(" /team ", &snapshot, &api, None, 7),
+            Some(SlashBackgroundRead::Team {
+                name: None,
+                attachment_epoch: 7,
+                ..
+            })
         ));
         for command in [
             "/session list",
             "/session history",
             "/session export",
             "/model",
+            "/team create NewTeam",
+            "/team run Reviewers task",
+            "/team leave",
+            "/team list",
+            "show the team",
             "/unknown",
         ] {
             assert!(
-                active_run_concurrent_read(command, &snapshot).is_none(),
+                active_run_concurrent_read(command, &snapshot, &api, None, 7).is_none(),
                 "stateful or unknown commands must wait for idle dispatch: {command}"
             );
         }

@@ -1,11 +1,9 @@
 use crate::cli::arg_render::{
     apply_system_prompt, render_agent_args, render_bug_args, render_debug_args, render_diff_args,
     render_grep_args, render_memory_args, render_permissions_args, render_review_args,
-    render_team_args,
 };
 use crate::cli::auth_flow::{
     clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
-    parse_auth_tokens, save_refreshed_profile_tokens,
 };
 use crate::cli::cli_config::cli_args::{
     AuditCmd, ChatArgs, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd,
@@ -773,6 +771,8 @@ fn team_run_chat_args(run: &TeamRunArgs, message: String) -> ChatArgs {
     chat.json = run.json;
     chat.no_resume = run.no_resume;
     chat.stream_events = run.stream_events.clone();
+    chat.explain = run.explain;
+    chat.max_wall_time_seconds = run.max_wall_time_seconds;
     chat
 }
 
@@ -785,7 +785,7 @@ mod team_run_capture_tests {
     #[test]
     fn team_run_projection_preserves_existing_chat_capture_controls() {
         let Command::Team(args) = parse_team_bridge_command(
-            "run dev --lead-agent-id lead --json --no-resume --stream-events events.jsonl task",
+            "run dev --lead-agent-id lead --json --no-resume --stream-events events.jsonl --explain=verbose --max-wall-time-seconds 90 task",
         )
         .expect("Team command") else {
             panic!("Team command")
@@ -798,9 +798,20 @@ mod team_run_capture_tests {
         assert!(chat.json);
         assert!(chat.no_resume);
         assert_eq!(
+            chat.explain,
+            Some(crate::cli::session::session_state::ExplainMode::Verbose)
+        );
+        assert_eq!(chat.max_wall_time_seconds, Some(90));
+        assert_eq!(
             chat.stream_events.as_deref(),
             Some(Path::new("events.jsonl"))
         );
+        for (budget, valid) in [("0", false), ("70", false), ("71", true)] {
+            let parsed = parse_team_bridge_command(&format!(
+                "run dev --max-wall-time-seconds {budget} task"
+            ));
+            assert_eq!(parsed.is_ok(), valid, "wall budget {budget}");
+        }
     }
 }
 
@@ -1096,18 +1107,30 @@ mod token_refresh_error_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn public_team_run_registers_after_canonical_lead_validation() {
+        use crate::cli::cli_config::cli_utils;
+
         let _creds = crate::tests::isolate_credentials();
         let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "team-token");
         let _registry = EnvVarGuard::remove("ASTRA_EDGE_REGISTRY");
+        let mut credentials = astra_credentials::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            astra_credentials::Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("team-token".into()),
+                ..Default::default()
+            },
+        );
+        cli_utils::save_credentials(&credentials).unwrap();
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
         let server = MockServer::start().await;
-        let mut team =
-            astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
-                .remove(0);
+        let mut team = astra_services::team_persistence::builtin_teams("owner").remove(0);
         team.team_id = "server-team-id".into();
         team.name = "dev".into();
-        team.members[0].agent_id = Some("lead".into());
+        team.members[0].agent_id = "lead".into();
         Mock::given(method("GET"))
-            .and(path("/teams/dev"))
+            .and(path("/teams/name/dev"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&team))
             .expect(2)
             .mount(&server)
@@ -1149,7 +1172,7 @@ mod token_refresh_error_tests {
         );
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 2, "chat and child admission must not start");
-        assert_eq!(requests[0].url.path(), "/teams/dev");
+        assert_eq!(requests[0].url.path(), "/teams/name/dev");
         assert_eq!(requests[1].url.path(), "/agents/edge");
 
         let error = execute_repl_bridge_command(
@@ -1168,28 +1191,19 @@ mod token_refresh_error_tests {
         );
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 4);
-        assert_eq!(requests[2].url.path(), "/teams/dev");
+        assert_eq!(requests[2].url.path(), "/teams/name/dev");
         assert_eq!(requests[3].url.path(), "/agents/edge");
 
         server.reset().await;
-        Mock::given(method("GET"))
-            .and(path("/teams"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "teams": []
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut accepted =
-            astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
-                .remove(0);
-        accepted.team_id = "server-team-id".into();
-        accepted.name = "draft".into();
-        accepted.description = "description".into();
-        accepted.members.clear();
         Mock::given(method("POST"))
             .and(path("/teams"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&accepted))
+            .respond_with(|request: &wiremock::Request| {
+                let mut accepted: serde_json::Value = request.body_json().unwrap();
+                assert!(!accepted["team_id"].as_str().unwrap().is_empty());
+                accepted["user_id"] = serde_json::json!("owner");
+                accepted["revision"] = serde_json::json!(1);
+                ResponseTemplate::new(200).set_body_json(accepted)
+            })
             .expect(1)
             .mount(&server)
             .await;
@@ -1207,9 +1221,12 @@ mod token_refresh_error_tests {
 
         assert_eq!(result, crate::cli::exit_code::ExitCode::Success);
         let requests = server.received_requests().await.expect("requests");
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].method.as_str(), "GET");
-        assert_eq!(requests[1].method.as_str(), "POST");
+        assert_eq!(
+            requests.len(),
+            1,
+            "create must not hydrate or reread a collection"
+        );
+        assert_eq!(requests[0].method.as_str(), "POST");
         assert!(
             requests
                 .iter()
@@ -1639,15 +1656,16 @@ async fn execute_cli_command_impl(
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = saved_profile
-                .refresh_token
-                .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
-            let body = api
-                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+            if saved_profile
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("refresh requires a server-issued account_id; log in again".into());
+            }
+            session_runtime::try_refresh_token(api, &name, &saved_profile, None)
                 .await
-                .map_err(map_thin_err)?;
-            let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
+                .map_err(|error| format!("refresh failed: {error:?}"))?;
             stdout_println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }
@@ -1721,13 +1739,7 @@ async fn execute_cli_command_impl(
             state.team_store = std::sync::Arc::new(
                 crate::cli::http_team_store::HttpTeamStore::new(api, profile.as_deref()),
             );
-            slash_team::handle_team_command(
-                &render_team_args(&args),
-                api,
-                profile.as_deref(),
-                &mut state,
-            )
-            .await?;
+            slash_team::handle_team_command(args, api, profile.as_deref(), &mut state).await?;
             Ok(ExitCode::Success)
         }
 

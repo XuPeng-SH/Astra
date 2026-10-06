@@ -3776,11 +3776,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
     if host
         .execution_time_budget_remaining()
-        .is_some_and(|remaining| {
-            remaining.as_secs()
-                <= astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-                    .as_secs()
-        })
+        .is_some_and(|remaining| !remaining.has_work())
     {
         let settlement_already_active = state.hooks.completion_settlement.text_only
             || state.hooks.completion_settlement.work_settlement_only
@@ -6071,9 +6067,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn short_total_budget_preserves_an_admitted_ordinary_work_slice() {
+        let mut host = MockHost::new(Vec::new()).with_execution_time_budget_remaining(
+            astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::from_secs(10),
+                total_remaining: Duration::from_secs(20),
+            },
+        );
+        let mut state = make_state();
+        state.turn_intent =
+            Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(!state.budget_wrapup_injected);
+    }
+
+    #[tokio::test]
     async fn execution_deadline_forces_settlement_before_round_budget_expires() {
-        let mut host =
-            MockHost::new(Vec::new()).with_execution_time_budget_remaining(Duration::from_secs(20));
+        let mut host = MockHost::new(Vec::new()).with_execution_time_budget_remaining(
+            astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::ZERO,
+                total_remaining: Duration::from_secs(20),
+            },
+        );
         let mut state = make_state();
         state.turn_intent =
             Some(TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::ReadOnly));
@@ -6101,8 +6120,10 @@ mod tests {
 
     #[tokio::test]
     async fn execution_deadline_accounts_for_whole_second_provider_budget_rounding() {
-        let remaining = astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-            + Duration::from_millis(999);
+        let remaining = astra_turn_types::ExecutionTimeRemaining {
+            work_remaining: Duration::from_millis(999),
+            total_remaining: Duration::from_secs(30),
+        };
         let mut host = MockHost::new(Vec::new()).with_execution_time_budget_remaining(remaining);
         let mut state = make_state();
         state.turn_intent =

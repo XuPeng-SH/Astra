@@ -418,6 +418,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "agent_type",
                 "description",
                 "prompt",
+                "requested_model_policy",
                 // Reasoning is a first-class child execution control. Keep it
                 // on the resident spawn contract so ordinary language such as
                 // “use high reasoning” cannot produce a valid canonical field
@@ -431,7 +432,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "Spawn: description+prompt. runtime binds requested models, no substitution. Receipt≠completion. agent(wait) yields for automatic results; no re-fetch if sufficient.",
+            "Omit unasked model policy. No substitution. launch≠done. Wait.",
         ),
         "introspect" => (
             &[
@@ -442,7 +443,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "offset",
                 "max_bytes",
             ][..],
-            "Explain: explain.target=previous|run; run needs run_id. question=label OR artifact=handle; never both. History=reflect; select:model_catalog.",
+            "explain.target=previous|run; run needs run_id. question=label OR artifact=handle; not both. History=reflect.",
         ),
         "reflect" => (
             &["question"][..],
@@ -591,19 +592,8 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         }
         question_items.insert("additionalProperties".to_string(), Value::Bool(false));
     }
-    // Outcome granularity is part of the start_work argument contract, not
-    // optional catalog prose. Preserve its canonical definition rather than
-    // maintaining a second explanation in this projection.
-    let task_outcome_description = (name == "start_work")
-        .then(|| properties.get("tasks")?.get("description").cloned())
-        .flatten();
     for property in properties.values_mut() {
         astra_tools::tool_search::compact_parameter_descriptions(property, true);
-    }
-    if let Some(description) = task_outcome_description {
-        properties
-            .get_mut("tasks")
-            .expect("canonical tasks property")["description"] = description;
     }
     // A managed edge Bash schema is a real executable contract, not a rare
     // catalog-only option: without these fields the model cannot keep a

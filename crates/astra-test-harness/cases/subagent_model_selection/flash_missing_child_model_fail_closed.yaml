@@ -28,7 +28,7 @@ criteria:
     name: agent
     document: result
     path: /error_kind
-    equals: delegation_model_scope_unresolved
+    equals: invalid_request
   - type: journal_tool_json
     name: agent
     document: result

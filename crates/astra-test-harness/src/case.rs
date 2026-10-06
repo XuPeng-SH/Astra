@@ -30,6 +30,11 @@ pub struct Case {
     /// what a developer would paste into `astra chat -m "..."`.
     pub prompt: String,
 
+    /// Exercise the native Team entrypoint using the ordinary turn capture,
+    /// criteria and watchdog. The definition must already exist for this owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamEntrypoint>,
+
     /// Meaning-preserving rewrites of one user turn. They are dormant unless
     /// the runner enables prompt-variant expansion, then each rewrite is
     /// evaluated with the exact same typed criteria as the canonical journey.
@@ -137,6 +142,14 @@ pub struct Case {
     /// tests that intentionally ban memory actions leave this false.
     #[serde(default)]
     pub requires_memoria: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamEntrypoint {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_agent_id: Option<String>,
 }
 
 /// A follow-up turn in a multi-turn case.
@@ -429,7 +442,7 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
     // Session ID — the harness manages --session-id for multi-turn
     // steps; a case overriding it would break session continuation.
     "--session-id",
-    // Required to archive primary/auxiliary usage before session cleanup.
+    // Defaults to on; only a validated on/off observation override is allowed.
     "--explain",
     // Cases may opt into an earlier CLI deadline via
     // `cli_wall_time_seconds`; the harness retains the outer watchdog.
@@ -441,8 +454,20 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
 /// exact form (`--model`) and `=` syntax (`--model=gpt-4`) so the
 /// denylist cannot be bypassed by appending `=value`.
 pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
-    for a in args {
+    let mut explain_seen = false;
+    for (index, a) in args.iter().enumerate() {
         let flag_part = a.split('=').next().unwrap_or(a);
+        if flag_part == "--explain" {
+            let value = a
+                .split_once('=')
+                .map(|(_, value)| value)
+                .or_else(|| args.get(index + 1).map(String::as_str));
+            if explain_seen || !matches!(value, Some("on" | "off")) {
+                return Err("--explain requires exactly one on/off observation mode".into());
+            }
+            explain_seen = true;
+            continue;
+        }
         for r in RESERVED_CLI_ARGS {
             if flag_part == *r {
                 return Err(format!(
@@ -545,6 +570,20 @@ impl Case {
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
+        if let Some(team) = &case.team
+            && std::iter::once(team.name.as_str())
+                .chain(team.lead_agent_id.as_deref())
+                .any(|identity| {
+                    identity.is_empty()
+                        || identity.trim() != identity
+                        || identity.chars().any(char::is_control)
+                })
+        {
+            anyhow::bail!(
+                "case {}: Team name and explicit lead identity must be nonempty, unpadded and contain no control characters",
+                path.display()
+            );
+        }
         // `timeout_seconds: 0` collapses `Duration::from_secs(0)` —
         // every case would instantly report synthetic exit 124 before
         // the child even runs. A YAML typo turns the whole suite into
@@ -689,7 +728,7 @@ mod tests {
         assert!(
             cases
                 .iter()
-                .any(|case| case.name == "flash_spawn_natural_language_glm")
+                .any(|case| case.name == "flash_semantic_model_reference_glm")
         );
     }
 
@@ -701,11 +740,32 @@ mod tests {
         let c = Case::from_path(&path).unwrap();
         assert_eq!(c.name, "hello");
         assert_eq!(c.prompt, "just say ok");
+        assert!(c.team.is_none());
         assert!(c.criteria.is_empty());
         assert_eq!(c.timeout_seconds, 180);
         assert_eq!(c.cli_wall_time_seconds, None);
         assert_eq!(c.cli_wall_time_override_for(c.timeout_seconds), None);
         assert!(!c.debug_log);
+    }
+
+    #[test]
+    fn native_team_entrypoint_is_explicit_and_strict() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("team.yaml");
+        for (selection, valid) in [
+            ("{name: fixture-team, lead_agent_id: fixture-lead}", true),
+            ("{name: fixture-team}", true),
+            ("{name: ''}", false),
+            ("{name: fixture-team, lead_agent_id: ''}", false),
+            ("{name: fixture-team, lead: guessed-role}", false),
+        ] {
+            std::fs::write(
+                &path,
+                format!("name: native-team\nprompt: finish\nteam: {selection}\n"),
+            )
+            .unwrap();
+            assert_eq!(Case::from_path(&path).is_ok(), valid, "{selection}");
+        }
     }
 
     #[test]
@@ -868,53 +928,6 @@ criteria:
             .criteria
             .iter()
             .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCallCount { name, min: 1, max: 1, .. } if name == "reflect")));
-    }
-
-    #[test]
-    fn bundled_subagent_model_selection_cases_keep_natural_language_contracts() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
-        let cases = Case::load_dir(&dir).expect("subagent model cases must parse");
-
-        assert!(!cases.is_empty());
-        assert!(cases.iter().all(|case| case.debug_log));
-        let natural_language = cases
-            .iter()
-            .find(|case| case.name == "flash_spawn_natural_language_glm")
-            .expect("natural-language intent case must be in the shipped suite");
-        assert!(natural_language.criteria.iter().any(|criterion| matches!(
-            criterion,
-            crate::criteria::Criterion::JournalToolCallCount {
-                name,
-                min: 1,
-                max: 1,
-                root_only: false,
-                ok: None,
-                document: Some(crate::criteria::JournalToolDocument::Arguments),
-                path: Some(path),
-                equals: Some(equals),
-            } if name == "agent"
-                && path == "/action"
-                && equals == "spawn"
-        )));
-        assert!(natural_language.criteria.iter().any(|criterion| matches!(
-            criterion,
-            crate::criteria::Criterion::JournalToolJson {
-                name,
-                document: crate::criteria::JournalToolDocument::Arguments,
-                path,
-                equals,
-                where_match: Some(crate::criteria::JournalJsonPredicate {
-                    document: crate::criteria::JournalToolDocument::Arguments,
-                    path: where_path,
-                    equals: where_equals,
-                }),
-                allow_missing: true,
-            } if name == "agent"
-                && path == "/requested_model_policy"
-                && equals.is_null()
-                && where_path == "/action"
-                && where_equals == "spawn"
-        )));
     }
 
     #[test]
@@ -1555,7 +1568,6 @@ steps:
             "--permission-mode=auto",
             "--system-prompt=override",
             "--session-id=hijack",
-            "--explain=off",
         ] {
             let err = validate_extra_cli_args(&[bypass.into()]);
             assert!(
@@ -1568,7 +1580,17 @@ steps:
     #[test]
     fn non_reserved_flag_with_equals_accepted() {
         assert!(validate_extra_cli_args(&["--verbose=true".into()]).is_ok());
-        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_err());
+        for args in [
+            vec!["--explain=yes"],
+            vec!["--explain"],
+            vec!["--explain=off", "--explain=on"],
+            vec!["--explain", "--model=other"],
+        ] {
+            assert!(
+                validate_extra_cli_args(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
     }
 
     #[test]

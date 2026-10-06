@@ -141,7 +141,6 @@ impl ReplyObligations {
 
     /// Restore into the same shared owner before wiring tools. Never overwrite
     /// a live sender's state, even with a superficially valid checkpoint.
-    #[cfg(test)]
     pub fn restore(
         &self,
         snapshot: &ReplyObligationsSnapshotV1,

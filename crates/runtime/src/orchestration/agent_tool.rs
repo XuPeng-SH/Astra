@@ -74,11 +74,6 @@ const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
 // The child runtime needs a small bounded interval after its work deadline to
 // publish the terminal receipt that the parent is waiting for.
 const FANOUT_TERMINAL_DELIVERY_GRACE: Duration = Duration::from_secs(5);
-/// Keep the parent's final-answer window after a foreground child settles.
-/// Optional parent verification can use time left if the child finishes early;
-/// it must not shorten every child's deadline pre-emptively.
-const FOREGROUND_CHILD_PARENT_FINAL_RESERVE: Duration =
-    astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET;
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
 /// caller-supplied agent_id — that value already appears in the
@@ -672,14 +667,10 @@ fn rejected_delivery_message(reason: impl Into<String>) -> String {
 fn agent_message_content(args: &Value) -> Result<String, String> {
     // Mailbox messages are coordination, not a bulk artifact channel. Keep
     // accepted model-authored guidance within the runtime's context preview.
-    let message = args
+    let content = args
         .get("message")
-        .ok_or_else(|| "send_message requires `message`".to_string())?;
-    let content = match message {
-        Value::String(content) => content.clone(),
-        other => serde_json::to_string(other)
-            .map_err(|_| "send_message could not serialize `message`".to_string())?,
-    };
+        .and_then(Value::as_str)
+        .ok_or_else(|| "send_message requires a string `message`".to_string())?;
     let content = content.trim();
     if content.is_empty() {
         return Err("send_message requires a non-empty `message`".to_string());
@@ -777,10 +768,16 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
         Ok(content) => content,
         Err(error) => return rejected_agent_message(error).into(),
     };
-    let message_type = args
-        .get("message_type")
-        .and_then(Value::as_str)
-        .unwrap_or("text");
+    let message_type = match args.get("message_type") {
+        None => "text",
+        Some(Value::String(message_type)) => message_type.as_str(),
+        Some(_) => {
+            return rejected_agent_message(
+                "message_type must be a string from the advertised enum",
+            )
+            .into();
+        }
+    };
     let request_id = args
         .get("request_id")
         .and_then(Value::as_str)
@@ -1076,7 +1073,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}]}. Put concise work instructions in each slots[i].prompt. If this run has an admitted profile directory, set agent_type on each slot or in defaults to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. If no admitted profile directory is present, omit agent_type for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. With an admitted profile directory, an omitted model policy uses that exact profile's model default; if it has no default, it inherits the parent Offering. Explicit Inherit requests the parent Offering, while an explicit authorized Offering ID or reasoning control remains authoritative; for any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and follows the launch receipt for waiting and automatic result delivery. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}]}. Put concise work instructions in each slots[i].prompt. If this run has an admitted profile directory, set agent_type on each slot or in defaults to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. If no admitted profile directory is present, omit agent_type for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. With an admitted profile directory, an omitted model policy uses that exact profile's model default; if it has no default, it inherits the parent Offering. Explicit Inherit requests the parent Offering, while an explicit authorized Offering ID or reasoning control remains authoritative; interpret a requested execution model and propose requested_model_policy using an exact authorized Offering ID or configured name; use model_catalog when choices are unknown. Preserve version and source; task content is not model selection. Never substitute a nearby model. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and follows the launch receipt for waiting and automatic result delivery. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1591,12 +1588,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
     let start_cancellation = start_claim.cancellation().clone();
     let shutdown = ctx.spawner.background_shutdown_token();
     let preparation_cutoff = child_execution_deadline.map(|deadline| {
-        let min_child_budget =
-            astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET;
         tokio::time::Instant::from_std(
             deadline
-                .monotonic_deadline()
-                .checked_sub(min_child_budget)
+                .monotonic_work_deadline()
+                .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(std::time::Instant::now),
         )
     });
@@ -1621,7 +1616,10 @@ async fn handle_agent_fanout_start_action_with_deadline(
     } {
         Ok(preparations) => preparations,
         Err(error) => {
-            return render_agent_tool_admission_error(&format!("fanout admission failed: {error}"));
+            return render_agent_tool_admission_error_with_kind(
+                &format!("fanout admission failed: {error}"),
+                error.error_kind(),
+            );
         }
     };
     for (index, preparation) in preparations.iter().enumerate() {
@@ -2793,24 +2791,23 @@ fn derive_foreground_child_deadline(
     let Some(parent) = parent else {
         return Ok(None);
     };
-    let child = parent
-        .with_parent_reserve(FOREGROUND_CHILD_PARENT_FINAL_RESERVE + FANOUT_TERMINAL_DELIVERY_GRACE)
-        .ok_or(())?;
-    (child.remaining()
-        >= astra_turn_core::chat_turn_heuristics::MIN_FOREGROUND_CHILD_EXECUTION_BUDGET)
-        .then_some(Some(child))
+    parent
+        .child_with_delivery_grace(FANOUT_TERMINAL_DELIVERY_GRACE)
+        .map(Some)
         .ok_or(())
 }
 
 fn execution_deadline_too_short_outcome() -> String {
     json!({
-        "status": "completed",
+        "result_family": AgentToolResultFamily::ControlReceipt,
+        "success": false,
+        "status": "rejected",
         "outcome": "delegation_skipped",
         "reason_code": "insufficient_time_to_delegate",
         "retryable": false,
         "executed": false,
-        "result": "No child run was accepted. Delegation is optional; continue the original task in this parent run with available tools and evidence. Do not retry delegation. Clearly identify any requested checks that remain unverified.",
-        "instruction": "No child run was accepted. Delegation is optional; continue the original task in this parent run with available tools and evidence. Do not retry delegation or ask the user to resume solely because delegation was skipped. Clearly identify any requested checks that remain unverified.",
+        "error": "No child run was accepted within the remaining execution window. Requested child work remains unperformed.",
+        "instruction": "Do not retry this rejected child launch or claim that a member performed the work. Continue only useful independent work within the remaining authority and clearly report any requested child work or checks that remain unverified.",
     })
     .to_string()
 }
@@ -2981,9 +2978,10 @@ async fn handle_agent_spawn_input_with_controls(
                 );
             }
             Err(error) => {
-                return render_agent_tool_admission_error(&format!(
-                    "spawn admission failed: {error}"
-                ));
+                return render_agent_tool_admission_error_with_kind(
+                    &format!("spawn admission failed: {error}"),
+                    error.error_kind(),
+                );
             }
         };
     }
@@ -3548,11 +3546,66 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::time::Instant;
 
-    #[test]
-    fn send_message_rejects_oversized_semantic_content_before_enqueue() {
-        assert!(agent_message_content(&json!({"message": "a".repeat(3_000)})).is_ok());
-        let error = agent_message_content(&json!({"message": "a".repeat(3_001)})).unwrap_err();
-        assert!(error.contains("3000 characters"), "{error}");
+    #[tokio::test]
+    async fn send_message_rejects_invalid_input_before_enqueue_and_preserves_string_content() {
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+            Arc::new(astra_messaging::InProcessTransport::new()),
+            Arc::new(DelegationTracker::new()),
+        ));
+        let _sender = router
+            .register(
+                astra_messaging::types::AgentAddress::new("parent-run", "lead"),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut receiver = router
+            .register(
+                astra_messaging::types::AgentAddress::new("child-run", "member"),
+                Some("parent-run".into()),
+            )
+            .await
+            .unwrap();
+        let obligations = Default::default();
+        for mut args in [
+            json!({"message": {"text":"do not serialize"}}),
+            json!({"message": ["do not serialize"]}),
+            json!({"message": true}),
+            json!({"message": null}),
+            json!({"message": "   "}),
+            json!({"message": "界".repeat(3_001)}),
+            json!({"message": "valid", "message_type": false}),
+            json!({"message": "valid", "message_type": "unknown"}),
+        ] {
+            args["to"] = json!("member");
+            let output = handle_agent_send_message_with_router(
+                &args,
+                &router,
+                "parent-run",
+                "lead",
+                &obligations,
+            )
+            .await;
+            let receipt: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(receipt["status"], "rejected", "{receipt}");
+            assert_eq!(receipt["executed"], false, "{receipt}");
+            assert!(receiver.try_recv().is_none(), "{receipt}");
+        }
+        let content = "界".repeat(3_000);
+        let output = handle_agent_send_message_with_router(
+            &json!({"to":"member", "message":content}),
+            &router,
+            "parent-run",
+            "lead",
+            &obligations,
+        )
+        .await;
+        let receipt: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt["status"], "queued", "{receipt}");
+        let received = receiver.try_recv().expect("actual mailbox delivery");
+        assert!(
+            matches!(&received.payload, MessagePayload::Text { content: actual, .. } if actual == &content)
+        );
     }
 
     #[test]
@@ -3642,6 +3695,13 @@ pub(crate) mod tests {
             observation.wake_policy,
             WorkUnitWakePolicy::OnAttentionOrTerminal
         );
+    }
+
+    #[test]
+    fn untyped_spawn_errors_do_not_classify_display_tags() {
+        let error = SpawnError::from("[invalid_request] untrusted display text".to_string());
+        assert!(matches!(error, SpawnError::DelegationFailed(_)));
+        assert_eq!(error.error_kind(), None);
     }
 
     #[test]
@@ -3932,7 +3992,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _context: &SpawnContext,
             parent_selection: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, SpawnError> {
             for input in inputs {
                 astra_turn_types::resolve_requested_model_selection(
                     input.requested_model_policy.as_ref(),
@@ -3997,6 +4057,7 @@ pub(crate) mod tests {
 
     struct RejectingBatchExecutor {
         preparations: std::sync::atomic::AtomicUsize,
+        model_error: Option<(axum::http::StatusCode, &'static str)>,
     }
 
     #[async_trait::async_trait]
@@ -4022,10 +4083,15 @@ pub(crate) mod tests {
             _: &[SpawnAgentInput],
             _: &SpawnContext,
             _: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, SpawnError> {
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err("catalog unavailable".into())
+            Err(match self.model_error {
+                Some((status, code)) => {
+                    crate::server::run::lifecycle::safe_model_spawn_error(status, Some(code))
+                }
+                None => "catalog unavailable".into(),
+            })
         }
     }
 
@@ -4128,7 +4194,7 @@ pub(crate) mod tests {
             inputs: &[SpawnAgentInput],
             _context: &SpawnContext,
             _parent_selection: Option<&astra_turn_types::ModelSelection>,
-        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, String> {
+        ) -> Result<Vec<Box<dyn crate::orchestration::PreparedSpawn>>, SpawnError> {
             Ok(inputs
                 .iter()
                 .map(|_| {
@@ -4875,7 +4941,7 @@ pub(crate) mod tests {
         ctx.execution_deadline = Some(
             astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
                 astra_services::runs::ExecutionTimeBudget {
-                    remaining_seconds: 89,
+                    remaining_seconds: 10,
                 },
                 1_000,
             )
@@ -4893,13 +4959,13 @@ pub(crate) mod tests {
         .await;
         let result: Value = serde_json::from_str(&result).expect("structured skip outcome");
 
-        assert_eq!(result["status"], "completed");
+        assert_eq!(result["status"], "rejected");
         assert_eq!(result["outcome"], "delegation_skipped");
         assert_eq!(result["reason_code"], "insufficient_time_to_delegate");
         assert_eq!(result["executed"], false);
         let instruction = result["instruction"].as_str().unwrap();
-        assert!(instruction.contains("continue the original task in this parent run"));
-        assert!(instruction.contains("Do not retry delegation"));
+        assert!(instruction.contains("requested child work or checks that remain unverified"));
+        assert!(instruction.contains("Do not retry this rejected child launch"));
         assert_eq!(executor.spawn_count(), 0);
     }
 
@@ -4907,19 +4973,21 @@ pub(crate) mod tests {
     fn foreground_child_requires_one_work_window_and_its_final_window() {
         let parent = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
             astra_services::runs::ExecutionTimeBudget {
-                remaining_seconds: 96,
+                remaining_seconds: 48,
             },
             1_000,
         )
         .expect("valid request deadline");
         let child = derive_foreground_child_deadline(Some(parent))
-            .expect("96 seconds leaves at least 60 for child work and settlement")
+            .expect("short child budgets retain both work and settlement windows")
             .expect("finite parent produces finite child deadline");
-        assert!(child.remaining() >= Duration::from_secs(60));
+        assert!(child.remaining() < Duration::from_secs(60));
+        assert!(child.remaining_at(std::time::Instant::now()).has_work());
+        assert!(child.monotonic_deadline() < parent.monotonic_work_deadline());
 
         let too_short = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
             astra_services::runs::ExecutionTimeBudget {
-                remaining_seconds: 95,
+                remaining_seconds: 10,
             },
             1_000,
         )
@@ -7447,6 +7515,7 @@ pub(crate) mod tests {
     async fn single_spawn_preparation_failure_does_not_create_child_work() {
         let executor = Arc::new(RejectingBatchExecutor {
             preparations: std::sync::atomic::AtomicUsize::new(0),
+            model_error: None,
         });
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
@@ -7460,6 +7529,7 @@ pub(crate) mod tests {
         let result: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(result["status"], "failed", "{result}");
         assert_eq!(result["executed"], false, "{result}");
+        assert!(result.get("error_kind").is_none(), "{result}");
         assert_eq!(
             executor
                 .preparations
@@ -7473,6 +7543,7 @@ pub(crate) mod tests {
     async fn fanout_capacity_rejection_skips_admission_and_failed_admission_releases_capacity() {
         let executor = Arc::new(RejectingBatchExecutor {
             preparations: std::sync::atomic::AtomicUsize::new(0),
+            model_error: None,
         });
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
@@ -7509,6 +7580,82 @@ pub(crate) mod tests {
             if expected_preparations > 0 {
                 assert_eq!(value["executed"], false, "{value}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_admission_error_kind_survives_prepare_to_agent_and_fanout_wire() {
+        use axum::http::StatusCode;
+
+        for (status, code, expected_kind) in [
+            (
+                StatusCode::BAD_REQUEST,
+                "model_selection_invalid",
+                Some("invalid_request"),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "model_reasoning_unsupported",
+                Some("invalid_request"),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "model_offering_not_found",
+                Some("tool_unavailable"),
+            ),
+            (StatusCode::FORBIDDEN, "unknown_code", Some("auth")),
+            (StatusCode::BAD_REQUEST, "unknown_code", None),
+        ] {
+            let executor = Arc::new(RejectingBatchExecutor {
+                preparations: std::sync::atomic::AtomicUsize::new(0),
+                model_error: Some((status, code)),
+            });
+            let spawner = test_spawner(executor.clone());
+            let ctx = test_spawn_context(spawner.clone(), Some("parent-model"));
+            let requested_model_policy = json!({
+                "mode": "fixed",
+                "selector": {"kind": "offering_id", "offering_id": "offer-unavailable"}
+            });
+            let single = handle_agent_tool(
+                &json!({
+                    "action": "spawn", "description": "review", "prompt": "review",
+                    "requested_model_policy": requested_model_policy.clone()
+                }),
+                Some(&ctx),
+            )
+            .await;
+            let batch = handle_agent_fanout_tool(
+                &json!({
+                    "action": "start", "group_id": "typed-admission", "target_count": 2,
+                    "slots": [
+                        {"description": "inherit", "prompt": "review"},
+                        {"description": "select", "prompt": "review",
+                         "requested_model_policy": requested_model_policy}
+                    ]
+                }),
+                Some(&ctx),
+            )
+            .await;
+            for output in [single, batch] {
+                let value: Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(value["result_family"], "control_receipt", "{value}");
+                assert_eq!(value["success"], false, "{value}");
+                assert_eq!(value["status"], "failed", "{value}");
+                assert_eq!(value["executed"], false, "{value}");
+                assert_eq!(
+                    value.get("error_kind").and_then(Value::as_str),
+                    expected_kind,
+                    "{value}"
+                );
+            }
+            assert_eq!(
+                executor
+                    .preparations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                2
+            );
+            assert!(spawner.list_agents(&ctx.run_id).await.is_empty());
+            assert!(spawner.fanout_group("typed-admission").await.is_none());
         }
     }
 
@@ -8292,7 +8439,8 @@ pub(crate) mod tests {
 
         assert_eq!(value["status"], "still_running");
         assert_eq!(value["waited_secs"], 1);
-        assert_eq!(value["delivery"], "asynchronous_parent_mailbox");
+        assert!(value.get("delivery").is_none());
+        assert_eq!(value["observation_timed_out"], true);
         assert!(
             value["hint"]
                 .as_str()

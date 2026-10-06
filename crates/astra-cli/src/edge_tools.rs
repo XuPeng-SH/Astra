@@ -1594,7 +1594,8 @@ impl ToolExecutor {
                     sandbox: astra_tools::SandboxConfig::standard(&root),
                     cancel_token: None,
                 },
-            ),
+            )
+            .with_local_network(),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
@@ -5063,7 +5064,15 @@ impl ToolExecutor {
                         .ok()
                         .and_then(|guard| guard.clone())
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
-                    astra_tools::web_fetch::fetch_with_cache_scope(args, &cache_scope).await
+                    let result = astra_tools::web_fetch::fetch_with_cache_scope(
+                        args,
+                        &cache_scope,
+                        astra_tools::web_fetch::FetchTransport::LocalEnvironment,
+                    )
+                    .await;
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
                 }
                 "display_sixel" => {
                     let result =
@@ -5352,9 +5361,14 @@ impl ToolExecutor {
                         .ok()
                         .and_then(|guard| guard.clone())
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
-                    let result =
-                        astra_tools::web_search::perform_web_search(args, &cache_scope).await;
+                    let result = astra_tools::web_search::perform_web_search(
+                        args,
+                        &cache_scope,
+                        astra_tools::web_fetch::FetchTransport::LocalEnvironment,
+                    )
+                    .await;
                     *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
                     result.output
                 }
                 "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
@@ -6764,6 +6778,7 @@ pub(crate) mod tests {
     async fn structured_writer_receipts_do_not_depend_on_full_workspace_fingerprints() {
         fn invocation(tool_call_id: &str) -> astra_tools::tool_engine::ToolInvocationMetadata<'_> {
             astra_tools::tool_engine::ToolInvocationMetadata {
+                admission_deadline: None,
                 task_resolution_authority: None,
                 run_id: Some("run-convergence"),
                 turn_chain_id: Some("turn-convergence"),
@@ -6953,6 +6968,7 @@ pub(crate) mod tests {
                     "content": content,
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    admission_deadline: None,
                     task_resolution_authority: None,
                     run_id: Some("run-external-noop"),
                     turn_chain_id: Some("turn-external-noop"),

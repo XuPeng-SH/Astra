@@ -53,14 +53,14 @@ use harness::require_system_e2e_env;
 macro_rules! matrix_test {
     (
         $(#[$extra:meta])*
-        $name:ident, $workers:literal, $reason:literal, $runner:path
+        $name:ident, $workers:literal, $reason:literal, $runner:path $(, $arg:expr)*
     ) => {
         $(#[$extra])*
         #[tokio::test(flavor = "multi_thread", worker_threads = $workers)]
         #[ignore = $reason]
         async fn $name() {
             require_system_e2e_env();
-            $runner().await;
+            $runner($($arg),*).await;
         }
     };
 }
@@ -80,6 +80,18 @@ macro_rules! current_thread_matrix_test {
     };
 }
 
+matrix_test! {
+    e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution, 2,
+    "live MatrixOne + scripted provider; real schema rejection and corrected child execution",
+    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, false
+}
+
+matrix_test! {
+    e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution_explain, 2,
+    "live MatrixOne + scripted provider; same correction/child contract with Explain enabled",
+    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, true
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn product_matrix_api_journey_hits_multiple_tables() {
@@ -93,6 +105,11 @@ matrix_test! {
     e2e_matrix_chat_run_pause_resume_http, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_tasks_runs::run_chat_run_pause_resume_http
+}
+matrix_test! {
+    e2e_matrix_execution_handoff_resume_reaches_provider_http, 2,
+    "live MatrixOne + mock LLM; public same-turn execution handoff restoration",
+    journey_tasks_runs::run_execution_handoff_resume_reaches_provider_http
 }
 matrix_test! {
     e2e_matrix_orphan_cancel_claim_race_http, 4,

@@ -17,11 +17,10 @@ use crate::coordination::{AgentProfile, AgentTier};
 const MAX_TEAM_LIST_ROWS: usize = 200;
 const MAX_TEAM_SNAPSHOT_LIST_ROWS: u32 = 200;
 const BUILTIN_OWNER_INIT_CACHE_CAPACITY: usize = 4096;
+const BUILTIN_TEAM_ID_PREFIX: &str = "bt-";
 const TEAM_LIST_SELECT_SQL: &str = "\
     SELECT team_id, user_id, name, description, \
-           members_json, context_json, \
-           CAST(created_at AS CHAR) AS created_at, \
-           CAST(updated_at AS CHAR) AS updated_at \
+           members_json, context_json, revision \
     FROM team_definitions \
     WHERE user_id = ? \
     ORDER BY name \
@@ -72,7 +71,7 @@ fn team_cursor_required_id(
 
 /// Persistent team definition stored in MatrixOne.
 ///
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamDefinition {
     pub team_id: String,
     pub user_id: String,
@@ -80,20 +79,148 @@ pub struct TeamDefinition {
     pub description: String,
     pub members: Vec<TeamMemberDef>,
     pub context: HashMap<String, String>,
-    pub created_at: String,
-    pub updated_at: String,
+    pub revision: u64,
+}
+
+/// Caller-generated identity is retained when delivery of a create is uncertain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTeam {
+    pub team_id: String,
+    pub name: String,
+    pub description: String,
+    pub members: Vec<TeamMemberDef>,
+    #[serde(default)]
+    pub context: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTeam {
+    pub expected_revision: u64,
+    pub name: String,
+    pub description: String,
+    pub members: Vec<TeamMemberDef>,
+    #[serde(default)]
+    pub context: HashMap<String, String>,
+}
+
+impl From<&TeamDefinition> for UpdateTeam {
+    fn from(team: &TeamDefinition) -> Self {
+        Self {
+            expected_revision: team.revision,
+            name: team.name.clone(),
+            description: team.description.clone(),
+            members: team.members.clone(),
+            context: team.context.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TeamWriteError {
+    Validation(Vec<TeamValidationError>),
+    ConflictOrMissing,
+    Rejected,
+    Unconfirmed,
+}
+
+impl std::fmt::Display for TeamWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(errors) => write!(
+                f,
+                "{}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Self::ConflictOrMissing => f.write_str(
+                "Team conflicts with existing configuration, is missing, or has changed",
+            ),
+            Self::Rejected => f.write_str("Team write was rejected"),
+            Self::Unconfirmed => f.write_str(
+                "Team write outcome is unconfirmed; read the same Team ID before retrying",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TeamWriteError {}
+
+impl CreateTeam {
+    fn definition(&self, user_id: &str) -> Result<TeamDefinition, TeamWriteError> {
+        if self.team_id.starts_with(BUILTIN_TEAM_ID_PREFIX) {
+            return Err(TeamWriteError::Validation(vec![
+                TeamValidationError::InvalidDefinition(format!(
+                    "team_id prefix '{BUILTIN_TEAM_ID_PREFIX}' is reserved for built-in Teams"
+                )),
+            ]));
+        }
+        let team = TeamDefinition {
+            team_id: self.team_id.clone(),
+            user_id: user_id.to_string(),
+            revision: 1,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            members: self.members.clone(),
+            context: self.context.clone(),
+        };
+        validate_team(&team).map_err(TeamWriteError::Validation)?;
+        Ok(team)
+    }
+}
+
+impl UpdateTeam {
+    fn definition(&self, user_id: &str, team_id: &str) -> Result<TeamDefinition, TeamWriteError> {
+        let revision = self
+            .expected_revision
+            .checked_add(1)
+            .filter(|_| self.expected_revision > 0)
+            .ok_or_else(|| {
+                TeamWriteError::Validation(vec![TeamValidationError::InvalidDefinition(
+                    "expected_revision must be positive and incrementable".to_string(),
+                )])
+            })?;
+        let team = TeamDefinition {
+            team_id: team_id.to_string(),
+            user_id: user_id.to_string(),
+            revision,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            members: self.members.clone(),
+            context: self.context.clone(),
+        };
+        validate_team(&team).map_err(TeamWriteError::Validation)?;
+        Ok(team)
+    }
+}
+
+fn team_write_db_error(error: sqlx::Error) -> TeamWriteError {
+    if is_duplicate_key_error(&error) {
+        TeamWriteError::ConflictOrMissing
+    } else {
+        match error {
+            sqlx::Error::Database(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut => {
+                TeamWriteError::Rejected
+            }
+            // A transport/protocol failure does not prove that the write was rejected.
+            _ => TeamWriteError::Unconfirmed,
+        }
+    }
 }
 
 /// Lightweight member declaration within a team.
 ///
 /// Resolved to a full [`AgentProfile`] at execution time via [`resolve_member_to_profile`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeamMemberDef {
     pub role: String,
-    /// Logical identity inside this owner-scoped team. When `None`, an
-    /// execution-private identity is derived from the team and role.
-    pub agent_id: Option<String>,
+    /// Stable logical identity, independent of mutable Team and role names.
+    pub agent_id: String,
     pub system_prompt: Option<String>,
     pub skills: Vec<String>,
     /// Optional execution-tool allowlist. `None` inherits the admitted tool
@@ -128,11 +255,6 @@ pub struct TeamMemberDef {
 /// The generated profile inherits the team description as context in its system
 /// prompt and stores team context in `metadata["team_context"]`.
 pub fn resolve_member_to_profile(member: &TeamMemberDef, team: &TeamDefinition) -> AgentProfile {
-    let agent_id = member
-        .agent_id
-        .clone()
-        .unwrap_or_else(|| format!("team-{}-{}", team.name, member.role));
-
     // Team definitions are the complete source of member authority. Never
     // inherit a process-global profile with the same naked agent_id: that
     // would let another tenant alter this execution's prompt, tools or tier.
@@ -141,7 +263,7 @@ pub fn resolve_member_to_profile(member: &TeamMemberDef, team: &TeamDefinition) 
     } else {
         AgentTier::User
     };
-    let mut profile = AgentProfile::new(&agent_id, &member.role, tier);
+    let mut profile = AgentProfile::new(&member.agent_id, &member.role, tier);
 
     // Apply member-level overrides
     let system_prompt = member.system_prompt.clone().unwrap_or_else(|| {
@@ -203,9 +325,10 @@ pub fn resolve_member_to_profile(member: &TeamMemberDef, team: &TeamDefinition) 
 /// Validation errors for a team definition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TeamValidationError {
+    InvalidDefinition(String),
     /// Duplicate role names within the same team.
     DuplicateRoles(Vec<String>),
-    /// Duplicate agent IDs (explicit or generated).
+    /// Duplicate stable agent IDs.
     DuplicateAgentIds(Vec<String>),
     /// A member contains an invalid canonical profile control.
     InvalidMember(String),
@@ -214,6 +337,7 @@ pub enum TeamValidationError {
 impl std::fmt::Display for TeamValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidDefinition(msg) => write!(f, "invalid team definition: {msg}"),
             Self::DuplicateRoles(roles) => {
                 write!(f, "duplicate roles: {}", roles.join(", "))
             }
@@ -231,9 +355,25 @@ impl std::fmt::Display for TeamValidationError {
 ///
 /// Checks:
 /// - No duplicate roles
-/// - No duplicate agent IDs (after resolution)
+/// - Required stable identity and no duplicate agent IDs
 pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationError>> {
     let mut errors = Vec::new();
+    for (field, value, maximum) in [
+        ("team_id", team.team_id.as_str(), 64),
+        ("user_id", team.user_id.as_str(), 128),
+        ("name", team.name.as_str(), 128),
+    ] {
+        if value.trim().is_empty() || value.chars().count() > maximum {
+            errors.push(TeamValidationError::InvalidDefinition(format!(
+                "{field} must be nonempty and at most {maximum} characters"
+            )));
+        }
+    }
+    if team.revision == 0 {
+        errors.push(TeamValidationError::InvalidDefinition(
+            "revision must be positive".to_string(),
+        ));
+    }
 
     // Check duplicate roles
     let mut role_counts: HashMap<&str, usize> = HashMap::new();
@@ -252,20 +392,18 @@ pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationErro
     // Check duplicate agent IDs
     let mut id_counts: HashMap<String, usize> = HashMap::new();
     for m in &team.members {
-        let id = m
-            .agent_id
-            .clone()
-            .unwrap_or_else(|| format!("team-{}-{}", team.name, m.role));
-        *id_counts.entry(id).or_default() += 1;
+        *id_counts.entry(m.agent_id.clone()).or_default() += 1;
 
-        if m.agent_id
-            .as_deref()
-            .is_some_and(|agent_id| agent_id.trim().is_empty())
-        {
+        if m.agent_id.trim().is_empty() {
             errors.push(TeamValidationError::InvalidMember(format!(
                 "role '{}' agent_id must not be empty",
                 m.role
             )));
+        }
+        if m.role.trim().is_empty() {
+            errors.push(TeamValidationError::InvalidMember(
+                "role must not be empty".to_string(),
+            ));
         }
 
         if m.initial_turns == Some(0) {
@@ -408,7 +546,17 @@ pub trait TeamPersistenceService: Send + Sync {
     /// principal.
     async fn ensure_builtins(&self, user_id: &str) -> Result<(), String>;
 
-    async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String>;
+    async fn create_team(
+        &self,
+        user_id: &str,
+        input: &CreateTeam,
+    ) -> Result<TeamDefinition, TeamWriteError>;
+    async fn update_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        input: &UpdateTeam,
+    ) -> Result<TeamDefinition, TeamWriteError>;
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String>;
     async fn load_team_by_id(
         &self,
@@ -416,7 +564,7 @@ pub trait TeamPersistenceService: Send + Sync {
         team_id: &str,
     ) -> Result<Option<TeamDefinition>, String>;
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String>;
-    async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String>;
+    async fn delete_team(&self, user_id: &str, team_id: &str) -> Result<bool, String>;
 
     // ── Snapshots ───────────────────────────────────────────────
 
@@ -429,7 +577,7 @@ pub trait TeamPersistenceService: Send + Sync {
     /// List snapshots for a team, most recent first. Default: empty.
     async fn list_snapshots(
         &self,
-        _team_name: &str,
+        _team_id: &str,
         _user_id: &str,
         _limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
@@ -438,13 +586,13 @@ pub trait TeamPersistenceService: Send + Sync {
 
     async fn list_snapshots_page(
         &self,
-        team_name: &str,
+        team_id: &str,
         user_id: &str,
         limit: u32,
         cursor: Option<TeamSnapshotListCursor>,
     ) -> Result<TeamSnapshotListPage, String> {
         let snapshots = self
-            .list_snapshots(team_name, user_id, MAX_TEAM_SNAPSHOT_LIST_ROWS)
+            .list_snapshots(team_id, user_id, MAX_TEAM_SNAPSHOT_LIST_ROWS)
             .await?;
         team_snapshot_page_from_records(snapshots, limit, cursor)
     }
@@ -481,13 +629,11 @@ impl InMemoryTeamStore {
     /// Create a store pre-populated with the three built-in teams.
     pub fn with_builtins(user_id: &str) -> Self {
         let store = Self::new();
-        let now = chrono::Utc::now().to_rfc3339();
-        let builtins = builtin_teams(user_id, &now);
+        let builtins = builtin_teams(user_id);
         {
             let mut map = astra_core::sync_poison::recover_rwlock_write(&store.teams);
             for t in builtins {
-                let key = format!("{}:{}", t.user_id, t.name);
-                map.insert(key, t);
+                map.insert(t.team_id.clone(), t);
             }
         }
         store
@@ -503,26 +649,67 @@ impl Default for InMemoryTeamStore {
 #[async_trait]
 impl TeamPersistenceService for InMemoryTeamStore {
     async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
-        let now = chrono::Utc::now().to_rfc3339();
         let mut map = self.teams.write().map_err(|e| e.to_string())?;
-        for team in builtin_teams(user_id, &now) {
-            let key = format!("{}:{}", team.user_id, team.name);
-            map.entry(key).or_insert(team);
+        for team in builtin_teams(user_id) {
+            if !map
+                .values()
+                .any(|existing| existing.user_id == user_id && existing.name == team.name)
+            {
+                if let Some(existing) = map.get(&team.team_id) {
+                    if existing.user_id != user_id {
+                        return Err("builtin Team identity belongs to another owner".to_string());
+                    }
+                } else {
+                    map.insert(team.team_id.clone(), team);
+                }
+            }
         }
         Ok(())
     }
 
-    async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String> {
-        let key = format!("{}:{}", team.user_id, team.name);
-        let mut map = self.teams.write().map_err(|e| e.to_string())?;
-        map.insert(key, team.clone());
-        Ok(team.clone())
+    async fn create_team(
+        &self,
+        user_id: &str,
+        input: &CreateTeam,
+    ) -> Result<TeamDefinition, TeamWriteError> {
+        let team = input.definition(user_id)?;
+        let mut map = self.teams.write().map_err(|_| TeamWriteError::Rejected)?;
+        if map.contains_key(&team.team_id)
+            || map
+                .values()
+                .any(|existing| existing.user_id == user_id && existing.name == team.name)
+        {
+            return Err(TeamWriteError::ConflictOrMissing);
+        }
+        map.insert(team.team_id.clone(), team.clone());
+        Ok(team)
+    }
+
+    async fn update_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        input: &UpdateTeam,
+    ) -> Result<TeamDefinition, TeamWriteError> {
+        let team = input.definition(user_id, team_id)?;
+        let mut map = self.teams.write().map_err(|_| TeamWriteError::Rejected)?;
+        if !map.get(team_id).is_some_and(|existing| {
+            existing.user_id == user_id && existing.revision == input.expected_revision
+        }) || map.values().any(|existing| {
+            existing.team_id != team_id && existing.user_id == user_id && existing.name == team.name
+        }) {
+            return Err(TeamWriteError::ConflictOrMissing);
+        }
+        map.insert(team_id.to_string(), team.clone());
+        Ok(team)
     }
 
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String> {
-        let key = format!("{user_id}:{name}");
         let map = self.teams.read().map_err(|e| e.to_string())?;
-        Ok(map.get(&key).cloned())
+        Ok(map
+            .values()
+            .find(|team| team.user_id == user_id && team.name == name)
+            .cloned())
     }
 
     async fn load_team_by_id(
@@ -532,28 +719,31 @@ impl TeamPersistenceService for InMemoryTeamStore {
     ) -> Result<Option<TeamDefinition>, String> {
         let map = self.teams.read().map_err(|e| e.to_string())?;
         Ok(map
-            .values()
-            .find(|team| team.user_id == user_id && team.team_id == team_id)
+            .get(team_id)
+            .filter(|team| team.user_id == user_id)
             .cloned())
     }
 
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String> {
-        let prefix = format!("{user_id}:");
         let map = self.teams.read().map_err(|e| e.to_string())?;
         let mut teams: Vec<_> = map
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| v.clone())
+            .values()
+            .filter(|team| team.user_id == user_id)
+            .cloned()
             .collect();
         teams.sort_by(|a, b| a.name.cmp(&b.name));
         teams.truncate(MAX_TEAM_LIST_ROWS);
         Ok(teams)
     }
 
-    async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String> {
-        let key = format!("{user_id}:{name}");
+    async fn delete_team(&self, user_id: &str, team_id: &str) -> Result<bool, String> {
         let mut map = self.teams.write().map_err(|e| e.to_string())?;
-        Ok(map.remove(&key).is_some())
+        if map.get(team_id).is_some_and(|team| team.user_id == user_id) {
+            map.remove(team_id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // ── Snapshots ───────────────────────────────────────────────
@@ -569,14 +759,14 @@ impl TeamPersistenceService for InMemoryTeamStore {
 
     async fn list_snapshots(
         &self,
-        team_name: &str,
+        team_id: &str,
         user_id: &str,
         limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
         let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
         let mut matching: Vec<_> = snaps
             .iter()
-            .filter(|s| s.team_name == team_name && s.user_id == user_id)
+            .filter(|s| s.team_id == team_id && s.user_id == user_id)
             .cloned()
             .collect();
         sort_team_snapshots_recent(&mut matching);
@@ -586,7 +776,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
 
     async fn list_snapshots_page(
         &self,
-        team_name: &str,
+        team_id: &str,
         user_id: &str,
         limit: u32,
         cursor: Option<TeamSnapshotListCursor>,
@@ -594,7 +784,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
         let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
         let matching: Vec<_> = snaps
             .iter()
-            .filter(|s| s.team_name == team_name && s.user_id == user_id)
+            .filter(|s| s.team_id == team_id && s.user_id == user_id)
             .cloned()
             .collect();
         team_snapshot_page_from_records(matching, limit, cursor)
@@ -703,10 +893,7 @@ impl MatrixOneTeamStore {
     /// Materialize built-in teams without overwriting an owner's existing
     /// same-name definition.
     ///
-    /// This uses insert-only admission rather than `load` followed by
-    /// [`TeamPersistenceService::save_team`]. The latter is an upsert and can
-    /// overwrite a user customization when first-request initialization races
-    /// with an explicit create.
+    /// This insertion-only initialization cannot overwrite user customizations.
     pub async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
         self.owner_initializations
             .ensure(user_id, || self.ensure_builtins_uncached(user_id))
@@ -714,8 +901,7 @@ impl MatrixOneTeamStore {
     }
 
     async fn ensure_builtins_uncached(&self, user_id: &str) -> Result<(), String> {
-        let now = chrono::Utc::now().to_rfc3339();
-        for team in builtin_teams(user_id, &now) {
+        for team in builtin_teams(user_id) {
             self.insert_builtin_if_absent(&team).await?;
         }
         Ok(())
@@ -728,9 +914,8 @@ impl MatrixOneTeamStore {
         match sqlx::query(
             "INSERT INTO team_definitions \
              (team_id, user_id, name, description, members_json, \
-              context_json, \
-              created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+              context_json, revision) \
+             VALUES (?, ?, ?, ?, ?, ?, 1)",
         )
         .bind(&team.team_id)
         .bind(&team.user_id)
@@ -743,7 +928,19 @@ impl MatrixOneTeamStore {
         {
             Ok(_) => Ok(()),
             Err(error) if is_duplicate_key_error(&error) => {
-                if self.load_team(&team.user_id, &team.name).await?.is_some() {
+                // A builtin can be renamed without losing its identity. A custom
+                // same-name definition also wins, but another owner's ID cannot.
+                let owned = sqlx::query(
+                    "SELECT team_id FROM team_definitions \
+                     WHERE user_id = ? AND (team_id = ? OR name = ?) LIMIT 1",
+                )
+                .bind(&team.user_id)
+                .bind(&team.team_id)
+                .bind(&team.name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| format!("builtin team collision check failed: {error}"))?;
+                if owned.is_some() {
                     Ok(())
                 } else {
                     Err(format!(
@@ -763,18 +960,21 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         MatrixOneTeamStore::ensure_builtins(self, user_id).await
     }
 
-    async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String> {
-        let members_json = serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
-        let context_json = serde_json::to_string(&team.context).map_err(|e| e.to_string())?;
-
-        // Insert first so concurrent creates collapse into a duplicate-key path, then
-        // update only the logical team identified by UNIQUE(user_id, name).
-        match sqlx::query(
+    async fn create_team(
+        &self,
+        user_id: &str,
+        input: &CreateTeam,
+    ) -> Result<TeamDefinition, TeamWriteError> {
+        let team = input.definition(user_id)?;
+        let members_json =
+            serde_json::to_string(&team.members).map_err(|_| TeamWriteError::Rejected)?;
+        let context_json =
+            serde_json::to_string(&team.context).map_err(|_| TeamWriteError::Rejected)?;
+        sqlx::query(
             "INSERT INTO team_definitions \
              (team_id, user_id, name, description, members_json, \
-              context_json, \
-              created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+              context_json, revision) \
+             VALUES (?, ?, ?, ?, ?, ?, 1)",
         )
         .bind(&team.team_id)
         .bind(&team.user_id)
@@ -784,47 +984,46 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         .bind(&context_json)
         .execute(&self.pool)
         .await
-        {
-            Ok(_) => {}
-            Err(error) if is_duplicate_key_error(&error) => {
-                let updated = sqlx::query(
-                    "UPDATE team_definitions SET \
-                         team_id       = ?, \
-                         description   = ?, \
-                         members_json  = ?, \
-                         context_json  = ?, \
-                         updated_at    = NOW(6) \
-                     WHERE user_id = ? AND name = ?",
-                )
-                .bind(&team.team_id)
-                .bind(&team.description)
-                .bind(&members_json)
-                .bind(&context_json)
-                .bind(&team.user_id)
-                .bind(&team.name)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| format!("team UPDATE after duplicate failed: {e}"))?;
+        .map_err(team_write_db_error)?;
+        Ok(team)
+    }
 
-                if updated.rows_affected() == 0 {
-                    return Err(format!(
-                        "team INSERT failed: duplicate team_id {} belongs to a different team",
-                        team.team_id
-                    ));
-                }
-            }
-            Err(error) => return Err(format!("team INSERT failed: {error}")),
+    async fn update_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        input: &UpdateTeam,
+    ) -> Result<TeamDefinition, TeamWriteError> {
+        let team = input.definition(user_id, team_id)?;
+        let members_json =
+            serde_json::to_string(&team.members).map_err(|_| TeamWriteError::Rejected)?;
+        let context_json =
+            serde_json::to_string(&team.context).map_err(|_| TeamWriteError::Rejected)?;
+        let result = sqlx::query(
+            "UPDATE team_definitions SET name = ?, description = ?, members_json = ?, \
+             context_json = ?, revision = revision + 1 \
+             WHERE user_id = ? AND team_id = ? AND revision = ?",
+        )
+        .bind(&team.name)
+        .bind(&team.description)
+        .bind(members_json)
+        .bind(context_json)
+        .bind(user_id)
+        .bind(team_id)
+        .bind(input.expected_revision)
+        .execute(&self.pool)
+        .await
+        .map_err(team_write_db_error)?;
+        if result.rows_affected() == 0 {
+            return Err(TeamWriteError::ConflictOrMissing);
         }
-
-        Ok(team.clone())
+        Ok(team)
     }
 
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String> {
         let row = sqlx::query(
             "SELECT team_id, user_id, name, description, \
-                    members_json, context_json, \
-                    CAST(created_at AS CHAR) AS created_at, \
-                    CAST(updated_at AS CHAR) AS updated_at \
+                    members_json, context_json, revision \
              FROM team_definitions WHERE user_id = ? AND name = ?",
         )
         .bind(user_id)
@@ -849,9 +1048,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
     ) -> Result<Option<TeamDefinition>, String> {
         let row = sqlx::query(
             "SELECT team_id, user_id, name, description, \
-                    members_json, context_json, \
-                    CAST(created_at AS CHAR) AS created_at, \
-                    CAST(updated_at AS CHAR) AS updated_at \
+                    members_json, context_json, revision \
              FROM team_definitions WHERE user_id = ? AND team_id = ?",
         )
         .bind(user_id)
@@ -884,10 +1081,10 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         Ok(teams)
     }
 
-    async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String> {
-        let result = sqlx::query("DELETE FROM team_definitions WHERE user_id = ? AND name = ?")
+    async fn delete_team(&self, user_id: &str, team_id: &str) -> Result<bool, String> {
+        let result = sqlx::query("DELETE FROM team_definitions WHERE user_id = ? AND team_id = ?")
             .bind(user_id)
-            .bind(name)
+            .bind(team_id)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("team DELETE failed: {e}"))?;
@@ -903,11 +1100,12 @@ impl TeamPersistenceService for MatrixOneTeamStore {
     ) -> Result<TeamSnapshotRecord, String> {
         sqlx::query(
             "INSERT INTO team_snapshots \
-             (snapshot_id, team_name, user_id, label, git_commit, session_id, \
+             (snapshot_id, team_id, team_name, user_id, label, git_commit, session_id, \
               team_definition_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&snapshot.snapshot_id)
+        .bind(&snapshot.team_id)
         .bind(&snapshot.team_name)
         .bind(&snapshot.user_id)
         .bind(&snapshot.label)
@@ -922,21 +1120,21 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
     async fn list_snapshots(
         &self,
-        team_name: &str,
+        team_id: &str,
         user_id: &str,
         limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
         let rows = sqlx::query(
-            "SELECT snapshot_id, team_name, user_id, label, git_commit, \
+            "SELECT snapshot_id, team_id, team_name, user_id, label, git_commit, \
                     session_id, team_definition_json, \
                     CAST(created_at AS CHAR) AS created_at \
              FROM team_snapshots \
-             WHERE user_id = ? AND team_name = ? \
+             WHERE user_id = ? AND team_id = ? \
              ORDER BY created_at DESC, snapshot_id DESC \
              LIMIT ?",
         )
         .bind(user_id)
-        .bind(team_name)
+        .bind(team_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -951,22 +1149,22 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
     async fn list_snapshots_page(
         &self,
-        team_name: &str,
+        team_id: &str,
         user_id: &str,
         limit: u32,
         cursor: Option<TeamSnapshotListCursor>,
     ) -> Result<TeamSnapshotListPage, String> {
         let limit = validate_team_snapshot_list_limit(limit);
         let mut qb = QueryBuilder::<MySql>::new(
-            "SELECT snapshot_id, team_name, user_id, label, git_commit, \
+            "SELECT snapshot_id, team_id, team_name, user_id, label, git_commit, \
                     session_id, team_definition_json, \
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM team_snapshots \
              WHERE user_id = ",
         );
         qb.push_bind(user_id);
-        qb.push(" AND team_name = ");
-        qb.push_bind(team_name);
+        qb.push(" AND team_id = ");
+        qb.push_bind(team_id);
         if let Some(cursor) = &cursor {
             let created_at = team_snapshot_cursor_db_created_at(cursor)?;
             let snapshot_id = team_snapshot_cursor_snapshot_id(cursor)?;
@@ -1015,7 +1213,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         user_id: &str,
     ) -> Result<Option<TeamSnapshotRecord>, String> {
         let row = sqlx::query(
-            "SELECT snapshot_id, team_name, user_id, label, git_commit, \
+            "SELECT snapshot_id, team_id, team_name, user_id, label, git_commit, \
                     session_id, team_definition_json, \
                     CAST(created_at AS CHAR) AS created_at \
              FROM team_snapshots \
@@ -1081,6 +1279,7 @@ fn parse_row_json<T: DeserializeOwned>(
 }
 
 fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition, String> {
+    use sqlx::Row;
     const TABLE: &str = "team_definitions";
 
     let team_id = row_string(row, TABLE, "team_id")?;
@@ -1089,8 +1288,9 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
     let description = row_string(row, TABLE, "description")?;
     let members_str = row_string(row, TABLE, "members_json")?;
     let context_str = row_string(row, TABLE, "context_json")?;
-    let created_at = row_string(row, TABLE, "created_at")?;
-    let updated_at = row_string(row, TABLE, "updated_at")?;
+    let revision = row
+        .try_get::<u64, _>("revision")
+        .map_err(|error| row_decode_error(TABLE, "revision", error))?;
 
     let members: Vec<TeamMemberDef> = parse_row_json(TABLE, "members_json", &members_str)?;
     let context: HashMap<String, String> = parse_row_json(TABLE, "context_json", &context_str)?;
@@ -1102,8 +1302,7 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
         description,
         members,
         context,
-        created_at,
-        updated_at,
+        revision,
     })
 }
 
@@ -1112,6 +1311,7 @@ fn row_to_team_snapshot_record(row: &sqlx::mysql::MySqlRow) -> Result<TeamSnapsh
 
     Ok(TeamSnapshotRecord {
         snapshot_id: row_string(row, TABLE, "snapshot_id")?,
+        team_id: row_string(row, TABLE, "team_id")?,
         team_name: row_string(row, TABLE, "team_name")?,
         user_id: row_string(row, TABLE, "user_id")?,
         label: row_string(row, TABLE, "label")?,
@@ -1126,6 +1326,7 @@ fn row_to_team_snapshot_record(row: &sqlx::mysql::MySqlRow) -> Result<TeamSnapsh
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamSnapshotRecord {
     pub snapshot_id: String,
+    pub team_id: String,
     pub team_name: String,
     pub user_id: String,
     pub label: String,
@@ -1138,17 +1339,17 @@ pub struct TeamSnapshotRecord {
 // ─── Built-in Teams ─────────────────────────────────────────────────────────
 
 /// The three standard team templates: review, research, dev.
-pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
+pub fn builtin_teams(user_id: &str) -> Vec<TeamDefinition> {
     vec![
         TeamDefinition {
-            team_id: format!("bt-rev-{user_id}"),
+            team_id: format!("{BUILTIN_TEAM_ID_PREFIX}rev-{user_id}"),
             user_id: user_id.to_string(),
             name: "review".to_string(),
             description: "Independent code reviews with aggregated findings".to_string(),
             members: vec![
                 TeamMemberDef {
                     role: "correctness_reviewer".to_string(),
-                    agent_id: None,
+                    agent_id: "team-review-correctness_reviewer".to_string(),
                     system_prompt: Some(
                         "Review the task for correctness and provide evidence-backed findings. Do not modify code."
                             .to_string(),
@@ -1162,7 +1363,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
                 TeamMemberDef {
                     role: "reviewer".to_string(),
-                    agent_id: None,
+                    agent_id: "team-review-reviewer".to_string(),
                     system_prompt: Some(
                         "You review code for bugs, security issues, and correctness. \
                          Provide actionable feedback."
@@ -1177,11 +1378,10 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
             ],
             context: HashMap::new(),
-            created_at: now.to_string(),
-            updated_at: now.to_string(),
+            revision: 1,
         },
         TeamDefinition {
-            team_id: format!("bt-res-{user_id}"),
+            team_id: format!("{BUILTIN_TEAM_ID_PREFIX}res-{user_id}"),
             user_id: user_id.to_string(),
             name: "research".to_string(),
             description: "Deep research: explorer gathers info, synthesizer produces report"
@@ -1189,7 +1389,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             members: vec![
                 TeamMemberDef {
                     role: "explorer".to_string(),
-                    agent_id: None,
+                    agent_id: "team-research-explorer".to_string(),
                     system_prompt: Some(
                         "You search the codebase, read docs, and gather information. \
                          Output structured findings."
@@ -1204,7 +1404,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
                 TeamMemberDef {
                     role: "synthesizer".to_string(),
-                    agent_id: None,
+                    agent_id: "team-research-synthesizer".to_string(),
                     system_prompt: Some(
                         "You synthesize findings into a coherent analysis report.".to_string(),
                     ),
@@ -1217,11 +1417,10 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
             ],
             context: HashMap::new(),
-            created_at: now.to_string(),
-            updated_at: now.to_string(),
+            revision: 1,
         },
         TeamDefinition {
-            team_id: format!("bt-dev-{user_id}"),
+            team_id: format!("{BUILTIN_TEAM_ID_PREFIX}dev-{user_id}"),
             user_id: user_id.to_string(),
             name: "dev".to_string(),
             description:
@@ -1230,7 +1429,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             members: vec![
                 TeamMemberDef {
                     role: "planner".to_string(),
-                    agent_id: None,
+                    agent_id: "team-dev-planner".to_string(),
                     system_prompt: Some(
                         "You decompose the task into subtasks with acceptance criteria."
                             .to_string(),
@@ -1244,7 +1443,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
                 TeamMemberDef {
                     role: "implementer".to_string(),
-                    agent_id: None,
+                    agent_id: "team-dev-implementer".to_string(),
                     system_prompt: Some(
                         "You implement code changes following the plan.".to_string(),
                     ),
@@ -1257,7 +1456,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
                 TeamMemberDef {
                     role: "tester".to_string(),
-                    agent_id: None,
+                    agent_id: "team-dev-tester".to_string(),
                     system_prompt: Some(
                         "You write and run tests, verifying acceptance criteria.".to_string(),
                     ),
@@ -1270,8 +1469,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
             ],
             context: HashMap::new(),
-            created_at: now.to_string(),
-            updated_at: now.to_string(),
+            revision: 1,
         },
     ]
 }
@@ -1298,7 +1496,7 @@ mod tests {
             members: vec![
                 TeamMemberDef {
                     role: "coder".to_string(),
-                    agent_id: Some("coder-agent".to_string()),
+                    agent_id: "coder-agent".to_string(),
                     system_prompt: None,
                     skills: vec!["edit".to_string()],
                     allow_tools: Some(vec!["read_file".to_string()]),
@@ -1312,7 +1510,7 @@ mod tests {
                 },
                 TeamMemberDef {
                     role: "reviewer".to_string(),
-                    agent_id: None,
+                    agent_id: "team-test-team-reviewer".to_string(),
                     system_prompt: Some("Review carefully".to_string()),
                     skills: vec!["review-changes".to_string()],
                     model_selection: Some(selection("offer-claude-opus")),
@@ -1323,8 +1521,17 @@ mod tests {
                 },
             ],
             context: HashMap::from([("project".to_string(), "test-project".to_string())]),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            revision: 1,
+        }
+    }
+
+    fn create_input(team: &TeamDefinition) -> CreateTeam {
+        CreateTeam {
+            team_id: team.team_id.clone(),
+            name: team.name.clone(),
+            description: team.description.clone(),
+            members: team.members.clone(),
+            context: team.context.clone(),
         }
     }
 
@@ -1412,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_member_auto_generates_agent_id() {
+    fn resolve_member_preserves_stable_agent_id() {
         let team = test_team();
         let profile = resolve_member_to_profile(&team.members[1], &team);
         assert_eq!(profile.agent_id, "team-test-team-reviewer");
@@ -1460,7 +1667,10 @@ mod tests {
         let team = test_team();
 
         // Save
-        store.save_team(&team).await.unwrap();
+        store
+            .create_team(&team.user_id, &create_input(&team))
+            .await
+            .unwrap();
 
         // Load
         let loaded = store.load_team("user-1", "test-team").await.unwrap();
@@ -1472,12 +1682,166 @@ mod tests {
         assert_eq!(list.len(), 1);
 
         // Delete
-        let deleted = store.delete_team("user-1", "test-team").await.unwrap();
+        let deleted = store.delete_team("user-1", "test-team-1").await.unwrap();
         assert!(deleted);
 
         // Verify gone
         let gone = store.load_team("user-1", "test-team").await.unwrap();
         assert!(gone.is_none());
+    }
+
+    #[tokio::test]
+    async fn team_writes_compare_owner_identity_revision_without_overwriting() {
+        let store = InMemoryTeamStore::new();
+        let original = test_team();
+        let input = create_input(&original);
+        let accepted = store.create_team(&original.user_id, &input).await.unwrap();
+        assert_eq!(accepted, original);
+        assert_eq!(
+            store.create_team(&original.user_id, &input).await,
+            Err(TeamWriteError::ConflictOrMissing)
+        );
+        let mut same_name = input.clone();
+        same_name.team_id = "another-id".to_string();
+        assert_eq!(
+            store.create_team(&original.user_id, &same_name).await,
+            Err(TeamWriteError::ConflictOrMissing)
+        );
+        assert_eq!(
+            store.create_team("another-owner", &input).await,
+            Err(TeamWriteError::ConflictOrMissing)
+        );
+
+        let mut update = UpdateTeam::from(&accepted);
+        update.name = "renamed".to_string();
+        update.members[0].role = "renamed-role".to_string();
+        for (owner, id) in [
+            ("another-owner", original.team_id.as_str()),
+            (original.user_id.as_str(), "missing"),
+        ] {
+            assert_eq!(
+                store.update_team(owner, id, &update).await,
+                Err(TeamWriteError::ConflictOrMissing)
+            );
+        }
+        let (a, b) = tokio::join!(
+            store.update_team(&original.user_id, &original.team_id, &update),
+            store.update_team(&original.user_id, &original.team_id, &update)
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        let accepted = a.or(b).unwrap();
+        assert_eq!(accepted.revision, 2);
+        assert_eq!(accepted.team_id, original.team_id);
+        assert_eq!(accepted.members[0].agent_id, original.members[0].agent_id);
+        assert!(
+            store
+                .load_team(&original.user_id, &original.name)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .load_team_by_id(&original.user_id, &original.team_id)
+                .await
+                .unwrap(),
+            Some(accepted.clone())
+        );
+        assert_eq!(
+            store
+                .update_team(&original.user_id, &original.team_id, &update)
+                .await,
+            Err(TeamWriteError::ConflictOrMissing)
+        );
+        assert!(
+            !store
+                .delete_team("another-owner", &original.team_id)
+                .await
+                .unwrap()
+        );
+
+        let mut snapshot = test_snapshot_record("snapshot", "2026-10-01T12:00:00.000000");
+        snapshot.team_id = original.team_id.clone();
+        snapshot.team_name = original.name.clone();
+        snapshot.user_id = original.user_id.clone();
+        store.save_snapshot(&snapshot).await.unwrap();
+        assert_eq!(
+            store
+                .list_snapshots(&accepted.team_id, &accepted.user_id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .delete_team(&accepted.user_id, &accepted.team_id)
+                .await
+                .unwrap()
+        );
+        let mut recreated = input;
+        recreated.team_id = "recreated-id".to_string();
+        store
+            .create_team(&original.user_id, &recreated)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_snapshots(&recreated.team_id, &original.user_id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn team_write_validation_and_uncertain_delivery_remain_distinct() {
+        let team = test_team();
+        let mut reserved = create_input(&team);
+        reserved.team_id = format!("{BUILTIN_TEAM_ID_PREFIX}custom");
+        assert!(matches!(
+            reserved.definition(&team.user_id),
+            Err(TeamWriteError::Validation(_))
+        ));
+        for revision in [0, u64::MAX] {
+            let mut input = UpdateTeam::from(&team);
+            input.expected_revision = revision;
+            assert!(matches!(
+                input.definition(&team.user_id, &team.team_id),
+                Err(TeamWriteError::Validation(_))
+            ));
+        }
+        let mut input = create_input(&team);
+        input.members[0].agent_id.clear();
+        assert!(matches!(
+            input.definition(&team.user_id),
+            Err(TeamWriteError::Validation(_))
+        ));
+        let mut update = UpdateTeam::from(&team);
+        update.members[0].agent_id.clear();
+        assert!(matches!(
+            update.definition(&team.user_id, &team.team_id),
+            Err(TeamWriteError::Validation(_))
+        ));
+        let mut wire = serde_json::to_value(&team.members[0]).unwrap();
+        for missing in [true, false] {
+            if missing {
+                wire.as_object_mut().unwrap().remove("agent_id");
+            } else {
+                wire["agent_id"] = serde_json::Value::Null;
+            }
+            assert!(serde_json::from_value::<TeamMemberDef>(wire.clone()).is_err());
+        }
+        assert_eq!(
+            team_write_db_error(sqlx::Error::PoolClosed),
+            TeamWriteError::Rejected
+        );
+        assert_eq!(
+            team_write_db_error(sqlx::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset
+            ))),
+            TeamWriteError::Unconfirmed
+        );
     }
 
     #[tokio::test]
@@ -1499,8 +1863,28 @@ mod tests {
         existing_review.user_id = "alice".to_string();
         existing_review.name = "review".to_string();
         existing_review.description = "owner customized review".to_string();
-        store.save_team(&existing_review).await.unwrap();
+        store
+            .create_team(&existing_review.user_id, &create_input(&existing_review))
+            .await
+            .unwrap();
 
+        let bob_builtins = builtin_teams("bob");
+        for builtin in &bob_builtins {
+            let mut claim = create_input(builtin);
+            claim.name = format!("claim-{}", builtin.name);
+            assert!(matches!(
+                store.create_team("alice", &claim).await,
+                Err(TeamWriteError::Validation(_))
+            ));
+            assert!(
+                store
+                    .load_team_by_id("alice", &builtin.team_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(store.list_teams("bob").await.unwrap().is_empty());
         store.ensure_builtins("alice").await.unwrap();
         store.ensure_builtins("alice").await.unwrap();
         store.ensure_builtins("bob").await.unwrap();
@@ -1523,6 +1907,24 @@ mod tests {
                 .all(|team| team.user_id == "alice" && !team.team_id.contains("bob"))
         );
         assert!(bob.iter().all(|team| team.user_id == "bob"));
+        assert!(bob_builtins.iter().all(|builtin| bob.contains(builtin)));
+
+        let dev = store.load_team("alice", "dev").await.unwrap().unwrap();
+        let mut renamed = UpdateTeam::from(&dev);
+        renamed.name = "my-dev".to_string();
+        let accepted = store
+            .update_team("alice", &dev.team_id, &renamed)
+            .await
+            .unwrap();
+        assert_eq!(accepted.team_id, dev.team_id);
+        assert_eq!(accepted.revision, dev.revision + 1);
+        store.ensure_builtins("alice").await.unwrap();
+        assert_eq!(
+            store.load_team_by_id("alice", &dev.team_id).await.unwrap(),
+            Some(accepted)
+        );
+        assert!(store.load_team("alice", "dev").await.unwrap().is_none());
+        assert_eq!(store.list_teams("alice").await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -1554,7 +1956,10 @@ mod tests {
             let mut team = test_team();
             team.team_id = format!("team-{idx:03}");
             team.name = format!("team-{idx:03}");
-            store.save_team(&team).await.unwrap();
+            store
+                .create_team(&team.user_id, &create_input(&team))
+                .await
+                .unwrap();
         }
 
         let teams = store.list_teams("user-1").await.unwrap();
@@ -1577,7 +1982,7 @@ mod tests {
 
     #[test]
     fn builtin_member_profiles_do_not_require_workspace_skills() {
-        for team in builtin_teams("u1", "2026-01-01T00:00:00Z") {
+        for team in builtin_teams("u1") {
             for member in &team.members {
                 let profile = resolve_member_to_profile(member, &team);
                 assert!(
@@ -1602,7 +2007,7 @@ mod tests {
         let members = vec![
             TeamMemberDef {
                 role: "coder".to_string(),
-                agent_id: Some("my-coder".to_string()),
+                agent_id: "my-coder".to_string(),
                 system_prompt: None,
                 skills: vec!["edit".to_string(), "test".to_string()],
                 model_selection: Some(selection("offer-gpt-4")),
@@ -1613,7 +2018,7 @@ mod tests {
             },
             TeamMemberDef {
                 role: "reviewer".to_string(),
-                agent_id: None,
+                agent_id: "team-test-team-reviewer".to_string(),
                 system_prompt: Some("Be thorough".to_string()),
                 skills: vec![],
                 model_selection: None,
@@ -1628,7 +2033,7 @@ mod tests {
         let parsed: Vec<TeamMemberDef> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].role, "coder");
-        assert_eq!(parsed[0].agent_id.as_deref(), Some("my-coder"));
+        assert_eq!(parsed[0].agent_id, "my-coder");
         assert_eq!(parsed[1].system_prompt.as_deref(), Some("Be thorough"));
     }
 
@@ -1675,6 +2080,7 @@ mod tests {
     fn test_snapshot_record(snapshot_id: &str, created_at: &str) -> TeamSnapshotRecord {
         TeamSnapshotRecord {
             snapshot_id: snapshot_id.to_string(),
+            team_id: "team-a-id".to_string(),
             team_name: "team-a".to_string(),
             user_id: "user-1".to_string(),
             label: format!("snapshot {snapshot_id}"),
@@ -1758,8 +2164,8 @@ mod tests {
     #[test]
     fn validate_team_duplicate_agent_ids() {
         let mut team = test_team();
-        team.members[0].agent_id = Some("same-id".to_string());
-        team.members[1].agent_id = Some("same-id".to_string());
+        team.members[0].agent_id = "same-id".to_string();
+        team.members[1].agent_id = "same-id".to_string();
         let err = validate_team(&team).unwrap_err();
         assert!(
             err.iter()
@@ -1774,9 +2180,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_member_generates_auto_id() {
-        let team = test_team();
-        let member = &team.members[1]; // reviewer, agent_id=None
+    fn resolve_member_identity_survives_rename() {
+        let mut team = test_team();
+        team.name = "renamed-team".to_string();
+        team.members[1].role = "renamed-role".to_string();
+        let member = &team.members[1]; // reviewer, stable agent ID
         let profile = resolve_member_to_profile(member, &team);
         assert_eq!(profile.agent_id, "team-test-team-reviewer");
     }
@@ -1784,7 +2192,7 @@ mod tests {
     #[test]
     fn resolve_member_creates_fresh_profile() {
         let team = test_team();
-        let member = &team.members[1]; // reviewer, agent_id=None
+        let member = &team.members[1]; // reviewer, stable agent ID
         let profile = resolve_member_to_profile(member, &team);
 
         // member[1] has system_prompt = Some("Review carefully") → used as-is
@@ -1867,7 +2275,7 @@ mod tests {
         // Deserialize without can_delegate/max_delegation_depth → defaults
         let json = r#"{
             "role": "worker",
-            "agent_id": null,
+            "agent_id": "worker",
             "system_prompt": null,
             "skills": [],
             "model_selection": null,
@@ -1903,6 +2311,7 @@ mod tests {
 
         let snap = TeamSnapshotRecord {
             snapshot_id: "snap-1".to_string(),
+            team_id: "team-a-id".to_string(),
             team_name: "team-a".to_string(),
             user_id: "user-1".to_string(),
             label: "before refactor".to_string(),
@@ -1916,7 +2325,10 @@ mod tests {
         store.save_snapshot(&snap).await.unwrap();
 
         // List
-        let list = store.list_snapshots("team-a", "user-1", 50).await.unwrap();
+        let list = store
+            .list_snapshots("team-a-id", "user-1", 50)
+            .await
+            .unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].label, "before refactor");
 
@@ -1942,6 +2354,7 @@ mod tests {
             store
                 .save_snapshot(&TeamSnapshotRecord {
                     snapshot_id: id.to_string(),
+                    team_id: format!("{team}-id"),
                     team_name: team.to_string(),
                     user_id: "u1".to_string(),
                     label: format!("snap {id}"),
@@ -1954,10 +2367,10 @@ mod tests {
                 .unwrap();
         }
 
-        let a_snaps = store.list_snapshots("team-a", "u1", 50).await.unwrap();
+        let a_snaps = store.list_snapshots("team-a-id", "u1", 50).await.unwrap();
         assert_eq!(a_snaps.len(), 2);
 
-        let b_snaps = store.list_snapshots("team-b", "u1", 50).await.unwrap();
+        let b_snaps = store.list_snapshots("team-b-id", "u1", 50).await.unwrap();
         assert_eq!(b_snaps.len(), 1);
     }
 
@@ -1973,6 +2386,7 @@ mod tests {
         let store = InMemoryTeamStore::new();
         let snap = TeamSnapshotRecord {
             snapshot_id: "snap-shared-id".to_string(),
+            team_id: "team-a-id".to_string(),
             team_name: "team-x".to_string(),
             user_id: "alice".to_string(),
             label: "alice snap".to_string(),
@@ -1992,7 +2406,7 @@ mod tests {
         );
         assert!(
             store
-                .list_snapshots("team-x", "bob", 50)
+                .list_snapshots("team-a-id", "bob", 50)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2026,6 +2440,7 @@ mod tests {
         store
             .save_snapshot(&TeamSnapshotRecord {
                 snapshot_id: "snap-def".to_string(),
+                team_id: "team-a-id".to_string(),
                 team_name: "test-team".to_string(),
                 user_id: "u1".to_string(),
                 label: "with definition".to_string(),

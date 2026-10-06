@@ -1343,20 +1343,15 @@ impl ToolHandler<RuntimeToolExecutor> for DefaultExecutorToolHandler {
             .map(|(run_id, turn_chain_id)| {
                 format!("{}:{run_id}:{turn_chain_id}", context.session_id)
             });
-        let Some(authority) = authority else {
-            return context
-                .default_executor
-                .execute_with_cancel(self.name, args, cancel_token)
-                .await;
-        };
         context
             .default_executor
             .execute_with_workspace_convergence_authority(
                 self.name,
                 args,
                 &context.convergence_tracker,
-                &authority,
+                authority.as_deref(),
                 cancel_token,
+                invocation.admission_deadline,
             )
             .await
     }
@@ -1718,12 +1713,68 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result(name, false);
         }
-        context.execute_mcp_tool(name, args, None, None, None).await
+        context
+            .execute_mcp_tool(
+                name,
+                args,
+                None,
+                None,
+                None,
+                context
+                    .admitted_execution_deadline
+                    .map(|deadline| deadline.monotonic_work_deadline()),
+            )
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn default_adapter_retains_cutoff_without_convergence_identity() {
+        use astra_tools::tool_engine::{ToolHandler, ToolInvocationMetadata};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("answer.txt"), "read only before expiry").unwrap();
+        let executor = super::RuntimeToolExecutor::new(
+            root.path().to_path_buf(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        let handler = super::DefaultExecutorToolHandler { name: "read_file" };
+        for (has_identity, expired) in [(false, true), (true, true), (false, false)] {
+            let now = tokio::time::Instant::now().into_std();
+            let result = handler
+                .execute_invocation(
+                    &executor,
+                    &serde_json::json!({"path": "answer.txt"}),
+                    ToolInvocationMetadata {
+                        admission_deadline: Some(if expired {
+                            now
+                        } else {
+                            now + std::time::Duration::from_secs(10)
+                        }),
+                        run_id: has_identity.then_some("run"),
+                        turn_chain_id: has_identity.then_some("turn"),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await;
+            if expired {
+                assert_eq!(
+                    result.metadata.as_ref().unwrap()["execution_started"],
+                    false
+                );
+                assert!(!result.output.contains("read only before expiry"));
+            } else {
+                assert!(!result.is_error, "{result:?}");
+                assert!(result.output.contains("read only before expiry"));
+            }
+        }
+    }
+
     use super::*;
 
     #[tokio::test]

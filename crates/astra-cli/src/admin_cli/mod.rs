@@ -1,11 +1,8 @@
 use std::fs;
 
-use crate::cli::auth_flow::{
-    parse_auth_tokens, save_profile_auth_tokens, save_refreshed_profile_tokens,
-};
+use crate::cli::auth_flow::{clear_profile_auth, parse_auth_tokens, save_profile_auth_tokens};
 use crate::cli::cli_config::cli_utils::{
-    bound_profile_access_token, credential_store, get_profile_and_token, load_credentials,
-    profile_name,
+    bound_profile_access_token, get_profile_and_token, load_credentials, profile_name,
 };
 use crate::cli::session::session_runtime;
 use astra_thin_client::ThinClient;
@@ -68,6 +65,7 @@ async fn load_models(
     args: &ModelLoadArgs,
 ) -> Result<(), String> {
     let judgment_default = judgment_default_name(models)?;
+    let mut judgment_available = false;
     for entry in models {
         let model_name = entry
             .get("name")
@@ -144,23 +142,22 @@ async fn load_models(
                 Err(e) => return Err(map_thin_err(e)),
             }
         };
-        if needs_check {
+        if needs_check || judgment_default == Some(model_name) {
+            if judgment_default == Some(model_name) {
+                judgment_available = false;
+            }
             match api
                 .post_bearer_path_empty_text(token, &paths::model_check(model_name))
                 .await
             {
                 Ok(body) => {
                     let checked = serde_json::from_str::<serde_json::Value>(&body).ok();
-                    if judgment_default == Some(model_name)
-                        && checked
+                    if judgment_default == Some(model_name) {
+                        judgment_available = checked
                             .as_ref()
                             .and_then(|v| v.get("is_active"))
                             .and_then(serde_json::Value::as_bool)
-                            != Some(true)
-                    {
-                        return Err(format!(
-                            "Judgment model '{model_name}' check did not confirm an active model; binding was not changed. Run: astra admin model check {model_name}"
-                        ));
+                            == Some(true);
                     }
                     let cap = checked
                         .and_then(|v| v.get("thinking_capability")?.as_str().map(String::from));
@@ -180,19 +177,19 @@ async fn load_models(
                     }
                 }
                 Err(e) => {
-                    if judgment_default == Some(model_name) {
-                        return Err(format!(
-                            "Judgment model '{model_name}' check failed; binding was not changed: {}",
-                            map_thin_err(e)
-                        ));
-                    }
-                    eprintln!("  thinking probe failed for {model_name}: {e}");
+                    eprintln!("  model check failed for {model_name}: {e}");
                 }
             }
         }
     }
     if let Some(name) = judgment_default {
-        bind_judgment_default(api, token, name).await?;
+        if judgment_available {
+            bind_judgment_default(api, token, name).await?;
+        } else {
+            eprintln!(
+                "warning: model catalog loaded, but optional judgment model '{name}' was not confirmed active; judgment binding unchanged. Check upstream availability and model configuration with `astra admin model check {name}`, then reload models."
+            );
+        }
     }
     Ok(())
 }
@@ -203,17 +200,17 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
         stdout_println!("  (non-JSON response, len {} bytes)", body.len());
         return;
     };
-    let active = value
-        .get("is_active")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true); // fail-open: treat missing/invalid as active so user proceeds
-    stdout_println!("  is_active: {active}");
+    let active = value.get("is_active").and_then(serde_json::Value::as_bool);
+    match active {
+        Some(active) => stdout_println!("  is_active: {active}"),
+        None => stdout_println!("  is_active: unknown"),
+    }
     if let Some(c) = value
         .get("connectivity")
         .and_then(serde_json::Value::as_str)
     {
         stdout_println!("  connectivity: {c}");
-    } else if !active {
+    } else if active != Some(true) {
         stdout_println!(
             "  connectivity: (not in response; run: astra admin model check {model_name})"
         );
@@ -239,9 +236,9 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
             other => stdout_println!("  thinking: {other}"),
         }
     }
-    if !active {
+    if active != Some(true) {
         eprintln!(
-            "  warning: model is inactive — server probe failed or was skipped; fix YAML then `astra admin model load <file> --update-existing`, or `astra admin model check {model_name}`"
+            "  warning: model availability was not confirmed. Check upstream health, credentials and endpoint with `astra admin model check {model_name}`; reload models after resolving the cause."
         );
     }
 }
@@ -546,15 +543,16 @@ pub async fn run(
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = saved_profile
-                .refresh_token
-                .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
-            let body = api
-                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+            if saved_profile
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("refresh requires a server-issued account_id; log in again".into());
+            }
+            session_runtime::try_refresh_token(&api, &name, &saved_profile, None)
                 .await
-                .map_err(map_thin_err)?;
-            let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
+                .map_err(|error| format!("refresh failed: {error:?}"))?;
             stdout_println!("token refreshed");
             Ok(())
         }
@@ -573,16 +571,7 @@ pub async fn run(
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            let cli_profile = profile.clone();
-            credential_store()
-                .mutate(|creds| {
-                    let name = profile_name(cli_profile.as_deref(), creds);
-                    if let Some(entry) = creds.profiles.get_mut(&name) {
-                        entry.access_token = None;
-                        entry.refresh_token = None;
-                    }
-                })
-                .map_err(|e| e.to_string())?;
+            clear_profile_auth(profile.as_deref())?;
             print_json_or_raw(&body);
             Ok(())
         }
@@ -933,10 +922,10 @@ mod tests {
         for (default, check_status, active, binding_status, expected_ok) in [
             (true, 200, Some(true), 200, true),
             (false, 200, Some(true), 200, true),
-            (true, 503, Some(true), 200, false),
+            (true, 503, Some(true), 200, true),
             (true, 200, Some(true), 400, false),
-            (true, 200, Some(false), 200, false),
-            (true, 200, None, 200, false),
+            (true, 200, Some(false), 200, true),
+            (true, 200, None, 200, true),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("PUT"))
@@ -948,6 +937,26 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
+            for model in ["primary", "last"] {
+                Mock::given(method("PUT"))
+                    .and(path(format!("/models/{model}")))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(
+                            serde_json::json!({"is_active":true,"context_window":1000}),
+                        ),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path(format!("/models/{model}/check")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"is_active":true,"thinking_capability":"both"}),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
             Mock::given(method("POST"))
                 .and(path("/models/jev/check"))
                 .respond_with(
@@ -973,7 +982,7 @@ mod tests {
                 .await;
             // No credentials or profiles: metadata-only load uses the stored server key.
             let doc = yaml(&format!(
-                "[{{name: jev, provider: typesafe, context_window: 1000, judgment_default: {default}}}]"
+                "[{{name: jev, provider: typesafe, context_window: 1000, judgment_default: {default}}}, {{name: primary, provider: openai, context_window: 1000}}, {{name: last, provider: openai, context_window: 1000}}]"
             ));
             let args = ModelLoadArgs {
                 path: "unused.yaml".into(),
@@ -989,6 +998,53 @@ mod tests {
                     "/admin/config/judgment_model"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_default_still_requires_a_successful_health_check() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for active in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(400).set_body_string("already exists"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/models/jev/check"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"is_active":active})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/admin/config/judgment_model"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(if active { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            let doc = yaml(
+                "[{name: jev, provider: typesafe, api_key: test-only-placeholder, context_window: 1000, judgment_default: true}]",
+            );
+            let api = ThinClient::new(&server.uri(), None).unwrap();
+            let args = ModelLoadArgs {
+                path: "unused.yaml".into(),
+                update_existing: false,
+            };
+            assert!(
+                load_models(&api, "fake-token", doc.as_sequence().unwrap(), &args)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                2 + usize::from(active)
+            );
         }
     }
 

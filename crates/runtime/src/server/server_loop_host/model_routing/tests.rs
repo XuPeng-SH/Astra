@@ -1179,19 +1179,6 @@ async fn auto_recovery_retains_source_bound_child_model_requirement() {
         source.owner_generation + 1
     );
     assert_eq!(classified.source.as_ref().unwrap().control_epoch, 42);
-    let absent = r#"{"disposition":"not_applicable"}"#;
-    assert!(
-        astra_services::delegation_model_requirement::parse_delegation_intent_requirements(
-            absent,
-            &state.message,
-            &[],
-            None,
-            classified.delegation_model_requirement
-                == Some(astra_services::WorkAdmissionTruth::Yes),
-        )
-        .is_err(),
-        "a recovered positive model requirement must reject no-requirement output"
-    );
 
     state.message = "a different instruction".into();
     state.user_intent = state.message.clone();

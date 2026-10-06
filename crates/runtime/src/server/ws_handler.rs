@@ -1329,6 +1329,7 @@ fn build_ws_chat_request(
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id,
+        execution_authentication: None,
         session_admission_facts: None,
         work_binding: None,
         run_start_idempotency: None,

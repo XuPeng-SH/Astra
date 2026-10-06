@@ -78,11 +78,18 @@ error with reason-specific retryability, never raw backend error text.
 
 ## Runtime and artifact observations
 
-Explain snapshots are discovered lazily through the same `introspect` tool:
-`explain={target:"previous"}` excludes the current server root, while
-`explain={target:"run",run_id:"…"}` selects an exact authorized root in the
-active session. Discovery returns the first bounded window and a fixed opaque
-artifact handle for subsequent pages. Ordinary server chat preparation does
+Historical execution is read lazily through the same `introspect` tool:
+`explain={target:"previous"}` selects the latest root strictly before the trusted
+current server root's `(created_at, run_id)` admission key for the authenticated
+user in the active session. A missing, foreign, or non-root current fails closed;
+later-admitted roots are never previous. Selection is ordered by created time
+then run ID descending. Child runs, later updates, and Explain
+eligibility do not affect that choice; unavailable evidence never selects an
+older run. `explain={target:"run",run_id:"…"}` selects an exact authorized run
+in the active session, including a child. Both selectors return the existing
+bounded durable projection for ordinary runs without creating an artifact.
+Runs that requested Explain retain the artifact summary/window and fixed opaque
+handle for subsequent pages. Ordinary server chat preparation does
 not discover or recover reports. Local CLI/Edge selectors explicitly report
 unsupported; existing local handles remain usable through their local reader.
 Identity, physical-absence-only recovery, capture completeness and window

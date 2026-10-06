@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use crate::turn::agentic_loop::host::AgenticLoopHost;
 use astra_core::{ErrorResponse, error_response};
 use astra_services::{auth::*, models::*};
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ struct CatalogSpy {
     reads: AtomicUsize,
     items: Mutex<Vec<ModelListItem>>,
     failure: Mutex<Option<StatusCode>>,
+    pause: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 #[async_trait]
@@ -48,7 +50,12 @@ impl ModelService for CatalogSpy {
     }
     async fn list_models(&self, user: String, _: bool) -> HttpResult<Vec<ModelListItem>> {
         assert_eq!(user, "owner");
+        tokio::task::yield_now().await;
         self.reads.fetch_add(1, Ordering::SeqCst);
+        let pause = self.pause.lock().unwrap().clone();
+        if let Some(pause) = pause {
+            pause.notified().await;
+        }
         if let Some(status) = *self.failure.lock().unwrap() {
             return Err(error_response(
                 status,
@@ -127,6 +134,7 @@ fn principal(edge: bool) -> AuthPrincipal {
             display_name: None,
         },
         session_id: None,
+        execution_continuation: None,
         origin: if edge {
             AuthPrincipalOrigin::ProviderAuthorizedRequest(AuthProviderAuthorizedRequestContext {
                 provider_id: "provider".into(),
@@ -192,6 +200,283 @@ async fn edge_scope_never_reads_owner_catalog_even_when_revoked() {
     assert!(value["total"].is_null());
     assert_eq!(models.reads.load(Ordering::SeqCst), 0);
     assert_eq!(auth.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_observation_cache_coalesces_and_isolates_generations() {
+    let models = Arc::new(CatalogSpy::default());
+    *models.items.lock().unwrap() = vec![fixture(0)];
+    let auth = Arc::new(ScopedAuthSpy::default());
+    let cache = AuthorizedModelCatalogCache::default();
+    let bind = |principal| {
+        AuthorizedModelCatalogReader::with_cache(
+            models.clone(),
+            auth.clone(),
+            principal,
+            cache.clone(),
+        )
+    };
+    let first = bind(principal(false));
+    let second = bind(principal(false));
+    let (a, b) = tokio::join!(first.read_snapshot(), second.read_snapshot());
+    assert_eq!(a.unwrap(), b.unwrap());
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1);
+    *models.items.lock().unwrap() = vec![fixture(1)];
+    assert_eq!(
+        bind(principal(false)).read_snapshot().await.unwrap()[0].offering_id,
+        "id-000"
+    );
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    assert_eq!(
+        bind(principal(false)).read_snapshot().await.unwrap()[0].offering_id,
+        "id-001"
+    );
+    assert_eq!(models.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        first.read_snapshot().await.unwrap()[0].offering_id,
+        "id-000",
+        "running requests retain their observed generation"
+    );
+    let mut other_session = principal(false);
+    other_session.session_id = Some("another-auth-session".into());
+    bind(other_session).read_snapshot().await.unwrap();
+    assert_eq!(models.reads.load(Ordering::SeqCst), 3);
+    bind(principal(true)).read_snapshot().await.unwrap();
+    assert_eq!(auth.reads.load(Ordering::SeqCst), 1);
+    let mut other_authorization = principal(true);
+    if let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &mut other_authorization.origin
+    {
+        context.request_authorization_id = "different-authorization".into();
+    }
+    bind(other_authorization).read_snapshot().await.unwrap();
+    assert_eq!(auth.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        models.reads.load(Ordering::SeqCst),
+        3,
+        "provider scopes cannot widen to the owner catalog"
+    );
+}
+
+#[tokio::test]
+async fn catalog_cache_failure_is_request_local_and_refresh_observes_revocation() {
+    let models = Arc::new(CatalogSpy::default());
+    let auth = Arc::new(ScopedAuthSpy::default());
+    let cache = AuthorizedModelCatalogCache::default();
+    let bind = || {
+        AuthorizedModelCatalogReader::with_cache(
+            models.clone(),
+            auth.clone(),
+            principal(false),
+            cache.clone(),
+        )
+    };
+    *models.failure.lock().unwrap() = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let failed = bind();
+    assert!(failed.read_snapshot().await.is_err());
+    assert!(failed.read_snapshot().await.is_err());
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1);
+    *models.failure.lock().unwrap() = None;
+    *models.items.lock().unwrap() = vec![fixture(0)];
+    let recovered = bind();
+    recovered.read_snapshot().await.unwrap();
+    assert_eq!(models.reads.load(Ordering::SeqCst), 2);
+    *models.failure.lock().unwrap() = Some(StatusCode::FORBIDDEN);
+    assert!(recovered.read_fresh_items().await.is_err());
+    assert!(
+        bind().read_snapshot().await.is_err(),
+        "failed refresh invalidates shared observation"
+    );
+    assert_eq!(models.reads.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn catalog_context_projects_safe_stable_candidates_and_partial_coverage() {
+    let models = Arc::new(CatalogSpy::default());
+    *models.items.lock().unwrap() = vec![fixture(0)];
+    let reader = AuthorizedModelCatalogReader::new(
+        models.clone(),
+        Arc::new(ScopedAuthSpy::default()),
+        principal(false),
+    );
+    let host = super::super::server_loop_host::ServerAgenticLoopHostBuilder::new(
+        crate::MatrixOneSettings::default(),
+        Arc::new(crate::FernetTokenEncryptor::new("catalog-test-only").unwrap()),
+        "owner".into(),
+        "session".into(),
+    )
+    .with_model_catalog_reader(Some(reader.clone()))
+    .build();
+    let before_tools = host.valid_tool_names();
+    let first = host.model_catalog_context().await.unwrap();
+    assert_eq!(first, host.model_catalog_context().await.unwrap());
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1);
+    assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+        &first
+    ));
+    let content = first["content"].as_str().unwrap();
+    let projected: Value = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        projected.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["catalog", "child_model_selection_allowed"]
+    );
+    assert_eq!(projected["catalog"]["coverage"], "complete");
+    assert_eq!(projected["child_model_selection_allowed"], true);
+    assert_eq!(projected["catalog"]["items"][0]["offering_id"], "id-000");
+    assert!(projected["catalog"]["observed_at"].is_null());
+    assert!(!content.contains("private"));
+    assert_eq!(
+        before_tools,
+        host.valid_tool_names(),
+        "observing candidates never mutates tool authority or stable schemas"
+    );
+    *models.items.lock().unwrap() = (0..20).map(fixture).collect();
+    reader.read_fresh_items().await.unwrap();
+    let partial = host.model_catalog_context().await.unwrap();
+    let projected: Value = serde_json::from_str(partial["content"].as_str().unwrap()).unwrap();
+    assert_eq!(projected["catalog"]["coverage"], "page");
+    assert_eq!(projected["catalog"]["returned"], 16);
+    assert!(projected["catalog"]["next_cursor"].is_string());
+    assert_eq!(models.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn catalog_context_keeps_provider_child_selection_ceiling() {
+    let models = Arc::new(CatalogSpy::default());
+    let auth = Arc::new(ScopedAuthSpy::default());
+    for principal in [principal(true), runtime_provider_principal()] {
+        let reader = AuthorizedModelCatalogReader::new(models.clone(), auth.clone(), principal);
+        let host = super::super::server_loop_host::ServerAgenticLoopHostBuilder::new(
+            crate::MatrixOneSettings::default(),
+            Arc::new(crate::FernetTokenEncryptor::new("catalog-test-only").unwrap()),
+            "owner".into(),
+            "session".into(),
+        )
+        .with_model_catalog_reader(Some(reader))
+        .build();
+        let context = host.model_catalog_context().await.unwrap();
+        let projected: Value = serde_json::from_str(context["content"].as_str().unwrap()).unwrap();
+        assert_eq!(projected["catalog"]["coverage"], "complete");
+        assert_eq!(projected["child_model_selection_allowed"], false);
+        assert!(!context.to_string().contains("private"));
+    }
+    assert_eq!(models.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(auth.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn catalog_observation_cache_does_not_retain_oversized_catalogs() {
+    let models = Arc::new(CatalogSpy::default());
+    let mut item = fixture(0);
+    item.description = Some("x".repeat(65_536));
+    *models.items.lock().unwrap() = vec![item];
+    let auth = Arc::new(ScopedAuthSpy::default());
+    let cache = AuthorizedModelCatalogCache::default();
+    for _ in 0..2 {
+        let reader = AuthorizedModelCatalogReader::with_cache(
+            models.clone(),
+            auth.clone(),
+            principal(false),
+            cache.clone(),
+        );
+        reader.read_snapshot().await.unwrap();
+        reader.read_snapshot().await.unwrap();
+    }
+    assert_eq!(
+        models.reads.load(Ordering::SeqCst),
+        2,
+        "large snapshots are retained only in the request, not across requests"
+    );
+}
+
+#[tokio::test]
+async fn catalog_observation_cache_evicts_principals_at_capacity() {
+    let models = Arc::new(CatalogSpy::default());
+    *models.items.lock().unwrap() = vec![fixture(0)];
+    let auth = Arc::new(ScopedAuthSpy::default());
+    let cache = AuthorizedModelCatalogCache::default();
+    let bind = |session: usize| {
+        let mut principal = principal(false);
+        principal.session_id = Some(format!("auth-session-{session}"));
+        AuthorizedModelCatalogReader::with_cache(
+            models.clone(),
+            auth.clone(),
+            principal,
+            cache.clone(),
+        )
+    };
+    for session in 0..1025 {
+        bind(session).read_snapshot().await.unwrap();
+    }
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1025);
+    bind(1024).read_snapshot().await.unwrap();
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1025);
+    bind(0).read_snapshot().await.unwrap();
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1026);
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_deadline_includes_waiters_and_cancelled_refresh_invalidates_success() {
+    let models = Arc::new(CatalogSpy::default());
+    *models.items.lock().unwrap() = vec![fixture(0)];
+    *models.pause.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
+    let auth = Arc::new(ScopedAuthSpy::default());
+    let cache = AuthorizedModelCatalogCache::default();
+    let bind = || {
+        AuthorizedModelCatalogReader::with_cache(
+            models.clone(),
+            auth.clone(),
+            principal(false),
+            cache.clone(),
+        )
+    };
+    let first = bind();
+    let a = tokio::spawn({
+        let reader = first.clone();
+        async move { reader.read_snapshot().await }
+    });
+    let b = tokio::spawn({
+        let reader = bind();
+        async move { reader.read_snapshot().await }
+    });
+    while models.reads.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    assert!(a.await.unwrap().is_err());
+    assert!(b.await.unwrap().is_err());
+    assert_eq!(
+        models.reads.load(Ordering::SeqCst),
+        1,
+        "waiters share the total deadline, not serial backend timeouts"
+    );
+    assert!(first.read_snapshot().await.is_err());
+    assert_eq!(models.reads.load(Ordering::SeqCst), 1);
+    *models.pause.lock().unwrap() = None;
+    let recovered = bind();
+    recovered.read_snapshot().await.unwrap();
+    assert_eq!(models.reads.load(Ordering::SeqCst), 2);
+    *models.pause.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
+    let refreshing = tokio::spawn({
+        let reader = recovered.clone();
+        async move { reader.read_fresh_items().await }
+    });
+    while models.reads.load(Ordering::SeqCst) != 3 {
+        tokio::task::yield_now().await;
+    }
+    refreshing.abort();
+    assert!(refreshing.await.unwrap_err().is_cancelled());
+    assert!(recovered.cached_snapshot().await.is_none());
+    assert!(recovered.read_snapshot().await.is_err());
+    *models.pause.lock().unwrap() = None;
+    *models.items.lock().unwrap() = vec![fixture(1)];
+    assert_eq!(
+        bind().read_snapshot().await.unwrap()[0].offering_id,
+        "id-001",
+        "cancelled refresh cannot leave shared stale success"
+    );
+    assert_eq!(models.reads.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]

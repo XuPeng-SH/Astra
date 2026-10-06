@@ -64,6 +64,12 @@ pub(crate) fn record_pre_execution_rejections(
             astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
         ));
         let structured_result = serde_json::from_str::<Value>(&rejected.result).ok();
+        let error_kind = structured_result
+            .as_ref()
+            .and_then(|value| value.get("error_kind"))
+            .and_then(Value::as_str)
+            .and_then(astra_core::ErrorKind::parse_tag)
+            .unwrap_or(astra_core::ErrorKind::ContractViolation);
         let rejection_detail = structured_result
             .as_ref()
             .and_then(|value| value.get("error"))
@@ -114,7 +120,7 @@ pub(crate) fn record_pre_execution_rejections(
             result_full: Some(rejected.result),
             round,
             start_offset_ms,
-            error_kind: Some(astra_core::ErrorKind::ContractViolation),
+            error_kind: Some(error_kind),
             disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
             ..Default::default()
         });

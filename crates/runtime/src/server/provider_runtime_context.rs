@@ -5,11 +5,15 @@ pub(crate) async fn inject_effective_runtime_context(
     principal: &AuthPrincipal,
     request: &mut astra_services::runs::ChatRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    request.model_catalog_reader = Some(astra_services::models::AuthorizedModelCatalogReader::new(
-        state.model_service.clone(),
-        state.auth_service.clone(),
-        principal.clone(),
-    ));
+    request.execution_authentication = principal.execution_authentication_provenance();
+    request.model_catalog_reader = Some(
+        astra_services::models::AuthorizedModelCatalogReader::with_cache(
+            state.model_service.clone(),
+            state.auth_service.clone(),
+            principal.clone(),
+            state.model_catalog_cache.clone(),
+        ),
+    );
     if principal.is_provider_authorized_request() {
         request.provider_runtime_authorized = true;
         if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {
@@ -475,6 +479,7 @@ mod tests {
                 display_name: None,
             },
             session_id: None,
+            execution_continuation: None,
             origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 AuthProviderAuthorizedRequestContext {
                     provider_id: "p1".to_string(),
@@ -629,6 +634,14 @@ mod tests {
             .expect("provider authorization should accept the supplied runtime context");
 
         assert!(request.provider_runtime_authorized);
+        assert_eq!(
+            serde_json::to_value(request.execution_authentication.as_ref().unwrap()).unwrap(),
+            serde_json::json!({
+                "kind": "provider_request", "user_id": "u1", "provider_id": "p1",
+                "external_subject": "s1", "provider_scope_id": "ws-1",
+                "request_authorization_id": "r1"
+            })
+        );
         let reader = request
             .model_catalog_reader
             .as_ref()

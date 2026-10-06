@@ -80,7 +80,8 @@ use astra_services::multi_agent::EdgeDispatchService;
 #[cfg(test)]
 use astra_services::runs::ExecutionTimeBudget;
 use astra_services::runs::{
-    RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
+    ExecutionDeadlineAuthority, RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy,
+    TurnIntentExecutionPolicy,
 };
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use astra_services::{AdmittedModelExecution, SessionArtifactStore};
@@ -102,74 +103,6 @@ use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 /// observer.  The event is retained before this bounded live delivery and can
 /// therefore be replayed after the observer catches up or reconnects.
 const COMMITTED_LIFECYCLE_LIVE_DELIVERY_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Process-local monotonic authority for one run's wall-clock budget.
-///
-/// Wire snapshots are relative and may be replayed by transport retries. Once
-/// anchored, a later snapshot may only move the deadline earlier; it can never
-/// replenish time already spent by this host.
-#[derive(Clone, Copy, Debug)]
-struct RunExecutionTimeBudget {
-    deadline: tokio::time::Instant,
-    deadline_unix_ms: u64,
-}
-
-impl RunExecutionTimeBudget {
-    #[cfg(test)]
-    fn new(snapshot: ExecutionTimeBudget) -> Self {
-        Self::new_at(snapshot, tokio::time::Instant::now())
-    }
-
-    #[cfg(test)]
-    fn new_at(snapshot: ExecutionTimeBudget, now: tokio::time::Instant) -> Self {
-        let wall_now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        Self {
-            deadline: now + Duration::from_secs(snapshot.remaining_seconds),
-            deadline_unix_ms: wall_now_ms
-                .saturating_add(snapshot.remaining_seconds.saturating_mul(1_000)),
-        }
-    }
-
-    #[cfg(test)]
-    fn tighten_at(&mut self, snapshot: ExecutionTimeBudget, now: tokio::time::Instant) {
-        let proposed = now + Duration::from_secs(snapshot.remaining_seconds);
-        if proposed < self.deadline {
-            self.deadline = proposed;
-            let wall_now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
-            self.deadline_unix_ms =
-                wall_now_ms.saturating_add(snapshot.remaining_seconds.saturating_mul(1_000));
-        }
-    }
-
-    fn remaining(self) -> Duration {
-        self.remaining_at(tokio::time::Instant::now())
-    }
-
-    fn remaining_at(self, now: tokio::time::Instant) -> Duration {
-        self.deadline.saturating_duration_since(now)
-    }
-
-    fn authority_snapshot(self) -> ExecutionDeadlineAuthority {
-        ExecutionDeadlineAuthority {
-            deadline_unix_ms: self.deadline_unix_ms,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ExecutionDeadlineAuthority {
-    deadline_unix_ms: u64,
-}
 
 /// Execution-owned provider-work slice derived from the run's monotonic
 /// deadline. It is deliberately distinct from the admitted endpoint's
@@ -2627,17 +2560,6 @@ fn scoped_inference_operation_id(stage: &str, identity: &str) -> String {
     )
 }
 
-fn delegation_intent_assessment_operation_id(
-    source_digest: &str,
-    input_digest: &str,
-    candidate_snapshot_digest: &str,
-) -> String {
-    scoped_inference_operation_id(
-        "intent",
-        &format!("{source_digest}|{input_digest}|{candidate_snapshot_digest}"),
-    )
-}
-
 fn inherited_delegation_source_from_state(
     state: &AgenticLoopState,
     origin: &astra_turn_types::DelegationUserRequirementSource,
@@ -3674,13 +3596,12 @@ pub struct ServerAgenticLoopHost {
     /// One-turn, in-memory repair evidence for a fused delegation scope.
     /// Reuse is allowed only when the complete source and slot inputs match;
     /// a new batch establishes its own scope.
-    delegation_scope_retry_cache: Option<DelegationScopeRetryCache>,
     /// One monotonic auxiliary-inference identity namespace for this host.
     /// Independently reconstructed summary clients must never restart at zero
     /// for the same durable run scope.
     summary_attempt_allocator: DurableSummaryAttemptAllocator,
     /// Monotonic wall-clock authority for this process-local run host.
-    execution_time_budget: Option<RunExecutionTimeBudget>,
+    execution_time_budget: Option<ExecutionDeadlineAuthority>,
     /// Recovery gate for provider-attempt-owned canonical append WAL. It is
     /// opened exactly once, after session history restoration and before any
     /// real provider dispatch owned by this host.
@@ -4018,9 +3939,10 @@ pub struct ServerAgenticLoopHost {
 }
 
 struct ExecutionHandoffContext {
-    requested: Arc<std::sync::atomic::AtomicBool>,
+    requested: tokio_util::sync::CancellationToken,
     engine: crate::server::run::engine::RunEngine,
     reservation: astra_turn_types::TurnReservationV1,
+    original_user_message: String,
 }
 
 /// Unfinished-turn continuation, not a committed session cursor or authority.
@@ -4034,9 +3956,81 @@ pub(crate) enum ToolLedgerContinuation {
     Unavailable,
 }
 
+/// Handoff-only pairing with an existing authority reference. Ordinary journal
+/// restoration intentionally cannot install execution evidence from display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoricalToolCallContinuation {
+    pub(crate) record: astra_services::session_journal::ToolCallRecord,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub(crate) completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
+}
+
+fn validate_handoff_tool_history(
+    history: &[HistoricalToolCallContinuation],
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    chain: Option<&str>,
+    journal_next_round: Option<u32>,
+) -> Result<(), &'static str> {
+    let mut identities = HashSet::new();
+    let mut previous_round = None;
+    for entry in history {
+        if let Some(round) = entry.record.round {
+            if journal_next_round.is_none_or(|next| round >= next)
+                || previous_round.is_some_and(|previous| round < previous)
+            {
+                return Err("handoff tool history has conflicting chronology");
+            }
+            previous_round = Some(round);
+        }
+        let Some(reference) = &entry.completion else {
+            continue;
+        };
+        let identity = reference.identity();
+        if identity.user_id != user_id
+            || identity.session_id != session_id
+            || identity.run_id != run_id
+            || Some(identity.turn_chain_id.as_str()) != chain
+            || entry.record.tool_call_id.as_deref() != Some(identity.invocation_id.as_str())
+            || !identities.insert(identity.invocation_id.as_str())
+        {
+            return Err("handoff tool history has conflicting execution identity");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeExecutionHandoff {
+    // Audit input is immutable; original_facts.message may reflect steering.
+    pub(crate) original_user_message: String,
+    // Original composed model inputs, not credentials or execution grants.
+    // Restore must independently authorize capabilities before reusing these
+    // contracts. The enclosing checkpoint's byte limit bounds their retention.
+    pub(crate) edge_profile: Map<String, Value>,
+    pub(crate) edge_provider_tool_schemas: Vec<Value>,
+    pub(crate) tool_schemas: Vec<Value>,
+    pub(crate) admission_tool_schemas: Vec<Value>,
+    pub(crate) deferred_tool_schemas: Vec<Value>,
+    pub(crate) always_load_tool_names: BTreeSet<String>,
+    pub(crate) client_pipeline_skill_names: BTreeSet<String>,
+    pub(crate) admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
+    pub(crate) permissions: astra_turn_core::permission::types::PermissionSyncContinuation,
+    pub(crate) tool_history: Vec<HistoricalToolCallContinuation>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub(crate) journal_next_round: Option<u32>,
+    pub(crate) circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
+    pub(crate) last_turn_policy: astra_turn_core::interaction_types::TurnInteractionPolicy,
+    pub(crate) work_evidence_advisory_emitted: bool,
+    pub(crate) parallel_batching_advisory_emitted: bool,
+    pub(crate) cache_waste_advisory_emitted: bool,
+    pub(crate) introspection_count: u32,
+    pub(crate) work_unit_observations: astra_core::work_unit::WorkUnitObservationTracker,
+    pub(crate) turn_sigs: Vec<BTreeSet<astra_turn_core::stall::StallSignature>>,
+    pub(crate) stall_events: Vec<(String, u32)>,
     pub(crate) original_facts: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts,
     pub(crate) hooks: crate::skills::hooks::HookContinuation,
     pub(crate) user_intents: crate::turn::agentic_loop::host::DurableUserIntentState,
@@ -4044,8 +4038,177 @@ pub(crate) struct RuntimeExecutionHandoff {
     pub(crate) primary_work: crate::server::runtime_tool_executor::PrimaryWorkHandoff,
     pub(crate) verification: astra_turn_types::VerificationHandoff,
     pub(crate) heavy: astra_pipeline::step_protocol::HeavyCheckpoint,
+    pub(crate) recorder: astra_pipeline::step_recorder::SettledRecorderContinuation,
     pub(crate) reservation: astra_turn_types::TurnReservationV1,
     pub(crate) continuation: astra_turn_types::ProviderCanonicalTransitionV2,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub(crate) execution_deadline: Option<astra_services::runs::ExecutionDeadlineSnapshot>,
+}
+
+impl RuntimeExecutionHandoff {
+    /// Decode only the immutable checkpoint returned by committed adoption.
+    /// Historical provenance is not permission to execute with old credentials.
+    pub(crate) fn from_adopted(
+        adopted: &astra_services::session_context_coordinator::ResumedExecutionTurn,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let invalid = |detail: &str| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                detail.to_string(),
+            )
+        };
+        let receipt = adopted.receipt();
+        let checkpoint = adopted.checkpoint();
+        astra_services::runs::validate_run_checkpoint_size(&checkpoint.checkpoint_json)
+            .map_err(invalid)?;
+        if checkpoint.checkpoint_kind != "execution_handoff"
+            || checkpoint.checkpoint_version != "execution_handoff_v1"
+            || checkpoint.checkpoint_id != receipt.checkpoint_id
+            || checkpoint.run_id != receipt.run_id
+            || checkpoint.user_id != receipt.source.key.owner_user_id
+            || checkpoint.session_id != receipt.source.key.session_id
+            || receipt.turn_reservation.key != receipt.source.key
+            || receipt.run_generation <= receipt.producer_generation
+        {
+            return Err(invalid(
+                "adopted checkpoint has conflicting execution identity",
+            ));
+        }
+        let astra_services::runs::DurableExecutionHandoff::V1 {
+            producer_run_id,
+            producer_owner_generation,
+            heavy: mut payload,
+        } = serde_json::from_str::<astra_services::runs::DurableExecutionHandoff<Self>>(
+            &checkpoint.checkpoint_json,
+        )
+        .map_err(|_| invalid("adopted execution checkpoint is malformed"))?;
+        if producer_run_id != receipt.run_id
+            || producer_owner_generation != receipt.producer_generation
+            || payload.reservation != receipt.source
+            || payload.original_facts.session_turn != receipt.source.reserved_turn
+            || payload.original_facts.canonical_turn_started_at.is_none()
+        {
+            return Err(invalid(
+                "execution facts do not belong to the adopted producer",
+            ));
+        }
+        payload.heavy = validate_handoff_heavy(payload.heavy)?;
+        validate_handoff_tool_history(
+            &payload.tool_history,
+            &checkpoint.user_id,
+            &checkpoint.session_id,
+            &receipt.run_id,
+            payload.original_facts.canonical_turn_chain_id.as_deref(),
+            payload.journal_next_round,
+        )
+        .map_err(invalid)?;
+        let Some(astra_pipeline::step_protocol::RunExecutionBudget::V1 {
+            run_id,
+            producer_owner_generation,
+            ..
+        }) = payload.heavy.run_execution_budget.as_ref()
+        else {
+            return Err(invalid("adopted execution has no original run budget"));
+        };
+        if run_id != &receipt.run_id
+            || *producer_owner_generation != receipt.producer_generation
+            || payload.heavy.run_execution_control.is_none()
+        {
+            return Err(invalid(
+                "adopted execution budget or control belongs to another producer",
+            ));
+        }
+        payload
+            .work_unit_observations
+            .validate_continuation()
+            .map_err(invalid)?;
+        payload
+            .circuit_breaker
+            .validate_continuation()
+            .map_err(invalid)?;
+        payload
+            .primary_work
+            .validate()
+            .map_err(|error| invalid(&error))?;
+        Ok(payload)
+    }
+}
+
+impl ServerAgenticLoopHost {
+    /// Reuse model-visible contracts only after current runtime authorization.
+    /// Execution routing, credentials and capability grants stay with the host.
+    pub(crate) fn restore_handoff_contracts(&mut self, handoff: &RuntimeExecutionHandoff) {
+        self.edge_profile = handoff.edge_profile.clone();
+        self.edge_provider_tool_schemas = handoff.edge_provider_tool_schemas.clone();
+        self.tool_schemas = handoff.tool_schemas.clone();
+        self.admission_tool_schemas = handoff.admission_tool_schemas.clone();
+        self.deferred_tool_schemas = handoff.deferred_tool_schemas.clone();
+        self.always_load_tool_names = handoff.always_load_tool_names.iter().cloned().collect();
+    }
+
+    pub(crate) async fn restore_handoff_wal(
+        &mut self,
+        state: &mut AgenticLoopState,
+        handoff: &RuntimeExecutionHandoff,
+        durable_prefix: &[Value],
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let invalid = |detail: String| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, detail)
+        };
+        let pool = self
+            .shared_pool
+            .as_ref()
+            .ok_or_else(|| invalid("handoff has no durable WAL owner".into()))?;
+        let receipts = astra_services::load_inference_canonical_transitions_for_session(
+            pool,
+            &self.user_id,
+            &self.session_id,
+            state.session_turn,
+        )
+        .await
+        .map_err(|error| invalid(format!("load handoff WAL: {error}")))?;
+        let mut recovered = durable_prefix.to_vec();
+        let outcome = apply_provider_canonical_transition_receipts(&mut recovered, receipts)?;
+        if outcome.head.as_ref().map(|head| &head.transition_id)
+            != handoff.continuation.parent_transition_id.as_ref()
+            || outcome.head.as_ref().map(|head| &head.result)
+                != handoff.continuation.parent_result.as_ref()
+        {
+            return Err(invalid(
+                "handoff no longer matches the durable provider frontier".into(),
+            ));
+        }
+        handoff
+            .continuation
+            .apply_to(&mut recovered)
+            .map_err(|error| invalid(error.to_string()))?;
+        if astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(&recovered)
+            .map_err(|error| invalid(error.to_string()))?
+            != handoff.continuation.result
+        {
+            return Err(invalid(
+                "handoff WAL result differs from its settled checkpoint".into(),
+            ));
+        }
+        state.provider_canonical_wal_base = Some(handoff.continuation.durable_base.clone());
+        state.provider_canonical_wal_head = outcome.head;
+        let replacement = if handoff.continuation.recovery_mode
+            == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+        {
+            Some(&handoff.continuation)
+        } else {
+            outcome.replacement.as_ref()
+        };
+        if let Some(replacement) = replacement {
+            state
+                .recover_provider_canonical_replacement(replacement, &recovered)
+                .map_err(invalid)?;
+        }
+        // The loop's normal hydration hook must not treat the already restored
+        // suffix as a new user request and append it a second time.
+        self.canonical_transition_hydrated = true;
+        Ok(())
+    }
 }
 
 fn validate_handoff_heavy(
@@ -5041,7 +5204,7 @@ pub struct ServerAgenticLoopHostBuilder {
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     inference_owner_pod_id: Option<String>,
-    execution_time_budget: Option<RunExecutionTimeBudget>,
+    execution_time_budget: Option<ExecutionDeadlineAuthority>,
     edge_tools: Vec<Value>,
     edge_provider_tool_native_ids: HashMap<String, String>,
     edge_profile: Map<String, Value>,
@@ -5242,10 +5405,18 @@ impl ServerAgenticLoopHostBuilder {
     #[cfg(test)]
     pub fn with_execution_time_budget(mut self, budget: Option<ExecutionTimeBudget>) -> Self {
         if let Some(snapshot) = budget {
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap();
+            let candidate = ExecutionDeadlineAuthority::from_budget_at(snapshot, now_unix_ms)
+                .expect("valid test execution deadline");
             if let Some(current) = self.execution_time_budget.as_mut() {
-                current.tighten_at(snapshot, tokio::time::Instant::now());
+                current.tighten_to(candidate);
             } else {
-                self.execution_time_budget = Some(RunExecutionTimeBudget::new(snapshot));
+                self.execution_time_budget = Some(candidate);
             }
         }
         self
@@ -5257,15 +5428,10 @@ impl ServerAgenticLoopHostBuilder {
         deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     ) -> Self {
         if let Some(deadline) = deadline {
-            let candidate = RunExecutionTimeBudget {
-                deadline: tokio::time::Instant::from_std(deadline.monotonic_deadline()),
-                deadline_unix_ms: deadline.deadline_unix_ms,
-            };
-            if self
-                .execution_time_budget
-                .is_none_or(|current| candidate.deadline < current.deadline)
-            {
-                self.execution_time_budget = Some(candidate);
+            if let Some(current) = self.execution_time_budget.as_mut() {
+                current.tighten_to(deadline);
+            } else {
+                self.execution_time_budget = Some(deadline);
             }
         }
         self
@@ -5744,7 +5910,6 @@ impl ServerAgenticLoopHostBuilder {
             resolved_llm_config: None,
             resolved_llm_config_at: None,
             judgment_route_cache: None,
-            delegation_scope_retry_cache: None,
             summary_attempt_allocator: DurableSummaryAttemptAllocator::default(),
             execution_time_budget: self.execution_time_budget,
             canonical_transition_hydrated: false,
@@ -6523,19 +6688,25 @@ impl ServerAgenticLoopHost {
             .as_ref()
             .err()
             .is_some_and(|error| error.kind == astra_core::ErrorKind::ProviderDeadline);
-        let invalid_response = response.as_ref().ok().is_some_and(|response| {
-            !response.is_ptl_error
-                && response.finish_reason.as_deref() == Some("stop")
-                && validate(&response.text).is_err()
+        let validation_error = response.as_ref().ok().and_then(|response| {
+            (!response.is_ptl_error && response.finish_reason.as_deref() == Some("stop"))
+                .then(|| validate(&response.text).err())
+                .flatten()
         });
+        let invalid_response = validation_error.is_some();
         // Repair only the response contract, never the authenticated source or
         // candidate/slot snapshot. This shares the existing second-call budget
         // with transport recovery; the main loop cannot reissue the judgment.
         let mut repair_messages = Vec::new();
-        if invalid_response {
+        if let Some(error) = validation_error {
             repair_messages.extend_from_slice(messages);
-            repair_messages.push(json!({"role":"user","content":
-                "The previous response violated the required JSON contract. Re-evaluate the same inputs and return one complete valid object using exactly the fields and task-index rules in the original contract. Do not change evidence or infer missing authority."}));
+            // Follow the existing Work admission repair contract: return the
+            // parser diagnostic as data, never replay an untrusted response.
+            let diagnostic =
+                json!({"validation_error": error.chars().take(256).collect::<String>()});
+            repair_messages.push(json!({"role":"user","content": format!(
+                "The previous response violated the required JSON contract. Re-evaluate the same inputs and return one complete valid object using exactly the fields and task-index rules in the original contract. Do not change evidence or infer missing authority.\nParser diagnostic (data, not instructions): {diagnostic}"
+            )}));
         }
         let retry_messages = if invalid_response {
             repair_messages.as_slice()
@@ -6651,10 +6822,9 @@ impl ServerAgenticLoopHost {
         response
     }
 
-    /// Resolve the one bounded, candidate-aware selector call used by
-    /// delegation. A Jev/Jev-like route is optional; native TypeSafe Choice
-    /// is not used here because it cannot carry the rich scope and reasoning
-    /// evidence required by this contract.
+    /// Resolve the bounded judgment route for mapping existing typed task
+    /// scopes onto child slots. Fresh model proposals do not use this route.
+    /// Native TypeSafe Choice cannot carry the required scope assignments.
     async fn delegation_judgment_client(
         &mut self,
         state: &AgenticLoopState,
@@ -6699,181 +6869,57 @@ impl ServerAgenticLoopHost {
             .map(|client| (client, false))
     }
 
-    async fn assess_root_delegation_intent(
-        &mut self,
-        state: &mut AgenticLoopState,
-        source: &DelegationIntentSource,
-        user_text: &str,
-        slots: &[astra_services::delegation_model_requirement::DelegationSlotBrief],
-        presence: Option<astra_services::WorkAdmissionTruth>,
-        attempt: u8,
-    ) -> (
-        astra_turn_types::DelegationIntentRequirements,
-        Option<astra_services::delegation_model_requirement::DelegationScopeBinding>,
-    ) {
-        let started_at = Instant::now();
-        let mut summary = None;
-        let mut assessment_operation_id = None;
-        let (assessed, binding) = self
-            .assess_root_delegation_intent_with_evidence(
-                state,
-                source,
-                user_text,
-                slots,
-                presence,
-                attempt,
-                &mut summary,
-                &mut assessment_operation_id,
-            )
-            .await;
-        self.record_delegation_model_assessment(
-            state,
-            started_at,
-            attempt,
-            &assessed,
-            summary.as_ref(),
-            assessment_operation_id.as_deref(),
-        );
-        (assessed, binding)
+    /// Shared authenticated observation for candidate visibility and routing.
+    /// The executor still owns fresh authorization of an exact proposal.
+    async fn read_authorized_model_catalog(&self) -> Option<Vec<astra_services::ModelListItem>> {
+        if let Some(reader) = self.model_catalog_reader.as_ref() {
+            return tokio::time::timeout(Duration::from_secs(5), reader.read_snapshot())
+                .await
+                .ok()
+                .and_then(Result::ok);
+        }
+        if self.provider_scope_bound {
+            return None;
+        }
+        self.model_service
+            .as_ref()?
+            .list_models(self.user_id.clone(), false)
+            .await
+            .ok()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn assess_root_delegation_intent_with_evidence(
-        &mut self,
-        state: &AgenticLoopState,
-        source: &DelegationIntentSource,
-        user_text: &str,
-        slots: &[astra_services::delegation_model_requirement::DelegationSlotBrief],
-        presence: Option<astra_services::WorkAdmissionTruth>,
-        attempt: u8,
-        summary: &mut Option<
-            astra_services::delegation_model_requirement::DelegationCandidateJudgmentSummary,
-        >,
-        assessment_operation_id: &mut Option<String>,
-    ) -> (
-        astra_turn_types::DelegationIntentRequirements,
-        Option<astra_services::delegation_model_requirement::DelegationScopeBinding>,
-    ) {
-        use astra_services::delegation_model_requirement::delegation_model_candidates;
-        use astra_turn_types::DelegationIntentRequirements;
-
-        let origin = delegation_requirement_source(source);
-        let unresolved = |reason: &str| DelegationIntentRequirements::Unresolved {
-            source: origin.clone(),
-            reason: reason.to_string(),
+    pub(crate) async fn model_catalog_context(&self) -> Option<Value> {
+        use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page, unavailable_page};
+        let reader = self.model_catalog_reader.as_ref()?;
+        let mut page = match reader.read_snapshot().await {
+            Ok(items) => catalog_page(items, &ModelCatalogRequest::default(), reader.scope())
+                .unwrap_or_else(|error| unavailable_page(error, reader.scope())),
+            Err((status, _)) => unavailable_page(
+                super::tool_model_catalog::catalog_read_error(status),
+                reader.scope(),
+            ),
         };
-        let unavailable = |reason: &str| DelegationIntentRequirements::Unavailable {
-            source: origin.clone(),
-            reason: reason.to_string(),
-            attempts: attempt,
-        };
-        let catalog = self.read_authorized_model_catalog().await.map(|items| {
-            astra_services::models::model_catalog_for_purpose(
-                items,
-                astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        // A changing wall clock is not a new catalog generation. Keep the
+        // request/descendant observation byte-stable outside the system prefix.
+        page.observed_at = None;
+        let child_model_selection_allowed =
+            crate::server::run::lifecycle::ensure_child_model_selection_scope(
+                Some(reader),
+                self.provider_scope_bound,
             )
-        });
-        let Some(catalog) = catalog else {
-            return (
-                unavailable("The authorized model catalog is unavailable."),
-                None,
-            );
-        };
-        let candidates = delegation_model_candidates(&catalog);
-        let assessment_request =
-            match astra_services::delegation_model_requirement::delegation_intent_assessment_request(
-                user_text,
-                &candidates,
-                Some(slots),
-            ) {
-                Ok(request) => request,
-                Err(_) => {
-                    return (
-                        unresolved(
-                            "The user model requirement or candidate catalog exceeds the bounded interpretation contract.",
-                        ),
-                        None,
-                    );
-                }
-            };
-        let operation_id = delegation_intent_assessment_operation_id(
-            &source.user_intent_digest,
-            &assessment_request.input_digest,
-            &assessment_request.candidate_snapshot_digest,
-        );
-        *assessment_operation_id = Some(operation_id.clone());
-        let explicit_requirement_presence =
-            presence == Some(astra_services::WorkAdmissionTruth::Yes);
-        let Some(response) = self
-            .call_delegation_judgment(
-                state,
-                &operation_id,
-                "delegation_candidate_assessment",
-                assessment_request.max_output_tokens,
-                &assessment_request.messages,
-                |raw| astra_services::delegation_model_requirement::parse_delegation_intent_requirements_with_request(
-                    raw, explicit_requirement_presence, &assessment_request,
-                ).map(|_| ()),
-            )
-            .await
-        else {
-            return (
-                unavailable("Model requirements could not be checked."),
-                None,
-            );
-        };
-        let response = match response {
-            Ok(response)
-                if !response.is_ptl_error && response.finish_reason.as_deref() == Some("stop") =>
-            {
-                response
-            }
-            Err(_) => {
-                return (
-                    unavailable("Model requirement assessment provider call failed."),
-                    None,
-                );
-            }
-            Ok(response) if response.is_ptl_error => {
-                return (
-                    unavailable("Model requirement assessment returned a provider error."),
-                    None,
-                );
-            }
-            Ok(_) => {
-                return (
-                    unavailable("Model requirement assessment did not complete."),
-                    None,
-                );
-            }
-        };
-        let extracted =
-            match astra_services::delegation_model_requirement::parse_delegation_intent_requirements_with_request(
-                &response.text,
-                explicit_requirement_presence,
-                &assessment_request,
-            ) {
-                Ok(extracted) => extracted,
-                Err(error) => {
-                    tracing::warn!(
-                        operation_id,
-                        error = %error,
-                        "delegation model assessment response was rejected"
-                    );
-                    return (
-                        unavailable("The model-selection service returned invalid evidence; no child was started. Changing spawn arguments or inspecting local configuration cannot repair this internal response."),
-                        None,
-                    );
-                }
-            };
-        *summary = Some(extracted.summary.clone());
-        let assessed = match astra_services::delegation_model_requirement::materialize_delegation_intent_requirements(
-            &extracted, origin.clone(),
-        ) {
-            Ok(assessed) => assessed,
-            Err(reason) => return (unresolved(&reason), None),
-        };
-        (assessed, extracted.scope_binding)
+            .is_ok();
+        // This is an observation, not a second model-selection instruction.
+        // Execution-vs-content interpretation belongs to the tool contract.
+        let context = json!({
+            "catalog": page,
+            "child_model_selection_allowed": child_model_selection_allowed,
+        })
+        .to_string();
+        crate::turn::wire_assembly::required_runtime_preamble_message(
+            &context,
+            crate::turn::wire_assembly::RuntimeAuthorityKind::AuthorizedModelCatalog,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
     }
 
     async fn judge_delegation_scope_binding(
@@ -6916,322 +6962,6 @@ impl ServerAgenticLoopHost {
             scoped,
             slots.len(),
         )
-    }
-
-    async fn rebind_changed_delegation_scope_batch(
-        &mut self,
-        state: &mut AgenticLoopState,
-        source: &DelegationIntentSource,
-        user_text: &str,
-        pending: &[PendingDelegationCall],
-        assessed: &astra_turn_types::DelegationIntentRequirements,
-        cache: &DelegationScopeRetryCache,
-    ) -> Result<
-        (
-            astra_services::delegation_model_requirement::DelegationScopeBinding,
-            BTreeSet<String>,
-        ),
-        String,
-    > {
-        use astra_turn_types::DelegationIntentRequirements;
-
-        assessed.validate().map_err(str::to_string)?;
-        let requirements = match assessed {
-            DelegationIntentRequirements::Requirements { requirements, .. } => requirements,
-            _ => return Err("Delegation scope ledger requires resolved requirements.".into()),
-        };
-        let scoped = requirements
-            .iter()
-            .filter(|item| item.task_scope_quote.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        if scoped.is_empty() {
-            return Err("Delegation scope ledger has no scoped requirements.".into());
-        }
-
-        let previous_assignments = cache.binding.validated_assignments(
-            scoped.iter().map(|item| item.requirement_id.as_str()),
-            cache.slots.len(),
-        )?;
-
-        let current_slots = pending
-            .iter()
-            .flat_map(|item| item.slots.iter().cloned())
-            .collect::<Vec<_>>();
-        if current_slots.is_empty() {
-            return Err("Delegation task slot count is invalid.".into());
-        }
-        let mut used_current = HashSet::new();
-        let old_to_current = cache
-            .slots
-            .iter()
-            .map(|old| {
-                current_slots
-                    .iter()
-                    .enumerate()
-                    .find(|(index, current)| {
-                        !used_current.contains(index) && delegation_scope_inputs_match(old, current)
-                    })
-                    .map(|(index, _)| {
-                        used_current.insert(index);
-                        index
-                    })
-            })
-            .collect::<Vec<_>>();
-        let new_slot_indices = current_slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, _)| (!used_current.contains(&index)).then_some(index))
-            .collect::<Vec<_>>();
-
-        let mut consumed = cache.consumed_requirement_ids.clone();
-        for (requirement_id, slot_indices) in &previous_assignments {
-            if consumed.contains(*requirement_id) || slot_indices.is_empty() {
-                continue;
-            }
-            let fully_executed = slot_indices.iter().all(|&index| {
-                cache
-                    .slots
-                    .get(index)
-                    .is_some_and(|slot| delegation_scope_slot_succeeded(state, slot))
-            });
-            if fully_executed {
-                consumed.insert((*requirement_id).to_owned());
-            }
-        }
-
-        let mut assignments = scoped
-            .iter()
-            .map(|requirement| (requirement.requirement_id.clone(), Vec::new()))
-            .collect::<BTreeMap<_, _>>();
-        for requirement in &scoped {
-            if consumed.contains(&requirement.requirement_id) {
-                continue;
-            }
-            let Some(previous) = previous_assignments.get(requirement.requirement_id.as_str())
-            else {
-                return Err("Delegation scope ledger is missing a requirement assignment.".into());
-            };
-            let current = assignments
-                .get_mut(&requirement.requirement_id)
-                .expect("assignment initialized from scoped requirements");
-            for &old_index in previous {
-                if let Some(current_index) = old_to_current[old_index] {
-                    current.push(current_index);
-                }
-            }
-        }
-
-        let remaining = scoped
-            .iter()
-            .filter(|requirement| !consumed.contains(&requirement.requirement_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !remaining.is_empty() && !new_slot_indices.is_empty() {
-            let new_slots = new_slot_indices
-                .iter()
-                .map(|&index| current_slots[index].clone())
-                .collect::<Vec<_>>();
-            let identity = new_slots
-                .iter()
-                .map(|slot| {
-                    slot.invocation.as_ref().map_or_else(
-                        || format!("{}:{}", slot.description, slot.prompt),
-                        |invocation| {
-                            format!(
-                                "{}:{}:{}:{}",
-                                invocation.tool_call_id,
-                                invocation.tool_name,
-                                invocation.group_id.as_deref().unwrap_or_default(),
-                                invocation.slot_index
-                            )
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("|");
-            let judged = self
-                .judge_delegation_scope_binding(
-                    state, source, user_text, &remaining, &new_slots, &identity,
-                )
-                .await?;
-            for assignment in judged.assignments {
-                let Some(target) = assignments.get_mut(&assignment.requirement_id) else {
-                    return Err("Delegation scope judgment returned an unknown requirement.".into());
-                };
-                for local_index in assignment.slot_indices {
-                    let Some(&current_index) = new_slot_indices.get(local_index) else {
-                        return Err("Delegation scope judgment returned an invalid slot.".into());
-                    };
-                    if target.contains(&current_index) {
-                        return Err("Delegation scope judgment duplicated a slot.".into());
-                    }
-                    target.push(current_index);
-                }
-            }
-        }
-
-        Ok((
-            astra_services::delegation_model_requirement::DelegationScopeBinding {
-                assignments: scoped
-                    .iter()
-                    .map(|requirement| {
-                        let mut slot_indices = assignments
-                            .remove(&requirement.requirement_id)
-                            .expect("assignment initialized from scoped requirements");
-                        slot_indices.sort_unstable();
-                        astra_services::delegation_model_requirement::DelegationScopeAssignment {
-                            requirement_id: requirement.requirement_id.clone(),
-                            slot_indices,
-                        }
-                    })
-                    .collect(),
-                unresolved: Vec::new(),
-            },
-            consumed,
-        ))
-    }
-
-    /// Share the authenticated request snapshot with every model-dependent
-    /// decision in this run. The reader caches only within this request and
-    /// its descendants; a failed read is never replaced by an unscoped direct
-    /// query, and execution still revalidates the selected Offering.
-    async fn read_authorized_model_catalog(&self) -> Option<Vec<astra_services::ModelListItem>> {
-        if let Some(reader) = self.model_catalog_reader.as_ref() {
-            return tokio::time::timeout(Duration::from_secs(5), reader.read_snapshot())
-                .await
-                .ok()
-                .and_then(Result::ok);
-        }
-        if self.provider_scope_bound {
-            return None;
-        }
-        self.model_service
-            .as_ref()?
-            .list_models(self.user_id.clone(), false)
-            .await
-            .ok()
-    }
-
-    /// Enrich the existing journal/Explain lanes without consulting storage or
-    /// changing admission. Only the shared safe summary crosses this boundary;
-    /// requirement reasons, source quotes and catalog/provider payloads do not.
-    fn record_delegation_model_assessment(
-        &mut self,
-        state: &mut AgenticLoopState,
-        started_at: Instant,
-        attempt: u8,
-        assessed: &astra_turn_types::DelegationIntentRequirements,
-        summary: Option<
-            &astra_services::delegation_model_requirement::DelegationCandidateJudgmentSummary,
-        >,
-        assessment_operation_id: Option<&str>,
-    ) {
-        use astra_turn_types::{
-            DelegationIntentRequirements as Requirements, ExplainAnalyzeOutcomeV1 as Outcome,
-        };
-
-        let (source, outcome, error_kind, label) = match assessed {
-            Requirements::Unassessed => return,
-            Requirements::Unconstrained { source } => (
-                source,
-                Outcome::Resolved,
-                None,
-                "No delegated model requirement",
-            ),
-            Requirements::Requirements { source, .. } => {
-                (source, Outcome::Resolved, None, "Select delegated models")
-            }
-            Requirements::Unresolved { source, .. } => (
-                source,
-                Outcome::Blocked,
-                Some("delegation_model_scope_unresolved"),
-                "Delegated model requirements unresolved",
-            ),
-            Requirements::Unavailable { source, .. } => (
-                source,
-                Outcome::Unavailable,
-                Some("delegation_model_assessment_unavailable"),
-                "Delegated model assessment unavailable",
-            ),
-            Requirements::CatalogResolutionFailed { source, .. } => (
-                source,
-                Outcome::Blocked,
-                Some("delegation_model_catalog_resolution_failed"),
-                "Delegated model selection unresolved",
-            ),
-        };
-        let finished_at = Instant::now();
-        let duration = finished_at.saturating_duration_since(started_at);
-        let span_id = format!(
-            "delegation_intent_assessment-{}-{}-{attempt}",
-            source.session_turn, state.current_round_index,
-        );
-        let method = summary.map_or(
-            astra_services::delegation_model_requirement::DelegationRequirementJudgmentMethod::CandidateAwareOneCallV1,
-            |summary| summary.method,
-        );
-        if let Some(buffer) = state.turn_event_buffer.as_mut() {
-            let attrs = HashMap::from([(
-                "delegation_model_assessment".to_string(),
-                json!({
-                    "schema_version": 1,
-                    "method": method,
-                    "source_digest": source.user_intent_digest,
-                    "operation_id": assessment_operation_id,
-                    "round_index": state.current_round_index,
-                    "attempt_index": attempt,
-                    "outcome": outcome,
-                    "error_kind": error_kind,
-                    "assessment": summary,
-                })
-                .to_string(),
-            )]);
-            let end_us = chrono::Utc::now().timestamp_micros().max(0) as u64;
-            buffer.record_trace_span_v2(
-                astra_services::session_journal::TraceSpanBuilder::default()
-                    .span_id(span_id.clone())
-                    .name("delegation_model_assessment".to_string())
-                    .trace_id(state.current_run_id.clone())
-                    .turn(Some(source.session_turn))
-                    .start_us(end_us.saturating_sub(duration.as_micros() as u64))
-                    .end_us(end_us)
-                    .attrs(Some(&attrs)),
-            );
-        }
-        if let Some(context) = self.explain_analyze_context.clone() {
-            let label = summary.map_or_else(
-                || label.to_string(),
-                |summary| {
-                    format!(
-                        "{label} (candidates: {}, requirements: {})",
-                        summary.candidate_count,
-                        summary.selections.len(),
-                    )
-                },
-            );
-            let node = ExplainAnalyzeNode::new(
-                &context,
-                format!("{}/delegation/{span_id}", context.root_node_id),
-                Some(context.root_node_id.clone()),
-                astra_turn_types::ExplainAnalyzeNodeKindV1::Admission,
-                label,
-                started_at,
-                Some(state.current_round_index),
-                Some(u32::from(attempt)),
-            );
-            let node_id = node.node_id.clone();
-            self.start_explain_analyze_node(node);
-            self.finish_explain_analyze_node_at(
-                &node_id,
-                duration.as_millis() as u64,
-                outcome,
-                None,
-                finished_at,
-                None,
-                delegation_catalog_resolution_explain_detail(assessed),
-            );
-        }
     }
 
     async fn bind_assessed_delegation_models(
@@ -7309,6 +7039,7 @@ impl ServerAgenticLoopHost {
         }
         let mut admissions = std::collections::HashMap::new();
         let mut blocked = Vec::new();
+        let mut catalog_snapshot = None;
         let mut offset = 0;
         for item in pending {
             let end = offset + item.slots.len();
@@ -7333,11 +7064,61 @@ impl ServerAgenticLoopHost {
                 }
             });
             offset += item.slots.len();
-            let (slots, child_requirements) = match astra_services::delegation_model_requirement::bind_delegation_requirements_to_slots(
-                assessed,
-                local_binding.as_ref(),
-                &item.slots,
-            ) {
+            let bound =
+                astra_services::delegation_model_requirement::bind_delegation_requirements_to_slots(
+                    assessed,
+                    local_binding.as_ref(),
+                    &item.slots,
+                );
+            let bound = match bound {
+                Ok((mut slots, child_requirements)) => {
+                    let named = slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, slot)| {
+                            if slot.model_selection.is_none()
+                                && slot.model_strength
+                                    == Some(astra_turn_types::DelegationRequirementStrength::Hard)
+                                && let Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                                    selector:
+                                        selector @ astra_turn_types::ModelSelector::ConfiguredName {
+                                            ..
+                                        },
+                                }) = slot.requested_model_policy.as_ref()
+                            {
+                                Some((index, selector.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let resolved = if named.is_empty() {
+                        Ok(())
+                    } else {
+                        if catalog_snapshot.is_none() {
+                            catalog_snapshot = Some(self.read_authorized_model_catalog().await);
+                        }
+                        match catalog_snapshot.as_ref().and_then(Option::as_ref) {
+                            Some(catalog) => {
+                                let selectors = named
+                                    .iter()
+                                    .map(|(_, selector)| selector.clone())
+                                    .collect::<Vec<_>>();
+                                astra_services::delegation_model_requirement::resolve_model_selectors(&selectors, catalog)
+                                    .map(|selections| {
+                                        for ((index, _), selection) in named.into_iter().zip(selections) {
+                                            slots[index].model_selection = Some(selection);
+                                        }
+                                    })
+                            }
+                            None => Err("The authorized model catalog is unavailable.".into()),
+                        }
+                    };
+                    resolved.map(|()| (slots, child_requirements))
+                }
+                Err(reason) => Err(reason),
+            };
+            let (slots, child_requirements) = match bound {
                 Ok(bound) => bound,
                 Err(reason) => {
                     let error_kind = if [
@@ -7396,14 +7177,16 @@ impl ServerAgenticLoopHost {
 
     pub(crate) fn bind_execution_handoff(
         &mut self,
-        requested: Arc<std::sync::atomic::AtomicBool>,
+        requested: tokio_util::sync::CancellationToken,
         engine: crate::server::run::engine::RunEngine,
         reservation: astra_turn_types::TurnReservationV1,
+        original_user_message: String,
     ) {
         self.execution_handoff = Some(ExecutionHandoffContext {
             requested,
             engine,
             reservation,
+            original_user_message,
         });
     }
 
@@ -7458,6 +7241,40 @@ impl ServerAgenticLoopHost {
             }
         }
         admission.admitted = admitted;
+        self.enforce_tool_execution_time(admission)
+    }
+
+    fn enforce_tool_execution_time(
+        &self,
+        mut admission: crate::turn::agentic_loop::host::ToolCallAdmission,
+    ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
+        let Some(authority) = self.execution_time_budget else {
+            return admission;
+        };
+        let now = tokio::time::Instant::now().into_std();
+        let mut retained = Vec::with_capacity(admission.admitted.len());
+        for invocation in admission.admitted.drain(..) {
+            let cutoff = if invocation.runtime_control_kind() == Some(
+                astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement,
+            ) {
+                authority.monotonic_deadline()
+            } else {
+                authority.monotonic_work_deadline()
+            };
+            if now < cutoff {
+                retained.push(invocation);
+            } else {
+                admission.rejected.push(crate::turn::agentic_loop::host::RejectedToolCall {
+                    invocation,
+                    result: json!({
+                        "status": "rejected", "error_kind": "execution_time_budget_exhausted",
+                        "retryable": false, "executed": false,
+                        "error": "The tool's admitted execution window closed before dispatch; it was not executed.",
+                    }).to_string(),
+                });
+            }
+        }
+        admission.admitted = retained;
         admission
     }
 
@@ -7616,31 +7433,8 @@ impl ServerAgenticLoopHost {
         )
     }
 
-    #[cfg(test)]
-    fn execution_provider_work_budget(
-        execution_time_budget: Option<RunExecutionTimeBudget>,
-    ) -> Result<Option<ProviderWorkBudget>, astra_core::ClassifiedError> {
-        let Some(budget) = execution_time_budget else {
-            return Ok(None);
-        };
-        let remaining = budget.remaining();
-        if remaining.is_zero() {
-            return Err(Self::execution_time_budget_error());
-        }
-        Ok(Some(ProviderWorkBudget(remaining)))
-    }
-
-    #[cfg(test)]
-    fn provider_work_budget_at_client_boundary(
-        execution_time_budget: Option<RunExecutionTimeBudget>,
-        boundary: ProviderAttemptBoundary,
-    ) -> Result<Option<Duration>, astra_core::ClassifiedError> {
-        Ok(boundary
-            .provider_work_budget(Self::execution_provider_work_budget(execution_time_budget)?))
-    }
-
     fn provider_dispatch_budget(
-        execution_time_budget: Option<RunExecutionTimeBudget>,
+        execution_time_budget: Option<ExecutionDeadlineAuthority>,
         boundary: ProviderAttemptBoundary,
         final_settlement: bool,
     ) -> Result<ProviderDispatchBudget, astra_core::ClassifiedError> {
@@ -7652,17 +7446,15 @@ impl ServerAgenticLoopHost {
         // The wire schema is second-granular. Clamp the actual provider slice
         // to those same whole seconds instead of advertising a smaller value
         // while silently granting the fractional remainder.
-        let remaining = execution_time_budget.remaining();
+        let remaining = execution_time_budget.remaining_at(tokio::time::Instant::now().into_std());
         // Ordinary provider work must not consume the convergence window that
         // the agentic loop needs to produce a final, tool-free answer. Once
         // typed settlement has begun, that reserve is available to the final
         // request itself.
         let remaining = if final_settlement {
-            remaining
+            remaining.total_remaining
         } else {
-            remaining.saturating_sub(
-                astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET,
-            )
+            remaining.work_remaining
         };
         let remaining_seconds = remaining.as_secs();
         if remaining_seconds == 0 {
@@ -7686,7 +7478,9 @@ impl ServerAgenticLoopHost {
     fn clamp_execution_timeout(&self, requested: Duration) -> Option<Duration> {
         self.execution_time_budget
             .map_or(Some(requested), |budget| {
-                let remaining = budget.remaining();
+                let remaining = budget
+                    .remaining_at(tokio::time::Instant::now().into_std())
+                    .work_remaining;
                 let usable = astra_turn_core::chat_turn_heuristics::action_command_window(
                     remaining,
                     Duration::ZERO,
@@ -7697,12 +7491,11 @@ impl ServerAgenticLoopHost {
 
     fn execution_time_budget_context(
         snapshot: ExecutionDeadlineAuthority,
-        remaining: Duration,
+        remaining: astra_turn_types::ExecutionTimeRemaining,
         round_index: u32,
     ) -> Option<String> {
         use astra_turn_core::chat_turn_heuristics::{
-            DIRECT_ACTION_SETTLEMENT_GRACE, PROCESS_ACTION_SETTLEMENT_GRACE,
-            PROVIDER_ACTION_CONVERGENCE_BUDGET, action_command_window,
+            DIRECT_ACTION_SETTLEMENT_GRACE, PROCESS_ACTION_SETTLEMENT_GRACE, action_command_window,
         };
         let injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
             kind: "execution_time_budget".to_string(),
@@ -7711,12 +7504,14 @@ impl ServerAgenticLoopHost {
             payload: json!({
                 "schema": "execution_time_deadline.v3",
                 "deadline_unix_ms": snapshot.deadline_unix_ms,
+                "work_deadline_unix_ms": snapshot.work_deadline_unix_ms,
                 "status": "active",
                 "action_budget_at_request": {
-                    "remaining_seconds": remaining.as_secs(),
-                    "final_answer_reserved_seconds": PROVIDER_ACTION_CONVERGENCE_BUDGET.as_secs(),
-                    "max_process_command_seconds": action_command_window(remaining, PROCESS_ACTION_SETTLEMENT_GRACE).as_secs(),
-                    "max_direct_callback_seconds": action_command_window(remaining, DIRECT_ACTION_SETTLEMENT_GRACE).as_secs(),
+                    "remaining_seconds": remaining.total_remaining.as_secs(),
+                    "work_remaining_seconds": remaining.work_remaining.as_secs(),
+                    "final_answer_reserved_seconds": remaining.total_remaining.saturating_sub(remaining.work_remaining).as_secs(),
+                    "max_process_command_seconds": action_command_window(remaining.work_remaining, PROCESS_ACTION_SETTLEMENT_GRACE).as_secs(),
+                    "max_direct_callback_seconds": action_command_window(remaining.work_remaining, DIRECT_ACTION_SETTLEMENT_GRACE).as_secs(),
                 },
                 "instruction": "This is the immutable wall-clock deadline paired with the runtime's monotonic hard timeout. The action allowances are a snapshot before model generation and shrink while the request runs. Process actions also reserve cleanup/receipt time; choose an explicit bounded timeout only when the work safely fits. Admission remains authoritative. Finish or hand off before the deadline; do not treat it as a replenishable per-request allowance.",
             }),
@@ -7733,8 +7528,8 @@ impl ServerAgenticLoopHost {
     fn current_execution_time_budget_preamble(&self, round_index: u32) -> Option<Value> {
         let budget = self.execution_time_budget?;
         let content = Self::execution_time_budget_context(
-            budget.authority_snapshot(),
-            budget.remaining(),
+            budget,
+            budget.remaining_at(tokio::time::Instant::now().into_std()),
             round_index,
         )?;
         crate::turn::wire_assembly::required_runtime_preamble_message(
@@ -8027,6 +7822,7 @@ impl ServerAgenticLoopHost {
             admission.admitted = retained;
         }
         let admission = self.enforce_canonical_delegation_lifecycle(state, admission);
+        let admission = self.enforce_tool_execution_time(admission);
         let admitted = admission
             .admitted
             .iter()
@@ -8078,14 +7874,7 @@ impl ServerAgenticLoopHost {
                         .rejected
                         .push(crate::turn::agentic_loop::host::RejectedToolCall {
                             invocation,
-                            result: json!({
-                                "status": "rejected",
-                                "error_kind": "tool_invalid_args",
-                                "retryable": true,
-                                "executed": false,
-                                "error": error.output(),
-                            })
-                            .to_string(),
+                            result: error.rejection_output().to_string(),
                         })
                 }
             }
@@ -15612,15 +15401,21 @@ impl ServerAgenticLoopHost {
                     stop_after_started_calls = true;
                     break;
                 };
-                let execution_deadline =
+                let mut execution_deadline =
                     Instant::now() + Duration::from_millis(execution_timeout_ms);
-                let execution_deadline_unix_ms = SystemTime::now()
+                let mut execution_deadline_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis()
                     .saturating_add(u128::from(execution_timeout_ms))
                     .min(u128::from(u64::MAX))
                     as u64;
+                if let Some(authority) = self.execution_time_budget {
+                    execution_deadline =
+                        execution_deadline.min(authority.monotonic_work_deadline());
+                    execution_deadline_unix_ms =
+                        execution_deadline_unix_ms.min(authority.work_deadline_unix_ms);
+                }
                 let mut progress_events = Vec::new();
                 let mut tool_request_event = None;
                 for event in sse_maps_through_tool_request(
@@ -16241,7 +16036,9 @@ impl ServerAgenticLoopHost {
         if self.execution_time_budget.is_some_and(|budget| {
             command_timeout
                 > astra_turn_core::chat_turn_heuristics::action_command_window(
-                    budget.remaining(),
+                    budget
+                        .remaining_at(tokio::time::Instant::now().into_std())
+                        .work_remaining,
                     settlement_grace,
                 )
         }) {
@@ -18027,108 +17824,6 @@ struct PendingDelegationCall {
     valid_shape: bool,
 }
 
-#[derive(Clone)]
-struct DelegationScopeRetryCache {
-    source_digest: String,
-    binding: astra_services::delegation_model_requirement::DelegationScopeBinding,
-    slots: Vec<astra_services::delegation_model_requirement::DelegationSlotBrief>,
-    call_ids: Vec<String>,
-    /// Requirements whose previously assigned slots have completed
-    /// successfully. This is turn-local ledger state; it is never persisted
-    /// and is carried forward only so a later batch cannot reapply a consumed
-    /// hard scope to an unrelated slot.
-    consumed_requirement_ids: BTreeSet<String>,
-}
-
-fn delegation_scope_inputs_match(
-    left: &astra_services::delegation_model_requirement::DelegationSlotBrief,
-    right: &astra_services::delegation_model_requirement::DelegationSlotBrief,
-) -> bool {
-    left.description == right.description
-        && left.prompt == right.prompt
-        && left.requested_model_policy == right.requested_model_policy
-        && left.reasoning == right.reasoning
-        && match (&left.invocation, &right.invocation) {
-            (Some(left), Some(right)) => {
-                left.tool_name == right.tool_name
-                    && left.group_id == right.group_id
-                    && left.slot_index == right.slot_index
-            }
-            (None, None) => true,
-            _ => false,
-        }
-}
-
-fn delegation_scope_slot_succeeded(
-    state: &AgenticLoopState,
-    slot: &astra_services::delegation_model_requirement::DelegationSlotBrief,
-) -> bool {
-    let Some(tool_call_id) = slot
-        .invocation
-        .as_ref()
-        .map(|invocation| invocation.tool_call_id.as_str())
-    else {
-        return false;
-    };
-    state.stall.tool_call_records.iter().any(|record| {
-        record.tool_call_id.as_deref() == Some(tool_call_id) && record.was_executed() && record.ok
-    })
-}
-
-fn delegation_scope_batch_matches(
-    pending: &[PendingDelegationCall],
-    cached_slots: &[astra_services::delegation_model_requirement::DelegationSlotBrief],
-) -> bool {
-    let current_slots = pending
-        .iter()
-        .flat_map(|item| item.slots.iter())
-        .collect::<Vec<_>>();
-    current_slots.len() == cached_slots.len()
-        && current_slots
-            .iter()
-            .zip(cached_slots.iter())
-            .all(|(current, cached)| delegation_scope_inputs_match(current, cached))
-}
-
-fn reusable_delegation_scope_binding(
-    state: &AgenticLoopState,
-    source: &DelegationIntentSource,
-    pending: &[PendingDelegationCall],
-    cache: &DelegationScopeRetryCache,
-) -> Option<astra_services::delegation_model_requirement::DelegationScopeBinding> {
-    if cache.source_digest != source.user_intent_digest {
-        return None;
-    }
-
-    // A cached binding is repair evidence only after the original invocation
-    // actually failed. A successful first batch must not silently authorize a
-    // later, independent task in the same user turn.
-    let all_original_failed = !cache.call_ids.is_empty()
-        && cache.call_ids.iter().all(|call_id| {
-            state.stall.tool_call_records.iter().any(|record| {
-                record.tool_call_id.as_deref() == Some(call_id.as_str())
-                    && !record.ok
-                    && matches!(
-                        record.effective_disposition(),
-                        astra_services::session_journal::ToolCallDisposition::Executed
-                            | astra_services::session_journal::ToolCallDisposition::Rejected
-                    )
-            })
-        });
-    if !all_original_failed {
-        return None;
-    }
-
-    // Reuse only when the entire scoped input batch is unchanged. Matching a
-    // retry by model identity or by one failed slot can leak a prior task's
-    // scope into a new task in the same turn.
-    if !delegation_scope_batch_matches(pending, &cache.slots) {
-        return None;
-    }
-
-    Some(cache.binding.clone())
-}
-
 fn annotate_delegation_slots(
     slots: &mut [astra_services::delegation_model_requirement::DelegationSlotBrief],
     tool_call_id: &str,
@@ -18496,178 +18191,58 @@ impl ServerAgenticLoopHost {
                 None,
             ).await);
         };
-        let user_text = authoritative_delegation_user_text(state).expect("source has user text");
-        let presence = self
-            .pending_work_admission
-            .as_ref()
-            .filter(|assessment| assessment.source.as_ref() == Some(&source))
-            .and_then(|assessment| assessment.delegation_model_requirement);
+        // The proposal owns natural-language interpretation, not user authority.
+        // Runtime retains typed hard constraints and frozen invocation decisions;
+        // exact identity, authorization and capability checks still precede start.
+        use astra_turn_types::DelegationIntentRequirements;
+        let origin = delegation_requirement_source(&source);
         let current = &state
             .skills
             .request_constraints
             .delegated_model_requirements;
-        let current_source = match current {
-            astra_turn_types::DelegationIntentRequirements::Unassessed => None,
-            astra_turn_types::DelegationIntentRequirements::Unconstrained { source }
-            | astra_turn_types::DelegationIntentRequirements::Unresolved { source, .. }
-            | astra_turn_types::DelegationIntentRequirements::Unavailable { source, .. }
-            | astra_turn_types::DelegationIntentRequirements::CatalogResolutionFailed {
-                source,
-                ..
+        let assessed = match current {
+            DelegationIntentRequirements::Unassessed
+            | DelegationIntentRequirements::Unconstrained { .. } => {
+                DelegationIntentRequirements::Unconstrained {
+                    source: origin.clone(),
+                }
             }
-            | astra_turn_types::DelegationIntentRequirements::Requirements { source, .. } => {
-                Some(source)
+            DelegationIntentRequirements::Requirements { source, .. }
+            | DelegationIntentRequirements::Unresolved { source, .. }
+            | DelegationIntentRequirements::Unavailable { source, .. }
+            | DelegationIntentRequirements::CatalogResolutionFailed { source, .. }
+                if *source == origin =>
+            {
+                current.clone()
             }
-        };
-        let matches_source = current_source.is_some_and(|current| {
-            current.user_id == source.user_id
-                && current.session_id == source.session_id
-                && current.session_turn == source.session_turn
-                && current.applied_intent_id == source.applied_intent_id
-                && current.user_intent_digest == source.user_intent_digest
-        });
-        // Keep one bounded, in-memory scope ledger for this authenticated
-        // source. Exact failed retries reuse it; a changed batch advances it
-        // incrementally instead of re-running candidate assessment or reading
-        // the authorized catalog again.
-        let cached_scope = matches_source
-            .then(|| self.delegation_scope_retry_cache.clone())
-            .flatten();
-        let retry_binding = cached_scope
-            .as_ref()
-            .and_then(|cache| reusable_delegation_scope_binding(state, &source, &pending, cache));
-        let needs_assessment = !matches_source;
-        let binding_result: Result<
-            Option<(
-                astra_services::delegation_model_requirement::DelegationScopeBinding,
-                BTreeSet<String>,
-            )>,
-            String,
-        > = if needs_assessment {
-            let slots = pending
-                .iter()
-                .flat_map(|item| item.slots.iter().cloned())
-                .collect::<Vec<_>>();
-            // The rich selector preserves scoped requirements beyond the
-            // current batch. The authenticated source and slot snapshot are
-            // retained only for a bounded, exact retry reuse.
-            // The Work classifier's model-requirement field is a cheap
-            // presence signal, not the model-selection authority. A negative
-            // result may be wrong for natural-language requests such as
-            // "use glm 5.2"; treating it as final would silently inherit the
-            // parent Offering. The candidate-aware selector is the single
-            // authority that can bind user text to this authorized catalog
-            // snapshot, and it must run for every new delegated batch.
-            let (assessed, binding) = self
-                .assess_root_delegation_intent(state, &source, &user_text, &slots, presence, 1)
-                .await;
-            state
-                .skills
-                .request_constraints
-                .delegated_model_requirements = assessed;
-            Ok(binding.map(|binding| (binding, BTreeSet::new())))
-        } else if let Some(cache) = cached_scope.as_ref() {
-            if let Some(binding) = retry_binding {
-                Ok(Some((binding, cache.consumed_requirement_ids.clone())))
-            } else if !delegation_scope_batch_matches(&pending, &cache.slots) {
-                let assessed_for_scope = state
-                    .skills
-                    .request_constraints
-                    .delegated_model_requirements
-                    .clone();
-                self.rebind_changed_delegation_scope_batch(
-                    state,
-                    &source,
-                    &user_text,
-                    &pending,
-                    &assessed_for_scope,
-                    cache,
-                )
-                .await
-                .map(Some)
-            } else {
-                // The same semantic batch was already successfully admitted
-                // (or has no repair evidence). Let the canonical binder judge
-                // this genuinely new invocation instead of reusing a prior
-                // successful task's scope.
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        };
-        let first_batch_binding = match binding_result {
-            Ok(Some((binding, consumed_requirement_ids))) => {
-                let slots = pending
-                    .iter()
-                    .flat_map(|item| item.slots.iter().cloned())
-                    .collect::<Vec<_>>();
-                let call_ids = pending.iter().map(|item| item.id.clone()).collect();
-                self.delegation_scope_retry_cache = Some(DelegationScopeRetryCache {
-                    source_digest: source.user_intent_digest.clone(),
-                    binding: binding.clone(),
-                    slots,
-                    call_ids,
-                    consumed_requirement_ids,
-                });
-                Some(binding)
-            }
-            Ok(None) => None,
-            Err(reason) => {
-                return merge(
-                    self.recover_existing_or_block_new_delegation_calls(
-                        state,
-                        &pending,
-                        "delegation_model_scope_unresolved",
-                        &reason,
-                        None,
-                    )
-                    .await,
-                );
+            _ => {
+                return merge(self.recover_existing_or_block_new_delegation_calls(
+                    state, &pending, "delegation_model_scope_unresolved",
+                    "The structured model constraints belong to a different user source; no child was started.",
+                    None,
+                ).await);
             }
         };
-        let assessed = state
+        state
             .skills
             .request_constraints
-            .delegated_model_requirements
-            .clone();
-        let decision_detail = delegation_catalog_resolution_explain_detail(&assessed);
+            .delegated_model_requirements = assessed.clone();
+        let user_text = authoritative_delegation_user_text(state).expect("source has user text");
         merge(
             match self
                 .bind_assessed_delegation_models(
-                    state,
-                    &source,
-                    &user_text,
-                    &pending,
-                    &assessed,
-                    first_batch_binding.as_ref(),
+                    state, &source, &user_text, &pending, &assessed, None,
                 )
                 .await
             {
                 Ok(outcome) => outcome,
                 Err(reason) => {
-                    let error_kind = if matches!(
-                        assessed,
-                        astra_turn_types::DelegationIntentRequirements::Unavailable { .. }
-                    ) {
-                        "delegation_model_assessment_unavailable"
-                    } else if [
-                        astra_turn_types::AutoModelStrategy::Balanced,
-                        astra_turn_types::AutoModelStrategy::CostPriority,
-                    ]
-                    .into_iter()
-                    .any(|strategy| {
-                        reason == astra_services::delegation_model_requirement::automatic_model_routing_unavailable_reason(strategy)
-                    }) {
-                        "delegation_model_unavailable"
-                    } else {
-                        "delegation_model_scope_unresolved"
-                    };
                     self.recover_existing_or_block_new_delegation_calls(
                         state,
                         &pending,
-                        error_kind,
+                        "delegation_model_scope_unresolved",
                         &reason,
-                        decision_detail,
+                        delegation_catalog_resolution_explain_detail(&assessed),
                     )
                     .await
                 }
@@ -18725,7 +18300,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         if let Some(budget) = self.execution_time_budget {
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(budget.deadline) => Err("context history persistence reached the admitted execution deadline".into()),
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(budget.monotonic_deadline())) => Err("context history persistence reached the admitted execution deadline".into()),
                 result = persist => result,
             }
         } else {
@@ -18814,15 +18389,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         server_context_manifest_identity(&self.session_id, state.current_run_id.as_deref(), result)
     }
 
-    fn execution_handoff_requested(&self) -> bool {
+    fn execution_handoff_wake(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.execution_handoff
             .as_ref()
-            .is_some_and(|context| context.requested.load(std::sync::atomic::Ordering::Acquire))
+            .map(|context| context.requested.clone())
     }
 
-    fn execution_time_budget_remaining(&self) -> Option<Duration> {
+    fn execution_time_budget_remaining(&self) -> Option<astra_turn_types::ExecutionTimeRemaining> {
         self.execution_time_budget
-            .map(RunExecutionTimeBudget::remaining)
+            .map(|budget| budget.remaining_at(tokio::time::Instant::now().into_std()))
     }
 
     fn direct_child_completion_owner(
@@ -18961,6 +18536,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let classify = |error: String| {
             astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
         };
+        // Recovery must not silently persist credentials or rewrite the
+        // original model inputs. Reuse the canonical redaction boundary as a
+        // detection-only gate; a secret-bearing profile is not resumable.
+        let mut profile = Value::Object(self.edge_profile.clone());
+        if astra_text_utils::credential_redaction::redact_credentials_in_json(&mut profile) > 0 {
+            return Err(classify(
+                "execution profile contains non-persistable credentials".into(),
+            ));
+        }
         let authorization =
             state.provider_canonical_replacement_authorization(base, &state.messages);
         let plan = plan_provider_canonical_wal_transition(
@@ -18995,10 +18579,86 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ToolLedgerContinuation::Unavailable
             }
         };
+        // Session decisions belong to the existing permission owner. Persist
+        // them separately from inherited authorization, which recovery must
+        // acquire again. Missing or non-persistable decisions retain custody.
+        let Some(permission_context) = state.permission_context.as_ref() else {
+            return Ok(false);
+        };
+        let permissions = match permission_context.read().await.capture_continuation() {
+            Ok(permissions) => permissions,
+            Err(_) => return Ok(false),
+        };
+        let tool_history = state
+            .stall
+            .tool_call_records
+            .iter()
+            .map(|record| {
+                let mut durable_record = record.clone();
+                durable_record.runtime_args_full = None;
+                durable_record.runtime_model_result_full = None;
+                durable_record.execution_completion = None;
+                HistoricalToolCallContinuation {
+                    record: durable_record,
+                    completion: record.execution_completion.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let journal_next_round = state
+            .turn_event_buffer
+            .as_ref()
+            .map(|buffer| buffer.current_round());
+        if validate_handoff_tool_history(
+            &tool_history,
+            &self.user_id,
+            &self.session_id,
+            run_id,
+            state.canonical_turn_chain_id.as_deref(),
+            journal_next_round,
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
         let payload = astra_services::runs::DurableExecutionHandoff::V1 {
             producer_run_id: run_id.to_string(),
             producer_owner_generation: generation,
             heavy: RuntimeExecutionHandoff {
+                original_user_message: context.original_user_message.clone(),
+                edge_profile: self.edge_profile.clone(),
+                edge_provider_tool_schemas: self.edge_provider_tool_schemas.clone(),
+                tool_schemas: self.tool_schemas.clone(),
+                admission_tool_schemas: self.admission_tool_schemas.clone(),
+                deferred_tool_schemas: self.deferred_tool_schemas.clone(),
+                always_load_tool_names: self.always_load_tool_names.iter().cloned().collect(),
+                client_pipeline_skill_names: state.skills.client_pipeline_skill_names.iter().cloned().collect(),
+                admitted_tool_policy: state.admitted_tool_policy.clone(),
+                permissions,
+                tool_history,
+                journal_next_round,
+                last_turn_policy: state.last_turn_policy.clone(),
+                work_evidence_advisory_emitted: state.stall.work_evidence_advisory_emitted,
+                parallel_batching_advisory_emitted: state.stall.parallel_batching_advisory_emitted,
+                cache_waste_advisory_emitted: state.stall.cache_waste_advisory_emitted,
+                introspection_count: state.stall.introspection_count,
+                work_unit_observations: {
+                    state.stall.work_unit_observations.validate_continuation()
+                        .map_err(|error| classify(error.to_string()))?;
+                    state.stall.work_unit_observations.clone()
+                },
+                turn_sigs: {
+                    let window = state.turn_guard.stall_window().max(
+                        astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD,
+                    );
+                    state.stall.turn_sigs[state.stall.turn_sigs.len().saturating_sub(window)..]
+                        .to_vec()
+                },
+                stall_events: state.stall.events.clone(),
+                circuit_breaker: {
+                    state.stall.circuit_breaker.validate_continuation()
+                        .map_err(|error| classify(error.to_string()))?;
+                    state.stall.circuit_breaker.clone()
+                },
                 hooks: crate::skills::hooks::HookContinuation::capture(
                     &state.skills.tool_event_hooks,
                     &state.skills.session_event_hooks,
@@ -19019,13 +18679,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     &state.stall.tool_call_records,
                     state.canonical_turn_chain_id.as_deref(),
                 ),
+                recorder: state.step_recorder.capture_settled_continuation(&heavy.light)
+                    .map_err(|error| classify(error.to_string()))?,
                 heavy,
                 reservation: context.reservation.clone(),
                 continuation: plan.transition,
+                execution_deadline: self.execution_time_budget.map(|deadline| deadline.snapshot()),
             },
         };
-        let checkpoint_json =
-            serde_json::to_string(&payload).map_err(|error| classify(error.to_string()))?;
+        let checkpoint_json = match astra_services::runs::encode_execution_handoff(&payload) {
+            Ok(json) => json,
+            Err(_) => return Ok(false),
+        };
+        state
+            .step_recorder
+            .confirm_handoff_persistence()
+            .await
+            .map_err(classify)?;
         context
             .engine
             .persist_owned_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
@@ -19150,7 +18820,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         tool_calls: &[Value],
         finish_reason: Option<&str>,
     ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
-        let mut admission = match self.pending_tool_call_admission.take() {
+        match self.pending_tool_call_admission.take() {
             Some(admission) => Self::cached_admission_for_provider_calls(admission, tool_calls)
                 .unwrap_or_else(|| {
                     crate::turn::agentic::tool_interception::admit_tool_calls(
@@ -19161,25 +18831,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             None => {
                 crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
             }
-        };
-        if self
-            .execution_time_budget
-            .is_some_and(|budget| budget.remaining().is_zero())
-        {
-            admission.rejected.extend(admission.admitted.drain(..).map(|canonical_call| {
-                crate::turn::agentic_loop::host::RejectedToolCall {
-                    invocation: canonical_call,
-                    result: json!({
-                        "status": "rejected",
-                        "error_kind": "execution_time_budget_exhausted",
-                        "retryable": false,
-                        "error": "The run wall-clock budget expired before this tool could be admitted; it was not executed.",
-                    })
-                    .to_string(),
-                }
-            }));
         }
-        admission
     }
 
     fn injects_round_guidance(&self) -> bool {
@@ -19289,6 +18941,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         self.publish_explain_analyze_tool_route_spans();
         let outcome = match result {
+            Ok(AgenticLoopOutcome::Completed) if state.interruption.is_some() => {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+            }
             Ok(AgenticLoopOutcome::Completed) => {
                 astra_turn_types::ExplainAnalyzeOutcomeV1::Completed
             }
@@ -20252,6 +19907,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Runtime no longer re-derives any of these.
         let context_assembly_node_id =
             self.start_explain_analyze_context_assembly(state, Instant::now());
+        let model_catalog_context = self.model_catalog_context().await;
         let (prompt_memory_recall, initial_session_memory_entry) = self
             .memory_context_for_turn(
                 state.session_turn,
@@ -20314,6 +19970,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut final_context_assembly = initial_context_assembly;
         let mut final_system_messages = system_messages;
         let mut final_volatile_preamble = volatile_preamble;
+        if let Some(context) = model_catalog_context.as_ref() {
+            final_volatile_preamble.push(context.clone());
+        }
         let mut final_system_prompt_breakdown = system_prompt_breakdown;
         let mut final_pipeline_tool_schemas = pipeline_tool_schemas;
         let mut final_manifest_trace = manifest_trace;
@@ -20424,6 +20083,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             final_system_messages = rerun.system_messages;
             final_volatile_preamble = rerun.volatile_preamble;
+            if let Some(context) = model_catalog_context {
+                final_volatile_preamble.push(context);
+            }
             final_system_prompt_breakdown = rerun.breakdown;
             final_pipeline_tool_schemas = rerun.tool_schemas;
             final_manifest_trace = rerun.manifest_trace;
@@ -22626,21 +22288,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return AdmittedToolCallOutcome::default();
         }
-        if self
-            .execution_time_budget
-            .is_some_and(|budget| budget.remaining().is_zero())
-        {
-            let results = self.edge_action_blocked_results(
-                tool_calls,
-                "execution_time_budget_exhausted",
-                "The run wall-clock budget expired before tool execution; the tool was not executed.",
-            );
-            return AdmittedToolCallOutcome {
-                results,
-                control: AdmittedToolCallControl::FailedClosed,
-                ..AdmittedToolCallOutcome::default()
-            };
-        }
         self.emit_admitted_tool_call_events(state.current_round_index, tool_calls);
         let externally_dispatchable = tool_calls
             .iter()
@@ -22679,10 +22326,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .map(|invocation| invocation.logical_target_call().clone())
             .collect::<Vec<_>>();
         let (admissions, blocked) = if self.admitted_tool_side_effects_enabled
-            && !self
-                .execution_time_budget
-                .is_some_and(|budget| budget.remaining().is_zero())
-        {
+            && !self.execution_time_budget.is_some_and(|budget| {
+                !budget
+                    .remaining_at(tokio::time::Instant::now().into_std())
+                    .has_work()
+            }) {
             self.admitted_delegation_models(state, &tool_calls).await
         } else {
             (std::collections::HashMap::new(), Vec::new())
@@ -23865,35 +23513,6 @@ mod tests {
     }
 
     #[test]
-    fn delegation_scope_retry_matches_semantics_not_attempt_ids() {
-        use astra_services::delegation_model_requirement::DelegationSlotBrief;
-
-        let slot = |call_id: &str, group_id: Option<&str>| DelegationSlotBrief {
-            description: "review".into(),
-            prompt: "Review the change".into(),
-            requested_model_policy: None,
-            reasoning: None,
-            invocation: Some(
-                astra_services::delegation_model_requirement::DelegationSlotInvocation {
-                    tool_call_id: call_id.into(),
-                    tool_name: "agent".into(),
-                    group_id: group_id.map(str::to_owned),
-                    slot_index: 0,
-                },
-            ),
-        };
-
-        assert!(delegation_scope_inputs_match(
-            &slot("first", Some("group-a")),
-            &slot("retry", Some("group-a")),
-        ));
-        assert!(!delegation_scope_inputs_match(
-            &slot("retry", Some("group-a")),
-            &slot("retry", Some("group-b")),
-        ));
-    }
-
-    #[test]
     fn canonical_edge_evidence_rejects_foreign_custody_and_changed_payload() {
         use astra_thin_client::{ToolResultRequest, ToolResultRequestParts};
         let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
@@ -24149,51 +23768,17 @@ mod tests {
         assert!(!work_scheduler_batch_conflict("run_next_work_item", true));
     }
 
-    #[test]
-    fn execution_time_budget_retry_can_only_tighten_deadline() {
-        let start = tokio::time::Instant::now();
-        let mut budget = RunExecutionTimeBudget::new_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 10,
-            },
-            start,
-        );
-
-        budget.tighten_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 20,
-            },
-            start + Duration::from_secs(2),
-        );
-        assert_eq!(
-            budget.remaining_at(start + Duration::from_secs(2)),
-            Duration::from_secs(8),
-            "a replayed larger relative snapshot must not extend the original deadline"
-        );
-
-        budget.tighten_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 2,
-            },
-            start + Duration::from_secs(3),
-        );
-        assert_eq!(
-            budget.remaining_at(start + Duration::from_secs(3)),
-            Duration::from_secs(2),
-            "a smaller snapshot must tighten the deadline"
-        );
+    fn test_execution_deadline(remaining_seconds: u64) -> ExecutionDeadlineAuthority {
+        ExecutionDeadlineAuthority::from_budget_at(ExecutionTimeBudget { remaining_seconds }, 0)
+            .unwrap()
     }
 
     #[test]
     fn execution_time_budget_zero_rejects_new_timeout() {
-        let now = tokio::time::Instant::now();
-        let budget = RunExecutionTimeBudget::new_at(
-            ExecutionTimeBudget {
-                remaining_seconds: 0,
-            },
-            now,
-        );
-        assert_eq!(budget.remaining_at(now), Duration::ZERO);
+        let budget = test_execution_deadline(0);
+        let remaining = budget.remaining_at(std::time::Instant::now());
+        assert_eq!(remaining.total_remaining, Duration::ZERO);
+        assert_eq!(remaining.work_remaining, Duration::ZERO);
         assert!(
             ServerAgenticLoopHost::provider_dispatch_budget(
                 Some(budget),
@@ -24209,11 +23794,13 @@ mod tests {
         let host = test_host_builder("u-unbounded-time", "s-unbounded-time").build();
 
         assert_eq!(
-            ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
+            ServerAgenticLoopHost::provider_dispatch_budget(
                 host.execution_time_budget,
                 ProviderAttemptBoundary::new(false, false),
+                false,
             )
-            .expect("unbounded behavior"),
+            .expect("unbounded behavior")
+            .client_timeout,
             None
         );
         assert_eq!(
@@ -24250,15 +23837,16 @@ mod tests {
             .build();
         let installed = host.execution_time_budget.unwrap();
         assert_eq!(installed.deadline_unix_ms, 723_000);
-        assert_eq!(installed.deadline.into_std(), deadline.monotonic_deadline());
+        assert_eq!(
+            installed.monotonic_deadline(),
+            deadline.monotonic_deadline()
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn execution_deadline_preserves_provider_settlement_reserve_after_admission_delay() {
         let mut host = test_host_builder("u-delayed-provider", "s-delayed-provider").build();
-        host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
-            remaining_seconds: 100,
-        }));
+        host.execution_time_budget = Some(test_execution_deadline(100));
         let ordinary = ProviderAttemptBoundary::new(false, false);
 
         assert_eq!(
@@ -24313,9 +23901,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn execution_deadline_final_settlement_can_use_the_reserved_provider_window() {
-        let budget = RunExecutionTimeBudget::new(ExecutionTimeBudget {
-            remaining_seconds: 20,
-        });
+        let budget = test_execution_deadline(20);
 
         assert_eq!(
             ServerAgenticLoopHost::provider_dispatch_budget(
@@ -24331,9 +23917,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn typed_completion_action_preserves_the_following_provider_window() {
-        let budget = RunExecutionTimeBudget::new(ExecutionTimeBudget {
-            remaining_seconds: 20,
-        });
+        let budget = test_execution_deadline(20);
         let boundary = ProviderAttemptBoundary::new(false, false);
         let mut settlement = astra_turn_types::CompletionSettlementState::default();
 
@@ -24363,6 +23947,7 @@ mod tests {
         assert!(!ServerAgenticLoopHost::provider_attempt_is_settlement(
             &settlement
         ));
+        tokio::time::advance(Duration::from_secs(10)).await;
         assert!(
             ServerAgenticLoopHost::provider_dispatch_budget(
                 Some(budget),
@@ -24522,28 +24107,45 @@ mod tests {
         assert!(message_text(skill_attachments[0]).contains("review instructions"));
     }
 
-    #[test]
-    fn exhausted_execution_time_budget_rejects_new_tool_admission() {
-        let mut host = test_host_builder("u-expired-tool", "s-expired-tool")
-            .with_execution_time_budget(Some(ExecutionTimeBudget {
-                remaining_seconds: 0,
-            }))
-            .build();
-        let calls = vec![json!({
-            "id": "call-expired",
-            "type": "function",
-            "function": {"name": "shell", "arguments": "{}"},
-        })];
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_execution_time_budget_rejects_new_tool_admission() {
+        for remaining_seconds in [0, 10] {
+            let mut host = test_host_builder("u-expired-tool", "s-expired-tool")
+                .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+                .with_execution_time_budget(Some(ExecutionTimeBudget { remaining_seconds }))
+                .build();
+            if remaining_seconds != 0 {
+                tokio::time::advance(Duration::from_secs(6)).await;
+                assert!(
+                    host.execution_time_budget
+                        .unwrap()
+                        .remaining_at(tokio::time::Instant::now().into_std())
+                        .total_remaining
+                        > Duration::ZERO
+                );
+            }
+            let calls = vec![json!({
+                "id": "call-expired",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"echo should-not-run\"}"},
+            })];
 
-        let admission = AgenticLoopHost::admit_tool_calls(&mut host, &calls, Some("tool_calls"));
-        assert!(admission.admitted.is_empty());
-        assert_eq!(admission.rejected.len(), 1);
-        assert!(
-            admission.rejected[0]
-                .result
-                .contains("execution_time_budget_exhausted")
-        );
-        assert!(admission.rejected[0].result.contains("\"retryable\":false"));
+            let admission =
+                AgenticLoopHost::admit_tool_calls(&mut host, &calls, Some("tool_calls"));
+            let admission = AgenticLoopHost::canonicalize_deferred_tool_admission(
+                &mut host,
+                &create_test_state(),
+                admission,
+            );
+            assert!(admission.admitted.is_empty());
+            assert_eq!(admission.rejected.len(), 1);
+            assert!(
+                admission.rejected[0]
+                    .result
+                    .contains("execution_time_budget_exhausted")
+            );
+            assert!(admission.rejected[0].result.contains("\"retryable\":false"));
+        }
     }
 
     #[test]
@@ -24860,12 +24462,15 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated MatrixOne: run with ASTRA_TEST_DB_IT=1"]
-    async fn execution_handoff_custody_survives_claims_and_production_recovery() {
+    async fn execution_handoff_adoption_preserves_checkpoint_across_owner_generations() {
+        let journal = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(journal.path());
         use astra_services::runs::RunStateStore;
         use astra_services::session_context_coordinator::{
             AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
-            SessionContextCoordinator,
+            ResumedExecutionTurnRequest, SessionContextCoordinator,
         };
+        use sqlx::Row;
         assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
         let _ = dotenvy::dotenv();
         // Recovery discovery is intentionally database-wide. Give this test a
@@ -24883,21 +24488,139 @@ mod tests {
             .await
             .unwrap();
         let pool = SharedPool::new(&settings).await.unwrap();
-        let user = "replay-user";
+        let auth = astra_services::DatabaseAuthService::new(
+            settings.clone(),
+            astra_core::JwtSettings {
+                secret_key: format!("execution-handoff-test-{database}"),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 30,
+                refresh_token_expire_days: 7,
+            },
+        )
+        .with_pool(pool.clone());
+        let account_name = format!("execution_handoff_{}", uuid::Uuid::new_v4().simple());
+        let account_password = "execution-handoff-test-password";
+        let account = astra_services::AuthService::register(
+            &auth,
+            astra_services::AuthRegisterRequestData {
+                username: account_name.clone(),
+                email: format!("{account_name}@example.invalid"),
+                password: account_password.into(),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        let login = astra_services::AuthService::login(
+            &auth,
+            astra_services::AuthLoginRequestData {
+                username: account_name.clone(),
+                password: account_password.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let auth_session_id: String = sqlx::query(
+            "SELECT session_id FROM auth_refresh_tokens WHERE user_id = ? AND is_revoked = 0 LIMIT 1",
+        )
+        .bind(&account.user_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+        .try_get("session_id")
+        .unwrap();
+        // Make the refresh extension observable without sleeping. The grant
+        // below is still produced by current_principal from this live row.
+        assert_eq!(
+            sqlx::query(
+                "UPDATE auth_refresh_tokens SET expires_at = DATE_ADD(NOW(), INTERVAL 1 HOUR) \
+                 WHERE user_id = ? AND session_id = ? AND is_revoked = 0",
+            )
+            .bind(&account.user_id)
+            .bind(&auth_session_id)
+            .execute(pool.get())
+            .await
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        let mut login_headers = axum::http::HeaderMap::new();
+        login_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", login.access_token)).unwrap(),
+        );
+        let principal = astra_services::AuthService::current_principal(&auth, &login_headers)
+            .await
+            .unwrap();
+        let frozen_grant = principal.execution_continuation.clone().unwrap();
+        assert_eq!(principal.user.user_id, account.user_id);
+        assert_eq!(
+            principal.session_id.as_deref(),
+            Some(auth_session_id.as_str())
+        );
         let session = "replay-session";
+        assert_ne!(principal.session_id.as_deref(), Some(session));
+        let execution_authentication = principal
+            .execution_authentication_provenance()
+            .expect("a local JWT principal must provide trusted run provenance");
+        let refreshed_login = astra_services::AuthService::refresh(
+            &auth,
+            astra_services::AuthRefreshRequestData {
+                refresh_token: login.refresh_token.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut refreshed_headers = axum::http::HeaderMap::new();
+        refreshed_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", refreshed_login.access_token))
+                .unwrap(),
+        );
+        let refreshed_principal =
+            astra_services::AuthService::current_principal(&auth, &refreshed_headers)
+                .await
+                .unwrap();
+        assert_eq!(
+            refreshed_principal.session_id.as_deref(),
+            Some(auth_session_id.as_str())
+        );
+        assert!(
+            refreshed_principal
+                .execution_continuation
+                .as_ref()
+                .unwrap()
+                .expires_at_unix
+                > frozen_grant.expires_at_unix,
+            "same-session refresh must extend current session state in the DB"
+        );
+        let user = account.user_id.clone();
         let run_id = "replay-run";
         sqlx::query("INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) VALUES (?, ?, 'replay', 'active', 0)")
-            .bind(session).bind(user).execute(pool.get()).await.unwrap();
+            .bind(session).bind(&user).execute(pool.get()).await.unwrap();
         let store = Arc::new(
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("replay-test-owner"),
         );
         let engine = crate::server::run::engine::RunEngine::new(store.clone());
-        engine.start_run(run_id, user, session).await.unwrap();
+        engine
+            .start_run_with_context(
+                run_id,
+                &user,
+                session,
+                crate::server::run::engine::RunStartContext {
+                    execution_authentication: Some(execution_authentication.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let original_admission =
+            store.load_run(&user, run_id).await.unwrap().unwrap().events[0].clone();
         let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-        let key = astra_turn_types::SessionKeyV1::owner_session("server", user, session, "main");
+        let key = astra_turn_types::SessionKeyV1::owner_session("server", &user, session, "main");
         let actor = astra_turn_types::ActorContextV1::owner_user(
-            user,
+            &user,
             "replay-writer",
             astra_turn_types::ActorKindV1::Cli,
             astra_turn_types::SessionSurfaceV1::Cli,
@@ -24919,101 +24642,461 @@ mod tests {
         else {
             panic!("original turn admission failed")
         };
+        let original_profile = Map::from_iter([(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS.into(),
+            json!(["Original native runtime instructions"]),
+        )]);
         let mut host = ServerAgenticLoopHostBuilder::new(
             settings.clone(),
             mock_encryptor(),
-            user.into(),
+            user.clone(),
             session.into(),
         )
         .with_pool(pool.clone())
+        .with_edge_profile(original_profile.clone())
         .build();
+        let original_tools = host.tool_schemas.clone();
+        let original_deferred = host.deferred_tool_schemas.clone();
+        let original_always_load: BTreeSet<_> =
+            host.always_load_tool_names.iter().cloned().collect();
         let mut state = create_test_state();
         state.current_run_id = Some(run_id.into());
         state.current_session_id = Some(session.into());
+        state.permission_context = Some(
+            astra_turn_core::permission::types::PermissionSyncContext::shared_root(
+                astra_turn_core::permission::types::PermissionMode::Prompt,
+            ),
+        );
         state.current_run_owner_generation = Some(0);
         state.canonical_turn_chain_id = Some("replay-chain".into());
         state.session_turn = reservation.reserved_turn;
         state.total_prompt = 123;
+        state
+            .skills
+            .client_pipeline_skill_names
+            .insert("original-client-skill".into());
+        state.step_recorder = astra_pipeline::step_recorder::StepRecorder::with_persistence_for_run(
+            &user, session, run_id, run_id,
+        );
         state.step_recorder.begin_turn(reservation.reserved_turn);
+        // Tool-free rounds still advance the journal; the last tool record
+        // cannot reconstruct this cursor.
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn_with_round(
+                Some(session),
+                reservation.reserved_turn,
+                7,
+            ),
+        );
+        let original_turn_started_at = state.turn_event_buffer.as_ref().unwrap().turn_started_at();
+        state.canonical_turn_started_at = std::sync::OnceLock::from(original_turn_started_at);
         state.initialize_provider_canonical_wal_base(&[]);
+        state.message = "subsequent steering guidance".into();
         state.messages = vec![
             json!({"role":"user","content":"inspect result"}),
             json!({"role":"assistant","content":null,"tool_calls":[{"id":"replay-tool","type":"function","function":{"name":"test_tool","arguments":"{}"}}]}),
             json!({"role":"tool","tool_call_id":"replay-tool","content":"one result"}),
         ];
         host.bind_execution_handoff(
-            Arc::new(AtomicBool::new(true)),
+            {
+                let wake = tokio_util::sync::CancellationToken::new();
+                wake.cancel();
+                wake
+            },
             engine.clone(),
             reservation.clone(),
+            "\n  inspect result\t\n".into(),
         );
         let heavy =
             crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
                 .unwrap();
         assert!(host.persist_execution_handoff(&state, heavy).await.unwrap());
         let checkpoint = engine
-            .load_latest_checkpoint(user, run_id, Some("execution_handoff"))
+            .load_latest_checkpoint(&user, run_id, Some("execution_handoff"))
             .await
             .unwrap()
             .unwrap();
         coordinator.release_writer(&lease).await.unwrap();
-        let authority_sql = "SELECT writer_epoch, active_writer_json, active_reservation_json FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?";
-        let original_authority: (i64, Option<String>, Option<String>) =
-            sqlx::query_as(authority_sql)
-                .bind(&key.isolation_domain)
-                .bind(user)
-                .bind(session)
-                .bind(&key.branch_id)
-                .fetch_one(pool.get())
+        let first_claim = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .unwrap()
+            .remove(0);
+        store
+            .reconcile_execution_handoff(&first_claim)
+            .await
+            .unwrap()
+            .unwrap();
+        let custody_snapshot = || async {
+            let run: (
+                String,
+                i64,
+                Option<String>,
+                Option<chrono::NaiveDateTime>,
+                i64,
+            ) = sqlx::query_as(
+                "SELECT status, run_generation, owner_pod_id, owner_lease_expires_at,
+                     last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&user)
+            .bind(run_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            let slot: Option<String> = sqlx::query_scalar(
+                "SELECT run_id FROM agent_session_execution_slots
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user)
+            .bind(session)
+            .fetch_optional(pool.get())
+            .await
+            .unwrap();
+            (run, slot)
+        };
+        let resume_request = |generation, owner| ResumedExecutionTurnRequest {
+            user_id: &user,
+            session_id: session,
+            run_id,
+            expected_owner_generation: generation,
+            checkpoint_id: &checkpoint.checkpoint_id,
+            source: &reservation,
+            actor: &actor,
+            owner_pod_id: owner,
+            ttl: Duration::from_secs(60),
+        };
+        // Rejection must preserve durable custody and canonical turn authority.
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = 'live-owner', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(run_id).execute(pool.get()).await.unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
                 .await
-                .unwrap();
-        for generation in 1..=2 {
-            let mut claims = store.claim_recoverable_active_runs(1).await.unwrap();
-            assert_eq!(claims.len(), 1);
-            let claim = claims.remove(0);
-            assert_eq!(claim.run.run_generation, generation);
+                .is_err()
+        );
+        assert_eq!(custody_snapshot().await, before);
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = NULL, owner_lease_expires_at = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(run_id).execute(pool.get()).await.unwrap();
+
+        engine
+            .start_run("slot-blocker", &user, session)
+            .await
+            .unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
+                .await
+                .is_err()
+        );
+        assert_eq!(custody_snapshot().await, before);
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user,
+                    session,
+                    "slot-blocker",
+                    &[astra_core::STATUS_RUNNING],
+                    Some(0),
+                    astra_core::STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut conflicting_checkpoint: Value =
+            serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
+        conflicting_checkpoint["heavy"]["original_facts"]["total_prompt"] = json!(124);
+        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(conflicting_checkpoint.to_string())
+            .bind(&user)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            custody_snapshot().await,
+            before,
+            "checkpoint mismatch cannot retain the provisional claim"
+        );
+        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(&checkpoint.checkpoint_json)
+            .bind(&user)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+
+        let tail_index = custody_snapshot().await.0.4;
+        let tail: String = sqlx::query_scalar("SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(&user).bind(run_id).bind(tail_index).fetch_one(pool.get()).await.unwrap();
+        sqlx::query("UPDATE agent_run_events SET payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(json!({"event_type":"unrelated"}).to_string())
+            .bind(&user).bind(run_id).bind(tail_index).execute(pool.get()).await.unwrap();
+        let before = custody_snapshot().await;
+        assert!(
+            coordinator
+                .resume_execution_turn(resume_request(1, "replay-test-owner"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            custody_snapshot().await,
+            before,
+            "unassociated tail rolls back Running, generation, lease and slot"
+        );
+        sqlx::query("UPDATE agent_run_events SET payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(tail).bind(&user).bind(run_id).bind(tail_index).execute(pool.get()).await.unwrap();
+        for generation in 2..=4 {
+            let (first, second) = tokio::join!(
+                coordinator
+                    .resume_execution_turn(resume_request(generation - 1, "replay-test-owner-a")),
+                coordinator
+                    .resume_execution_turn(resume_request(generation - 1, "replay-test-owner-b")),
+            );
+            assert_ne!(
+                first.is_ok(),
+                second.is_ok(),
+                "only one concurrent owner wins"
+            );
+            let winner = if first.is_ok() {
+                "replay-test-owner-a"
+            } else {
+                "replay-test-owner-b"
+            };
+            let adopted = first.or(second).unwrap();
+            assert_eq!(adopted.receipt().producer_generation, 0);
+            assert_eq!(adopted.run().events.len(), 1);
+            assert_eq!(adopted.run().events[0]["event_type"], "run_started");
             assert_eq!(
-                claim.run.checkpoint_json.as_deref(),
-                Some(checkpoint.checkpoint_json.as_str())
+                adopted.run().original_admission_data().unwrap(),
+                original_admission["data"].as_object().unwrap(),
+                "preserve original admission facts independently of display indexes"
+            );
+            assert_eq!(adopted.run().run_generation, generation);
+            assert!(adopted.run().checkpoint_json.is_none());
+            assert_eq!(
+                adopted.run().execution_authentication().unwrap(),
+                Some(execution_authentication.clone())
+            );
+            if generation == 2 {
+                // A committed custody proof is not permission to dispatch an
+                // incomplete runtime checkpoint. Test missing and explicit-null
+                // original inputs through the actual adoption boundary.
+                for (field, missing) in [
+                    ("canonical_turn_started_at", true),
+                    ("canonical_turn_started_at", false),
+                    ("original_user_message", true),
+                    ("original_user_message", false),
+                ] {
+                    let mut malformed: Value =
+                        serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
+                    let facts = if field == "original_user_message" {
+                        &mut malformed["heavy"]
+                    } else {
+                        &mut malformed["heavy"]["original_facts"]
+                    };
+                    if missing {
+                        facts.as_object_mut().unwrap().remove(field);
+                    } else {
+                        facts[field] = Value::Null;
+                    }
+                    for table in ["agent_runs", "run_checkpoints"] {
+                        sqlx::query(&format!("UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"))
+                            .bind(malformed.to_string()).bind(&user).bind(run_id)
+                            .execute(pool.get()).await.unwrap();
+                    }
+                    let invalid = coordinator
+                        .resume_execution_turn(resume_request(generation - 1, winner))
+                        .await
+                        .unwrap();
+                    assert!(RuntimeExecutionHandoff::from_adopted(&invalid).is_err());
+                }
+                for table in ["agent_runs", "run_checkpoints"] {
+                    sqlx::query(&format!(
+                        "UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"
+                    ))
+                    .bind(&checkpoint.checkpoint_json)
+                    .bind(&user)
+                    .bind(run_id)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                }
+            }
+            let recovered = RuntimeExecutionHandoff::from_adopted(&adopted)
+                .expect("decode the exact checkpoint returned by atomic adoption");
+            assert_eq!(recovered.edge_profile, original_profile);
+            assert_eq!(recovered.tool_schemas, original_tools);
+            assert_eq!(recovered.deferred_tool_schemas, original_deferred);
+            assert_eq!(recovered.always_load_tool_names, original_always_load);
+            assert_eq!(
+                recovered.client_pipeline_skill_names,
+                BTreeSet::from(["original-client-skill".into()])
+            );
+            assert_eq!(recovered.reservation, reservation);
+            assert_eq!(recovered.original_user_message, "\n  inspect result\t\n");
+            assert_eq!(
+                recovered.original_facts.message,
+                "subsequent steering guidance"
+            );
+            assert_eq!(recovered.journal_next_round, Some(7));
+            assert_eq!(
+                recovered.original_facts.canonical_turn_started_at,
+                Some(original_turn_started_at)
+            );
+            assert_eq!(
+                adopted.checkpoint().checkpoint_json.as_str(),
+                checkpoint.checkpoint_json.as_str()
             );
             assert_eq!(
                 engine
-                    .load_latest_checkpoint(user, run_id, Some("execution_handoff"))
+                    .load_latest_checkpoint(&user, run_id, Some("execution_handoff"))
                     .await
                     .unwrap()
                     .unwrap(),
                 checkpoint
             );
-        }
-        engine.recover_active_runs().await.unwrap();
-        let final_run = store.load_run(user, run_id).await.unwrap().unwrap();
-        assert_eq!(final_run.status, "paused");
-        assert_eq!(final_run.run_generation, 3);
-        let current_authority: (i64, Option<String>, Option<String>) =
-            sqlx::query_as(authority_sql)
-                .bind(&key.isolation_domain)
-                .bind(user)
-                .bind(session)
-                .bind(&key.branch_id)
-                .fetch_one(pool.get())
+            assert!(adopted.receipt().writer_lease.writer_epoch > lease.writer_epoch);
+            let reauthorized =
+                astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                    .await
+                    .expect("the live original session may reauthorize the adopted proof");
+            assert_eq!(reauthorized.user.user_id, user);
+            assert_eq!(
+                reauthorized.session_id.as_deref(),
+                Some(auth_session_id.as_str())
+            );
+            assert_eq!(
+                reauthorized.execution_continuation,
+                Some(frozen_grant.clone())
+            );
+            if generation == 4 {
+                sqlx::query("INSERT INTO auth_external_identities (provider_id, external_subject, astra_user_id) VALUES ('memoria:changed-origin', 'changed-subject', ?)")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                let (status, _) =
+                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                        .await
+                        .expect_err(
+                            "a changed provider origin cannot downgrade to local authority",
+                        );
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+                sqlx::query("DELETE FROM auth_external_identities WHERE astra_user_id = ? AND provider_id = 'memoria:changed-origin'")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE auth_users SET is_active = 0 WHERE user_id = ?")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                let (status, _) =
+                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                        .await
+                        .expect_err("an inactive account cannot continue an adopted run");
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+                sqlx::query("UPDATE auth_users SET is_active = 1 WHERE user_id = ?")
+                    .bind(&user)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                astra_services::AuthService::logout(
+                    &auth,
+                    astra_services::AuthRefreshRequestData {
+                        refresh_token: refreshed_login.refresh_token.clone(),
+                    },
+                )
                 .await
                 .unwrap();
-        assert_eq!(current_authority, original_authority);
-        let recovery = final_run.events.last().unwrap();
-        assert_eq!(recovery["data"]["execution_handoff_preserved"], true);
-        assert_eq!(recovery["data"]["automatic_execution_reconstructed"], false);
-        assert_eq!(
-            recovery["data"]["execution_handoff_recovery"],
-            json!({
-                "checkpoint_id": checkpoint.checkpoint_id,
-                "producer_generation": 0,
-                "claimed_from_generation": 2,
-                "recovered_generation": 3,
-            })
-        );
-        assert_eq!(
-            final_run.checkpoint_json.as_deref(),
-            Some(checkpoint.checkpoint_json.as_str())
-        );
+                let replacement_login = astra_services::AuthService::login(
+                    &auth,
+                    astra_services::AuthLoginRequestData {
+                        username: account_name.clone(),
+                        password: account_password.into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let mut replacement_headers = axum::http::HeaderMap::new();
+                replacement_headers.insert(
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_str(&format!(
+                        "Bearer {}",
+                        replacement_login.access_token
+                    ))
+                    .unwrap(),
+                );
+                let replacement_principal =
+                    astra_services::AuthService::current_principal(&auth, &replacement_headers)
+                        .await
+                        .unwrap();
+                assert_eq!(replacement_principal.user.user_id, user);
+                assert_ne!(
+                    replacement_principal.session_id.as_deref(),
+                    Some(auth_session_id.as_str())
+                );
+                let (status, _) =
+                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
+                        .await
+                        .expect_err("a new login must not replace the revoked original session");
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+            }
+            coordinator
+                .release_writer(&adopted.receipt().writer_lease)
+                .await
+                .unwrap();
+            if generation < 4 {
+                assert!(
+                    engine
+                        .park_resumed_execution(&adopted)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "the previous owner cannot park the resumed execution"
+                );
+                let winner_store = Arc::new(
+                    astra_services::runs::DatabaseRunStateStore::new(pool.clone())
+                        .with_owner_pod_id(winner),
+                );
+                let winner_engine =
+                    crate::server::run::engine::RunEngine::new(winner_store.clone());
+                let parked = winner_engine
+                    .park_resumed_execution(&adopted)
+                    .await
+                    .unwrap()
+                    .expect("the current owner must confirm checkpoint parking");
+                assert_eq!(parked.status, astra_core::STATUS_PAUSED);
+                assert_eq!(parked.run_generation, generation);
+                assert_eq!(
+                    parked.checkpoint_json.as_deref(),
+                    Some(checkpoint.checkpoint_json.as_str())
+                );
+                // Production heartbeat releases this lease after confirmed
+                // parking. This fixture owns the pod without a heartbeat.
+                assert!(
+                    winner_store
+                        .release_owner_lease(&user, session, run_id, generation)
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+        let final_run = store.load_run(&user, run_id).await.unwrap().unwrap();
         assert_eq!(
             final_run
                 .events
@@ -25034,6 +25117,8 @@ mod tests {
 
     #[tokio::test]
     async fn execution_handoff_preserves_settled_checkpoint_without_reconstructing_execution() {
+        let journal = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(journal.path());
         for (cancelled, chain, accounting_available) in [
             (false, Some("handoff-chain"), true),
             (true, Some("handoff-chain"), true),
@@ -25047,13 +25132,69 @@ mod tests {
                 .start_run("handoff-run", "handoff-user", "handoff-session")
                 .await
                 .unwrap();
-            let mut host = test_host_builder("handoff-user", "handoff-session").build();
+            let deadline = astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+                astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 86_400,
+                },
+                1_000,
+            )
+            .unwrap();
+            let mut host = test_host_builder("handoff-user", "handoff-session")
+                .with_admitted_execution_deadline(Some(deadline))
+                .build();
             let mut state = create_test_state();
             state.current_run_id = Some("handoff-run".into());
+            let mut permissions = astra_turn_core::permission::types::PermissionSyncContext::root(
+                astra_turn_core::permission::types::PermissionMode::Prompt,
+            );
+            permissions.apply_update(
+                &astra_turn_core::permission::types::PermissionUpdate::allow(
+                    astra_turn_core::permission::types::PermissionRule::tool("read_file"),
+                ),
+            );
+            permissions.apply_update(&astra_turn_core::permission::types::PermissionUpdate::deny(
+                astra_turn_core::permission::types::PermissionRule::tool("write_file"),
+            ));
+            state.permission_context = Some(permissions.into_shared());
             state.canonical_turn_chain_id = chain.map(str::to_owned);
             state.current_run_owner_generation = Some(0);
             state.current_session_id = Some("handoff-session".into());
             state.session_turn = 1;
+            state.turn_guard = astra_turn_core::turn_guard::TurnGuard::new();
+            state.stall.turn_sigs = (0..8)
+                .map(|index| {
+                    BTreeSet::from([astra_turn_core::stall::StallSignature::new(
+                        "read_file",
+                        index.to_string().as_bytes(),
+                    )])
+                })
+                .collect();
+            state.stall.events.push(("repetition_threshold".into(), 5));
+            let observation = astra_core::work_unit::WorkUnitObservation::new(
+                "finished-child",
+                "agent",
+                astra_core::work_unit::WorkUnitStatus::Completed,
+                2,
+                astra_core::work_unit::WorkUnitObservationMode::Transition,
+            )
+            .unwrap();
+            state.stall.work_unit_observations.observe(&observation);
+            state.stall.work_evidence_advisory_emitted = true;
+            state.stall.parallel_batching_advisory_emitted = true;
+            state.stall.cache_waste_advisory_emitted = true;
+            state.stall.introspection_count = 2;
+            state.last_turn_policy =
+                astra_turn_core::interaction_types::TurnInteractionPolicy::from_visible_tool_names(
+                    astra_turn_core::interaction_types::TurnInteractionMode::Prompt,
+                    vec!["read_file".into(), "ask_user".into()],
+                );
+            state.step_recorder =
+                astra_pipeline::step_recorder::StepRecorder::with_persistence_for_run(
+                    "handoff-user",
+                    "handoff-session",
+                    "handoff-run",
+                    "handoff-run",
+                );
             state.step_recorder.begin_turn(1);
             state.initialize_provider_canonical_wal_base(&[]);
             state.messages = vec![
@@ -25087,9 +25228,14 @@ mod tests {
                 idempotency_key: "handoff-reservation".into(),
             };
             host.bind_execution_handoff(
-                Arc::new(AtomicBool::new(true)),
+                {
+                    let wake = tokio_util::sync::CancellationToken::new();
+                    wake.cancel();
+                    wake
+                },
                 engine.clone(),
                 reservation.clone(),
+                state.message.clone(),
             );
             let heavy =
                 crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
@@ -25100,6 +25246,20 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            host.edge_profile.insert(
+                "api_key".into(),
+                Value::String(format!("sk-{}", "z".repeat(48))),
+            );
+            let secret_profile =
+                crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
+                    .unwrap();
+            assert!(
+                host.persist_execution_handoff(&state, secret_profile)
+                    .await
+                    .is_err(),
+                "credential-bearing input must not become a recovery checkpoint"
+            );
+            host.edge_profile.remove("api_key");
             state.push_volatile_payload(
                 crate::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
                 json!({"mode": "text_only"}),
@@ -25128,14 +25288,121 @@ mod tests {
                 "an unresolved delivery lease must not replace the settled checkpoint",
             );
             state.restore_volatile_attempt_lease();
-            let astra_services::runs::DurableExecutionHandoff::V1 { heavy: payload, .. } =
-                serde_json::from_str::<
+            let mut wire: serde_json::Value = serde_json::from_str(&saved.checkpoint_json).unwrap();
+            for field in [
+                "edge_profile",
+                "edge_provider_tool_schemas",
+                "tool_schemas",
+                "admission_tool_schemas",
+                "deferred_tool_schemas",
+                "always_load_tool_names",
+                "client_pipeline_skill_names",
+            ] {
+                let original = wire["heavy"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field)
+                    .unwrap();
+                assert!(
+                    serde_json::from_value::<
+                        astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
+                    >(wire.clone())
+                    .is_err(),
+                    "missing native input {field} cannot default during recovery"
+                );
+                wire["heavy"][field] = original;
+            }
+            let deadline_field = wire["heavy"]
+                .as_object_mut()
+                .unwrap()
+                .remove("execution_deadline")
+                .unwrap();
+            assert!(
+                serde_json::from_value::<
                     astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
-                >(&saved.checkpoint_json)
+                >(wire.clone())
+                .is_err(),
+                "missing deadline authority must not silently become an unbounded grant",
+            );
+            wire["heavy"]["execution_deadline"] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<
+                    astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
+                >(wire.clone())
+                .is_ok(),
+                "an explicit unbounded grant remains representable",
+            );
+            wire["heavy"]["execution_deadline"] = deadline_field;
+            let astra_services::runs::DurableExecutionHandoff::V1 { heavy: payload, .. } =
+                serde_json::from_value::<
+                    astra_services::runs::DurableExecutionHandoff<RuntimeExecutionHandoff>,
+                >(wire)
                 .unwrap();
             assert_eq!(
                 matches!(payload.tool_ledger, ToolLedgerContinuation::Bound { .. }),
                 accounting_available
+            );
+            assert_eq!(payload.execution_deadline, Some(deadline.snapshot()));
+            assert_eq!(
+                payload.permissions,
+                state
+                    .permission_context
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .await
+                    .capture_continuation()
+                    .unwrap(),
+            );
+            let permission_context = state.permission_context.take();
+            let without_permissions =
+                crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
+                    .unwrap();
+            assert!(
+                !host
+                    .persist_execution_handoff(&state, without_permissions)
+                    .await
+                    .unwrap()
+            );
+            state.permission_context = permission_context;
+            assert_eq!(payload.last_turn_policy, state.last_turn_policy);
+            assert!(payload.work_evidence_advisory_emitted);
+            assert!(payload.parallel_batching_advisory_emitted);
+            assert!(payload.cache_waste_advisory_emitted);
+            assert_eq!(payload.introspection_count, 2);
+            assert_eq!(payload.turn_sigs, state.stall.turn_sigs[3..]);
+            assert_eq!(payload.stall_events, state.stall.events);
+            payload
+                .work_unit_observations
+                .validate_continuation()
+                .unwrap();
+            let mut restored_observations = payload.work_unit_observations.clone();
+            let mut stale_observation = observation.clone();
+            stale_observation.status = astra_core::work_unit::WorkUnitStatus::Running;
+            stale_observation.revision = 1;
+            assert_eq!(
+                restored_observations.observe(&stale_observation),
+                astra_core::work_unit::WorkUnitObservationOutcome::Ignored
+            );
+            payload.circuit_breaker.validate_continuation().unwrap();
+            assert_eq!(
+                serde_json::to_value(&payload.admitted_tool_policy).unwrap(),
+                serde_json::to_value(&state.admitted_tool_policy).unwrap(),
+                "recovery must retain the original admission policy, not current configuration",
+            );
+            let restored_recorder =
+                astra_pipeline::step_recorder::StepRecorder::restore_settled_continuation(
+                    "handoff-user",
+                    "handoff-session",
+                    "handoff-run",
+                    payload.recorder.clone(),
+                    &payload.heavy,
+                )
+                .expect("restore the recorder captured by the actual handoff writer");
+            assert!(restored_recorder.events().is_empty());
+            assert_eq!(
+                serde_json::to_value(restored_recorder.current_step()).unwrap(),
+                serde_json::to_value(state.step_recorder.current_step()).unwrap(),
             );
             payload
                 .hooks
@@ -29340,6 +29607,93 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let history = records
+            .iter()
+            .map(|record| HistoricalToolCallContinuation {
+                record: record.clone(),
+                completion: record.execution_completion.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut wire = serde_json::to_value(&history).unwrap();
+        let decoded: Vec<HistoricalToolCallContinuation> =
+            serde_json::from_value(wire.clone()).unwrap();
+        validate_handoff_tool_history(&decoded, "user1", "sess1", "run1", Some("chain"), Some(2))
+            .unwrap();
+        for cursor in [None, Some(1)] {
+            assert!(
+                validate_handoff_tool_history(
+                    &decoded,
+                    "user1",
+                    "sess1",
+                    "run1",
+                    Some("chain"),
+                    cursor,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            decoded
+                .iter()
+                .all(|entry| entry.record.execution_completion.is_none())
+        );
+        assert_eq!(decoded[0].completion, records[0].execution_completion);
+        assert_eq!(decoded[1].completion, records[1].execution_completion);
+        assert!(
+            validate_handoff_tool_history(
+                &decoded,
+                "other-owner",
+                "sess1",
+                "run1",
+                Some("chain"),
+                Some(2)
+            )
+            .is_err()
+        );
+        let mut reversed = decoded.clone();
+        reversed.reverse();
+        assert!(
+            validate_handoff_tool_history(
+                &reversed,
+                "user1",
+                "sess1",
+                "run1",
+                Some("chain"),
+                Some(2)
+            )
+            .is_err()
+        );
+        let mut duplicated = decoded.clone();
+        duplicated.push(decoded[1].clone());
+        assert!(
+            validate_handoff_tool_history(
+                &duplicated,
+                "user1",
+                "sess1",
+                "run1",
+                Some("chain"),
+                Some(2)
+            )
+            .is_err()
+        );
+        wire[0].as_object_mut().unwrap().remove("completion");
+        assert!(
+            serde_json::from_value::<Vec<HistoricalToolCallContinuation>>(wire.clone()).is_err()
+        );
+        wire[0]["completion"] = Value::Null;
+        let unknown: Vec<HistoricalToolCallContinuation> = serde_json::from_value(wire).unwrap();
+        assert!(unknown[0].completion.is_none());
+        assert!(unknown[0].record.execution_completion.is_none());
+        // Exercise the reconstructed continuation, not the original live
+        // records: ordinary record serde deliberately drops authority.
+        let records = decoded
+            .into_iter()
+            .map(|entry| {
+                let mut record = entry.record;
+                record.execution_completion = entry.completion;
+                record
+            })
+            .collect::<Vec<_>>();
         let assessment = TaskResolutionAssessment {
             scope: "intent".into(),
             boundary_id: "boundary".into(),
@@ -29872,15 +30226,7 @@ mod tests {
         state.sticky_tool_schemas = host.visible_turn_tools(&mut state);
         let before = state.sticky_tool_schemas.clone();
         let args = json!({"facet":"overview","depth":"diagnostic","horizon":"session"});
-        let direct = json!({"id":"direct-reflect","type":"function","function":{
-            "name":"reflect","arguments":args.to_string()
-        }});
-        assert!(
-            host.admit_terminal_tool_calls(&state, &[direct], Some("tool_calls"))
-                .is_empty()
-        );
-        let rejected = host.pending_tool_call_admission.take().unwrap();
-        assert!(rejected.rejected[0].result.contains("tool_invalid_args"));
+        assert!(!schema_names(&before).contains("reflect"));
 
         let carrier = |arguments: Value| {
             json!({"id":"typed-reflect","type":"function","function":{
@@ -29904,8 +30250,8 @@ mod tests {
             admit(&host, &state, json!({"question":"Current progress?"}))
                 .admitted
                 .len(),
-            1,
-            "ordinary resident reflection does not require selection"
+            0,
+            "deferred reflection requires a selected carrier even for ordinary questions"
         );
         let contracts = host.current_deferred_tool_contract_schemas(&state);
         let selected =
@@ -30420,7 +30766,7 @@ mod tests {
             .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in ["ask_user", "notify", "tool_search", "introspect"] {
+        for expected in ["ask_user", "tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible when server-service capacity is disabled: {names:?}"
@@ -32200,7 +32546,7 @@ mod tests {
             .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in ["bash", "read_file", "memory", "notify", "tool_search"] {
+        for expected in ["bash", "read_file", "tool_search"] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible in the composed server+edge surface: {names:?}"
@@ -32211,7 +32557,7 @@ mod tests {
             );
         }
         let deferred = schema_names(&host.deferred_tool_schemas);
-        for expected in ["session", "web_search"] {
+        for expected in ["session", "web_search", "memory", "notify"] {
             assert!(
                 deferred.contains(expected),
                 "{expected} should remain available through deferred discovery: {deferred:?}"
@@ -32258,7 +32604,7 @@ mod tests {
             names.contains("bash"),
             "edge-declared runtime tools should remain visible"
         );
-        for expected in ["notify", "tool_search", "introspect"] {
+        for expected in ["tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible with edge tools: {names:?}"
@@ -32980,7 +33326,7 @@ mod tests {
 
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
-        for expected in ["notify", "tool_search", "introspect"] {
+        for expected in ["tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid with server-service capacity disabled: {:?}",
@@ -33024,13 +33370,14 @@ mod tests {
             !names.contains("bash"),
             "prompt-visible edge runtime tools must mirror the advertised offer set"
         );
-        for expected in ["notify", "tool_search", "introspect"] {
+        for expected in ["tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid while runtime tools are provider-scoped"
             );
         }
         assert!(schema_names(&host.deferred_tool_schemas).contains("session"));
+        assert!(schema_names(&host.deferred_tool_schemas).contains("notify"));
     }
 
     #[test]
@@ -34665,10 +35012,17 @@ mod tests {
     #[test]
     fn deadline_producer_keeps_instruction_separate_from_timestamp() {
         let content = ServerAgenticLoopHost::execution_time_budget_context(
-            ExecutionDeadlineAuthority {
-                deadline_unix_ms: 123456789,
+            ExecutionDeadlineAuthority::from_budget_at(
+                ExecutionTimeBudget {
+                    remaining_seconds: 90,
+                },
+                123366789,
+            )
+            .unwrap(),
+            astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::from_secs(60),
+                total_remaining: Duration::from_secs(90),
             },
-            Duration::from_secs(90),
             7,
         )
         .unwrap();
@@ -36140,11 +36494,12 @@ mod tests {
 
     #[tokio::test]
     async fn explain_analyze_tracks_tool_calls_and_final_settlement_with_explicit_coverage() {
-        for lane in [
-            None,
-            Some((256, false)),
-            Some((1, false)),
-            Some((256, true)),
+        for (lane, interrupted) in [
+            (None, false),
+            (Some((256, false)), false),
+            (Some((1, false)), false),
+            (Some((256, true)), false),
+            (None, true),
         ] {
             let mut host = test_host_builder("u-explain-tools", "s-explain-tools").build();
             let (tx, mut live_events) =
@@ -36216,8 +36571,17 @@ mod tests {
                 outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
             });
             host.on_final_output_ready(&state).await;
+            state.final_text = "Observed output".into();
+            if interrupted {
+                state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                    astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+                    astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                    crate::turn::agentic_loop::lifecycle::interruption_state_summary(&state, None),
+                ));
+            }
             host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
                 .await;
+            assert_eq!(state.final_text, "Observed output");
 
             let explain_facts = host
                 .take_emitted_events()
@@ -36286,10 +36650,26 @@ mod tests {
                 .expect("answer settlement node");
             assert_eq!(settlement["label"], "Deliver final answer");
             assert_eq!(settlement["transition"], "finished");
+            assert_eq!(
+                settlement["outcome"],
+                if interrupted {
+                    "interrupted"
+                } else {
+                    "completed"
+                }
+            );
             let turn_terminal = explain_facts
                 .iter()
                 .find(|event| event["kind"] == "turn" && event["transition"] == "finished")
                 .expect("turn terminal fact");
+            assert_eq!(
+                turn_terminal["outcome"],
+                if interrupted {
+                    "interrupted"
+                } else {
+                    "completed"
+                }
+            );
             assert_eq!(
                 turn_terminal["coverage_gaps"],
                 json!([
@@ -40527,19 +40907,6 @@ mod tests {
             intent,
             scoped_inference_operation_id("intent", &"b".repeat(64))
         );
-        let snapshot_a = delegation_intent_assessment_operation_id(
-            &digest,
-            "sha256:input-a",
-            "sha256:snapshot-a",
-        );
-        let snapshot_b = delegation_intent_assessment_operation_id(
-            &digest,
-            "sha256:input-a",
-            "sha256:snapshot-b",
-        );
-        assert_eq!(snapshot_a.len(), 64);
-        assert_ne!(snapshot_a, snapshot_b);
-        assert_ne!(snapshot_a, intent);
     }
 
     #[tokio::test]
@@ -40653,169 +41020,6 @@ mod tests {
                 .delegation_model_requirement,
             Some(astra_services::WorkAdmissionTruth::No)
         );
-    }
-
-    #[test]
-    fn delegation_model_assessment_records_safe_summary_and_typed_explain_outcomes() {
-        use astra_services::delegation_model_requirement::{
-            DelegationModelCandidate, DelegationSlotBrief,
-            materialize_delegation_intent_requirements, parse_delegation_intent_requirements,
-        };
-
-        let user_text = "Use PrivateModel for review. Private task details.";
-        let candidates = vec![DelegationModelCandidate {
-            candidate_id: "offer-selected".into(),
-            model_name: "PrivateModel".into(),
-            provider: "private-provider".into(),
-            access_label: "private-access-label".into(),
-        }];
-        let slots = vec![DelegationSlotBrief {
-            description: "private-description".into(),
-            prompt: "private-slot-prompt".into(),
-            ..Default::default()
-        }];
-        let resolved = json!({
-            "disposition": "resolved",
-            "requirements": [{
-                "candidate_index": 0,
-                "model_quote": "PrivateModel",
-                "scope_quote": "review",
-                "slots": [0]
-            }]
-        });
-        for (response, outcome, error_kind) in [
-            (resolved, "resolved", Value::Null),
-            (
-                json!({"disposition":"not_applicable"}),
-                "resolved",
-                Value::Null,
-            ),
-            (
-                json!({"disposition":"unresolved","reason":
-                    "Ambiguous PrivateModel: private provider payload sk-test-do-not-record"
-                }),
-                "blocked",
-                json!("delegation_model_scope_unresolved"),
-            ),
-            (
-                json!({"disposition":"unresolved","reason":
-                    "Unavailable PrivateModel at https://private.invalid sk-test-do-not-record"
-                }),
-                "blocked",
-                json!("delegation_model_scope_unresolved"),
-            ),
-        ] {
-            let mut host = test_host_builder("user", "session").build();
-            let mut state = create_test_state();
-            state.current_run_id = Some("run-assessment".into());
-            state.session_turn = 3;
-            state.current_round_index = 2;
-            state.turn_event_buffer = Some(
-                astra_services::session_journal::TurnEventBuffer::begin_turn(Some("session"), 3),
-            );
-            host.on_turn_started(&state);
-            let assessment = parse_delegation_intent_requirements(
-                &response.to_string(),
-                user_text,
-                &candidates,
-                Some(&slots),
-                false,
-            )
-            .unwrap();
-            let source = astra_turn_types::DelegationUserRequirementSource {
-                user_id: "user".into(),
-                session_id: "session".into(),
-                session_turn: 3,
-                applied_intent_id: None,
-                command_intent_id: None,
-                user_intent_digest: "source-digest".into(),
-            };
-            let assessed = materialize_delegation_intent_requirements(&assessment, source).unwrap();
-            let operation_id =
-                (response["disposition"] == "resolved").then_some("sha256:assessment-operation");
-            host.record_delegation_model_assessment(
-                &mut state,
-                Instant::now(),
-                1,
-                &assessed,
-                Some(&assessment.summary),
-                operation_id,
-            );
-
-            let trace = state.turn_event_buffer.as_mut().unwrap().drain();
-            assert_eq!(trace.len(), 1);
-            assert_eq!(trace[0].session_id.as_deref(), Some("session"));
-            assert_eq!(trace[0].turn, Some(3));
-            let ingestion = astra_services::event_ingestion::IngestionEvent::from_journal_event(
-                &trace[0], "user",
-            )
-            .expect("assessment reaches the existing durable ingestion projection");
-            assert_eq!(ingestion.event_type, "trace_span");
-            let metadata = ingestion.metadata.as_ref().unwrap();
-            assert_eq!(metadata["name"], "delegation_model_assessment");
-            assert_eq!(metadata["trace_id"], "run-assessment");
-            let evidence: Value = serde_json::from_str(
-                metadata["attrs"]["delegation_model_assessment"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(evidence["assessment"], json!(assessment.summary));
-            assert_eq!(evidence["method"], "candidate_aware_one_call_v1");
-            assert_eq!(evidence["source_digest"], "source-digest");
-            assert_eq!(evidence["operation_id"], json!(operation_id));
-            assert_eq!(evidence["round_index"], 2);
-            assert_eq!(evidence["attempt_index"], 1);
-            assert_eq!(evidence["outcome"], outcome);
-            assert_eq!(evidence["error_kind"], error_kind);
-            if response["disposition"] == "resolved" {
-                assert_eq!(
-                    evidence["assessment"]["selections"][0]["candidate_id"],
-                    "offer-selected"
-                );
-                assert_eq!(
-                    evidence["assessment"]["selections"][0]["slot_indices"],
-                    json!([0])
-                );
-            }
-
-            let events = host.take_emitted_events();
-            let facts = events
-                .iter()
-                .map(|event| astra_turn_types::decode_explain_analyze_wire(event).unwrap())
-                .collect::<Vec<_>>();
-            assert!(facts.iter().all(|fact| fact.is_valid()));
-            assert_eq!(facts.len(), 3, "root and one assessment start/finish pair");
-            assert_eq!(facts[1].node_id, facts[2].node_id);
-            assert!(
-                facts[2]
-                    .node_id
-                    .ends_with(metadata["span_id"].as_str().unwrap())
-            );
-            assert_eq!(serde_json::to_value(facts[2].outcome).unwrap(), outcome);
-            assert!(facts[2].label.contains("candidates: 1"));
-            assert!(
-                facts[2].usage.is_none(),
-                "assessment must not duplicate inference usage"
-            );
-            let recorded = format!("{metadata}{}", json!(events));
-            for private in [
-                user_text,
-                "PrivateModel",
-                "private-provider",
-                "private-access-label",
-                "private-description",
-                "private-slot-prompt",
-                "private provider payload",
-                "https://private.invalid",
-                "sk-test-do-not-record",
-            ] {
-                assert!(
-                    !recorded.contains(private),
-                    "private assessment input leaked: {private}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -40976,25 +41180,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fused_delegation_assessment_reuses_intent_without_catalog_or_judge_read() {
+    async fn proposed_delegation_controls_do_not_create_auxiliary_user_constraints() {
         let reads = Arc::new(std::sync::Mutex::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let response = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A","slots":[0]
-        }]})
-        .to_string();
-        let client = |response: String| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
         let mut host = test_host_builder("catalog-user", "catalog-session")
             .with_model_service(Some(Arc::new(DelegationCatalogSpy {
                 reads: reads.clone(),
             })))
-            .with_test_judgment_clients([client(response.clone()), client(response)])
+            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                requests: requests.clone(),
+            })
+                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
             .build();
         let mut state = create_test_state();
         state.context_manifest_user_id = Some("catalog-user".into());
@@ -41002,31 +41200,209 @@ mod tests {
         state.current_run_id = Some("catalog-run".into());
         state.canonical_turn_chain_id = Some("catalog-chain".into());
         state.current_run_owner_generation = Some(1);
-        let make_call = |id: &str| {
-            json!({"id":id,"type":"function","function":{
-                "name":"agent", "arguments":json!({
-                    "action":"spawn","description":"Independent","prompt":"Reply OK"
-                }).to_string()
-            }})
-        };
-        for (text, id, expected_calls) in [
-            ("Use Model-A for every delegated child.", "first", 1),
-            ("Use Model-A for every delegated child.", "second", 1),
-            ("Use Model-A for each delegated child.", "third", 2),
+        for (text, policy) in [
+            (
+                "Use the requested model for this child.",
+                json!({"mode":"fixed","selector":{
+                "kind":"configured_name","model_name":"Model-A"}}),
+            ),
+            ("Ask a child to quote a model name.", Value::Null),
         ] {
             state.user_intent = text.into();
-            let (admitted, blocked) = host
-                .admitted_delegation_models(&mut state, &[make_call(id)])
-                .await;
-            assert!(blocked.is_empty(), "{id}: {blocked:?}");
+            let mut args =
+                json!({"action":"spawn","description":"Independent","prompt":"Reply OK"});
+            if !policy.is_null() {
+                args["requested_model_policy"] = policy.clone();
+            }
+            let call = json!({"id":"proposal","type":"function","function":{
+                "name":"agent","arguments":args.to_string()
+            }});
+            let (admitted, blocked) = host.admitted_delegation_models(&mut state, &[call]).await;
+            assert!(blocked.is_empty(), "{blocked:?}");
+            let admission = &admitted["proposal"];
+            if policy.is_null() {
+                assert!(matches!(
+                    admission.outcome,
+                    astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+                        slot_count: 1
+                    }
+                ));
+            } else {
+                let astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots } =
+                    &admission.outcome
+                else {
+                    panic!("proposal was dropped")
+                };
+                assert_eq!(json!(slots[0].requested_model_policy), policy);
+                assert!(slots[0].model_selection.is_none());
+                assert!(slots[0].reasoning.is_none());
+                assert_eq!(
+                    slots[0].model_strength,
+                    Some(astra_turn_types::DelegationRequirementStrength::Default)
+                );
+            }
             assert!(matches!(
-                &admitted[id].outcome,
-                astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                    if slots.len() == 1 && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
+                admission.child_requirements.as_slice(),
+                [astra_turn_types::DelegationIntentRequirements::Unconstrained { .. }]
             ));
-            assert_eq!(*reads.lock().unwrap(), expected_calls);
-            assert_eq!(requests.lock().unwrap().len(), expected_calls);
         }
+        assert_eq!(
+            *reads.lock().unwrap(),
+            0,
+            "the child executor owns exact selector admission"
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no competing semantic judgment"
+        );
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements =
+            astra_turn_types::DelegationIntentRequirements::Requirements {
+                source: delegation_requirement_source(
+                    &delegation_intent_source_from_state(&state).unwrap(),
+                ),
+                requirements: vec![astra_turn_types::DelegationIntentRequirement {
+                    requirement_id: "typed-model".into(),
+                    model_selection: Some(astra_turn_types::ModelSelection {
+                        offering_id: "required-offer".into(),
+                    }),
+                    requested_model_policy: None,
+                    reasoning: None,
+                    task_scope_quote: None,
+                    propagation: astra_turn_types::DelegationRequirementPropagation::Descendants,
+                    strength: astra_turn_types::DelegationRequirementStrength::Hard,
+                }],
+            };
+        let proposed = |policy: Value| {
+            json!({"id":"typed-proposal","type":"function","function":{
+                "name":"agent","arguments":json!({"action":"spawn","description":"Independent","prompt":"Reply OK",
+                    "requested_model_policy":policy}).to_string()
+            }})
+        };
+        let conflict = proposed(
+            json!({"mode":"fixed","selector":{"kind":"offering_id","offering_id":"other-offer"}}),
+        );
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[conflict])
+            .await;
+        assert!(admitted.is_empty());
+        assert_eq!(blocked.len(), 1);
+        assert!(
+            blocked[0]
+                .output
+                .contains("conflicts with hard delegation requirement")
+        );
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[proposed(Value::Null)])
+            .await;
+        assert!(blocked.is_empty());
+        let astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots } =
+            &admitted["typed-proposal"].outcome
+        else {
+            panic!("typed authority was lost")
+        };
+        assert_eq!(
+            slots[0].model_selection.as_ref().unwrap().offering_id,
+            "required-offer"
+        );
+        state.user_intent = "A different authenticated instruction".into();
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[proposed(Value::Null)])
+            .await;
+        assert!(admitted.is_empty());
+        assert_eq!(blocked.len(), 1);
+        assert!(blocked[0].output.contains("different user source"));
+        assert_eq!(*reads.lock().unwrap(), 0);
+        assert!(requests.lock().unwrap().is_empty());
+        for (name, allowed) in [("Model-A", true), ("Unavailable Model", false)] {
+            let origin = delegation_requirement_source(
+                &delegation_intent_source_from_state(&state).unwrap(),
+            );
+            let astra_turn_types::DelegationIntentRequirements::Requirements {
+                source,
+                requirements,
+            } = &mut state
+                .skills
+                .request_constraints
+                .delegated_model_requirements
+            else {
+                unreachable!()
+            };
+            *source = origin;
+            requirements[0].model_selection = None;
+            requirements[0].requested_model_policy =
+                Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                    selector: astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name: name.into(),
+                        source: None,
+                    },
+                });
+            let call = proposed(
+                json!({"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-a"}}),
+            );
+            let (admitted, blocked) = host.admitted_delegation_models(&mut state, &[call]).await;
+            assert_eq!(admitted.len(), usize::from(allowed));
+            assert_eq!(blocked.len(), usize::from(!allowed));
+            if allowed {
+                let astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots } =
+                    &admitted["typed-proposal"].outcome
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    slots[0].model_selection.as_ref().unwrap().offering_id,
+                    "offer-a"
+                );
+            }
+        }
+        assert_eq!(
+            *reads.lock().unwrap(),
+            2,
+            "only actual typed named constraints load a catalog"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        let astra_turn_types::DelegationIntentRequirements::Requirements { requirements, .. } =
+            &mut state
+                .skills
+                .request_constraints
+                .delegated_model_requirements
+        else {
+            unreachable!()
+        };
+        requirements[0].task_scope_quote = Some("authenticated instruction".into());
+        host.test_judgment_clients.clear();
+        host.test_judgment_clients.push_back(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                json!({"assignments":[{"requirement_id":"typed-model","slot_indices":[]}],"unresolved":[]}).to_string()
+            ])),
+            requests: requests.clone(),
+        }));
+        let (admitted, blocked) = host
+            .admitted_delegation_models(&mut state, &[proposed(Value::Null)])
+            .await;
+        assert!(blocked.is_empty(), "{blocked:?}");
+        assert!(matches!(
+            admitted["typed-proposal"].outcome,
+            astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { .. }
+        ));
+        assert!(
+            matches!(admitted["typed-proposal"].child_requirements.as_slice(),
+            [astra_turn_types::DelegationIntentRequirements::Requirements { requirements, .. }]
+                if requirements.len() == 1 && requirements[0].task_scope_quote.is_some())
+        );
+        assert_eq!(
+            *reads.lock().unwrap(),
+            2,
+            "unmatched descendant names must not block or load the catalog"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "only existing typed scope needed judgment"
+        );
     }
 
     #[tokio::test]
@@ -41054,6 +41430,16 @@ mod tests {
         state.current_run_owner_generation = Some(1);
         state.user_intent =
             "Delegate review to Model-A-Pro; independently inspect the catalog.".into();
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements =
+            astra_turn_types::DelegationIntentRequirements::Unresolved {
+                source: delegation_requirement_source(
+                    &delegation_intent_source_from_state(&state).unwrap(),
+                ),
+                reason: reason.into(),
+            };
         for id in ["first-spawn", "repeated-spawn"] {
             let call = json!({"id":id,"type":"function","function":{
                 "name":"agent","arguments":json!({"action":"spawn","description":"Review",
@@ -41107,13 +41493,13 @@ mod tests {
         }
         assert_eq!(
             *reads.lock().unwrap(),
-            1,
-            "reuse the authorized catalog snapshot"
+            0,
+            "a structured rejection needs no catalog lookup"
         );
         assert_eq!(
             requests.lock().unwrap().len(),
-            1,
-            "never pay to reinterpret the same intent"
+            0,
+            "never reinterpret independently supplied constraints"
         );
         assert_eq!(state.stall.turn_sigs[0], state.stall.turn_sigs[1]);
         state.agentic_turn_budget =
@@ -41135,469 +41521,6 @@ mod tests {
         assert_eq!(
             state.max_turns, old_limit,
             "rejected repetition cannot renew execution indefinitely"
-        );
-    }
-
-    #[tokio::test]
-    async fn delegation_response_recovery_is_bounded_and_does_not_cache_user_ambiguity() {
-        let valid = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A","slots":[0]
-        }]})
-        .to_string();
-        let unresolved =
-            json!({"disposition":"unresolved","reason":"The user must choose a variant."})
-                .to_string();
-        for (responses, expected_kind, expected_calls) in [
-            (vec!["invalid".to_string(), valid], None, 2),
-            (
-                vec!["invalid".to_string(), "invalid".to_string()],
-                Some("delegation_model_assessment_unavailable"),
-                2,
-            ),
-            (
-                vec![unresolved],
-                Some("delegation_model_scope_unresolved"),
-                1,
-            ),
-        ] {
-            let reads = Arc::new(std::sync::Mutex::new(0));
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut host = test_host_builder("user", "session")
-                .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                    reads: reads.clone(),
-                })))
-                .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                    provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                    responses: std::sync::Mutex::new(responses.into()),
-                    requests: requests.clone(),
-                }) as Box<dyn SummaryLlmClient>])
-                .build();
-            let mut state = create_test_state();
-            state.context_manifest_user_id = Some("user".into());
-            state.current_session_id = Some("session".into());
-            state.current_run_id = Some("root-run".into());
-            state.canonical_turn_chain_id = Some("chain".into());
-            state.current_run_owner_generation = Some(1);
-            state.user_intent = "Use Model-A for the delegated child.".into();
-            for id in ["first", "retry"] {
-                let call = json!({"id":id,"type":"function","function":{
-                    "name":"agent","arguments":json!({"action":"spawn", "description":"Independent", "prompt":"Reply OK"}).to_string()
-                }});
-                let (admitted, blocked) =
-                    host.admitted_delegation_models(&mut state, &[call]).await;
-                if let Some(kind) = expected_kind {
-                    assert!(admitted.is_empty());
-                    assert_eq!(blocked.len(), 1);
-                    assert_eq!(
-                        blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
-                        kind
-                    );
-                    let fields = blocked[0].tool_result_fields.as_ref().unwrap();
-                    assert_eq!(fields["retryable"], false);
-                    assert_eq!(fields["executed"], false);
-                } else {
-                    assert!(blocked.is_empty(), "{blocked:?}");
-                    assert!(matches!(&admitted[id].outcome,
-                        astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                        if slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"));
-                    break;
-                }
-            }
-            assert_eq!(*reads.lock().unwrap(), 1);
-            let requests = requests.lock().unwrap();
-            assert_eq!(requests.len(), expected_calls);
-            if expected_calls == 2 {
-                assert_eq!(
-                    &requests[1][..requests[0].len()],
-                    requests[0].as_slice(),
-                    "recovery must preserve the original source and candidate/slot snapshot"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn negative_model_presence_does_not_skip_natural_model_selection() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let response = json!({
-            "disposition": "resolved",
-            "requirements": [{"candidate_index": 0, "model_quote": "Model-A", "slots": [0]}]
-        })
-        .to_string();
-        let mut host = test_host_builder("negative-presence-user", "negative-presence-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("negative-presence-user".into());
-        state.current_session_id = Some("negative-presence-session".into());
-        state.current_run_id = Some("negative-presence-run".into());
-        state.canonical_turn_chain_id = Some("negative-presence-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for this delegated child.".into();
-        let source = delegation_intent_source_from_state(&state).expect("user source");
-        host.apply_classified_work_admission(ClassifiedWorkAdmission {
-            decision: astra_services::WorkAdmissionDecision::NotRequired {
-                assessment: None,
-                domain: None,
-                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
-                mutation_completion_scope:
-                    astra_config::user_profile::MutationCompletionScope::Unknown,
-                execution_topology: astra_services::WorkExecutionTopology::Primary,
-                required_capabilities: Vec::new(),
-            },
-            delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::No),
-            source: Some(source),
-            work_handoff_pending: true,
-        });
-
-        let call = json!({
-            "id": "marker-child",
-            "type": "function",
-            "function": {
-                "name": "agent",
-                "arguments": json!({
-                    "action": "spawn",
-                    "description": "Deterministic marker",
-                    "prompt": "Reply exactly DEFAULT-CHILD-MARKER-OK"
-                })
-                .to_string()
-            }
-        });
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&call))
-            .await;
-
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(
-            &admitted["marker-child"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().is_some_and(|selection| {
-                        selection.offering_id == "offer-a"
-                    })
-        ));
-        assert_eq!(
-            *reads.lock().unwrap(),
-            1,
-            "the candidate-aware selector owns natural-language model binding"
-        );
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        assert!(matches!(
-            state
-                .skills
-                .request_constraints
-                .delegated_model_requirements,
-            astra_turn_types::DelegationIntentRequirements::Requirements { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn scoped_auto_rejects_only_its_invocation_not_an_independent_fixed_child() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let response = json!({"disposition":"resolved","requirements":[
-            {"model_quote":"auto balanced","automatic_strategy":"balanced",
-             "scope_quote":"group X","slots":[0]},
-            {"candidate_index":0,"model_quote":"Model-A","scope_quote":"group Y","slots":[1]}
-        ]})
-        .to_string();
-        let mut host = test_host_builder("mixed-user", "mixed-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("mixed-user".into());
-        state.current_session_id = Some("mixed-session".into());
-        state.current_run_id = Some("mixed-run".into());
-        state.canonical_turn_chain_id = Some("mixed-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use auto balanced for group X and Model-A for group Y".into();
-        let call = |id: &str, description: &str| {
-            json!({"id":id,"type":"function","function":{
-                "name":"agent","arguments":json!({
-                    "action":"spawn","description":description,"prompt":"Reply OK"
-                }).to_string()
-            }})
-        };
-        let (admitted, blocked) = host
-            .admitted_delegation_models(
-                &mut state,
-                &[call("auto-x", "group X"), call("fixed-y", "group Y")],
-            )
-            .await;
-        assert_eq!(*reads.lock().unwrap(), 1);
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        assert_eq!(blocked.len(), 1, "{blocked:?}");
-        assert_eq!(blocked[0].request_id, "auto-x");
-        assert_eq!(
-            blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
-            "delegation_model_unavailable"
-        );
-        assert_eq!(admitted.len(), 1);
-        assert!(matches!(
-            &admitted["fixed-y"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1 && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-    }
-
-    #[tokio::test]
-    async fn scoped_fixed_binding_is_local_to_each_invocation_and_reused_later() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let first = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A",
-            "scope_quote":"review","slots":[0,2]
-        }]})
-        .to_string();
-        let later = json!({"assignments":[{"requirement_id":"0","slot_indices":[0]}],
-            "unresolved":[]})
-        .to_string();
-        let client = |response: String| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
-        let mut host = test_host_builder("scoped-user", "scoped-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([client(first), client(later)])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("scoped-user".into());
-        state.current_session_id = Some("scoped-session".into());
-        state.current_run_id = Some("scoped-run".into());
-        state.canonical_turn_chain_id = Some("scoped-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for review.".into();
-        let fanout = json!({"id":"fanout","type":"function","function":{
-            "name":"agent_fanout","arguments":json!({
-                "action":"start","group_id":"scoped-group","target_count":2,
-                "slots":[{"description":"review","prompt":"Review"},
-                         {"description":"plan","prompt":"Plan"}]
-            }).to_string()
-        }});
-        let spawn = |id: &str, policy: Option<Value>| {
-            let mut args = json!({"action":"spawn","description":"review","prompt":"Review"});
-            if let Some(policy) = policy {
-                args["requested_model_policy"] = policy;
-            }
-            json!({"id":id,"type":"function","function":{
-                "name":"agent","arguments":args.to_string()
-            }})
-        };
-        let bad = spawn(
-            "bad",
-            Some(json!({"mode":"fixed","selector":{
-                "kind":"offering_id","offering_id":"wrong-offering"
-            }})),
-        );
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[fanout, bad])
-            .await;
-        assert_eq!(blocked.len(), 1, "{blocked:?}");
-        assert_eq!(blocked[0].request_id, "bad");
-        assert_eq!(admitted.len(), 1);
-        assert!(matches!(&admitted["fanout"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 2
-                    && slots[0].slot_index == 0
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-                    && slots[1].slot_index == 1
-                    && slots[1].model_selection.is_none()
-        ));
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[spawn("later", None)])
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(&admitted["later"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].slot_index == 0
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        assert_eq!(*reads.lock().unwrap(), 1);
-        assert_eq!(requests.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn successful_scope_batch_advances_without_reassessing_candidates() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let first = json!({"disposition":"resolved","requirements":[
-            {"candidate_index":0,"model_quote":"Model-A",
-             "scope_quote":"review","slots":[0]},
-            {"candidate_index":0,"model_quote":"Model-A",
-             "scope_quote":"testing","slots":[]}
-        ]})
-        .to_string();
-        let later = json!({"assignments":[
-            {"requirement_id":"1","slot_indices":[0]}
-        ],"unresolved":[]})
-        .to_string();
-        let client = |response: String| {
-            Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
-                requests: requests.clone(),
-            }) as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>
-        };
-        let mut host = test_host_builder("scope-ledger-user", "scope-ledger-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([client(first), client(later)])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("scope-ledger-user".into());
-        state.current_session_id = Some("scope-ledger-session".into());
-        state.current_run_id = Some("scope-ledger-run".into());
-        state.canonical_turn_chain_id = Some("scope-ledger-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for review and testing".into();
-        let call = |id: &str, description: &str, prompt: &str| {
-            json!({"id":id,"type":"function","function":{
-                "name":"agent", "arguments":json!({
-                    "action":"spawn","description":description,"prompt":prompt
-                }).to_string()
-            }})
-        };
-
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[call("first", "review", "Review")])
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(
-            &admitted["first"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        state.stall.tool_call_records.push(ToolCallRecord {
-            tool_call_id: Some("first".into()),
-            name: "agent".into(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, &[call("second", "testing", "Test")])
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert!(matches!(
-            &admitted["second"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        assert_eq!(*reads.lock().unwrap(), 1, "candidate catalog is turn-local");
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            2,
-            "one fused candidate assessment plus one incremental scope judgment"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_fused_scope_reuses_one_slot_repair_without_a_second_judgment() {
-        let reads = Arc::new(std::sync::Mutex::new(0));
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut host = test_host_builder("scope-repair-user", "scope-repair-session")
-            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
-                reads: reads.clone(),
-            })))
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    json!({"disposition":"resolved","requirements":[{
-                        "candidate_index":0,"model_quote":"Model-A",
-                        "scope_quote":"delegated child","slots":[0]
-                    }]})
-                    .to_string(),
-                ])),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.context_manifest_user_id = Some("scope-repair-user".into());
-        state.current_session_id = Some("scope-repair-session".into());
-        state.current_run_id = Some("scope-repair-run".into());
-        state.canonical_turn_chain_id = Some("scope-repair-chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use Model-A for this delegated child.".into();
-
-        let first = json!({"id":"first","type":"function","function":{
-            "name":"agent", "arguments":json!({
-                "action":"spawn","description":"first","prompt":"Do the task",
-                "requested_model_policy":{"mode":"fixed","selector":{
-                    "kind":"configured_name","model_name":"Model A"}}
-            }).to_string()
-        }});
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&first))
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert_eq!(admitted.len(), 1);
-
-        // The child admission is rejected after preparation (for example by
-        // the provider identity boundary). The next model round repeats the
-        // same semantic slot with a new tool-call ID, so its frozen scope can
-        // be reused without another judgment.
-        state
-            .stall
-            .tool_call_records
-            .push(astra_services::session_journal::ToolCallRecord {
-                tool_call_id: Some("first".into()),
-                name: "agent".into(),
-                ok: false,
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                error: Some("model selection rejected".into()),
-                ..Default::default()
-            });
-        let retry = json!({"id":"retry","type":"function","function":{
-            "name":"agent", "arguments":json!({
-                "action":"spawn","description":"first","prompt":"Do the task",
-                "requested_model_policy":{"mode":"fixed","selector":{
-                    "kind":"configured_name","model_name":"Model A"}}
-            }).to_string()
-        }});
-        let (admitted, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&retry))
-            .await;
-        assert!(blocked.is_empty(), "{blocked:?}");
-        assert_eq!(admitted.len(), 1);
-        assert!(matches!(
-            &admitted["retry"].outcome,
-            astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
-                if slots.len() == 1
-                    && slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"
-        ));
-        assert_eq!(*reads.lock().unwrap(), 1);
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            1,
-            "the failed repair reused the fused scope binding"
         );
     }
 
@@ -41661,8 +41584,8 @@ mod tests {
             vec![fixed.clone(), call.clone()],
         ] {
             let (admitted, blocked) = host.admitted_delegation_models(&mut state, &calls).await;
-            assert!(admitted.is_empty());
-            assert_eq!(blocked.len(), 2);
+            assert!(admitted.contains_key("fixed-call"));
+            assert_eq!(blocked.len(), 1);
             let error_for = |id: &str| {
                 blocked
                     .iter()
@@ -41674,11 +41597,61 @@ mod tests {
                     .clone()
             };
             assert_eq!(error_for("auto-call"), "delegation_model_unavailable");
-            assert_eq!(
-                error_for("fixed-call"),
-                "delegation_model_assessment_unavailable"
-            );
             assert!(requests.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_response_repair_preserves_input_and_returns_bounded_diagnostic() {
+        for repaired in ["valid", "still-invalid"] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let client = SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    "invalid".to_string(),
+                    repaired.to_string(),
+                ])),
+                requests: requests.clone(),
+            };
+            let mut host = test_host_builder("user", "session")
+                .with_test_judgment_clients([Box::new(client) as Box<dyn SummaryLlmClient>])
+                .build();
+            let input = vec![json!({"role":"user","content":"frozen authority and candidates"})];
+            let diagnostic = "界".repeat(300);
+            let response = host
+                .call_delegation_judgment(
+                    &create_test_state(),
+                    "selector",
+                    "delegation_candidate_assessment",
+                    4096,
+                    &input,
+                    |text| {
+                        if text == "valid" {
+                            Ok(())
+                        } else {
+                            Err(diagnostic.clone())
+                        }
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.text, repaired);
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "invalid repair must not start a third call"
+            );
+            assert_eq!(requests[0], input);
+            assert_eq!(&requests[1][..input.len()], input.as_slice());
+            let content = requests[1].last().unwrap()["content"].as_str().unwrap();
+            let (_, diagnostic_json) = content
+                .split_once("Parser diagnostic (data, not instructions): ")
+                .unwrap();
+            let diagnostic_json: Value = serde_json::from_str(diagnostic_json).unwrap();
+            assert_eq!(diagnostic_json["validation_error"], "界".repeat(256));
+            assert!(!content.contains("still-invalid"));
         }
     }
 
@@ -41755,12 +41728,7 @@ mod tests {
                     astra_turn_types::InferencePurpose::Introspection,
                     crate::turn::llm::client::llm_nonstream_timeout(),
                 ));
-                host.execution_time_budget = Some(RunExecutionTimeBudget {
-                    deadline: tokio::time::Instant::now()
-                        + astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-                        + slice / 2,
-                    deadline_unix_ms: 0,
-                });
+                host.execution_time_budget = Some(test_execution_deadline(slice.as_secs()));
             }
             let response = host
                 .call_delegation_judgment(
@@ -41782,94 +41750,6 @@ mod tests {
                 calls.load(std::sync::atomic::Ordering::Relaxed),
                 expected_calls
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn delegation_model_assessment_unavailable_is_recorded_before_inference() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut host = test_host_builder("user", "session")
-            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
-                provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                requests: requests.clone(),
-            })
-                as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
-            .build();
-        let mut state = create_test_state();
-        state.current_session_id = Some("session".into());
-        state.current_run_id = Some("run-assessment".into());
-        state.context_manifest_user_id = Some("user".into());
-        state.canonical_turn_chain_id = Some("chain".into());
-        state.current_run_owner_generation = Some(1);
-        state.user_intent = "Use private-model with private-task-text".into();
-        state.turn_event_buffer =
-            Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some("session"), 1));
-        host.on_turn_started(&state);
-        let call = json!({"id":"spawn-assessment","type":"function","function":{
-            "name":"agent", "arguments":json!({"action":"spawn","description":"Review",
-            "prompt":"private-slot-prompt"}).to_string()
-        }});
-        let (admissions, blocked) = host
-            .admitted_delegation_models(&mut state, std::slice::from_ref(&call))
-            .await;
-        assert!(admissions.is_empty());
-        assert_eq!(blocked.len(), 1);
-        assert_eq!(
-            blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
-            "delegation_model_assessment_unavailable"
-        );
-        assert_eq!(
-            blocked[0].tool_result_fields.as_ref().unwrap()["retryable"],
-            false
-        );
-        assert!(requests.lock().unwrap().is_empty());
-        assert!(matches!(
-            state
-                .skills
-                .request_constraints
-                .delegated_model_requirements,
-            astra_turn_types::DelegationIntentRequirements::Unavailable { .. }
-        ));
-        let (_, blocked_again) = host.admitted_delegation_models(&mut state, &[call]).await;
-        assert_eq!(blocked_again.len(), 1);
-        let trace = state.turn_event_buffer.as_mut().unwrap().drain();
-        assert_eq!(
-            trace.len(),
-            1,
-            "reused intent must not invent another assessment"
-        );
-        let metadata = trace[0].metadata.as_ref().unwrap();
-        let evidence: Value = serde_json::from_str(
-            metadata["attrs"]["delegation_model_assessment"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(evidence["outcome"], "unavailable");
-        assert_eq!(
-            evidence["error_kind"],
-            "delegation_model_assessment_unavailable"
-        );
-        assert!(evidence["operation_id"].is_null());
-        assert!(
-            evidence["assessment"].is_null(),
-            "missing evidence must remain unknown"
-        );
-        let events = host.take_emitted_events();
-        let terminal = events
-            .iter()
-            .find(|event| event["kind"] == "admission" && event["transition"] == "finished")
-            .unwrap();
-        assert_eq!(terminal["outcome"], "unavailable");
-        assert!(
-            astra_turn_types::decode_explain_analyze_wire(terminal)
-                .unwrap()
-                .is_valid()
-        );
-        let recorded = format!("{metadata}{}", json!(events));
-        for private in ["private-model", "private-task-text", "private-slot-prompt"] {
-            assert!(!recorded.contains(private));
         }
     }
 
@@ -43829,11 +43709,11 @@ mod tests {
                 .is_empty()
             );
             host.pending_tool_call_admission = None;
-            host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
-                remaining_seconds: 0,
-            }));
+            host.execution_time_budget = Some(test_execution_deadline(0));
             let expired =
                 AgenticLoopHost::admit_tool_calls(&mut host, &[fanout], Some("tool_calls"));
+            let expired =
+                AgenticLoopHost::canonicalize_deferred_tool_admission(&mut host, &state, expired);
             assert!(expired.admitted.is_empty());
             assert_eq!(expired.rejected.len(), 1);
             assert!(
@@ -47122,8 +47002,8 @@ mod tests {
             .build();
         let raw_names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.tool_schemas);
         assert!(
-            raw_names.contains("reflect"),
-            "reflect is a first-class observation contract on the resident surface"
+            raw_names.contains("introspect") && !raw_names.contains("reflect"),
+            "introspection is resident; reflection uses the selected deferred contract"
         );
 
         let mut state = create_test_state();
@@ -47140,8 +47020,8 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible);
         assert!(
-            names.contains("reflect"),
-            "reflect remains directly callable when the runtime executor is ready: {names:?}"
+            !names.contains("reflect"),
+            "executor readiness must not widen the default wire surface: {names:?}"
         );
         assert!(
             schema_names(&host.deferred_tool_schemas).contains("reflect"),
@@ -47869,7 +47749,7 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
-        for required in ["bash", "read_file", "introspect", "notify", "tool_search"] {
+        for required in ["bash", "read_file", "introspect", "tool_search"] {
             assert!(
                 policy
                     .visible_tool_names
@@ -47885,11 +47765,7 @@ mod tests {
                 .observation_tool_names
                 .contains(&"read_file".to_string())
         );
-        assert!(
-            policy
-                .observation_tool_names
-                .contains(&"notify".to_string())
-        );
+        assert!(schema_names(&host.deferred_tool_schemas).contains("notify"));
         assert!(!policy.allow_ask_user);
         assert!(
             policy
@@ -47932,7 +47808,7 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(host.turn_interaction_mode(), &final_tools);
 
-        for required in ["bash", "read_file", "introspect", "notify", "tool_search"] {
+        for required in ["bash", "read_file", "introspect", "tool_search"] {
             assert!(
                 policy
                     .visible_tool_names
@@ -47948,11 +47824,7 @@ mod tests {
                 .observation_tool_names
                 .contains(&"read_file".to_string())
         );
-        assert!(
-            policy
-                .observation_tool_names
-                .contains(&"notify".to_string())
-        );
+        assert!(schema_names(&host.deferred_tool_schemas).contains("notify"));
         assert!(
             policy
                 .visible_tool_names
@@ -50232,12 +50104,7 @@ mod tests {
                 .build();
             host.judgment_route_cache = Some(Ok(ResolvedJudgmentRoute { config, execution }));
             if partial_budget {
-                host.execution_time_budget = Some(RunExecutionTimeBudget {
-                    deadline: tokio::time::Instant::now()
-                        + astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-                        + Duration::from_millis(1),
-                    deadline_unix_ms: 0,
-                });
+                host.execution_time_budget = Some(test_execution_deadline(0));
             }
             let result = host
                 .call_delegation_judgment(
@@ -51931,11 +51798,9 @@ mod tests {
     async fn context_history_writer_obeys_admitted_absolute_deadline() {
         let directory = tempfile::TempDir::new().unwrap();
         let mut host = test_host_builder("owner", "session").build();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        host.execution_time_budget = Some(RunExecutionTimeBudget {
-            deadline,
-            deadline_unix_ms: 1,
-        });
+        let authority = test_execution_deadline(1);
+        let deadline = tokio::time::Instant::from_std(authority.monotonic_deadline());
+        host.execution_time_budget = Some(authority);
         let mut state = create_test_state();
         state.current_session_id = Some("session".into());
         state.runtime_tool_executor = Some(Arc::new(
@@ -51964,7 +51829,10 @@ mod tests {
         assert!(error.contains("admitted execution deadline"));
         assert_eq!(tokio::time::Instant::now(), deadline);
         assert_eq!(state.messages, before);
-        assert_eq!(host.execution_time_budget.unwrap().deadline, deadline);
+        assert_eq!(
+            host.execution_time_budget.unwrap().monotonic_deadline(),
+            deadline.into_std()
+        );
     }
 
     #[test]

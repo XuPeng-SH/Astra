@@ -2,7 +2,7 @@
 //!
 //! Exercises the full team management surface through HTTP requests:
 //! CRUD and draft persistence, validation edge-cases,
-//! concurrent team mutations, upsert semantics, and large-team handling.
+//! concurrent Team revision updates, immutable identities, and large-team handling.
 //!
 //! Uses Tower oneshot (no network), InMemoryTeamStore (no DB required).
 
@@ -122,8 +122,28 @@ async fn get(app: Router, path: &str, user: &str) -> (StatusCode, Value) {
 }
 
 async fn post(app: Router, path: &str, user: &str, payload: Value) -> (StatusCode, Value) {
+    write_json(app, "POST", path, user, payload).await
+}
+
+async fn put(app: Router, path: &str, user: &str, payload: Value) -> (StatusCode, Value) {
+    write_json(app, "PUT", path, user, payload).await
+}
+
+fn update_payload(mut payload: Value, expected_revision: u64) -> Value {
+    payload.as_object_mut().unwrap().remove("team_id");
+    payload["expected_revision"] = json!(expected_revision);
+    payload
+}
+
+async fn write_json(
+    app: Router,
+    method: &str,
+    path: &str,
+    user: &str,
+    payload: Value,
+) -> (StatusCode, Value) {
     let mut builder = Request::builder()
-        .method("POST")
+        .method(method)
         .uri(path)
         .header("content-type", "application/json");
     for (k, v) in auth(user) {
@@ -182,11 +202,13 @@ async fn delete(app: Router, path: &str, user: &str) -> (StatusCode, Value) {
 
 fn dev_team_payload() -> Value {
     json!({
+        "team_id": "id-dev-cycle",
         "name": "dev-cycle",
         "description": "Full dev cycle: plan, implement, test, review",
         "members": [
             {
                 "role": "planner",
+                "agent_id": "member-planner",
                 "system_prompt": "Decompose the task into subtasks with acceptance criteria.",
                 "skills": ["plan-decompose"],
                 "mcp_servers": [],
@@ -205,6 +227,7 @@ fn dev_team_payload() -> Value {
             },
             {
                 "role": "tester",
+                "agent_id": "member-tester",
                 "system_prompt": "Write and run tests, verifying acceptance criteria.",
                 "skills": ["verify-task", "shell"],
                 "mcp_servers": [],
@@ -213,6 +236,7 @@ fn dev_team_payload() -> Value {
             },
             {
                 "role": "reviewer",
+                "agent_id": "member-reviewer",
                 "system_prompt": "Review code changes for correctness, style, and security.",
                 "skills": ["review-changes"],
                 "model_selection": { "offering_id": "offer-dev-reviewer" },
@@ -231,11 +255,13 @@ fn dev_team_payload() -> Value {
 
 fn ordered_review_payload() -> Value {
     json!({
+        "team_id": "id-ordered-review",
         "name": "ordered-review",
         "description": "Produce an output and review it in order",
         "members": [
             {
                 "role": "producer",
+                "agent_id": "member-producer",
                 "system_prompt": "Write high-quality code.",
                 "skills": ["edit", "shell"],
                 "mcp_servers": [],
@@ -244,6 +270,7 @@ fn ordered_review_payload() -> Value {
             },
             {
                 "role": "reviewer",
+                "agent_id": "member-reviewer",
                 "system_prompt": "Find bugs, security issues, and performance problems.",
                 "skills": ["review-changes"],
                 "mcp_servers": [],
@@ -256,11 +283,13 @@ fn ordered_review_payload() -> Value {
 
 fn fanout_research_payload() -> Value {
     json!({
+        "team_id": "id-parallel-research",
         "name": "parallel-research",
         "description": "Fan-out: 3 researchers investigate in parallel, results merged",
         "members": [
             {
                 "role": "researcher-api",
+                "agent_id": "member-researcher-api",
                 "system_prompt": "Research REST API best practices.",
                 "skills": ["web-search"],
                 "mcp_servers": [],
@@ -269,6 +298,7 @@ fn fanout_research_payload() -> Value {
             },
             {
                 "role": "researcher-perf",
+                "agent_id": "member-researcher-perf",
                 "system_prompt": "Research performance optimization techniques.",
                 "skills": ["web-search"],
                 "mcp_servers": [],
@@ -277,6 +307,7 @@ fn fanout_research_payload() -> Value {
             },
             {
                 "role": "researcher-sec",
+                "agent_id": "member-researcher-sec",
                 "system_prompt": "Research security hardening strategies.",
                 "skills": ["web-search"],
                 "mcp_servers": [],
@@ -289,11 +320,13 @@ fn fanout_research_payload() -> Value {
 
 fn sequential_migration_payload() -> Value {
     json!({
+        "team_id": "id-db-migration",
         "name": "db-migration",
         "description": "Sequential: analyze schema, write migration, test, deploy",
         "members": [
             {
                 "role": "schema-analyst",
+                "agent_id": "member-schema-analyst",
                 "system_prompt": "Analyze current schema and propose migration plan.",
                 "skills": [],
                 "mcp_servers": ["database"],
@@ -302,6 +335,7 @@ fn sequential_migration_payload() -> Value {
             },
             {
                 "role": "migration-writer",
+                "agent_id": "member-migration-writer",
                 "system_prompt": "Write backward-compatible SQL migration.",
                 "skills": ["edit"],
                 "mcp_servers": [],
@@ -354,35 +388,41 @@ async fn scenario_full_team_lifecycle() {
     assert!(names.contains(&"dev"));
 
     // ── Get detail for dev-cycle: verify members ──
-    let (status, body) = get(app.clone(), "/teams/dev-cycle", user).await;
+    let (status, body) = get(app.clone(), "/teams/name/dev-cycle", user).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["name"], "dev-cycle");
     assert_eq!(body["members"].as_array().unwrap().len(), 4);
 
     // ── Get detail for ordered-review ──
-    let (status, body) = get(app.clone(), "/teams/ordered-review", user).await;
+    let (status, body) = get(app.clone(), "/teams/name/ordered-review", user).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["members"].as_array().unwrap().len(), 2);
 
     // ── Update dev-cycle: change description ──
     let mut updated = dev_team_payload();
     updated["description"] = json!("Updated: full dev cycle v2");
-    let (status, body) = post(app.clone(), "/teams", user, updated).await;
+    let (status, body) = put(
+        app.clone(),
+        "/teams/id-dev-cycle",
+        user,
+        update_payload(updated, 1),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["description"], "Updated: full dev cycle v2");
 
     // Re-fetch to confirm persistence
-    let (status, body) = get(app.clone(), "/teams/dev-cycle", user).await;
+    let (status, body) = get(app.clone(), "/teams/name/dev-cycle", user).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["description"], "Updated: full dev cycle v2");
 
     // ── Delete db-migration ──
-    let (status, body) = delete(app.clone(), "/teams/db-migration", user).await;
+    let (status, body) = delete(app.clone(), "/teams/id-db-migration", user).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["deleted"].as_bool().unwrap());
 
     // Confirm gone
-    let (status, _) = get(app.clone(), "/teams/db-migration", user).await;
+    let (status, _) = get(app.clone(), "/teams/name/db-migration", user).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // List should now have 3 custom teams plus the 3 owner-scoped builtins.
@@ -404,7 +444,9 @@ async fn scenario_multi_user_isolation() {
     assert_eq!(s, StatusCode::OK);
 
     // User B creates a team with the same name
-    let (s, _) = post(app.clone(), "/teams", "bob", dev_team_payload()).await;
+    let mut bob = dev_team_payload();
+    bob["team_id"] = json!("bob-dev-cycle");
+    let (s, _) = post(app.clone(), "/teams", "bob", bob).await;
     assert_eq!(s, StatusCode::OK);
 
     // Each user sees only their own
@@ -431,7 +473,7 @@ async fn scenario_multi_user_isolation() {
     assert_ne!(id_a, id_b);
 
     // User A cannot see user B's team by name (scoped)
-    let (s, _) = get(app.clone(), "/teams/dev-cycle", "charlie").await;
+    let (s, _) = get(app.clone(), "/teams/name/dev-cycle", "charlie").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
@@ -451,11 +493,11 @@ async fn scenario_fresh_owner_lazily_receives_isolated_builtin_teams() {
         std::collections::BTreeSet::from(["dev", "research", "review"])
     );
 
-    let (status, review) = get(app.clone(), "/teams/review", "alice-new").await;
+    let (status, review) = get(app.clone(), "/teams/name/review", "alice-new").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(review["user_id"], "alice-new");
 
-    let (status, bob_review) = get(app, "/teams/review", "bob-new").await;
+    let (status, bob_review) = get(app, "/teams/name/review", "bob-new").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(bob_review["user_id"], "bob-new");
     assert_ne!(review["team_id"], bob_review["team_id"]);
@@ -476,6 +518,7 @@ async fn scenario_draft_persistence_and_validation() {
         "/teams",
         user,
         json!({
+            "team_id": "id-empty-team",
             "name": "empty-team",
             "description": "no members",
             "members": []
@@ -484,7 +527,7 @@ async fn scenario_draft_persistence_and_validation() {
     .await;
     assert_eq!(status, StatusCode::OK, "empty roster draft: {body}");
     assert_eq!(body["members"], json!([]));
-    let (status, saved) = get(app.clone(), "/teams/empty-team", user).await;
+    let (status, saved) = get(app.clone(), "/teams/name/empty-team", user).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(saved, body);
 
@@ -494,11 +537,12 @@ async fn scenario_draft_persistence_and_validation() {
         "/teams",
         user,
         json!({
+            "team_id": "id-dup-roles",
             "name": "dup-roles",
             "description": "duplicate role names",
             "members": [
-                { "role": "coder", "skills": [], "mcp_servers": [] },
-                { "role": "coder", "skills": [], "mcp_servers": [] }
+                { "role": "coder", "agent_id": "member-coder", "skills": [], "mcp_servers": [] },
+                { "role": "coder", "agent_id": "second-coder", "skills": [], "mcp_servers": [] }
             ]
         }),
     )
@@ -507,31 +551,78 @@ async fn scenario_draft_persistence_and_validation() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Scenario 4: Upsert semantics — same name preserves team_id
+// Scenario 4: One writer wins each revision; names cannot redirect an ID write.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn scenario_upsert_preserves_team_id() {
+async fn scenario_cas_preserves_identity_and_rejects_stale_or_foreign_writes() {
     let app = build_test_app();
-    let user = "upsert-user";
+    let user = "cas-user";
+    let original = sequential_migration_payload();
+    let (status, body1) = post(app.clone(), "/teams", user, original.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body1["revision"], 1);
+    assert!(body1.get("created_at").is_none());
+    assert!(body1.get("updated_at").is_none());
+    let team_id = body1["team_id"].as_str().unwrap();
+    let path = format!("/teams/{team_id}");
+    let (status, conflict) = post(app.clone(), "/teams", user, original.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict["error_code"], "team_conflict_or_missing");
 
-    // Create
-    let (_, body1) = post(app.clone(), "/teams", user, sequential_migration_payload()).await;
-    let team_id = body1["team_id"].as_str().unwrap().to_string();
-    assert!(!team_id.is_empty());
-
-    // Upsert with changed description
-    let mut updated = sequential_migration_payload();
-    updated["description"] = json!("Updated migration workflow v2");
-    let (_, body2) = post(app.clone(), "/teams", user, updated).await;
-    assert_eq!(
-        body2["team_id"].as_str().unwrap(),
-        team_id,
-        "team_id must be stable across upserts"
+    let mut updated = update_payload(original, 1);
+    updated["name"] = json!("renamed");
+    updated["members"][0]["role"] = json!("renamed-role");
+    let (a, b) = tokio::join!(
+        put(app.clone(), &path, user, updated.clone()),
+        put(app.clone(), &path, user, updated.clone()),
     );
-    assert_eq!(body2["description"], "Updated migration workflow v2");
-    let created_at = body1["created_at"].as_str().expect("created_at");
-    assert_eq!(body2["created_at"].as_str(), Some(created_at));
+    let (winner, loser) = if a.0 == StatusCode::OK {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(winner.0, StatusCode::OK);
+    assert_eq!(loser.0, StatusCode::CONFLICT);
+    assert_eq!(winner.1["team_id"], body1["team_id"]);
+    assert_eq!(winner.1["revision"], 2);
+    assert_eq!(
+        winner.1["members"][0]["agent_id"],
+        body1["members"][0]["agent_id"]
+    );
+    assert_eq!(get(app.clone(), &path, user).await.1, winner.1);
+    assert_eq!(
+        get(app.clone(), "/teams/name/db-migration", user).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(app.clone(), "/teams/renamed", user).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(app.clone(), "/teams/name/renamed", user).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(app.clone(), &format!("/teams/name/{team_id}"), user)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    for (owner, target) in [
+        (user, path.as_str()),
+        ("other-owner", path.as_str()),
+        (user, "/teams/renamed"),
+    ] {
+        let (status, body) = put(app.clone(), target, owner, updated.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error_code"], "team_conflict_or_missing");
+    }
+    assert_eq!(
+        delete(app.clone(), &path, "other-owner").await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get(app, &path, user).await.1, winner.1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -575,6 +666,7 @@ async fn scenario_complex_team_full_roundtrip() {
     let user = "complex-user";
 
     let payload = json!({
+        "team_id": "id-mega-team",
         "name": "mega-team",
         "description": "Complex team exercising every field",
         "members": [
@@ -590,6 +682,7 @@ async fn scenario_complex_team_full_roundtrip() {
             },
             {
                 "role": "backend",
+                "agent_id": "member-backend",
                 "system_prompt": "Implement backend features in Rust.",
                 "skills": ["edit", "shell", "review-changes"],
                 "model_selection": { "offering_id": "offer-mega-backend" },
@@ -608,6 +701,7 @@ async fn scenario_complex_team_full_roundtrip() {
             },
             {
                 "role": "devops",
+                "agent_id": "member-devops",
                 "system_prompt": "Handle CI/CD, Docker, and deployment.",
                 "skills": ["shell"],
                 "model_selection": { "offering_id": "offer-mega-devops" },
@@ -617,6 +711,7 @@ async fn scenario_complex_team_full_roundtrip() {
             },
             {
                 "role": "security",
+                "agent_id": "member-security",
                 "system_prompt": "Audit for vulnerabilities and compliance.",
                 "skills": ["review-changes", "web-search"],
                 "mcp_servers": [],
@@ -638,7 +733,7 @@ async fn scenario_complex_team_full_roundtrip() {
     assert_eq!(status, StatusCode::OK, "create mega-team: {body}");
 
     // Fetch and verify every field
-    let (status, team) = get(app.clone(), "/teams/mega-team", user).await;
+    let (status, team) = get(app.clone(), "/teams/name/mega-team", user).await;
     assert_eq!(status, StatusCode::OK);
 
     // Top-level
@@ -702,17 +797,18 @@ async fn scenario_minimal_team_defaults() {
         "/teams",
         user,
         json!({
+            "team_id": "id-bare-minimum",
             "name": "bare-minimum",
             "description": "Minimal member configuration",
             "members": [
-                { "role": "worker", "skills": [], "mcp_servers": [] }
+                { "role": "worker", "agent_id": "member-worker", "skills": [], "mcp_servers": [] }
             ]
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "minimal team: {body}");
 
-    let (status, saved) = get(app, "/teams/bare-minimum", user).await;
+    let (status, saved) = get(app, "/teams/name/bare-minimum", user).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(saved, body);
 }
@@ -751,9 +847,57 @@ async fn scenario_post_teams_invalid_payload_is_4xx() {
     let mut payload = dev_team_payload();
     payload["unexpected"] = json!(true);
     let (status, _) = post(app.clone(), "/teams", "u1", payload).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let (status, _) = get(app, "/teams/dev-cycle", "u1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get(app, "/teams/name/dev-cycle", "u1").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn scenario_team_identity_and_revision_are_required() {
+    let app = build_test_app();
+    for field in ["team_id", "agent_id"] {
+        for invalid in [None, Some(Value::Null), Some(json!(""))] {
+            let mut payload = dev_team_payload();
+            let object = if field == "team_id" {
+                payload.as_object_mut().unwrap()
+            } else {
+                payload["members"][0].as_object_mut().unwrap()
+            };
+            match invalid {
+                Some(value) => {
+                    object.insert(field.to_string(), value);
+                }
+                None => {
+                    object.remove(field);
+                }
+            }
+            let (status, body) = post(app.clone(), "/teams", "owner", payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error_code"], "team_validation_failed");
+        }
+    }
+    let (status, original) = post(app.clone(), "/teams", "owner", dev_team_payload()).await;
+    assert_eq!(status, StatusCode::OK);
+    for invalid in [
+        None,
+        Some(Value::Null),
+        Some(json!(0)),
+        Some(json!(u64::MAX)),
+    ] {
+        let mut payload = update_payload(dev_team_payload(), 1);
+        match invalid {
+            Some(value) => {
+                payload["expected_revision"] = value;
+            }
+            None => {
+                payload.as_object_mut().unwrap().remove("expected_revision");
+            }
+        }
+        let (status, body) = put(app.clone(), "/teams/id-dev-cycle", "owner", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error_code"], "team_validation_failed");
+    }
+    assert_eq!(get(app, "/teams/id-dev-cycle", "owner").await.1, original);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -772,7 +916,7 @@ async fn scenario_snapshot_crud() {
     // Create snapshot
     let (s, snap) = post(
         app.clone(),
-        "/teams/db-migration/snapshots",
+        "/teams/id-db-migration/snapshots",
         user,
         json!({ "label": "before refactor", "git_commit": "abc123" }),
     )
@@ -780,6 +924,7 @@ async fn scenario_snapshot_crud() {
     assert_eq!(s, StatusCode::OK, "create snapshot: {snap}");
     assert!(!snap["snapshot_id"].as_str().unwrap().is_empty());
     assert_eq!(snap["team_name"], "db-migration");
+    assert_eq!(snap["team_id"], "id-db-migration");
     assert_eq!(snap["label"], "before refactor");
     assert_eq!(snap["git_commit"], "abc123");
     assert!(snap["team_definition_json"].as_str().is_some());
@@ -787,11 +932,45 @@ async fn scenario_snapshot_crud() {
     let snap_id = snap["snapshot_id"].as_str().unwrap().to_string();
 
     // List snapshots
-    let (s, body) = get(app.clone(), "/teams/db-migration/snapshots", user).await;
+    let (s, body) = get(app.clone(), "/teams/id-db-migration/snapshots", user).await;
     assert_eq!(s, StatusCode::OK);
     let snaps = body["snapshots"].as_array().unwrap();
     assert_eq!(snaps.len(), 1);
     assert_eq!(snaps[0]["snapshot_id"], snap_id);
+
+    // A rename retains the history; a new Team with the old name does not inherit it.
+    let mut renamed = update_payload(sequential_migration_payload(), 1);
+    renamed["name"] = json!("renamed-migration");
+    assert_eq!(
+        put(app.clone(), "/teams/id-db-migration", user, renamed)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(app.clone(), "/teams/id-db-migration/snapshots", user)
+            .await
+            .1["snapshots"][0]["team_id"],
+        "id-db-migration"
+    );
+    let mut recreated = sequential_migration_payload();
+    recreated["team_id"] = json!("recreated-migration");
+    assert_eq!(
+        post(app.clone(), "/teams", user, recreated).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(app.clone(), "/teams/recreated-migration/snapshots", user)
+            .await
+            .1["snapshots"],
+        json!([])
+    );
+    assert_eq!(
+        get(app.clone(), &format!("/teams/snapshots/{snap_id}"), user)
+            .await
+            .1["team_id"],
+        "id-db-migration"
+    );
 
     // Delete snapshot
     let (s, body) = delete(app.clone(), &format!("/teams/snapshots/{snap_id}"), user).await;
@@ -799,7 +978,7 @@ async fn scenario_snapshot_crud() {
     assert!(body["deleted"].as_bool().unwrap());
 
     // Confirm gone
-    let (s, body) = get(app.clone(), "/teams/db-migration/snapshots", user).await;
+    let (s, body) = get(app.clone(), "/teams/id-db-migration/snapshots", user).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["snapshots"].as_array().unwrap().len(), 0);
 }
@@ -823,7 +1002,7 @@ async fn scenario_snapshot_user_isolation() {
     assert_eq!(s, StatusCode::OK);
     let (s, snap) = post(
         app.clone(),
-        "/teams/db-migration/snapshots",
+        "/teams/id-db-migration/snapshots",
         "alice",
         json!({ "label": "alice snap" }),
     )
@@ -832,11 +1011,13 @@ async fn scenario_snapshot_user_isolation() {
     let snap_id = snap["snapshot_id"].as_str().unwrap().to_string();
 
     // Bob creates same-named team
-    let (s, _) = post(app.clone(), "/teams", "bob", sequential_migration_payload()).await;
+    let mut bob = sequential_migration_payload();
+    bob["team_id"] = json!("bob-db-migration");
+    let (s, _) = post(app.clone(), "/teams", "bob", bob).await;
     assert_eq!(s, StatusCode::OK);
 
     // Bob sees no snapshots for his team
-    let (s, body) = get(app.clone(), "/teams/db-migration/snapshots", "bob").await;
+    let (s, body) = get(app.clone(), "/teams/bob-db-migration/snapshots", "bob").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["snapshots"].as_array().unwrap().len(), 0);
 
@@ -845,7 +1026,7 @@ async fn scenario_snapshot_user_isolation() {
     assert_eq!(s, StatusCode::NOT_FOUND);
 
     // Alice still sees her snapshot
-    let (s, body) = get(app.clone(), "/teams/db-migration/snapshots", "alice").await;
+    let (s, body) = get(app.clone(), "/teams/id-db-migration/snapshots", "alice").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["snapshots"].as_array().unwrap().len(), 1);
 }

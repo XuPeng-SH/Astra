@@ -326,6 +326,7 @@ pub(crate) enum RuntimeActivityOutcome {
     NoPendingWork,
     Incomplete,
     ExecutionPaused(String),
+    ExecutionHandoff,
 }
 
 impl RuntimeActivityOutcome {
@@ -390,7 +391,8 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         state.final_text_streamed = false;
     }
     let started = Instant::now();
-    let remaining = host.execution_time_budget_remaining();
+    let time_budget = host.execution_time_budget_remaining();
+    let remaining = time_budget.map(|budget| budget.total_remaining);
     let authority_deadline = remaining.map(|remaining| tokio::time::Instant::now() + remaining);
     // Yielding a committed pause spends no synthesis allowance. Hard cancel
     // and actual execution authority still precede that nonterminal outcome.
@@ -441,11 +443,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         host.release_execution_capacity_for_wait();
         let requested_wait =
             observation_request.map(|request| Duration::from_millis(request.timeout_ms));
-        let authorized_wait = remaining.map(|remaining| {
-            remaining.saturating_sub(
-                astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET,
-            )
-        });
+        let authorized_wait = time_budget.map(|budget| budget.work_remaining);
         let wait_budget = match (requested_wait, authorized_wait) {
             (Some(requested), Some(authorized)) => Some(requested.min(authorized)),
             (requested, authorized) => requested.or(authorized),
@@ -453,6 +451,14 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         let deadline = wait_budget.map(|budget| tokio::time::Instant::now() + budget);
         let executor = state.runtime_tool_executor.clone();
         let cancellation = state.cancellation.clone();
+        let handoff = host.execution_handoff_wake();
+        let handoff_requested = async {
+            match handoff.as_ref() {
+                Some(wake) => wake.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(handoff_requested);
         let mut mailbox_open = state.messaging.mailbox.is_some();
         let mut intent_wake = state.user_intents.wake.clone();
         let mut checked_watermark = -1_i64;
@@ -489,6 +495,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                             "parent cancelled while waiting for direct children"));
                     }
                     _ = wait_for_runtime_deadline(deadline) => break 'waiting "deadline",
+                    _ = &mut handoff_requested => return Ok(RuntimeActivityOutcome::ExecutionHandoff),
                     _ = &mut child_update => ReadySource::Child,
                     watermark = async {
                         match intent_wake.as_mut() {
@@ -566,6 +573,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                             }
                             continue;
                         }
+                        _ = &mut handoff_requested => return Ok(RuntimeActivityOutcome::ExecutionHandoff),
                         result = host.reacquire_execution_capacity_after_wait() => result,
                     };
                 };
@@ -656,6 +664,9 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
             }
             _ = std::future::ready(()) => {}
         }
+        if host.execution_handoff_requested() {
+            return Ok(RuntimeActivityOutcome::ExecutionHandoff);
+        }
         if let Some(outcome) =
             paused_direct_child_outcome(host, state, owner.as_deref(), started, observation_request)
         {
@@ -690,6 +701,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         return Ok(RuntimeActivityOutcome::InputReady);
     }
     if outcome == "observation_timed_out" {
+        let handoff = host.execution_handoff_wake();
         loop {
             tokio::select! {
                 biased;
@@ -709,6 +721,12 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                     }
                     continue;
                 }
+                _ = async {
+                    match handoff.as_ref() {
+                        Some(wake) => wake.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => return Ok(RuntimeActivityOutcome::ExecutionHandoff),
                 result = host.reacquire_execution_capacity_after_wait() => { result?; break; },
             }
         }
@@ -5244,6 +5262,7 @@ pub(crate) struct TurnExecutionPhase {
 pub(crate) enum TurnExecutionControl {
     Proceed(Box<TurnExecutionPhase>),
     ContinueLoop,
+    WaitForInput,
     Return(AgenticLoopOutcome),
 }
 
@@ -6159,11 +6178,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 && !state.budget_wrapup_injected
                 && host
                     .execution_time_budget_remaining()
-                    .is_some_and(|remaining| {
-                        remaining.as_secs()
-                            <= astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
-                                .as_secs()
-                    });
+                    .is_some_and(|remaining| !remaining.has_work());
             let run_deadline_stopped_safe_work = error.kind
                 == astra_core::ErrorKind::BudgetExhausted
                 || (error.kind == astra_core::ErrorKind::ProviderDeadline
@@ -7051,10 +7066,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     Some("direct_child_completion_wait"),
                 );
+                state.step_recorder.end_turn(false);
+                if continuation_authority == ContinuationAuthority::Runtime {
+                    finalize_turn_trace(state).await;
+                    return Ok(TurnExecutionControl::WaitForInput);
+                }
                 let child_barrier =
                     await_direct_children_before_completion(host, state, continuation_authority)
                         .await;
-                state.step_recorder.end_turn(false);
                 if matches!(
                     &child_barrier,
                     Ok(RuntimeActivityOutcome::ExecutionPaused(_))
@@ -10734,8 +10753,12 @@ mod tests {
             },
         });
         let wait_started = Arc::new(tokio::sync::Notify::new());
-        let mut host =
-            MockHost::new(vec![]).with_execution_time_budget_remaining(Duration::from_secs(45));
+        let mut host = MockHost::new(vec![]).with_execution_time_budget_remaining(
+            astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::from_secs(15),
+                total_remaining: Duration::from_secs(45),
+            },
+        );
         host.direct_child_owner = Some(Arc::clone(&owner));
         host.child_wait_started = Some(Arc::clone(&wait_started));
         let mut state = make_state();
@@ -10793,7 +10816,12 @@ mod tests {
             host.direct_child_owner = Some(Arc::clone(&owner));
             host.child_wait_started = Some(Arc::clone(&wait_started));
             if let Some(remaining) = remaining {
-                host = host.with_execution_time_budget_remaining(remaining);
+                host = host.with_execution_time_budget_remaining(
+                    astra_turn_types::ExecutionTimeRemaining {
+                        work_remaining: remaining.saturating_sub(Duration::from_secs(30)),
+                        total_remaining: remaining,
+                    },
+                );
             }
             let mut state = make_state();
             state.current_run_id = Some("parent-run".into());
@@ -10937,60 +10965,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_interrupts_a_stalled_runtime_input_poll() {
-        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
-            "agent-run",
-            "child-agent",
-        );
-        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
-            agent_id: "child-agent".into(),
-            run_id: "child-run".into(),
-            parent_agent_id: "agent".into(),
-            status: crate::orchestration::AgentStatus::Running {
-                activity: "working".into(),
-            },
-        });
-        let poll_entered = Arc::new(tokio::sync::Notify::new());
-        let poll_release = Arc::new(tokio::sync::Notify::new());
-        let mut provider = StubRunControlProvider::new(vec![]);
-        provider.poll_gate = Some((poll_entered.clone(), poll_release));
-        let provider = Arc::new(provider);
-        let (wake_tx, wake_rx) = tokio::sync::watch::channel(-1);
-        let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
-        let wait_started = Arc::new(tokio::sync::Notify::new());
-        let mut host = MockHost::new(vec![]);
-        host.direct_child_owner = Some(Arc::clone(&owner));
-        host.child_wait_started = Some(Arc::clone(&wait_started));
-        let mut state = make_state();
-        state.current_run_id = Some("agent-run".into());
-        state.current_session_id = Some("session".into());
-        state.context_manifest_user_id = Some("user".into());
-        state.run_control = Some(provider);
-        state.user_intents.bind_wake(Some(wake_rx));
-        state.cancellation.token = Some(cancellation.clone());
-        let task = tokio::spawn(async move {
-            await_direct_children_before_completion(
-                &mut host,
-                &mut state,
-                ContinuationAuthority::Runtime,
-            )
+    async fn shutdown_handoff_preserves_input_poll_but_user_cancellation_interrupts_it() {
+        use super::super::host::{LoopEntry, RuntimeInputWait, run_agentic_loop_impl};
+        for shutdown in [false, true] {
+            let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "agent-run",
+                "child-agent",
+            );
+            owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+                agent_id: "child-agent".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: "agent".into(),
+                status: crate::orchestration::AgentStatus::Running {
+                    activity: "working".into(),
+                },
+            });
+            let poll_entered = Arc::new(tokio::sync::Notify::new());
+            let poll_release = Arc::new(tokio::sync::Notify::new());
+            let mut provider = StubRunControlProvider::new(vec![UserIntentPoll {
+                next_cursor: 1,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "guidance-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 0,
+                    input: serde_json::json!({"content": "Continue with the received guidance."}),
+                }],
+                ..UserIntentPoll::default()
+            }]);
+            if shutdown {
+                provider.apply_gate = Some((poll_entered.clone(), poll_release.clone()));
+            } else {
+                provider.poll_gate = Some((poll_entered.clone(), poll_release.clone()));
+            }
+            let provider = Arc::new(provider);
+            let (wake_tx, wake_rx) = tokio::sync::watch::channel(-1);
+            let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+            let wait_started = Arc::new(tokio::sync::Notify::new());
+            let mut host = MockHost::new(vec![]);
+            let handoff = tokio_util::sync::CancellationToken::new();
+            host.handoff_requested = Some(handoff.clone());
+            host.handoff_accepted = true;
+            host.direct_child_owner = Some(Arc::clone(&owner));
+            host.child_wait_started = Some(Arc::clone(&wait_started));
+            let mut state = make_state();
+            state.current_run_id = Some("agent-run".into());
+            state.current_session_id = Some("session".into());
+            state.context_manifest_user_id = Some("user".into());
+            state.run_control = Some(provider.clone());
+            state.current_run_owner_generation = Some(3);
+            state.step_recorder.begin_turn(0);
+            state.loop_entry = LoopEntry::InputWait {
+                next_index: 1,
+                harness_pause_recovery_count: 0,
+                wait: RuntimeInputWait::Completion,
+            };
+            let budget = state.run_execution_budget_snapshot();
+            state.user_intents.bind_wake(Some(wake_rx));
+            state.cancellation.token = Some(cancellation.clone());
+            let mut task = tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    run_agentic_loop_impl(&mut host, &mut state),
+                )
+                .await;
+                (host, state, result)
+            });
+            tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
+                .await
+                .expect("wait started");
+            wake_tx.send(0).expect("active receiver");
+            tokio::time::timeout(Duration::from_secs(2), poll_entered.notified())
+                .await
+                .expect("authoritative input transaction started");
+            if shutdown {
+                handoff.cancel();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), &mut task)
+                        .await
+                        .is_err(),
+                    "shutdown must not abandon an in-flight durable input transaction"
+                );
+                poll_release.notify_one();
+            } else {
+                cancellation.cancel();
+            }
+            let (host, state, result) = tokio::time::timeout(Duration::from_secs(2), task)
             .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
-            .await
-            .expect("wait started");
-        wake_tx.send(0).expect("active receiver");
-        tokio::time::timeout(Duration::from_secs(2), poll_entered.notified())
-            .await
-            .expect("authoritative poll started");
-        cancellation.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("cancellation must not wait for the stalled poll")
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
-        assert!(owner.has_pending_direct_children());
+            .expect("the owner must observe shutdown after input settlement or explicit cancellation")
+            .unwrap();
+            if shutdown {
+                assert!(
+                    result.is_err(),
+                    "settled input must freeze in the shared consumer"
+                );
+                assert_eq!(host.handoff_snapshots.len(), 1);
+                assert_eq!(provider.released.lock().await.as_slice(), &[0]);
+                assert_eq!(host.user_intent_applied_indices, vec![0]);
+                assert_eq!(state.message, "Continue with the received guidance.");
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap_err().kind,
+                    astra_core::ErrorKind::Cancelled
+                );
+                assert!(host.handoff_snapshots.is_empty());
+            }
+            assert!(host.executed_messages.is_empty());
+            assert_eq!(state.run_execution_budget_snapshot(), budget);
+            assert!(owner.has_pending_direct_children());
+        }
     }
 
     #[tokio::test]
@@ -22726,6 +22810,7 @@ mod tests {
         polls: Mutex<VecDeque<UserIntentPoll>>,
         poll_calls: Mutex<Vec<usize>>,
         poll_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        apply_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         released: Mutex<Vec<usize>>,
         release_failures: Mutex<usize>,
         terminal_on_release: bool,
@@ -22744,6 +22829,7 @@ mod tests {
                 polls: Mutex::new(VecDeque::from(polls)),
                 poll_calls: Mutex::new(Vec::new()),
                 poll_gate: None,
+                apply_gate: None,
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(0),
                 terminal_on_release: false,
@@ -23013,6 +23099,10 @@ mod tests {
             event_indices: &[usize],
             _authority: UserIntentAdmissionAuthority,
         ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+            if let Some((entered, release)) = &self.apply_gate {
+                entered.notify_one();
+                release.notified().await;
+            }
             if self.terminal_on_release {
                 return Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned);
             }

@@ -17,6 +17,7 @@ pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
 pub(crate) mod task_detail_view;
+pub(crate) mod team_editor_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;
@@ -177,14 +178,28 @@ enum PendingUserIntentCustody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingUserIntentTarget {
     ActiveRun,
-    AgentRun { run_id: String, agent_name: String },
+    AgentRun {
+        run_id: String,
+        agent_name: String,
+        attachment_epoch: u64,
+    },
 }
 
 fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatus) -> String {
-    if matches!(intent.target, PendingUserIntentTarget::ActiveRun)
-        && intent.custody == PendingUserIntentCustody::Unconfirmed
-    {
-        return "Guidance delivery uncertain · stable identity retained".to_string();
+    if intent.custody == PendingUserIntentCustody::Unconfirmed {
+        return match &intent.target {
+            PendingUserIntentTarget::ActiveRun => {
+                "Guidance delivery uncertain · stable identity retained".to_string()
+            }
+            PendingUserIntentTarget::AgentRun { agent_name, .. } => {
+                let phase = if intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote {
+                    "application"
+                } else {
+                    "delivery"
+                };
+                format!("Guidance {phase} unknown for {agent_name} · stable identity retained")
+            }
+        };
     }
     match (&intent.target, intent.status) {
         (
@@ -388,13 +403,18 @@ impl BottomPane {
         run_id: String,
         agent_name: String,
         text: String,
+        attachment_epoch: u64,
     ) -> bool {
         self.accept_user_intent_for_target(
             intent_id,
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             astra_turn_types::UserIntentStatus::AcceptedLocal,
             text,
-            PendingUserIntentTarget::AgentRun { run_id, agent_name },
+            PendingUserIntentTarget::AgentRun {
+                run_id,
+                agent_name,
+                attachment_epoch,
+            },
         )
         .is_ok()
     }
@@ -463,7 +483,6 @@ impl BottomPane {
     pub fn mark_user_intent_unconfirmed(&mut self, intent_id: &str) -> bool {
         let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
             intent.intent_id == intent_id
-                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
                 && matches!(
                     intent.custody,
                     PendingUserIntentCustody::Client | PendingUserIntentCustody::Run
@@ -506,10 +525,21 @@ impl BottomPane {
         self.pending_user_intents.remove(index)
     }
 
-    pub fn remove_agent_guide(&mut self, intent_id: &str) -> Option<PendingUserIntent> {
+    /// Claim one member intent in its original attachment. Mailbox receipts
+    /// additionally have to identify the exact run that observed the message.
+    pub fn remove_agent_guide(
+        &mut self,
+        intent_id: &str,
+        attachment_epoch: u64,
+        receiver_run_id: Option<&str>,
+    ) -> Option<PendingUserIntent> {
         let index = self.pending_user_intents.iter().position(|intent| {
             intent.intent_id == intent_id
-                && matches!(intent.target, PendingUserIntentTarget::AgentRun { .. })
+                && matches!(&intent.target,
+                    PendingUserIntentTarget::AgentRun { run_id, attachment_epoch: bound_epoch, .. }
+                        if *bound_epoch == attachment_epoch
+                            && receiver_run_id.is_none_or(|receiver| receiver == run_id)
+                )
         })?;
         self.pending_user_intents.remove(index)
     }
@@ -688,12 +718,16 @@ impl BottomPane {
         self.pending_user_intents.len()
     }
 
+    #[cfg(test)]
     fn has_pending_user_intents(&self) -> bool {
         !self.pending_user_intents.is_empty()
     }
 
     fn has_pending_composer_queue(&self) -> bool {
-        self.has_pending_user_intents() || !self.queued_next_turn_submissions.is_empty()
+        self.pending_user_intents
+            .iter()
+            .any(|intent| matches!(intent.target, PendingUserIntentTarget::ActiveRun))
+            || !self.queued_next_turn_submissions.is_empty()
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
@@ -735,6 +769,47 @@ impl BottomPane {
             self.conversation_tab_order.push(tab_id);
         }
         self.view_stack.push(view);
+    }
+
+    pub(crate) fn team_editor_pending(
+        &self,
+        request: &team_editor_view::TeamEditorRequest,
+    ) -> bool {
+        self.view_stack
+            .iter()
+            .any(|view| view.team_editor_pending(request))
+    }
+
+    pub(crate) fn update_team_editor(&mut self, update: &team_editor_view::TeamEditorUpdate) {
+        let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|view| view.team_editor_pending(&update.request))
+        else {
+            return;
+        };
+        let picker = self.view_stack[index].update_team_editor(update);
+        // A background catalog must not cover an approval or another focused
+        // view. Its owner retains the draft even when the picker is dismissed.
+        if let Some(picker) = picker
+            && index + 1 == self.view_stack.len()
+        {
+            self.push_view(picker);
+        }
+    }
+
+    pub(crate) fn select_team_member_model(
+        &mut self,
+        target: &team_editor_view::TeamEditorTarget,
+        operation_id: u64,
+        agent_id: &str,
+        selection: Option<astra_turn_types::ModelSelection>,
+    ) {
+        for view in self.view_stack.iter_mut().rev() {
+            if view.select_team_member_model(target, operation_id, agent_id, selection.clone()) {
+                break;
+            }
+        }
     }
 
     pub fn enqueue_ask_user(
@@ -1265,10 +1340,12 @@ impl BottomPane {
             return;
         }
 
-        // Slash menu: open whenever the first line starts with '/'. Empty
-        // matches still keep the menu open so users see a "no matches"
-        // message rather than silent closure.
-        if self.view_stack.is_empty() && is_open_for(&text) && !self.slash_items.is_empty() {
+        // Completion owns command names, never their arguments. Otherwise
+        // selecting a menu item would discard the user's remaining input.
+        if self.view_stack.is_empty()
+            && is_open_for(&text, &self.slash_items)
+            && !self.slash_items.is_empty()
+        {
             self.close_mention();
             self.skill_popup = None;
             match self.slash_menu.as_mut() {
@@ -1931,6 +2008,11 @@ impl BottomPane {
                 Some(BottomPaneAction::Consumed)
             }
             KeyCode::Char(digit) if key.modifiers.is_empty() && digit.is_ascii_digit() => {
+                let mut prospective = self.composer.text();
+                prospective.insert(self.composer.cursor_byte(), digit);
+                if !is_open_for(&prospective, &self.slash_items) {
+                    return None;
+                }
                 if let Some(index) = digit.to_digit(10) {
                     if index > 0 {
                         if self
@@ -2286,11 +2368,15 @@ impl BottomPane {
             .enumerate()
         {
             // Truncate by the actual column budget, not a hard-coded 100.
-            let status = match pending.status {
-                astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
-                astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
-                astra_turn_types::UserIntentStatus::Applied => "applied",
-                astra_turn_types::UserIntentStatus::Returned => "returned",
+            let status = if pending.custody == PendingUserIntentCustody::Unconfirmed {
+                "unknown"
+            } else {
+                match pending.status {
+                    astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
+                    astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
+                    astra_turn_types::UserIntentStatus::Applied => "applied",
+                    astra_turn_types::UserIntentStatus::Returned => "returned",
+                }
             };
             let prefix = format!("{}  {status} · ", idx + 1);
             let budget = area.width.saturating_sub(prefix.width() as u16) as usize;

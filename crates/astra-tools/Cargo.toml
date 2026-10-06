@@ -59,6 +59,7 @@ which = "7"
 [dev-dependencies]
 serde_json.workspace = true
 serial_test = "3"
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 wiremock = "0.6"
 

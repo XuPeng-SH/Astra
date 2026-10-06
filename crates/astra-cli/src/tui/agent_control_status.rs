@@ -62,10 +62,6 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
             .or(status)
             .unwrap_or("uncertain")
     };
-    let skipped = payload.is_some_and(|payload| {
-        astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_receipt_kind(payload)
-            == Some(astra_turn_core::orchestration::agent_result_wire::AgentFanoutControlReceiptKind::SkippedBeforeAcceptance)
-    });
     let slot_failure = parsed.as_ref().and_then(|value| {
         ["agents", "results"].into_iter().find_map(|field| {
             value.get(field)?.as_array()?.iter().find_map(|slot| {
@@ -82,9 +78,7 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
             })
         })
     });
-    let status = if skipped {
-        "not started"
-    } else if slot_failure.is_some() {
+    let status = if slot_failure.is_some() {
         "partial failure"
     } else {
         match wire_status {
@@ -92,7 +86,6 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
             "completed" | "success" => "completed",
             "completed_with_issues" => "completed with issues",
             "failed" | "error" | "spawn_rejected" => "failed",
-            "skipped_before_acceptance" => "not started",
             "cancelled" => "cancelled",
             "interrupted" => "interrupted",
             "rejected" => "rejected",
@@ -160,7 +153,7 @@ mod tests {
     fn interrupted_message_uses_shared_wait_copy_for_get_result() {
         assert_eq!(
             agent_control_interrupted_message(true, Some("budget_exhausted")),
-            "Needs continuation: The run reached its turn budget."
+            "Needs continuation: The run reached its execution budget."
         );
         assert_eq!(
             agent_control_interrupted_message(false, Some("context_overflow")),
@@ -223,8 +216,8 @@ mod tests {
         );
         assert!(compact_delegation_result(
             None,
-            Some(r#"{"status":"completed","outcome":"delegation_skipped","reason_code":"insufficient_time_to_delegate","executed":false}"#)
-        ).contains("not started"));
+            Some(r#"{"status":"rejected","outcome":"delegation_skipped","reason_code":"insufficient_time_to_delegate","executed":false}"#)
+        ).contains("rejected"));
         assert!(
             compact_delegation_result(
                 None,

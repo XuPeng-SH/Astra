@@ -178,6 +178,7 @@ pub struct AppState {
     pub(crate) context_service: Arc<dyn ContextService>,
     pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
+    pub(crate) model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
     pub(crate) sandbox_service: Arc<dyn SandboxService>,
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
@@ -220,8 +221,6 @@ pub struct AppState {
     /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`astra_turn_core::edge_ledger`].
     pub(crate) edge_callback_ledger:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
-    /// Multi-agent profile registry — defines agent tiers, delegation rules.
-    pub(crate) agent_profile_registry: Arc<astra_services::AgentProfileRegistry>,
     /// Delegation engine — coordinates multi-agent runs.
     pub(crate) delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
     /// Team persistence store — definitions and immutable snapshots.
@@ -288,6 +287,7 @@ impl AppState {
             context_service: Arc::new(UnconfiguredContextService),
             decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
+            model_catalog_cache: Default::default(),
             sandbox_service: Arc::new(UnconfiguredSandboxService),
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
@@ -332,7 +332,6 @@ impl AppState {
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            agent_profile_registry: Arc::new(astra_services::AgentProfileRegistry::new()),
             delegation_engine: None,
             team_store: None,
             resource_governor: std::sync::Arc::new(
@@ -825,14 +824,6 @@ impl AppState {
         self
     }
 
-    pub fn with_agent_profile_registry(
-        mut self,
-        registry: Arc<astra_services::AgentProfileRegistry>,
-    ) -> Self {
-        self.agent_profile_registry = registry;
-        self
-    }
-
     pub fn with_delegation_engine(
         mut self,
         engine: Arc<crate::server::delegation::engine::DelegationEngine>,
@@ -857,15 +848,10 @@ impl AppState {
         self
     }
 
-    /// Access the agent profile registry.
     /// Shared Prometheus-style metrics registry. Handlers and pipeline code
     /// register/increment counters here; `/metrics` renders its contents.
     pub fn metrics_registry(&self) -> Arc<astra_turn_core::pipeline_metrics::MetricsRegistry> {
         self.metrics_registry.clone()
-    }
-
-    pub fn agent_profile_registry(&self) -> &astra_services::AgentProfileRegistry {
-        &self.agent_profile_registry
     }
 
     /// Access the delegation engine (if configured).

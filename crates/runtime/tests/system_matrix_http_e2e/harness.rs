@@ -176,9 +176,13 @@ pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> S
 async fn build_state(
     memoria: Arc<E2eMemoriaStub>,
     memoria_base_url: String,
+    database: Option<&str>,
 ) -> (astra_runtime::AppState, String, String) {
     let mut settings =
         AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
+    if let Some(database) = database {
+        settings.matrixone.database = database.to_string();
+    }
     // Runtime memory/observer clients are constructed by build_server_state,
     // independently of the forwarder replaced below. Bind every client to
     // the fixture before construction; never let this mock-provider suite
@@ -684,12 +688,41 @@ pub struct MatrixE2eCtx {
     pub edge_agent_id: String,
     pub model_offering_id: String,
     pub suffix: String,
+    isolated_database: Option<String>,
     fixture_heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
     fixture_heartbeat_error: Arc<Mutex<Option<String>>>,
     native_providers: Mutex<Vec<ProviderGateway>>,
 }
 
 impl MatrixE2eCtx {
+    /// Rebuild production wiring after the caller has drained/stopped its
+    /// producer and observed writer release. Keep auth, session and Offering
+    /// identities, assertion pool, heartbeat and provider scripts alive.
+    pub async fn restart_after_execution_handoff(&mut self) {
+        assert!(
+            self.isolated_database.is_some(),
+            "startup recovery scans the catalog"
+        );
+        self.app_state.close_database_pools().await;
+        let (state, database, _) = build_state(
+            self.memoria.clone(),
+            start_mock_memoria().await,
+            self.isolated_database.as_deref(),
+        )
+        .await;
+        assert_eq!(database, self.matrixone_database);
+        let _ = state
+            .refresh_memoria_health_if_stale(std::time::Duration::ZERO)
+            .await;
+        self.shared_pool = state
+            .shared_pool
+            .as_ref()
+            .expect("restarted shared pool")
+            .clone();
+        self.app_state = state.clone();
+        self.app = build_app(state);
+    }
+
     /// Configure the fixture Offering through the public model API. Scripts
     /// respond at the provider boundary; they never enter request context.
     /// Background extraction may skip or resolve another deployment Offering.
@@ -989,10 +1022,32 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
 }
 
 pub async fn bootstrap() -> BootstrapResult {
+    bootstrap_in_database(None).await
+}
+
+/// Recovery discovery is catalog-wide, so restart tests cannot share the
+/// catalog of concurrent journeys. Bootstrap still uses the production schema
+/// owner and the existing public auth/session/model fixture. The caller owns
+/// this exact name and its independent cleanup connection before bootstrap.
+pub async fn bootstrap_isolated_execution_handoff(database: String) -> BootstrapResult {
+    assert!(database.starts_with("astra_test_http_handoff_"));
+    assert!(
+        database
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    );
+    bootstrap_in_database(Some(database)).await
+}
+
+async fn bootstrap_in_database(database: Option<String>) -> BootstrapResult {
     let memoria = Arc::new(E2eMemoriaStub::default());
     let memoria_base_url = start_mock_memoria().await;
-    let (state, matrixone_database, url) =
-        build_state(memoria.clone(), memoria_base_url.clone()).await;
+    let (state, matrixone_database, url) = build_state(
+        memoria.clone(),
+        memoria_base_url.clone(),
+        database.as_deref(),
+    )
+    .await;
 
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(4)
@@ -1215,6 +1270,7 @@ pub async fn bootstrap() -> BootstrapResult {
             edge_agent_id,
             model_offering_id,
             suffix,
+            isolated_database: database,
             fixture_heartbeat: Mutex::new(Some(fixture_heartbeat)),
             fixture_heartbeat_error,
             native_providers: Mutex::new(Vec::new()),

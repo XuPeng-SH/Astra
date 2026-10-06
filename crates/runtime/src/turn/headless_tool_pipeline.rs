@@ -1088,6 +1088,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let durable_dispatch_admission = self.ctx.durable_dispatch_admission;
         let delegation_model_admissions = self.ctx.delegation_model_admissions;
         let task_resolution_authority = self.ctx.task_resolution_authority;
+        let runtime_control_calls = self.ctx.runtime_control_calls_by_id;
         let session_turn = self.ctx.session_turn;
         let edge_round_present = !self.ctx.edge_tool_round.is_empty();
 
@@ -1126,6 +1127,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 };
                 let delegation_model_admission =
                     delegation_model_admissions.and_then(|admissions| admissions.get(&exec.id));
+                let runtime_control_kind = runtime_control_calls.get(&exec.id).copied();
                 execute_tool_pure(
                     exec,
                     server_executor,
@@ -1141,6 +1143,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     permission_grant.as_ref(),
                     session_turn,
                     edge_round_present,
+                    runtime_control_kind,
                 )
                 .await
             })

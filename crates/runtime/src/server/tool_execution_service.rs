@@ -882,6 +882,10 @@ impl ToolExecutionService {
             return capability_denied_result(&transport_request, &binding, reason).into();
         }
 
+        if let Some(result) = transport_request.policy.dispatch_deadline_rejection() {
+            return result.into();
+        }
+
         match route {
             ToolExecutionRouteKind::ServerLocal | ToolExecutionRouteKind::ServerControlPlane => {
                 execute_local_route(

@@ -167,7 +167,7 @@ impl ToolArgumentValidationError {
                     "kind": "malformed_tool_arguments",
                     "tool": self.tool_name,
                     "executed": false,
-                    "next_step": "Retry the same native tool once with one complete JSON argument object matching the advertised schema.",
+                    "next_step": "If the task permits another call, retry with one complete JSON argument object matching this invocation's advertised schema.",
                 },
             });
             let mut metadata = Map::new();
@@ -192,8 +192,23 @@ impl ToolArgumentValidationError {
             return body.to_string();
         }
         format!(
-            "Error: {self}. Correct the arguments and issue one new call matching the advertised schema."
+            "Error: {self}. Correct the named fields using this invocation's advertised schema. Objects and arrays must be JSON values, not JSON-encoded strings. Do not repeat these identical arguments. Make a corrected call only if the task permits another call."
         )
+    }
+
+    /// A schema rejection is not a transient execution failure. Preserve its
+    /// recovery action without authorizing an unchanged retry.
+    #[must_use]
+    pub fn rejection_output(&self) -> Value {
+        let evidence = self.failure_evidence();
+        json!({
+            "status": "rejected",
+            "error_kind": evidence.kind.as_str(),
+            "retryable": evidence.retryable,
+            "executed": false,
+            "error": self.output(),
+            "recovery_evidence": evidence,
+        })
     }
 
     #[must_use]
@@ -355,6 +370,18 @@ fn validate_schema_value(
     check_required: bool,
     issues: &mut Vec<String>,
 ) {
+    // A shared outer type applies to every alternative. Reject it before
+    // evaluating branches so a type error is not reported as an ambiguous
+    // union, and invalid scalar input cannot trigger redundant branch work.
+    if let Some(expected) = schema.get("type")
+        && !schema_type_matches(value, expected)
+    {
+        issues.push(format!(
+            "{path} has type {}, expected {expected}",
+            json_type_name(value)
+        ));
+        return;
+    }
     for keyword in ["anyOf", "oneOf"] {
         let Some(alternatives) = schema.get(keyword).and_then(Value::as_array) else {
             continue;
@@ -399,15 +426,6 @@ fn validate_schema_value(
             issues.push(format!("{path} must match exactly one advertised branch"));
             return;
         }
-    }
-    if let Some(expected) = schema.get("type")
-        && !schema_type_matches(value, expected)
-    {
-        issues.push(format!(
-            "{path} has type {}, expected {expected}",
-            json_type_name(value)
-        ));
-        return;
     }
     if let Some(expected) = schema.get("const")
         && value != expected
@@ -679,15 +697,17 @@ pub fn submit_task_resolution_schema() -> Value {
 }
 
 fn start_work_schema() -> Value {
+    let tasks = "Known acceptance units incl. dependents; no report subtasks.";
+    let prerequisites = "1-based output prerequisites; no order/text edges. Omit if independent.";
     json!({
         "type": "function",
         "function": {
             "name": "start_work",
-            "description": "Establish the conversation's one canonical Work with an initial ordered task list. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. When the user explicitly requests durable Work with 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses independent agent.spawn calls, or agent_fanout when group control is needed, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Declare every known outcome initially, including dependent outcomes; task identities are server-owned; declare only explicit execution prerequisites via after_initial_tasks. Omit only outcomes to be decided, discovered, added, replaced, or cancelled later until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
+            "description": "Establish the conversation's one canonical Work with an initial task graph. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. When the user explicitly requests durable Work with 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses independent agent.spawn calls, or agent_fanout when group control is needed, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Declare every known outcome initially, including dependent outcomes; task identities are server-owned; declare only explicit execution prerequisites via after_initial_tasks. Omit only outcomes to be decided, discovered, added, replaced, or cancelled later until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
-                "x-astra-discovery-summary": "Declare known outcomes, including dependencies. Omit later decisions/additions/replacements until graph update. Preserve exactly N named initial tracks. start assigns the first task; use its returned assignment.",
+                "x-astra-discovery-summary": "Declare known outcomes, including dependencies. Omit later decisions/additions/replacements. Use exactly N named initial tracks. start returns the first assignment.",
                 "properties": {
                     "goal": {
                         "type": "string",
@@ -704,7 +724,8 @@ fn start_work_schema() -> Value {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 8,
-                        "description": "Known acceptance units, including dependent outcomes; honor counts. Keep observation/verification/report together; omit later decisions/additions/replacements.",
+                        "description": tasks,
+                        "x-astra-discovery-summary": tasks,
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
@@ -714,7 +735,8 @@ fn start_work_schema() -> Value {
                                 "after_initial_tasks": {
                                     "type": "array", "maxItems": 8, "uniqueItems": true,
                                     "items": {"type": "integer", "minimum": 1, "maximum": 8},
-                                    "description": "Explicit prerequisites only: 1-based initial task indices that must deliver first. Omit for independent tasks."
+                                    "description": prerequisites,
+                                    "x-astra-discovery-summary": prerequisites
                                 }
                             },
                             "required": ["objective", "expected_result"]
@@ -1296,33 +1318,35 @@ macro_rules! heap_schema_vec {
 }
 
 fn delegation_agent_type_schema() -> Value {
-    let selection = "With an admitted directory, use its exact profile ID. Otherwise omitted/explore/code-review are read-only (no shell); choose task/general-purpose for shell or mutation, within parent permissions.";
+    let selection = "If runtime context supplies an admitted profile directory, use its exact profile ID; never search workspace files for profiles. Without a directory, omit for the bounded read-only default or choose explore/code-review (no shell); choose task/general-purpose for shell or mutation, within parent permissions.";
     json!({
         "type": "string",
         "minLength": 1,
         "description": selection,
-        "x-astra-discovery-summary": "Exact directory ID; else explore=no shell(default), task requests shell.",
+        "x-astra-discovery-summary": "Directory: exact ID required; absent: omit (read-only). No file discovery.",
     })
 }
 
 fn requested_model_policy_schema() -> Value {
+    let source_guidance =
+        "Exact catalog provider/access_label only; omit unless user specifies one.";
     json!({
-        "description": "Requested model behavior, distinct from the resolved Offering. For a model name coming from the human request, omit this field—including exact names and harmless spelling variants—so one candidate-aware admission can resolve it against the authorized catalog. Use a fixed selector only when the caller already has an exact authorized Offering ID; never put a display name in offering_id, normalize a human name into a fixed selector, or guess an Offering ID. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
+        "type": "object",
+        "x-astra-discovery-summary": "Not task/output text; omit unless asked.",
+        "description": "Optional execution-model override, distinct from the resolved Offering. Omit to use the admitted profile's model default, otherwise the parent Offering. Set a fixed selector only when the user requests an execution-model override, using an exact authorized Offering ID or configured name. If those choices are unknown, use model_catalog, never workspace configuration. Preserve requested versions and sources; never substitute a nearby model or invent an Offering ID. Names in quoted output or task content are not overrides. Runtime validates the selector against the authorized catalog before any child starts. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
         "oneOf": [
             {
-                "type": "object",
                 "properties": {"mode": {"const": "inherit"}},
                 "required": ["mode"],
                 "additionalProperties": false
             },
             {
-                "type": "object",
                 "properties": {
                     "mode": {"const": "fixed"},
                     "selector": {
+                        "type": "object",
                         "oneOf": [
                             {
-                                "type": "object",
                                 "properties": {
                                     "kind": {"const": "offering_id"},
                                     "offering_id": {"type": "string", "minLength": 1, "maxLength": 64}
@@ -1331,11 +1355,12 @@ fn requested_model_policy_schema() -> Value {
                                 "additionalProperties": false
                             },
                             {
-                                "type": "object",
                                 "properties": {
                                     "kind": {"const": "configured_name"},
                                     "model_name": {"type": "string", "minLength": 1, "maxLength": 256},
-                                    "source": {"type": "string", "minLength": 1, "maxLength": 128}
+                                    "source": {"type": "string", "minLength": 1, "maxLength": 128,
+                                        "description": source_guidance,
+                                        "x-astra-discovery-summary": "Exact provider/access_label."}
                                 },
                                 "required": ["kind", "model_name"],
                                 "additionalProperties": false
@@ -1347,7 +1372,6 @@ fn requested_model_policy_schema() -> Value {
                 "additionalProperties": false
             },
             {
-                "type": "object",
                 "properties": {
                     "mode": {"const": "auto"},
                     "strategy": {"type": "string", "enum": ["cost_priority", "balanced"]}
@@ -1361,7 +1385,8 @@ fn requested_model_policy_schema() -> Value {
 
 fn fanout_reasoning_schema() -> Value {
     json!({
-        "description": "Exact reasoning control. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
+        "description": "Optional reasoning override only for the children the user requests it for; never copy one child's control to another. Shared defaults apply only to requirements common to all slots. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
+        "x-astra-discovery-summary": "Omit outside user-requested scope.",
         "type": "object",
         "required": ["mode"],
         "oneOf": [
@@ -1927,7 +1952,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
-         Model choice uses `requested_model_policy`, not a `model` field. If the `agent` tool is already visible, call it directly; do not call `tool_search` or `model_catalog` first just to spawn one child. For any model name coming from the user—including natural-language variations in spelling, spacing, or component order—omit `requested_model_policy`; one candidate-aware admission resolves it against the authorized catalog. Use a fixed selector only when an exact authorized Offering ID is already supplied by the caller. Never guess an Offering ID, inspect configuration, or turn a human name into a fixed selector. When an admitted profile directory is present, `agent_type` must be its exact non-empty directory/profile ID; do not omit it or substitute a builtin persona. Omit `agent_type` only when no admitted directory is present; the trusted runtime then supplies the bounded default.\n\n\
+         Model policy is an optional override: omit `requested_model_policy` for the profile's model default, otherwise the parent Offering. If the user requests another execution model, set this policy using an exact authorized Offering ID or configured name, never a `model` field. If the `agent` tool is visible, call it directly; discover unknown model choices through `model_catalog`, not tool or filesystem exploration. Never guess an Offering ID, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. When an admitted profile directory is present, `agent_type` must be its exact non-empty directory/profile ID; do not omit it or substitute a builtin persona. Omit `agent_type` only when no admitted directory is present; the trusted runtime then supplies the bounded default.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\"}`\n\n\
          ## Execution mode\n\
@@ -1955,19 +1980,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["local", "server"]
                     },
                     "x-astra-surface-descriptions": {
-                        "server": "Server-owned single-agent lifecycle. If visible, call it directly; do not call tool_search or model_catalog first just to spawn. Actions: spawn, list, get_result, send_message. When an admitted profile directory is present, use its exact non-empty directory/profile ID for agent_type; do not omit it or substitute a builtin persona. Without a directory, omit agent_type for the bounded read-only default; choose a builtin persona only then when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For a user model name, omit requested_model_policy for one catalog admission; fixed selectors require an exact authorized Offering ID. Never inspect workspace files, model configuration, or credentials or normalize a human name into a selector. Use visible start_work for durable Work."
+                        "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. When an admitted profile directory is present, use its exact non-empty directory/profile ID for agent_type; do not omit it or substitute a builtin persona. Without a directory, omit agent_type for the bounded read-only default; choose a builtin persona only then when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
                     },
                     "x-astra-surface-discovery-summaries": {
-                        "server": "requested_model_policy: user model=omit (no catalog); fixed=Offering ID; no config reads; hard reqs bind; launched; propose final; runtime waits; no shell sleep; agent question."
+                        "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question"
                     },
                     "x-astra-per-action-discovery-summaries": {
-                        "spawn": "requested_model_policy: user model=omit (no catalog); fixed=Offering ID; no config reads; hard reqs bind; launched; propose final; runtime waits; no shell sleep; agent question.",
+                        "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
                         "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
+                        "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
                         "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
                         "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
                         "send_message": "action+to+message; child asks parent via to=parent, message_type=question (not ask_user); parent answers with the exact request_id"
                     },
-                    "x-astra-discovery-summary": "requested_model_policy: user model=omit (no catalog); fixed=Offering ID; no config reads; hard reqs bind; launched; propose final; runtime waits; no shell sleep; agent question.",
+                    "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
                         "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
@@ -1988,7 +2014,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
-                        "prompt": {"type": "string", "description": "Full self-contained child task brief for spawn. Include the constraints, conditional mappings, and expected output needed to finish; only a choice the child must ask about may be left unresolved. Non-empty and required with description."},
+                        "prompt": {"type": "string", "description": "Full self-contained child brief: preserve constraints, conditional mappings and exact output requirements. Keep parent-only reporting outside the brief: the parent reports execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; parent uses model/status receipts."},
                         "agent_type": delegation_agent_type_schema(),
                         "requested_model_policy": requested_model_policy_schema(),
                         "reasoning": fanout_reasoning_schema(),
@@ -2021,7 +2047,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
-                        "message": {"description": "REQUIRED for action='send_message'. Concise coordination message (at most 3000 characters); share an artifact for larger content."},
+                        "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
                     },
@@ -2056,16 +2082,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_results`: requires `action` and returned `group_id`. It takes a short non-blocking snapshot; the parent-owned completion boundary independently stages terminal child outcomes, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy uses the admitted profile's model default, then the parent Offering; explicit inherit selects the parent Offering. Exact authorized Offering and reasoning overrides require atomic admission before any slot starts. For any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it against the authorized catalog; use a fixed selector only when an exact authorized Offering ID is already supplied. Never inspect workspace configuration or credentials or normalize a human name into a selector. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. When an admitted profile directory is present, set `agent_type` on each slot or in `defaults` to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. Without a directory, omit `agent_type` for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll.",
+        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy uses the admitted profile's model default, then the parent Offering; explicit inherit selects the parent Offering. Exact authorized Offering and reasoning overrides require atomic admission before any slot starts. Interpret each requested execution model and propose requested_model_policy with an exact authorized Offering ID or configured name. Discover unknown choices using model_catalog. Preserve versions and sources; never substitute or inspect workspace configuration or credentials. Quoted model names in task content are not model selection. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. When an admitted profile directory is present, set `agent_type` on each slot or in `defaults` to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. Without a directory, omit `agent_type` for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll.",
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
-                        "start": "requested_model_policy: user model=omit (no catalog prerequisite); fixed=Offering ID; no config reads; hard requirements bind; start: target_count slots, description+prompt; atomic.",
+                        "start": "requested_model_policy: omit unless user requests override; then authorized ID/name; unknown=model_catalog; no substitution/config reads; hard requirements bind; target_count slots, description+prompt; atomic.",
                         "get_results": "action+group_id; use bounded result windows and follow next_call",
                         "stop_slot": "action+group_id+slot_index",
                         "stop_group": "action+group_id"
                     },
-                     "x-astra-discovery-summary": "requested_model_policy: user model=omit (no catalog prerequisite); fixed=Offering ID; no config reads; hard requirements bind; start: target_count slots, description+prompt; atomic.",
+                     "x-astra-discovery-summary": "requested_model_policy: omit unless user requests override; then authorized ID/name; unknown=model_catalog; no substitution/config reads; hard requirements bind; target_count slots, description+prompt; atomic.",
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
                         "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results, stop_slot, and stop_group."},
@@ -2080,7 +2106,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "properties": {
                                     "id": {"type": "string", "description": "Optional stable caller-facing label for this slot. Returned in start/results/fanout projections. Not the runtime agent_id."},
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
-                                    "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
+                                    "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Preserve user constraints and exact output in each brief. Keep parent-only reporting outside: use runtime model/status receipts, not child self-report. Inherits provider bindings; use only exposed tools. Never paste files, diffs, or prior tool output.", "x-astra-discovery-summary": "Preserve exact child output; parent uses model/status receipts."},
                                     "agent_type": delegation_agent_type_schema(),
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                     "max_output_tokens": {"type": "integer", "minimum": 1},
@@ -2133,10 +2159,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "model_catalog",
-                "description": "Read the current user's authorized active Chat models. Returns one complete JSON page with exact offering/name/provider/access identities, capabilities, nullable prices, revision and continuation cursor. Call only when the user asks which delegated models are available, compares models, or leaves model identity genuinely ambiguous; concrete user-named models, including harmless separator/case variants, are resolved during admission, so never call this merely to spawn one. Never inspect workspace configuration for model identity. Omit cursor and catalog_revision on the first page; send both unchanged when following next_cursor.",
+                "description": "Read the current user's authorized active Chat models. Returns one complete JSON page with exact offering/name/provider/access identities, capabilities, nullable prices, revision and continuation cursor. Use for requested availability/comparison or unknown model choices. Reuse a complete catalog already supplied in runtime context rather than rediscovering it to spawn. The primary interprets human references and proposes an exact authorized selector; admission does not infer a model from task text. Never inspect workspace configuration for model identity. Omit cursor and catalog_revision on the first page; send both unchanged when following next_cursor.",
                 "parameters": {
                     "type": "object",
-                    "x-astra-discovery-summary": "Authorized Chat model availability/comparison only; never a user-named spawn prerequisite. JSON only. limit defaults 16; follow next_cursor with catalog_revision. No workspace config reads. Discovery is not execution admission.",
+                    "x-astra-discovery-summary": "Authorized Chat availability/comparison or unknown choices. Reuse supplied complete catalog. JSON only; limit=16; follow next_cursor with catalog_revision. No config reads. Not execution admission.",
                     "properties": {
                         "limit": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16},
                         "cursor": {"type": "string", "minLength": 1, "maxLength": 2048},
@@ -2150,7 +2176,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Read bounded current runtime observations or an identified artifact; use model_catalog for available Chat models. Current live queries default to facet=overview and depth=summary; use depth=hint for quick checks and diagnostic detail only for a concrete gap or requested audit. Exact historical execution evidence comes from Server Explain: explain={target:previous} excludes the current root and selects the latest eligible prior root, which is not guaranteed to be the previous user turn; target=run requires run_id and identifies that exact run. A run that requested Explain returns its selected artifact handle; an ordinary run returns a bounded durable projection without creating an artifact. CLI/Edge Explain selectors are unsupported. For session-level prior causality, use reflect; do not use an ordinary live query as historical evidence or combine it with history unless current state is also requested or a concrete evidence gap requires one. Do not repeat identical diagnostics without new state or a requested deep audit; a cached repeat adds no evidence. Live horizons are not historical truth. Observation/evidence URNs such as urn:astra:observation:* are citations, not artifact handles. Use artifact://session/tool-result/<opaque_token> for artifacts; omit it for live state.",
+                "description": "Read bounded current runtime observations or an identified artifact; use model_catalog for available Chat models. Current live queries default to facet=overview and depth=summary; use depth=hint for quick checks and diagnostic detail only for a concrete gap or requested audit. Exact historical execution evidence comes from Server Explain: explain={target:previous} excludes the current root and selects the most recently admitted prior root in the active session, including ordinary runs; target=run requires run_id and identifies that exact run. A run that requested Explain returns its selected artifact handle; an ordinary run returns a bounded durable projection without creating an artifact. Never skip unavailable evidence for an older Explain capture. CLI/Edge Explain selectors are unsupported. For session-level prior causality, use reflect; do not use an ordinary live query as historical evidence or combine it with history unless current state is also requested or a concrete evidence gap requires one. Do not repeat identical diagnostics without new state or a requested deep audit; a cached repeat adds no evidence. Live horizons are not historical truth. Observation/evidence URNs such as urn:astra:observation:* are citations, not artifact handles. Use artifact://session/tool-result/<opaque_token> for artifacts; omit it for live state.",
                 "parameters": {
                     "type": "object",
                     "x-astra-discovery-summary": "Live runtime observation and Server Explain/artifact recovery. For authorized Chat models use model_catalog, not workspace configuration.",
@@ -2172,7 +2198,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             },
                             "required": ["target"],
                             "additionalProperties": false,
-                            "description": "Server only. run requires run_id; previous forbids it. Exclusive with artifact; offset must be 0. target=run is exact active-session execution evidence; target=previous selects the latest eligible prior root without older fallback."
+                            "description": "Server only. run requires run_id; previous forbids it. Exclusive with artifact; offset must be 0. Both select exact active-session evidence; previous selects the latest root admitted strictly before the trusted current root, ordered by admission time and run ID, without older fallback."
                         },
                         "offset": {"type": "integer", "minimum": 0, "description": "Artifact byte offset; default 0."},
                         "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Artifact page bytes or bounded projection output budget. Default Explain discovery returns a summary with a detail handle; projections retain whole records and omission counts without pagination. A larger budget does not recover upstream capture omissions."}
@@ -2690,13 +2716,15 @@ mod tests {
         let policy_description = properties["requested_model_policy"]["description"]
             .as_str()
             .expect("requested model policy description");
-        assert!(policy_description.contains("For a model name coming from the human request"));
-        assert!(policy_description.contains(
-            "Use a fixed selector only when the caller already has an exact authorized Offering ID"
-        ));
-        assert!(policy_description.contains("never put a display name in offering_id"));
+        assert!(policy_description.contains("Optional execution-model override"));
+        assert!(policy_description.contains("Omit to use the admitted profile's model default"));
+        assert!(
+            policy_description.contains("only when the user requests an execution-model override")
+        );
+        assert!(policy_description.contains("exact authorized Offering ID or configured name"));
+        assert!(policy_description.contains("never substitute a nearby model"));
         assert!(policy_description.contains("authorized catalog"));
-        assert!(policy_description.contains("omit this field"));
+        assert!(policy_description.contains("quoted output or task content"));
         assert!(policy_description.contains("cannot override a hard user requirement"));
         assert!(description.contains("exact non-empty directory/profile ID"));
         assert!(description.contains("do not omit it or substitute a builtin persona"));
@@ -2726,14 +2754,21 @@ mod tests {
                         summary.contains("requested_model_policy"),
                         "{surface}: {summary}"
                     );
-                    assert!(summary.contains("user model"), "{surface}: {summary}");
+                    assert!(
+                        summary.contains("authorized ID/name"),
+                        "{surface}: {summary}"
+                    );
                     assert!(
                         summary.contains("hard requirements bind")
                             || summary.contains("hard reqs bind"),
                         "{surface}: {summary}"
                     );
-                    assert!(summary.contains("no config reads"), "{surface}: {summary}");
+                    assert!(
+                        summary.contains("no substitution/config reads"),
+                        "{surface}: {summary}"
+                    );
                     assert!(summary.contains("launched"), "{surface}: {summary}");
+                    assert!(summary.contains("omit unasked"), "{surface}: {summary}");
                     assert!(
                         summary.contains("propose final") || summary.contains("proposes final"),
                         "{surface}: {summary}"
@@ -2743,9 +2778,13 @@ mod tests {
                     assert!(!summary.contains("foreground"), "{surface}: {summary}");
                 } else {
                     let lower = summary.to_ascii_lowercase();
-                    assert!(lower.contains("user model"), "{surface}/{name}: {summary}");
+                    assert!(lower.contains("omit unless user requests override"));
                     assert!(
-                        lower.contains("omit") && lower.contains("catalog"),
+                        lower.contains("authorized id/name"),
+                        "{surface}/{name}: {summary}"
+                    );
+                    assert!(
+                        lower.contains("model_catalog") && lower.contains("no substitution"),
                         "{surface}/{name}: {summary}"
                     );
                     assert!(
@@ -2753,7 +2792,7 @@ mod tests {
                         "{surface}/{name}: {summary}"
                     );
                     assert!(
-                        summary.contains("no config reads"),
+                        summary.contains("no substitution/config reads"),
                         "{surface}/{name}: {summary}"
                     );
                 }
@@ -2795,7 +2834,12 @@ mod tests {
             assert!(description.contains("message_type=question"));
             assert!(description.contains("ask_user"));
             if surface == "server" {
-                assert!(description.contains("one catalog admission"));
+                assert!(
+                    description.contains("use model_catalog only when model choices are unknown")
+                );
+                assert!(description.contains(
+                    "propose requested_model_policy with an exact authorized Offering ID or configured name"
+                ));
                 assert!(description.contains(
                     "Never inspect workspace files, model configuration, or credentials"
                 ));
@@ -3052,11 +3096,10 @@ mod tests {
 
     #[test]
     fn admitted_team_profile_ids_validate_through_native_and_deferred_schemas() {
-        let team =
-            astra_services::team_persistence::builtin_teams("schema-owner", "2026-10-03T00:00:00Z")
-                .into_iter()
-                .next()
-                .expect("builtin team fixture");
+        let team = astra_services::team_persistence::builtin_teams("schema-owner")
+            .into_iter()
+            .next()
+            .expect("builtin team fixture");
         let profile_id =
             astra_services::team_persistence::resolve_member_to_profile(&team.members[0], &team)
                 .agent_id;
@@ -3259,6 +3302,13 @@ mod tests {
                 && summary.contains("Omit later decisions/additions/replacements")
                 && summary.contains("exactly N named initial tracks")
         }));
+        let prerequisite_path =
+            "/properties/tasks/items/properties/after_initial_tasks/description";
+        assert_eq!(
+            selection["parameters"].pointer(prerequisite_path),
+            parameters.pointer(prerequisite_path),
+            "selected tools must retain the same dependency guidance as resident tools"
+        );
         let task_properties = parameters["properties"]["tasks"]["items"]["properties"]
             .as_object()
             .expect("task fields must be structurally declared");
@@ -3750,7 +3800,7 @@ mod tests {
         assert!(description.contains("diagnostic detail only for a concrete gap"));
         assert!(description.contains("requested deep audit"));
         assert!(description.contains("cached repeat adds no evidence"));
-        assert!(description.contains("not guaranteed to be the previous user turn"));
+        assert!(description.contains("most recently admitted prior root"));
         assert!(description.contains("urn:astra:observation:*"));
         assert!(description.contains("artifact://session/tool-result/<opaque_token>"));
         let properties = introspect["function"]["parameters"]["properties"]
@@ -4410,6 +4460,39 @@ mod tests {
             error.failure_evidence().kind,
             astra_core::ErrorKind::ToolInvalidArgs
         );
+        assert!(
+            error
+                .output()
+                .contains("Do not repeat these identical arguments")
+        );
+        assert!(
+            error
+                .output()
+                .contains("only if the task permits another call")
+        );
+    }
+
+    #[test]
+    fn model_policy_requires_json_objects_and_preserves_correction_evidence() {
+        let policy =
+            json!({"mode":"fixed","selector":{"kind":"configured_name","model_name":"candidate"}});
+        let mut args = json!({"action":"spawn","description":"Read a value","prompt":"Return the value","requested_model_policy":policy.to_string()});
+        let error = validate_tool_arguments("agent", &args).unwrap_err();
+        let output = error.rejection_output();
+        assert_eq!(output["error_kind"], "tool_invalid_args");
+        assert_eq!(output["executed"], false);
+        assert_eq!(output["retryable"], false);
+        assert_eq!(output["recovery_evidence"], json!(error.failure_evidence()));
+        assert_eq!(
+            output["recovery_evidence"]["recovery_actions"],
+            json!(["correct_arguments"])
+        );
+        assert!(!output["error"].as_str().unwrap().contains("tool_search"));
+        args["requested_model_policy"] = policy;
+        validate_tool_arguments("agent", &args).expect("a corrected object is admitted");
+        args["requested_model_policy"]["selector"] =
+            json!("{\"kind\":\"configured_name\",\"model_name\":\"candidate\"}");
+        assert!(validate_tool_arguments("agent", &args).is_err());
     }
 
     #[test]
@@ -4433,6 +4516,12 @@ mod tests {
         assert_eq!(output["advisory"]["executed"], false);
         assert_eq!(output["advisory"]["parse_error"]["column"], 106);
         assert!(output["advisory"]["parse_error"].get("raw").is_none());
+        assert!(
+            output["advisory"]["next_step"]
+                .as_str()
+                .unwrap()
+                .starts_with("If the task permits another call")
+        );
     }
 
     #[test]
