@@ -6105,7 +6105,8 @@ fn execution_resume_storage_error(
     error: crate::runs::ExecutionHandoffReferenceError,
 ) -> SessionContextCoordinatorError {
     match error {
-        crate::runs::ExecutionHandoffReferenceError::Rejected(_) => {
+        crate::runs::ExecutionHandoffReferenceError::Rejected(detail) => {
+            tracing::warn!(reason = detail, "execution resume custody rejected");
             SessionContextCoordinatorError::Fenced
         }
         crate::runs::ExecutionHandoffReferenceError::Unavailable(detail) => {

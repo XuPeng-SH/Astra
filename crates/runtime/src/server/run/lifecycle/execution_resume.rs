@@ -374,7 +374,21 @@ impl AgenticRunLifecycleService {
             handoff.original_facts.delegated_model_requirements.clone(),
         )
         .map_err(invalid_resume)?;
-        let original_workspace: WorkspaceBinding = admission_field(admission, "workspace")?;
+        let binding = Self::durable_run_execution_binding_snapshot(run);
+        let original_workspace: WorkspaceBinding = serde_json::from_value(
+            binding
+                .workspace
+                .ok_or_else(|| invalid_resume("original workspace binding is missing"))?,
+        )
+        .map_err(|_| invalid_resume("original workspace binding is invalid"))?;
+        let original_executor = binding
+            .executor
+            .ok_or_else(|| invalid_resume("original executor binding is missing"))?;
+        let binding_metadata = json!({
+            "workspace": original_workspace,
+            "executor": original_executor,
+            "execution_binding_generation": binding.execution_binding_generation,
+        });
         let workspace = if original_workspace.kind == WorkspaceBindingKind::ServerSandbox {
             let store = self
                 .workspace_record_store
@@ -402,7 +416,7 @@ impl AgenticRunLifecycleService {
             ));
         };
         let bindings = crate::server::run::binding_resolution::execution_bindings_from_metadata(
-            Some(&Value::Object(admission.clone())),
+            Some(&binding_metadata),
             &workspace,
         )
         .ok_or_else(|| invalid_resume("original execution binding is missing"))?;
@@ -572,6 +586,7 @@ impl AgenticRunLifecycleService {
             self.execution_handoff_requested.clone(),
             self.run_engine.clone(),
             canonical.reservation.clone(),
+            handoff.original_user_message.clone(),
         );
         self.configure_host_approval_audit_context(
             &mut host,
@@ -733,7 +748,7 @@ impl AgenticRunLifecycleService {
             }),
             agent_id: run.agent_id.clone(),
             model_name: run.resolved_model_name.clone(),
-            user_message: state.message.clone(),
+            user_message: handoff.original_user_message.clone(),
             #[cfg(feature = "e2e-hooks")]
             test_post_loop_settlement_delay_ms: 0,
             host,

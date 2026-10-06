@@ -2306,20 +2306,36 @@ pub(crate) async fn lock_execution_resume_tx(
             return Err(Rejected("execution advanced beyond its resume receipt"));
         }
     }
-    let starts: Vec<String> = sqlx::query_scalar(
+    // Idempotent admission precedes workspace materialization. Its immutable
+    // binding facts arrive in the two canonical binding events, not necessarily
+    // in run_started. Read only those facts, with one overflow row to fail closed.
+    let facts: Vec<String> = sqlx::query_scalar(
         "SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ?
-         AND event_type = 'run_started' ORDER BY event_idx ASC LIMIT 2 FOR UPDATE",
+         AND event_type IN ('run_started', 'workspace_bound', 'executor_bound')
+         ORDER BY event_idx ASC LIMIT 4 FOR UPDATE",
     )
     .bind(request.user_id)
     .bind(request.run_id)
     .fetch_all(&mut **tx)
     .await
     .map_err(|error| Unavailable(error.to_string()))?;
-    run.events = starts
+    run.events = facts
         .iter()
         .map(|json| serde_json::from_str(json))
         .collect::<Result<_, _>>()
         .map_err(|error| Unavailable(error.to_string()))?;
+    let mut kinds = std::collections::HashSet::new();
+    if run.events.len() > 3
+        || run.events.iter().any(|event| {
+            let kind = extract_event_type(event);
+            !matches!(
+                kind.as_str(),
+                "run_started" | "workspace_bound" | "executor_bound"
+            ) || !kinds.insert(kind)
+        })
+    {
+        return Err(Rejected("original execution binding facts are conflicting"));
+    }
     run.original_admission_data()
         .map_err(|_| Rejected("original execution admission is missing or conflicting"))?;
     Ok((run, checkpoint))
@@ -2376,11 +2392,12 @@ pub(crate) async fn activate_execution_resume_tx(
          WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?
          AND last_event_idx = ? AND status = 'paused' AND waiting_for IS NULL
          AND cancellation_requested_at IS NULL
-         AND (owner_pod_id IS NULL OR owner_lease_expires_at IS NULL OR owner_lease_expires_at < NOW(6))",
+         AND (owner_pod_id = ? OR owner_pod_id IS NULL OR owner_lease_expires_at IS NULL OR owner_lease_expires_at < NOW(6))",
     ).bind(owner_pod_id)
         .bind(DatabaseRunStateStore::DEFAULT_LEASE_TTL.as_micros() as i64)
         .bind(next_generation).bind(next_idx).bind(&run.user_id).bind(&run.session_id)
         .bind(&run.run_id).bind(run.run_generation as i64).bind(run.last_event_idx)
+        .bind(owner_pod_id)
         .execute(&mut **tx).await.map_err(|error| Unavailable(error.to_string()))?;
     if affected.rows_affected() != 1 {
         return Err(Rejected("execution owner remains live or changed"));
@@ -29419,6 +29436,26 @@ mod tests {
         let run_id = format!("resume-atomic-r-{nonce}");
         let (coordinator, source, actor, checkpoint) =
             parked_execution_resume_fixture(&store, &pool, &user, &session, &run_id).await;
+        // Startup recovery retains a live custody lease while parking the
+        // checkpoint. Its own owner may resume, but not bypass a live writer.
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = 'resume-atomic-owner', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+        // Use the production binding event envelope, plus an unrelated tail
+        // which the bounded authority proof must not hydrate.
+        let binding = json!({"kind":"none", "cwd":null, "authority":"none"});
+        store
+            .append_events_batch(
+                &user,
+                &session,
+                &run_id,
+                &[
+                    json!({"type":"workspace_bound", "workspace":binding}),
+                    json!({"type":"executor_bound", "executor":{"kind":"server_local"}}),
+                    make_event("agent_progress", json!({"step":0})),
+                ],
+            )
+            .await
+            .unwrap();
         let before = store.load_run(&user, &run_id).await.unwrap().unwrap();
         let request = |actor| ResumedExecutionTurnRequest {
             user_id: &user,
@@ -29431,6 +29468,28 @@ mod tests {
             owner_pod_id: "resume-atomic-owner",
             ttl: Duration::from_secs(60),
         };
+        // A fourth authority fact must not hide a duplicate start or binding
+        // behind the query limit. Rejection must leave custody unchanged.
+        for kind in ["run_started", "workspace_bound"] {
+            sqlx::query("UPDATE agent_run_events SET event_type = ?, payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+                .bind(kind).bind(make_event(kind, json!({})).to_string())
+                .bind(&user).bind(&run_id).bind(before.last_event_idx)
+                .execute(pool.get()).await.unwrap();
+            let conflicting = store.load_run(&user, &run_id).await.unwrap().unwrap();
+            assert!(
+                coordinator
+                    .resume_execution_turn(request(&actor))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store.load_run(&user, &run_id).await.unwrap().unwrap(),
+                conflicting
+            );
+        }
+        sqlx::query("UPDATE agent_run_events SET event_type = 'agent_progress', payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
+            .bind(before.events.last().unwrap().to_string()).bind(&user).bind(&run_id)
+            .bind(before.last_event_idx).execute(pool.get()).await.unwrap();
         // Authority epochs are checked under lock; no stale actor may resume.
         let mut stale_actor = actor.clone();
         stale_actor.authority_epochs.permission_epoch += 1;
@@ -29499,10 +29558,12 @@ mod tests {
         assert_eq!(proof.run().run_generation, before.run_generation + 1);
         assert_eq!(
             proof.run().events.len(),
-            1,
-            "proof excludes execution history"
+            3,
+            "proof retains only original admission and binding authority"
         );
         assert_eq!(proof.run().events[0]["event_type"], "run_started");
+        assert_eq!(proof.run().events[1]["workspace"], binding);
+        assert_eq!(proof.run().events[2]["type"], "executor_bound");
         assert_eq!(
             proof.run().original_admission_data().unwrap(),
             before.original_admission_data().unwrap(),

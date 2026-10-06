@@ -1311,8 +1311,8 @@ fn delegation_agent_type_schema() -> Value {
 
 fn requested_model_policy_schema() -> Value {
     json!({
-        "x-astra-discovery-summary": "Execution model only. Omit for task or output names.",
-        "description": "Requested model behavior, distinct from the resolved Offering. Interpret the human request and propose a fixed selector using an exact authorized Offering ID or configured name. If the available choices are not known, use model_catalog, never workspace configuration. Preserve requested versions and sources; never substitute a nearby model or invent an Offering ID. Names in quoted output or task content are not execution controls. Runtime validates the selector against the authorized catalog before any child starts. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
+        "x-astra-discovery-summary": "Model override, not task/output text. Omit for defaults.",
+        "description": "Optional execution-model override, distinct from the resolved Offering. Omit to use the admitted profile's model default, otherwise the parent Offering. Set a fixed selector only when the user requests an execution-model override, using an exact authorized Offering ID or configured name. If those choices are unknown, use model_catalog, never workspace configuration. Preserve requested versions and sources; never substitute a nearby model or invent an Offering ID. Names in quoted output or task content are not overrides. Runtime validates the selector against the authorized catalog before any child starts. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
         "oneOf": [
             {
                 "type": "object",
@@ -1932,7 +1932,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
-         Model choice uses `requested_model_policy`, not a `model` field. If the `agent` tool is already visible, call it directly. Interpret the requested execution model, then use `requested_model_policy` with an exact authorized Offering ID or configured name. Discover unknown choices through `model_catalog`, not tool or filesystem exploration. Never guess an Offering ID, inspect configuration, or substitute a different version. Omit reasoning unless requested; quoted model names are task content, not model selection. When an admitted profile directory is present, `agent_type` must be its exact non-empty directory/profile ID; do not omit it or substitute a builtin persona. Omit `agent_type` only when no admitted directory is present; the trusted runtime then supplies the bounded default.\n\n\
+         Model policy is an optional override: omit `requested_model_policy` for the profile's model default, otherwise the parent Offering. If the user requests another execution model, set this policy using an exact authorized Offering ID or configured name, never a `model` field. If the `agent` tool is visible, call it directly; discover unknown model choices through `model_catalog`, not tool or filesystem exploration. Never guess an Offering ID, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. When an admitted profile directory is present, `agent_type` must be its exact non-empty directory/profile ID; do not omit it or substitute a builtin persona. Omit `agent_type` only when no admitted directory is present; the trusted runtime then supplies the bounded default.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\"}`\n\n\
          ## Execution mode\n\
@@ -2696,7 +2696,11 @@ mod tests {
         let policy_description = properties["requested_model_policy"]["description"]
             .as_str()
             .expect("requested model policy description");
-        assert!(policy_description.contains("Interpret the human request"));
+        assert!(policy_description.contains("Optional execution-model override"));
+        assert!(policy_description.contains("Omit to use the admitted profile's model default"));
+        assert!(
+            policy_description.contains("only when the user requests an execution-model override")
+        );
         assert!(policy_description.contains("exact authorized Offering ID or configured name"));
         assert!(policy_description.contains("never substitute a nearby model"));
         assert!(policy_description.contains("authorized catalog"));

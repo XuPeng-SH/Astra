@@ -2682,6 +2682,8 @@ pub(crate) struct OriginalLoopExecutionFacts {
     pub canonical_turn_chain_id: Option<String>,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub root_user_query_event_id: Option<String>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub canonical_turn_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub total_prompt: u64,
     pub total_completion: u64,
     pub total_cache_read: u64,
@@ -2755,6 +2757,7 @@ impl OriginalLoopExecutionFacts {
             session_turn: state.session_turn,
             canonical_turn_chain_id: state.canonical_turn_chain_id.clone(),
             root_user_query_event_id: state.root_user_query_event_id.clone(),
+            canonical_turn_started_at: state.canonical_turn_started_at.get().copied(),
             total_prompt: state.total_prompt,
             total_completion: state.total_completion,
             total_cache_read: state.total_cache_read,

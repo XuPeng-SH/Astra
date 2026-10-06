@@ -501,8 +501,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         "resident projection must retain model-control semantics"
     );
     let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
-    assert!(summary.contains("Execution model only"));
-    assert!(summary.contains("Omit for task or output names"));
+    assert!(summary.contains("Model override, not task/output text"));
+    assert!(summary.contains("Omit for defaults"));
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
             .iter()

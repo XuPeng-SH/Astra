@@ -4810,6 +4810,7 @@ impl LoopExecutionFacts {
                 session_turn: 0,
                 canonical_turn_chain_id,
                 root_user_query_event_id: None,
+                canonical_turn_started_at: None,
                 total_prompt: 0,
                 total_completion: 0,
                 total_cache_read: 0,
@@ -13728,6 +13729,10 @@ impl AgenticRunLifecycleService {
             session_turn: facts.original.session_turn,
             canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
             root_user_query_event_id: facts.original.root_user_query_event_id,
+            canonical_turn_started_at: facts
+                .original
+                .canonical_turn_started_at
+                .map_or_else(Default::default, std::sync::OnceLock::from),
             harness,
             ..AgenticLoopState::fresh(
                 facts.step_recorder,
@@ -17020,10 +17025,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
-                    .map(|(workspace, executor)| {
-                        ExecutionBindingSnapshot::inferred(workspace, executor)
-                    })
+                resolve_request_execution_bindings_without_server_workspace(
+                    &request,
+                    &edge_context.edge_profile,
+                )
+                .map(|(workspace, executor)| {
+                    ExecutionBindingSnapshot::inferred(workspace, executor)
+                })
             });
         if let Some(generation) = request.execution_binding_generation {
             let Some(snapshot) = execution_bindings.as_mut() else {
@@ -17312,6 +17320,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 self.execution_handoff_requested.clone(),
                 self.run_engine.clone(),
                 admission.reservation.clone(),
+                request.message.clone(),
             );
         }
         if let Some(admission) = canonical_turn.as_ref()
@@ -17893,10 +17902,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
-                    .map(|(workspace, executor)| {
-                        ExecutionBindingSnapshot::inferred(workspace, executor)
-                    })
+                resolve_request_execution_bindings_without_server_workspace(
+                    &request,
+                    &edge_context.edge_profile,
+                )
+                .map(|(workspace, executor)| {
+                    ExecutionBindingSnapshot::inferred(workspace, executor)
+                })
             });
         if let Some(generation) = request.execution_binding_generation {
             let Some(snapshot) = execution_bindings.as_mut() else {
@@ -18484,6 +18496,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 self.execution_handoff_requested.clone(),
                 self.run_engine.clone(),
                 admission.reservation.clone(),
+                request.message.clone(),
             );
         }
         self.configure_host_approval_audit_context(

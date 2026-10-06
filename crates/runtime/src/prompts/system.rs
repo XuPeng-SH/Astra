@@ -679,7 +679,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     }
     if agent_visible {
         body.push_str(
-"         - Delegation: when the user asks for a child, its model is known, and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. For absent actions or fields, follow the Tool Availability Protocol; never drop requested constraints. Default `agent_type`: bounded read-only `explore`; `code-review` for review, `task`/`general-purpose` for mutation/full capabilities. Propose `requested_model_policy` with an exact authorized ID or configured name for the requested execution model. If choices are unknown, discover them through `model_catalog` before spawning. Task/quoted model names are not execution controls; never invent reasoning requirements, read workspace configuration/credentials, or substitute unavailable/prohibited models.\n",
+"         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Absent fields/actions: Tool Availability Protocol; preserve constraints. Default `agent_type`: read-only `explore`; review: `code-review`; mutation: `task`/`general-purpose`. Model policy is an optional override: omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, set an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not execution controls; never invent reasoning requirements, read configuration/credentials, or substitute unavailable/prohibited models.\n",
         );
         body.push_str(
             "         - Spawn before child-specific checks. Preserve user-assigned model/task pairs: parent work stays with the parent, never replaces child work. One child per objective; fanout controls groups, not duplication.\n",
@@ -1373,7 +1373,10 @@ mod tests {
         );
         assert!(agent_surface.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(agent_surface.contains("all required arguments fit the visible schema"));
-        assert!(agent_surface.contains("discover them through `model_catalog` before spawning"));
+        assert!(
+            agent_surface
+                .contains("Unknown explicit models require `model_catalog` before spawning")
+        );
         assert!(agent_surface.contains("or substitute unavailable/prohibited models"));
         assert!(!agent_surface.contains("settle_work_item"));
         let fanout_surface = tool_conditional_section(&["agent_fanout"]);
@@ -1567,8 +1570,10 @@ mod tests {
     fn named_child_model_does_not_require_parent_preflight() {
         let prompt = tool_conditional_section(&["agent", "tool_search", "model_catalog", "bash"]);
         assert!(prompt.contains("exact authorized ID or configured name"));
-        assert!(prompt.contains("If choices are unknown, discover them through `model_catalog`"));
+        assert!(prompt.contains("Unknown explicit models require `model_catalog` before spawning"));
         assert!(prompt.contains("Task/quoted model names are not execution controls"));
+        assert!(prompt.contains("omit `requested_model_policy` for profile/parent defaults"));
+        assert!(prompt.contains("Only for a user-requested execution-model override"));
         assert!(prompt.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(prompt.contains("when the user asks for a child"));
         assert!(prompt.contains("Spawn before child-specific checks"));
@@ -1955,15 +1960,16 @@ mod tests {
                 .contains("Use the visible `agent` schema directly for its permitted actions")
         );
         assert!(discoverable.contains("all required arguments fit the visible schema"));
-        assert!(
-            discoverable
-                .contains("For absent actions or fields, follow the Tool Availability Protocol")
-        );
-        assert!(discoverable.contains("never drop requested constraints"));
+        assert!(discoverable.contains("Absent fields/actions: Tool Availability Protocol"));
+        assert!(discoverable.contains("preserve constraints"));
+        assert!(discoverable.contains("using defaults or a known selector"));
         assert!(!discoverable.contains("Do not call `tool_search`"));
         assert!(discoverable.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(discoverable.contains("exact authorized ID or configured name"));
-        assert!(discoverable.contains("discover them through `model_catalog` before spawning"));
+        assert!(
+            discoverable
+                .contains("Unknown explicit models require `model_catalog` before spawning")
+        );
     }
 
     #[test]

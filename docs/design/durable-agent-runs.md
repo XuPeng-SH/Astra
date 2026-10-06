@@ -280,6 +280,9 @@ and heavy snapshot for checkpoint custody. The old reservation is identity
 evidence, not renewed authority. Explicit same-run resume obtains a renewed
 writer/reservation pair and checkpoint custody in one coordinator transaction
 before reconstructing execution through the existing background loop.
+The payload preserves the raw submitted user text and original audit timestamp,
+separately from the loop's current input, which steering may replace. Restoration
+must not reconstruct either immutable audit fact from the mutable prompt state.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import

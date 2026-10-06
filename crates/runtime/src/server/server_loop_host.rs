@@ -3942,6 +3942,7 @@ struct ExecutionHandoffContext {
     requested: tokio_util::sync::CancellationToken,
     engine: crate::server::run::engine::RunEngine,
     reservation: astra_turn_types::TurnReservationV1,
+    original_user_message: String,
 }
 
 /// Unfinished-turn continuation, not a committed session cursor or authority.
@@ -4004,6 +4005,8 @@ fn validate_handoff_tool_history(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeExecutionHandoff {
+    // Audit input is immutable; original_facts.message may reflect steering.
+    pub(crate) original_user_message: String,
     // Original composed model inputs, not credentials or execution grants.
     // Restore must independently authorize capabilities before reusing these
     // contracts. The enclosing checkpoint's byte limit bounds their retention.
@@ -4083,6 +4086,7 @@ impl RuntimeExecutionHandoff {
             || producer_owner_generation != receipt.producer_generation
             || payload.reservation != receipt.source
             || payload.original_facts.session_turn != receipt.source.reserved_turn
+            || payload.original_facts.canonical_turn_started_at.is_none()
         {
             return Err(invalid(
                 "execution facts do not belong to the adopted producer",
@@ -7176,11 +7180,13 @@ impl ServerAgenticLoopHost {
         requested: tokio_util::sync::CancellationToken,
         engine: crate::server::run::engine::RunEngine,
         reservation: astra_turn_types::TurnReservationV1,
+        original_user_message: String,
     ) {
         self.execution_handoff = Some(ExecutionHandoffContext {
             requested,
             engine,
             reservation,
+            original_user_message,
         });
     }
 
@@ -18625,6 +18631,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             producer_run_id: run_id.to_string(),
             producer_owner_generation: generation,
             heavy: RuntimeExecutionHandoff {
+                original_user_message: context.original_user_message.clone(),
                 edge_profile: self.edge_profile.clone(),
                 edge_provider_tool_schemas: self.edge_provider_tool_schemas.clone(),
                 tool_schemas: self.tool_schemas.clone(),
@@ -24688,7 +24695,10 @@ mod tests {
                 7,
             ),
         );
+        let original_turn_started_at = state.turn_event_buffer.as_ref().unwrap().turn_started_at();
+        state.canonical_turn_started_at = std::sync::OnceLock::from(original_turn_started_at);
         state.initialize_provider_canonical_wal_base(&[]);
+        state.message = "subsequent steering guidance".into();
         state.messages = vec![
             json!({"role":"user","content":"inspect result"}),
             json!({"role":"assistant","content":null,"tool_calls":[{"id":"replay-tool","type":"function","function":{"name":"test_tool","arguments":"{}"}}]}),
@@ -24702,6 +24712,7 @@ mod tests {
             },
             engine.clone(),
             reservation.clone(),
+            "\n  inspect result\t\n".into(),
         );
         let heavy =
             crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
@@ -24886,6 +24897,51 @@ mod tests {
                 adopted.run().execution_authentication().unwrap(),
                 Some(execution_authentication.clone())
             );
+            if generation == 2 {
+                // A committed custody proof is not permission to dispatch an
+                // incomplete runtime checkpoint. Test missing and explicit-null
+                // original inputs through the actual adoption boundary.
+                for (field, missing) in [
+                    ("canonical_turn_started_at", true),
+                    ("canonical_turn_started_at", false),
+                    ("original_user_message", true),
+                    ("original_user_message", false),
+                ] {
+                    let mut malformed: Value =
+                        serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
+                    let facts = if field == "original_user_message" {
+                        &mut malformed["heavy"]
+                    } else {
+                        &mut malformed["heavy"]["original_facts"]
+                    };
+                    if missing {
+                        facts.as_object_mut().unwrap().remove(field);
+                    } else {
+                        facts[field] = Value::Null;
+                    }
+                    for table in ["agent_runs", "run_checkpoints"] {
+                        sqlx::query(&format!("UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"))
+                            .bind(malformed.to_string()).bind(&user).bind(run_id)
+                            .execute(pool.get()).await.unwrap();
+                    }
+                    let invalid = coordinator
+                        .resume_execution_turn(resume_request(generation - 1, winner))
+                        .await
+                        .unwrap();
+                    assert!(RuntimeExecutionHandoff::from_adopted(&invalid).is_err());
+                }
+                for table in ["agent_runs", "run_checkpoints"] {
+                    sqlx::query(&format!(
+                        "UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"
+                    ))
+                    .bind(&checkpoint.checkpoint_json)
+                    .bind(&user)
+                    .bind(run_id)
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+                }
+            }
             let recovered = RuntimeExecutionHandoff::from_adopted(&adopted)
                 .expect("decode the exact checkpoint returned by atomic adoption");
             assert_eq!(recovered.edge_profile, original_profile);
@@ -24897,7 +24953,16 @@ mod tests {
                 BTreeSet::from(["original-client-skill".into()])
             );
             assert_eq!(recovered.reservation, reservation);
+            assert_eq!(recovered.original_user_message, "\n  inspect result\t\n");
+            assert_eq!(
+                recovered.original_facts.message,
+                "subsequent steering guidance"
+            );
             assert_eq!(recovered.journal_next_round, Some(7));
+            assert_eq!(
+                recovered.original_facts.canonical_turn_started_at,
+                Some(original_turn_started_at)
+            );
             assert_eq!(
                 adopted.checkpoint().checkpoint_json.as_str(),
                 checkpoint.checkpoint_json.as_str()
@@ -25177,6 +25242,7 @@ mod tests {
                 },
                 engine.clone(),
                 reservation.clone(),
+                state.message.clone(),
             );
             let heavy =
                 crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)

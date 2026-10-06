@@ -95,6 +95,11 @@ matrix_test! {
     journey_tasks_runs::run_chat_run_pause_resume_http
 }
 matrix_test! {
+    e2e_matrix_execution_handoff_resume_reaches_provider_http, 2,
+    "live MatrixOne + mock LLM; public same-turn execution handoff restoration",
+    journey_tasks_runs::run_execution_handoff_resume_reaches_provider_http
+}
+matrix_test! {
     e2e_matrix_orphan_cancel_claim_race_http, 4,
     "live MatrixOne; production orphan claim x HTTP DELETE cancellation race",
     journey_tasks_runs::run_orphan_cancel_claim_race_http

@@ -16834,6 +16834,7 @@ fn edge_profile_does_not_infer_execution_bindings() {
     edge_profile.insert("cwd".to_string(), json!("/workspace/astra"));
     edge_profile.insert("edge_agent_id".to_string(), json!("edge-macbook-1"));
     edge_profile.insert("hostname".to_string(), json!("MacBook Pro"));
+    let edge_profile = serde_json::from_value(Value::Object(edge_profile)).unwrap();
 
     assert!(
         resolve_request_execution_bindings_without_server_workspace(
@@ -16849,7 +16850,7 @@ fn edge_profile_does_not_infer_execution_bindings() {
 fn missing_edge_profile_execution_bindings_emit_no_file_environment() {
     let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
         &test_request("hello"),
-        &Map::new(),
+        &Default::default(),
     )
     .expect("missing edge profile should still produce an explicit no-file-environment binding");
 
@@ -16867,7 +16868,7 @@ fn missing_edge_profile_execution_bindings_emit_no_file_environment() {
 fn edge_tools_without_profile_do_not_create_edge_ledger_binding() {
     let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
         &test_request("run client tool"),
-        &Map::new(),
+        &Default::default(),
     )
     .expect("missing edge profile should produce no-file control-plane binding");
 
@@ -26716,6 +26717,8 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     facts.original.session_turn = 7;
     facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
     facts.original.root_user_query_event_id = Some("original-query".to_string());
+    let original_turn_started_at = chrono::DateTime::from_timestamp(1_700_000_000, 123).unwrap();
+    facts.original.canonical_turn_started_at = Some(original_turn_started_at);
     facts.original.total_prompt = 11;
     facts.original.total_completion = 13;
     facts.original.total_cache_read = 101;
@@ -26845,6 +26848,10 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(
         state.root_user_query_event_id.as_deref(),
         Some("original-query")
+    );
+    assert_eq!(
+        state.canonical_turn_started_at.get(),
+        Some(&original_turn_started_at)
     );
     assert_eq!(
         (
