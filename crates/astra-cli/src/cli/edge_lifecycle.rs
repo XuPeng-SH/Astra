@@ -779,7 +779,14 @@ mod tests {
         attach_runtime_environment_capabilities(&mut body);
 
         let capabilities = body.capabilities.expect("runtime capabilities");
-        assert_eq!(capabilities["schema_version"], 1);
+        let decoded: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(capabilities.clone())
+                .expect("current consumer accepts advertisement");
+        assert_eq!(
+            decoded.schema_version,
+            astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+        );
+        assert!(decoded.provider_discovery.is_empty());
         assert_eq!(
             capabilities["binding"]["workspace"]["kind"],
             "edge_workspace"

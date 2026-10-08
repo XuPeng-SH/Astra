@@ -471,6 +471,17 @@ pub struct InvocationSupervisor {
 }
 
 impl InvocationSupervisor {
+    fn target_released(&self) -> Option<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.started)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Prepare a helper command and its authenticated control channel.
     /// [`Self::install`] must be called after all environment filtering and
     /// before spawning the returned command.

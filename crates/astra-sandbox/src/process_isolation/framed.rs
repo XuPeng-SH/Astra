@@ -412,7 +412,7 @@ async fn drive(
         .owner
         .as_ref()
         .and_then(|owner| owner.supervisor.as_ref())
-        .map(|supervisor| supervisor.started);
+        .and_then(super::InvocationSupervisor::target_released);
     let end = if let Some(error) = startup_error {
         match error.kind() {
             io::ErrorKind::Interrupted => FramedProcessEnd::Cancelled,

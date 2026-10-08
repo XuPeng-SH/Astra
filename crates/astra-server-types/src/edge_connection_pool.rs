@@ -1818,9 +1818,6 @@ mod tests {
                 request_id,
                 delivery_generation,
                 timeout_secs,
-                execution_deadline_unix_ms: _,
-                execution_timeout_ms: _,
-                command_timeout_cap_ms: _,
                 ..
             } => (request_id, delivery_generation, timeout_secs),
             other => panic!("expected tool request, got {other:?}"),

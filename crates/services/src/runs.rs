@@ -15509,7 +15509,11 @@ impl DatabaseRunStateStore {
         )
         .await
         .map(|(claim, _)| claim)
-        .map_err(|error| error.to_string())
+        .map_err(|error| match error {
+            CollaboratorStoreError::SessionUnavailable => "session is not active".to_owned(),
+            CollaboratorStoreError::Persistence(reason) => reason,
+            error => error.to_string(),
+        })
     }
 
     async fn reconcile_collaborator_admission(
