@@ -7426,7 +7426,20 @@ fn refresh_footer_from_state(
 fn enqueue_approval_request(
     bottom_pane: &mut BottomPane,
     request: crate::cli::chat_stream::ApprovalRequest,
+    session_id: Option<&str>,
+    attachment_epoch: u64,
 ) {
+    if request.metadata.as_ref().is_some_and(|metadata| {
+        metadata
+            .runtime_dependencies
+            .as_ref()
+            .is_some_and(|context| !context.is_current(session_id, attachment_epoch))
+    }) {
+        let _ = request
+            .response_tx
+            .send(crate::cli::chat_stream::ApprovalResponse::Deny);
+        return;
+    }
     if let Some(metadata) = request.metadata {
         bottom_pane.enqueue_approval_with_metadata(
             request.tool,
@@ -7993,7 +8006,7 @@ pub(crate) async fn run_tui_session(
                 break 'main Ok(());
             }
             Some(request) = approval_rx.recv() => {
-                enqueue_approval_request(&mut bottom_pane, request);
+                enqueue_approval_request(&mut bottom_pane, request, state.session_id.as_deref(), state.session_attachment_epoch);
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 refresh_open_transcript_view(&chat_widget, &mut bottom_pane, width);
                 frame_requester.schedule_frame();
@@ -9388,6 +9401,7 @@ pub(crate) async fn run_tui_session(
                                             slash_dispatch::session_hub_snapshot(&state);
                                         let turn_session_id = state.session_id.clone();
                                         let turn_session_attachment_epoch = state.session_attachment_epoch;
+                                        let turn_permission_policy = state.perm_manager.subscribe_permission_policy();
                                         let turn_submission_id =
                                             uuid::Uuid::now_v7().to_string();
                                         let bound_turn_api = continuation.as_ref().map(|target| match &target.0.owner.native_binding {
@@ -10731,7 +10745,10 @@ pub(crate) async fn run_tui_session(
                                                     // approval card is rendered by BottomPane above the
                                                     // composer so arrow-key focus is visible. Resolve
                                                     // events flush a compact audit line to scrollback.
-                                                    enqueue_approval_request(&mut bottom_pane, req);
+                                                    let attachment = turn_permission_policy.current();
+                                                    enqueue_approval_request(&mut bottom_pane, req,
+                                                        attachment.as_ref().map(|policy| policy.session_id()),
+                                                        attachment.as_ref().map_or(0, |policy| policy.attachment_epoch()));
                                                     let width = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     refresh_open_transcript_view(
                                                         &chat_widget,
@@ -12920,6 +12937,71 @@ fn apply_terminal_explain_analyze_degraded_marker(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_dependency_approval_uses_live_attachment_after_turn_binding() {
+        use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse};
+        use crate::tui::approval::queue::{ApprovalMetadata, RuntimeDependencyApprovalContext};
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let observer = state.perm_manager.subscribe_permission_policy();
+        assert!(observer.current().is_none());
+        state.set_session_id("bound-during-turn");
+        let admitted_epoch = state.session_attachment_epoch;
+        let mut pane = BottomPane::new();
+        for rebind in [false, true] {
+            if rebind {
+                state.reset_for_new_session();
+            }
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let mut request = ApprovalRequest::bare(
+                "sandbox_expand:runtime".into(),
+                "Read dependencies".into(),
+                None,
+                "exact dependency reads".into(),
+                serde_json::Value::Null,
+                tx,
+            );
+            request.metadata = Some(Box::new(ApprovalMetadata {
+                runtime_dependencies: Some(RuntimeDependencyApprovalContext {
+                    invocation: astra_turn_types::ToolInvocationIdentity::new(
+                        "u",
+                        "bound-during-turn",
+                        "r",
+                        "r",
+                        "i",
+                    )
+                    .unwrap(),
+                    attachment_epoch: admitted_epoch,
+                    execution_binding_generation: 1,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                }),
+                ..Default::default()
+            }));
+            let current = observer.current().unwrap();
+            enqueue_approval_request(
+                &mut pane,
+                request,
+                Some(current.session_id()),
+                current.attachment_epoch(),
+            );
+            if rebind {
+                assert!(!pane.has_pending_approvals());
+                assert_eq!(rx.try_recv().unwrap(), ApprovalResponse::Deny);
+            } else {
+                assert!(pane.has_pending_approvals());
+                assert_eq!(
+                    pane.reevaluate_approvals_for_mode(
+                        crate::cli::permission_manager::PermissionMode::Bypass
+                    ),
+                    0
+                );
+                assert!(rx.try_recv().is_err());
+                pane.respond_focused_approval(ApprovalResponse::AllowOnce);
+                assert_eq!(rx.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+            }
+        }
+    }
+
     fn interactive_queue<const N: usize>(items: [String; N]) -> VecDeque<NextTurnSubmission> {
         items
             .into_iter()

@@ -408,6 +408,9 @@ impl EdgeInvocationJournal {
         }
     }
 
+    // Keep the wire request key, durable identity, payload and frozen ceiling
+    // explicit at this admission boundary; none is inferred from another.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prepare(
         &mut self,
         request_id: &str,

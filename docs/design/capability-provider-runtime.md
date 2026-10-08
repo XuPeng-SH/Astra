@@ -252,6 +252,16 @@ and sensitive-path denials still apply independently. The current ceiling cannot
 represent restricted filesystem allowlists or stronger isolation guarantees and
 must reject them rather than project them into unrestricted workspace reads.
 
+CLI runtime dependency admission reads the existing session permission writer
+through an immutable subscription. Requests carry the canonical session
+attachment epoch; reset, rebind or writer closure invalidates retained policy.
+One invocation-scoped approval covers the frozen dependency set, with every
+dependency checked again after policy changes and before dispatch. An automatic
+policy release is not recorded as a user approval. The existing TUI approval
+queue is reused; mode-only queue reevaluation cannot authorize this bundle.
+Remembered dependency grants require acknowledgement from that same permission
+writer and are not currently supported by this admission path.
+
 These contracts do not imply that a particular external collaborator is ready
 for end-user use; its production entrypoint and complete journey need separate
 verification.

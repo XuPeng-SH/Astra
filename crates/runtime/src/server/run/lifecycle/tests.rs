@@ -24988,7 +24988,7 @@ async fn provider_interaction_requires_an_authenticated_provider_run_owner() {
     assert!(matches!(
         decision,
         astra_tools::ProviderInteractionDecision::Error(ref message)
-            if message.contains("authenticated provider run owner")
+            if message.contains("authenticated provider or exact remote invocation origin")
     ));
     let durable = svc
         .run_engine

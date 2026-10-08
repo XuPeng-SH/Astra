@@ -1040,6 +1040,8 @@ fn validate_interaction_response(
     Ok(())
 }
 
+// Protocol transport, output budget and interaction authority have distinct owners.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     process: &mut FramedProcess,
     stage: &Stage,
@@ -1155,6 +1157,8 @@ impl ToolExecutor {
     }
 
     /// Existing selected CLI execution entrypoint owns workspace and sandbox.
+    // Keep the invocation, ceiling and locally approved runtime authority explicit.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_native_codex(
         &self,
         args: &Value,

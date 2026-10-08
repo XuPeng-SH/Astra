@@ -1,10 +1,11 @@
 //! CLI hosting of the shared Edge delivery owner. Bootstrap permission is
-//! resolved once against a frozen declaration, not inferred from discovery.
+//! resolved on actual invocation against a frozen declaration, never at
+//! installation or inferred from discovery.
 
 use super::provider_interaction::NativeInvocationInteractionGate;
 use crate::cli::{
     chat_stream,
-    permission_manager::{GateOutcome, PermissionManager},
+    permission_manager::{GateOutcome, PermissionPolicySubscription},
 };
 use crate::edge_tools::{
     ToolExecutor,
@@ -60,6 +61,9 @@ pub(crate) struct NativeDeliveryConfig {
     pub(crate) journal_path: PathBuf,
     pub(crate) executor: Arc<ToolExecutor>,
     pub(crate) ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
+    /// Read-only publication from the selected SessionState permission writer.
+    pub(crate) permission_policy: PermissionPolicySubscription,
+    pub(crate) approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
 }
 
 fn bootstrap_args(snapshot: &ProviderDiscoverySnapshot, path: &str) -> Value {
@@ -88,92 +92,199 @@ fn discovery_snapshot(
     .map_err(|_| "invalid native declaration".into())
 }
 
-/// One UI request for the complete dependency set. Each constituent path still
-/// goes through the existing evaluator/audit owner; hard denies win over UI.
-async fn approve_bootstrap(
-    executor: &ToolExecutor,
-    snapshot: ProviderDiscoverySnapshot,
-    pm: &mut PermissionManager,
-    approval_tx: Option<&chat_stream::ApprovalRequestTx>,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<ApprovedNativeRuntime, String> {
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        return Err("native bootstrap admission cancelled or expired".into());
+/// Verify current attachment authority, not merely a retained policy Arc.
+fn current_policy(
+    policy: &PermissionPolicySubscription,
+    session_id: &str,
+    attachment_epoch: u64,
+) -> Result<Arc<crate::cli::permission_manager::PermissionPolicySnapshot>, String> {
+    let current = policy
+        .current()
+        .ok_or("native permission attachment is unbound")?;
+    if current.session_id() != session_id || current.attachment_epoch() != attachment_epoch {
+        return Err("native permission attachment changed".into());
     }
-    let declaration = snapshot
-        .tool_declarations
-        .first()
-        .ok_or("missing native declaration")?;
-    let requirements = astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
-        &declaration.extension_fields,
-    )
-    .map_err(|_| "invalid native runtime requirements")?
-    .ok_or("missing native runtime requirements")?;
-    let root = executor
-        .effective_project_root()
-        .canonicalize()
-        .map_err(|_| "native workspace is unavailable")?;
-    let name = "sandbox_expand:native_codex";
-    let mut needs_approval = false;
+    Ok(current)
+}
+
+fn dependencies_need_approval(
+    policy: &PermissionPolicySubscription,
+    session_id: &str,
+    attachment_epoch: u64,
+    snapshot: &ProviderDiscoverySnapshot,
+    requirements: &astra_turn_types::ProviderRuntimeRequirements,
+) -> Result<bool, String> {
+    let current = current_policy(policy, session_id, attachment_epoch)?;
+    let mut needed = false;
     for path in &requirements.read_paths {
         if astra_sandbox::is_never_readable_path(std::path::Path::new(path)) {
             return Err("native bootstrap contains a forbidden path".into());
         }
-        match crate::tool_safety_guard::ToolSafetyGuard::check_request(
-            Some(pm),
-            name,
-            &bootstrap_args(&snapshot, path),
+        match current.check_sandbox_expansion(
+            "sandbox_expand:native_codex",
+            &bootstrap_args(snapshot, path),
         ) {
             GateOutcome::Allow => {}
             GateOutcome::Deny(_) => return Err("native bootstrap denied by local policy".into()),
-            GateOutcome::NeedApproval { .. } => needs_approval = true,
+            GateOutcome::NeedApproval { .. } => needed = true,
         }
     }
-    let source = if needs_approval {
+    Ok(needed)
+}
+
+/// One complete-set prompt, with no permission writes in the consumer.
+impl CliNativeExecutor {
+    async fn approve_bootstrap(
+        &self,
+        invocation: &EdgeInvocation,
+        cancellation: &CancellationToken,
+    ) -> Result<ApprovedNativeRuntime, String> {
+        let executor = &self.config.executor;
+        let snapshot = self.snapshot.clone();
+        let permission_policy = &self.config.permission_policy;
+        let expected_session_id = self.expected_session_id.as_str();
+        let expected_attachment_epoch = self.expected_attachment_epoch;
+        let approval_tx = self.config.approval_request_tx.as_ref();
+        let deadline = invocation.execution_deadline;
         if cancellation.is_cancelled() || Instant::now() >= deadline {
             return Err("native bootstrap admission cancelled or expired".into());
         }
-        let tx = approval_tx.ok_or("native bootstrap requires an approval consumer")?;
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let args = json!({"provider_snapshot_hash": snapshot.content_hash,
+        if invocation.identity.session_id != expected_session_id {
+            return Err("native invocation does not match permission attachment".into());
+        }
+        let binding_generation = invocation
+            .execution_ceiling
+            .as_ref()
+            .ok_or("native bootstrap requires an execution ceiling")?
+            .execution_binding_generation;
+        if binding_generation == 0 {
+            return Err("native bootstrap requires a binding generation".into());
+        }
+        let declaration = snapshot
+            .tool_declarations
+            .first()
+            .ok_or("missing native declaration")?;
+        let requirements = astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
+            &declaration.extension_fields,
+        )
+        .map_err(|_| "invalid native runtime requirements")?
+        .ok_or("missing native runtime requirements")?;
+        let root = executor
+            .effective_project_root()
+            .canonicalize()
+            .map_err(|_| "native workspace is unavailable")?;
+        let mut policy = permission_policy.clone();
+        let source = if dependencies_need_approval(
+            &policy,
+            expected_session_id,
+            expected_attachment_epoch,
+            &snapshot,
+            &requirements,
+        )? {
+            let tx = approval_tx.ok_or("native bootstrap requires an approval consumer")?;
+            let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+            let args = json!({"provider_snapshot_hash": snapshot.content_hash,
             "provider_binding": snapshot.binding_ref, "executable": requirements.executable,
             "read_paths": requirements.read_paths, "access": "native_runtime_read"});
-        chat_stream::enqueue_interactive_request(tx, chat_stream::ApprovalRequest::bare(
-            name.into(), "Allow native Codex runtime reads?".into(),
+            let mut request = chat_stream::ApprovalRequest::bare(
+            "sandbox_expand:native_codex".into(), "Allow native Codex runtime reads?".into(),
             Some(requirements.read_paths.join("\n")),
             "These exact executable/platform paths become readable by the native collaborator; workspace, network and sensitive-path restrictions remain in force.".into(),
-            args, response_tx)).map_err(|_| "native bootstrap approval consumer unavailable")?;
-        let approved = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => false,
-            result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), response_rx) =>
-                result.ok().and_then(Result::ok).is_some_and(|response| response.is_approved()),
+            args, response_tx,
+        );
+            request.metadata = Some(Box::new(crate::tui::approval::queue::ApprovalMetadata {
+                runtime_dependencies: Some(
+                    crate::tui::approval::queue::RuntimeDependencyApprovalContext {
+                        invocation: invocation.identity.clone(),
+                        attachment_epoch: expected_attachment_epoch,
+                        execution_binding_generation: binding_generation,
+                        deadline,
+                        cancel: cancellation.clone(),
+                    },
+                ),
+                ..Default::default()
+            }));
+            chat_stream::enqueue_interactive_request(tx, request)
+                .map_err(|_| "native bootstrap approval consumer unavailable")?;
+            let cutoff = tokio::time::Instant::from_std(deadline);
+            loop {
+                if cancellation.is_cancelled() || tokio::time::Instant::now() >= cutoff {
+                    return Err("native bootstrap admission cancelled or expired".into());
+                }
+                let needs_approval = dependencies_need_approval(
+                    &policy,
+                    expected_session_id,
+                    expected_attachment_epoch,
+                    &snapshot,
+                    &requirements,
+                )?;
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() =>
+                        return Err("native bootstrap admission cancelled".into()),
+                    _ = tokio::time::sleep_until(cutoff) =>
+                        return Err("native bootstrap admission expired".into()),
+                    response = &mut response_rx => {
+                        // The latest whole-set decision always wins over a stale answer.
+                        let needed = dependencies_need_approval(
+                            &policy, expected_session_id, expected_attachment_epoch, &snapshot, &requirements,
+                        )?;
+                        match response.map_err(|_| "native bootstrap approval consumer closed")? {
+                            chat_stream::ApprovalResponse::AllowOnce => break if needed {
+                                ToolInvocationAdmissionSource::ParentApproval
+                            } else {
+                                ToolInvocationAdmissionSource::Policy
+                            },
+                            chat_stream::ApprovalResponse::AlwaysAllow =>
+                                return Err("native dependency persistent approval is not supported".into()),
+                            chat_stream::ApprovalResponse::Deny =>
+                                return Err("native bootstrap approval denied".into()),
+                        }
+                    }
+                    changed = policy.changed() => {
+                        changed.map_err(|_| "native permission writer closed")?;
+                    }
+                    _ = std::future::ready(()), if !needs_approval =>
+                        break ToolInvocationAdmissionSource::Policy,
+                }
+            }
+        } else {
+            ToolInvocationAdmissionSource::Policy
         };
-        for path in &requirements.read_paths {
-            pm.record_approval(name, Some(&bootstrap_args(&snapshot, path)), approved);
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err("native bootstrap admission cancelled or expired".into());
         }
-        if !approved {
-            return Err("native bootstrap approval denied, cancelled or expired".into());
+        let still_needs_approval = dependencies_need_approval(
+            &policy,
+            expected_session_id,
+            expected_attachment_epoch,
+            &snapshot,
+            &requirements,
+        )?;
+        if still_needs_approval && source == ToolInvocationAdmissionSource::Policy {
+            return Err("native bootstrap policy approval was revoked".into());
         }
-        ToolInvocationAdmissionSource::ParentApproval
-    } else {
-        ToolInvocationAdmissionSource::Policy
-    };
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        return Err("native bootstrap admission cancelled or expired".into());
+        let source = if still_needs_approval {
+            source
+        } else {
+            ToolInvocationAdmissionSource::Policy
+        };
+        Ok(ApprovedNativeRuntime {
+            snapshot: (*snapshot).clone(),
+            requirements,
+            workspace_root: root,
+            admission_source: source,
+        })
     }
-    Ok(ApprovedNativeRuntime {
-        snapshot,
-        requirements,
-        workspace_root: root,
-        admission_source: source,
-    })
 }
 
 struct CliNativeExecutor {
     config: Arc<NativeDeliveryConfig>,
-    approval: Arc<ApprovedNativeRuntime>,
+    snapshot: Arc<ProviderDiscoverySnapshot>,
+    workspace_root: PathBuf,
+    requirements: astra_turn_types::ProviderRuntimeRequirements,
+    expected_session_id: String,
+    expected_attachment_epoch: u64,
 }
 
 fn rejected(reason: &str) -> ToolResult {
@@ -201,13 +312,36 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
             };
             if invocation.tool != native_codex::TOOL_NAME
                 || invocation.identity.user_id != config.account_id
-                || ceiling.workspace_root != self.approval.workspace_root.to_string_lossy()
+                || ceiling.workspace_root != self.workspace_root.to_string_lossy()
                 || ceiling.workspace_id != config.workspace_id
                 || ceiling.materialization_id.as_deref() != Some(config.materialization_id.as_str())
                 || ceiling.execution_binding_generation == 0
                 || invocation.runtime_process_authorization.is_some()
+                || ceiling.runtime_read_paths != self.requirements.read_paths
             {
                 return rejected("CLI native delivery does not match the selected boundary");
+            }
+            // Discovery is capability only. Local approval is acquired on a
+            // real, fenced invocation using its original work deadline. The
+            // UI wait and native execution share that cutoff.
+            if config
+                .executor
+                .effective_project_root()
+                .canonicalize()
+                .ok()
+                .as_ref()
+                != Some(&self.workspace_root)
+            {
+                return rejected("native bootstrap workspace no longer matches discovery");
+            }
+            let approval = match self.approve_bootstrap(&invocation, &cancel).await {
+                Ok(approval) => approval,
+                Err(reason) => return rejected(&reason),
+            };
+            // A worktree change while the approval was pending must not turn
+            // the frozen grant into authority over the newly selected root.
+            if approval.workspace_root != self.workspace_root {
+                return rejected("native bootstrap workspace changed during approval");
             }
             let gate = NativeInvocationInteractionGate {
                 api: config.api.clone(),
@@ -223,10 +357,26 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                 run_id: Some(&invocation.identity.run_id),
                 turn_chain_id: Some(&invocation.identity.turn_chain_id),
                 tool_call_id: Some(&invocation.identity.invocation_id),
-                admission_source: Some(self.approval.admission_source),
+                admission_source: Some(approval.admission_source),
                 command_timeout_cap_ms: invocation.command_timeout_cap_ms,
                 ..ToolInvocationMetadata::default()
             };
+            let needed = match dependencies_need_approval(
+                &config.permission_policy,
+                &self.expected_session_id,
+                self.expected_attachment_epoch,
+                &self.snapshot,
+                &self.requirements,
+            ) {
+                Ok(needed) => needed,
+                Err(reason) => return rejected(&reason),
+            };
+            if needed && approval.admission_source == ToolInvocationAdmissionSource::Policy {
+                return rejected("native bootstrap policy approval was revoked before dispatch");
+            }
+            if cancel.is_cancelled() || Instant::now() >= invocation.execution_deadline {
+                return rejected("native invocation cancelled or expired before dispatch");
+            }
             let outcome = config
                 .executor
                 .execute_native_codex_provider_invocation(
@@ -235,7 +385,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                     Some(&cancel),
                     &gate,
                     ceiling,
-                    Some(&self.approval),
+                    Some(&approval),
                 )
                 .await;
             ToolResult {
@@ -284,10 +434,10 @@ async fn publish(
 
 /// Called by the process-scoped CLI lifecycle after constructing the real
 /// executor and UI channels. No standalone model-tool projection is installed.
+/// Installation neither evaluates local permission nor asks for bootstrap
+/// approval: discovery becomes a grant only inside a fenced invocation.
 pub(crate) async fn install_native_delivery(
     config: NativeDeliveryConfig,
-    pm: &mut PermissionManager,
-    approval_tx: Option<&chat_stream::ApprovalRequestTx>,
     admission_deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<NativeDeliveryHandle, String> {
@@ -314,29 +464,38 @@ pub(crate) async fn install_native_delivery(
         root_text,
         declaration,
     )?;
-    let approval = Arc::new(
-        approve_bootstrap(
-            &config.executor,
-            snapshot,
-            pm,
-            approval_tx,
-            admission_deadline,
-            cancellation,
-        )
-        .await?,
-    );
-    connect_admitted_delivery(config, approval, admission_deadline, cancellation).await
+    connect_native_delivery(config, Arc::new(snapshot), admission_deadline, cancellation).await
 }
 
-// The admitted installation path is shared by production and real transport
+// The capability-only installation path is shared by production and real transport
 // tests; tests replace only the external peer, not Astra auth/custody/dispatch.
-async fn connect_admitted_delivery(
+async fn connect_native_delivery(
     config: NativeDeliveryConfig,
-    approval: Arc<ApprovedNativeRuntime>,
+    snapshot: Arc<ProviderDiscoverySnapshot>,
     admission_deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<NativeDeliveryHandle, String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let workspace_root = config
+        .executor
+        .effective_project_root()
+        .canonicalize()
+        .map_err(|_| "native workspace is unavailable")?;
+    let declaration = snapshot
+        .tool_declarations
+        .first()
+        .ok_or("missing native declaration")?;
+    let requirements = astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
+        &declaration.extension_fields,
+    )
+    .map_err(|_| "invalid native runtime requirements")?
+    .ok_or("missing native runtime requirements")?;
+    let attachment = config
+        .permission_policy
+        .current()
+        .ok_or("native delivery requires a bound permission attachment")?;
+    let expected_session_id = attachment.session_id().to_owned();
+    let expected_attachment_epoch = attachment.attachment_epoch();
     let config = Arc::new(config);
     let mut request = config
         .websocket_url
@@ -364,7 +523,7 @@ async fn connect_admitted_delivery(
         materialization_id: config.materialization_id.clone(),
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
         hostname: None,
-        workspace_dir: Some(approval.workspace_root.to_string_lossy().into_owned()),
+        workspace_dir: Some(workspace_root.to_string_lossy().into_owned()),
         capabilities: Some(capabilities(&config, None)),
     };
     let (socket, account_id) =
@@ -375,14 +534,18 @@ async fn connect_admitted_delivery(
     let context = EdgeConnectionContext {
         account_id,
         edge_agent_id: config.edge_agent_id.clone(),
-        workspace_dir: approval.workspace_root.clone(),
+        workspace_dir: workspace_root.clone(),
         journal_path: config.journal_path.clone(),
         ready: Some(ready_tx),
     };
     let owner_cancel = cancellation.child_token();
     let callback = Arc::new(CliNativeExecutor {
         config: config.clone(),
-        approval: approval.clone(),
+        snapshot: snapshot.clone(),
+        workspace_root,
+        requirements,
+        expected_session_id,
+        expected_attachment_epoch,
     });
     let task_cancel = owner_cancel.clone();
     let task_config = config.clone();
@@ -402,7 +565,7 @@ async fn connect_admitted_delivery(
             // withdrawn its capacity.
             let result = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(admission_deadline),
-                publish(&task_config, Some(&approval.snapshot)),
+                publish(&task_config, Some(&snapshot)),
             );
             tokio::pin!(result);
             let mut owner_ended = false;
@@ -459,7 +622,8 @@ async fn connect_admitted_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::permission_manager::PermissionMode;
+    use crate::cli::permission_manager::{PermissionManager, PermissionMode};
+    use crate::cli::session::session_state::SessionState;
     use astra_turn_types::{NativeToolId, ProviderRuntimeRequirements, ProviderToolDeclaration};
     use std::time::Duration;
 
@@ -503,113 +667,400 @@ mod tests {
         }
     }
 
+    fn consumer(
+        workspace: &std::path::Path,
+        runtime: &std::path::Path,
+        approval_tx: Option<chat_stream::ApprovalRequestTx>,
+    ) -> (CliNativeExecutor, SessionState) {
+        let mut owner = SessionState {
+            perm_manager: PermissionManager::with_project_mode(PermissionMode::Prompt, workspace),
+            ..SessionState::default()
+        };
+        owner.set_session_id("session-test");
+        let requirements = requirements(runtime);
+        let consumer = CliNativeExecutor {
+            snapshot: Arc::new(snapshot(&requirements, workspace)),
+            workspace_root: workspace.canonicalize().unwrap(),
+            requirements,
+            expected_session_id: "session-test".into(),
+            expected_attachment_epoch: owner.session_attachment_epoch,
+            config: Arc::new(NativeDeliveryConfig {
+                websocket_url: "ws://127.0.0.1:1/edge/ws".into(),
+                api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+                auth: "test-only-token".into(),
+                account_id: "account-test".into(),
+                edge_agent_id: "edge-test".into(),
+                edge_transport_id: "transport-test".into(),
+                workspace_id: None,
+                materialization_id: "materialization-test".into(),
+                journal_path: workspace.join("journal.json"),
+                executor: Arc::new(ToolExecutor::new(workspace)),
+                ask_user_request_tx: None,
+                permission_policy: owner.perm_manager.subscribe_permission_policy(),
+                approval_request_tx: approval_tx,
+            }),
+        };
+        (consumer, owner)
+    }
+
+    async fn admission(
+        consumer: &CliNativeExecutor,
+        invocation: &EdgeInvocation,
+        cancel: &CancellationToken,
+    ) -> Result<ApprovedNativeRuntime, String> {
+        consumer.approve_bootstrap(invocation, cancel).await
+    }
+
+    fn invocation(consumer: &CliNativeExecutor) -> EdgeInvocation {
+        EdgeInvocation {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "account-test",
+                "session-test",
+                "run-test",
+                "chain-test",
+                "call-test",
+            )
+            .unwrap(),
+            delivery_generation: 1,
+            tool: native_codex::TOOL_NAME.into(),
+            args: json!({"task": "No paid invocation", "anchor_run_id": "anchor-test"}),
+            execution_deadline: Instant::now() + Duration::from_secs(5),
+            command_timeout_cap_ms: Some(120_000),
+            runtime_process_authorization: None,
+            execution_ceiling: Some(Box::new(
+                astra_server_types::edge_ws_protocol::EdgeExecutionCeiling {
+                    workspace_root: consumer.workspace_root.to_str().unwrap().into(),
+                    workspace_id: None,
+                    materialization_id: Some("materialization-test".into()),
+                    execution_binding_generation: 1,
+                    runtime_read_paths: consumer.requirements.read_paths.clone(),
+                    workspace_write_allowed: false,
+                    network_allowed: false,
+                },
+            )),
+        }
+    }
+
     #[tokio::test]
-    async fn bootstrap_uses_one_prompt_and_does_not_expand_general_file_authority() {
+    async fn actual_invocation_allow_once_does_not_write_permission_owner() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
-        let executor = ToolExecutor::new(workspace.path());
-        let before = executor
-            .sandbox_policy
-            .read()
-            .unwrap()
-            .clone()
-            .unwrap()
-            .allowed_paths;
-        let req = requirements(runtime.path());
-        let frozen = snapshot(&req, workspace.path());
-        let hash = frozen.content_hash.clone();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, workspace.path());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        assert!(rx.try_recv().is_err(), "discovery has no approval effect");
+        for _ in 0..2 {
+            let call = invocation(&consumer);
+            let identity = call.identity.clone();
+            let deadline = call.execution_deadline;
+            let ui = async {
+                let prompt = rx.recv().await.unwrap();
+                let context = prompt
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .runtime_dependencies
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(context.invocation, identity);
+                assert_eq!(context.attachment_epoch, owner.session_attachment_epoch);
+                assert_eq!(context.execution_binding_generation, 1);
+                assert_eq!(
+                    prompt.args["provider_snapshot_hash"].as_str().unwrap(),
+                    consumer.snapshot.content_hash
+                );
+                assert_eq!(context.deadline, deadline);
+                prompt
+                    .response_tx
+                    .send(chat_stream::ApprovalResponse::AllowOnce)
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(consumer.execute(call, CancellationToken::new()), ui);
+            assert_eq!(
+                result.metadata.unwrap()["native_collaborator"]["dispatch_state"],
+                "not_dispatched"
+            );
+            assert!(
+                matches!(
+                    owner
+                        .perm_manager
+                        .subscribe_permission_policy()
+                        .current()
+                        .unwrap()
+                        .check_sandbox_expansion(
+                            "sandbox_expand:native_codex",
+                            &bootstrap_args(
+                                &consumer.snapshot,
+                                &consumer.requirements.read_paths[0]
+                            )
+                        ),
+                    GateOutcome::NeedApproval { .. }
+                ),
+                "allow once must not persist an override"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_approval_observes_hard_revocation_without_ui_response() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, mut owner) = consumer(workspace.path(), runtime.path(), Some(tx));
         let ui = async {
             let prompt = rx.recv().await.unwrap();
-            assert_eq!(prompt.args["provider_snapshot_hash"], hash);
-            assert_eq!(prompt.args["read_paths"], json!(req.read_paths));
+            owner.perm_manager.set_mode(PermissionMode::Deny);
+            prompt
+        };
+        let (result, prompt) = tokio::join!(
+            consumer.execute(invocation(&consumer), CancellationToken::new()),
+            ui
+        );
+        assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+        assert!(prompt.response_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn queued_user_deny_wins_simultaneously_ready_policy_allow() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, mut owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        let ui = async {
+            let prompt = rx.recv().await.unwrap();
+            // No await between these operations: both watch and response are
+            // ready before the admission future can be polled again.
+            owner.perm_manager.set_mode(PermissionMode::Bypass);
+            assert!(
+                !dependencies_need_approval(
+                    &consumer.config.permission_policy,
+                    &consumer.expected_session_id,
+                    consumer.expected_attachment_epoch,
+                    &consumer.snapshot,
+                    &consumer.requirements,
+                )
+                .unwrap()
+            );
+            prompt
+                .response_tx
+                .send(chat_stream::ApprovalResponse::Deny)
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            biased;
+            consumer.execute(invocation(&consumer), CancellationToken::new()),
+            ui
+        );
+        assert!(result.is_error);
+        assert_eq!(result.output, "native bootstrap approval denied");
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["execution_fact"], "not_executed");
+        assert!(
+            metadata.get("native_collaborator").is_none(),
+            "native leaf must not dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_change_rechecks_all_dependencies_and_returns_policy_not_user_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, mut owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        let call = invocation(&consumer);
+        let cancel = CancellationToken::new();
+        let ui = async {
+            let prompt = rx.recv().await.unwrap();
+            owner.perm_manager.record_approval(
+                "sandbox_expand:native_codex",
+                Some(&bootstrap_args(
+                    &consumer.snapshot,
+                    &consumer.requirements.read_paths[0],
+                )),
+                true,
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                !prompt.response_tx.is_closed(),
+                "one allowed path is not the complete set"
+            );
+            owner.perm_manager.set_mode(PermissionMode::Bypass);
+            prompt
+        };
+        let (result, prompt) = tokio::join!(admission(&consumer, &call, &cancel), ui);
+        assert_eq!(
+            result.unwrap().admission_source,
+            ToolInvocationAdmissionSource::Policy
+        );
+        assert!(prompt.response_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn coalesced_same_session_rebind_revokes_pending_and_future_dispatch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, mut owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        let ui = async {
+            let prompt = rx.recv().await.unwrap();
+            owner.clear_session_id();
+            owner.set_session_id("session-test");
             prompt
                 .response_tx
                 .send(chat_stream::ApprovalResponse::AllowOnce)
                 .unwrap();
         };
-        let cancel = CancellationToken::new();
-        let (receipt, ()) = tokio::join!(
-            approve_bootstrap(
-                &executor,
-                frozen,
-                &mut pm,
-                Some(&tx),
-                Instant::now() + Duration::from_secs(5),
-                &cancel
-            ),
+        let (result, ()) = tokio::join!(
+            consumer.execute(invocation(&consumer), CancellationToken::new()),
             ui
         );
-        let receipt = receipt.unwrap();
-        assert_eq!(
-            receipt.admission_source,
-            ToolInvocationAdmissionSource::ParentApproval
-        );
-        assert_eq!(
-            executor
-                .sandbox_policy
-                .read()
+        assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+        owner.perm_manager.set_mode(PermissionMode::Bypass);
+        let result = consumer
+            .execute(invocation(&consumer), CancellationToken::new())
+            .await;
+        assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn always_allow_is_rejected_without_permission_writeback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        let call = invocation(&consumer);
+        let cancel = CancellationToken::new();
+        let ui = async {
+            rx.recv()
+                .await
                 .unwrap()
-                .as_ref()
-                .unwrap()
-                .allowed_paths,
-            before
-        );
-        assert!(rx.try_recv().is_err(), "only one complete-set prompt");
-        // The existing remembered approval is exact-descriptor/path scoped.
-        let mut changed = req.clone();
-        changed
-            .read_paths
-            .push(runtime.path().join("new-runtime").to_str().unwrap().into());
-        let changed = snapshot(&changed, workspace.path());
+                .response_tx
+                .send(chat_stream::ApprovalResponse::AlwaysAllow)
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(admission(&consumer, &call, &cancel), ui);
+        assert!(result.is_err());
         assert!(matches!(
-            crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                Some(&mut pm),
-                "sandbox_expand:native_codex",
-                &bootstrap_args(&changed, &req.read_paths[0])
-            ),
+            owner
+                .perm_manager
+                .subscribe_permission_policy()
+                .current()
+                .unwrap()
+                .check_sandbox_expansion(
+                    "sandbox_expand:native_codex",
+                    &bootstrap_args(&consumer.snapshot, &consumer.requirements.read_paths[0])
+                ),
             GateOutcome::NeedApproval { .. }
         ));
     }
 
     #[tokio::test]
-    async fn bootstrap_cancellation_and_forbidden_paths_never_enqueue_approval() {
+    async fn same_id_reset_and_closed_writer_reject_without_prompt() {
         let workspace = tempfile::tempdir().unwrap();
-        let executor = ToolExecutor::new(workspace.path());
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, workspace.path());
+        let runtime = tempfile::tempdir().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, mut owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        owner.perm_manager.set_mode(PermissionMode::Bypass);
+        assert!(
+            current_policy(
+                &consumer.config.permission_policy,
+                &consumer.expected_session_id,
+                consumer.expected_attachment_epoch,
+            )
+            .is_ok()
+        );
+        owner.reset_for_new_session();
+        let result = consumer
+            .execute(invocation(&consumer), CancellationToken::new())
+            .await;
+        assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+        drop(owner);
+        let result = consumer
+            .execute(invocation(&consumer), CancellationToken::new())
+            .await;
+        assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn mismatched_ceiling_cancel_unbound_and_forbidden_paths_never_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, mut owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        let mut call = invocation(&consumer);
+        call.execution_ceiling
+            .as_mut()
+            .unwrap()
+            .runtime_read_paths
+            .push("/unapproved".into());
+        assert_eq!(
+            consumer
+                .execute(call, CancellationToken::new())
+                .await
+                .metadata
+                .unwrap()["execution_fact"],
+            "not_executed"
+        );
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(
-            approve_bootstrap(
-                &executor,
-                snapshot(&requirements(workspace.path()), workspace.path()),
-                &mut pm,
-                Some(&tx),
-                Instant::now() + Duration::from_secs(5),
-                &cancel
-            )
-            .await
-            .is_err()
+            admission(&consumer, &invocation(&consumer), &cancel)
+                .await
+                .is_err()
         );
-        let mut forbidden = requirements(workspace.path());
+        let mut forbidden = consumer.requirements.clone();
         forbidden
             .read_paths
             .push(workspace.path().join(".env.local").to_str().unwrap().into());
         assert!(
-            approve_bootstrap(
-                &executor,
-                snapshot(&forbidden, workspace.path()),
-                &mut pm,
-                Some(&tx),
-                Instant::now() + Duration::from_secs(5),
-                &CancellationToken::new()
+            dependencies_need_approval(
+                &consumer.config.permission_policy,
+                &consumer.expected_session_id,
+                consumer.expected_attachment_epoch,
+                &snapshot(&forbidden, workspace.path()),
+                &forbidden,
             )
-            .await
             .is_err()
         );
+        owner.clear_session_id();
+        owner.perm_manager.set_active_session_id("session-test");
+        owner.perm_manager.set_mode(PermissionMode::Bypass);
+        assert!(
+            admission(&consumer, &invocation(&consumer), &CancellationToken::new())
+                .await
+                .is_err()
+        );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_approval_cancellation_and_deadline_close_response_without_dispatch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+        let (consumer, _owner) = consumer(workspace.path(), runtime.path(), Some(tx));
+        let cancel = CancellationToken::new();
+        let ui = async {
+            let prompt = rx.recv().await.unwrap();
+            cancel.cancel();
+            prompt
+        };
+        let (result, prompt) =
+            tokio::join!(consumer.execute(invocation(&consumer), cancel.clone()), ui);
+        assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+        assert!(prompt.response_tx.is_closed());
+        let ui = async {
+            let prompt = rx.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            prompt
+        };
+        let (result, prompt) = tokio::join!(
+            consumer.execute(invocation(&consumer), CancellationToken::new()),
+            ui
+        );
+        assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+        assert!(prompt.response_tx.is_closed());
     }
 
     #[tokio::test]
@@ -632,17 +1083,21 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
         let executor = Arc::new(ToolExecutor::new(workspace.path()));
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
         let req = requirements(runtime.path());
-        let approval = Arc::new(ApprovedNativeRuntime {
-            snapshot: snapshot(&req, workspace.path()),
-            requirements: req.clone(),
-            workspace_root: workspace.path().canonicalize().unwrap(),
-            admission_source: ToolInvocationAdmissionSource::Policy,
-        });
+        let discovery = Arc::new(snapshot(&req, workspace.path()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let root = approval.workspace_root.to_str().unwrap().to_owned();
+        let root = workspace
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -666,6 +1121,7 @@ mod tests {
             ))
             .await
             .unwrap();
+            dispatch_rx.await.unwrap();
             let identity = ToolInvocationIdentity::new(
                 "account-test",
                 "session-test",
@@ -739,6 +1195,14 @@ mod tests {
                 }
             }
         });
+        let mut permission_owner = SessionState {
+            perm_manager: PermissionManager::with_project_mode(
+                PermissionMode::Prompt,
+                workspace.path(),
+            ),
+            ..SessionState::default()
+        };
+        permission_owner.set_session_id("session-test");
         let config = NativeDeliveryConfig {
             websocket_url: endpoint,
             api: astra_thin_client::ThinClient::new(&http.uri(), None).unwrap(),
@@ -751,15 +1215,30 @@ mod tests {
             journal_path: workspace.path().join("journal.json"),
             executor,
             ask_user_request_tx: None,
+            permission_policy: permission_owner.perm_manager.subscribe_permission_policy(),
+            approval_request_tx: Some(approval_tx),
         };
-        let handle = connect_admitted_delivery(
+        let handle = connect_native_delivery(
             config,
-            approval,
+            discovery,
             Instant::now() + Duration::from_secs(5),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "installation/discovery cannot prompt"
+        );
+        dispatch_tx.send(()).unwrap();
+        let prompt = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        prompt
+            .response_tx
+            .send(chat_stream::ApprovalResponse::AllowOnce)
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), result_rx)
             .await
             .unwrap()

@@ -4550,6 +4550,8 @@ impl ToolExecutor {
         .into_outcome()
     }
 
+    // Independent invocation controls are checked together, not inferred from tool arguments.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_run_with_native_interaction(
         &self,
         name: &str,
@@ -4991,6 +4993,8 @@ impl ToolExecutor {
         .with_tool_result_fields(tool_result_fields)
     }
 
+    // This execution boundary receives prepared capability and authority facts explicitly.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_raw(
         &self,
         name: &str,

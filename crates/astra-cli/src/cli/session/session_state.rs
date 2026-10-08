@@ -701,6 +701,9 @@ impl SessionState {
             .checked_add(1)
             .expect("session attachment epoch exhausted");
         self.active_conversation = None;
+        // Invalidate before publishing any new identity. Never pair an old
+        // session id with a newly advanced attachment epoch.
+        self.perm_manager.clear_active_session_id();
     }
 
     fn clear_resume_recovery_state(&mut self) {
@@ -725,8 +728,13 @@ impl SessionState {
             // Attaching an identity does not establish historical billing coverage.
             self.total_session_cost = None;
         }
-        self.perm_manager.set_active_session_id(&sid);
         self.session_id = Some(sid);
+        self.perm_manager.bind_permission_attachment(
+            self.session_id
+                .as_deref()
+                .expect("just assigned session id"),
+            self.session_attachment_epoch,
+        );
     }
 
     /// Clear the current session id and its session-scoped runtime state.
@@ -802,6 +810,10 @@ impl SessionState {
         self.csl_manager = None;
         self.perm_manager.clear_session_overrides();
         self.pending_bg_notifications.clear();
+        if let Some(session_id) = self.session_id.as_deref() {
+            self.perm_manager
+                .bind_permission_attachment(session_id, self.session_attachment_epoch);
+        }
     }
 
     /// Reset live state before restoring a different session into this REPL.
@@ -853,6 +865,59 @@ pub(crate) fn apply_initial_explain_mode(
 mod default_tests {
     use super::{ContinuationAnchor, ExplainMode, SessionState, apply_initial_explain_mode};
     use crate::cli::permission_manager::PermissionManager;
+
+    #[test]
+    fn permission_policy_attachment_tracks_canonical_reset_and_coalesced_rebind() {
+        let mut state = SessionState::default();
+        let observer = state.perm_manager.subscribe_permission_policy();
+        state.perm_manager.set_active_session_id("ordinary-only");
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Bypass);
+        assert!(
+            observer.current().is_none(),
+            "ordinary identity is not an attachment"
+        );
+
+        state.set_session_id("attached");
+        let first = observer.current().unwrap();
+        assert_eq!(first.session_id(), "attached");
+        assert_eq!(first.attachment_epoch(), state.session_attachment_epoch);
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Deny);
+        assert_eq!(
+            observer.current().unwrap().attachment_epoch(),
+            first.attachment_epoch()
+        );
+        state.set_session_id("attached");
+        assert_eq!(
+            observer.current().unwrap().attachment_epoch(),
+            first.attachment_epoch()
+        );
+
+        state.reset_for_new_session();
+        let reset = observer.current().unwrap();
+        assert_eq!(reset.session_id(), "attached");
+        assert_eq!(reset.attachment_epoch(), state.session_attachment_epoch);
+        assert_ne!(reset.attachment_epoch(), first.attachment_epoch());
+
+        // Deliberately do not consume watch changes between clear and bind.
+        state.clear_session_id();
+        assert!(observer.current().is_none());
+        state.set_session_id("attached");
+        let rebound = observer.current().unwrap();
+        assert_eq!(rebound.session_id(), reset.session_id());
+        assert_ne!(rebound.attachment_epoch(), reset.attachment_epoch());
+        assert_eq!(rebound.attachment_epoch(), state.session_attachment_epoch);
+
+        state.set_session_id("different");
+        let different = observer.current().unwrap();
+        assert_eq!(different.session_id(), "different");
+        assert_eq!(different.attachment_epoch(), state.session_attachment_epoch);
+        state.reset_for_session_restore();
+        assert!(observer.current().is_none());
+    }
 
     #[test]
     fn explain_slash_parser_is_explicit_and_idempotent() {
