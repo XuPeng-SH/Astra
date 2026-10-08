@@ -900,7 +900,7 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
         )
         .map(|selected| selected.is_some())
     };
-    assert_eq!(select(&agent, &invocation).unwrap(), true);
+    assert!(select(&agent, &invocation).unwrap());
     let mut unadmitted = invocation.clone();
     unadmitted.policy.resolved_provider_policy = None;
     assert!(select(&agent, &unadmitted).is_err());
@@ -3505,9 +3505,6 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
                 tool,
                 args,
                 timeout_secs,
-                execution_deadline_unix_ms: _,
-                execution_timeout_ms: _,
-                command_timeout_cap_ms: _,
                 ..
             } => {
                 assert_eq!(request_id, row.request_id);

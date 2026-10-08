@@ -146,7 +146,10 @@ fn authenticated_edge_discovery_merges_with_mcp_without_overwriting_or_impersona
     let mut runtime = PreparedRuntimeCapabilities::default();
     runtime.mcp_bundle = Some(runtime_mcp::RuntimeMcpBundle {
         schemas: Vec::new(),
-        provider_policy_index: ResolvedProviderPolicyIndex::from_snapshots(&[mcp.clone()]).unwrap(),
+        provider_policy_index: ResolvedProviderPolicyIndex::from_snapshots(std::slice::from_ref(
+            &mcp,
+        ))
+        .unwrap(),
         provider_snapshots: vec![mcp],
         control_tools: Default::default(),
         stop_after_success_tools: Default::default(),
