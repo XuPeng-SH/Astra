@@ -193,8 +193,11 @@ fn native_executable() -> Result<std::path::PathBuf, &'static str> {
         .ok_or("native executable is unavailable")
 }
 
-/// Protocol projection only. The grant supplies workspace authority; the
-/// selected local policy can narrow it. No provider/user config supplies roots.
+/// Project Astra's already-approved path rules into the native provider's
+/// managed profile. The provider needs an enforceable child boundary because
+/// `SandboxPolicy::sandbox_command` only filters environment/cwd; it is not a
+/// filesystem mount. This is a projection of the canonical rules, not a new
+/// matcher or a second source of authority.
 fn permission_profile(
     cwd: &str,
     write: bool,
@@ -203,21 +206,70 @@ fn permission_profile(
 ) -> Result<Value, &'static str> {
     let id = format!("astra_admitted_{}", uuid::Uuid::new_v4().simple());
     let mut filesystem = serde_json::Map::new();
+    // Do not inherit Codex's built-in profiles or `:minimal`: both include a
+    // root/platform read baseline. The admitted runtime paths below are the
+    // complete platform bootstrap; keeping the profile rootless is what makes
+    // the native child boundary match Astra's path authority.
+    if cwd == "/" || astra_sandbox::is_sensitive_system_dir(std::path::Path::new(cwd)) {
+        return Err("native workspace boundary is not readable by policy");
+    }
     filesystem.insert(cwd.into(), json!(if write { "write" } else { "read" }));
     for path in &requirements.read_paths {
+        if path == "/" || astra_sandbox::is_sensitive_system_dir(std::path::Path::new(path)) {
+            return Err("native runtime boundary contains a sensitive system root");
+        }
         filesystem
             .entry(path.clone())
             .or_insert_with(|| json!("read"));
     }
-    // :minimal adds the installed Linux platform defaults. Requirements above
-    // enumerate its non-sensitive roots; canonical directory denials mask /etc,
-    // /proc, /sys and non-safe devices. It never grants provider home/auth.
-    filesystem.insert(":minimal".into(), json!("read"));
-    for pattern in filesystem_denials()? {
-        filesystem.insert(pattern, json!("deny"));
+
+    let rules = astra_sandbox::sensitive_path_rules();
+    // The only roots exposed to the provider are the selected workspace and
+    // the explicitly captured installed-runtime paths. Scope the canonical
+    // sensitive-path rules to those roots, using prefixes accepted by Codex's
+    // glob scanner. System-sensitive roots are not exposed at all, so they do
+    // not need a broad deny glob that would conflict with platform bootstrap.
+    let mut scoped_roots = std::collections::BTreeSet::new();
+    scoped_roots.insert(cwd.to_owned());
+    scoped_roots.extend(requirements.read_paths.iter().cloned());
+    for root in scoped_roots {
+        let root = root.trim_end_matches('/');
+        if root.is_empty() || root == "/" {
+            return Err("native runtime boundary cannot project a filesystem root");
+        }
+        for substring in rules.path_substrings {
+            let substring = substring.trim_start_matches('/');
+            if !substring.is_empty() {
+                filesystem.insert(format!("{root}/*{substring}*"), json!("deny"));
+                filesystem.insert(format!("{root}/**/*{substring}*"), json!("deny"));
+                filesystem.insert(format!("{root}/*{substring}*/**"), json!("deny"));
+                filesystem.insert(format!("{root}/**/*{substring}*/**"), json!("deny"));
+            }
+        }
+        for name in rules.credential_file_names {
+            filesystem.insert(format!("{root}/{name}"), json!("deny"));
+            filesystem.insert(format!("{root}/**/{name}"), json!("deny"));
+        }
+        for marker in rules.credential_directories {
+            let marker = case_insensitive_glob_literal(marker.trim_start_matches('/'));
+            filesystem.insert(format!("{root}/{marker}"), json!("deny"));
+            filesystem.insert(format!("{root}/{marker}/**"), json!("deny"));
+            filesystem.insert(format!("{root}/**/{marker}"), json!("deny"));
+            filesystem.insert(format!("{root}/**/{marker}/**"), json!("deny"));
+        }
     }
-    let config = json!({format!("permissions.{id}"): {"filesystem": filesystem, "network": {"enabled": network}}});
-    Ok(json!({"profileId": id, "config": config}))
+
+    let profile = json!({
+        "filesystem": filesystem,
+        "network": {"enabled": network}
+    });
+    Ok(json!({
+        "profileId": id,
+        "config": {
+            "default_permissions": id,
+            "permissions": {id: profile}
+        }
+    }))
 }
 
 fn case_insensitive_glob_literal(value: &str) -> String {
@@ -233,57 +285,40 @@ fn case_insensitive_glob_literal(value: &str) -> String {
         .collect()
 }
 
-/// Native deny-glob projection of the authoritative read-only rule view.
-/// Linux shell enforcement masks matches at sandbox construction; it is not
-/// a continuous filename policy for newly created files or arbitrary aliases.
-fn filesystem_denials() -> Result<Vec<String>, &'static str> {
-    let rules = astra_sandbox::sensitive_path_rules();
-    let mut denies = std::collections::BTreeSet::new();
-    for substring in rules.path_substrings {
-        // Match substrings within components and descendants of a matching
-        // directory. Never lower-case these case-sensitive rules.
-        let pattern = format!("/**/*{substring}*");
-        denies.insert(pattern.clone());
-        denies.insert(format!("{pattern}/**"));
+fn requested_profile_config(requested: &Value) -> Result<&Value, &'static str> {
+    let id = requested
+        .get("profileId")
+        .and_then(Value::as_str)
+        .ok_or("native permission profile identity missing")?;
+    requested
+        .get("config")
+        .and_then(|config| config.pointer(&format!("/permissions/{id}")))
+        .ok_or("native permission profile configuration missing")
+}
+
+fn expected_profile_sandbox(
+    requested: &Value,
+    cwd: &str,
+) -> Result<(&'static str, bool), &'static str> {
+    let profile = requested_profile_config(requested)?;
+    if profile.get("extends").is_some() {
+        return Err("native permission profile must not inherit provider authority");
     }
-    for name in rules.credential_file_names {
-        denies.insert(format!("/**/{name}"));
-    }
-    for marker in rules.credential_directories {
-        let pattern = format!("/**{}", case_insensitive_glob_literal(marker));
-        denies.insert(pattern.clone());
-        denies.insert(format!("{pattern}/**"));
-    }
-    for directory in rules.system_directories {
-        let has_exceptions = rules.safe_device_files.iter().any(|path| {
-            path.strip_prefix(directory)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-        });
-        if has_exceptions {
-            // A blanket ancestor mask would hide safe-device exceptions too.
-            // Enumerate its current children with the canonical matcher; no
-            // second matcher or copied device list lives in this adapter.
-            for child in std::fs::read_dir(directory)
-                .map_err(|_| "native device boundary cannot be projected")?
-            {
-                let path = child
-                    .map_err(|_| "native device boundary cannot be projected")?
-                    .path();
-                if astra_sandbox::is_never_readable_path(&path) {
-                    denies.insert(
-                        path.to_str()
-                            .ok_or("native denied path is not UTF-8")?
-                            .to_owned(),
-                    );
-                }
-            }
-        } else {
-            let pattern = case_insensitive_glob_literal(directory);
-            denies.insert(pattern.clone());
-            denies.insert(format!("{pattern}/**"));
-        }
-    }
-    Ok(denies.into_iter().collect())
+    let sandbox_type = match profile
+        .get("filesystem")
+        .and_then(Value::as_object)
+        .and_then(|filesystem| filesystem.get(cwd))
+        .and_then(Value::as_str)
+    {
+        Some("read") => "readOnly",
+        Some("write") => "workspaceWrite",
+        _ => return Err("native permission profile workspace authority missing"),
+    };
+    let network = profile
+        .pointer("/network/enabled")
+        .and_then(Value::as_bool)
+        .ok_or("native permission profile network setting missing")?;
+    Ok((sandbox_type, network))
 }
 
 async fn verify_installed_version(
@@ -730,6 +765,21 @@ async fn rpc(
             if evidence.turn.is_none()
                 && (id == json!(3) || (id == json!(2) && method == "thread/tokenUsage/updated"))
             {
+                // Thread/configuration chatter can arrive between a turn
+                // request and its ACK. It is not a turn fact and must not
+                // consume the bounded pre-ACK evidence budget. Retain only
+                // notifications carrying the canonical turn identity; these
+                // may contain output, usage, or an interaction request that
+                // arrived before the ACK.
+                let params = &envelope["params"];
+                let has_turn_identity = params.get("turnId").and_then(Value::as_str).is_some()
+                    || params.pointer("/turn/id").and_then(Value::as_str).is_some();
+                if !has_turn_identity {
+                    if envelope.get("id").is_some() {
+                        return Err("native request before active turn acknowledgement");
+                    }
+                    continue;
+                }
                 if evidence.pre_ack.len() == PRE_ACK_EVENTS {
                     return Err("native pre-ack event budget exceeded");
                 }
@@ -744,7 +794,12 @@ async fn rpc(
                 return Err("native acknowledgement request ID mismatch");
             }
             if envelope.get("error").is_some() {
-                return Err("native request rejected");
+                return Err(match id.as_i64() {
+                    Some(1) => "native initialize request rejected",
+                    Some(2) => "native thread request rejected",
+                    Some(3) => "native turn request rejected",
+                    _ => "native request rejected",
+                });
             }
             return Ok(envelope["result"].clone());
         }
@@ -819,16 +874,27 @@ fn verify_sandbox(result: &Value, requested: &Value, cwd: &str) -> Result<(), &'
     {
         return Err("native acknowledged different workspace/approval authority");
     }
-    let effective = result
+    let requested_id = requested
+        .get("profileId")
+        .and_then(Value::as_str)
+        .ok_or("native permission profile identity missing")?;
+    let (expected_type, expected_network) = expected_profile_sandbox(requested, cwd)?;
+    let active = result
         .get("activePermissionProfile")
-        .ok_or("native permission profile acknowledgement missing")?;
-    if effective.get("id").and_then(Value::as_str).is_none()
-        || effective.get("id") != requested.get("profileId")
-        || effective
-            .get("extends")
-            .is_none_or(|value| !value.is_null())
+        .and_then(|profile| profile.get("id"))
+        .and_then(Value::as_str);
+    let active_has_parent = result
+        .pointer("/activePermissionProfile/extends")
+        .is_some_and(|value| !value.is_null());
+    let sandbox = result
+        .get("sandbox")
+        .ok_or("native sandbox acknowledgement missing")?;
+    if active != Some(requested_id)
+        || active_has_parent
+        || sandbox.get("type").and_then(Value::as_str) != Some(expected_type)
+        || sandbox.get("networkAccess").and_then(Value::as_bool) != Some(expected_network)
     {
-        return Err("native acknowledged different or inherited permission profile");
+        return Err("native acknowledged a different permission profile");
     }
     Ok(())
 }
@@ -1248,7 +1314,7 @@ impl ToolExecutor {
         }
         let executable = std::path::Path::new(&requirements.executable);
         let sandbox = match permission_profile(cwd_text, !read_only, network, &requirements) {
-            Ok(profile) => profile,
+            Ok(sandbox) => sandbox,
             Err(reason) => return failure(reason),
         };
         // Work authority is the immutable admission cutoff. A Bash command

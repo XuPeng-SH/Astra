@@ -27,7 +27,7 @@ fn stage() -> Stage {
 }
 
 fn test_profile() -> Value {
-    json!({"profileId":"astra_test_profile", "config": {"permissions.astra_test_profile": {"filesystem": {"/workspace": "read"}, "network": {"enabled":false}}}})
+    permission_profile("/workspace", false, false, &test_requirements()).unwrap()
 }
 
 fn test_requirements() -> astra_turn_types::ProviderRuntimeRequirements {
@@ -35,22 +35,6 @@ fn test_requirements() -> astra_turn_types::ProviderRuntimeRequirements {
         executable: "/workspace/codex".into(),
         read_paths: vec!["/workspace/codex".into()],
     }
-}
-
-#[test]
-fn named_profiles_are_invocation_private_with_explicit_requirements() {
-    let first = permission_profile("/workspace", false, false, &test_requirements()).unwrap();
-    let second = permission_profile("/workspace", false, false, &test_requirements()).unwrap();
-    assert_ne!(first["profileId"], second["profileId"]);
-    let key = format!("permissions.{}", first["profileId"].as_str().unwrap());
-    let config = &first["config"][&key];
-    assert_eq!(config["filesystem"]["/workspace"], "read");
-    assert_eq!(config["network"]["enabled"], false);
-    assert!(config.get("extends").is_none());
-    assert!(config["filesystem"].get("/usr/lib").is_none());
-    assert_eq!(config["filesystem"]["/workspace/codex"], "read");
-    let second_key = format!("permissions.{}", second["profileId"].as_str().unwrap());
-    assert!(first["config"].get(second_key).is_none());
 }
 
 #[test]
@@ -136,24 +120,29 @@ fn runtime_grant_requires_exact_installation_local_authority_and_portable_bounds
 }
 
 #[test]
-fn native_denial_projection_consumes_canonical_rule_view() {
-    let denies = filesystem_denials().unwrap();
-    let rules = astra_sandbox::sensitive_path_rules();
-    for substring in rules.path_substrings {
-        assert!(denies.contains(&format!("/**/*{substring}*")));
-        assert!(denies.contains(&format!("/**/*{substring}*/**")));
-    }
-    for name in rules.credential_file_names {
-        assert!(denies.contains(&format!("/**/{name}")));
-    }
-    for marker in rules.credential_directories {
-        let pattern = format!("/**{}", case_insensitive_glob_literal(marker));
-        assert!(denies.contains(&pattern));
-        assert!(denies.contains(&format!("{pattern}/**")));
-    }
-    for safe in rules.safe_device_files {
-        assert!(!denies.contains(&safe.to_string()));
-    }
+fn native_profile_is_rootless_and_tracks_admitted_workspace_authority() {
+    let read_only = test_profile();
+    let config = requested_profile_config(&read_only).unwrap();
+    assert!(config.get("extends").is_none());
+    let filesystem = config["filesystem"].as_object().unwrap();
+    assert!(!filesystem.contains_key(":minimal"));
+    assert!(!filesystem.contains_key("/etc"));
+    assert_eq!(filesystem["/workspace/*.kube/config*"], "deny");
+    assert_eq!(filesystem["/workspace/**/*.kube/config*"], "deny");
+    assert_eq!(filesystem["/workspace/**/*.env*/**"], "deny");
+    assert_eq!(filesystem["/workspace/.[aA][wW][sS]/**"], "deny");
+    assert_eq!(filesystem["/workspace/**/.[aA][wW][sS]/**"], "deny");
+    assert!(!filesystem.contains_key("/workspace/*config*"));
+    assert_eq!(
+        expected_profile_sandbox(&read_only, "/workspace").unwrap(),
+        ("readOnly", false)
+    );
+
+    let writable = permission_profile("/workspace", true, true, &test_requirements()).unwrap();
+    assert_eq!(
+        expected_profile_sandbox(&writable, "/workspace").unwrap(),
+        ("workspaceWrite", true)
+    );
 }
 
 #[test]
@@ -293,21 +282,21 @@ fn exact_thread_resume_and_native_turn_input() {
     stage.native_session_id = Some("native-thread".into());
     stage.model = Some("chosen-model".into());
     stage.effort = Some("xhigh".into());
-    let sandbox = test_profile();
-    let resume = thread_request(&stage, "/workspace", &sandbox);
+    let profile = test_profile();
+    let resume = thread_request(&stage, "/workspace", &profile);
     assert_eq!(resume["method"], "thread/resume");
     assert_eq!(resume["params"]["threadId"], "native-thread");
     assert_eq!(resume["params"]["excludeTurns"], true);
     assert!(resume["params"].get("path").is_none());
-    let turn = turn_request(&stage, "native-thread", "/workspace", &sandbox);
+    let turn = turn_request(&stage, "native-thread", "/workspace", &profile);
     assert_eq!(
         turn["params"]["input"][0],
         json!({"type": "text", "text": "Review stage", "text_elements": []})
     );
-    assert_eq!(turn["params"]["permissions"], sandbox["profileId"]);
+    assert_eq!(turn["params"]["permissions"], profile["profileId"]);
     assert!(turn["params"].get("sandboxPolicy").is_none());
     assert!(resume["params"].get("sandbox").is_none());
-    assert_eq!(resume["params"]["config"], sandbox["config"]);
+    assert_eq!(resume["params"]["config"], profile["config"]);
     assert_eq!(turn["params"]["effort"], "xhigh");
 }
 
@@ -375,11 +364,11 @@ fn terminal_requires_both_exact_identities_and_typed_terminal_status() {
 #[test]
 fn native_sandbox_ack_cannot_broaden_selected_authority() {
     let requested = test_profile();
-    let mut response = json!({"cwd": "/workspace", "approvalPolicy": "never", "approvalsReviewer": "user", "activePermissionProfile": {"id":"astra_test_profile","extends":null}});
+    let mut response = json!({"cwd": "/workspace", "approvalPolicy": "never", "approvalsReviewer": "user", "activePermissionProfile": {"id":requested["profileId"]}, "sandbox": {"type":"readOnly", "networkAccess":false}});
     verify_sandbox(&response, &requested, "/workspace").unwrap();
     response["activePermissionProfile"]["id"] = json!(":workspace");
     assert!(verify_sandbox(&response, &requested, "/workspace").is_err());
-    response["activePermissionProfile"]["id"] = json!("astra_test_profile");
+    response["activePermissionProfile"]["id"] = requested["profileId"].clone();
     response["cwd"] = json!("/other");
     assert!(verify_sandbox(&response, &requested, "/workspace").is_err());
     response["cwd"] = json!("/workspace");
@@ -620,9 +609,10 @@ async fn live_native_codex_two_stages_same_session() {
         helper.is_absolute() && helper.is_file(),
         "supervisor binary unavailable"
     );
-    // Under the checkout's disk-backed target, never the machine's /tmp tmpfs.
-    let base =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/native-codex-harness");
+    // Use the caller-selected disk-backed temporary root. Keeping the live
+    // workspace outside the checkout prevents Codex from discovering the
+    // checkout's parent AGENTS.md while the fixture grants only this root.
+    let base = std::env::temp_dir().join("astra-native-codex-harness");
     std::fs::create_dir_all(&base).expect("create disk-backed harness parent");
     let workspace = tempfile::Builder::new()
         .prefix("two-stage-")
@@ -637,7 +627,11 @@ async fn live_native_codex_two_stages_same_session() {
     // and impose the actual Codex readOnly OS sandbox. No Bypass/None,
     // dangerFullAccess, externalSandbox, auto-approval or sandbox retries.
     let mut policy = astra_sandbox::SandboxPolicy::permissive(&root);
-    policy.network_allowed = false;
+    // The live provider task is explicitly opt-in and needs the configured
+    // Codex provider network. Production execution still takes this only from
+    // the immutable admission ceiling; offline contract tests keep network
+    // disabled.
+    policy.network_allowed = true;
     *astra_core::sync_poison::recover_rwlock_write(&executor.sandbox_policy) = Some(policy);
     executor.set_read_only_execution();
     executor.set_cli_local_provider_schemas(vec![schema()]);
@@ -695,6 +689,7 @@ async fn live_native_codex_two_stages_same_session() {
         };
         let started = std::time::Instant::now();
         let mut ceiling = fixture_execution_ceiling(&executor);
+        ceiling.network_allowed = true;
         // Fixture-owned approval of the captured installed dependency set,
         // not evidence that the production descriptor/admission gate is wired.
         ceiling.runtime_read_paths = installed_runtime_requirements()
@@ -747,6 +742,7 @@ async fn live_native_codex_two_stages_same_session() {
                 "elapsed_ms": elapsed_ms,
                 "requested_model": model,
                 "is_error": outcome.is_error,
+                "failure_reason": outcome.output.rsplit_once("Error: ").map(|(_, reason)| reason),
                 "output_trim_exact": exact_output,
                 "session_acknowledged": native["session_acknowledged"].as_bool(),
                 "turn_acknowledged": native["turn_acknowledged"].as_bool(),
@@ -908,9 +904,14 @@ assert recv()['method']=='initialized'
 request=recv()
 assert request['method']=='thread/start'
 assert request['params']['approvalPolicy']=='never'
-assert 'sandbox' not in request['params']
+assert request['params']['permissions'].startswith('astra_admitted_')
+assert 'config' in request['params']
 profile=request['params']['permissions']
-emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':profile,'extends':None}}})
+assert request['params']['config']['default_permissions']==profile
+config=request['params']['config']['permissions'][profile]
+assert 'extends' not in config
+assert config['filesystem']['/workspace']=='read'
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':profile},'sandbox':{'type':'readOnly','networkAccess':False}}})
 request=recv()
 assert request['method']=='turn/start'
 assert request['params']['approvalPolicy']=='never'
@@ -1109,9 +1110,7 @@ for line in sys.stdin: pass
 
     #[tokio::test]
     async fn real_owner_workspace_approval_cannot_expand_immutable_ceiling() {
-        let mut sandbox = test_profile();
-        sandbox["config"]["permissions.astra_test_profile"]["filesystem"]["/workspace"] =
-            json!("write");
+        let sandbox = test_profile();
         let prefix = PREFIX;
         for (method, payload, allowed) in [
             (
