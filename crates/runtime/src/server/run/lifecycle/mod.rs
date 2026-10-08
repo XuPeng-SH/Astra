@@ -4813,14 +4813,18 @@ impl PreparedRuntimeCapabilities {
                         return Err(invalid());
                     }
                 }
-                // Authentication establishes provenance, never claim trust or permission.
+                // Authentication establishes provenance. The first-party
+                // native collaborator read-only claim is the one exception:
+                // its trust is assigned here by the selected CLI boundary,
+                // never by the provider declaration itself.
+                let mut trust_policy = ProviderClaimTrustPolicy::default();
+                trust_policy.astra_components.insert(
+                    astra_turn_types::PROVIDER_NATIVE_COLLABORATOR_COMPONENT.into(),
+                    astra_turn_types::ProviderClaimTrust::Trusted,
+                );
                 snapshots.push(
-                    resolve_provider_snapshot(
-                        snapshot,
-                        &ProviderClaimTrustPolicy::default(),
-                        &aliases,
-                    )
-                    .map_err(|_| invalid())?,
+                    resolve_provider_snapshot(snapshot, &trust_policy, &aliases)
+                        .map_err(|_| invalid())?,
                 );
             }
         }
@@ -17372,8 +17376,9 @@ impl AgenticRunLifecycleService {
                 plan_authoring_active,
                 work_runtime_binding.as_ref(),
             );
-            host.authenticated_edge_discovery =
-                runtime_capabilities.authenticated_edge_discovery.clone();
+            host.set_authenticated_edge_discovery(
+                runtime_capabilities.authenticated_edge_discovery.clone(),
+            );
             if let Some(admission) = canonical_turn.as_ref() {
                 host.bind_execution_handoff(
                     self.execution_handoff_requested.clone(),
@@ -21508,6 +21513,9 @@ impl ServerSpawnAgentExecutor {
                 return Err("native collaborator requires a resolved provider tool policy".into());
             }
         };
+        if !executor.provider_is_collaborator_stage(&request.tool) {
+            return Err("selected provider is not an admitted collaborator stage".into());
+        }
         let provider = native_collaborator_provider(&policy.descriptor)?;
         let binding = &parent
             .execution_contract
@@ -21705,6 +21713,19 @@ struct ServerPreparedSpawn {
 impl PreparedSpawn for ServerPreparedSpawn {
     fn effective_thinking(&self) -> Option<astra_turn_core::thinking_config::ThinkingConfig> {
         Some(self.thinking.clone())
+    }
+
+    fn collaborator_id(&self, launched_run_id: &str) -> Option<String> {
+        match &self.execution {
+            ServerPreparedExecution::Native(native) => {
+                Some(if native.stage_admission.anchor_run_id.is_empty() {
+                    launched_run_id.to_string()
+                } else {
+                    native.stage_admission.anchor_run_id.clone()
+                })
+            }
+            ServerPreparedExecution::Internal(_) => None,
+        }
     }
 
     fn execution_identity(&self) -> Option<crate::orchestration::PreparedSpawnIdentity> {
@@ -21942,30 +21963,39 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             let engine = self.run_engine.as_ref().ok_or_else(|| {
                 "collaborator continuation requires the canonical RunEngine".to_string()
             })?;
-            let spawner = parent
-                .spawner
-                .upgrade()
-                .ok_or_else(|| "collaborator supervisor stopped".to_string())?;
             for (index, input) in resolved_inputs.to_mut().iter_mut().enumerate() {
                 let Some(collaborator_id) = input.collaborator_id.as_deref() else {
                     continue;
                 };
                 input.validate_execution_request()?;
-                let collaborator = spawner
-                    .get_agent_state_any(collaborator_id)
+                // The launch receipt exposes the durable association anchor,
+                // not the latest process-local agent ID. Resolve it from the
+                // canonical store so a later turn can continue after a CLI or
+                // server restart.
+                let association = engine
+                    .store()
+                    .load_collaborator_association(
+                        &parent.user_id,
+                        &parent.session_id,
+                        collaborator_id,
+                    )
                     .await
+                    .map_err(|error| error.to_string())?
                     .ok_or_else(|| {
-                        "original collaborator is not restored in this supervisor".to_string()
+                        "collaborator has no durable execution association".to_string()
                     })?;
+                if association.latest_stage.anchor_run_id != collaborator_id {
+                    return Err("collaborator receipt is not its durable association anchor".into());
+                }
                 let original = engine
-                    .load_run(&parent.user_id, &collaborator.run_id)
+                    .load_run(&parent.user_id, &association.latest_stage.run_id)
                     .await?
                     .filter(|run| {
                         run.session_id == parent.session_id
-                            && run.agent_id.as_deref() == Some(collaborator_id)
+                            && run.run_id == association.latest_stage.run_id
                     })
                     .ok_or_else(|| {
-                        "original collaborator is outside the authorized session".to_string()
+                        "latest collaborator stage is outside the authorized session".to_string()
                     })?;
                 if input.reasoning.is_none() {
                     input.reasoning = Some(
@@ -21979,18 +22009,6 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 // stage mailbox are wired, do not silently launch a fresh
                 // loop under a stable collaborator handle.
                 ensure_collaborator_context_continuation(&original)?;
-                let association = engine
-                    .store()
-                    .load_collaborator_association(
-                        &parent.user_id,
-                        &parent.session_id,
-                        &original.run_id,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| {
-                        "collaborator has no durable execution association".to_string()
-                    })?;
                 let locator = association
                     .association
                     .native_execution
@@ -23189,6 +23207,11 @@ impl ServerSubRunExecutor {
         let control_epoch = i64::try_from(state.user_intents.user_intent_cursor())
             .map_err(|_| invalid("native stage control epoch overflowed".into()))?;
         let dispatch_started_at = Instant::now();
+        executor.set_current_selected_provider_offer(
+            &native.tool_name,
+            &native.policy,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::EdgeBound,
+        );
         let deferred = executor
             .execute_invocation_before_governance(
                 &config.run_id,

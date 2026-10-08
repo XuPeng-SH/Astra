@@ -38,12 +38,13 @@ fn authenticated_edge_discovery_fixture() -> server_loop_host::AuthenticatedEdge
                     input_schema: json!({"type":"object"}),
                     output_schema: None,
                     claims: Default::default(),
-                    task_support: Default::default(),
-                    extension_fields: serde_json::from_value(
-                        json!({(astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY): {
+                    task_support: astra_turn_types::ProviderTaskSupport::Required,
+                    extension_fields: serde_json::from_value(json!({
+                        (astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY): {
                             "executable":"/installed/provider", "read_paths":["/installed/provider"]
-                        }}),
-                    )
+                        },
+                        (astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY): true
+                    }))
                     .unwrap(),
                 }],
             )
@@ -117,6 +118,29 @@ fn authenticated_edge_discovery_restores_exact_policy_and_fences_binding() {
         PreparedRuntimeCapabilities::validate_edge_discovery_binding(&restored, "owner", &bindings)
             .is_err()
     );
+}
+
+#[test]
+fn authenticated_native_collaborator_claim_is_read_only_without_name_heuristics() {
+    let mut discovery = authenticated_edge_discovery_fixture();
+    let declaration = &mut discovery.snapshots[0].tool_declarations[0];
+    declaration.claims.read_only = Some(astra_turn_types::ProviderClaim::new(
+        true,
+        astra_turn_types::ProviderClaimSource::AstraOwned {
+            component: astra_turn_types::PROVIDER_NATIVE_COLLABORATOR_COMPONENT.into(),
+            field: "read_only_execution".into(),
+        },
+    ));
+    let mut capabilities = PreparedRuntimeCapabilities::default();
+    capabilities
+        .bind_edge_discovery(Some(discovery))
+        .expect("authenticated native discovery should resolve");
+    let policy = capabilities
+        .provider_policy_index
+        .resolve("fixture_native_stage")
+        .expect("native stage policy");
+    assert!(policy.is_read_only());
+    assert!(!policy.requires_approval());
 }
 
 #[test]
@@ -5522,8 +5546,11 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
                 input_schema: json!({"type":"object"}),
                 output_schema: None,
                 claims: Default::default(),
-                task_support: Default::default(),
-                extension_fields: Default::default(),
+                task_support: astra_turn_types::ProviderTaskSupport::Required,
+                extension_fields: serde_json::Map::from_iter([(
+                    astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
+                    json!(true),
+                )]),
             }],
         )
         .unwrap();

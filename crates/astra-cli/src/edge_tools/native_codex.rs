@@ -396,6 +396,10 @@ fn provider_declaration(
         astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY.into(),
         json!(requirements),
     );
+    extension_fields.insert(
+        astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
+        json!(true),
+    );
     extension_fields.insert("codex.protocolVersion".into(), json!("0.160.0"));
     astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(&extension_fields)?;
     let declaration = astra_turn_types::ProviderToolDeclaration {
@@ -408,8 +412,20 @@ fn provider_declaration(
             .map(str::to_owned),
         input_schema: schema["function"]["parameters"].clone(),
         output_schema: None,
-        claims: astra_turn_types::ProviderToolClaims::default(),
-        task_support: astra_turn_types::ProviderTaskSupport::Unspecified,
+        claims: astra_turn_types::ProviderToolClaims {
+            read_only: Some(astra_turn_types::ProviderClaim::new(
+                true,
+                astra_turn_types::ProviderClaimSource::AstraOwned {
+                    component: astra_turn_types::PROVIDER_NATIVE_COLLABORATOR_COMPONENT.into(),
+                    field: "read_only_execution".into(),
+                },
+            )),
+            ..Default::default()
+        },
+        // This declaration is an agent-stage capacity, not an ordinary tool.
+        // The shared runtime uses this typed fact to expose it in the
+        // provider-owned collaborator directory without name matching.
+        task_support: astra_turn_types::ProviderTaskSupport::Required,
         extension_fields,
     };
     declaration.validate()?;
@@ -464,6 +480,7 @@ struct Evidence {
     usage: Option<Value>,
     usage_baseline: Option<Value>,
     output: String,
+    final_output: Option<String>,
     output_capped: bool,
     pre_ack: Vec<Value>,
 }
@@ -564,6 +581,22 @@ impl Evidence {
                 }
                 self.output.push_str(&delta[..keep]);
                 self.output_capped |= keep < delta.len();
+            }
+            "item/completed" => {
+                self.require_scope(params)?;
+                let item = params.get("item").ok_or("missing native completed item")?;
+                if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                    let text = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or("invalid native completed agent message")?;
+                    let mut keep = text.len().min(output_limit);
+                    while !text.is_char_boundary(keep) {
+                        keep -= 1;
+                    }
+                    self.final_output = Some(text[..keep].to_owned());
+                    self.output_capped |= keep < text.len();
+                }
             }
             "thread/tokenUsage/updated" => {
                 if self.thread.is_none()
@@ -1443,7 +1476,10 @@ impl ToolExecutor {
                     provider: astra_services::runs::CollaboratorProvider::Codex,
                     native_session_id: id.clone(),
                 });
-        let mut output = evidence.output;
+        // Delta notifications are progress, not the authoritative final
+        // message. The completed item replaces a possibly truncated progress
+        // buffer while retaining the same byte/UTF-8 budget.
+        let mut output = evidence.final_output.take().unwrap_or(evidence.output);
         if is_error {
             if !output.is_empty() {
                 output.push('\n');

@@ -1367,6 +1367,13 @@ impl RuntimeToolExecutor {
         }
     }
 
+    pub(crate) fn provider_is_collaborator_stage(&self, public_alias: &str) -> bool {
+        self.provider_policy_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_collaborator_stage(public_alias)
+    }
+
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
         let allowed = self.provider_visible_runtime_tool_names();
         let conflicts = prompt_schema_conflicting_tool_names(schemas);
@@ -1464,6 +1471,26 @@ impl RuntimeToolExecutor {
             "current_selected_tool_offers",
         );
         *guard = offers;
+    }
+
+    /// Install one provider offer that was already resolved by canonical
+    /// admission. Native collaborator stages execute before the normal model
+    /// loop installs its wire surface, so they use this same selected-offer
+    /// store rather than falling back to a public tool name.
+    pub(crate) fn set_current_selected_provider_offer(
+        &self,
+        tool_name: &str,
+        policy: &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        route: crate::server::tool_route_selection::ToolExecutionRouteKind,
+    ) {
+        let offer = SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+            tool_name,
+            policy.descriptor.identity.provider_binding.as_str(),
+            route,
+            Some(policy.descriptor.descriptor_version.to_string()),
+            policy.descriptor.identity.native_tool_id.as_str(),
+        );
+        self.set_current_selected_tool_offers(HashMap::from([(tool_name.to_string(), offer)]));
     }
 
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {

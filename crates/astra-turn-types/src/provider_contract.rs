@@ -25,6 +25,17 @@ pub const STABLE_TOOL_ALIAS_METADATA_KEY: &str = "astra/stableToolAlias";
 
 pub const PROVIDER_RUNTIME_REQUIREMENTS_KEY: &str = "astra.runtimeRequirements";
 
+/// Typed declaration marker for a provider capacity that can continue an
+/// agent stage.  This is deliberately separate from `task_support`: ordinary
+/// asynchronous tools may require task support without being a collaborator
+/// transport.
+pub const PROVIDER_COLLABORATOR_STAGE_KEY: &str = "astra.collaboratorStage";
+
+/// Host-owned claim namespace for the native collaborator's read-only
+/// execution baseline.  The selected CLI boundary may trust this claim after
+/// authenticating the declaration; arbitrary providers may not.
+pub const PROVIDER_NATIVE_COLLABORATOR_COMPONENT: &str = "native-collaborator";
+
 /// Installed-provider dependencies, not an authorization grant. The local
 /// runtime owner supplies these facts; canonical admission approves them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,6 +487,15 @@ pub struct ProviderToolDeclaration {
 }
 
 impl ProviderToolDeclaration {
+    pub fn is_collaborator_stage(&self) -> bool {
+        self.task_support == ProviderTaskSupport::Required
+            && self
+                .extension_fields
+                .get(PROVIDER_COLLABORATOR_STAGE_KEY)
+                .and_then(Value::as_bool)
+                == Some(true)
+    }
+
     pub fn validate(&self) -> Result<(), ProviderContractError> {
         if self.native_tool_name.trim().is_empty() {
             return Err(ProviderContractError::EmptyIdentifier {

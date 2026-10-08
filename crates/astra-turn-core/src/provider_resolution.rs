@@ -66,6 +66,7 @@ impl ResolvedInvocationPolicy {
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedProviderPolicyIndex {
     by_alias: BTreeMap<String, ResolvedInvocationPolicy>,
+    collaborator_stage_aliases: std::collections::BTreeSet<String>,
 }
 
 impl ResolvedProviderPolicyIndex {
@@ -73,6 +74,7 @@ impl ResolvedProviderPolicyIndex {
         snapshots: &[ResolvedProviderSnapshot],
     ) -> Result<Self, ProviderResolutionError> {
         let mut by_alias = BTreeMap::new();
+        let mut collaborator_stage_aliases = std::collections::BTreeSet::new();
         for snapshot in snapshots {
             let descriptors = snapshot
                 .descriptors
@@ -110,9 +112,21 @@ impl ResolvedProviderPolicyIndex {
                         alias: alias.to_string(),
                     });
                 }
+                if descriptor
+                    .extension_fields
+                    .get(astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY)
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && descriptor.task_support == astra_turn_types::ProviderTaskSupport::Required
+                {
+                    collaborator_stage_aliases.insert(alias.to_string());
+                }
             }
         }
-        Ok(Self { by_alias })
+        Ok(Self {
+            by_alias,
+            collaborator_stage_aliases,
+        })
     }
 
     pub fn resolve(&self, public_alias: &str) -> Option<&ResolvedInvocationPolicy> {
@@ -125,6 +139,10 @@ impl ResolvedProviderPolicyIndex {
 
     pub fn is_empty(&self) -> bool {
         self.by_alias.is_empty()
+    }
+
+    pub fn is_collaborator_stage(&self, public_alias: &str) -> bool {
+        self.collaborator_stage_aliases.contains(public_alias)
     }
 }
 

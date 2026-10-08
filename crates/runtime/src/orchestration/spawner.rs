@@ -2733,6 +2733,13 @@ pub trait PreparedSpawn: Send {
         None
     }
 
+    /// Stable durable identity to return for a provider collaborator. Ordinary
+    /// children have no such identity; native stages use their association
+    /// anchor so follow-up requests do not depend on the latest stage ID.
+    fn collaborator_id(&self, _launched_run_id: &str) -> Option<String> {
+        None
+    }
+
     /// Consume the prepared request and register controls synchronously at the
     /// spawner's atomic handle boundary. No I/O starts before the returned
     /// execution future is polled by the child supervisor.
@@ -7333,6 +7340,7 @@ impl DynamicAgentSpawner {
         // it before model-sensitive thinking and prefix compatibility are
         // computed; the caller's configured name is not an execution identity.
         let execution_identity = preparation.execution_identity();
+        let collaborator_id = preparation.collaborator_id(&run_id);
         let native_execution = matches!(
             execution_identity,
             Some(PreparedSpawnIdentity::ExternalProvider(_))
@@ -8074,6 +8082,7 @@ impl DynamicAgentSpawner {
         Ok(SpawnAgentOutput::Launched {
             agent_id,
             run_id,
+            collaborator_id,
             description,
             messaging_address: messaging_address_text,
         })

@@ -48,6 +48,15 @@ fn provider_declaration_carries_bounded_runtime_requirements_in_the_existing_ext
     .unwrap();
     assert_eq!(roundtrip, requirements);
     assert_eq!(declaration.native_tool_name, TOOL_NAME);
+    assert!(declaration.is_collaborator_stage());
+    assert_eq!(
+        declaration
+            .claims
+            .read_only
+            .as_ref()
+            .map(|claim| claim.value),
+        Some(true)
+    );
     assert!(
         declaration.input_schema["properties"]
             .get("runtime_read_paths")
@@ -498,6 +507,31 @@ fn output_is_utf8_bounded_and_not_terminal_evidence() {
     assert_eq!(evidence.output, "你");
     assert!(evidence.output_capped);
     assert!(evidence.terminal.is_none());
+}
+
+#[test]
+fn completed_agent_message_is_authoritative_over_truncated_progress() {
+    let mut evidence = active();
+    evidence
+        .notification(
+            "item/agentMessage/delta",
+            &json!({"threadId": "thread", "turnId": "turn", "delta": "x".repeat(OUTPUT_BYTES + 1)}),
+            OUTPUT_BYTES,
+        )
+        .unwrap();
+    evidence
+        .notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": {"type": "agentMessage", "id": "answer", "text": "final answer"}
+            }),
+            OUTPUT_BYTES,
+        )
+        .unwrap();
+    assert_eq!(evidence.final_output.as_deref(), Some("final answer"));
+    assert!(evidence.output_capped);
 }
 
 #[test]

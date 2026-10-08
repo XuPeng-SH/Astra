@@ -526,6 +526,11 @@ pub enum SpawnAgentOutput {
         agent_id: String,
         /// Immutable execution identity for the canonical child transcript.
         run_id: String,
+        /// Stable durable identity for a provider collaborator. This is an
+        /// association anchor, not the current stage's agent ID, so a later
+        /// turn can continue after a process restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collaborator_id: Option<String>,
         description: String,
         messaging_address: Option<String>,
     },
@@ -540,6 +545,7 @@ impl SpawnAgentOutput {
         Self::Launched {
             agent_id: agent_id.into(),
             run_id: run_id.into(),
+            collaborator_id: None,
             description: description.into(),
             messaging_address: None,
         }

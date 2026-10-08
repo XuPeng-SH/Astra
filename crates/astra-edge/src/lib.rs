@@ -235,6 +235,23 @@ fn command_deadline(
     }
 }
 
+fn deadline_result(tool: &str, mut result: astra_tools::ToolResult) -> astra_tools::ToolResult {
+    let observed_output = std::mem::take(&mut result.output);
+    result.output = if observed_output.is_empty() {
+        format!("Tool '{tool}' exceeded its server-issued execution deadline")
+    } else {
+        format!(
+            "Tool '{tool}' exceeded its server-issued execution deadline. Observed output before the deadline:\n{observed_output}"
+        )
+    };
+    result.is_error = true;
+    result.metadata.get_or_insert_with(Default::default).insert(
+        "execution_deadline_exceeded".into(),
+        serde_json::Value::Bool(true),
+    );
+    result
+}
+
 /// Anchor the immutable server work budget at receipt, before queueing or
 /// journal I/O. Relative remaining time must never renew an absolute cutoff.
 fn edge_execution_deadline(
@@ -600,10 +617,8 @@ pub async fn serve_connection(
                                         result = &mut execution => result,
                                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(execution_deadline)) => {
                                             cancel.cancel();
-                                            let _ = execution.await;
-                                            astra_tools::ToolResult::error(
-                                                format!("Tool '{tool}' exceeded its server-issued execution deadline")
-                                            )
+                                            let observed = execution.await;
+                                            deadline_result(&tool, observed)
                                         }
                                     };
                                     let completion = CompletedEdgeInvocation {
@@ -1101,6 +1116,40 @@ mod tests {
         let absolute =
             edge_execution_deadline(30, Some(unix_ms + 1_000), Some(86_400_000)).unwrap();
         assert!(absolute.saturating_duration_since(Instant::now()) <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn deadline_result_preserves_observed_output_and_metadata() {
+        let result = deadline_result(
+            "native_provider",
+            astra_tools::ToolResult {
+                output: "partial provider output".into(),
+                metadata: Some(serde_json::Map::from_iter([(
+                    "native_session".into(),
+                    serde_json::Value::String("session-1".into()),
+                )])),
+                is_error: false,
+                exit_semantics: None,
+            },
+        );
+
+        assert!(result.is_error);
+        assert!(result.output.contains("partial provider output"));
+        assert_eq!(
+            result.metadata.as_ref().and_then(|metadata| {
+                metadata
+                    .get("native_session")
+                    .and_then(|value| value.as_str())
+            }),
+            Some("session-1")
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("execution_deadline_exceeded")),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     #[test]

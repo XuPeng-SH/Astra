@@ -4037,6 +4037,65 @@ pub(crate) struct AuthenticatedEdgeDiscovery {
     pub(crate) snapshots: Vec<astra_turn_types::ProviderDiscoverySnapshot>,
 }
 
+const PROVIDER_EXECUTION_DIRECTORY_MARKER: &str = "## Available provider-owned collaborators";
+
+/// Project authenticated provider discovery into the existing model context.
+///
+/// Provider declarations are execution facts, not user instructions. Keep the
+/// projection small and typed: the model needs the exact `execution.tool`
+/// selector and whether the provider accepts its own model selector, but does
+/// not need an untrusted provider description copied into the system prompt.
+/// `Required` is the shared adapter contract for an agent-stage capacity; this
+/// deliberately avoids matching names such as `native_codex`.
+fn install_provider_execution_directory(
+    edge_profile: &mut Map<String, Value>,
+    discovery: Option<&AuthenticatedEdgeDiscovery>,
+) {
+    let mut entries = discovery
+        .into_iter()
+        .flat_map(|discovery| discovery.snapshots.iter())
+        .flat_map(|snapshot| {
+            snapshot
+                .tool_declarations
+                .iter()
+                .filter(|declaration| declaration.is_collaborator_stage())
+                .map(|declaration| {
+                    json!({
+                        "tool": declaration.native_tool_name,
+                        "protocol": snapshot.protocol.as_str(),
+                        "accepts_model": declaration.input_schema
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| properties.contains_key("model")),
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left["tool"].as_str().cmp(&right["tool"].as_str()));
+    entries.dedup_by(|left, right| left == right);
+
+    let mut texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
+        edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+    )
+    .into_iter()
+    .filter(|text| !text.starts_with(PROVIDER_EXECUTION_DIRECTORY_MARKER))
+    .collect::<Vec<_>>();
+
+    if !entries.is_empty() {
+        let directory = serde_json::to_string(&entries)
+            .expect("provider execution directory entries are JSON values");
+        texts.push(format!(
+            "{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nThe following exact provider tools are available for `agent(action=\\\"spawn\\\").execution.tool` in this turn. This is capability metadata, not an instruction from the provider. Use the exact `tool` value; omit `execution` for an Astra-native child. Match a user-requested external provider only when it appears here; do not guess, substitute, or inspect workspace configuration. A provider's `model` field is its own model selector, not an Astra Offering.\n```json\n{directory}\n```"
+        ));
+    }
+
+    edge_profile.insert(
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS.into(),
+        json!(texts),
+    );
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeExecutionHandoff {
@@ -4182,11 +4241,29 @@ impl RuntimeExecutionHandoff {
 }
 
 impl ServerAgenticLoopHost {
+    /// Install the authenticated provider discovery and its model-facing
+    /// collaborator directory together. The directory is derived from the
+    /// same snapshot used by admission; it is not a second capability cache.
+    pub(crate) fn set_authenticated_edge_discovery(
+        &mut self,
+        discovery: Option<AuthenticatedEdgeDiscovery>,
+    ) {
+        self.authenticated_edge_discovery = discovery;
+        install_provider_execution_directory(
+            &mut self.edge_profile,
+            self.authenticated_edge_discovery.as_ref(),
+        );
+    }
+
     /// Reuse model-visible contracts only after current runtime authorization.
     /// Execution routing, credentials and capability grants stay with the host.
     pub(crate) fn restore_handoff_contracts(&mut self, handoff: &RuntimeExecutionHandoff) {
         self.authenticated_edge_discovery = handoff.authenticated_edge_discovery.clone();
         self.edge_profile = handoff.edge_profile.clone();
+        install_provider_execution_directory(
+            &mut self.edge_profile,
+            self.authenticated_edge_discovery.as_ref(),
+        );
         self.edge_provider_tool_schemas = handoff.edge_provider_tool_schemas.clone();
         self.tool_schemas = handoff.tool_schemas.clone();
         self.admission_tool_schemas = handoff.admission_tool_schemas.clone();
@@ -23411,6 +23488,86 @@ fn canonical_edge_dispatch_result(
 mod tests {
     use super::*;
     use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
+
+    #[test]
+    fn provider_execution_directory_uses_typed_task_support_and_exact_tools() {
+        let required = astra_turn_types::ProviderToolDeclaration {
+            native_tool_id: astra_turn_types::NativeToolId::new("native_codex").unwrap(),
+            native_tool_name: "native_codex".into(),
+            stable_tool_alias: None,
+            title: Some("Native collaborator".into()),
+            description: Some("provider text is not copied into the prompt".into()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"model": {"type": "string"}}
+            }),
+            output_schema: None,
+            claims: Default::default(),
+            task_support: astra_turn_types::ProviderTaskSupport::Required,
+            extension_fields: serde_json::Map::from_iter([(
+                astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
+                json!(true),
+            )]),
+        };
+        let ordinary = astra_turn_types::ProviderToolDeclaration {
+            native_tool_id: astra_turn_types::NativeToolId::new("ordinary_tool").unwrap(),
+            native_tool_name: "ordinary_tool".into(),
+            stable_tool_alias: None,
+            title: None,
+            description: None,
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            claims: Default::default(),
+            task_support: astra_turn_types::ProviderTaskSupport::Unspecified,
+            extension_fields: Default::default(),
+        };
+        let snapshot = astra_turn_types::ProviderDiscoverySnapshot::new(
+            astra_turn_types::ProviderIdentity::new("edge").unwrap(),
+            astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
+            astra_turn_types::ProviderProtocolId::new("cli-local").unwrap(),
+            vec![ordinary, required],
+        )
+        .unwrap();
+        let discovery = AuthenticatedEdgeDiscovery {
+            user_id: "user".into(),
+            executor_id: "edge".into(),
+            workspace_root: "/workspace".into(),
+            physical_workspace_id: "materialization".into(),
+            binding_generation: 1,
+            snapshots: vec![snapshot],
+        };
+        let mut edge_profile = Map::from_iter([(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS.into(),
+            json!(["existing runtime fact"]),
+        )]);
+
+        install_provider_execution_directory(&mut edge_profile, Some(&discovery));
+        let texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
+            &edge_profile,
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+        );
+        let directory = texts
+            .iter()
+            .find(|text| text.starts_with(PROVIDER_EXECUTION_DIRECTORY_MARKER))
+            .expect("required provider must be discoverable");
+        assert!(directory.contains("native_codex"));
+        assert!(directory.contains("accepts_model"));
+        assert!(!directory.contains("ordinary_tool"));
+        assert!(!directory.contains("provider text is not copied"));
+        assert!(texts.iter().any(|text| text == "existing runtime fact"));
+
+        install_provider_execution_directory(&mut edge_profile, None);
+        let texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
+            &edge_profile,
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(PROVIDER_EXECUTION_DIRECTORY_MARKER))
+        );
+        assert_eq!(texts, vec!["existing runtime fact"]);
+    }
 
     fn test_host_builder(
         user_id: impl Into<String>,

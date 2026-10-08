@@ -1713,6 +1713,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
                     "requested_description": requested_description,
                     "agent_id": rendered_value.get("agent_id").cloned().unwrap_or(Value::Null),
                     "run_id": rendered_value.get("run_id").cloned().unwrap_or(Value::Null),
+                    "collaborator_id": rendered_value.get("collaborator_id").cloned().unwrap_or(Value::Null),
                     "status": rendered_value.get("status").cloned().unwrap_or(Value::Null),
                     "finish_reason": rendered_value.get("finish_reason").cloned().unwrap_or(Value::Null),
                     "error": rendered_value.get("error").cloned().unwrap_or(Value::Null),

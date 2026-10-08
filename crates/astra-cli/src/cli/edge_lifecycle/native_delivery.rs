@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct NativeDeliveryHandle {
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
+    ready: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Drop for NativeDeliveryHandle {
@@ -59,6 +60,24 @@ impl NativeDeliveryHandle {
             let _ = task.await;
         }
     }
+}
+
+async fn wait_for_native_delivery_ready(handle: &NativeDeliveryHandle) {
+    if *handle.ready.borrow() {
+        return;
+    }
+    let mut ready = handle.ready.clone();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+        loop {
+            if *ready.borrow() {
+                break;
+            }
+            if ready.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 /// All identities come from the selected authenticated CLI boundary. The
@@ -420,6 +439,20 @@ fn capabilities(
         &config.edge_agent_id,
         config.executor.effective_project_root().to_string_lossy(),
     );
+    // This socket is a provider-stage executor, not the ordinary CLI tool
+    // boundary. Advertising the builtin surface would let server admission
+    // route `bash`/file tools here even though this executor intentionally
+    // accepts only the native provider invocation.
+    if let Some(surface) = value
+        .get_mut("binding")
+        .and_then(Value::as_object_mut)
+        .and_then(|binding| binding.get_mut("tool_surface"))
+        .and_then(Value::as_object_mut)
+    {
+        surface.insert("tool_names".into(), json!([]));
+        surface.insert("admissions".into(), json!([]));
+        surface.insert("denials".into(), json!([]));
+    }
     value["provider_discovery"] = json!(snapshot.into_iter().collect::<Vec<_>>());
     value
 }
@@ -619,6 +652,7 @@ async fn connect_native_delivery(
     let handle = NativeDeliveryHandle {
         cancellation: owner_cancel,
         task: Some(task),
+        ready: tokio::sync::watch::channel(true).1,
     };
     let installed = tokio::select! {
         biased;
@@ -649,12 +683,14 @@ pub(crate) async fn ensure_session_native_delivery(
     session_id: &str,
 ) {
     let attachment_epoch = state.session_attachment_epoch;
-    let ready = state.native_delivery.as_ref().is_some_and(|handle| {
-        !handle.is_finished()
-            && state.native_delivery_session_id.as_deref() == Some(session_id)
-            && state.native_delivery_attachment_epoch == Some(attachment_epoch)
-    });
-    if ready {
+    if let Some(handle) = state.native_delivery.as_ref()
+        && state.native_delivery_session_id.as_deref() == Some(session_id)
+        && state.native_delivery_attachment_epoch == Some(attachment_epoch)
+        && !handle.is_finished()
+    {
+        wait_for_native_delivery_ready(handle).await;
+        // Capacity is optional. A slow or unavailable provider must not block
+        // the ordinary turn; the next turn reuses the same readiness watch.
         return;
     }
 
@@ -681,17 +717,6 @@ pub(crate) async fn ensure_session_native_delivery(
         tracing::debug!("native collaborator delivery skipped: account identity unavailable");
         return;
     };
-    let base_edge_agent_id = match crate::cli::chat_stream::try_edge_executor_instance_id() {
-        Ok(id) => id.to_owned(),
-        Err(error) => {
-            tracing::warn!(%error, "native collaborator delivery skipped: Edge identity unavailable");
-            return;
-        }
-    };
-    // The ordinary CLI registration and native collaborator socket share the
-    // live process-scoped identity. Different TUI processes in one checkout
-    // therefore cannot replace each other's connection.
-    let edge_agent_id = base_edge_agent_id;
     let root = match std::env::current_dir()
         .ok()
         .and_then(|path| std::fs::canonicalize(path).ok())
@@ -706,6 +731,13 @@ pub(crate) async fn ensure_session_native_delivery(
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "native collaborator delivery skipped: materialization is unavailable");
+            return;
+        }
+    };
+    let edge_agent_id = match crate::cli::chat_stream::try_edge_executor_instance_id() {
+        Ok(id) => id.to_owned(),
+        Err(error) => {
+            tracing::warn!(%error, "native collaborator delivery skipped: Edge identity unavailable");
             return;
         }
     };
@@ -751,6 +783,7 @@ pub(crate) async fn ensure_session_native_delivery(
     let task_session_id = session_id.to_owned();
     let install_cancel = task_cancel.clone();
     let supervisor_cancel = task_cancel.clone();
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         let result = install_native_delivery(
             config,
@@ -758,6 +791,7 @@ pub(crate) async fn ensure_session_native_delivery(
             &install_cancel,
         )
         .await;
+        let _ = ready_tx.send(true);
         match result {
             Ok(mut delivery) => {
                 // Keep the actual Edge owner alive inside the session-owned
@@ -779,9 +813,13 @@ pub(crate) async fn ensure_session_native_delivery(
     state.native_delivery = Some(NativeDeliveryHandle {
         cancellation: task_cancel,
         task: Some(task),
+        ready: ready_rx,
     });
     state.native_delivery_session_id = Some(session_id.to_owned());
     state.native_delivery_attachment_epoch = Some(attachment_epoch);
+    if let Some(handle) = state.native_delivery.as_ref() {
+        wait_for_native_delivery_ready(handle).await;
+    }
     tracing::info!(
         session_id,
         attachment_epoch,
@@ -806,6 +844,22 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with(".native-edge.jsonl"))
+        );
+    }
+
+    #[test]
+    fn native_registration_advertises_only_the_provider_stage_surface() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (consumer, _owner) = consumer(workspace.path(), runtime.path(), None);
+        let value = capabilities(&consumer.config, Some(&consumer.snapshot));
+        let surface = &value["binding"]["tool_surface"];
+        assert_eq!(surface["tool_names"], json!([]));
+        assert_eq!(surface["admissions"], json!([]));
+        assert_eq!(surface["denials"], json!([]));
+        assert_eq!(
+            value["provider_discovery"][0]["tool_declarations"][0]["native_tool_name"],
+            native_codex::TOOL_NAME
         );
     }
 
