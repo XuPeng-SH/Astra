@@ -139,6 +139,27 @@ pub enum EdgeClientMessage {
     Ping {},
 }
 
+/// Concrete execution grant, frozen by admission rather than inferred from
+/// tool arguments. Workspace authority is confined to the exact selected
+/// materialization; it does not authorize reading arbitrary host files or
+/// provider credentials. Consumers intersect it with local authority and
+/// mandatory sensitive-path restrictions, never expand it via approval.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeExecutionCeiling {
+    pub workspace_root: String,
+    pub workspace_id: Option<String>,
+    pub materialization_id: Option<String>,
+    pub execution_binding_generation: u64,
+    /// Locally approved provider executable/bootstrap paths, frozen by
+    /// admission. Files grant only that file; directories grant descendants
+    /// subject to mandatory sensitive-path denial. Not arbitrary data roots.
+    /// An empty list is explicit; consumers must never add fallback paths.
+    pub runtime_read_paths: Vec<String>,
+    pub workspace_write_allowed: bool,
+    pub network_allowed: bool,
+}
+
 /// Messages sent from server to edge agent.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", deny_unknown_fields)]
@@ -164,6 +185,9 @@ pub enum EdgeServerMessage {
         delivery_generation: u64,
         tool: String,
         args: Value,
+        /// Frozen per-invocation authority. Native executors require it;
+        /// ordinary command execution still uses its existing local boundary.
+        execution_ceiling: Option<Box<EdgeExecutionCeiling>>,
         /// Opaque provider authorization injected only for this bash call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_process_authorization: Option<Box<RuntimeProcessAuthorizationContext>>,
@@ -174,6 +198,13 @@ pub enum EdgeServerMessage {
         /// Maximum execution time in seconds.
         #[serde(default = "default_tool_timeout_secs")]
         timeout_secs: u64,
+        /// Immutable server-admitted work cutoff, excluding settlement grace.
+        execution_deadline_unix_ms: Option<u64>,
+        /// Work remaining when this dispatch was produced. Replay must also
+        /// enforce the absolute cutoff; this value never renews authority.
+        execution_timeout_ms: Option<u64>,
+        /// Independent command policy ceiling, not the native job budget.
+        command_timeout_cap_ms: Option<u64>,
     },
 
     /// Server heartbeat response.
@@ -333,6 +364,7 @@ mod tests {
     #[test]
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
+            execution_ceiling: None,
             request_id: "req-456".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,
@@ -341,6 +373,9 @@ mod tests {
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: 120,
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_tool_request");
@@ -351,6 +386,7 @@ mod tests {
     #[test]
     fn edge_tool_request_round_trips_hidden_process_authorization() {
         let msg = EdgeServerMessage::ToolRequest {
+            execution_ceiling: None,
             request_id: "req-process-auth".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,
@@ -361,6 +397,9 @@ mod tests {
             })),
             runtime_process_authorization_required: true,
             timeout_secs: 120,
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
         };
 
         assert!(!format!("{msg:?}").contains("runtime-grant"));

@@ -3224,6 +3224,7 @@ mod tests {
         approval: crate::provider_resolution::ProviderApprovalBaseline,
     ) -> crate::provider_resolution::ResolvedInvocationPolicy {
         crate::provider_resolution::ResolvedInvocationPolicy {
+            runtime_requirements: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding").unwrap(),

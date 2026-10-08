@@ -145,11 +145,12 @@ pub use provider_canonical_transition::{
 };
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
-    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderBindingRef, ProviderCallOutcome,
-    ProviderCallPayload, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
-    ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionOutcome,
-    ProviderInteractionRequest, ProviderInteractionResponse, ProviderProtocolId, ProviderRejection,
-    ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticCacheContract,
+    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, PROVIDER_RUNTIME_REQUIREMENTS_KEY,
+    ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload, ProviderClaim,
+    ProviderClaimSource, ProviderClaimTrust, ProviderContractError, ProviderDiscoverySnapshot,
+    ProviderIdentity, ProviderInteractionOutcome, ProviderInteractionRequest,
+    ProviderInteractionResponse, ProviderProtocolId, ProviderRejection, ProviderRejectionCode,
+    ProviderResolverVersion, ProviderRuntimeRequirements, ProviderSemanticCacheContract,
     ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode, ProviderTaskSupport,
     ProviderToolClaims, ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline,
     ResolvedProviderClaim, ResolvedProviderSnapshot, ResolvedProviderSnapshotRef,

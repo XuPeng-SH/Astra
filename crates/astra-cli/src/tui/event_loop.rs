@@ -3750,6 +3750,7 @@ impl GuidanceSubmissionError {
             | astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
             | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
             | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)
+            | astra_thin_client::ThinClientError::InvalidProviderInteractionResponse(_)
             | astra_thin_client::ThinClientError::InvalidSseJson(_) => {
                 Self::Unconfirmed(error.to_string())
             }

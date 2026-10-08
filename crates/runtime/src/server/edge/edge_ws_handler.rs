@@ -1903,9 +1903,13 @@ mod tests {
             delivery_generation: 1,
             tool: tool.to_string(),
             args,
+            execution_ceiling: None,
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: 30,
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
         }
     }
 

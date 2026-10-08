@@ -23,6 +23,47 @@ pub const STABLE_TOOL_ALIAS_SCHEMA_KEY: &str = "x-astra-stable-tool-alias";
 /// consumers must never infer it from a runtime-qualified tool name.
 pub const STABLE_TOOL_ALIAS_METADATA_KEY: &str = "astra/stableToolAlias";
 
+pub const PROVIDER_RUNTIME_REQUIREMENTS_KEY: &str = "astra.runtimeRequirements";
+
+/// Installed-provider dependencies, not an authorization grant. The local
+/// runtime owner supplies these facts; canonical admission approves them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRuntimeRequirements {
+    pub executable: String,
+    pub read_paths: Vec<String>,
+}
+
+impl ProviderRuntimeRequirements {
+    pub fn from_extension_fields(
+        fields: &Map<String, Value>,
+    ) -> Result<Option<Self>, ProviderContractError> {
+        let Some(value) = fields.get(PROVIDER_RUNTIME_REQUIREMENTS_KEY) else {
+            return Ok(None);
+        };
+        let requirements: Self = serde_json::from_value(value.clone())
+            .map_err(|_| ProviderContractError::InvalidRuntimeRequirements)?;
+        let bounded = |path: &str| {
+            !path.trim().is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
+        };
+        if !bounded(&requirements.executable)
+            || requirements.read_paths.len() > 32
+            || requirements.read_paths.iter().any(|path| !bounded(path))
+            || requirements
+                .read_paths
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                > 16 * 1024
+        {
+            return Err(ProviderContractError::InvalidRuntimeRequirements);
+        }
+        // Platform path resolution and sensitive/bootstrap classification
+        // belong to the selected local owner, not this portable wire type.
+        Ok(Some(requirements))
+    }
+}
+
 macro_rules! non_empty_id {
     ($name:ident, $kind:literal) => {
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -970,6 +1011,8 @@ impl ProviderCallOutcome {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ProviderContractError {
+    #[error("invalid installed-provider runtime requirements")]
+    InvalidRuntimeRequirements,
     #[error("{kind} must not be empty")]
     EmptyIdentifier { kind: &'static str },
     #[error("invalid provider interaction: {0}")]

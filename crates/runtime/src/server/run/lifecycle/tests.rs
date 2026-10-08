@@ -13,6 +13,186 @@ use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 #[path = "cancellation_db_tests.rs"]
 mod cancellation_db_tests;
 
+fn authenticated_edge_discovery_fixture() -> server_loop_host::AuthenticatedEdgeDiscovery {
+    use astra_turn_types::{
+        NativeToolId, ProviderBindingRef, ProviderDiscoverySnapshot, ProviderIdentity,
+        ProviderProtocolId, ProviderToolDeclaration,
+    };
+    server_loop_host::AuthenticatedEdgeDiscovery {
+        user_id: "owner".into(),
+        executor_id: "selected-edge".into(),
+        workspace_root: "/selected".into(),
+        physical_workspace_id: "selected-materialization".into(),
+        binding_generation: 7,
+        snapshots: vec![
+            ProviderDiscoverySnapshot::new(
+                ProviderIdentity::new("selected-edge").unwrap(),
+                ProviderBindingRef::new("selected-materialization").unwrap(),
+                ProviderProtocolId::new("cli-local").unwrap(),
+                vec![ProviderToolDeclaration {
+                    native_tool_id: NativeToolId::new("provider-stage").unwrap(),
+                    native_tool_name: "fixture_native_stage".into(),
+                    stable_tool_alias: None,
+                    title: None,
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                    output_schema: None,
+                    claims: Default::default(),
+                    task_support: Default::default(),
+                    extension_fields: serde_json::from_value(
+                        json!({(astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY): {
+                            "executable":"/installed/provider", "read_paths":["/installed/provider"]
+                        }}),
+                    )
+                    .unwrap(),
+                }],
+            )
+            .unwrap(),
+        ],
+    }
+}
+
+#[test]
+fn authenticated_edge_discovery_restores_exact_policy_and_fences_binding() {
+    let discovery = authenticated_edge_discovery_fixture();
+    let mut fresh = PreparedRuntimeCapabilities::default();
+    fresh.bind_edge_discovery(Some(discovery.clone())).unwrap();
+    let policy = fresh
+        .provider_policy_index
+        .resolve("fixture_native_stage")
+        .unwrap();
+    assert!(
+        policy.requires_approval(),
+        "authentication must not relax provider approval"
+    );
+    assert_eq!(
+        policy.runtime_requirements.as_ref().unwrap().read_paths,
+        ["/installed/provider"]
+    );
+    let restored: server_loop_host::AuthenticatedEdgeDiscovery =
+        serde_json::from_value(serde_json::to_value(&discovery).unwrap()).unwrap();
+    let mut resumed = PreparedRuntimeCapabilities::default();
+    resumed.bind_edge_discovery(Some(restored.clone())).unwrap();
+    assert_eq!(
+        policy,
+        resumed
+            .provider_policy_index
+            .resolve("fixture_native_stage")
+            .unwrap()
+    );
+    let mut wrong_executor = restored.clone();
+    wrong_executor.executor_id = "other-edge".into();
+    assert!(resumed.bind_edge_discovery(Some(wrong_executor)).is_err());
+    let mut wrong_materialization = restored.clone();
+    wrong_materialization.physical_workspace_id = "other-materialization".into();
+    assert!(
+        resumed
+            .bind_edge_discovery(Some(wrong_materialization))
+            .is_err()
+    );
+    let mut bindings = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::edge_workspace("selected", "/selected", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "selected-edge",
+            "selected",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        ),
+    );
+    bindings.execution_binding_generation = Some(7);
+    PreparedRuntimeCapabilities::validate_edge_discovery_binding(&restored, "owner", &bindings)
+        .unwrap();
+    assert!(
+        PreparedRuntimeCapabilities::validate_edge_discovery_binding(&restored, "other", &bindings)
+            .is_err()
+    );
+    bindings.execution_binding_generation = Some(8);
+    assert!(
+        PreparedRuntimeCapabilities::validate_edge_discovery_binding(&restored, "owner", &bindings)
+            .is_err()
+    );
+    bindings.execution_binding_generation = Some(7);
+    bindings.workspace.cwd = Some("/other".into());
+    assert!(
+        PreparedRuntimeCapabilities::validate_edge_discovery_binding(&restored, "owner", &bindings)
+            .is_err()
+    );
+}
+
+#[test]
+fn authenticated_edge_discovery_merges_with_mcp_without_overwriting_or_impersonation() {
+    use astra_turn_core::provider_resolution::{
+        ResolvedProviderPolicyIndex, resolve_provider_snapshot,
+    };
+    use astra_turn_types::{ProviderDiscoverySnapshot, ProviderProtocolId, PublicToolAlias};
+    let edge = authenticated_edge_discovery_fixture();
+    let declaration = edge.snapshots[0].tool_declarations[0].clone();
+    let mcp_discovery = ProviderDiscoverySnapshot::new(
+        edge.snapshots[0].provider_identity.clone(),
+        edge.snapshots[0].binding_ref.clone(),
+        ProviderProtocolId::new("mcp").unwrap(),
+        vec![declaration.clone()],
+    )
+    .unwrap();
+    let mcp = resolve_provider_snapshot(
+        &mcp_discovery,
+        &Default::default(),
+        &std::collections::BTreeMap::from([(
+            declaration.native_tool_id.clone(),
+            PublicToolAlias::new("mcp__fixture__read").unwrap(),
+        )]),
+    )
+    .unwrap();
+    let mut runtime = PreparedRuntimeCapabilities::default();
+    runtime.mcp_bundle = Some(runtime_mcp::RuntimeMcpBundle {
+        schemas: Vec::new(),
+        provider_policy_index: ResolvedProviderPolicyIndex::from_snapshots(&[mcp.clone()]).unwrap(),
+        provider_snapshots: vec![mcp],
+        control_tools: Default::default(),
+        stop_after_success_tools: Default::default(),
+        manager: None,
+        agent_binding_mcp: None,
+        semantic_read_capabilities: Default::default(),
+    });
+    runtime.bind_edge_discovery(Some(edge.clone())).unwrap();
+    assert_eq!(runtime.provider_policy_index.len(), 2);
+    assert!(
+        runtime
+            .provider_policy_index
+            .resolve("mcp__fixture__read")
+            .is_some()
+    );
+    let native = runtime
+        .provider_policy_index
+        .resolve("fixture_native_stage")
+        .unwrap();
+    assert_eq!(
+        native.descriptor.identity.native_tool_id.as_str(),
+        "provider-stage"
+    );
+    assert_eq!(
+        runtime
+            .authenticated_edge_discovery
+            .as_ref()
+            .unwrap()
+            .snapshots[0]
+            .protocol
+            .as_str(),
+        "cli-local"
+    );
+    let mut forged = edge.clone();
+    forged.snapshots = vec![mcp_discovery];
+    assert!(runtime.bind_edge_discovery(Some(forged)).is_err());
+    let mut duplicate = edge;
+    duplicate.snapshots.push(duplicate.snapshots[0].clone());
+    assert!(runtime.bind_edge_discovery(Some(duplicate)).is_err());
+    assert_eq!(
+        runtime.provider_policy_index.len(),
+        2,
+        "failed binding must not replace the index"
+    );
+}
+
 #[test]
 fn session_writer_conflict_tells_the_caller_to_wait_or_cancel() {
     let (status, Json(body)) = session_writer_conflict_response("sess-active", Some(1));
@@ -5173,6 +5353,7 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
     let execution_owner_generation = Arc::new(ExecutionOwnerGenerationSink::preparing(0));
     execution_owner_generation.publish(0);
     ServerSpawnRuntimeContext {
+        tool_executor: Arc::new(Default::default()),
         execution_contract: None,
         model_catalog_reader: None,
         parent_run_id: parent_run_id.to_string(),
@@ -5198,6 +5379,253 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
         #[cfg(feature = "harness")]
         harness_sink: None,
     }
+}
+
+#[test]
+fn native_stage_reasoning_is_explicit_and_does_not_inherit_parent_defaults() {
+    use astra_services::runs::CollaboratorProvider;
+    use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+    for provider in [
+        CollaboratorProvider::Claude,
+        CollaboratorProvider::OpenCode,
+        CollaboratorProvider::Codex,
+    ] {
+        assert!(
+            native_stage_reasoning_arguments(&provider, &ThinkingConfig::ModelDefault)
+                .unwrap()
+                .is_empty()
+        );
+        let explicit = native_stage_reasoning_arguments(
+            &provider,
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explicit["effort"],
+            if provider == CollaboratorProvider::Claude {
+                "max"
+            } else {
+                "xhigh"
+            }
+        );
+        assert!(
+            native_stage_reasoning_arguments(
+                &provider,
+                &ThinkingConfig::Enabled {
+                    budget_tokens: 1024
+                }
+            )
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_owner() {
+    use astra_turn_core::orchestration_spawn_tool::{
+        ProviderChildExecutionRequest, SpawnAgentInput,
+    };
+    use astra_turn_core::provider_resolution::{
+        ResolvedProviderPolicyIndex, resolve_provider_snapshot,
+    };
+    use astra_turn_types::{
+        NativeToolId, ProviderBindingRef, ProviderDiscoverySnapshot, ProviderIdentity,
+        ProviderProtocolId, ProviderToolDeclaration, PublicToolAlias,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let tool_executor = Arc::new(runtime_tool_executor::RuntimeToolExecutor::new(
+        directory.path().to_path_buf(),
+        "user-a".into(),
+        "session-1".into(),
+        None,
+        None,
+    ));
+    let executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_run_engine(RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new(),
+        ))),
+    );
+    let mut parent = test_spawn_runtime_context("native-parent", "user-a");
+    parent
+        .tool_executor
+        .set(Arc::downgrade(&tool_executor))
+        .unwrap();
+    let mut binding = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::edge_workspace(
+            "Selected CLI",
+            "/user-local/not-server",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "selected-cli",
+            "Selected CLI",
+            ToolTransportKind::EdgeWs,
+            crate::server::tool_execution_binding::ExecutorStatus::Online,
+        ),
+    );
+    binding.execution_binding_generation = Some(7);
+    parent.execution_contract = Some((binding, Default::default()));
+    assert!(executor.set_runtime_context(parent.clone()).await);
+    let mut context = test_spawn_context("native-parent");
+    context.spawn_tool_call_id = Some("source-invocation".into());
+    let requirements = astra_turn_types::DelegationIntentRequirements::Unconstrained {
+        source: astra_turn_types::DelegationUserRequirementSource {
+            user_id: "user-a".into(),
+            session_id: "session-1".into(),
+            session_turn: 1,
+            applied_intent_id: None,
+            command_intent_id: None,
+            user_intent_digest: "sha256:native-intent".into(),
+        },
+    };
+    context.delegation_model_admission = Some(astra_turn_types::DelegationModelAdmission {
+        source: astra_turn_types::DelegationModelInstructionSource {
+            user_id: "user-a".into(),
+            session_id: "session-1".into(),
+            run_id: "native-parent".into(),
+            turn_chain_id: "parent-chain".into(),
+            owner_generation: 1,
+            control_epoch: 0,
+            applied_intent_id: None,
+            session_turn: 1,
+            user_intent_digest: "sha256:native-intent".into(),
+        },
+        invocation_id: "source-invocation".into(),
+        arguments_digest: "sha256:arguments".into(),
+        outcome: astra_turn_types::DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+            slot_count: 1,
+        },
+        child_requirements: vec![requirements.clone()],
+    });
+    for tool_name in ["native_claude", "native_opencode", "native_codex"] {
+        let native_id = NativeToolId::new(tool_name).unwrap();
+        let discovery = ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("selected-cli-native-provider").unwrap(),
+            ProviderBindingRef::new("selected-cli-native-binding").unwrap(),
+            ProviderProtocolId::new("native-agent-stage").unwrap(),
+            vec![ProviderToolDeclaration {
+                native_tool_id: native_id.clone(),
+                native_tool_name: tool_name.into(),
+                stable_tool_alias: None,
+                title: None,
+                description: None,
+                input_schema: json!({"type":"object"}),
+                output_schema: None,
+                claims: Default::default(),
+                task_support: Default::default(),
+                extension_fields: Default::default(),
+            }],
+        )
+        .unwrap();
+        let snapshot = resolve_provider_snapshot(
+            &discovery,
+            &Default::default(),
+            &BTreeMap::from([(native_id, PublicToolAlias::new(tool_name).unwrap())]),
+        )
+        .unwrap();
+        let descriptor = snapshot.descriptors[0].descriptor_ref();
+        let index = ResolvedProviderPolicyIndex::from_snapshots(&[snapshot]).unwrap();
+        tool_executor.set_provider_policy_index(index.clone());
+        let inputs = [
+            SpawnAgentInput {
+                description: "Native stage".into(),
+                prompt: "Perform the stage".into(),
+                execution: Some(ProviderChildExecutionRequest {
+                    tool: tool_name.into(),
+                    model: Some("native-model".into()),
+                }),
+                ..Default::default()
+            },
+            SpawnAgentInput {
+                description: "Internal stage".into(),
+                prompt: "Read one file".into(),
+                ..Default::default()
+            },
+        ];
+        let mut prepared = Arc::clone(&executor)
+            .prepare_batch(&inputs, &context, None)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 2);
+        let Some(crate::orchestration::PreparedSpawnIdentity::ExternalProvider(native)) =
+            prepared[0].execution_identity()
+        else {
+            panic!("native selector must not become an Offering");
+        };
+        assert_eq!(native.descriptor, descriptor);
+        assert_eq!(native.requested_model.as_deref(), Some("native-model"));
+        assert_eq!(native.execution_binding_generation, 7);
+        assert!(matches!(
+            prepared[1].execution_identity(),
+            Some(crate::orchestration::PreparedSpawnIdentity::InternalModel(
+                _
+            ))
+        ));
+        let mut config = test_spawn_run_config(vec!["*"], false);
+        config.parent_address = Some(astra_messaging::types::AgentAddress::new(
+            "native-parent",
+            "root-agent",
+        ));
+        config.delegated_model_requirements = requirements.clone();
+        let result = prepared.remove(0).launch(config).unwrap().await;
+        // The stopped supervisor is intentional: reaching it proves the real
+        // prepared launch accepted the exact admission, without invoking a
+        // provider or pretending this fixture proves native task execution.
+        assert_eq!(
+            result.unwrap_err(),
+            "server dynamic agent lifecycle is no longer available for this session"
+        );
+        tool_executor.set_provider_policy_index(Default::default());
+        assert!(
+            Arc::clone(&executor)
+                .prepare_batch(&inputs, &context, None)
+                .await
+                .is_err(),
+            "a tool name without current resolved policy is not execution authority"
+        );
+        tool_executor.set_provider_policy_index(index);
+    }
+    let request = SpawnAgentInput {
+        execution: Some(ProviderChildExecutionRequest {
+            tool: "native_codex".into(),
+            model: None,
+        }),
+        ..Default::default()
+    };
+    assert!(
+        executor
+            .prepare_native_spawn(&request, &context, &parent, None)
+            .await
+            .is_ok()
+    );
+    let mut missing_slot = context.clone();
+    missing_slot
+        .delegation_model_admission
+        .as_mut()
+        .unwrap()
+        .child_requirements
+        .clear();
+    assert!(
+        executor
+            .prepare_native_spawn(&request, &missing_slot, &parent, None)
+            .await
+            .is_err(),
+        "an absent admitted child slot must not silently become unconstrained"
+    );
+    parent.execution_contract.as_mut().unwrap().0.executor = ExecutorBinding::server_local();
+    assert!(
+        executor
+            .prepare_native_spawn(&request, &context, &parent, None)
+            .await
+            .is_err()
+    );
 }
 
 fn test_spawn_context(parent_run_id: &str) -> crate::orchestration::SpawnContext {
@@ -7220,9 +7648,11 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
             &root,
             &child,
             child_constraints,
-            root.admitted_model_execution
-                .clone()
-                .expect("root model admission"),
+            Some(
+                root.admitted_model_execution
+                    .clone()
+                    .expect("root model admission"),
+            ),
         )
         .await
         .expect("publish child runtime context");
@@ -7591,7 +8021,11 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         "duplicate selectors share one batched Offering admission"
     );
     for prepared in named_prepared {
-        let identity = prepared.model_identity().expect("admitted model identity");
+        let Some(crate::orchestration::PreparedSpawnIdentity::InternalModel(identity)) =
+            prepared.execution_identity()
+        else {
+            panic!("expected admitted internal model preparation");
+        };
         assert_eq!(identity.offering_id, "model-test-model");
         assert_eq!(identity.model_name, "test-model");
     }
@@ -7977,10 +8411,12 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
             &parent,
             &child,
             spawn_child_request_constraints(&parent.request_constraints, &child).unwrap(),
-            parent
-                .admitted_model_execution
-                .clone()
-                .expect("parent model admission"),
+            Some(
+                parent
+                    .admitted_model_execution
+                    .clone()
+                    .expect("parent model admission"),
+            ),
         )
         .await
         .expect("publish child runtime context");
@@ -8017,10 +8453,12 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
             &parent,
             &sibling,
             spawn_child_request_constraints(&parent.request_constraints, &sibling).unwrap(),
-            parent
-                .admitted_model_execution
-                .clone()
-                .expect("parent model admission"),
+            Some(
+                parent
+                    .admitted_model_execution
+                    .clone()
+                    .expect("parent model admission"),
+            ),
         )
         .await
         .expect("publish sibling runtime context");
@@ -17294,13 +17732,38 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
 #[tokio::test]
 async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
     let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let physical =
+        astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+            "materialization-owner-1",
+            "/workspace/owner",
+        );
+    let template = authenticated_edge_discovery_fixture().snapshots.remove(0);
+    let snapshot = astra_turn_types::ProviderDiscoverySnapshot::new(
+        astra_turn_types::ProviderIdentity::new("edge-owner-1").unwrap(),
+        astra_turn_types::ProviderBindingRef::new(physical.clone()).unwrap(),
+        template.protocol,
+        template.tool_declarations,
+    )
+    .unwrap();
+    let binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::edge_workspace(
+            "/workspace/owner",
+            astra_runtime_env::WorkspaceAuthority::ReadWrite,
+        ),
+        astra_runtime_env::ExecutorBinding::edge_agent("edge-owner-1"),
+        astra_runtime_env::RuntimeBinding::host_process("fixture-runtime"),
+        astra_runtime_env::PolicyIntent::local_developer(),
+        &astra_runtime_env::ToolRegistry::builtins(),
+    );
+    let mut advert = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(binding);
+    advert.provider_discovery = vec![snapshot.clone()];
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);
     edge_pool.register_with_capabilities_registry_and_materialization_id(
         "owner-1",
         "edge-owner-1",
         None,
         Some("/workspace/owner".to_string()),
-        None,
+        Some(serde_json::to_value(advert).unwrap()),
         None,
         Some("registry-owner-1".to_string()),
         Some("materialization-owner-1".to_string()),
@@ -17325,19 +17788,39 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
         status: Some(astra_services::runs::ExecutorStatusRequest::Online),
     });
-    service
-        .authorize_native_edge_execution("owner-1", &request)
+    let mut discovered = Vec::new();
+    let physical_id = service
+        .authorize_native_edge_execution("owner-1", &request, &mut discovered)
         .await
         .expect("owned native Edge should be authorized");
+    assert_eq!(physical_id.as_deref(), Some(physical.as_str()));
+    assert_eq!(discovered, [snapshot]);
+    let mut runtime = PreparedRuntimeCapabilities::default();
+    runtime
+        .bind_edge_discovery(Some(server_loop_host::AuthenticatedEdgeDiscovery {
+            user_id: "owner-1".into(),
+            executor_id: "edge-owner-1".into(),
+            workspace_root: "/workspace/owner".into(),
+            physical_workspace_id: physical,
+            binding_generation: 1,
+            snapshots: discovered,
+        }))
+        .unwrap();
+    assert!(
+        runtime
+            .provider_policy_index
+            .resolve("fixture_native_stage")
+            .is_some()
+    );
     let denied = service
-        .authorize_native_edge_execution("other-user", &request)
+        .authorize_native_edge_execution("other-user", &request, &mut Vec::new())
         .await
         .expect_err("a different user must not authorize the Edge");
     assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
 
     request.workspace_binding.as_mut().unwrap().root = Some("/workspace/other".to_string());
     let denied = service
-        .authorize_native_edge_execution("owner-1", &request)
+        .authorize_native_edge_execution("owner-1", &request, &mut Vec::new())
         .await
         .expect_err("a different workspace path must not authorize the Edge");
     assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
@@ -24597,6 +25080,10 @@ async fn provider_interaction_wait_is_registered_and_resolved_durably() {
         .expect("provider interaction required event");
     assert_eq!(required["type"], "provider_interaction_required");
     assert_eq!(required["run_id"], "provider-interaction-durable");
+    assert!(
+        !interaction.is_finished(),
+        "committed ACK precedes final response"
+    );
     assert_eq!(
         required["provider_run_owner"],
         json!({
@@ -24653,6 +25140,61 @@ async fn provider_interaction_wait_is_registered_and_resolved_durably() {
         "provider_interaction_resolved"
     );
     assert_eq!(durable.events[4]["event_type"], "run_resumed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_interaction_slow_ack_observer_cannot_extend_stage_deadline() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("slow-interaction", "user-1", "slow-session")
+        .await
+        .unwrap();
+    let (tx, _unpolled_rx) = mpsc::channel(1);
+    tx.send(json!({"type":"test_queue_full"})).await.unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "slow-session".into(),
+        "slow-interaction".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(tx),
+    )
+    .with_provider_run_owner(Some(astra_services::runs::ProviderRunOwner {
+        provider_id: "moi".into(),
+        provider_scope_id: "workspace-a".into(),
+    }))
+    .with_admitted_deadline(Some(Instant::now() + Duration::from_millis(30)));
+    let request = astra_turn_types::ProviderInteractionRequest {
+        request_id: "slow-question".into(),
+        payload: json!({"question":"continue?"}),
+        timeout_ms: Some(60_000),
+    };
+    // A full observer queue must not prevent canonical timeout settlement.
+    let decision = tokio::time::timeout(
+        Duration::from_secs(1),
+        astra_tools::ProviderInteractionGate::request_interaction(&gate, &request),
+    )
+    .await
+    .expect("observer must not extend the execution budget");
+    assert!(matches!(
+        decision,
+        astra_tools::ProviderInteractionDecision::Timeout
+    ));
+    assert!(
+        svc.run_engine
+            .store()
+            .load_run_interaction_event(
+                "user-1",
+                "slow-interaction",
+                "slow-question",
+                "provider_interaction_required"
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -29090,6 +29632,8 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
         )
         .unwrap();
     let capabilities = PreparedRuntimeCapabilities {
+        authenticated_edge_discovery: None,
+        provider_policy_index: provider_policy_index.clone(),
         mcp_bundle: Some(runtime_mcp::RuntimeMcpBundle {
             schemas: vec![json!({
                 "type": "function",

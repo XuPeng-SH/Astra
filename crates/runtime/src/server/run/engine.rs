@@ -551,6 +551,8 @@ pub struct RunStartContext {
     /// Exact runtime child instance, distinct from its reusable agent profile.
     /// Only an internal child admission may establish this recovery identity.
     pub(crate) child_runtime_id: Option<String>,
+    /// Trusted prepared-stage admission, never taken from execution_metadata.
+    pub(crate) collaborator_stage: Option<astra_services::runs::CollaboratorStageAdmission>,
     pub execution_restrictions: Option<astra_services::runs::DurableExecutionRestrictions>,
     pub admission_source: Option<astra_services::runs::DurableAdmissionSource>,
     pub(crate) execution_authentication:
@@ -604,6 +606,7 @@ impl Default for RunStartContext {
             skill_auto_route_policy: SkillAutoRouteExecutionPolicy::default(),
             execution_metadata: None,
             child_runtime_id: None,
+            collaborator_stage: None,
             execution_restrictions: None,
             admission_source: None,
             execution_authentication: None,
@@ -1086,6 +1089,7 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
                 && key != "generation_controls"
                 && key != "delegated_model_requirements"
                 && key != "child_runtime_id"
+                && key != "collaborator_stage"
                 && key != "profile_authority"
                 && key != "delegation_authority"
             {
@@ -1864,9 +1868,34 @@ impl RunEngine {
         delegation_id: Option<&str>,
         agent_id: Option<&str>,
         retry_of: Option<&str>,
-        context: RunStartContext,
+        mut context: RunStartContext,
         execution_deadline: Option<tokio::time::Instant>,
     ) -> Result<RunExecutionAuthority, String> {
+        if let Some(stage) = context.collaborator_stage.take() {
+            let receipt = self
+                .admit_collaborator_stage(
+                    run_id,
+                    user_id,
+                    session_id,
+                    parent_run_id.ok_or("collaborator stage requires a parent run")?,
+                    agent_id.ok_or("collaborator stage requires a child identity")?,
+                    context,
+                    stage,
+                    execution_deadline,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            // The supervisor must resolve an idempotent receipt before launch.
+            // This authority-only entrypoint cannot turn it into a new lease.
+            if receipt.replayed || receipt.run_id != run_id {
+                return Err(
+                    "collaborator stage was already admitted; no new execution authority".into(),
+                );
+            }
+            return Ok(RunExecutionAuthority {
+                owner_generation: receipt.owner_generation,
+            });
+        }
         let build_record = self.build_run_start_record(
             run_id,
             user_id,
@@ -1896,6 +1925,47 @@ impl RunEngine {
             None => self.store.insert_run(record).await?,
         }
         Ok(RunExecutionAuthority { owner_generation })
+    }
+
+    /// Admit one stage through the same run-record construction and store as
+    /// ordinary children. A replay receipt identifies an existing run; it is
+    /// not fresh execution authority and must never launch another process.
+    pub(crate) async fn admit_collaborator_stage(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+        agent_id: &str,
+        context: RunStartContext,
+        admission: astra_services::runs::CollaboratorStageAdmission,
+        execution_deadline: Option<tokio::time::Instant>,
+    ) -> Result<
+        astra_services::runs::CollaboratorStageReceipt,
+        astra_services::runs::CollaboratorStoreError,
+    > {
+        let build_record = self.build_run_start_record(
+            run_id,
+            user_id,
+            session_id,
+            Some(parent_run_id),
+            None,
+            Some(agent_id),
+            None,
+            context,
+        );
+        let record = match execution_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, build_record)
+                .await
+                .map_err(|_| astra_services::runs::CollaboratorStoreError::DeadlineExpired)??,
+            None => build_record.await?,
+        };
+        if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(astra_services::runs::CollaboratorStoreError::DeadlineExpired);
+        }
+        self.store
+            .insert_run_with_collaborator_stage(record, admission, execution_deadline)
+            .await
     }
 
     /// Atomically claim a provider-selected run identity or observe the
@@ -7931,11 +8001,16 @@ mod tests {
                         serde_json::json!({"thinking": {"mode": "off"}, "first_output_max_tokens": 1}),
                     ),
                     ("child_runtime_id".to_string(), serde_json::json!("forged")),
+                    (
+                        "collaborator_stage".to_string(),
+                        serde_json::json!({"anchor_run_id": "forged"}),
+                    ),
                 ])),
                 child_runtime_id: child_runtime_id.clone(),
                 ..Default::default()
             });
             assert!(event.get("generation_controls").is_none());
+            assert!(event.get("collaborator_stage").is_none());
             assert_eq!(
                 event
                     .get("child_runtime_id")

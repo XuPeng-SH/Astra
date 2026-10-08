@@ -297,6 +297,7 @@ pub(crate) fn run_start_context_from_request(
         delegation_authority: crate::orchestration::DelegationAuthority::Allowed,
         delegated_model_requirements: None,
         child_runtime_id: None,
+        collaborator_stage: None,
         interaction_mode: super::engine::effective_requested_interaction_mode(
             request.interaction_mode,
             request.interactive_client,

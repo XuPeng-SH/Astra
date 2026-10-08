@@ -848,6 +848,9 @@ impl BottomPane {
         prompt: crate::cli::chat_stream::AskUserPrompt,
         response_tx: oneshot::Sender<crate::cli::chat_stream::AskUserResponse>,
     ) {
+        if response_tx.is_closed() {
+            return;
+        }
         self.view_stack
             .push(Box::new(AskUserView::new(prompt, response_tx)));
     }

@@ -3658,6 +3658,7 @@ pub struct ServerAgenticLoopHost {
     /// Kept separate from the server catalog so dynamic edge offers can be
     /// installed into the runtime executor without becoming prompt schemas.
     edge_provider_tool_schemas: Vec<Value>,
+    pub(crate) authenticated_edge_discovery: Option<AuthenticatedEdgeDiscovery>,
     /// Full-schema digests for the edge-owned provider declarations used by
     /// typed admission. This map is never inferred from tool names/prose.
     edge_provider_tool_schema_digests: HashMap<String, String>,
@@ -4024,9 +4025,23 @@ fn validate_handoff_tool_history(
     Ok(())
 }
 
+/// Discovery captured from the selected authenticated registration, not chat schemas.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthenticatedEdgeDiscovery {
+    pub(crate) user_id: String,
+    pub(crate) executor_id: String,
+    pub(crate) workspace_root: String,
+    pub(crate) physical_workspace_id: String,
+    pub(crate) binding_generation: u64,
+    pub(crate) snapshots: Vec<astra_turn_types::ProviderDiscoverySnapshot>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeExecutionHandoff {
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub(crate) authenticated_edge_discovery: Option<AuthenticatedEdgeDiscovery>,
     // Audit input is immutable; original_facts.message may reflect steering.
     pub(crate) original_user_message: String,
     // Original composed model inputs, not credentials or execution grants.
@@ -4170,6 +4185,7 @@ impl ServerAgenticLoopHost {
     /// Reuse model-visible contracts only after current runtime authorization.
     /// Execution routing, credentials and capability grants stay with the host.
     pub(crate) fn restore_handoff_contracts(&mut self, handoff: &RuntimeExecutionHandoff) {
+        self.authenticated_edge_discovery = handoff.authenticated_edge_discovery.clone();
         self.edge_profile = handoff.edge_profile.clone();
         self.edge_provider_tool_schemas = handoff.edge_provider_tool_schemas.clone();
         self.tool_schemas = handoff.tool_schemas.clone();
@@ -5937,6 +5953,7 @@ impl ServerAgenticLoopHostBuilder {
             admission_tool_schemas,
             deferred_tool_schemas,
             edge_provider_tool_schemas,
+            authenticated_edge_discovery: None,
             edge_provider_tool_schema_digests: runtime_declared_tool_schema_digests,
             edge_provider_tool_native_ids: runtime_declared_tool_native_ids,
             resolved_deferred_activations_for_delivery: HashMap::new(),
@@ -18775,6 +18792,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             producer_run_id: run_id.to_string(),
             producer_owner_generation: generation,
             heavy: RuntimeExecutionHandoff {
+                authenticated_edge_discovery: self.authenticated_edge_discovery.clone(),
                 original_user_message: context.original_user_message.clone(),
                 edge_profile: self.edge_profile.clone(),
                 edge_provider_tool_schemas: self.edge_provider_tool_schemas.clone(),

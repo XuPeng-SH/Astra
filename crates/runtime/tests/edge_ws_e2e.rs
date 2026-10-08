@@ -607,6 +607,9 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
         timeout_secs: 30,
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(
@@ -667,6 +670,9 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
         timeout_secs: 30,
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(

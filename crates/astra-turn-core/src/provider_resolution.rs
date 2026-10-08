@@ -31,6 +31,8 @@ pub enum ProviderApprovalBaseline {
 /// later phases, but consumers must never reinterpret the raw claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedInvocationPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_requirements: Option<astra_turn_types::ProviderRuntimeRequirements>,
     pub descriptor: ResolvedToolDescriptorRef,
     pub effect: ResolvedToolEffect,
     pub parallelizable: bool,
@@ -86,6 +88,10 @@ impl ResolvedProviderPolicyIndex {
                 })?;
                 let semantics = &descriptor.semantic_baseline;
                 let policy = ResolvedInvocationPolicy {
+                    runtime_requirements:
+                        astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
+                            &descriptor.extension_fields,
+                        )?,
                     descriptor: descriptor_ref.clone(),
                     effect: semantics.effect,
                     parallelizable: semantics.concurrency
@@ -749,6 +755,42 @@ mod tests {
             read.baseline_content_id().unwrap(),
             changed.baseline_content_id().unwrap()
         );
+    }
+
+    #[test]
+    fn runtime_requirements_are_preserved_and_change_the_decision_identity() {
+        let resolve = |paths: serde_json::Value| {
+            let mut tool = declaration("runtime", ProviderToolClaims::default());
+            tool.extension_fields.insert(
+                astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY.into(),
+                serde_json::json!({"executable":"/installed/provider", "read_paths":paths}),
+            );
+            let snapshot = resolve_provider_snapshot(
+                &discovery(vec![tool]),
+                &trusted_mcp(),
+                &aliases(&["runtime"]),
+            )
+            .unwrap();
+            ResolvedProviderPolicyIndex::from_snapshots(&[snapshot])
+        };
+        let first = resolve(serde_json::json!(["/installed/provider"])).unwrap();
+        let changed = resolve(serde_json::json!([
+            "/installed/provider",
+            "/runtime/library"
+        ]))
+        .unwrap();
+        let first = first.resolve("provider__runtime").unwrap();
+        let changed = changed.resolve("provider__runtime").unwrap();
+        assert_eq!(
+            first.runtime_requirements.as_ref().unwrap().read_paths,
+            ["/installed/provider"]
+        );
+        assert_ne!(
+            first.baseline_content_id().unwrap(),
+            changed.baseline_content_id().unwrap()
+        );
+        assert!(resolve(serde_json::json!(["\u{0}"])).is_err());
+        assert!(resolve(serde_json::json!(vec!["/runtime/library"; 33])).is_err());
     }
 
     #[test]

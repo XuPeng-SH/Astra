@@ -2069,14 +2069,27 @@ async fn begin_durable_server_interaction_wait(
         .await?
         .filter(|run| run.session_id == session_id)
         .ok_or_else(|| format!("durable run {run_id} disappeared or crossed session scope"))?;
-    if run.status != STATUS_RUNNING {
+    let tool_origin = required_event
+        .pointer("/data/tool_invocation_origin")
+        .map(|origin| {
+            serde_json::from_value::<astra_services::runs::ToolInvocationInteractionOrigin>(
+                origin.clone(),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if run.status != STATUS_RUNNING && !(tool_origin.is_some() && run.status == STATUS_WAITING) {
         return Err(format!(
             "durable run {run_id} cannot register a new interaction from status {}",
             run.status
         ));
     }
-    let expected_control_epoch = run.last_event_idx;
-    let expected_owner_generation = run.run_generation;
+    let expected_control_epoch = tool_origin
+        .as_ref()
+        .map_or(run.last_event_idx, |origin| origin.control_epoch);
+    let expected_owner_generation = tool_origin
+        .as_ref()
+        .map_or(run.run_generation, |origin| origin.owner_generation);
     match run_engine
         .register_guarded_interaction_batch(
             astra_services::runs::AtomicRunInteractionBatchRegistrationRequest {
@@ -2882,6 +2895,8 @@ struct DurableRunUserPromptGate {
     cancel_token: Option<Arc<CancellationToken>>,
     timeout: Duration,
     provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
+    tool_invocation_origin: Option<astra_services::runs::ToolInvocationInteractionOrigin>,
+    admitted_deadline: Option<Instant>,
 }
 
 impl DurableRunUserPromptGate {
@@ -2909,6 +2924,8 @@ impl DurableRunUserPromptGate {
             cancel_token: None,
             timeout: Self::DEFAULT_TIMEOUT,
             provider_run_owner: None,
+            tool_invocation_origin: None,
+            admitted_deadline: None,
         }
     }
 
@@ -2917,6 +2934,19 @@ impl DurableRunUserPromptGate {
         provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
     ) -> Self {
         self.provider_run_owner = provider_run_owner;
+        self
+    }
+
+    fn with_tool_invocation_origin(
+        mut self,
+        origin: astra_services::runs::ToolInvocationInteractionOrigin,
+    ) -> Self {
+        self.tool_invocation_origin = Some(origin);
+        self
+    }
+
+    fn with_admitted_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.admitted_deadline = deadline;
         self
     }
 
@@ -2953,15 +2983,28 @@ impl DurableRunUserPromptGate {
         &self,
         event: Value,
         kind: astra_services::runs::DurableRunInteractionKind,
-    ) {
+    ) -> bool {
         let indexed_event = load_exact_indexed_interaction_event(
             &self.run_engine,
             &self.user_id,
             &self.context.run_id,
             &event,
         )
-        .await
-        .unwrap_or_else(|| event.clone());
+        .await;
+        let indexed_event = match indexed_event {
+            Some(indexed)
+                if self.tool_invocation_origin.is_none()
+                    || indexed.get("index").and_then(Value::as_u64).is_some() =>
+            {
+                indexed
+            }
+            _ if self.tool_invocation_origin.is_some() => {
+                // Registration already committed. Missing cursor evidence
+                // must not manufacture an ACK or remove the pending question.
+                return false;
+            }
+            _ => event.clone(),
+        };
         let client_events = run_handlers::transform_stream_run_events_for_client(
             &self.context.run_id,
             vec![indexed_event],
@@ -2985,7 +3028,14 @@ impl DurableRunUserPromptGate {
         };
         if let Some(stream_event_tx) = &self.stream_event_tx {
             for event in &client_events {
-                if stream_event_tx.send(event.clone()).await.is_err() {
+                let send = stream_event_tx.send(event.clone());
+                let delivered = match self.admitted_deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline.into(), send)
+                        .await
+                        .is_ok_and(|result| result.is_ok()),
+                    None => send.await.is_ok(),
+                };
+                if !delivered {
                     tracing::debug!(
                         target: "astra_runtime::run_lifecycle",
                         run_id = %self.context.run_id,
@@ -2995,6 +3045,7 @@ impl DurableRunUserPromptGate {
                 }
             }
         }
+        true
     }
 
     fn no_longer_active() -> astra_tools::AskUserDecision {
@@ -3169,12 +3220,21 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         &self,
         request: &astra_turn_types::ProviderInteractionRequest,
     ) -> astra_tools::ProviderInteractionDecision {
-        let Some(provider_run_owner) = self.provider_run_owner.as_ref() else {
+        if let Err(error) = request.validate() {
+            return astra_tools::ProviderInteractionDecision::Error(error.to_string());
+        }
+        if self
+            .admitted_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return astra_tools::ProviderInteractionDecision::Timeout;
+        }
+        if self.provider_run_owner.is_some() == self.tool_invocation_origin.is_some() {
             return astra_tools::ProviderInteractionDecision::Error(
-                "provider interaction requires an authenticated provider run owner".to_string(),
+                "provider interaction requires one authenticated provider or exact remote invocation origin".to_string(),
             );
-        };
-        let event = json!({
+        }
+        let mut event = json!({
             "event_type": "provider_interaction_required",
             "idempotency_key": format!(
                 "server-provider-interaction-required:{}",
@@ -3189,9 +3249,14 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
                 "timeout_ms": request
                     .timeout_ms
                     .unwrap_or(self.timeout.as_millis() as u64),
-                "provider_run_owner": provider_run_owner,
             }
         });
+        if let Some(owner) = &self.provider_run_owner {
+            event["data"]["provider_run_owner"] = json!(owner);
+        }
+        if let Some(origin) = &self.tool_invocation_origin {
+            event["data"]["tool_invocation_origin"] = json!(origin);
+        }
         let already_resolved = match begin_durable_server_interaction_wait(
             &self.run_engine,
             &self.user_id,
@@ -3204,11 +3269,17 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         .await
         {
             Ok(DurableServerInteractionWaitStart::Waiting) => {
-                self.project_durable_wait(
-                    event,
-                    astra_services::runs::DurableRunInteractionKind::Provider,
-                )
-                .await;
+                if !self
+                    .project_durable_wait(
+                        event,
+                        astra_services::runs::DurableRunInteractionKind::Provider,
+                    )
+                    .await
+                {
+                    return astra_tools::ProviderInteractionDecision::Error(
+                        "Committed interaction acknowledgement is unavailable".into(),
+                    );
+                }
                 None
             }
             Ok(DurableServerInteractionWaitStart::AlreadyResolved(event)) => Some(event),
@@ -3230,10 +3301,13 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
             return provider_interaction_decision_from_shared_event(&resolved);
         }
 
-        let timeout = request
+        let mut timeout = request
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(self.timeout);
+        if let Some(deadline) = self.admitted_deadline {
+            timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
+        }
         let resolved = if let Some(cancel_token) = &self.cancel_token {
             tokio::select! {
                 _ = cancel_token.cancelled() => return astra_tools::ProviderInteractionDecision::Cancelled,
@@ -3267,7 +3341,11 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
                 &self.context.run_id,
                 &request.request_id,
                 astra_services::runs::DurableRunInteractionKind::Provider.resolved_event_type(),
-                self.stream_event_tx.as_ref(),
+                if self.admitted_deadline.is_some() {
+                    None
+                } else {
+                    self.stream_event_tx.as_ref()
+                },
             )
             .await;
             return provider_interaction_decision_from_shared_event(&resolved);
@@ -3299,7 +3377,11 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
                     &self.context.run_id,
                     &request.request_id,
                     astra_services::runs::DurableRunInteractionKind::Provider.resolved_event_type(),
-                    self.stream_event_tx.as_ref(),
+                    if self.admitted_deadline.is_some() {
+                        None
+                    } else {
+                        self.stream_event_tx.as_ref()
+                    },
                 )
                 .await;
                 provider_interaction_decision_from_shared_event(&event)
@@ -4649,10 +4731,104 @@ struct ResolvedAgentBindingRuntime {
 
 #[derive(Clone, Default)]
 struct PreparedRuntimeCapabilities {
+    authenticated_edge_discovery: Option<server_loop_host::AuthenticatedEdgeDiscovery>,
+    provider_policy_index: astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex,
     mcp_bundle: Option<runtime_mcp::RuntimeMcpBundle>,
     request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     server_skill_resolver: ServerSkillResolverBundle,
     agent_binding: Option<PreparedAgentBindingLoopContext>,
+}
+
+impl PreparedRuntimeCapabilities {
+    fn validate_edge_discovery_binding(
+        discovery: &server_loop_host::AuthenticatedEdgeDiscovery,
+        user_id: &str,
+        bindings: &ExecutionBindingSnapshot,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if discovery.user_id != user_id
+            || bindings.executor.kind != ExecutorBindingKind::EdgeAgent
+            || discovery.executor_id != bindings.executor.executor_id
+            || bindings.workspace.kind != WorkspaceBindingKind::EdgeWorkspace
+            || bindings.workspace.cwd.as_deref() != Some(discovery.workspace_root.as_str())
+            || bindings.execution_binding_generation != Some(discovery.binding_generation)
+            || discovery.physical_workspace_id.trim().is_empty()
+        {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "authenticated Edge discovery binding was superseded",
+            ));
+        }
+        Ok(())
+    }
+
+    fn bind_edge_discovery(
+        &mut self,
+        discovery: Option<server_loop_host::AuthenticatedEdgeDiscovery>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        use astra_turn_core::provider_resolution::{
+            ProviderClaimTrustPolicy, ResolvedProviderPolicyIndex, resolve_provider_snapshot,
+        };
+        let invalid = || {
+            error_response(
+                StatusCode::CONFLICT,
+                "authenticated Edge provider discovery is invalid",
+            )
+        };
+        let mut snapshots = self
+            .mcp_bundle
+            .as_ref()
+            .map(|bundle| bundle.provider_snapshots.clone())
+            .unwrap_or_default();
+        if let Some(edge) = &discovery {
+            if edge.user_id.trim().is_empty()
+                || edge.executor_id.trim().is_empty()
+                || edge.workspace_root.trim().is_empty()
+                || edge.physical_workspace_id.trim().is_empty()
+                || edge.binding_generation == 0
+            {
+                return Err(invalid());
+            }
+            let registry = astra_runtime_env::ToolRegistry::builtins();
+            for snapshot in &edge.snapshots {
+                // First-party discovery identity is the selected executor; its
+                // binding is the existing materialization+root physical identity.
+                // Neither identifier may be supplied by a model-facing alias.
+                if snapshot.protocol.as_str() != "cli-local"
+                    || snapshot.provider_identity.as_str() != edge.executor_id
+                    || snapshot.binding_ref.as_str() != edge.physical_workspace_id
+                {
+                    return Err(invalid());
+                }
+                let mut aliases = std::collections::BTreeMap::new();
+                for tool in &snapshot.tool_declarations {
+                    if registry.get(&tool.native_tool_name).is_some()
+                        || astra_runtime_env::is_mcp_namespaced_tool_name(&tool.native_tool_name)
+                    {
+                        return Err(invalid());
+                    }
+                    let alias =
+                        astra_turn_types::PublicToolAlias::new(tool.native_tool_name.clone())
+                            .map_err(|_| invalid())?;
+                    if aliases.insert(tool.native_tool_id.clone(), alias).is_some() {
+                        return Err(invalid());
+                    }
+                }
+                // Authentication establishes provenance, never claim trust or permission.
+                snapshots.push(
+                    resolve_provider_snapshot(
+                        snapshot,
+                        &ProviderClaimTrustPolicy::default(),
+                        &aliases,
+                    )
+                    .map_err(|_| invalid())?,
+                );
+            }
+        }
+        self.provider_policy_index =
+            ResolvedProviderPolicyIndex::from_snapshots(&snapshots).map_err(|_| invalid())?;
+        self.authenticated_edge_discovery = discovery;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -5086,8 +5262,14 @@ enum NewRunPreparation {
     },
 }
 
+type SpawnToolExecutorPublication =
+    Arc<std::sync::OnceLock<Weak<runtime_tool_executor::RuntimeToolExecutor>>>;
+
 #[derive(Clone)]
 struct ServerSpawnRuntimeContext {
+    /// Non-owning access to this exact publication's canonical tool owner.
+    /// This is neither a provider index nor a durable association cache.
+    tool_executor: SpawnToolExecutorPublication,
     model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     parent_run_id: String,
     /// Process-local identity of this exact context publication. Unlike the
@@ -5145,6 +5327,7 @@ struct ServerDynamicAgentToolsWiring {
 }
 
 struct ServerRootRuntimeContextGuard {
+    tool_executor: SpawnToolExecutorPublication,
     executor: Arc<ServerSpawnAgentExecutor>,
     user_id: String,
     run_id: String,
@@ -7552,6 +7735,7 @@ impl AgenticRunLifecycleService {
         // concurrent terminal can therefore close this exact Arc even when
         // publication has not reached the registry yet.
         let runtime_context = ServerSpawnRuntimeContext {
+            tool_executor: Arc::new(Default::default()),
             model_catalog_reader: request.model_catalog_reader.clone(),
             parent_run_id: run_id.to_string(),
             runtime_context_id: Uuid::new_v4().to_string(),
@@ -7710,6 +7894,7 @@ impl AgenticRunLifecycleService {
         runtime_context.execution_metadata = execution_metadata.clone();
         runtime_context.spawner = Arc::downgrade(&entry.spawner);
         let runtime_context_id = runtime_context.runtime_context_id.clone();
+        let tool_executor = Arc::clone(&runtime_context.tool_executor);
         if !entry.executor.set_runtime_context(runtime_context).await {
             return Err(format!(
                 "root run {run_id} lost its runtime-context publication capability"
@@ -7734,6 +7919,7 @@ impl AgenticRunLifecycleService {
         Ok(ServerDynamicAgentToolsWiring {
             active_work_registry,
             root_runtime_context_guard: ServerRootRuntimeContextGuard {
+                tool_executor,
                 executor: entry.executor.clone(),
                 user_id,
                 run_id,
@@ -10062,7 +10248,11 @@ impl AgenticRunLifecycleService {
         session_id: &str,
         request: &mut ChatRequestData,
         work_binding: Option<&ValidatedWorkRuntimeBinding>,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<
+        Option<server_loop_host::AuthenticatedEdgeDiscovery>,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        let mut authenticated_discovery = Vec::new();
         let request_is_edge = request.workspace_binding.as_ref().is_some_and(|binding| {
             binding.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
         }) || request.executor_binding.as_ref().is_some_and(|binding| {
@@ -10122,7 +10312,7 @@ impl AgenticRunLifecycleService {
                 }
             }
             request.execution_binding_generation = None;
-            return Ok(());
+            return Ok(None);
         }
 
         let Some(pool) = self.shared_pool.clone() else {
@@ -10145,7 +10335,7 @@ impl AgenticRunLifecycleService {
             // Work requests still fail closed until durable selection exists.
             if work_binding.is_none() && (!request_is_edge || edge_ledger || edge_offline) {
                 request.execution_binding_generation = None;
-                return Ok(());
+                return Ok(None);
             }
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -10188,7 +10378,7 @@ impl AgenticRunLifecycleService {
         let initial = match (existing.as_ref(), request_is_edge) {
             (None, true) => {
                 let physical_workspace_id = self
-                    .authorize_native_edge_execution(user_id, request)
+                    .authorize_native_edge_execution(user_id, request, &mut authenticated_discovery)
                     .await?;
                 let workspace = request.workspace_binding.clone().ok_or_else(|| {
                     error_response_coded(
@@ -10232,7 +10422,7 @@ impl AgenticRunLifecycleService {
                 // explicitly selects Server), the row above is created and
                 // all subsequent writes are fenced by its claim.
                 request.execution_binding_generation = None;
-                return Ok(());
+                return Ok(None);
             }
             (Some(existing), _) => existing.clone(),
         };
@@ -10321,7 +10511,7 @@ impl AgenticRunLifecycleService {
                 ));
             }
             let authorized_physical_id = self
-                .authorize_native_edge_execution(user_id, request)
+                .authorize_native_edge_execution(user_id, request, &mut authenticated_discovery)
                 .await?;
             if binding.physical_workspace_id != authorized_physical_id {
                 return Err(error_response_coded(
@@ -10351,10 +10541,32 @@ impl AgenticRunLifecycleService {
             };
             return Err(error_response_coded(StatusCode::CONFLICT, message, code));
         }
+        let authenticated_edge_discovery = if binding_is_edge && !authenticated_discovery.is_empty()
+        {
+            Some(server_loop_host::AuthenticatedEdgeDiscovery {
+                user_id: user_id.to_owned(),
+                executor_id: binding.executor.executor_id.clone().ok_or_else(|| {
+                    error_response(StatusCode::CONFLICT, "selected Edge executor is missing")
+                })?,
+                workspace_root: binding.workspace.root.clone().ok_or_else(|| {
+                    error_response(StatusCode::CONFLICT, "selected Edge root is missing")
+                })?,
+                physical_workspace_id: binding.physical_workspace_id.clone().ok_or_else(|| {
+                    error_response(
+                        StatusCode::CONFLICT,
+                        "selected Edge materialization is missing",
+                    )
+                })?,
+                binding_generation: binding.generation,
+                snapshots: authenticated_discovery,
+            })
+        } else {
+            None
+        };
         request.workspace_binding = Some(binding.workspace);
         request.executor_binding = Some(binding.executor);
         request.execution_binding_generation = Some(binding.generation);
-        Ok(())
+        Ok(authenticated_edge_discovery)
     }
 
     /// A first-party user request may select only an Edge connection that is
@@ -10367,6 +10579,7 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         request: &ChatRequestData,
+        authenticated_discovery: &mut Vec<astra_turn_types::ProviderDiscoverySnapshot>,
     ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
         if request.provider_runtime_authorized {
             return Ok(None);
@@ -10448,6 +10661,16 @@ impl AgenticRunLifecycleService {
         } else {
             None
         };
+        if registry_edge.as_ref().is_some_and(|agent| {
+            agent.user_id != user_id
+                || agent.edge_agent_id != executor_id
+                || agent.workspace_id.is_some()
+        }) {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "selected Edge registration crosses its owner boundary",
+            ));
+        }
         if let Some(agent) = registry_edge.as_ref()
             && !path_matches(agent.worktree_path.as_deref())
         {
@@ -10508,6 +10731,60 @@ impl AgenticRunLifecycleService {
             .map(str::trim)
             .filter(|id| !id.is_empty())
         {
+            let parse = |capabilities: Option<&Value>| -> Result<
+                Vec<astra_turn_types::ProviderDiscoverySnapshot>,
+                (StatusCode, Json<ErrorResponse>),
+            > {
+                let Some(capabilities) = capabilities else {
+                    return Ok(Vec::new());
+                };
+                let advert: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+                    serde_json::from_value(capabilities.clone()).map_err(|_| {
+                        error_response(StatusCode::CONFLICT, "selected Edge discovery is invalid")
+                    })?;
+                if advert.schema_version
+                    != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+                    || advert.binding.executor.executor_id != executor_id
+                    || !advert.binding.executor.is_edge_agent()
+                    || advert.binding.workspace.kind
+                        != astra_runtime_env::WorkspaceBindingKind::EdgeWorkspace
+                    || advert.binding.workspace.cwd.as_deref() != Some(root)
+                {
+                    return Err(error_response(
+                        StatusCode::CONFLICT,
+                        "selected Edge discovery does not match its registration",
+                    ));
+                }
+                let physical_id = astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(materialization_id, root);
+                if advert.provider_discovery.iter().any(|snapshot| {
+                    snapshot.protocol.as_str() != "cli-local"
+                        || snapshot.provider_identity.as_str() != executor_id
+                        || snapshot.binding_ref.as_str() != physical_id
+                }) {
+                    return Err(error_response(
+                        StatusCode::CONFLICT,
+                        "selected Edge discovery identity does not match its materialization",
+                    ));
+                }
+                Ok(advert.provider_discovery)
+            };
+            let snapshots = match (pool_edge.as_ref(), registry_edge.as_ref()) {
+                (Some(pool), Some(registry)) => {
+                    let local = parse(pool.capabilities.as_ref())?;
+                    let registered = parse(registry.capabilities.as_ref())?;
+                    if local != registered {
+                        return Err(error_response(
+                            StatusCode::CONFLICT,
+                            "selected Edge discovery registrations disagree",
+                        ));
+                    }
+                    registered
+                }
+                (Some(pool), None) => parse(pool.capabilities.as_ref())?,
+                (None, Some(registry)) => parse(registry.capabilities.as_ref())?,
+                (None, None) => Vec::new(),
+            };
+            *authenticated_discovery = snapshots;
             return Ok(Some(
                 astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
                     materialization_id,
@@ -11448,6 +11725,11 @@ impl AgenticRunLifecycleService {
                 ServerSkillResolverBundle::default()
             };
             return Ok(PreparedRuntimeCapabilities {
+                authenticated_edge_discovery: None,
+                provider_policy_index: mcp_bundle
+                    .as_ref()
+                    .map(|bundle| bundle.provider_policy_index.clone())
+                    .unwrap_or_default(),
                 mcp_bundle,
                 request_scoped_skill_resolver,
                 server_skill_resolver,
@@ -11569,6 +11851,8 @@ impl AgenticRunLifecycleService {
             .collect::<Vec<_>>();
         let prompt_section = Self::agent_binding_prompt_section(&bindings, &skill_catalogs)?;
         Ok(PreparedRuntimeCapabilities {
+            authenticated_edge_discovery: None,
+            provider_policy_index: bundle.provider_policy_index.clone(),
             mcp_bundle: Some(bundle),
             request_scoped_skill_resolver: None,
             server_skill_resolver: ServerSkillResolverBundle::default(),
@@ -13523,8 +13807,8 @@ impl AgenticRunLifecycleService {
                 executor.set_agent_binding_mcp(agent_binding_mcp.clone());
             }
             executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
-            executor.set_provider_policy_index(bundle.provider_policy_index.clone());
         }
+        executor.set_provider_policy_index(runtime_capabilities.provider_policy_index.clone());
         // Wire the plan repository so enter/exit_plan_mode tools work and
         // the write-tool guard can check `active_plan_id`.
         if let Some(shared) = &self.shared_pool {
@@ -16568,16 +16852,18 @@ impl AgenticRunLifecycleService {
         let work_runtime_binding = self
             .validate_work_runtime_binding(&user_id, &session_id, &request)
             .await?;
-        let runtime_capabilities = self
+        let mut runtime_capabilities = self
             .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
             .await?;
-        self.bind_execution_selection(
-            &user_id,
-            &session_id,
-            &mut request,
-            work_runtime_binding.as_ref(),
-        )
-        .await?;
+        let authenticated_edge_discovery = self
+            .bind_execution_selection(
+                &user_id,
+                &session_id,
+                &mut request,
+                work_runtime_binding.as_ref(),
+            )
+            .await?;
+        runtime_capabilities.bind_edge_discovery(authenticated_edge_discovery)?;
 
         let agent_binding_mode = request.has_agent_binding_runtime();
         let edge_context = Self::extract_edge_context(&request)?;
@@ -17086,6 +17372,8 @@ impl AgenticRunLifecycleService {
                 plan_authoring_active,
                 work_runtime_binding.as_ref(),
             );
+            host.authenticated_edge_discovery =
+                runtime_capabilities.authenticated_edge_discovery.clone();
             if let Some(admission) = canonical_turn.as_ref() {
                 host.bind_execution_handoff(
                     self.execution_handoff_requested.clone(),
@@ -17398,6 +17686,12 @@ impl AgenticRunLifecycleService {
                     executor.set_provider_interaction_gate(user_prompt_gate);
                 }
                 wire_executor_into_state(executor, &mut state);
+                if let (Some(guard), Some(executor)) = (
+                    root_runtime_context_guard.as_ref(),
+                    state.runtime_tool_executor.as_ref(),
+                ) {
+                    let _ = guard.tool_executor.set(Arc::downgrade(executor));
+                }
                 if let Some(event) =
                     restore_continuation_primary_work_attempt(&state, &run_id).await
                 {
@@ -18224,6 +18518,133 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .load_run_interaction_event(&user_id, &run_id, &request_id, &event_type)
             .await
             .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+    }
+
+    async fn request_tool_interaction(
+        &self,
+        user_id: String,
+        identity: astra_turn_types::ToolInvocationIdentity,
+        edge_agent_id: String,
+        interaction: astra_turn_types::ProviderInteractionRequest,
+        stream_event_tx: Option<mpsc::Sender<Value>>,
+    ) -> Result<astra_turn_types::ProviderInteractionResponse, (StatusCode, Json<ErrorResponse>)>
+    {
+        use astra_services::runs::ToolInteractionAdmissionError;
+        use astra_tools::{ProviderInteractionDecision, ProviderInteractionGate};
+        use astra_turn_types::{ProviderInteractionOutcome, ProviderInteractionResponse};
+        if identity.user_id != user_id {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "Tool interaction crosses authenticated owner",
+            ));
+        }
+        interaction
+            .validate()
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+        let origin = self
+            .run_engine
+            .store()
+            .derive_tool_interaction_origin(&identity, &edge_agent_id)
+            .await
+            .map_err(|error| {
+                let status = match &error {
+                    ToolInteractionAdmissionError::Unproven
+                    | ToolInteractionAdmissionError::DeadlineExpired => StatusCode::CONFLICT,
+                    ToolInteractionAdmissionError::Unsupported => StatusCode::NOT_IMPLEMENTED,
+                    ToolInteractionAdmissionError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                error_response(status, error.to_string())
+            })?;
+        let run = self
+            .run_engine
+            .load_run(&user_id, &identity.run_id)
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?
+            .filter(|run| run.session_id == identity.session_id)
+            .ok_or_else(|| {
+                error_response(StatusCode::NOT_FOUND, "Tool interaction run not found")
+            })?;
+        let cutoff = run
+            .execution_restrictions()
+            .map_err(|error| error_response(StatusCode::CONFLICT, error.to_string()))?
+            .and_then(|restrictions| match restrictions {
+                astra_services::runs::DurableExecutionRestrictions::V1 {
+                    execution_work_deadline_unix_ms,
+                    ..
+                } => execution_work_deadline_unix_ms,
+            });
+        let admitted_deadline = if let Some(cutoff) = cutoff {
+            let now_unix_ms =
+                u64::try_from(chrono::Utc::now().timestamp_millis()).map_err(|_| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Execution clock is invalid",
+                    )
+                })?;
+            let remaining = cutoff
+                .checked_sub(now_unix_ms)
+                .filter(|remaining| *remaining > 0)
+                .ok_or_else(|| {
+                    error_response_coded(
+                        StatusCode::CONFLICT,
+                        "Native stage execution deadline expired",
+                        "execution_deadline_expired",
+                    )
+                })?;
+            Some(
+                Instant::now()
+                    .checked_add(Duration::from_millis(remaining))
+                    .ok_or_else(|| {
+                        error_response(
+                            StatusCode::CONFLICT,
+                            "Native stage deadline is outside clock range",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut gate = DurableRunUserPromptGate::new(
+            user_id.clone(),
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            None,
+            self.run_engine.clone(),
+            self.runs.clone(),
+            None,
+            stream_event_tx,
+        )
+        .with_tool_invocation_origin(origin)
+        .with_admitted_deadline(admitted_deadline);
+        if let Some(token) = self
+            .runs
+            .read()
+            .await
+            .get(&identity.run_id)
+            .filter(|run| run.user_id == user_id)
+            .map(|run| run.llm_cancel_token.clone())
+        {
+            gate = gate.with_cancel_token(token);
+        }
+        let (outcome, payload) = match gate.request_interaction(&interaction).await {
+            ProviderInteractionDecision::Submitted(payload) => {
+                (ProviderInteractionOutcome::Submitted, Some(payload))
+            }
+            ProviderInteractionDecision::Cancelled => (ProviderInteractionOutcome::Cancelled, None),
+            ProviderInteractionDecision::Timeout => (ProviderInteractionOutcome::TimedOut, None),
+            ProviderInteractionDecision::Error(error) => {
+                return Err(error_response(StatusCode::CONFLICT, error));
+            }
+        };
+        let response = ProviderInteractionResponse {
+            request_id: interaction.request_id.clone(),
+            outcome,
+            payload,
+        };
+        response
+            .validate_for(&interaction)
+            .map_err(|error| error_response(StatusCode::CONFLICT, error.to_string()))?;
+        Ok(response)
     }
 
     async fn resolve_run_interaction(
@@ -19931,7 +20352,7 @@ impl ServerSpawnAgentExecutor {
         parent: &ServerSpawnRuntimeContext,
         config: &SpawnRunConfig,
         request_constraints: RequestConstraints,
-        admitted_model_execution: astra_services::AdmittedModelExecution,
+        admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     ) -> Result<(ServerSpawnRuntimeContext, ExecutionOwnerGenerationGuard), String> {
         // A child owns its own local control handles. Parent cancellation is
         // inherited through the token tree, while a child's direct pause or
@@ -19951,6 +20372,7 @@ impl ServerSpawnAgentExecutor {
         let generation_publication_guard = execution_owner_generation.guard();
         let publication_capability = self.publication_capability_for_run(&config.run_id);
         let child_context = ServerSpawnRuntimeContext {
+            tool_executor: Arc::new(Default::default()),
             model_catalog_reader: parent.model_catalog_reader.clone(),
             parent_run_id: config.run_id.clone(),
             runtime_context_id: Uuid::new_v4().to_string(),
@@ -19960,7 +20382,7 @@ impl ServerSpawnAgentExecutor {
             session_id: parent.session_id.clone(),
             trace_context: parent.trace_context.clone(),
             forward_headers: parent.forward_headers.clone(),
-            admitted_model_execution: Some(admitted_model_execution),
+            admitted_model_execution,
             interaction_mode: parent.interaction_mode,
             edge_tools: parent.edge_tools.clone(),
             request_constraints,
@@ -20981,11 +21403,297 @@ async fn admit_model_offering_batch(
     Ok(executions)
 }
 
+/// Trusted native-stage material from the selected provider's ordinary tool
+/// admission. There is no native run owner here: creation, leases, control and
+/// terminal settlement remain in RunEngine / ServerSubRunExecutor.
+#[derive(Clone)]
+pub(crate) struct PreparedNativeSubrunExecution {
+    pub stage_admission: astra_services::runs::CollaboratorStageAdmission,
+    pub identity: crate::orchestration::PreparedSpawnProviderIdentity,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub policy: astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+    pub run_state_store: Arc<dyn astra_services::runs::RunStateStore>,
+}
+
+fn native_collaborator_provider(
+    descriptor: &astra_turn_types::ResolvedToolDescriptorRef,
+) -> Result<astra_services::runs::CollaboratorProvider, String> {
+    use astra_services::runs::CollaboratorProvider;
+    // Provider-owned native IDs, never the caller's public alias. Resolution
+    // has already authenticated the descriptor and its binding.
+    match descriptor.identity.native_tool_id.as_str() {
+        "native_claude" => Ok(CollaboratorProvider::Claude),
+        "native_opencode" => Ok(CollaboratorProvider::OpenCode),
+        "native_codex" => Ok(CollaboratorProvider::Codex),
+        _ => Err("selected provider descriptor is not a native collaborator stage".into()),
+    }
+}
+
+fn ensure_collaborator_context_continuation(
+    original: &astra_services::runs::DurableRunRecord,
+) -> Result<(), String> {
+    if original.model_offering_id.is_some() {
+        return Err(
+            "internal collaborator continuation requires durable child checkpoint restoration and current-stage mailbox routing; fresh launch is forbidden"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn native_stage_reasoning_arguments(
+    provider: &astra_services::runs::CollaboratorProvider,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+) -> Result<Map<String, Value>, String> {
+    use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+    let effort = match thinking {
+        ThinkingConfig::ModelDefault => return Ok(Map::new()),
+        ThinkingConfig::Off => "none",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Low,
+        } => "low",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Medium,
+        } => "medium",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::High,
+        } => "high",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Max,
+        } if *provider == astra_services::runs::CollaboratorProvider::Claude => "max",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Max,
+        } => "xhigh",
+        ThinkingConfig::On {} | ThinkingConfig::Enabled { .. } => {
+            return Err("selected native stage does not support this reasoning control".into());
+        }
+    };
+    Ok(Map::from_iter([("effort".into(), json!(effort))]))
+}
+
+impl ServerSpawnAgentExecutor {
+    async fn prepare_native_spawn(
+        self: &Arc<Self>,
+        input: &astra_turn_core::orchestration_spawn_tool::SpawnAgentInput,
+        context: &SpawnContext,
+        parent: &ServerSpawnRuntimeContext,
+        durable_followup: Option<&astra_services::runs::DurableCollaboratorAssociation>,
+    ) -> Result<ServerPreparedSpawn, crate::orchestration::SpawnError> {
+        let mut admitted_input = input.clone();
+        if let Some(admission) = context.delegation_model_admission.as_ref() {
+            crate::orchestration::spawner::apply_delegation_model_admission(
+                &mut admitted_input,
+                admission,
+                &context.parent_run_id,
+                context.spawn_tool_call_id.as_deref(),
+            )?;
+        }
+        let input = &admitted_input;
+        input.validate_execution_request()?;
+        let delegated_model_requirements =
+            crate::orchestration::spawner::delegated_requirements_for_spawn(input, context)?;
+        let request = input.execution.as_ref().ok_or_else(|| {
+            "collaborator follow-up requires its selected provider execution".to_string()
+        })?;
+        let executor = parent
+            .tool_executor
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| "parent's canonical tool executor is no longer available".to_string())?;
+        let policy = match executor.provider_policy_lookup(&request.tool) {
+            runtime_tool_executor::ProviderPolicyLookup::Resolved(policy) => policy,
+            runtime_tool_executor::ProviderPolicyLookup::MissingPolicy { .. }
+            | runtime_tool_executor::ProviderPolicyLookup::NotProvider => {
+                return Err("native collaborator requires a resolved provider tool policy".into());
+            }
+        };
+        let provider = native_collaborator_provider(&policy.descriptor)?;
+        let binding = &parent
+            .execution_contract
+            .as_ref()
+            .ok_or_else(|| "native collaborator requires a selected execution binding".to_string())?
+            .0;
+        if binding.executor.kind != ExecutorBindingKind::EdgeAgent
+            || !matches!(
+                binding.executor.transport,
+                ToolTransportKind::EdgeWs | ToolTransportKind::EdgeLedger
+            )
+            || binding.workspace.kind != WorkspaceBindingKind::EdgeWorkspace
+        {
+            return Err("native collaborators require an explicitly selected CLI/User Runner; Server execution is forbidden".into());
+        }
+        let binding_generation = binding.execution_binding_generation.ok_or_else(|| {
+            "native collaborator execution binding has no durable generation".to_string()
+        })?;
+        let engine = self
+            .run_engine
+            .as_ref()
+            .ok_or_else(|| "native collaborator requires the canonical RunEngine".to_string())?;
+        let source = context
+            .spawn_tool_call_id
+            .as_deref()
+            .ok_or_else(|| "native stage requires its canonical source invocation".to_string())?;
+        let source_message_id = format!(
+            "{}/{}/{}",
+            context.parent_run_id,
+            source,
+            input.fanout_slot_index.unwrap_or(0)
+        );
+        let expected_parent_generation = match parent
+            .execution_owner_generation
+            .wait_until_published_or_stopped()
+            .await
+        {
+            ExecutionOwnerGenerationPublication::Acquired(generation) => generation,
+            ExecutionOwnerGenerationPublication::StoppedBeforeAcquisition { .. }
+            | ExecutionOwnerGenerationPublication::Preparing { .. } => {
+                return Err("native stage parent execution stopped".into());
+            }
+        };
+        let policy_content_id = policy
+            .baseline_content_id()
+            .map_err(|error| error.to_string())?;
+        let mut association = astra_services::runs::CollaboratorAssociation {
+            provider: provider.clone(),
+            execution_boundary: astra_services::runs::CollaboratorExecutionBoundary::UserRunner {
+                runner_id: binding.executor.executor_id.clone(),
+            },
+            execution_identity_fingerprint: format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&(
+                        &policy.descriptor,
+                        &policy_content_id,
+                        &request.model,
+                        &binding.executor.executor_id
+                    ))
+                    .map_err(|error| error.to_string())?
+                )
+            ),
+            native_execution: Some(astra_services::runs::CollaboratorNativeExecutionLocator {
+                descriptor: policy.descriptor.clone(),
+                public_tool_name: request.tool.clone(),
+                requested_model: request.model.clone(),
+                policy_content_id: policy_content_id.clone(),
+            }),
+        };
+        let (anchor_run_id, previous, native_session) = if input.collaborator_id.is_some() {
+            let durable = durable_followup.ok_or_else(|| {
+                "native continuation has no authorized durable association".to_string()
+            })?;
+            if durable.association.provider != association.provider
+                || durable.association.execution_boundary != association.execution_boundary
+                || durable.association.execution_identity_fingerprint
+                    != association.execution_identity_fingerprint
+                || durable
+                    .association
+                    .native_execution
+                    .as_ref()
+                    .is_none_or(|locator| {
+                        locator.descriptor != policy.descriptor
+                            || locator.requested_model != request.model
+                            || locator.policy_content_id != policy_content_id
+                    })
+            {
+                return Err("native collaborator selected execution changed".into());
+            }
+            association = durable.association.clone();
+            let native_session = durable.native_session.as_ref().ok_or_else(|| {
+                "native collaborator session is not durably acknowledged".to_string()
+            })?;
+            (
+                durable.latest_stage.anchor_run_id.clone(),
+                Some(durable.latest_stage.run_id.clone()),
+                Some(native_session.native_session_id.clone()),
+            )
+        } else {
+            (String::new(), None, None)
+        };
+        // No parent Offering or parent reasoning defaults enter a native call.
+        let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
+            input.reasoning.as_ref(),
+            None,
+            None,
+        );
+        if input.max_output_tokens.is_some() {
+            return Err("selected native stage has no admitted output-token cap contract".into());
+        }
+        let arguments = native_stage_reasoning_arguments(&provider, &thinking)?;
+        let mut arguments = Value::Object(arguments);
+        arguments["task"] = json!(input.prompt);
+        if let Some(model) = request.model.as_ref() {
+            arguments["model"] = json!(model);
+        }
+        if let Some(native_session) = native_session {
+            arguments["native_session_id"] = json!(native_session);
+        }
+        let request_fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&json!({
+                    "arguments": arguments, "association": association,
+                    "agent_type": input.agent_type, "description": input.description,
+                    "allowed_tools": input.allowed_tools, "initial_turns": input.initial_turns,
+                    "complexity": input.complexity, "work_item": input.work_item,
+                }))
+                .map_err(|error| error.to_string())?
+            )
+        );
+        let native = PreparedNativeSubrunExecution {
+            stage_admission: astra_services::runs::CollaboratorStageAdmission {
+                anchor_run_id,
+                source_message_id,
+                request_fingerprint,
+                expected_previous_stage_run_id: previous,
+                expected_parent_generation,
+                association,
+            },
+            identity: crate::orchestration::PreparedSpawnProviderIdentity {
+                descriptor: policy.descriptor.clone(),
+                decision_id: policy_content_id,
+                execution_binding_generation: binding_generation,
+                requested_model: request.model.clone(),
+            },
+            tool_name: request.tool.clone(),
+            arguments,
+            policy,
+            run_state_store: Arc::clone(engine.store()),
+        };
+        Ok(ServerPreparedSpawn {
+            max_output_tokens: None,
+            executor: Arc::clone(self),
+            parent: parent.clone(),
+            execution: ServerPreparedExecution::Native(native),
+            requested_model_policy: None,
+            resolved_selection: None,
+            thinking,
+            slot: input.fanout_slot_identity()?,
+            delegated_model_requirements,
+        })
+    }
+}
+
+#[derive(Clone)]
+enum ServerPreparedExecution {
+    Internal(astra_services::AdmittedModelExecution),
+    Native(PreparedNativeSubrunExecution),
+}
+
+impl ServerPreparedExecution {
+    fn model(&self) -> Option<&astra_services::AdmittedModelExecution> {
+        match self {
+            Self::Internal(model) => Some(model),
+            Self::Native(_) => None,
+        }
+    }
+}
+
 struct ServerPreparedSpawn {
     max_output_tokens: Option<u32>,
     executor: Arc<ServerSpawnAgentExecutor>,
     parent: ServerSpawnRuntimeContext,
-    execution: astra_services::AdmittedModelExecution,
+    execution: ServerPreparedExecution,
     requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     resolved_selection: Option<ModelSelection>,
     thinking: astra_turn_core::thinking_config::ThinkingConfig,
@@ -20995,11 +21703,26 @@ struct ServerPreparedSpawn {
 
 #[async_trait]
 impl PreparedSpawn for ServerPreparedSpawn {
-    fn model_identity(&self) -> Option<crate::orchestration::PreparedSpawnModelIdentity> {
-        Some(crate::orchestration::PreparedSpawnModelIdentity {
-            offering_id: self.execution.offering_id.clone(),
-            model_name: self.execution.model_name.clone(),
-            provenance: "admission_validated",
+    fn effective_thinking(&self) -> Option<astra_turn_core::thinking_config::ThinkingConfig> {
+        Some(self.thinking.clone())
+    }
+
+    fn execution_identity(&self) -> Option<crate::orchestration::PreparedSpawnIdentity> {
+        Some(match &self.execution {
+            ServerPreparedExecution::Native(native) => {
+                crate::orchestration::PreparedSpawnIdentity::ExternalProvider(
+                    native.identity.clone(),
+                )
+            }
+            ServerPreparedExecution::Internal(model) => {
+                crate::orchestration::PreparedSpawnIdentity::InternalModel(
+                    crate::orchestration::PreparedSpawnModelIdentity {
+                        offering_id: model.offering_id.clone(),
+                        model_name: model.model_name.clone(),
+                        provenance: "admission_validated",
+                    },
+                )
+            }
         })
     }
 
@@ -21033,7 +21756,7 @@ impl PreparedSpawn for ServerPreparedSpawn {
                 return Err("prepared child parent generation is no longer current".to_string());
             }
             self.executor
-                .execute_with_admitted_model(config, self.parent, self.execution)
+                .execute_with_prepared(config, self.parent, self.execution)
                 .await
         }))
     }
@@ -21141,6 +21864,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let guard = sink.guard();
         sink.publish(generation);
         let context = ServerSpawnRuntimeContext {
+            tool_executor: Arc::new(Default::default()),
             model_catalog_reader: None,
             parent_run_id: config.run_id.clone(),
             runtime_context_id: Uuid::new_v4().to_string(),
@@ -21210,6 +21934,82 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let parent = self
             .runtime_context_for_parent_run(&context.parent_run_id)
             .await?;
+        let mut resolved_inputs = std::borrow::Cow::Borrowed(inputs);
+        // Immutable preparation facts read by the canonical association owner,
+        // reused within this batch only; never a restart/multi-node owner.
+        let mut durable_followups = vec![None; inputs.len()];
+        if inputs.iter().any(|input| input.collaborator_id.is_some()) {
+            let engine = self.run_engine.as_ref().ok_or_else(|| {
+                "collaborator continuation requires the canonical RunEngine".to_string()
+            })?;
+            let spawner = parent
+                .spawner
+                .upgrade()
+                .ok_or_else(|| "collaborator supervisor stopped".to_string())?;
+            for (index, input) in resolved_inputs.to_mut().iter_mut().enumerate() {
+                let Some(collaborator_id) = input.collaborator_id.as_deref() else {
+                    continue;
+                };
+                input.validate_execution_request()?;
+                let collaborator = spawner
+                    .get_agent_state_any(collaborator_id)
+                    .await
+                    .ok_or_else(|| {
+                        "original collaborator is not restored in this supervisor".to_string()
+                    })?;
+                let original = engine
+                    .load_run(&parent.user_id, &collaborator.run_id)
+                    .await?
+                    .filter(|run| {
+                        run.session_id == parent.session_id
+                            && run.agent_id.as_deref() == Some(collaborator_id)
+                    })
+                    .ok_or_else(|| {
+                        "original collaborator is outside the authorized session".to_string()
+                    })?;
+                if input.reasoning.is_none() {
+                    input.reasoning = Some(
+                        crate::server::run::engine::durable_run_generation_controls(&original)?
+                            .thinking
+                            .into(),
+                    );
+                }
+                // An Offering is not a restored conversation. Until the
+                // canonical child checkpoint/continuation owner and current
+                // stage mailbox are wired, do not silently launch a fresh
+                // loop under a stable collaborator handle.
+                ensure_collaborator_context_continuation(&original)?;
+                let association = engine
+                    .store()
+                    .load_collaborator_association(
+                        &parent.user_id,
+                        &parent.session_id,
+                        &original.run_id,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        "collaborator has no durable execution association".to_string()
+                    })?;
+                let locator = association
+                    .association
+                    .native_execution
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "native collaborator has no durable execution locator".to_string()
+                    })?;
+                if input.execution.is_none() {
+                    input.execution = Some(
+                        astra_turn_core::orchestration_spawn_tool::ProviderChildExecutionRequest {
+                            tool: locator.public_tool_name.clone(),
+                            model: locator.requested_model.clone(),
+                        },
+                    );
+                }
+                durable_followups[index] = Some(association);
+            }
+        }
+        let inputs = resolved_inputs.as_ref();
         let inherited = parent.admitted_model_execution.as_ref();
         let inherited_selection = inherited.map(|execution| ModelSelection {
             offering_id: execution.offering_id.clone(),
@@ -21219,11 +22019,27 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let mut selectors_to_admit = Vec::new();
         for input in inputs {
             input.fanout_slot_identity()?;
+            input.validate_execution_request()?;
+            if input.execution.is_some() {
+                slot_selectors.push(None);
+                initial_selections.push(None);
+                continue;
+            }
             let selector = crate::orchestration::selector_for_admitted_spawn_input(
                 input,
                 inherited_selection.as_ref(),
             )
             .map_err(|error| error.to_string())?;
+            let selector =
+                if input.collaborator_id.is_some() && input.requested_model_policy.is_none() {
+                    input.resolved_model_selection.as_ref().map(|selection| {
+                        astra_turn_types::ModelSelector::OfferingId {
+                            offering_id: selection.offering_id.clone(),
+                        }
+                    })
+                } else {
+                    selector
+                };
             let selection = match selector.as_ref() {
                 Some(astra_turn_types::ModelSelector::OfferingId { offering_id }) => {
                     astra_services::validate_model_offering_id(offering_id)
@@ -21295,6 +22111,18 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         }
         let mut prepared: Vec<Box<dyn PreparedSpawn>> = Vec::with_capacity(inputs.len());
         for (index, input) in inputs.iter().enumerate() {
+            if input.execution.is_some() {
+                prepared.push(Box::new(
+                    self.prepare_native_spawn(
+                        input,
+                        context,
+                        &parent,
+                        durable_followups[index].as_ref(),
+                    )
+                    .await?,
+                ));
+                continue;
+            }
             let slot = input.fanout_slot_identity()?;
             let selector = slot_selectors[index].as_ref();
             let mut requested_selection = initial_selections[index].clone();
@@ -21337,21 +22165,15 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 )
                 .map_err(|error| error.to_string())?;
             }
-            let delegated_model_requirements = match context.delegation_model_admission.as_ref() {
-                Some(admission) => admission
-                    .child_requirements
-                    .get(input.fanout_slot_index.unwrap_or(0))
-                    .cloned()
-                    .ok_or_else(|| "prepared child requirement slot is missing".to_string())?,
-                None => Default::default(),
-            };
-            delegated_model_requirements
-                .validate()
-                .map_err(str::to_string)?;
+            let delegated_model_requirements =
+                crate::orchestration::spawner::delegated_requirements_for_spawn(input, context)?;
             let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
                 input.reasoning.as_ref(),
                 requested_selection.as_ref(),
-                context.parent_model_reasoning.as_ref(),
+                context
+                    .parent_model_reasoning
+                    .as_ref()
+                    .filter(|_| input.collaborator_id.is_none()),
             );
             let execution = if let Some(execution) = selected_execution {
                 execution
@@ -21393,7 +22215,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 max_output_tokens: input.max_output_tokens,
                 executor: Arc::clone(&self),
                 parent: parent.clone(),
-                execution,
+                execution: ServerPreparedExecution::Internal(execution),
                 requested_model_policy: admitted_input.requested_model_policy,
                 resolved_selection: Some(resolved_selection),
                 thinking,
@@ -21689,12 +22511,13 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
 }
 
 impl ServerSpawnAgentExecutor {
-    async fn execute_with_admitted_model(
+    async fn execute_with_prepared(
         &self,
         config: SpawnRunConfig,
         context: ServerSpawnRuntimeContext,
-        admitted_model_execution: astra_services::AdmittedModelExecution,
+        prepared_execution: ServerPreparedExecution,
     ) -> Result<SpawnRunResult, String> {
+        let admitted_model_execution = prepared_execution.model().cloned();
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
             "server dynamic agent lifecycle is no longer available for this session".to_string()
         })?;
@@ -21721,9 +22544,11 @@ impl ServerSpawnAgentExecutor {
         // capabilities and remains separate in trusted execution context.
         profile.agent_id = config.agent_id.clone();
         profile.system_prompt = Some(spawn_system_prompt(&config));
-        profile.model_selection = Some(ModelSelection {
-            offering_id: admitted_model_execution.offering_id.clone(),
-        });
+        profile.model_selection = admitted_model_execution
+            .as_ref()
+            .map(|model| ModelSelection {
+                offering_id: model.offering_id.clone(),
+            });
         profile.allow_tools = (!config.allowed_tools.iter().any(|tool| tool == "*"))
             .then(|| config.allowed_tools.clone());
         profile.read_only = config.read_only;
@@ -21821,7 +22646,7 @@ impl ServerSpawnAgentExecutor {
             previous_output: None,
             context: subrun_context,
             forward_headers: context.forward_headers.clone(),
-            admitted_model_execution: Some(admitted_model_execution.clone()),
+            admitted_model_execution: admitted_model_execution.clone(),
             prepared_model: None,
             requested_model_policy: config.requested_model_policy.clone(),
             thinking: config.thinking.clone(),
@@ -21851,11 +22676,27 @@ impl ServerSpawnAgentExecutor {
             .build_subrun_executor(
                 child_permissions,
                 config.client_tool_delivery_tx.clone(),
-                Some(&admitted_model_execution),
+                admitted_model_execution.as_ref(),
                 child_runtime_context.edge_tools.clone(),
             )
             .with_provider_scope_bound(context.provider_run_owner.is_some())
+            .with_tool_executor_publication(Arc::clone(&child_runtime_context.tool_executor))
             .with_model_catalog_reader(child_runtime_context.model_catalog_reader.clone());
+        let executor = match prepared_execution {
+            ServerPreparedExecution::Internal(_) => executor,
+            ServerPreparedExecution::Native(mut native) => {
+                if native.stage_admission.anchor_run_id.is_empty() {
+                    native.stage_admission.anchor_run_id = config.run_id.clone();
+                }
+                if native.arguments.get("task").and_then(Value::as_str)
+                    != Some(config.task.as_str())
+                {
+                    return Err("prepared native task changed before launch".into());
+                }
+                native.arguments["anchor_run_id"] = json!(native.stage_admission.anchor_run_id);
+                executor.with_native_execution(native)
+            }
+        };
         let execution = AssertUnwindSafe(executor.execute(subrun))
             .catch_unwind()
             .await;
@@ -21991,6 +22832,8 @@ pub struct ServerSubRunExecutor {
     /// Short-lived material inherited from an already admitted live parent.
     /// Recovery executors leave this empty and re-materialize by durable ID.
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    native_execution: Option<PreparedNativeSubrunExecution>,
+    tool_executor_publication: Option<SpawnToolExecutorPublication>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
@@ -22087,6 +22930,8 @@ impl ServerSubRunExecutor {
             invocation_ledger: None,
             shared_pool: None,
             admitted_model_execution: None,
+            native_execution: None,
+            tool_executor_publication: None,
             edge_callback_ledger,
             edge_connection_pool: None,
             edge_dispatch_service: None,
@@ -22216,6 +23061,360 @@ struct DurableSubrunAdmission {
 }
 
 impl ServerSubRunExecutor {
+    fn with_tool_executor_publication(mut self, publication: SpawnToolExecutorPublication) -> Self {
+        self.tool_executor_publication = Some(publication);
+        self
+    }
+    pub(crate) fn with_native_execution(mut self, native: PreparedNativeSubrunExecution) -> Self {
+        self.admitted_model_execution = None;
+        self.native_execution = Some(native);
+        self
+    }
+
+    async fn execute_native_stage(
+        &self,
+        config: &SubRunConfig,
+        state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
+        plan_mode_active: bool,
+    ) -> Result<crate::turn::agentic_loop::host::AgenticLoopOutcome, astra_core::ClassifiedError>
+    {
+        use crate::server::tool_execution_binding::{
+            ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+        };
+        use crate::server::tool_invocation_runtime::DurableDispatchAdmission;
+        use crate::turn::agentic_loop::host::{AgenticLoopOutcome, ToolLedgerAttemptBatch};
+        use crate::turn::permission_gate::PermissionCheckResult;
+        use astra_turn_types::{
+            DispatchCertainty, ToolInvocationState, ToolInvocationTerminalOutcome,
+        };
+        let invalid = |reason: String| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ToolBinding, reason)
+        };
+        let native = self
+            .native_execution
+            .as_ref()
+            .ok_or_else(|| invalid("native stage has no prepared execution".into()))?;
+        let executor = state
+            .runtime_tool_executor
+            .clone()
+            .ok_or_else(|| invalid("native stage has no canonical tool executor".into()))?;
+        let generation = state
+            .current_run_owner_generation
+            .ok_or_else(|| invalid("native stage has no durable execution owner".into()))?;
+        let engine = self
+            .run_engine
+            .as_ref()
+            .ok_or_else(|| invalid("native stage has no RunEngine".into()))?;
+        if !Arc::ptr_eq(engine.store(), &native.run_state_store) {
+            return Err(invalid(
+                "native association and execution have different RunStateStore owners".into(),
+            ));
+        }
+        let association = native
+            .run_state_store
+            .load_collaborator_association(
+                &config.user_id,
+                &config.session_id,
+                &native.stage_admission.anchor_run_id,
+            )
+            .await
+            .map_err(|error| invalid(error.to_string()))?
+            .ok_or_else(|| invalid("native stage association disappeared".into()))?;
+        if association.association != native.stage_admission.association
+            || association.latest_stage.run_id != config.run_id
+        {
+            return Err(invalid(
+                "native stage association owner was superseded".into(),
+            ));
+        }
+        let args =
+            serde_json::to_string(&native.arguments).map_err(|error| invalid(error.to_string()))?;
+        let stage_deadline = config.execution_deadline.ok_or_else(|| {
+            invalid("native stage requires its server-admitted execution budget".into())
+        })?;
+        let permission_timeout = stage_deadline
+            .monotonic_work_deadline()
+            .saturating_duration_since(Instant::now());
+        if permission_timeout.is_zero() {
+            return Err(invalid(
+                "native stage execution budget expired before permission admission".into(),
+            ));
+        }
+        let permission =
+            crate::turn::permission_gate::check_tool_permission_in_plan_mode_with_provider_policy(
+                &native.tool_name,
+                Some(&args),
+                state.permission_context.as_ref(),
+                state.messaging.mailbox.as_mut(),
+                permission_timeout,
+                plan_mode_active,
+                Some(&native.policy),
+            );
+        let permission = if let Some(token) = config.cancel_token.as_ref() {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => return Ok(AgenticLoopOutcome::Cancelled),
+                permission = permission => permission,
+            }
+        } else {
+            permission.await
+        };
+        let permission_grant = match permission {
+            PermissionCheckResult::Allowed => ToolPermissionGrantSnapshot {
+                source: ToolPermissionGrantSource::Policy,
+                reason: None,
+                updates_hash: None,
+            },
+            PermissionCheckResult::AllowedImplicit { reason } => ToolPermissionGrantSnapshot {
+                source: ToolPermissionGrantSource::ImplicitPolicy,
+                reason: Some(reason),
+                updates_hash: None,
+            },
+            PermissionCheckResult::AllowedViaRequest { new_rules } => ToolPermissionGrantSnapshot {
+                source: ToolPermissionGrantSource::ParentApproval,
+                reason: None,
+                updates_hash: Some(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&new_rules)
+                            .map_err(|error| invalid(error.to_string()))?
+                    )
+                )),
+            },
+            PermissionCheckResult::Denied { reason } => {
+                return Ok(AgenticLoopOutcome::Error(reason));
+            }
+        };
+        const INVOCATION_ID: &str = "native-stage";
+        let control_epoch = i64::try_from(state.user_intents.user_intent_cursor())
+            .map_err(|_| invalid("native stage control epoch overflowed".into()))?;
+        let dispatch_started_at = Instant::now();
+        let deferred = executor
+            .execute_invocation_before_governance(
+                &config.run_id,
+                &config.run_id,
+                INVOCATION_ID,
+                &native.tool_name,
+                &native.arguments,
+                Some(&native.policy),
+                Some(&permission_grant),
+                Some(DurableDispatchAdmission {
+                    expected_control_epoch: control_epoch,
+                    expected_owner_generation: generation,
+                    expected_execution_binding_generation: Some(
+                        native.identity.execution_binding_generation,
+                    ),
+                }),
+                None,
+                None,
+            )
+            .await;
+        let dispatch_control = deferred.dispatch_control;
+        let replayed = deferred.confirmed_invocation.is_some();
+        let replay_record = deferred.confirmed_invocation;
+        let finished = executor
+            .finish_governed_tool_result(
+                runtime_tool_executor::govern_runtime_tool_result(deferred.result, false),
+                deferred.pending,
+            )
+            .await;
+        let record = finished.record.or(replay_record);
+        let result = finished.result;
+        let invocation = record.as_deref().ok_or_else(|| {
+            invalid("native stage result has no authoritative invocation receipt".into())
+        })?;
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            &config.user_id,
+            &config.session_id,
+            &config.run_id,
+            &config.run_id,
+            INVOCATION_ID,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        invocation
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        if invocation.identity != identity
+            || invocation.fingerprint.tool
+                != (astra_turn_types::DurableToolReference::Provider {
+                    descriptor: native.identity.descriptor.clone(),
+                })
+        {
+            return Err(invalid(
+                "native stage receipt does not match its exact prepared invocation".into(),
+            ));
+        }
+        let settled = matches!(
+            invocation.state,
+            ToolInvocationState::Succeeded
+                | ToolInvocationState::Failed
+                | ToolInvocationState::Rejected
+        );
+        let succeeded = invocation.state == ToolInvocationState::Succeeded
+            && invocation.dispatch_certainty == DispatchCertainty::Dispatched
+            && invocation.completion_source.is_none()
+            && matches!(
+                invocation.outcome,
+                Some(ToolInvocationTerminalOutcome::Succeeded { .. })
+            );
+        let mut tool_record = astra_services::session_journal::ToolCallRecord {
+            tool_call_id: Some(INVOCATION_ID.into()),
+            name: native.tool_name.clone(),
+            ok: succeeded,
+            ms: u64::try_from(dispatch_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            disposition: Some(if !settled {
+                astra_services::session_journal::ToolCallDisposition::Deferred
+            } else if replayed {
+                astra_services::session_journal::ToolCallDisposition::Reused
+            } else if invocation.state == ToolInvocationState::Rejected {
+                astra_services::session_journal::ToolCallDisposition::Rejected
+            } else {
+                astra_services::session_journal::ToolCallDisposition::Executed
+            }),
+            result_full: Some(result.output.clone()),
+            ..Default::default()
+        };
+        tool_record.execution_completion = Some(
+            astra_turn_types::task_resolution::ToolExecutionEvidenceRef::Invocation(Box::new(
+                astra_turn_types::ToolInvocationCompletionRef::from_record(invocation)
+                    .map_err(|error| invalid(error.to_string()))?,
+            )),
+        );
+        state.tool_ledger_receipt.observe_round(
+            &ToolLedgerAttemptBatch::from_validated_provider_calls(&[json!({"id": INVOCATION_ID})]),
+            std::slice::from_ref(&tool_record),
+        );
+        state.total_tool_calls = state.total_tool_calls.saturating_add(u32::from(
+            settled
+                && !replayed
+                && invocation.state != ToolInvocationState::Rejected
+                && invocation.dispatch_certainty == DispatchCertainty::Dispatched
+                && invocation.completion_source.is_none(),
+        ));
+        state.stall.tool_call_records.push(tool_record);
+        state.final_text = result.output.clone();
+        if let Some(usage) = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("collaborator_usage"))
+            .filter(|usage| !usage.is_null())
+        {
+            let usage: astra_turn_types::CanonicalTokenUsage =
+                serde_json::from_value(usage.clone())
+                    .map_err(|error| invalid(error.to_string()))?;
+            state.total_prompt = usage.input_tokens().unwrap_or_default();
+            state.total_completion = usage.output_tokens().unwrap_or_default();
+            state.total_cache_read = usage.cached_input_tokens().unwrap_or_default();
+            state.total_cache_creation = usage.cache_creation_tokens().unwrap_or_default();
+            state.has_any_usage = true;
+            state.add_qualified_usage(Some(usage));
+        }
+        if !settled {
+            if config
+                .cancel_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                // Cancellation settles the Run, never the unresolved dispatch.
+                // The canonical ledger keeps its unknown fence for later stages.
+                return Ok(AgenticLoopOutcome::Cancelled);
+            }
+            return Ok(AgenticLoopOutcome::Waiting(
+                "native_invocation_unsettled".into(),
+            ));
+        }
+        let ack = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata.get(astra_services::runs::COLLABORATOR_NATIVE_SESSION_METADATA_KEY)
+            })
+            .filter(|ack| !ack.is_null())
+            .cloned();
+        if succeeded && ack.is_none() {
+            return Err(invalid(
+                "native stage succeeded without acknowledged session metadata".into(),
+            ));
+        }
+        let ack_eligible = succeeded
+            || (invocation.state == ToolInvocationState::Failed
+                && invocation.dispatch_certainty == DispatchCertainty::Dispatched
+                && invocation.completion_source.is_none()
+                && matches!(
+                    invocation.outcome,
+                    Some(ToolInvocationTerminalOutcome::Failed { .. })
+                ));
+        if let Some(ack) = ack.filter(|_| ack_eligible) {
+            let ack: astra_services::runs::CollaboratorNativeSession =
+                serde_json::from_value(ack).map_err(|error| invalid(error.to_string()))?;
+            if ack.anchor_run_id != native.stage_admission.anchor_run_id
+                || ack.provider != association.association.provider
+            {
+                return Err(invalid(
+                    "native session ACK has a different collaborator identity".into(),
+                ));
+            }
+            match association.native_session {
+                Some(existing) if existing != ack => {
+                    return Err(invalid(
+                        "native provider changed its acknowledged session".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => native
+                    .run_state_store
+                    .confirm_collaborator_native_session(&identity, &ack, generation)
+                    .await
+                    .map_err(|error| invalid(error.to_string()))?,
+            }
+        }
+        match dispatch_control {
+            runtime_tool_executor::RuntimeToolDispatchControl::FailedClosed { reason } => {
+                return Err(invalid(reason));
+            }
+            runtime_tool_executor::RuntimeToolDispatchControl::Superseded { .. } => {
+                return Ok(AgenticLoopOutcome::Waiting(
+                    "native_stage_control_superseded".into(),
+                ));
+            }
+            runtime_tool_executor::RuntimeToolDispatchControl::Continue => {}
+        }
+        if config
+            .cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Ok(AgenticLoopOutcome::Cancelled);
+        }
+        if let Some(stage_state) = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("collaborator_stage_state"))
+        {
+            let stage_state: astra_core::SubRunState = serde_json::from_value(stage_state.clone())
+                .map_err(|error| invalid(error.to_string()))?;
+            return match stage_state {
+                astra_core::SubRunState::Completed if succeeded => {
+                    Ok(AgenticLoopOutcome::Completed)
+                }
+                astra_core::SubRunState::Cancelled => Ok(AgenticLoopOutcome::Cancelled),
+                astra_core::SubRunState::Waiting | astra_core::SubRunState::Paused => {
+                    Ok(AgenticLoopOutcome::Waiting("native_stage_waiting".into()))
+                }
+                astra_core::SubRunState::Failed | astra_core::SubRunState::VerificationFailed => {
+                    Ok(AgenticLoopOutcome::Error(result.output))
+                }
+                _ => Err(invalid(
+                    "native stage returned inconsistent terminal state".into(),
+                )),
+            };
+        }
+        Ok(if succeeded {
+            AgenticLoopOutcome::Completed
+        } else {
+            AgenticLoopOutcome::Error(result.output)
+        })
+    }
     fn durable_run_engine(&self) -> Option<RunEngine> {
         self.run_engine.clone()
     }
@@ -22455,6 +23654,10 @@ impl ServerSubRunExecutor {
                 Some(config.agent_profile.agent_id.as_str()),
                 None,
                 crate::server::run::engine::RunStartContext {
+                    collaborator_stage: self
+                        .native_execution
+                        .as_ref()
+                        .map(|native| native.stage_admission.clone()),
                     delegation_authority: config.delegation_authority,
                     interaction_mode: config.interaction_mode,
                     child_runtime_id: Some(config.agent_profile.agent_id.clone()),
@@ -22539,6 +23742,16 @@ impl ServerSubRunExecutor {
         {
             return Err("durable sub-run model requirements changed before execution".into());
         }
+        if self.native_execution.is_some() {
+            if inherited_execution.is_some()
+                || run.model_offering_id.is_some()
+                || run.resolved_model_name.is_some()
+                || config.requested_model_policy.is_some()
+            {
+                return Err("native durable child must not carry an Astra model admission".into());
+            }
+            return Ok((None, durable_controls));
+        }
         let offering_id = run.model_offering_id.as_deref().ok_or_else(|| {
             "durable sub-run is missing its admitted Offering identity".to_string()
         })?;
@@ -22576,6 +23789,16 @@ impl ServerSubRunExecutor {
         &self,
         config: &SubRunConfig,
     ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
+        if self.native_execution.is_some() {
+            if config.prepared_model.is_some()
+                || config.admitted_model_execution.is_some()
+                || config.agent_profile.model_selection.is_some()
+                || config.requested_model_policy.is_some()
+            {
+                return Err("native child must not inherit an Astra Offering".into());
+            }
+            return Ok(None);
+        }
         if let Some(prepared) = config.prepared_model.as_ref() {
             if config
                 .agent_profile
@@ -24077,7 +25300,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             resolved_origin: None,
         };
         loop_state.messaging = MessagingState {
-            mailbox: config.mailbox,
+            mailbox: config.mailbox.take(),
             progress_emitter: config.progress_emitter.clone(),
             ..Default::default()
         };
@@ -24284,6 +25507,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 });
             }
             wire_executor_into_state(executor, &mut loop_state);
+            if let (Some(publication), Some(executor)) =
+                (self.tool_executor_publication.as_ref(), loop_state.runtime_tool_executor.as_ref())
+            {
+                let _ = publication.set(Arc::downgrade(executor));
+            }
         }
 
         configure_runtime_controllers(
@@ -24313,7 +25541,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         let live_started_at = Instant::now();
         let live_agent_id = config.agent_profile.agent_id.clone();
-        let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+        let outcome = if self.native_execution.is_some() {
+            let plan_mode_active = host.plan_mode_active(&loop_state);
+            self.execute_native_stage(&config, &mut loop_state, plan_mode_active).await
+        } else {
+            run_agentic_loop_with_host(&mut host, &mut loop_state).await
+        };
         if local_execution_lease_lost.load(Ordering::Acquire) {
             drop(durable_control_watcher);
             drop(owner_lease_heartbeat.take());

@@ -200,6 +200,9 @@ pub struct ToolPolicySnapshot {
     /// run authority. Never a provider permission or a serialized deadline.
     #[serde(skip)]
     pub admission_deadline: Option<std::time::Instant>,
+    /// Same admitted work cutoff as admission_deadline, for remote transport.
+    #[serde(skip)]
+    pub execution_deadline_unix_ms: Option<u64>,
     pub allowed_tools: Vec<String>,
     pub approval_policy: Option<String>,
     pub network_policy: Option<String>,

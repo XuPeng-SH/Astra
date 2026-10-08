@@ -135,6 +135,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-credentials",
+ "astra-edge",
  "astra-harness",
  "astra-logging",
  "astra-mcp",
@@ -518,6 +519,7 @@ name = "astra-runtime-env"
 version = "0.2.10"
 dependencies = [
  "astra-core",
+ "astra-turn-types",
  "async-trait",
  "serde",
  "serde_json",

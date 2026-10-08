@@ -464,6 +464,16 @@ pub struct ProviderInteractionRespondRequest {
     pub payload: Option<Value>,
 }
 
+/// Correlation for a native question, not permission or generation authority.
+/// The server derives the origin from the active invocation ledger and binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInteractionRequest {
+    pub identity: astra_turn_types::ToolInvocationIdentity,
+    pub edge_agent_id: String,
+    pub interaction: astra_turn_types::ProviderInteractionRequest,
+}
+
 /// `POST /agents/edge` — matches server `EdgeRegisterRequest` (Phase 3 registry).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

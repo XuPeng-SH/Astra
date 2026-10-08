@@ -1,6 +1,8 @@
 //! Cloud edge registry + heartbeat (Phase 3). See `docs/design/multi-agent-cloud-runtime.md` §5.5.
 
 use std::cell::Cell;
+pub(crate) mod native_delivery;
+pub(crate) mod provider_interaction;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

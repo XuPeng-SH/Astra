@@ -3062,6 +3062,9 @@ impl RuntimeToolExecutor {
         request.policy.admission_deadline = self
             .admitted_execution_deadline
             .map(|deadline| deadline.monotonic_work_deadline());
+        request.policy.execution_deadline_unix_ms = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.work_deadline_unix_ms);
         if let Some(offer) = self.selected_offer_for_request(&request, None) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -3096,6 +3099,9 @@ impl RuntimeToolExecutor {
         request.policy.admission_deadline = self
             .admitted_execution_deadline
             .map(|deadline| deadline.monotonic_work_deadline());
+        request.policy.execution_deadline_unix_ms = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.work_deadline_unix_ms);
         if let Some(offer) = self.selected_offer_for_request(&request, resolved_provider_policy) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -7248,6 +7254,7 @@ pub(crate) mod tests {
         cache: astra_turn_types::ResolvedSemanticCacheBaseline,
     ) -> astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
         astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
+            runtime_requirements: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding-a").unwrap(),
@@ -8770,6 +8777,14 @@ pub(crate) mod tests {
         .unwrap();
         let mut request =
             exec.tool_execution_request_for_invocation(&identity, "write_file", &args, None);
+        assert_eq!(
+            request.policy.execution_deadline_unix_ms,
+            Some(deadline.work_deadline_unix_ms)
+        );
+        assert_eq!(
+            request.policy.admission_deadline,
+            Some(deadline.monotonic_work_deadline())
+        );
         request.policy.permission_grant = Some(grant.clone());
         request.policy.admission_snapshot = Some(
             exec.tool_execution_service

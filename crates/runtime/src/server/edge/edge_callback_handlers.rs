@@ -1342,6 +1342,83 @@ pub(crate) async fn post_user_prompt_respond_handler(
 /// This boundary authenticates the run and validates only Astra's generic
 /// envelope. Business payload validation remains the provider's
 /// responsibility when the suspended tool invocation resumes.
+/// Intermediate request, not a terminal `/tools/result` callback. The
+/// authenticated Edge supplies correlation only; Run/ledger own authority.
+pub(crate) async fn post_tool_interaction_request_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<astra_thin_client::ToolInteractionRequest>,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if body.identity.user_id != user.user_id {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Tool interaction crosses authenticated owner",
+        ));
+    }
+    let edge_id = headers
+        .get(astra_thin_client::ASTRA_EDGE_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty() && *value == value.trim())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "Tool interaction requires an Edge identity header",
+            )
+        })?;
+    let edge = state
+        .execution
+        .edge_registry_service
+        .find_by_user_agent_and_workspace(&user.user_id, &body.edge_agent_id, None)
+        .await
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?
+        .filter(|edge| edge.edge_id == edge_id)
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::FORBIDDEN,
+                "Tool interaction is not from the selected registered Edge",
+            )
+        })?;
+    validate_session_id(&body.identity.session_id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    body.interaction
+        .validate()
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Value>(8);
+    let lifecycle = state.execution.run_lifecycle_service.clone();
+    // The response body owns this task. Disconnect aborts only the callback
+    // waiter, never the durable Run or its actual invocation owner.
+    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let result = lifecycle
+            .request_tool_interaction(
+                user.user_id,
+                body.identity,
+                edge.edge_agent_id,
+                body.interaction,
+                Some(tx.clone()),
+            )
+            .await;
+        let final_event = match result {
+            Ok(response) => {
+                serde_json::json!({"type":"tool_interaction_response", "response":response})
+            }
+            Err((status, _)) => serde_json::json!({
+                "type":"error", "code":"tool_interaction_rejected", "status":status.as_u16(),
+                "message":"Tool interaction could not be completed"
+            }),
+        };
+        let _ = tx.send(final_event).await;
+    }));
+    let stream = futures_util::stream::unfold((rx, task), |(mut rx, task)| async move {
+        rx.recv().await.map(|event| {
+            let event = axum::response::sse::Event::default().data(event.to_string());
+            (Ok::<_, std::convert::Infallible>(event), (rx, task))
+        })
+    });
+    use axum::response::IntoResponse;
+    Ok(axum::response::Sse::new(stream).into_response())
+}
+
 pub(crate) async fn post_provider_interaction_respond_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
@@ -1363,21 +1440,6 @@ pub(crate) async fn post_provider_interaction_respond_handler(
             ),
         )
         .await?;
-    let callback_owner = match &principal.origin {
-        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
-            astra_services::runs::ProviderRunOwner {
-                provider_id: context.provider_id.clone(),
-                provider_scope_id: context.provider_scope_id.clone(),
-            }
-        }
-        astra_services::AuthPrincipalOrigin::Internal
-        | astra_services::AuthPrincipalOrigin::VerifiedProvider { .. } => {
-            return Err(error_response(
-                StatusCode::FORBIDDEN,
-                "Provider interaction responses require provider authorization",
-            ));
-        }
-    };
     let body =
         serde_json::from_slice::<astra_thin_client::ProviderInteractionRespondRequest>(&body)
             .map_err(|error| {
@@ -1386,7 +1448,7 @@ pub(crate) async fn post_provider_interaction_respond_handler(
                     format!("Provider interaction response payload is invalid: {error}"),
                 )
             })?;
-    let user = principal.user;
+    let user = &principal.user;
     let run_id = body.run_id.as_str();
     let session_id = body.session_id.as_str();
     let request_id = body.request_id.as_str();
@@ -1490,23 +1552,73 @@ pub(crate) async fn post_provider_interaction_respond_handler(
             "Provider interaction request identity does not match its durable event",
         ));
     }
-    let required_owner: astra_services::runs::ProviderRunOwner = serde_json::from_value(
-        required
-            .pointer("/data/provider_run_owner")
-            .cloned()
-            .unwrap_or(Value::Null),
-    )
-    .map_err(|error| {
-        error_response(
-            StatusCode::CONFLICT,
-            format!("Provider interaction has an invalid owner boundary: {error}"),
-        )
-    })?;
-    if required_owner != callback_owner {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "Provider interaction is owned by a different provider scope",
-        ));
+    match (
+        required.pointer("/data/provider_run_owner"),
+        required.pointer("/data/tool_invocation_origin"),
+    ) {
+        (Some(owner), None) => {
+            let astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) =
+                &principal.origin
+            else {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Provider interaction responses require provider authorization",
+                ));
+            };
+            let required_owner: astra_services::runs::ProviderRunOwner =
+                serde_json::from_value(owner.clone()).map_err(|error| {
+                    error_response(
+                        StatusCode::CONFLICT,
+                        format!("Provider interaction has an invalid owner boundary: {error}"),
+                    )
+                })?;
+            if required_owner
+                != (astra_services::runs::ProviderRunOwner {
+                    provider_id: context.provider_id.clone(),
+                    provider_scope_id: context.provider_scope_id.clone(),
+                })
+            {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Provider interaction is owned by a different provider scope",
+                ));
+            }
+        }
+        (None, Some(origin)) => {
+            if !matches!(
+                &principal.origin,
+                astra_services::AuthPrincipalOrigin::Internal
+            ) {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Remote tool interaction requires its authenticated user",
+                ));
+            }
+            let origin: astra_services::runs::ToolInvocationInteractionOrigin =
+                serde_json::from_value(origin.clone()).map_err(|error| {
+                    error_response(
+                        StatusCode::CONFLICT,
+                        format!("Tool interaction has an invalid durable origin: {error}"),
+                    )
+                })?;
+            if origin.identity.user_id != user.user_id
+                || origin.identity.session_id != session_id
+                || origin.identity.run_id != run_id
+            {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Tool interaction crosses its durable owner boundary",
+                ));
+            }
+            // Active invocation/binding/generation are rechecked by the
+            // existing store resolution transaction, not this observation.
+        }
+        _ => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Provider interaction must have exactly one durable origin",
+            ));
+        }
     }
     let expected_session_id = required
         .pointer("/data/session_id")

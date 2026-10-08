@@ -1,7 +1,7 @@
 # Capability provider runtime
 
 > Status: target design contract.
-> Last updated: 2026-07-16.
+> Last updated: 2026-10-09.
 
 This document defines Astra's protocol-independent provider, tool identity,
 discovery snapshot, invocation, and typed outcome contracts. It is a detailed
@@ -230,6 +230,31 @@ Snapshot construction must:
 - preserve optional versus explicitly false claims;
 - derive versions/hashes from semantic content, not timestamps or process IDs;
 - exclude volatile health samples and call statistics from descriptor hashes.
+
+### Authenticated local-runtime discovery
+
+Runtime advertisements use schema version 2 and carry an explicit
+`provider_discovery` array, including an empty array when no dynamic provider is
+declared. Missing discovery is not inferred from public tool schemas. Local
+snapshots use the `cli-local` discovery protocol, the authenticated executor as
+provider identity, and the materialization/root physical identity as binding.
+
+Server admission resolves the selected authenticated registration through the
+same conservative resolver as other providers and installs one combined policy
+index. Authentication proves provenance, not claim trust or permission. Recovery
+retains the admitted snapshot through the existing checkpoint; current dispatch
+must still reject a changed descriptor, capability or materialization.
+
+The qualified `astra.runtimeRequirements` extension declares an executable and
+a bounded set of runtime read dependencies. It does not grant access. A frozen
+execution ceiling limits workspace, network and runtime reads; local approval
+and sensitive-path denials still apply independently. The current ceiling cannot
+represent restricted filesystem allowlists or stronger isolation guarantees and
+must reject them rather than project them into unrestricted workspace reads.
+
+These contracts do not imply that a particular external collaborator is ready
+for end-user use; its production entrypoint and complete journey need separate
+verification.
 
 ### Provider claims
 

@@ -11,6 +11,25 @@ pub const AGENT_ACTIONS: &[&str] = &[
 ];
 pub const AGENT_ACTIONS_DISPLAY: &str = "spawn, list, get_result, wait, run_chain, send_message";
 
+pub const AGENT_SPAWN_FIELDS: &[&str] = &[
+    "action",
+    "description",
+    "prompt",
+    "agent_type",
+    "requested_model_policy",
+    "reasoning",
+    "name",
+    "initial_turns",
+    "max_output_tokens",
+    "complexity",
+    "isolated",
+    "allowed_tools",
+    "inherit_prefix",
+    "work_item",
+    "execution",
+    "collaborator_id",
+];
+
 pub const AGENT_WAIT_DEFAULT_MS: u64 = 30_000;
 pub const AGENT_WAIT_MAX_MS: u64 = 300_000;
 

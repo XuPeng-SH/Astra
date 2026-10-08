@@ -1431,6 +1431,24 @@ fn requested_model_policy_schema() -> Value {
     })
 }
 
+fn provider_child_execution_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Use a currently available provider-owned agent tool, not an Astra model Offering. Omit for normal internal model execution. Do not combine with requested_model_policy.",
+        "properties": {
+            "tool": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Exact tool name from the current capability surface; never a shell command or executable path."},
+            "model": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional model requested from that tool. Not an Astra Offering or proof of the model actually used."}
+        },
+        "required": ["tool"]
+    })
+}
+
+fn collaborator_identity_schema() -> Value {
+    json!({"type": "string", "minLength": 1, "maxLength": 256,
+        "description": "Resume the exact runtime-generated collaborator identity from an earlier launch, keeping its conversation. Never supply a third-party session ID or a made-up name. This starts a new independently settled stage, not a replay of its previous result."})
+}
+
 fn fanout_reasoning_schema() -> Value {
     json!({
         "description": "Optional reasoning override only for the children the user requests it for; never copy one child's control to another. Shared defaults apply only to requirements common to all slots. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
@@ -1442,6 +1460,112 @@ fn fanout_reasoning_schema() -> Value {
             {"properties": {"mode": {"const": "enabled"}, "budget_tokens": {"type": "integer", "minimum": 1024, "maximum": 4294967295_u64}}, "required": ["budget_tokens"], "additionalProperties": false},
             {"properties": {"mode": {"const": "adaptive"}, "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]}}, "required": ["effort"], "additionalProperties": false}
         ]
+    })
+}
+
+fn agent_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "x-astra-action-surfaces": {
+            "spawn": ["local", "server"],
+            "list": ["local", "server"],
+            "get_result": ["local", "server"],
+            "wait": ["local", "server"],
+            "run_chain": ["local"],
+            "send_message": ["local", "server"]
+        },
+        "x-astra-surface-descriptions": {
+            "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
+        },
+        "x-astra-surface-discovery-summaries": {
+            "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question"
+        },
+        "x-astra-per-action-discovery-summaries": {
+            "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+            "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
+            "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
+            "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
+            "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
+            "send_message": "action+to+message; child asks parent via to=parent, message_type=question (not ask_user); parent answers with the exact request_id"
+        },
+        "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+        "properties": {
+            "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
+            "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "description": "run_chain steps.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "args": {"type": "object"},
+                        "output_key": {"type": "string"},
+                        "skip_if_prev_contains": {"type": "string"}
+                    },
+                    "required": ["tool", "args"]
+                }
+            },
+            "description": {"type": "string", "description": "Short operation description when required by the selected action."},
+            "prompt": {"type": "string", "description": "Full self-contained child brief: preserve constraints, conditional mappings and exact output requirements. Keep parent-only reporting outside the brief: the parent reports execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; parent uses model/status receipts."},
+            "agent_type": delegation_agent_type_schema(),
+            "requested_model_policy": requested_model_policy_schema(),
+            "reasoning": fanout_reasoning_schema(),
+            "execution": provider_child_execution_schema(),
+            "collaborator_id": collaborator_identity_schema(),
+            "name": {"type": "string", "description": "Action label when accepted by the selected action."},
+            "input": {"type": "object", "description": "Optional run_chain template input."},
+            "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
+            "initial_turns": {"type": "integer", "minimum": 1, "description": "Optional first execution slice; renewable while progress continues. This is not a hard limit. When complexity is also present, the smaller initial slice wins."},
+            "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first child request output-token ceiling."},
+            "inherit_prefix": {
+                "type": ["object", "null"],
+                "description": "Parent prefix inheritance request. The Server child executor does not support inheritance and rejects explicit requests regardless of required. Omit for a fresh child context.",
+                "properties": {
+                    "from_run_id": {"type": ["string", "null"]},
+                    "required": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            },
+            "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Initial-slice hint: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller initial_turns hint."},
+            "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
+            "work_item": {
+                "type": "object",
+                "description": "Optional exact canonical WorkItem revision assigned to this child. Use an item returned by start_work or inspect_work_plan; the server verifies current Work membership and derives the attempt from the child run.",
+                "properties": {
+                    "item_id": {"type": "string", "minLength": 1},
+                    "item_revision": {"type": "integer", "minimum": 1}
+                },
+                "required": ["item_id", "item_revision"],
+                "additionalProperties": false
+            },
+            "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
+            "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
+            "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
+            "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
+            "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
+        },
+        "required": ["action"],
+        "additionalProperties": false,
+        "x-astra-per-action-required": {
+            "spawn": ["description", "prompt"],
+            "run_chain": ["name", "description", "steps"],
+            "get_result": ["agent_id"],
+            "list": [],
+            "wait": [],
+            "send_message": ["to", "message"]
+        },
+        "x-astra-per-action-allowed": {
+            "spawn": crate::agent_tool_contract::AGENT_SPAWN_FIELDS,
+            "get_result": ["action", "agent_id"],
+            "list": ["action", "agent_id"],
+            "wait": ["action", "timeout_ms"],
+            "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
+            "send_message": ["action", "to", "message", "message_type", "request_id"]
+        }
     })
 }
 
@@ -2009,107 +2133,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - When no canonical Work exists and the current turn requires durable task tracking, establish it with `start_work` before delegating. When canonical Work already exists, keep that Work as the durable scope rather than trying to create another one. `agent` and `agent_fanout` do not themselves create or replace a canonical task list.
          - `start_work` may return `initial_task`, and `settle_work_item` may return `next_task`. Each is already the server-selected primary-session assignment: execute it directly. Call `run_next_work_item({})` only when neither response supplied an assignment. Treat an assigned task's expected result as its stop boundary: gather sufficient direct evidence, settle immediately when satisfied, and do not expand into adjacent investigation. Generic `agent` and `agent_fanout` are reserved for real isolation or parallelism boundaries; a WorkItem alone is not a delegation reason.
          - Background task tools only observe or control execution; they are not a planning system.",
-                "parameters": {
-                    "type": "object",
-                    "x-astra-action-surfaces": {
-                        "spawn": ["local", "server"],
-                        "list": ["local", "server"],
-                        "get_result": ["local", "server"],
-                        "wait": ["local", "server"],
-                        "run_chain": ["local"],
-                        "send_message": ["local", "server"]
-                    },
-                    "x-astra-surface-descriptions": {
-                        "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
-                    },
-                    "x-astra-surface-discovery-summaries": {
-                        "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question"
-                    },
-                    "x-astra-per-action-discovery-summaries": {
-                        "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
-                        "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
-                        "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
-                        "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
-                        "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
-                        "send_message": "action+to+message; child asks parent via to=parent, message_type=question (not ask_user); parent answers with the exact request_id"
-                    },
-                    "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
-                        "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
-                        "steps": {
-                            "type": "array",
-                            "minItems": 1,
-                            "description": "run_chain steps.",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "tool": {"type": "string"},
-                                    "args": {"type": "object"},
-                                    "output_key": {"type": "string"},
-                                    "skip_if_prev_contains": {"type": "string"}
-                                },
-                                "required": ["tool", "args"]
-                            }
-                        },
-                        "description": {"type": "string", "description": "Short operation description when required by the selected action."},
-                        "prompt": {"type": "string", "description": "Full self-contained child brief: preserve constraints, conditional mappings and exact output requirements. Keep parent-only reporting outside the brief: the parent reports execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; parent uses model/status receipts."},
-                        "agent_type": delegation_agent_type_schema(),
-                        "requested_model_policy": requested_model_policy_schema(),
-                        "reasoning": fanout_reasoning_schema(),
-                        "name": {"type": "string", "description": "Action label when accepted by the selected action."},
-                        "input": {"type": "object", "description": "Optional run_chain template input."},
-                        "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
-                        "initial_turns": {"type": "integer", "minimum": 1, "description": "Optional first execution slice; renewable while progress continues. This is not a hard limit. When complexity is also present, the smaller initial slice wins."},
-                        "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first child request output-token ceiling."},
-                        "inherit_prefix": {
-                            "type": ["object", "null"],
-                            "description": "Parent prefix inheritance request. The Server child executor does not support inheritance and rejects explicit requests regardless of required. Omit for a fresh child context.",
-                            "properties": {
-                                "from_run_id": {"type": ["string", "null"]},
-                                "required": {"type": "boolean"}
-                            },
-                            "additionalProperties": false
-                        },
-                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Initial-slice hint: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller initial_turns hint."},
-                        "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
-                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
-                        "work_item": {
-                            "type": "object",
-                            "description": "Optional exact canonical WorkItem revision assigned to this child. Use an item returned by start_work or inspect_work_plan; the server verifies current Work membership and derives the attempt from the child run.",
-                            "properties": {
-                                "item_id": {"type": "string", "minLength": 1},
-                                "item_revision": {"type": "integer", "minimum": 1}
-                            },
-                            "required": ["item_id", "item_revision"],
-                            "additionalProperties": false
-                        },
-                        "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
-                        "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
-                        "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
-                        "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
-                        "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
-                    },
-                    "required": ["action"],
-                    "additionalProperties": false,
-                    "x-astra-per-action-required": {
-                        "spawn": ["description", "prompt"],
-                        "run_chain": ["name", "description", "steps"],
-                        "get_result": ["agent_id"],
-                        "list": [],
-                        "wait": [],
-                        "send_message": ["to", "message"]
-                    },
-                    "x-astra-per-action-allowed": {
-                        "spawn": ["action", "description", "prompt", "agent_type", "requested_model_policy", "reasoning", "name", "initial_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
-                        "get_result": ["action", "agent_id"],
-                        "list": ["action", "agent_id"],
-                        "wait": ["action", "timeout_ms"],
-                        "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
-                        "send_message": ["action", "to", "message", "message_type", "request_id"]
-                    }
-                }
+                "parameters": agent_parameters_schema()
             }
         }),
         json!({
@@ -2154,7 +2178,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                     "allowed_tools": {"type": "array", "items": {"type": "string"}},
                                     "requested_model_policy": requested_model_policy_schema(),
-                                    "reasoning": fanout_reasoning_schema()
+                                    "reasoning": fanout_reasoning_schema(),
+                                    "execution": provider_child_execution_schema(),
+                                    "collaborator_id": collaborator_identity_schema()
                                 },
                                 "required": ["description", "prompt"]
                             }
@@ -2171,7 +2197,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
                                 "requested_model_policy": requested_model_policy_schema(),
-                                "reasoning": fanout_reasoning_schema()
+                                "reasoning": fanout_reasoning_schema(),
+                                "execution": provider_child_execution_schema()
                             }
                         },
                         "slot_index": {"type": "integer", "minimum": 0, "description": "REQUIRED for stop_slot. Optional for get_results to read one slot result window."},

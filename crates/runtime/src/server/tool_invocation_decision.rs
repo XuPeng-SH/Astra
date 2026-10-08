@@ -639,6 +639,7 @@ mod tests {
         semantic_cache: ResolvedSemanticCacheBaseline,
     ) -> ResolvedInvocationPolicy {
         ResolvedInvocationPolicy {
+            runtime_requirements: None,
             descriptor: ResolvedToolDescriptorRef::new(
                 ToolIdentity::new(
                     ProviderBindingRef::new("provider-binding").unwrap(),

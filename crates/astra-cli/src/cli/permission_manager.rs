@@ -263,6 +263,10 @@ fn content_aware_fingerprint(
 ) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
     use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
 
+    if let Some(fingerprint) = native_bootstrap_fingerprint(name, args) {
+        return fingerprint;
+    }
+
     match cloud_gated_tool_kind_with_args(name, Some(args)) {
         Some(CloudGatedToolKind::Execute) => {
             if let Some(cmd) = command_hint_from_args(args) {
@@ -279,6 +283,23 @@ fn content_aware_fingerprint(
         }
         None => ApprovalFingerprint::bare(name),
     }
+}
+
+// Native bootstrap approval is tied to a frozen declaration and exact path,
+// unlike ordinary remembered sandbox expansion. Never mint a bare override
+// that would silently authorize another provider installation.
+fn native_bootstrap_fingerprint(
+    name: &str,
+    args: &serde_json::Value,
+) -> Option<astra_turn_core::approval_fingerprint::ApprovalFingerprint> {
+    if name != "sandbox_expand:native_codex" {
+        return None;
+    }
+    let hash = args.get("provider_snapshot_hash")?.as_str()?;
+    let binding = args.get("provider_binding")?.as_str()?;
+    let path = args.get("directory")?.as_str()?;
+    let key = serde_json::to_string(&(name, hash, binding, path)).ok()?;
+    Some(astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(&key))
 }
 
 fn file_write_fingerprint_tool(tool_name: &str) -> &str {
@@ -343,7 +364,8 @@ fn approval_lookup_fingerprint_candidates(
 ) -> Vec<astra_turn_core::approval_fingerprint::ApprovalFingerprint> {
     use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
 
-    let primary = approval_lookup_fingerprint(name, args);
+    let primary = native_bootstrap_fingerprint(name, args)
+        .unwrap_or_else(|| approval_lookup_fingerprint(name, args));
     let mut candidates = vec![primary.clone()];
     if matches!(
         cloud_gated_tool_kind_with_args(name, Some(args)),

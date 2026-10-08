@@ -3236,11 +3236,11 @@ impl DelegationEngine {
                 spawn_tool_call_id: None,
                 fanout_slot: None,
                 execution_metadata: config.execution_metadata.clone(),
-                prepared_model: config.prepared_model.as_ref().map(|model| PreparedSpawnModelIdentity {
+                prepared_execution: config.prepared_model.as_ref().map(|model| crate::orchestration::PreparedSpawnIdentity::InternalModel(PreparedSpawnModelIdentity {
                     offering_id: model.offering_id.clone(),
                     model_name: model.model_name.clone(),
                     provenance: "delegation_admission",
-                }),
+                })),
             };
             spawner.adopt_precreated_child(state).await.map_err(|error| error.to_string())?;
             adopted = true;
@@ -11812,7 +11812,11 @@ mod tests {
                     ))
                     .await
                     .unwrap();
-                let prepared = state.prepared_model.unwrap();
+                let Some(crate::orchestration::PreparedSpawnIdentity::InternalModel(prepared)) =
+                    state.prepared_execution
+                else {
+                    panic!("delegation must preserve its admitted internal model");
+                };
                 assert_eq!(prepared.offering_id, "opaque-offering-id");
                 assert_eq!(prepared.model_name, model);
                 assert_eq!(prepared.provenance, "delegation_admission");
