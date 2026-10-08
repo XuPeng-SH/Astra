@@ -23,6 +23,63 @@ use tokio::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
+/// Convert an API/server base URL into the WebSocket endpoint used by Edge
+/// owners. CLI hosts use this same conversion so HTTP configuration and native
+/// delivery cannot silently diverge.
+pub fn edge_ws_url(server_url: &str) -> Result<String, String> {
+    let trimmed = server_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("server URL must not be empty".to_string());
+    }
+    let with_ws_scheme = if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        trimmed.to_string()
+    } else if trimmed.contains("://") {
+        return Err(format!(
+            "unsupported server URL scheme in '{trimmed}'; use http(s):// or ws(s)://"
+        ));
+    } else {
+        format!("ws://{trimmed}")
+    };
+
+    let mut url = reqwest::Url::parse(&with_ws_scheme)
+        .map_err(|_| format!("invalid server URL '{server_url}'"))?;
+    if !matches!(url.scheme(), "ws" | "wss") {
+        return Err(format!(
+            "unsupported edge WebSocket URL scheme '{}'; use ws:// or wss://",
+            url.scheme()
+        ));
+    }
+    url.set_path(&normalized_edge_ws_path(url.path()));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn normalized_edge_ws_path(path: &str) -> String {
+    let segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() {
+        return "/edge/ws".to_string();
+    }
+
+    if let Some(index) = segments
+        .windows(2)
+        .position(|window| window == ["edge", "ws"])
+    {
+        return format!("/{}", segments[..index + 2].join("/"));
+    }
+
+    format!("/{}/edge/ws", segments.join("/"))
+}
+
 pub type EdgeConnectionError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]

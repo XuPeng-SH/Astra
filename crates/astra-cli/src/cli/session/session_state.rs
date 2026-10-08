@@ -518,6 +518,16 @@ pub(crate) struct SessionState {
     pub tui_approval_request_tx: Option<crate::cli::chat_stream::ApprovalRequestTx>,
     /// When set, ask_user requests are rendered by the native TUI overlay.
     pub tui_ask_user_request_tx: Option<crate::cli::chat_stream::AskUserRequestTx>,
+    /// Session-owned native collaborator delivery. The transport is kept
+    /// outside the turn future so a long external stage can outlive one
+    /// foreground turn without becoming a second lifecycle owner.
+    pub(crate) native_delivery:
+        Option<crate::cli::edge_lifecycle::native_delivery::NativeDeliveryHandle>,
+    pub(crate) native_delivery_session_id: Option<String>,
+    pub(crate) native_delivery_attachment_epoch: Option<u64>,
+    /// Set by the interactive surface. Turn cancellation must never cancel
+    /// native delivery; only session shutdown or attachment replacement does.
+    pub(crate) native_delivery_shutdown: Option<tokio_util::sync::CancellationToken>,
     /// When set, `exit_plan_mode` surfaces its 4-way plan-review
     /// overlay through the native TUI instead of headless / inquire
     /// prompts. Independent of `tui_ask_user_request_tx` because the
@@ -664,6 +674,10 @@ impl Default for SessionState {
             active_turn_local_run_control: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tui_approval_request_tx: None,
             tui_ask_user_request_tx: None,
+            native_delivery: None,
+            native_delivery_session_id: None,
+            native_delivery_attachment_epoch: None,
+            native_delivery_shutdown: None,
             tui_plan_review_request_tx: None,
             pending_bg_notifications: Vec::new(),
             bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -696,6 +710,11 @@ impl SessionState {
     }
 
     fn advance_session_attachment(&mut self) {
+        if let Some(handle) = self.native_delivery.as_ref() {
+            // The handle remains stored so the next attachment can await
+            // transport settlement before publishing a replacement.
+            handle.cancel();
+        }
         self.session_attachment_epoch = self
             .session_attachment_epoch
             .checked_add(1)

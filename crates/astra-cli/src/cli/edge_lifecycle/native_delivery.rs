@@ -39,8 +39,22 @@ impl Drop for NativeDeliveryHandle {
 }
 
 impl NativeDeliveryHandle {
-    pub(crate) async fn shutdown(mut self) {
+    pub(crate) fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        self.cancel();
+        self.wait().await;
+    }
+
+    async fn wait(&mut self) {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -619,9 +633,182 @@ async fn connect_native_delivery(
     Ok(handle)
 }
 
+fn native_journal_path(session_id: &str) -> PathBuf {
+    astra_services::session_journal::journal_file_path(session_id)
+        .with_extension("native-edge.jsonl")
+}
+
+/// Install the selected CLI capacity only after the canonical interactive
+/// session identity exists. The turn boundary is the existing owner for this
+/// one-time preparation; the handle itself remains owned by SessionState until
+/// the session attachment changes or the TUI shuts down.
+pub(crate) async fn ensure_session_native_delivery(
+    state: &mut crate::cli::session::session_state::SessionState,
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: &str,
+) {
+    let attachment_epoch = state.session_attachment_epoch;
+    let ready = state.native_delivery.as_ref().is_some_and(|handle| {
+        !handle.is_finished()
+            && state.native_delivery_session_id.as_deref() == Some(session_id)
+            && state.native_delivery_attachment_epoch == Some(attachment_epoch)
+    });
+    if ready {
+        return;
+    }
+
+    if let Some(handle) = state.native_delivery.take() {
+        handle.shutdown().await;
+    }
+    state.native_delivery_session_id = None;
+    state.native_delivery_attachment_epoch = None;
+
+    let Some(shutdown) = state.native_delivery_shutdown.clone() else {
+        // Headless/line callers have no interactive delivery owner. They
+        // continue through the ordinary canonical turn path unchanged.
+        return;
+    };
+    if shutdown.is_cancelled() {
+        return;
+    }
+
+    let account_id = state
+        .ingestion_user_id
+        .clone()
+        .or_else(crate::cli::cli_config::cli_utils::cli_account_id);
+    let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
+        tracing::debug!("native collaborator delivery skipped: account identity unavailable");
+        return;
+    };
+    let base_edge_agent_id = match crate::cli::chat_stream::try_edge_executor_instance_id() {
+        Ok(id) => id.to_owned(),
+        Err(error) => {
+            tracing::warn!(%error, "native collaborator delivery skipped: Edge identity unavailable");
+            return;
+        }
+    };
+    // The ordinary CLI registration and native collaborator socket share the
+    // live process-scoped identity. Different TUI processes in one checkout
+    // therefore cannot replace each other's connection.
+    let edge_agent_id = base_edge_agent_id;
+    let root = match std::env::current_dir()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+    {
+        Some(root) => root,
+        None => {
+            tracing::warn!("native collaborator delivery skipped: workspace is unavailable");
+            return;
+        }
+    };
+    let materialization_id = match astra_runtime_env::load_or_create_materialization_id(&root) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, "native collaborator delivery skipped: materialization is unavailable");
+            return;
+        }
+    };
+
+    let mut executor = ToolExecutor::new(root.clone())
+        .with_active_session_id(session_id.to_owned())
+        .with_cloud(api.api_origin(), token.to_owned())
+        .with_shared_file_journal(state.file_journal.clone())
+        .with_shared_file_state(state.file_state.clone())
+        .with_shared_database_snapshot_journal(state.database_snapshot_journal.clone())
+        .with_shared_git_worktree_journal(state.git_worktree_journal.clone())
+        .with_shared_session_state_journal(state.session_state_journal.clone())
+        .with_bg_task_commands(state.bg_task_commands.clone())
+        .with_bg_task_list_cache(state.bg_task_list_cache.clone())
+        .with_bash_detach_slot(state.bash_detach_slot.clone());
+    if let Some(observability) = state.observability_session.clone() {
+        executor = executor.with_observability_session(observability);
+    }
+
+    let config = NativeDeliveryConfig {
+        websocket_url: match astra_edge::edge_ws_url(&api.api_origin()) {
+            Ok(url) => url,
+            Err(error) => {
+                tracing::warn!(%error, "native collaborator delivery skipped: invalid WebSocket endpoint");
+                return;
+            }
+        },
+        api: api.clone(),
+        auth: token.to_owned(),
+        account_id,
+        edge_agent_id: edge_agent_id.clone(),
+        edge_transport_id: edge_agent_id,
+        workspace_id: None,
+        materialization_id,
+        journal_path: native_journal_path(session_id),
+        executor: Arc::new(executor),
+        ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
+        permission_policy: state.perm_manager.subscribe_permission_policy(),
+        approval_request_tx: state.tui_approval_request_tx.clone(),
+    };
+
+    let task_cancel = shutdown.child_token();
+    let task_session_id = session_id.to_owned();
+    let install_cancel = task_cancel.clone();
+    let supervisor_cancel = task_cancel.clone();
+    let task = tokio::spawn(async move {
+        let result = install_native_delivery(
+            config,
+            Instant::now() + std::time::Duration::from_secs(10),
+            &install_cancel,
+        )
+        .await;
+        match result {
+            Ok(mut delivery) => {
+                // Keep the actual Edge owner alive inside the session-owned
+                // supervisor. Dropping the returned handle would cancel its
+                // connection immediately after successful publication.
+                tokio::select! {
+                    _ = supervisor_cancel.cancelled() => delivery.shutdown().await,
+                    _ = delivery.wait() => {}
+                }
+            }
+            Err(error) => {
+                // Discovery is optional capacity. A failed native install must
+                // not turn an ordinary Astra turn into a false failure; the
+                // server simply cannot select this capacity until a later turn.
+                tracing::warn!(session_id = %task_session_id, %error, "native collaborator delivery unavailable");
+            }
+        }
+    });
+    state.native_delivery = Some(NativeDeliveryHandle {
+        cancellation: task_cancel,
+        task: Some(task),
+    });
+    state.native_delivery_session_id = Some(session_id.to_owned());
+    state.native_delivery_attachment_epoch = Some(attachment_epoch);
+    tracing::info!(
+        session_id,
+        attachment_epoch,
+        "native collaborator delivery startup scheduled"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_journal_is_a_session_sibling_file() {
+        let session_id = "session-test";
+        let journal = native_journal_path(session_id);
+        assert_eq!(
+            journal.parent(),
+            astra_services::session_journal::journal_file_path(session_id).parent()
+        );
+        assert!(
+            journal
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".native-edge.jsonl"))
+        );
+    }
+
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use crate::cli::session::session_state::SessionState;
     use astra_turn_types::{NativeToolId, ProviderRuntimeRequirements, ProviderToolDeclaration};

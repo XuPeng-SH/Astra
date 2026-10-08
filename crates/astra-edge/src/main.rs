@@ -145,62 +145,6 @@ fn default_server_url() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:17001".to_string())
 }
 
-fn edge_ws_url(server_url: &str) -> Result<String, String> {
-    let trimmed = server_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("server URL must not be empty".to_string());
-    }
-    let with_ws_scheme = if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
-        trimmed.to_string()
-    } else if trimmed.contains("://") {
-        return Err(format!(
-            "unsupported server URL scheme in '{trimmed}'; use http(s):// or ws(s)://"
-        ));
-    } else {
-        format!("ws://{trimmed}")
-    };
-
-    if let Ok(mut url) = reqwest::Url::parse(&with_ws_scheme) {
-        if !matches!(url.scheme(), "ws" | "wss") {
-            return Err(format!(
-                "unsupported edge WebSocket URL scheme '{}'; use ws:// or wss://",
-                url.scheme()
-            ));
-        }
-        url.set_path(&normalized_edge_ws_path(url.path()));
-        url.set_query(None);
-        url.set_fragment(None);
-        Ok(url.to_string())
-    } else {
-        Err(format!("invalid server URL '{server_url}'"))
-    }
-}
-
-fn normalized_edge_ws_path(path: &str) -> String {
-    let segments = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-
-    if segments.is_empty() {
-        return "/edge/ws".to_string();
-    }
-
-    if let Some(index) = segments
-        .windows(2)
-        .position(|window| window == ["edge", "ws"])
-    {
-        return format!("/{}", segments[..index + 2].join("/"));
-    }
-
-    format!("/{}/edge/ws", segments.join("/"))
-}
-
 fn token_from_credentials(
     creds: &CredentialsFile,
     profile_override: Option<&str>,
@@ -326,7 +270,7 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         .unwrap_or_else(|| default_edge_id(&workspace_dir));
     let materialization_id = load_or_create_materialization_id(&workspace_dir)?;
     Ok(EdgeConfig {
-        server_url: edge_ws_url(&raw_server_url)?,
+        server_url: astra_edge::edge_ws_url(&raw_server_url)?,
         token_manager: token_manager::TokenManager::new(token, fallback_token, token_file),
         workspace_dir,
         edge_id,
@@ -1567,43 +1511,43 @@ mod tests {
     #[test]
     fn edge_ws_url_accepts_api_or_ws_base_urls() {
         assert_eq!(
-            edge_ws_url("http://127.0.0.1:17001").unwrap(),
+            astra_edge::edge_ws_url("http://127.0.0.1:17001").unwrap(),
             "ws://127.0.0.1:17001/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("https://astra.example.com").unwrap(),
+            astra_edge::edge_ws_url("https://astra.example.com").unwrap(),
             "wss://astra.example.com/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("wss://astra.example.com/edge/ws").unwrap(),
+            astra_edge::edge_ws_url("wss://astra.example.com/edge/ws").unwrap(),
             "wss://astra.example.com/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("https://astra.example.com/edge/ws/extra-path").unwrap(),
+            astra_edge::edge_ws_url("https://astra.example.com/edge/ws/extra-path").unwrap(),
             "wss://astra.example.com/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("https://astra.example.com/prefix").unwrap(),
+            astra_edge::edge_ws_url("https://astra.example.com/prefix").unwrap(),
             "wss://astra.example.com/prefix/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("https://astra.example.com/prefix/edge/ws/extra-path").unwrap(),
+            astra_edge::edge_ws_url("https://astra.example.com/prefix/edge/ws/extra-path").unwrap(),
             "wss://astra.example.com/prefix/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("https://astra.example.com/not-edge/ws").unwrap(),
+            astra_edge::edge_ws_url("https://astra.example.com/not-edge/ws").unwrap(),
             "wss://astra.example.com/not-edge/ws/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("https://astra.example.com/edge/ws?debug=1#fragment").unwrap(),
+            astra_edge::edge_ws_url("https://astra.example.com/edge/ws?debug=1#fragment").unwrap(),
             "wss://astra.example.com/edge/ws"
         );
         assert_eq!(
-            edge_ws_url("127.0.0.1:17001").unwrap(),
+            astra_edge::edge_ws_url("127.0.0.1:17001").unwrap(),
             "ws://127.0.0.1:17001/edge/ws"
         );
-        assert!(edge_ws_url("ftp://astra.example.com").is_err());
-        assert!(edge_ws_url("").is_err());
+        assert!(astra_edge::edge_ws_url("ftp://astra.example.com").is_err());
+        assert!(astra_edge::edge_ws_url("").is_err());
     }
 
     #[test]

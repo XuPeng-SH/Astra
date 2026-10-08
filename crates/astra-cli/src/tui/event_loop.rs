@@ -7684,6 +7684,10 @@ pub(crate) async fn run_tui_session(
     state.tui_render_policy = Some(crate::cli::stream::stream_render::RenderPolicy::Silent);
     let mut tui_cancel_token = std::sync::Arc::new(session_shutdown_token.child_token());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
+    // Native collaborator delivery is session-scoped. Keep its lifetime on
+    // the process/session shutdown token, never on the per-turn interrupt
+    // token that is replaced after every Ctrl+C or completed turn.
+    state.native_delivery_shutdown = Some(session_shutdown_token.clone());
 
     // Approval channel: tool approval requests from SSE host → TUI overlay
     let (approval_tx, mut approval_rx) =
@@ -12600,6 +12604,12 @@ pub(crate) async fn run_tui_session(
     drop(plan_task_observer);
     drop(server_agent_observer);
     state.tui_cancel_token = None;
+    if let Some(handle) = state.native_delivery.take() {
+        handle.shutdown().await;
+    }
+    state.native_delivery_session_id = None;
+    state.native_delivery_attachment_epoch = None;
+    state.native_delivery_shutdown = None;
 
     if let Some(spawner) = state.agent_spawner.take() {
         retire_local_agent_spawner_with_reason(
