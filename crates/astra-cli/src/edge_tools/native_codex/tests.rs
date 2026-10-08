@@ -581,7 +581,9 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
         ..ToolInvocationMetadata::default()
     };
     let denied = executor
-        .execute_native_codex_provider_invocation(
+        .execute_native_provider_invocation(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
+            TOOL_NAME,
             &args,
             invocation,
             None,
@@ -599,7 +601,9 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
     // This reaches the selected entrypoint, not just the argument parser.
     *astra_core::sync_poison::recover_rwlock_write(&executor.sandbox_policy) = None;
     let denied = executor
-        .execute_native_codex_provider_invocation(
+        .execute_native_provider_invocation(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
+            TOOL_NAME,
             &args,
             ToolInvocationMetadata {
                 admission_deadline: None,
@@ -730,7 +734,9 @@ async fn live_native_codex_two_stages_same_session() {
             .expect("installed native requirements")
             .read_paths;
         let outcome = executor
-            .execute_native_codex_provider_invocation(
+            .execute_native_provider_invocation(
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
+                TOOL_NAME,
                 &args,
                 invocation,
                 Some(&cancel),

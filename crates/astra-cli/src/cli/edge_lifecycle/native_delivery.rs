@@ -7,16 +7,14 @@ use crate::cli::{
     chat_stream,
     permission_manager::{GateOutcome, PermissionPolicySubscription},
 };
-use crate::edge_tools::{
-    ToolExecutor,
-    native_codex::{self, ApprovedNativeRuntime},
-};
+use crate::edge_tools::{ApprovedNativeRuntime, ToolExecutor};
 use astra_edge::{EdgeConnectionContext, EdgeInvocation, EdgeInvocationExecutor};
 use astra_server_types::edge_ws_protocol::EdgeClientMessage;
 use astra_tools::{
     ToolResult,
     tool_engine::{ToolInvocationAdmissionSource, ToolInvocationMetadata},
 };
+use astra_turn_core::provider_resolution::NativeCollaboratorProtocol;
 use astra_turn_types::{
     ProviderBindingRef, ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId,
 };
@@ -148,15 +146,20 @@ fn dependencies_need_approval(
     requirements: &astra_turn_types::ProviderRuntimeRequirements,
 ) -> Result<bool, String> {
     let current = current_policy(policy, session_id, attachment_epoch)?;
+    let declaration = snapshot
+        .tool_declarations
+        .first()
+        .ok_or_else(|| "missing native collaborator declaration".to_string())?;
+    let protocol = NativeCollaboratorProtocol::from_extension_fields(&declaration.extension_fields)
+        .ok_or_else(|| "native collaborator protocol is not declared".to_string())?;
     let mut needed = false;
     for path in &requirements.read_paths {
         if astra_sandbox::is_never_readable_path(std::path::Path::new(path)) {
             return Err("native bootstrap contains a forbidden path".into());
         }
-        match current.check_sandbox_expansion(
-            "sandbox_expand:native_codex",
-            &bootstrap_args(snapshot, path),
-        ) {
+        match current
+            .check_sandbox_expansion(protocol.permission_scope(), &bootstrap_args(snapshot, path))
+        {
             GateOutcome::Allow => {}
             GateOutcome::Deny(_) => return Err("native bootstrap denied by local policy".into()),
             GateOutcome::NeedApproval { .. } => needed = true,
@@ -197,6 +200,9 @@ impl CliNativeExecutor {
             .tool_declarations
             .first()
             .ok_or("missing native declaration")?;
+        let protocol =
+            NativeCollaboratorProtocol::from_extension_fields(&declaration.extension_fields)
+                .ok_or("native collaborator protocol is not declared")?;
         let requirements = astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
             &declaration.extension_fields,
         )
@@ -220,7 +226,7 @@ impl CliNativeExecutor {
             "provider_binding": snapshot.binding_ref, "executable": requirements.executable,
             "read_paths": requirements.read_paths, "access": "native_runtime_read"});
             let mut request = chat_stream::ApprovalRequest::bare(
-            "sandbox_expand:native_codex".into(), "Allow native Codex runtime reads?".into(),
+            protocol.permission_scope().into(), format!("Allow native {} runtime reads?", protocol.display_name()),
             Some(requirements.read_paths.join("\n")),
             "These exact executable/platform paths become readable by the native collaborator; workspace, network and sensitive-path restrictions remain in force.".into(),
             args, response_tx,
@@ -303,6 +309,7 @@ impl CliNativeExecutor {
             ToolInvocationAdmissionSource::Policy
         };
         Ok(ApprovedNativeRuntime {
+            protocol,
             snapshot: (*snapshot).clone(),
             requirements,
             workspace_root: root,
@@ -316,6 +323,8 @@ struct CliNativeExecutor {
     snapshot: Arc<ProviderDiscoverySnapshot>,
     workspace_root: PathBuf,
     requirements: astra_turn_types::ProviderRuntimeRequirements,
+    tool_name: String,
+    protocol: NativeCollaboratorProtocol,
     expected_session_id: String,
     expected_attachment_epoch: u64,
 }
@@ -343,7 +352,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
             let Some(ceiling) = invocation.execution_ceiling.as_deref() else {
                 return rejected("CLI native delivery requires a frozen execution grant");
             };
-            if invocation.tool != native_codex::TOOL_NAME
+            if invocation.tool != self.tool_name
                 || invocation.identity.user_id != config.account_id
                 || ceiling.workspace_root != self.workspace_root.to_string_lossy()
                 || ceiling.workspace_id != config.workspace_id
@@ -412,7 +421,9 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
             }
             let outcome = config
                 .executor
-                .execute_native_codex_provider_invocation(
+                .execute_native_provider_invocation(
+                    self.protocol,
+                    &self.tool_name,
                     &invocation.args,
                     metadata,
                     Some(&cancel),
@@ -496,7 +507,7 @@ pub(crate) async fn install_native_delivery(
     }
     let declaration = config
         .executor
-        .native_codex_declaration_if_available(Some(cancellation))
+        .native_collaborator_declaration_if_available(Some(cancellation))
         .await
         .ok_or("installed native provider is unavailable")?;
     let root = config
@@ -532,6 +543,8 @@ async fn connect_native_delivery(
         .tool_declarations
         .first()
         .ok_or("missing native declaration")?;
+    let protocol = NativeCollaboratorProtocol::from_extension_fields(&declaration.extension_fields)
+        .ok_or("native collaborator protocol is not declared")?;
     let requirements = astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
         &declaration.extension_fields,
     )
@@ -591,6 +604,8 @@ async fn connect_native_delivery(
         snapshot: snapshot.clone(),
         workspace_root,
         requirements,
+        tool_name: declaration.native_tool_name.clone(),
+        protocol,
         expected_session_id,
         expected_attachment_epoch,
     });
@@ -830,6 +845,7 @@ pub(crate) async fn ensure_session_native_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edge_tools::native_codex;
 
     #[test]
     fn native_journal_is_a_session_sibling_file() {
@@ -877,6 +893,10 @@ mod tests {
             astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY.into(),
             json!(requirements),
         );
+        extension_fields.insert(
+            NativeCollaboratorProtocol::EXTENSION_KEY.into(),
+            json!(NativeCollaboratorProtocol::CodexAppServer.extension_value()),
+        );
         let declaration = ProviderToolDeclaration {
             native_tool_id: NativeToolId::new(native_codex::TOOL_NAME).unwrap(),
             native_tool_name: native_codex::TOOL_NAME.into(),
@@ -923,6 +943,8 @@ mod tests {
             snapshot: Arc::new(snapshot(&requirements, workspace)),
             workspace_root: workspace.canonicalize().unwrap(),
             requirements,
+            tool_name: native_codex::TOOL_NAME.into(),
+            protocol: NativeCollaboratorProtocol::CodexAppServer,
             expected_session_id: "session-test".into(),
             expected_attachment_epoch: owner.session_attachment_epoch,
             config: Arc::new(NativeDeliveryConfig {

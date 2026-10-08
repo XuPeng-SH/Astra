@@ -276,6 +276,17 @@ pub(crate) mod worktree;
 use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
+
+/// Permission admission for one provider-owned collaborator declaration.
+/// This is a receipt from the existing CLI permission owner; it is not a
+/// session registry and cannot be constructed from model-visible arguments.
+pub(crate) struct ApprovedNativeRuntime {
+    pub(crate) protocol: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
+    pub(crate) snapshot: astra_turn_types::ProviderDiscoverySnapshot,
+    pub(crate) requirements: astra_turn_types::ProviderRuntimeRequirements,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) admission_source: astra_tools::tool_engine::ToolInvocationAdmissionSource,
+}
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
 #[path = "edge_tools/memoria.rs"]
@@ -4520,6 +4531,7 @@ impl ToolExecutor {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4528,22 +4540,25 @@ impl ToolExecutor {
     /// exact authenticated callback identity/generation to the existing
     /// DurableRunUserPromptGate. Never store a mutable global question gate:
     /// foreground and child invocations may share this edge executor.
-    pub async fn execute_native_codex_provider_invocation(
+    pub(crate) async fn execute_native_provider_invocation(
         &self,
+        protocol: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
+        tool_name: &str,
         args: &Value,
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
         gate: &dyn astra_tools::ProviderInteractionGate,
         execution_ceiling: &astra_server_types::edge_ws_protocol::EdgeExecutionCeiling,
-        runtime_approval: Option<&native_codex::ApprovedNativeRuntime>,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
     ) -> ToolExecutionOutcome {
         self.execute_run_with_native_interaction(
-            native_codex::TOOL_NAME,
+            tool_name,
             args,
             invocation,
             cancel_token,
             Some(gate),
             Some(execution_ceiling),
+            Some(protocol),
             runtime_approval,
         )
         .await
@@ -4560,11 +4575,20 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
         native_gate: Option<&dyn astra_tools::ProviderInteractionGate>,
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
-        runtime_approval: Option<&native_codex::ApprovedNativeRuntime>,
+        native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
     ) -> EdgeToolRun {
-        let canonical_native = (name == native_codex::TOOL_NAME)
-            .then_some(runtime_approval)
-            .flatten();
+        let canonical_native = runtime_approval.filter(|approval| {
+            native_protocol.is_none_or(|protocol| protocol == approval.protocol)
+        });
+        if runtime_approval.is_some() && canonical_native.is_none() {
+            return EdgeToolRun::failure_evidence(
+                "native collaborator protocol and admission receipt do not match".into(),
+                astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolBinding,
+                ),
+            );
+        }
         let argument_validation = if let Some(approved) = canonical_native {
             let declaration = &approved.snapshot.tool_declarations[0];
             astra_tools::schemas::validate_tool_arguments_against_schema(
@@ -4665,7 +4689,7 @@ impl ToolExecutor {
         let mcp_workspace_effect = mcp_prepared
             .as_ref()
             .map(|(_, prepared)| prepared.policy().effect);
-        let execution_root = if name == native_codex::TOOL_NAME {
+        let execution_root = if native_protocol.is_some() {
             self.effective_project_root()
         } else {
             self.project_root.clone()
@@ -4682,7 +4706,7 @@ impl ToolExecutor {
             && name != "run_script"
             // MCP effects are resolved once from the discovered provider
             // declaration; typed tools use the shared built-in predicate.
-            && (name == native_codex::TOOL_NAME
+            && (native_protocol.is_some()
                 || mcp_workspace_effect == Some(astra_turn_types::ResolvedToolEffect::Mutating)
                 || astra_tools::executor::requires_workspace_serialization(name, args)
                 || targeted_observer)
@@ -4768,6 +4792,7 @@ impl ToolExecutor {
                 &execution_root,
                 native_gate,
                 execution_ceiling,
+                native_protocol,
                 runtime_approval,
             )
             .await;
@@ -4775,7 +4800,7 @@ impl ToolExecutor {
             fields: mut tool_result_fields,
             is_error: mut source_is_error,
         } = facts;
-        if name == native_codex::TOOL_NAME
+        if native_protocol.is_some()
             || matches!(
                 mcp_workspace_effect,
                 Some(astra_turn_types::ResolvedToolEffect::Mutating)
@@ -4789,7 +4814,7 @@ impl ToolExecutor {
             };
             let dispatched = result.metadata.as_ref().is_some_and(|fields| {
                 fields.get("mcp_call_dispatched").and_then(Value::as_bool) == Some(true)
-                    || (name == native_codex::TOOL_NAME
+                    || (native_protocol.is_some()
                         && fields
                             .get("native_collaborator")
                             .and_then(|native| native.get("target_released"))
@@ -5009,15 +5034,45 @@ impl ToolExecutor {
         execution_root: &Path,
         native_gate: Option<&dyn astra_tools::ProviderInteractionGate>,
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
-        runtime_approval: Option<&native_codex::ApprovedNativeRuntime>,
+        native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
     ) -> String {
         let ToolExecutionFacts {
             fields: tool_result_fields,
             is_error: source_is_error,
         } = facts;
-        let output = if is_plan_mode_blocked_tool(name, args)
-            && self.plan_mode_authoring_active().await
-        {
+        let output = if let Some(protocol) = native_protocol {
+            let result = match protocol {
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
+                    self.execute_native_codex(
+                        args,
+                        invocation,
+                        cancel_token,
+                        execution_root,
+                        native_gate,
+                        execution_ceiling,
+                        runtime_approval,
+                    )
+                    .await
+                }
+                protocol => {
+                    let mut metadata = serde_json::Map::new();
+                    astra_tools::execution_outcome::insert_not_executed_fact(&mut metadata);
+                    astra_tools::ToolResult {
+                        output: format!(
+                            "native collaborator protocol {} is not installed on this CLI",
+                            protocol.extension_value()
+                        ),
+                        is_error: true,
+                        metadata: Some(metadata),
+                        exit_semantics: None,
+                    }
+                }
+            };
+            *source_is_error = Some(result.is_error);
+            *tool_result_fields = result.metadata;
+            result.output
+        } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
                  Use read-only tools to finish the plan, then call \
@@ -5026,22 +5081,6 @@ impl ToolExecutor {
             )
         } else {
             match name {
-                native_codex::TOOL_NAME => {
-                    let result = self
-                        .execute_native_codex(
-                            args,
-                            invocation,
-                            cancel_token,
-                            execution_root,
-                            native_gate,
-                            execution_ceiling,
-                            runtime_approval,
-                        )
-                        .await;
-                    *source_is_error = Some(result.is_error);
-                    *tool_result_fields = result.metadata;
-                    result.output
-                }
                 "bash" => {
                     let outcome = self
                         .bash_outcome_with_cancel_async(args, invocation, cancel_token)

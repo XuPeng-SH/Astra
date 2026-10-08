@@ -3,7 +3,7 @@
 //! The process owner controls physical cancellation/settlement; only Codex's
 //! matching `turn/completed` notification establishes a native terminal result.
 
-use super::ToolExecutor;
+use super::{ApprovedNativeRuntime, ToolExecutor};
 use astra_sandbox::{
     BashInvocationOwner, FramedProcess, FramedProcessEnd, FramedProcessInput, FramedProcessLimits,
 };
@@ -22,15 +22,6 @@ const INTERACTION_TIMEOUT: Duration = Duration::from_secs(3600);
 const PRE_ACK_EVENTS: usize = 8;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPPORTED_VERSION: &[u8] = b"codex-cli 0.160.0";
-
-/// Local approval of a frozen declaration. Only the CLI permission owner
-/// constructs this receipt; wire arguments and capability advertisements cannot.
-pub struct ApprovedNativeRuntime {
-    pub(crate) snapshot: astra_turn_types::ProviderDiscoverySnapshot,
-    pub(crate) requirements: astra_turn_types::ProviderRuntimeRequirements,
-    pub(crate) workspace_root: std::path::PathBuf,
-    pub(crate) admission_source: astra_tools::tool_engine::ToolInvocationAdmissionSource,
-}
 
 fn native_stage_remaining(
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
@@ -1242,7 +1233,7 @@ impl ToolExecutor {
     /// Publish through the authenticated local-provider snapshot adapter.
     /// This declaration carries requirements, never permission or claim trust.
     /// The connection owner must prove consumer readiness before publishing it.
-    pub(crate) async fn native_codex_declaration_if_available(
+    pub(crate) async fn native_collaborator_declaration_if_available(
         &self,
         cancel: Option<&CancellationToken>,
     ) -> Option<astra_turn_types::ProviderToolDeclaration> {

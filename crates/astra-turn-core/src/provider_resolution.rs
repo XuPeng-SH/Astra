@@ -56,7 +56,9 @@ impl NativeCollaboratorProtocol {
         }
     }
 
-    fn from_extension(fields: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+    pub fn from_extension_fields(
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Self> {
         match fields
             .get(Self::EXTENSION_KEY)
             .and_then(serde_json::Value::as_str)
@@ -65,6 +67,22 @@ impl NativeCollaboratorProtocol {
             Some(Self::CLAUDE) => Some(Self::ClaudeStreamJson),
             Some(Self::OPENCODE) => Some(Self::OpenCodeAcp),
             _ => None,
+        }
+    }
+
+    pub const fn permission_scope(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "sandbox_expand:native_codex",
+            Self::ClaudeStreamJson => "sandbox_expand:native_claude",
+            Self::OpenCodeAcp => "sandbox_expand:native_opencode",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "Codex",
+            Self::ClaudeStreamJson => "Claude Code",
+            Self::OpenCodeAcp => "OpenCode",
         }
     }
 
@@ -163,10 +181,10 @@ impl ResolvedProviderPolicyIndex {
                             .and_then(serde_json::Value::as_bool)
                             == Some(true))
                     .then(|| {
-                        NativeCollaboratorProtocol::from_extension(&descriptor.extension_fields)
-                            .or_else(|| {
-                                NativeCollaboratorProtocol::from_protocol(&snapshot.protocol)
-                            })
+                        NativeCollaboratorProtocol::from_extension_fields(
+                            &descriptor.extension_fields,
+                        )
+                        .or_else(|| NativeCollaboratorProtocol::from_protocol(&snapshot.protocol))
                     })
                     .flatten(),
                     descriptor: descriptor_ref.clone(),
