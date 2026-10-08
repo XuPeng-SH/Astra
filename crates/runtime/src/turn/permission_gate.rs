@@ -313,6 +313,7 @@ mod tests {
         let read_only = effect == astra_turn_types::ResolvedToolEffect::ReadOnly;
         ResolvedInvocationPolicy {
             runtime_requirements: None,
+            native_collaborator_protocol: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding").unwrap(),

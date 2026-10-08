@@ -400,6 +400,13 @@ fn provider_declaration(
         astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
         json!(true),
     );
+    extension_fields.insert(
+        astra_turn_core::provider_resolution::NativeCollaboratorProtocol::EXTENSION_KEY.into(),
+        json!(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer
+                .extension_value()
+        ),
+    );
     extension_fields.insert("codex.protocolVersion".into(), json!("0.160.0"));
     astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(&extension_fields)?;
     let declaration = astra_turn_types::ProviderToolDeclaration {

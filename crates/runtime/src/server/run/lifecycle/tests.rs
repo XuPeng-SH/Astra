@@ -43,7 +43,10 @@ fn authenticated_edge_discovery_fixture() -> server_loop_host::AuthenticatedEdge
                         (astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY): {
                             "executable":"/installed/provider", "read_paths":["/installed/provider"]
                         },
-                        (astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY): true
+                        (astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY): true,
+                        (astra_turn_core::provider_resolution::NativeCollaboratorProtocol::EXTENSION_KEY):
+                            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer
+                                .extension_value()
                     }))
                     .unwrap(),
                 }],
@@ -5531,7 +5534,20 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
         },
         child_requirements: vec![requirements.clone()],
     });
-    for tool_name in ["native_claude", "native_opencode", "native_codex"] {
+    for (tool_name, protocol) in [
+        (
+            "native_claude",
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson,
+        ),
+        (
+            "native_opencode",
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp,
+        ),
+        (
+            "native_codex",
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
+        ),
+    ] {
         let native_id = NativeToolId::new(tool_name).unwrap();
         let discovery = ProviderDiscoverySnapshot::new(
             ProviderIdentity::new("selected-cli-native-provider").unwrap(),
@@ -5550,6 +5566,9 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
                 extension_fields: serde_json::Map::from_iter([(
                     astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
                     json!(true),
+                ), (
+                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::EXTENSION_KEY.into(),
+                    json!(protocol.extension_value()),
                 )]),
             }],
         )

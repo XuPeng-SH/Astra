@@ -21422,16 +21422,20 @@ pub(crate) struct PreparedNativeSubrunExecution {
 }
 
 fn native_collaborator_provider(
-    descriptor: &astra_turn_types::ResolvedToolDescriptorRef,
+    policy: &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
 ) -> Result<astra_services::runs::CollaboratorProvider, String> {
     use astra_services::runs::CollaboratorProvider;
-    // Provider-owned native IDs, never the caller's public alias. Resolution
-    // has already authenticated the descriptor and its binding.
-    match descriptor.identity.native_tool_id.as_str() {
-        "native_claude" => Ok(CollaboratorProvider::Claude),
-        "native_opencode" => Ok(CollaboratorProvider::OpenCode),
-        "native_codex" => Ok(CollaboratorProvider::Codex),
-        _ => Err("selected provider descriptor is not a native collaborator stage".into()),
+    match policy.native_collaborator_protocol {
+        Some(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson,
+        ) => Ok(CollaboratorProvider::Claude),
+        Some(astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp) => {
+            Ok(CollaboratorProvider::OpenCode)
+        }
+        Some(astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer) => {
+            Ok(CollaboratorProvider::Codex)
+        }
+        None => Err("selected provider descriptor is not a native collaborator stage".into()),
     }
 }
 
@@ -21516,7 +21520,7 @@ impl ServerSpawnAgentExecutor {
         if !executor.provider_is_collaborator_stage(&request.tool) {
             return Err("selected provider is not an admitted collaborator stage".into());
         }
-        let provider = native_collaborator_provider(&policy.descriptor)?;
+        let provider = native_collaborator_provider(&policy)?;
         let binding = &parent
             .execution_contract
             .as_ref()

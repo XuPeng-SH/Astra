@@ -640,6 +640,7 @@ mod tests {
     ) -> ResolvedInvocationPolicy {
         ResolvedInvocationPolicy {
             runtime_requirements: None,
+            native_collaborator_protocol: None,
             descriptor: ResolvedToolDescriptorRef::new(
                 ToolIdentity::new(
                     ProviderBindingRef::new("provider-binding").unwrap(),
