@@ -245,6 +245,29 @@ struct PendingRequestEntry {
     expires_at: tokio::time::Instant,
 }
 
+/// Keeps the existing per-key lock alive through cancellation and runs its
+/// existing GC before releasing the final caller reference. Borrowed mutex
+/// guards must be dropped before this owner can be dropped.
+pub struct EdgeRegistrationLock {
+    pool: EdgeConnectionPool,
+    user_id: String,
+    edge_agent_id: String,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl EdgeRegistrationLock {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutex.lock().await
+    }
+}
+
+impl Drop for EdgeRegistrationLock {
+    fn drop(&mut self) {
+        self.pool
+            .gc_reconnect_lock(&self.user_id, &self.edge_agent_id);
+    }
+}
+
 impl EdgeConnectionPool {
     pub fn new() -> Self {
         Self {
@@ -273,6 +296,15 @@ impl EdgeConnectionPool {
             .entry(pool_key(user_id, edge_agent_id))
             .or_default()
             .clone()
+    }
+
+    pub fn registration_lock(&self, user_id: &str, edge_agent_id: &str) -> EdgeRegistrationLock {
+        EdgeRegistrationLock {
+            pool: self.clone(),
+            user_id: user_id.into(),
+            edge_agent_id: edge_agent_id.into(),
+            mutex: self.reconnect_lock(user_id, edge_agent_id),
+        }
     }
 
     /// Drop the per-key reconnect lock once no reconnect is using it, bounding
@@ -640,6 +672,33 @@ impl EdgeConnectionPool {
         self.connections
             .iter()
             .any(|entry| entry.value().user_id == user_id && !entry.value().sender.is_closed())
+    }
+
+    /// Refresh an authenticated publication only on the socket incarnation
+    /// observed before registration. A delayed REST response must not modify
+    /// a replacement connection or move its physical workspace binding.
+    pub fn refresh_capabilities(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        expected: &EdgeConnectionInfo,
+        capabilities: Option<Value>,
+    ) -> bool {
+        let Some(mut connection) = self.connections.get_mut(&pool_key(user_id, edge_agent_id))
+        else {
+            return false;
+        };
+        if connection.generation != expected.generation
+            || connection.registry_id != expected.registry_id
+            || connection.materialization_id != expected.materialization_id
+            || connection.workspace_dir != expected.workspace_dir
+            || connection.workspace_id != expected.workspace_id
+            || connection.sender.is_closed()
+        {
+            return false;
+        }
+        connection.capabilities = capabilities;
+        true
     }
 
     /// Find a connected edge agent by its agent ID across all users.
@@ -1572,6 +1631,60 @@ mod tests {
             info.materialization_id.as_deref(),
             Some("materialization-a")
         );
+    }
+
+    #[test]
+    fn capability_refresh_is_fenced_to_the_observed_connection() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        pool.register("user-1", "edge-a", None, Some("/workspace".into()), tx);
+        let observed = pool.get_all_user_edges("user-1").pop().unwrap();
+        let capabilities = Some(json!({"provider_discovery": ["installed"]}));
+        assert!(pool.refresh_capabilities("user-1", "edge-a", &observed, capabilities.clone()));
+        assert_eq!(
+            pool.get_all_user_edges("user-1")[0].capabilities,
+            capabilities
+        );
+        assert!(!pool.refresh_capabilities("user-2", "edge-a", &observed, None));
+        let mut wrong_binding = observed.clone();
+        wrong_binding.materialization_id = Some("another-checkout".into());
+        assert!(!pool.refresh_capabilities("user-1", "edge-a", &wrong_binding, None));
+        let (tx, _replacement_rx) = mpsc::channel(1);
+        pool.register(
+            "user-1",
+            "edge-a",
+            None,
+            Some("/other-workspace".into()),
+            tx,
+        );
+        assert!(!pool.refresh_capabilities("user-1", "edge-a", &observed, None));
+        assert_eq!(
+            pool.get_all_user_edges("user-1")[0]
+                .workspace_dir
+                .as_deref(),
+            Some("/other-workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_lock_cancellation_reclaims_only_unused_keys() {
+        let pool = EdgeConnectionPool::new();
+        let held = pool.registration_lock("user", "edge");
+        let guard = held.lock().await;
+        let queued = pool.registration_lock("user", "edge");
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, queued.lock())
+                .await
+                .is_err()
+        );
+        drop(queued);
+        assert_eq!(pool.reconnect_locks.len(), 1);
+        drop(guard);
+        drop(held);
+        assert!(pool.reconnect_locks.is_empty());
+        let abandoned = pool.registration_lock("user", "other");
+        drop(abandoned);
+        assert!(pool.reconnect_locks.is_empty());
     }
 
     #[test]

@@ -7423,6 +7423,32 @@ fn refresh_footer_from_state(
     }
 }
 
+fn enqueue_approval_request(
+    bottom_pane: &mut BottomPane,
+    request: crate::cli::chat_stream::ApprovalRequest,
+) {
+    if let Some(metadata) = request.metadata {
+        bottom_pane.enqueue_approval_with_metadata(
+            request.tool,
+            request.header,
+            request.detail,
+            request.reason,
+            request.args,
+            request.response_tx,
+            *metadata,
+        );
+    } else {
+        bottom_pane.enqueue_approval(
+            request.tool,
+            request.header,
+            request.detail,
+            request.reason,
+            request.args,
+            request.response_tx,
+        );
+    }
+}
+
 fn surface_tui_file_write_errors(
     errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteError>,
     reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
@@ -7965,6 +7991,16 @@ pub(crate) async fn run_tui_session(
         tokio::select! {
             _ = session_shutdown_token.cancelled() => {
                 break 'main Ok(());
+            }
+            Some(request) = approval_rx.recv() => {
+                enqueue_approval_request(&mut bottom_pane, request);
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                refresh_open_transcript_view(&chat_widget, &mut bottom_pane, width);
+                frame_requester.schedule_frame();
+            }
+            Some(request) = ask_user_rx.recv() => {
+                bottom_pane.enqueue_ask_user(request.prompt, request.response_tx);
+                frame_requester.schedule_frame();
             }
             Some(progress) = login_progress_rx.recv() => {
                 if login_tasks.is_empty() { continue; }
@@ -10695,26 +10731,7 @@ pub(crate) async fn run_tui_session(
                                                     // approval card is rendered by BottomPane above the
                                                     // composer so arrow-key focus is visible. Resolve
                                                     // events flush a compact audit line to scrollback.
-                                                    let _id = if let Some(metadata) = req.metadata {
-                                                        bottom_pane.enqueue_approval_with_metadata(
-                                                            req.tool,
-                                                            req.header,
-                                                            req.detail,
-                                                            req.reason,
-                                                            req.args,
-                                                            req.response_tx,
-                                                            *metadata,
-                                                        )
-                                                    } else {
-                                                        bottom_pane.enqueue_approval(
-                                                            req.tool,
-                                                            req.header,
-                                                            req.detail,
-                                                            req.reason,
-                                                            req.args,
-                                                            req.response_tx,
-                                                        )
-                                                    };
+                                                    enqueue_approval_request(&mut bottom_pane, req);
                                                     let width = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     refresh_open_transcript_view(
                                                         &chat_widget,
@@ -10738,15 +10755,6 @@ pub(crate) async fn run_tui_session(
                                 }
                                                  }
                                                 Some(req) = ask_user_rx.recv() => {
-                                                    // Draft transition: show a brief
-                                                    // indicator before the ask-user form
-                                                    // opens so the user isn't surprised by
-                                                    // a sudden modal.
-                                                    chat_widget.commit_system(
-                                                        crate::tui::history_cell::system::SystemCell::response(
-                                                            "🤔 The agent needs your input — opening question…",
-                                                        ),
-                                                    );
                                                     bottom_pane.enqueue_ask_user(req.prompt, req.response_tx);
                                                     frame_requester.schedule_frame();
                                                     {
