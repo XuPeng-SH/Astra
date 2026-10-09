@@ -23659,13 +23659,16 @@ impl ServerSubRunExecutor {
                                 }
                             }
                             Ok(ack) => {
-                                // Do not consume a message the provider did
-                                // not accept. Keep the exact envelope and
-                                // retry it at the next provider boundary;
-                                // answering a concurrent question must not
-                                // permanently close the mailbox lane.
-                                mailbox_retry_at =
-                                    Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                                // A provider-level rejection is a known
+                                // boundary, not an uncertain transport
+                                // result. Keep the exact envelope in the
+                                // canonical mailbox, but do not spin on a
+                                // provider that has already said it cannot
+                                // accept follow-up text in this stage. The
+                                // next provider boundary releases it through
+                                // the existing mailbox retry path.
+                                lease.defer(true);
+                                mailbox_retry_at = None;
                                 tracing::warn!(
                                     target: "astra_runtime::run_lifecycle",
                                     run_id = %config.run_id,
