@@ -72,7 +72,7 @@ pub(crate) fn prepare_native_process(
     // supervisor helper; it still runs the real target and requires the same
     // authenticated ownership handshake and descendant settlement.
     #[cfg(all(test, target_os = "linux"))]
-    if let Some(helper) = std::env::var_os("ASTRA_NATIVE_CODEX_HARNESS_SUPERVISOR_BIN") {
+    if let Some(helper) = std::env::var_os("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN") {
         return BashInvocationOwner::prepare_with_supervisor_helper(
             helper.into(),
             std::iter::empty::<String>(),

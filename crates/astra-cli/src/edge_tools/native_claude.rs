@@ -199,11 +199,56 @@ struct Evidence {
     output: String,
     final_output: Option<String>,
     terminal: bool,
-    provider_error: Option<String>,
+    provider_error: Option<&'static str>,
+    provider_error_class: Option<&'static str>,
     usage: Option<Value>,
     cost_usd: Option<f64>,
     output_capped: bool,
     capability_unavailable: bool,
+}
+
+fn classify_provider_error(value: &str) -> &'static str {
+    let value = value.to_ascii_lowercase();
+    if ["auth", "login", "credential", "token"]
+        .iter()
+        .any(|needle| value.contains(needle))
+    {
+        "authentication"
+    } else if ["model", "not_found", "not found"]
+        .iter()
+        .any(|needle| value.contains(needle))
+    {
+        "model"
+    } else if ["billing", "quota", "payment"]
+        .iter()
+        .any(|needle| value.contains(needle))
+    {
+        "billing"
+    } else if ["permission", "denied", "forbidden"]
+        .iter()
+        .any(|needle| value.contains(needle))
+    {
+        "permission"
+    } else {
+        "provider"
+    }
+}
+
+fn provider_error_message(class: &'static str) -> &'static str {
+    match class {
+        "authentication" => "Claude Code authentication is required",
+        "model" => "Claude Code model is unavailable",
+        "billing" => "Claude Code billing or quota is unavailable",
+        "permission" => "Claude Code rejected the requested operation",
+        _ => "Claude Code reported a provider error",
+    }
+}
+
+fn record_provider_error(evidence: &mut Evidence, value: &str) {
+    let class = classify_provider_error(value);
+    evidence.provider_error_class = Some(class);
+    evidence.provider_error = Some(provider_error_message(class));
+    evidence.capability_unavailable |= matches!(class, "authentication" | "model" | "billing");
 }
 
 fn valid_id(value: &str) -> bool {
@@ -267,13 +312,7 @@ fn ingest(frame: &[u8], evidence: &mut Evidence, output_limit: usize) -> Result<
                 }
             }
             if let Some(error) = event.get("error").and_then(Value::as_str) {
-                evidence.provider_error = Some(error.to_owned());
-                if matches!(
-                    error,
-                    "authentication_failed" | "model_not_found" | "billing_error"
-                ) {
-                    evidence.capability_unavailable = true;
-                }
+                record_provider_error(evidence, error);
             }
         }
         "assistant" => {
@@ -284,10 +323,7 @@ fn ingest(frame: &[u8], evidence: &mut Evidence, output_limit: usize) -> Result<
                 &mut evidence.output_capped,
             );
             if let Some(error) = event.get("error").and_then(Value::as_str) {
-                evidence.provider_error = Some(error.to_owned());
-                if error == "authentication_failed" {
-                    evidence.capability_unavailable = true;
-                }
+                record_provider_error(evidence, error);
             }
         }
         "stream_event" => {
@@ -326,11 +362,12 @@ fn ingest(frame: &[u8], evidence: &mut Evidence, output_limit: usize) -> Result<
                 evidence.final_output = Some(final_output);
             }
             if event.get("is_error").and_then(Value::as_bool) == Some(true) {
-                evidence.provider_error = event
-                    .get("subtype")
+                let value = event
+                    .get("error")
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| Some("Claude Code reported a failed result".into()));
+                    .or_else(|| event.get("subtype").and_then(Value::as_str))
+                    .unwrap_or("provider");
+                record_provider_error(evidence, value);
             }
             if let Some(usage) = event.get("usage") {
                 evidence.usage = Some(usage.clone());
@@ -378,7 +415,7 @@ async fn drive(
                 } else {
                     input_rx = None;
                 }
-                None
+                continue;
             }
         };
         let Some(frame) = next else {
@@ -666,6 +703,7 @@ impl ToolExecutor {
                 "native_terminal": evidence.terminal,
                 "usage_snapshot": evidence.usage,
                 "cost_usd": evidence.cost_usd,
+                "provider_error_class": evidence.provider_error_class,
                 "output_capped": evidence.output_capped,
                 "target_released": target_released,
                 "settlement_authoritative": settled,
@@ -728,9 +766,31 @@ mod tests {
         assert!(evidence.capability_unavailable);
         assert_eq!(
             evidence.provider_error.as_deref(),
-            Some("authentication_failed")
+            Some("Claude Code authentication is required")
         );
+        assert_eq!(evidence.provider_error_class, Some("authentication"));
         assert_eq!(evidence.output, "Not logged in");
+    }
+
+    #[test]
+    fn provider_error_text_is_not_copied_into_evidence() {
+        let mut evidence = Evidence::default();
+        ingest(
+            br#"{"type":"assistant","error":"authentication_failed: secret-token-value","message":{"content":[]}}"#,
+            &mut evidence,
+            native_codex::OUTPUT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(evidence.provider_error_class, Some("authentication"));
+        assert_eq!(
+            evidence.provider_error,
+            Some("Claude Code authentication is required")
+        );
+        assert!(
+            !evidence
+                .provider_error
+                .is_some_and(|message| message.contains("secret-token-value"))
+        );
     }
 
     #[test]

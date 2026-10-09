@@ -1171,7 +1171,7 @@ async fn live_native_codex_two_stages_same_session() {
         .expect("ASTRA_NATIVE_CODEX_HARNESS_MODEL must select the requested model");
     assert!(valid_id(&model), "invalid harness model identity");
     let helper = std::path::PathBuf::from(
-        std::env::var_os("ASTRA_NATIVE_CODEX_HARNESS_SUPERVISOR_BIN")
+        std::env::var_os("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN")
             .expect("set the absolute path of a freshly built Astra supervisor binary"),
     );
     assert!(

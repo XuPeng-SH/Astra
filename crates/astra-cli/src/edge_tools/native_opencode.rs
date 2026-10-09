@@ -265,6 +265,30 @@ fn canonical_usage(value: &Value) -> Option<astra_turn_types::CanonicalTokenUsag
     astra_turn_types::CanonicalTokenUsage::new(Some(input?), None, None, Some(output?)).ok()
 }
 
+fn acknowledged_session_id(
+    response: &Value,
+    requested_session_id: Option<&str>,
+) -> Result<String, &'static str> {
+    let session_id = match response.get("sessionId") {
+        Some(value) => value
+            .as_str()
+            .filter(|id| valid_id(id))
+            .ok_or("OpenCode session response has an invalid sessionId")?
+            .to_owned(),
+        // ACP session/resume acknowledges the requested session through a
+        // successful response and returns configuration options, not another
+        // sessionId. The caller already supplied the exact identity.
+        None => requested_session_id
+            .filter(|id| valid_id(id))
+            .ok_or("OpenCode session response has no valid sessionId")?
+            .to_owned(),
+    };
+    if requested_session_id.is_some_and(|expected| expected != session_id) {
+        return Err("OpenCode resume acknowledged a different session");
+    }
+    Ok(session_id)
+}
+
 struct RpcError {
     message: String,
     code: Option<i64>,
@@ -443,19 +467,8 @@ async fn drive(
         &mut input_rx,
     )
     .await?;
-    let session_id = session
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .filter(|id| valid_id(id))
-        .ok_or("OpenCode session response has no valid sessionId")?;
-    if stage
-        .native_session_id
-        .as_deref()
-        .is_some_and(|expected| expected != session_id)
-    {
-        return Err("OpenCode resume acknowledged a different session".into());
-    }
-    evidence.session_id = Some(session_id.to_owned());
+    let session_id = acknowledged_session_id(&session, stage.native_session_id.as_deref())?;
+    evidence.session_id = Some(session_id.clone());
     if let Some(model) = &stage.model {
         let value = if stage
             .effort
@@ -473,7 +486,7 @@ async fn drive(
             "session/set_config_option",
             json!({"sessionId":session_id,"configId":"model","value":value}),
             evidence,
-            Some(session_id),
+            Some(&session_id),
             output_limit,
             cancel,
             &mut input_rx,
@@ -487,7 +500,7 @@ async fn drive(
         "session/prompt",
         json!({"sessionId":session_id,"prompt":[{"type":"text","text":stage.task}]}),
         evidence,
-        Some(session_id),
+        Some(&session_id),
         output_limit,
         cancel,
         &mut input_rx,
@@ -772,6 +785,7 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_tools::ProviderInteractionDecision;
 
     #[test]
     fn schema_reuses_the_canonical_stage_shape() {
@@ -829,6 +843,22 @@ mod tests {
     }
 
     #[test]
+    fn resume_acknowledges_the_requested_session_without_repeating_its_id() {
+        assert_eq!(
+            acknowledged_session_id(&json!({"configOptions": []}), Some("ses_existing")),
+            Ok("ses_existing".to_owned())
+        );
+        assert_eq!(
+            acknowledged_session_id(&json!({"sessionId": "ses_new"}), Some("ses_existing")),
+            Err("OpenCode resume acknowledged a different session")
+        );
+        assert_eq!(
+            acknowledged_session_id(&json!({"configOptions": []}), None),
+            Err("OpenCode session response has no valid sessionId")
+        );
+    }
+
+    #[test]
     fn rpc_errors_keep_structured_meaning_without_provider_text() {
         let auth = classify_rpc_error(&json!({
             "code": -32000,
@@ -854,5 +884,170 @@ mod tests {
             "data": {"service": "directory; secret"}
         }));
         assert_eq!(untrusted.message, "OpenCode service is unavailable");
+    }
+
+    /// Paid live evidence for the complete Astra adapter, not just a direct
+    /// ACP probe. The executable is selected from PATH so this test exercises
+    /// the same discovery, runtime grant, process owner, session identity and
+    /// settlement path as production. Keep it opt-in because provider auth,
+    /// network and model quota are deployment state.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live OpenCode task; requires explicit opt-in, auth, PATH-selected executable and fresh supervisor binary"]
+    async fn live_native_opencode_two_stages_same_session() {
+        assert_eq!(
+            std::env::var("ASTRA_NATIVE_OPENCODE_HARNESS").as_deref(),
+            Ok("1"),
+            "explicit paid-task opt-in is required"
+        );
+        let helper = std::path::PathBuf::from(
+            std::env::var_os("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN")
+                .expect("set the absolute path of a freshly built Astra supervisor binary"),
+        );
+        assert!(
+            helper.is_absolute() && helper.is_file(),
+            "supervisor binary unavailable"
+        );
+        let base = std::path::PathBuf::from("target/astra-native-opencode-harness");
+        std::fs::create_dir_all(&base).expect("create disk-backed harness parent");
+        let workspace = tempfile::Builder::new()
+            .prefix("two-stage-")
+            .tempdir_in(base)
+            .expect("create isolated disk workspace");
+        let root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let mut executor = ToolExecutor::new(&root);
+        let mut policy = astra_sandbox::SandboxPolicy::permissive(&root);
+        policy.network_allowed = true;
+        *astra_core::sync_poison::recover_rwlock_write(&executor.sandbox_policy) = Some(policy);
+        executor.set_read_only_execution();
+
+        struct RejectUnexpectedInteraction;
+        #[async_trait::async_trait]
+        impl ProviderInteractionGate for RejectUnexpectedInteraction {
+            async fn request_interaction(
+                &self,
+                request: &astra_turn_types::ProviderInteractionRequest,
+            ) -> astra_tools::ProviderInteractionDecision {
+                request
+                    .validate()
+                    .expect("canonical native question envelope");
+                ProviderInteractionDecision::Cancelled
+            }
+        }
+
+        let gate = RejectUnexpectedInteraction;
+        let cancel = CancellationToken::new();
+        let session = format!("opencode-live-session-{}", uuid::Uuid::now_v7());
+        let anchor_run_id = format!("opencode-live-run-{}", uuid::Uuid::now_v7());
+        let tasks = [
+            "Return exactly OPENCODE_ADAPTER_STAGE_ONE and nothing else.",
+            "Return exactly OPENCODE_ADAPTER_STAGE_TWO and nothing else.",
+        ];
+        let mut native_session: Option<String> = None;
+        for (index, task) in tasks.into_iter().enumerate() {
+            let run_id = format!("opencode-live-run-{}", uuid::Uuid::now_v7());
+            let identity = astra_turn_types::ToolInvocationIdentity::new(
+                "native-opencode-live-harness",
+                &session,
+                &run_id,
+                &run_id,
+                "native-stage",
+            )
+            .expect("canonical fixture invocation identity");
+            let mut args = json!({"task": task, "anchor_run_id": anchor_run_id});
+            if let Some(native_session) = &native_session {
+                args["native_session_id"] = json!(native_session);
+            }
+            let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
+                admission_deadline: Some(std::time::Instant::now() + Duration::from_secs(180)),
+                run_id: Some(&identity.run_id),
+                turn_chain_id: Some(&identity.turn_chain_id),
+                tool_call_id: Some(&identity.invocation_id),
+                admission_source: Some(
+                    astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval,
+                ),
+                ..astra_tools::tool_engine::ToolInvocationMetadata::default()
+            };
+            let mut ceiling = astra_server_types::edge_ws_protocol::EdgeExecutionCeiling {
+                workspace_root: root.to_string_lossy().into_owned(),
+                workspace_id: None,
+                materialization_id: None,
+                execution_binding_generation: 1,
+                runtime_read_paths: Vec::new(),
+                workspace_write_allowed: false,
+                network_allowed: true,
+            };
+            ceiling.runtime_read_paths = installed_runtime_requirements()
+                .expect("installed OpenCode requirements")
+                .read_paths;
+            let result = executor
+                .execute_native_opencode(
+                    &args,
+                    invocation,
+                    Some(&cancel),
+                    &root,
+                    Some(&gate),
+                    Some(&ceiling),
+                    None,
+                    None,
+                )
+                .await;
+            if result.is_error {
+                let native = result
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("native_collaborator"));
+                eprintln!(
+                    "OpenCode live stage {} failed: provider_error={:?} code={:?} session_acknowledged={:?} terminal={:?} transport_settled={:?} output_bytes={}",
+                    index + 1,
+                    native.and_then(|value| value.get("provider_error")),
+                    native.and_then(|value| value.get("provider_error_code")),
+                    native.and_then(|value| value.get("session_acknowledged")),
+                    native.and_then(|value| value.get("native_terminal")),
+                    native.and_then(|value| value.get("transport_settled_after_terminal")),
+                    result.output.len(),
+                );
+            }
+            assert!(
+                !result.is_error,
+                "OpenCode adapter stage {} failed",
+                index + 1
+            );
+            let metadata = result.metadata.as_ref().expect("native metadata");
+            let native = metadata
+                .get("native_collaborator")
+                .and_then(Value::as_object)
+                .expect("native collaborator metadata");
+            assert_eq!(native.get("session_acknowledged"), Some(&Value::Bool(true)));
+            assert_eq!(native.get("turn_acknowledged"), Some(&Value::Bool(true)));
+            assert_eq!(native.get("native_terminal"), Some(&Value::Bool(true)));
+            assert_eq!(
+                native.get("transport_settled_after_terminal"),
+                Some(&Value::Bool(true))
+            );
+            assert_eq!(
+                result.output.trim(),
+                if index == 0 {
+                    "OPENCODE_ADAPTER_STAGE_ONE"
+                } else {
+                    "OPENCODE_ADAPTER_STAGE_TWO"
+                }
+            );
+            let acknowledged = native
+                .get("native_session_id")
+                .and_then(Value::as_str)
+                .expect("acknowledged OpenCode session");
+            if let Some(previous) = &native_session {
+                assert_eq!(
+                    previous, acknowledged,
+                    "resume changed the session identity"
+                );
+            }
+            native_session = Some(acknowledged.to_owned());
+        }
+        workspace.close().expect("workspace cleanup");
     }
 }
