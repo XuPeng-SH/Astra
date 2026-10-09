@@ -23,11 +23,17 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+const NATIVE_DELIVERY_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const NATIVE_DELIVERY_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// Held by the existing CLI lifecycle, never by a root-turn future. Dropping
 /// the handle requests cancellation; the task still owns settlement/join.
 pub(crate) struct NativeDeliveryHandle {
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Set after the first discovery/handshake/publication attempt completes.
+    /// `true` means the optional capability is settled for this turn; it does
+    /// not claim that a provider was available.
     ready: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -65,7 +71,7 @@ async fn wait_for_native_delivery_ready(handle: &NativeDeliveryHandle) {
         return;
     }
     let mut ready = handle.ready.clone();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+    let _ = tokio::time::timeout(NATIVE_DELIVERY_STARTUP_WAIT, async move {
         loop {
             if *ready.borrow() {
                 break;
@@ -80,6 +86,7 @@ async fn wait_for_native_delivery_ready(handle: &NativeDeliveryHandle) {
 
 /// All identities come from the selected authenticated CLI boundary. The
 /// journal path is allocated by the existing local state owner, not the model.
+#[derive(Clone)]
 pub(crate) struct NativeDeliveryConfig {
     pub(crate) websocket_url: String,
     pub(crate) api: astra_thin_client::ThinClient,
@@ -592,10 +599,14 @@ async fn connect_native_delivery(
         workspace_dir: Some(workspace_root.to_string_lossy().into_owned()),
         capabilities: Some(capabilities(&config, None)),
     };
-    let (socket, account_id, edge_transport_id) =
-        astra_edge::authenticate_connection(socket, auth, Some(&config.account_id), cancellation)
-            .await
-            .map_err(|_| "native delivery authentication failed")?;
+    let authenticated = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(admission_deadline),
+        astra_edge::authenticate_connection(socket, auth, Some(&config.account_id), cancellation),
+    )
+    .await
+    .map_err(|_| "native delivery authentication deadline expired")?
+    .map_err(|_| "native delivery authentication failed")?;
+    let (socket, account_id, edge_transport_id) = authenticated;
     // The server owns the transport identity. The local agent label is only
     // an authenticated capability selector and must never be reused as the
     // REST callback identity.
@@ -809,32 +820,75 @@ pub(crate) async fn ensure_session_native_delivery(
 
     let task_cancel = shutdown.child_token();
     let task_session_id = session_id.to_owned();
-    let install_cancel = task_cancel.clone();
     let supervisor_cancel = task_cancel.clone();
     let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
-        let result = install_native_delivery(
-            config,
-            Instant::now() + std::time::Duration::from_secs(10),
-            &install_cancel,
-        )
-        .await;
-        let _ = ready_tx.send(true);
-        match result {
-            Ok(mut delivery) => {
-                // Keep the actual Edge owner alive inside the session-owned
-                // supervisor. Dropping the returned handle would cancel its
-                // connection immediately after successful publication.
-                tokio::select! {
-                    _ = supervisor_cancel.cancelled() => delivery.shutdown().await,
-                    _ = delivery.wait() => {}
+        let mut startup_tx = Some(ready_tx);
+        let mut was_available = false;
+        let mut reconnect_failures = 0_u32;
+        loop {
+            if supervisor_cancel.is_cancelled() {
+                break;
+            }
+            let result = install_native_delivery(
+                config.clone(),
+                Instant::now() + NATIVE_DELIVERY_STARTUP_TIMEOUT,
+                &supervisor_cancel,
+            )
+            .await;
+            match result {
+                Ok(mut delivery) => {
+                    // The first successful provider binding settles the
+                    // startup wait. Later disconnects are handled by this
+                    // same session owner, never by replaying an invocation.
+                    let _ = startup_tx.take().map(|tx| tx.send(true));
+                    was_available = true;
+                    tokio::select! {
+                        _ = supervisor_cancel.cancelled() => {
+                            delivery.shutdown().await;
+                            break;
+                        }
+                        _ = delivery.wait() => {}
+                    }
+                    if supervisor_cancel.is_cancelled() {
+                        break;
+                    }
+                    reconnect_failures = 1;
+                    tracing::warn!(
+                        session_id = %task_session_id,
+                        "native collaborator transport ended; retrying capability discovery"
+                    );
+                }
+                Err(error) if !was_available => {
+                    // Initial discovery is optional capacity. Do not keep a
+                    // missing client in a hot retry loop; the next user turn
+                    // performs a fresh probe and can bind it if it appears.
+                    let _ = startup_tx.take().map(|tx| tx.send(true));
+                    tracing::warn!(session_id = %task_session_id, %error, "native collaborator delivery unavailable");
+                    break;
+                }
+                Err(error) => {
+                    reconnect_failures = reconnect_failures.saturating_add(1);
+                    tracing::warn!(
+                        session_id = %task_session_id,
+                        attempt = reconnect_failures,
+                        %error,
+                        "native collaborator reconnect unavailable"
+                    );
                 }
             }
-            Err(error) => {
-                // Discovery is optional capacity. A failed native install must
-                // not turn an ordinary Astra turn into a false failure; the
-                // server simply cannot select this capacity until a later turn.
-                tracing::warn!(session_id = %task_session_id, %error, "native collaborator delivery unavailable");
+
+            let delay_secs = match reconnect_failures.min(5) {
+                0 => 1,
+                1 => 1,
+                2 => 2,
+                3 => 4,
+                4 => 8,
+                _ => 16,
+            };
+            tokio::select! {
+                _ = supervisor_cancel.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
             }
         }
     });

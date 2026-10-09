@@ -21538,122 +21538,6 @@ fn provider_stage_input_from_message(
     input.validate().ok().map(|()| input)
 }
 
-fn provider_stage_input_from_user_intent(
-    event: &crate::turn::run_control::QueuedUserIntent,
-) -> Option<astra_turn_types::ProviderStageInput> {
-    let content = crate::turn::run_control::user_intent_content(&event.input)?;
-    Some(astra_turn_types::ProviderStageInput::Text {
-        input_id: event.intent_id.clone(),
-        content,
-        correlation_id: None,
-        expected_turn_id: None,
-    })
-}
-
-enum NativeProviderInputPumpResult {
-    Idle,
-    Accepted,
-    Deferred,
-    Stopped,
-}
-
-async fn deliver_next_native_user_intent<H: AgenticLoopHost>(
-    pool: &astra_server_types::edge_connection_pool::EdgeConnectionPool,
-    identity: &astra_turn_types::ToolInvocationIdentity,
-    edge_agent_id: &str,
-    edge_deadline: tokio::time::Instant,
-    cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    host: &mut H,
-    state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
-    user_id: &str,
-    run_id: &str,
-) -> Result<NativeProviderInputPumpResult, astra_core::ClassifiedError> {
-    let pending = match crate::turn::agentic_loop::execution_phase::next_provider_stage_user_intent(
-        host, state, user_id, run_id,
-    )
-    .await
-    {
-        Ok(pending) => pending,
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                run_id,
-                error = %error,
-                "native provider stage could not observe current-run guidance; retaining it"
-            );
-            return Ok(NativeProviderInputPumpResult::Deferred);
-        }
-    };
-    let Some((event, next_cursor, commit_cursor)) = pending else {
-        return Ok(NativeProviderInputPumpResult::Idle);
-    };
-    let Some(stage_input) = provider_stage_input_from_user_intent(&event) else {
-        return Ok(NativeProviderInputPumpResult::Idle);
-    };
-    let ack = match pool
-        .deliver_provider_stage_input(
-            identity,
-            edge_agent_id,
-            stage_input,
-            edge_deadline,
-            cancel_token,
-        )
-        .await
-    {
-        Ok(ack) => ack,
-        Err(error) => {
-            tracing::debug!(
-                target: "astra_runtime::run_lifecycle",
-                run_id,
-                error = %error,
-                may_have_reached_provider = error.may_have_reached_provider,
-                "native provider guidance delivery did not complete"
-            );
-            return Ok(if error.may_have_reached_provider {
-                NativeProviderInputPumpResult::Stopped
-            } else {
-                NativeProviderInputPumpResult::Deferred
-            });
-        }
-    };
-    if ack.accepted {
-        let outcome = crate::turn::agentic_loop::execution_phase::apply_provider_stage_user_intent(
-            host,
-            state,
-            &event,
-            next_cursor,
-            commit_cursor,
-        )
-        .await?;
-        Ok(match outcome {
-            Some(
-                crate::turn::run_control::UserIntentApplyAck::Applied
-                | crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned,
-            ) => NativeProviderInputPumpResult::Accepted,
-            Some(crate::turn::run_control::UserIntentApplyAck::Paused) | None => {
-                // The provider has accepted the input. A failed durable apply
-                // must be retried by the canonical run-control owner, not by
-                // sending the same instruction to the provider again.
-                NativeProviderInputPumpResult::Stopped
-            }
-        })
-    } else {
-        tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            run_id,
-            intent_id = %event.intent_id,
-            reason = ack.reason.as_deref().unwrap_or("provider rejected input"),
-            "native provider rejected current-run guidance"
-        );
-        // The provider did not accept this input, so the durable source must
-        // retain it for the next safe provider boundary. A question/approval
-        // can temporarily occupy the native protocol; do not permanently
-        // disable the run's guidance lane merely because this attempt was
-        // rejected.
-        Ok(NativeProviderInputPumpResult::Deferred)
-    }
-}
-
 fn native_stage_reasoning_arguments(
     provider: &astra_services::runs::CollaboratorProvider,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
@@ -23328,12 +23212,11 @@ impl ServerSubRunExecutor {
         self
     }
 
-    async fn execute_native_stage<H: AgenticLoopHost>(
+    async fn execute_native_stage(
         &self,
         config: &SubRunConfig,
         state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
         plan_mode_active: bool,
-        host: &mut H,
     ) -> Result<crate::turn::agentic_loop::host::AgenticLoopOutcome, astra_core::ClassifiedError>
     {
         use crate::server::tool_execution_binding::{
@@ -23495,111 +23378,14 @@ impl ServerSubRunExecutor {
                 edge_agent_id.expect("edge agent checked before native provider input pump");
             let edge_deadline =
                 tokio::time::Instant::from_std(stage_deadline.monotonic_work_deadline());
-            let mut input_wake = state.user_intents.wake.clone();
             let mut invocation = Box::pin(invocation);
-            let mut user_intents_enabled = state.run_control.is_some();
-            let mut poll_user_intents = user_intents_enabled;
             let mut mailbox_enabled = mailbox.is_some();
-            // The two input owners have independent retry clocks. A provider
-            // rejecting one user guidance item must not pause mailbox delivery
-            // (or vice versa) for the lifetime of the native stage.
-            let mut user_intent_retry_at: Option<tokio::time::Instant> = None;
             let mut mailbox_retry_at: Option<tokio::time::Instant> = None;
             let deferred = loop {
-                if poll_user_intents {
-                    poll_user_intents = false;
-                    let input_result = deliver_next_native_user_intent(
-                        pool,
-                        &identity,
-                        &edge_agent_id,
-                        edge_deadline,
-                        config.cancel_token.as_deref(),
-                        host,
-                        state,
-                        &config.user_id,
-                        &config.run_id,
-                    )
-                    .await;
-                    match input_result {
-                        Err(error) => {
-                            // Applying provider-accepted guidance can wait for
-                            // a durable pause to clear. If cancellation wins
-                            // that wait, the invocation future is still the
-                            // owner of the live provider request. Cancel and
-                            // settle it through the existing executor before
-                            // returning; dropping it here would skip the
-                            // transport's ToolCancel and durable completion.
-                            if let Some(cancel_token) = config.cancel_token.as_ref() {
-                                cancel_token.cancel();
-                            }
-                            let cancelled_invocation = invocation.await;
-                            let _ = executor
-                                .finish_governed_tool_result(
-                                    runtime_tool_executor::govern_runtime_tool_result(
-                                        cancelled_invocation.result,
-                                        false,
-                                    ),
-                                    cancelled_invocation.pending,
-                                )
-                                .await;
-                            // The native stage temporarily owns the mailbox
-                            // while the provider invocation is active. An
-                            // authoritative poll failure must return that
-                            // owner before leaving this scope; otherwise
-                            // AgentMailbox::Drop detaches the subscription and
-                            // loses later messages.
-                            if let Some(mut mailbox) = mailbox.take() {
-                                mailbox.retry_deferred();
-                                state.messaging.mailbox = Some(mailbox);
-                            }
-                            return Err(error);
-                        }
-                        Ok(result) => match result {
-                            NativeProviderInputPumpResult::Idle => {}
-                            NativeProviderInputPumpResult::Accepted => {
-                                user_intent_retry_at = None;
-                                poll_user_intents = true;
-                            }
-                            NativeProviderInputPumpResult::Deferred => {
-                                user_intent_retry_at =
-                                    Some(tokio::time::Instant::now() + Duration::from_secs(5));
-                            }
-                            NativeProviderInputPumpResult::Stopped => {
-                                user_intent_retry_at = None;
-                                user_intents_enabled = false;
-                            }
-                        },
-                    }
-                    continue;
-                }
-
-                let has_input_wake = input_wake.is_some() && user_intents_enabled;
                 let has_mailbox = mailbox_enabled && mailbox_retry_at.is_none();
                 tokio::select! {
                     biased;
                     result = &mut invocation => break result,
-                    wake = async {
-                        match input_wake.as_mut() {
-                            Some(wake) => wake.changed().await.ok(),
-                            None => None,
-                        }
-                    }, if has_input_wake => {
-                        if wake.is_none() {
-                            input_wake = None;
-                            user_intents_enabled = false;
-                        } else {
-                            poll_user_intents = true;
-                        }
-                    }
-                    _ = async {
-                        match user_intent_retry_at {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
-                            None => std::future::pending().await,
-                        }
-                    }, if user_intent_retry_at.is_some() => {
-                        user_intent_retry_at = None;
-                        poll_user_intents = true;
-                    }
                     _ = async {
                         match mailbox_retry_at {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -23715,34 +23501,6 @@ impl ServerSubRunExecutor {
         } else {
             invocation.await
         };
-        let mut provider_apply_pending = false;
-        if can_pump_provider {
-            // Retry only events that were already accepted by the provider and
-            // staged before their durable apply. Do not run the ordinary
-            // settlement poll here: a newly arrived, rejected, or
-            // delivery-unknown event has no provider acceptance fact and must
-            // remain with its canonical owner.
-            let pending_apply_indices = state.user_intents.pending_apply_event_indices();
-            if !pending_apply_indices.is_empty() {
-                let run_control = state.run_control.clone().ok_or_else(|| {
-                    invalid("native stage has pending guidance but no run-control owner".into())
-                })?;
-                let apply_outcome =
-                    crate::turn::agentic_loop::execution_phase::apply_pending_user_intents(
-                        host,
-                        state,
-                        run_control.as_ref(),
-                        &config.user_id,
-                        &config.session_id,
-                        &config.run_id,
-                        &pending_apply_indices,
-                        None,
-                        false,
-                    )
-                    .await?;
-                provider_apply_pending = apply_outcome.is_none();
-            }
-        }
         let dispatch_control = deferred.dispatch_control;
         let replayed = deferred.confirmed_invocation.is_some();
         let replay_record = deferred.confirmed_invocation;
@@ -23911,11 +23669,6 @@ impl ServerSubRunExecutor {
             .is_some_and(|token| token.is_cancelled())
         {
             return Ok(AgenticLoopOutcome::Cancelled);
-        }
-        if provider_apply_pending {
-            return Ok(AgenticLoopOutcome::Waiting(
-                "native_guidance_apply_pending".into(),
-            ));
         }
         if let Some(stage_state) = result
             .metadata
@@ -26074,7 +25827,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = if self.native_execution.is_some() {
             let plan_mode_active = host.plan_mode_active(&loop_state);
-            self.execute_native_stage(&config, &mut loop_state, plan_mode_active, &mut host)
+            self.execute_native_stage(&config, &mut loop_state, plan_mode_active)
                 .await
         } else {
             run_agentic_loop_with_host(&mut host, &mut loop_state).await
