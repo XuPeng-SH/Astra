@@ -4813,18 +4813,13 @@ impl PreparedRuntimeCapabilities {
                         return Err(invalid());
                     }
                 }
-                // Authentication establishes provenance. The first-party
-                // native collaborator read-only claim is the one exception:
-                // its trust is assigned here by the selected CLI boundary,
-                // never by the provider declaration itself.
-                let mut trust_policy = ProviderClaimTrustPolicy::default();
-                trust_policy.astra_components.insert(
-                    astra_turn_types::PROVIDER_NATIVE_COLLABORATOR_COMPONENT.into(),
-                    astra_turn_types::ProviderClaimTrust::Trusted,
-                );
                 snapshots.push(
-                    resolve_provider_snapshot(snapshot, &trust_policy, &aliases)
-                        .map_err(|_| invalid())?,
+                    resolve_provider_snapshot(
+                        snapshot,
+                        &ProviderClaimTrustPolicy::default(),
+                        &aliases,
+                    )
+                    .map_err(|_| invalid())?,
                 );
             }
         }

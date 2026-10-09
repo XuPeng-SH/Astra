@@ -49,14 +49,7 @@ fn provider_declaration_carries_bounded_runtime_requirements_in_the_existing_ext
     assert_eq!(roundtrip, requirements);
     assert_eq!(declaration.native_tool_name, TOOL_NAME);
     assert!(declaration.is_collaborator_stage());
-    assert_eq!(
-        declaration
-            .claims
-            .read_only
-            .as_ref()
-            .map(|claim| claim.value),
-        Some(true)
-    );
+    assert!(declaration.claims.read_only.is_none());
     assert!(
         declaration.input_schema["properties"]
             .get("runtime_read_paths")
@@ -292,12 +285,18 @@ fn exact_thread_resume_and_native_turn_input() {
     stage.model = Some("chosen-model".into());
     stage.effort = Some("xhigh".into());
     let profile = test_profile();
-    let resume = thread_request(&stage, "/workspace", &profile);
+    let resume = thread_request(&stage, "/workspace", &profile, stage.model.as_deref());
     assert_eq!(resume["method"], "thread/resume");
     assert_eq!(resume["params"]["threadId"], "native-thread");
     assert_eq!(resume["params"]["excludeTurns"], true);
     assert!(resume["params"].get("path").is_none());
-    let turn = turn_request(&stage, "native-thread", "/workspace", &profile);
+    let turn = turn_request(
+        &stage,
+        "native-thread",
+        "/workspace",
+        &profile,
+        stage.model.as_deref(),
+    );
     assert_eq!(
         turn["params"]["input"][0],
         json!({"type": "text", "text": "Review stage", "text_elements": []})
@@ -307,6 +306,64 @@ fn exact_thread_resume_and_native_turn_input() {
     assert!(resume["params"].get("sandbox").is_none());
     assert_eq!(resume["params"]["config"], profile["config"]);
     assert_eq!(turn["params"]["effort"], "xhigh");
+}
+
+fn model_item(id: &str, model: &str, display_name: &str) -> NativeModelListItem {
+    NativeModelListItem {
+        id: id.into(),
+        model: model.into(),
+        display_name: display_name.into(),
+        hidden: false,
+        supported_reasoning_efforts: Vec::new(),
+    }
+}
+
+#[test]
+fn native_model_selector_uses_provider_names_without_guessing() {
+    let mut models = vec![
+        model_item("luna-56", "gpt-5.6-luna", "GPT-5.6-Luna"),
+        model_item("luna-6", "gpt-6-luna", "GPT-6-Luna"),
+        model_item("sol-6", "gpt-6-sol", "GPT-6-Sol"),
+    ];
+    assert_eq!(
+        resolve_model_selector("gpt-5.6-luna", &models).unwrap(),
+        "gpt-5.6-luna"
+    );
+    assert_eq!(
+        resolve_model_selector("luna-56", &models).unwrap(),
+        "gpt-5.6-luna"
+    );
+    assert_eq!(
+        resolve_model_selector("gPt-5.6-lUnA", &models).unwrap(),
+        "gpt-5.6-luna"
+    );
+    let ambiguous = resolve_model_selector("luna", &models).unwrap_err();
+    assert!(ambiguous.contains("choose one"));
+    assert!(ambiguous.contains("GPT-5.6-Luna"));
+    assert!(ambiguous.contains("GPT-6-Luna"));
+    assert!(!ambiguous.contains("gpt-5.6-luna"));
+    assert_eq!(resolve_model_selector("sol", &models).unwrap(), "gpt-6-sol");
+    assert!(resolve_model_selector("GPT-6-Luna", &models).is_ok());
+    let unavailable = resolve_model_selector("missing", &models).unwrap_err();
+    assert!(unavailable.contains("not available"));
+    assert!(unavailable.contains("GPT-5.6-Luna"));
+    assert!(!unavailable.contains("gpt-5.6-luna"));
+
+    let duplicate_display = vec![
+        model_item("luna-a", "provider-luna-a", "Luna"),
+        model_item("luna-b", "provider-luna-b", "Luna"),
+    ];
+    let duplicate = resolve_model_selector("luna", &duplicate_display).unwrap_err();
+    assert!(duplicate.contains("Luna (provider-luna-a)"));
+    assert!(duplicate.contains("Luna (provider-luna-b)"));
+
+    models[0].supported_reasoning_efforts = vec![NativeReasoningEffort {
+        reasoning_effort: "high".into(),
+    }];
+    assert!(validate_requested_effort(Some("high"), &models[0]).is_ok());
+    let unsupported = validate_requested_effort(Some("xhigh"), &models[0]).unwrap_err();
+    assert!(unsupported.contains("GPT-5.6-Luna"));
+    assert!(unsupported.contains("high"));
 }
 
 #[test]
@@ -958,6 +1015,170 @@ assert request['params']['approvalPolicy']=='never'
 assert request['params']['permissions']==profile
 assert 'sandboxPolicy' not in request['params']
 "#;
+
+    #[tokio::test]
+    async fn model_selector_uses_standard_provider_catalog_before_starting_a_thread() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+assert recv()['method']=='initialize'
+emit({'id':1,'result':{}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==4
+assert request['method']=='model/list'
+assert request['params']=={'limit':64,'includeHidden':True}
+emit({'id':4,'result':{'data':[
+    {'id':'luna-56','model':'gpt-5.6-luna','displayName':'GPT-5.6-Luna'}
+], 'nextCursor':'next'}})
+request=recv()
+assert request['id']==4 and request['method']=='model/list'
+assert request['params']['cursor']=='next'
+emit({'id':4,'result':{'data':[
+    {'id':'luna-6','model':'gpt-6-luna','displayName':'GPT-6-Luna'}
+], 'nextCursor':None}})
+request=recv()
+assert request['id']==2
+assert request['method']=='thread/start'
+assert request['params']['model']=='gpt-5.6-luna'
+assert request['params']['approvalPolicy']=='never'
+profile=request['params']['permissions']
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'model':'gpt-5.6-luna','cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':profile},'sandbox':{'type':'readOnly','networkAccess':False}}})
+request=recv()
+assert request['id']==3
+assert request['method']=='turn/start'
+assert request['params']['model']=='gpt-5.6-luna'
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
+for line in sys.stdin: pass
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(script, token.clone()).await;
+        let mut stage = stage();
+        stage.model = Some("gPt-5.6-lUnA".into());
+        let mut evidence = Evidence::default();
+        drive(
+            &mut process,
+            &stage,
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+        assert!(
+            process
+                .wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_model_name_stops_before_provider_start_and_returns_user_choices() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+assert recv()['method']=='initialize'
+emit({'id':1,'result':{}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==4 and request['method']=='model/list'
+assert request['params']['includeHidden'] is True
+emit({'id':4,'result':{'data':[
+    {'id':'luna-56','model':'gpt-5.6-luna','displayName':'GPT-5.6-Luna'},
+    {'id':'luna-6','model':'gpt-6-luna','displayName':'GPT-6-Luna'}
+], 'nextCursor':None}})
+for line in sys.stdin:
+    request=json.loads(line)
+    assert request['method'] not in ('thread/start','thread/resume','turn/start')
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(script, token.clone()).await;
+        let mut stage = stage();
+        stage.model = Some("luna".into());
+        let mut evidence = Evidence::default();
+        let error = drive(
+            &mut process,
+            &stage,
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("GPT-5.6-Luna"));
+        assert!(error.contains("GPT-6-Luna"));
+        assert!(!error.contains("gpt-5.6-luna"));
+        assert!(evidence.thread.is_none());
+        let outcome = process.cancel_and_wait().await.unwrap();
+        assert!(outcome.settlement.unwrap().ownership.is_authoritative());
+    }
+
+    #[tokio::test]
+    async fn model_acknowledgement_mismatch_stops_before_turn_start() {
+        let script = r#"
+import json,select,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+assert recv()['method']=='initialize'
+emit({'id':1,'result':{}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==4 and request['method']=='model/list'
+emit({'id':4,'result':{'data':[{'id':'luna-56','model':'gpt-5.6-luna','displayName':'GPT-5.6-Luna'}], 'nextCursor':None}})
+request=recv()
+assert request['id']==2 and request['method']=='thread/start'
+profile=request['params']['permissions']
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'model':'gpt-6-luna','cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':profile},'sandbox':{'type':'readOnly','networkAccess':False}}})
+ready,_,_=select.select([sys.stdin],[],[],1.0)
+if ready:
+    line=sys.stdin.readline()
+    if line:
+        request=json.loads(line)
+        assert request['method']!='turn/start'
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(script, token.clone()).await;
+        let mut stage = stage();
+        stage.model = Some("gpt-5.6-luna".into());
+        let mut evidence = Evidence::default();
+        let error = drive(
+            &mut process,
+            &stage,
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "native acknowledged a different model");
+        assert!(evidence.turn.is_none());
+        assert!(
+            process
+                .wait()
+                .await
+                .unwrap()
+                .status
+                .is_some_and(|status| status.success())
+        );
+    }
 
     #[tokio::test]
     async fn real_owner_preserves_terminal_and_delta_before_turn_ack() {

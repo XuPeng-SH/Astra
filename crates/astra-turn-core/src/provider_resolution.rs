@@ -131,6 +131,14 @@ impl ResolvedInvocationPolicy {
         self.effect == ResolvedToolEffect::ReadOnly
     }
 
+    /// A collaborator stage is a control-plane invocation whose workspace
+    /// effect is supplied by the immutable execution grant. It must not be
+    /// treated as an ordinary mutating tool by a read-only child; the native
+    /// adapter still enforces the grant before starting the provider.
+    pub fn is_collaborator_stage(&self) -> bool {
+        self.native_collaborator_protocol.is_some()
+    }
+
     /// Content-addressed descriptor semantic baseline. Runtime admission,
     /// authority, route, approval outcome and argument refinements must be
     /// combined with this ID to form the final per-invocation decision.

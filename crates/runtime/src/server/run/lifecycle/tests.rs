@@ -69,6 +69,8 @@ fn authenticated_edge_discovery_restores_exact_policy_and_fences_binding() {
         policy.requires_approval(),
         "authentication must not relax provider approval"
     );
+    assert!(policy.is_collaborator_stage());
+    assert!(!policy.is_read_only());
     assert_eq!(
         policy.runtime_requirements.as_ref().unwrap().read_paths,
         ["/installed/provider"]
@@ -121,29 +123,6 @@ fn authenticated_edge_discovery_restores_exact_policy_and_fences_binding() {
         PreparedRuntimeCapabilities::validate_edge_discovery_binding(&restored, "owner", &bindings)
             .is_err()
     );
-}
-
-#[test]
-fn authenticated_native_collaborator_claim_is_read_only_without_name_heuristics() {
-    let mut discovery = authenticated_edge_discovery_fixture();
-    let declaration = &mut discovery.snapshots[0].tool_declarations[0];
-    declaration.claims.read_only = Some(astra_turn_types::ProviderClaim::new(
-        true,
-        astra_turn_types::ProviderClaimSource::AstraOwned {
-            component: astra_turn_types::PROVIDER_NATIVE_COLLABORATOR_COMPONENT.into(),
-            field: "read_only_execution".into(),
-        },
-    ));
-    let mut capabilities = PreparedRuntimeCapabilities::default();
-    capabilities
-        .bind_edge_discovery(Some(discovery))
-        .expect("authenticated native discovery should resolve");
-    let policy = capabilities
-        .provider_policy_index
-        .resolve("fixture_native_stage")
-        .expect("native stage policy");
-    assert!(policy.is_read_only());
-    assert!(!policy.requires_approval());
 }
 
 #[test]

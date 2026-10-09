@@ -31,11 +31,6 @@ pub const PROVIDER_RUNTIME_REQUIREMENTS_KEY: &str = "astra.runtimeRequirements";
 /// transport.
 pub const PROVIDER_COLLABORATOR_STAGE_KEY: &str = "astra.collaboratorStage";
 
-/// Host-owned claim namespace for the native collaborator's read-only
-/// execution baseline.  The selected CLI boundary may trust this claim after
-/// authenticating the declaration; arbitrary providers may not.
-pub const PROVIDER_NATIVE_COLLABORATOR_COMPONENT: &str = "native-collaborator";
-
 /// Installed-provider dependencies, not an authorization grant. The local
 /// runtime owner supplies these facts; canonical admission approves them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

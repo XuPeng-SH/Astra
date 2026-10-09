@@ -22,6 +22,11 @@ const INTERACTION_TIMEOUT: Duration = Duration::from_secs(3600);
 const PRE_ACK_EVENTS: usize = 8;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPPORTED_VERSION: &[u8] = b"codex-cli 0.160.0";
+const MODEL_LIST_REQUEST_ID: i64 = 4;
+const INTERRUPT_REQUEST_ID: i64 = 5;
+const MODEL_LIST_PAGE_LIMIT: u64 = 64;
+const MODEL_LIST_MAX_PAGES: usize = 8;
+const MODEL_LIST_MAX_ITEMS: usize = 512;
 
 fn native_stage_remaining(
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
@@ -362,7 +367,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_NAME,
-            "description": "Execute one admitted native Codex collaborator stage in the selected CLI workspace. Resume only an exact acknowledged native_session_id. Run/control/deadline authority comes from the invocation, never arguments.",
+            "description": "Execute one admitted native Codex collaborator stage in the selected CLI workspace. The model is resolved from Codex model/list: use the provider model name or an unambiguous short name; if a name has multiple matches, ask the user to choose. Omit it to use the provider default. Resume only an exact acknowledged native_session_id. Run/control/deadline authority comes from the invocation, never arguments.",
             "parameters": {
                 "type": "object", "additionalProperties": false,
                 "properties": {
@@ -410,16 +415,11 @@ fn provider_declaration(
             .map(str::to_owned),
         input_schema: schema["function"]["parameters"].clone(),
         output_schema: None,
-        claims: astra_turn_types::ProviderToolClaims {
-            read_only: Some(astra_turn_types::ProviderClaim::new(
-                true,
-                astra_turn_types::ProviderClaimSource::AstraOwned {
-                    component: astra_turn_types::PROVIDER_NATIVE_COLLABORATOR_COMPONENT.into(),
-                    field: "read_only_execution".into(),
-                },
-            )),
-            ..Default::default()
-        },
+        // A collaborator stage is not an ordinary read-only tool. Its
+        // workspace effect is fixed by the invocation's execution ceiling;
+        // claiming read-only here would incorrectly make a writable stage
+        // cacheable and approval-free.
+        claims: Default::default(),
         // This declaration is an agent-stage capacity, not an ordinary tool.
         // The shared runtime uses this typed fact to expose it in the
         // provider-owned collaborator directory without name matching.
@@ -468,10 +468,183 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256 && id.trim() == id && !id.chars().any(char::is_control)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeModelListItem {
+    id: String,
+    model: String,
+    display_name: String,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    supported_reasoning_efforts: Vec<NativeReasoningEffort>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeReasoningEffort {
+    reasoning_effort: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeModelListPage {
+    data: Vec<NativeModelListItem>,
+    next_cursor: Option<String>,
+}
+
+fn normalized_model_selector(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn selector_tokens(value: &str) -> Vec<String> {
+    normalized_model_selector(value)
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn model_choice_names(models: &[&NativeModelListItem]) -> String {
+    let visible: Vec<_> = models
+        .iter()
+        .copied()
+        .filter(|model| !model.hidden)
+        .collect();
+    let mut choices = Vec::new();
+    for model in visible {
+        let duplicate_display_name = models
+            .iter()
+            .filter(|candidate| !candidate.hidden)
+            .filter(|candidate| candidate.display_name == model.display_name)
+            .count()
+            > 1;
+        let choice = if duplicate_display_name {
+            format!("{} ({})", model.display_name, model.model)
+        } else {
+            model.display_name.clone()
+        };
+        if !choices.iter().any(|existing| existing == &choice) {
+            choices.push(choice);
+        }
+        if choices.len() == 8 {
+            break;
+        }
+    }
+    choices.join(", ")
+}
+
+fn validate_requested_effort(
+    requested: Option<&str>,
+    model: &NativeModelListItem,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if model.supported_reasoning_efforts.is_empty()
+        || model
+            .supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort.reasoning_effort == requested)
+    {
+        return Ok(());
+    }
+    let choices = model
+        .supported_reasoning_efforts
+        .iter()
+        .map(|effort| effort.reasoning_effort.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Model '{}' does not support reasoning effort '{}'. Available levels: {choices}",
+        model.display_name, requested
+    ))
+}
+
+fn resolve_model_selector(
+    requested: &str,
+    models: &[NativeModelListItem],
+) -> Result<String, String> {
+    let exact: Vec<_> = models
+        .iter()
+        .filter(|model| model.model == requested || model.id == requested)
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact[0].model.clone());
+    }
+    if exact.len() > 1 {
+        return Err(format!(
+            "The model name '{requested}' is ambiguous; please choose one available model"
+        ));
+    }
+
+    let normalized = normalized_model_selector(requested);
+    let display_matches: Vec<_> = models
+        .iter()
+        .filter(|model| normalized_model_selector(&model.display_name) == normalized)
+        .collect();
+    if display_matches.len() == 1 {
+        return Ok(display_matches[0].model.clone());
+    }
+    if display_matches.len() > 1 {
+        return Err(format!(
+            "The model name '{requested}' is ambiguous; please choose one: {}",
+            model_choice_names(&display_matches)
+        ));
+    }
+
+    // A short name is useful only when it is an exact catalog component. Do
+    // not use substring, edit-distance, or provider-specific aliases: those
+    // make a natural request look convenient while silently selecting the
+    // wrong model. Ambiguous components remain a user clarification.
+    let requested_tokens = selector_tokens(requested);
+    let component_matches: Vec<_> = if requested_tokens.len() == 1 {
+        let requested_token = &requested_tokens[0];
+        models
+            .iter()
+            .filter(|model| !model.hidden)
+            .filter(|model| {
+                selector_tokens(&model.model)
+                    .into_iter()
+                    .chain(selector_tokens(&model.display_name))
+                    .any(|token| token == *requested_token)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if component_matches.len() == 1 {
+        return Ok(component_matches[0].model.clone());
+    }
+    if component_matches.len() > 1 {
+        return Err(format!(
+            "The model name '{requested}' is ambiguous; please choose one: {}",
+            model_choice_names(&component_matches)
+        ));
+    }
+
+    let choices = model_choice_names(&models.iter().collect::<Vec<_>>());
+    if choices.is_empty() {
+        Err(format!(
+            "The requested model '{requested}' is not available from this provider, and no choices were returned"
+        ))
+    } else {
+        Err(format!(
+            "The requested model '{requested}' is not available from this provider. Available choices: {choices}"
+        ))
+    }
+}
+
 #[derive(Default)]
 struct Evidence {
     thread: Option<String>,
     turn: Option<String>,
+    resolved_model: Option<String>,
+    acknowledged_model: Option<String>,
     resumed: bool,
     turn_queued: bool,
     terminal: Option<String>,
@@ -744,11 +917,34 @@ fn initialize() -> Value {
     }})
 }
 
-fn thread_request(stage: &Stage, cwd: &str, sandbox: &Value) -> Value {
+fn model_list_request(cursor: Option<&str>) -> Value {
+    let mut params = json!({
+        "limit": MODEL_LIST_PAGE_LIMIT,
+        // Explicit model selection is an execution lookup, not a picker. A
+        // hidden model is still a valid provider identity; hidden models are
+        // excluded only from the interactive picker.
+        "includeHidden": true
+    });
+    if let Some(cursor) = cursor {
+        params["cursor"] = json!(cursor);
+    }
+    json!({
+        "id": MODEL_LIST_REQUEST_ID,
+        "method": "model/list",
+        "params": params
+    })
+}
+
+fn thread_request(
+    stage: &Stage,
+    cwd: &str,
+    sandbox: &Value,
+    resolved_model: Option<&str>,
+) -> Value {
     // Approval is not an authorization to expand the admitted sandbox. Native
     // commands within this ceiling still run; unsandboxed retries must not.
     let mut params = json!({"cwd": cwd, "permissions": sandbox["profileId"], "config": sandbox["config"], "approvalPolicy": "never", "approvalsReviewer": "user"});
-    if let Some(model) = &stage.model {
+    if let Some(model) = resolved_model {
         params["model"] = json!(model);
     }
     let method = if let Some(thread) = &stage.native_session_id {
@@ -761,11 +957,17 @@ fn thread_request(stage: &Stage, cwd: &str, sandbox: &Value) -> Value {
     json!({"id": 2, "method": method, "params": params})
 }
 
-fn turn_request(stage: &Stage, thread: &str, cwd: &str, sandbox: &Value) -> Value {
+fn turn_request(
+    stage: &Stage,
+    thread: &str,
+    cwd: &str,
+    sandbox: &Value,
+    resolved_model: Option<&str>,
+) -> Value {
     let mut params = json!({"threadId": thread, "cwd": cwd,
         "input": [{"type": "text", "text": stage.task, "text_elements": []}],
         "permissions": sandbox["profileId"], "approvalPolicy": "never", "approvalsReviewer": "user"});
-    if let Some(model) = &stage.model {
+    if let Some(model) = resolved_model {
         params["model"] = json!(model);
     }
     if let Some(effort) = &stage.effort {
@@ -829,12 +1031,86 @@ async fn rpc(
                     Some(1) => "native initialize request rejected",
                     Some(2) => "native thread request rejected",
                     Some(3) => "native turn request rejected",
+                    Some(4) => "native model catalog request rejected",
+                    Some(5) => "native interrupt request rejected",
                     _ => "native request rejected",
                 });
             }
             return Ok(envelope["result"].clone());
         }
     }
+}
+
+async fn resolve_requested_model(
+    process: &mut FramedProcess,
+    input: &FramedProcessInput,
+    stage: &Stage,
+    evidence: &mut Evidence,
+    output_limit: usize,
+) -> Result<Option<String>, String> {
+    let Some(requested) = stage.model.as_deref() else {
+        // Omitting the selector is the provider-default path. It must not
+        // pay for discovery or turn a normal stage into a catalog dependency.
+        return Ok(None);
+    };
+
+    let mut models = Vec::new();
+    let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for page_index in 0..MODEL_LIST_MAX_PAGES {
+        let response = rpc(
+            process,
+            input,
+            model_list_request(cursor.as_deref()),
+            evidence,
+            output_limit,
+        )
+        .await
+        .map_err(str::to_owned)?;
+        let page: NativeModelListPage = serde_json::from_value(response)
+            .map_err(|_| "native model catalog response is invalid".to_owned())?;
+        if models
+            .len()
+            .checked_add(page.data.len())
+            .is_none_or(|total| total > MODEL_LIST_MAX_ITEMS)
+        {
+            return Err("native model catalog exceeds the bounded selection limit".into());
+        }
+        for model in page.data {
+            if !valid_id(&model.id)
+                || !valid_id(&model.model)
+                || model.display_name.trim().is_empty()
+                || model.display_name.len() > 256
+                || model.display_name.chars().any(char::is_control)
+                || model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|effort| !valid_id(&effort.reasoning_effort))
+                || models.iter().any(|existing: &NativeModelListItem| {
+                    existing.id == model.id || existing.model == model.model
+                })
+            {
+                return Err("native model catalog contains an invalid or duplicate model".into());
+            }
+            models.push(model);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        if !valid_id(&next_cursor) || !seen_cursors.insert(next_cursor.clone()) {
+            return Err("native model catalog pagination is invalid".into());
+        }
+        if page_index + 1 == MODEL_LIST_MAX_PAGES {
+            return Err("native model catalog pagination exceeds the bounded limit".into());
+        }
+        cursor = Some(next_cursor);
+    }
+    let resolved = resolve_model_selector(requested, &models)?;
+    if let Some(model) = models.iter().find(|model| model.model == resolved) {
+        validate_requested_effort(stage.effort.as_deref(), model)?;
+    }
+    evidence.resolved_model = Some(resolved.clone());
+    Ok(Some(resolved))
 }
 
 async fn next_envelope(
@@ -874,6 +1150,18 @@ fn acknowledge_thread(
     }
     evidence.thread = Some(id.to_owned());
     evidence.resumed = stage.native_session_id.is_some();
+    if let Some(model) = result
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| valid_id(model))
+    {
+        evidence.acknowledged_model = Some(model.to_owned());
+    }
+    if stage.model.is_some()
+        && evidence.acknowledged_model.as_deref() != evidence.resolved_model.as_deref()
+    {
+        return Err("native acknowledged a different model");
+    }
     // Do not turn/start into an existing active native turn: that method can
     // steer it, which would falsely attribute old work to a new child run.
     if thread.pointer("/status/type").and_then(Value::as_str) != Some("idle") {
@@ -1148,14 +1436,16 @@ async fn drive(
     output_limit: usize,
     gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     let input = process.input();
     rpc(process, &input, initialize(), evidence, output_limit).await?;
     send(&input, json!({"method": "initialized"})).await?;
+    let resolved_model =
+        resolve_requested_model(process, &input, stage, evidence, output_limit).await?;
     let response = rpc(
         process,
         &input,
-        thread_request(stage, cwd, sandbox),
+        thread_request(stage, cwd, sandbox, resolved_model.as_deref()),
         evidence,
         output_limit,
     )
@@ -1167,7 +1457,13 @@ async fn drive(
     let response = rpc(
         process,
         &input,
-        turn_request(stage, evidence.thread.as_deref().unwrap(), cwd, sandbox),
+        turn_request(
+            stage,
+            evidence.thread.as_deref().unwrap(),
+            cwd,
+            sandbox,
+            resolved_model.as_deref(),
+        ),
         evidence,
         output_limit,
     )
@@ -1190,11 +1486,11 @@ async fn drive(
             let decision = loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => return Err("native invocation cancelled"),
+                    _ = cancel.cancelled() => return Err("native invocation cancelled".into()),
                     decision = &mut decision => break decision.map_err(|_| "native interaction timed out")?,
                     event = next_envelope(process, evidence) => {
                         let event = event?;
-                        if event.get("id").is_some() { return Err("native concurrent interaction exceeds invocation bound"); }
+                        if event.get("id").is_some() { return Err("native concurrent interaction exceeds invocation bound".into()); }
                         let method = event["method"].as_str().ok_or("unexpected native response during interaction")?;
                         evidence.notification(method, &event["params"], output_limit)?;
                         if evidence.terminal.is_some() { return Ok(()); }
@@ -1207,13 +1503,17 @@ async fn drive(
                     send(&input, json!({"id": envelope["id"], "result": payload})).await?;
                 }
                 ProviderInteractionDecision::Submitted(_) => {
-                    return Err("invalid native interaction response");
+                    return Err("invalid native interaction response".into());
                 }
                 ProviderInteractionDecision::Cancelled => {
-                    return Err("native interaction cancelled");
+                    return Err("native interaction cancelled".into());
                 }
-                ProviderInteractionDecision::Timeout => return Err("native interaction timed out"),
-                ProviderInteractionDecision::Error(_) => return Err("native interaction failed"),
+                ProviderInteractionDecision::Timeout => {
+                    return Err("native interaction timed out".into());
+                }
+                ProviderInteractionDecision::Error(_) => {
+                    return Err("native interaction failed".into());
+                }
             }
         } else {
             evidence.notification(method, &envelope["params"], output_limit)?;
@@ -1402,7 +1702,7 @@ impl ToolExecutor {
         let mut evidence = Evidence::default();
         let driven = tokio::select! {
             biased;
-            _ = token.cancelled() => Err("native invocation cancelled"),
+            _ = token.cancelled() => Err("native invocation cancelled".into()),
             result = drive(&mut process, &stage, cwd_text, &sandbox, &mut evidence, output_limit, Some(gate), &token) => result,
         };
         // EOF after a terminal notification closes the native server normally.
@@ -1414,7 +1714,7 @@ impl ToolExecutor {
         {
             // Best effort protocol interruption, fenced to the actual ACKs.
             // Its ACK is not terminal evidence and never replaces settlement.
-            let request = json!({"id": 4, "method": "turn/interrupt", "params": {"threadId": thread, "turnId": turn}});
+            let request = json!({"id": INTERRUPT_REQUEST_ID, "method": "turn/interrupt", "params": {"threadId": thread, "turnId": turn}});
             let input = process.input();
             interrupt_acknowledged = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -1484,15 +1784,18 @@ impl ToolExecutor {
             }
             output.push_str(&format!(
                 "Error: {}",
-                driven
-                    .err()
-                    .unwrap_or("native stage did not complete with settled transport")
+                driven.err().unwrap_or_else(|| {
+                    "native stage did not complete with settled transport".into()
+                })
             ));
         }
         let mut metadata = json!({
                 "native_collaborator": {
                     "provider": "codex", "protocol": "codex-app-server",
                     "native_session_id": evidence.thread, "native_turn_id": evidence.turn,
+                    "requested_model": stage.model, "resolved_model": evidence.resolved_model,
+                    "acknowledged_model": evidence.acknowledged_model,
+                    "model_resolution": if stage.model.is_some() {"provider_catalog"} else {"provider_default"},
                     "session_acknowledged": session_acknowledged, "turn_acknowledged": turn_acknowledged,
                     "dispatch_state": if turn_acknowledged {"acknowledged"} else if evidence.turn_queued {"unknown"} else {"not_dispatched"},
                     "native_terminal": evidence.terminal, "usage_snapshot": evidence.usage, "cost_usd": null,
