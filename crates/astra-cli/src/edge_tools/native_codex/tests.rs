@@ -277,6 +277,12 @@ fn provider_declaration_carries_bounded_runtime_requirements_in_the_existing_ext
     assert!(declaration.is_collaborator_stage());
     assert!(declaration.claims.read_only.is_none());
     assert!(
+        !declaration
+            .extension_fields
+            .contains_key("codex.protocolVersion"),
+        "provider availability must be established by the protocol contract, not a CLI version"
+    );
+    assert!(
         declaration.input_schema["properties"]
             .get("runtime_read_paths")
             .is_none()
@@ -285,6 +291,76 @@ fn provider_declaration_carries_bounded_runtime_requirements_in_the_existing_ext
         declaration.input_schema["properties"]
             .get("permissions")
             .is_none()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn discovery_handshake_uses_the_same_bounded_initialize_contract_as_execution() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(value): print(json.dumps(value),flush=True)
+request=recv()
+assert request['id']==1 and request['method']=='initialize'
+emit({'id':1,'result':{'serverInfo':{'name':'fixture'}}})
+assert recv()['method']=='initialized'
+for line in sys.stdin: pass
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let input = process.input();
+    let mut evidence = Evidence::default();
+    initialize_protocol(
+        &mut process,
+        &input,
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        &token,
+    )
+    .await
+    .expect("a valid initialize response establishes the protocol contract");
+    let outcome = process.cancel_and_wait().await.unwrap();
+    assert!(
+        outcome
+            .settlement
+            .is_some_and(|settlement| settlement.ownership.is_authoritative())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn discovery_handshake_rejects_a_non_object_initialize_result() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(value): print(json.dumps(value),flush=True)
+request=recv()
+assert request['id']==1 and request['method']=='initialize'
+emit({'id':1,'result':[]})
+for line in sys.stdin: pass
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let input = process.input();
+    let mut evidence = Evidence::default();
+    let error = initialize_protocol(
+        &mut process,
+        &input,
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        &token,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "native initialize returned an invalid result");
+    let outcome = process.cancel_and_wait().await.unwrap();
+    assert!(
+        outcome
+            .settlement
+            .is_some_and(|settlement| settlement.ownership.is_authoritative())
     );
 }
 
@@ -1353,6 +1429,45 @@ for line in sys.stdin:
         assert!(error.contains("GPT-5.6-Luna"));
         assert!(error.contains("GPT-6-Luna"));
         assert!(!error.contains("gpt-5.6-luna"));
+        assert!(evidence.thread.is_none());
+        let outcome = process.cancel_and_wait().await.unwrap();
+        assert!(outcome.settlement.unwrap().ownership.is_authoritative());
+    }
+
+    #[tokio::test]
+    async fn unavailable_model_stops_before_thread_start_with_an_actionable_error() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+assert recv()['method']=='initialize'
+emit({'id':1,'result':{}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==4 and request['method']=='model/list'
+emit({'id':4,'result':{'data':[], 'nextCursor':None}})
+for line in sys.stdin:
+    request=json.loads(line)
+    assert request['method'] not in ('thread/start','thread/resume','turn/start')
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(script, token.clone()).await;
+        let mut stage = stage();
+        stage.model = Some("model-that-is-not-currently-listed".into());
+        let mut evidence = Evidence::default();
+        let error = drive(
+            &mut process,
+            &stage,
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("not available from this provider"));
         assert!(evidence.thread.is_none());
         let outcome = process.cancel_and_wait().await.unwrap();
         assert!(outcome.settlement.unwrap().ownership.is_authoritative());

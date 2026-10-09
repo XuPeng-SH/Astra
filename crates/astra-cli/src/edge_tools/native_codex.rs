@@ -22,7 +22,6 @@ const OUTPUT_BYTES: usize = 64 * 1024;
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(3600);
 const PRE_ACK_EVENTS: usize = 8;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-const SUPPORTED_VERSION: &[u8] = b"codex-cli 0.160.0";
 const MODEL_LIST_REQUEST_ID: i64 = 4;
 const INTERRUPT_REQUEST_ID: i64 = 5;
 const STEER_REQUEST_ID: i64 = 6;
@@ -319,45 +318,55 @@ fn expected_profile_sandbox(
     Ok((sandbox_type, network))
 }
 
-async fn verify_installed_version(
+/// Verify the installed provider by using its structured protocol, not by
+/// binding capability to a particular CLI release. Version output is useful
+/// telemetry, but only an accepted `initialize` response proves that this
+/// executable speaks the protocol Astra is about to use.
+async fn verify_installed_protocol(
     executable: &std::path::Path,
     cwd: &std::path::Path,
     cancel: &CancellationToken,
     timeout: Duration,
 ) -> Result<(), &'static str> {
-    let (mut command, owner) = prepare_native_process(executable, &["--version".into()])
-        .map_err(|_| "native version probe ownership unavailable")?;
+    let (mut command, owner) = prepare_native_process(executable, &["app-server".into()])
+        .map_err(|_| "native protocol probe ownership unavailable")?;
     command.current_dir(cwd);
     let mut process = owner
         .spawn_framed(
             command,
             FramedProcessLimits {
-                max_frame_bytes: 1024,
-                max_queued_frames: 1,
-                max_stderr_bytes: 0,
+                max_frame_bytes: FRAME_BYTES,
+                max_queued_frames: 4,
+                max_stderr_bytes: 4096,
                 timeout: timeout.min(Duration::from_secs(2)),
             },
             cancel.child_token(),
         )
-        .map_err(|_| "native version probe unavailable")?;
-    let supported = process
-        .recv_frame()
+        .map_err(|_| "native protocol probe unavailable")?;
+
+    let mut evidence = Evidence::default();
+    let input = process.input();
+    let probe = initialize_protocol(
+        &mut process,
+        &input,
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        cancel,
+    )
+    .await;
+    let outcome = process
+        .cancel_and_wait()
         .await
-        .is_some_and(|frame| frame == SUPPORTED_VERSION);
-    let outcome = if supported {
-        process.wait().await
-    } else {
-        process.cancel_and_wait().await
-    }
-    .map_err(|_| "native version probe settlement unavailable")?;
-    if !supported
-        || !matches!(outcome.end, FramedProcessEnd::Exited)
-        || !outcome.status.is_some_and(|status| status.success())
+        .map_err(|_| "native protocol probe settlement unavailable")?;
+    if probe.is_err()
         || !outcome
             .settlement
             .is_some_and(|settlement| settlement.ownership.is_authoritative())
     {
-        return Err("native Codex version is unavailable or unsupported");
+        return Err(probe
+            .err()
+            .unwrap_or("native protocol probe did not settle"));
     }
     Ok(())
 }
@@ -405,7 +414,6 @@ fn provider_declaration(
                 .extension_value()
         ),
     );
-    extension_fields.insert("codex.protocolVersion".into(), json!("0.160.0"));
     astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(&extension_fields)?;
     let declaration = astra_turn_types::ProviderToolDeclaration {
         native_tool_id: astra_turn_types::NativeToolId::new(TOOL_NAME)?,
@@ -1361,6 +1369,37 @@ async fn rpc(
     }
 }
 
+/// Perform the one protocol handshake shared by discovery and execution.
+/// Discovery proves only that this executable can speak the protocol; the
+/// actual stage still creates its own process and repeats the handshake before
+/// selecting a model or starting a turn.
+#[allow(clippy::too_many_arguments)]
+async fn initialize_protocol(
+    process: &mut FramedProcess,
+    input: &FramedProcessInput,
+    evidence: &mut Evidence,
+    output_limit: usize,
+    gate: Option<&dyn ProviderInteractionGate>,
+    cancel: &CancellationToken,
+) -> Result<(), &'static str> {
+    let response = rpc(
+        process,
+        input,
+        initialize(),
+        evidence,
+        output_limit,
+        gate,
+        Some(cancel),
+        None,
+        None,
+    )
+    .await?;
+    if !response.is_object() {
+        return Err("native initialize returned an invalid result");
+    }
+    send(input, json!({"method": "initialized"})).await
+}
+
 async fn resolve_requested_model(
     process: &mut FramedProcess,
     input: &FramedProcessInput,
@@ -1792,19 +1831,7 @@ async fn drive_with_input(
     mut input_rx: Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
 ) -> Result<(), String> {
     let input = process.input();
-    rpc(
-        process,
-        &input,
-        initialize(),
-        evidence,
-        output_limit,
-        gate,
-        Some(cancel),
-        None,
-        None,
-    )
-    .await?;
-    send(&input, json!({"method": "initialized"})).await?;
+    initialize_protocol(process, &input, evidence, output_limit, gate, cancel).await?;
     let resolved_model =
         resolve_requested_model(process, &input, stage, evidence, output_limit, gate, cancel)
             .await?;
@@ -1936,7 +1963,7 @@ impl ToolExecutor {
         let requirements = installed_runtime_requirements().ok()?;
         let executable = std::path::Path::new(&requirements.executable);
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
-        verify_installed_version(executable, &root, &token, Duration::from_secs(2))
+        verify_installed_protocol(executable, &root, &token, Duration::from_secs(2))
             .await
             .ok()?;
         provider_declaration(requirements).ok()
@@ -1980,10 +2007,9 @@ impl ToolExecutor {
             return failure("native invocation admission cancelled or expired");
         }
         // Check whole-job authority before capability/config preparation.
-        let timeout = match native_stage_remaining(invocation) {
-            Ok(remaining) => remaining,
-            Err(reason) => return failure(reason),
-        };
+        if let Err(reason) = native_stage_remaining(invocation) {
+            return failure(reason);
+        }
         let mut policy = astra_core::sync_poison::recover_rwlock_read(&self.sandbox_policy).clone();
         if policy
             .as_ref()
@@ -2044,9 +2070,6 @@ impl ToolExecutor {
             policy.max_output_bytes.min(OUTPUT_BYTES)
         });
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
-        if let Err(reason) = verify_installed_version(executable, &cwd, &token, timeout).await {
-            return failure(reason);
-        }
         let Some(attribution) =
             astra_tools::workspace_observation::WorkspaceAttributionState::capture(&cwd)
         else {
