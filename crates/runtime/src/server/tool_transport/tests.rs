@@ -818,6 +818,30 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
         .unwrap();
     assert!(!plan.requires_live_provider_interaction());
     assert!(plan.dispatch_payload_json().is_err());
+
+    let read_only_binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::edge_workspace(
+            "/Users/test/project",
+            astra_runtime_env::WorkspaceAuthority::ReadOnly,
+        ),
+        astra_runtime_env::ExecutorBinding::edge_agent("edge-1"),
+        astra_runtime_env::RuntimeBinding::host_process("edge-host:edge-1"),
+        astra_runtime_env::PolicyIntent::read_only_review(),
+        &astra_runtime_env::ToolRegistry::builtins(),
+    );
+    let mut read_only_invocation = invocation.clone();
+    read_only_invocation.workspace.authority = WorkspaceAuthority::ReadOnly;
+    let read_only_plan = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &read_only_invocation,
+        &read_only_binding,
+    )
+    .unwrap();
+    assert_eq!(
+        read_only_binding.policy.isolation,
+        astra_runtime_env::IsolationIntent::ProviderEnforced
+    );
+    assert!(read_only_plan.execution_ceiling().is_some());
+
     for filesystem in [
         astra_runtime_env::FilesystemPolicy::NoAccess,
         astra_runtime_env::FilesystemPolicy::ExplicitAllowList,

@@ -78,6 +78,16 @@ impl NativeCollaboratorProtocol {
         }
     }
 
+    pub fn from_permission_scope(value: &str) -> Option<Self> {
+        [
+            Self::CodexAppServer,
+            Self::ClaudeStreamJson,
+            Self::OpenCodeAcp,
+        ]
+        .into_iter()
+        .find(|protocol| protocol.permission_scope() == value)
+    }
+
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::CodexAppServer => "Codex",

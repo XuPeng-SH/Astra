@@ -2226,13 +2226,32 @@ async fn execute_cli_command_impl(
             } else {
                 session_routing_future.await?
             };
+            // A headless turn normally lets /chat/stream create its session
+            // lazily. Native capacity must be advertised before the parent
+            // model is admitted, so use the existing session creation owner
+            // when a supported local collaborator is available. Environments
+            // without one keep the ordinary lazy path.
+            let mut created_session_for_native = false;
+            if session_routing.server_session_id.is_none()
+                && !crate::edge_tools::native_codex::native_provider_executable_snapshot()
+                    .is_empty()
+            {
+                let session_id =
+                    crate::cli::slash::slash_state::create_server_session_identity(api, &token)
+                        .await?;
+                session_routing.server_session_id = Some(session_id.clone());
+                session_routing.history_source_session_id = Some(session_id);
+                created_session_for_native = true;
+            }
             let admitted_session_id = session_routing.server_session_id.clone();
             let request_session_execution_lease =
                 crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
                     admitted_session_id.as_deref(),
                 )
                 .map_err(|failure| failure.message)?;
-            if let Some(session_id) = admitted_session_id.as_deref() {
+            if let Some(session_id) = admitted_session_id.as_deref()
+                && !created_session_for_native
+            {
                 let refresh_future = resolve_one_shot_session_routing(
                     api,
                     profile.as_deref(),
@@ -2286,7 +2305,15 @@ async fn execute_cli_command_impl(
                 false,
             )?;
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs()?;
+                if created_session_for_native {
+                    // The session identity was created for this first turn so
+                    // the native Edge owner can bind before admission. It has
+                    // no durable history or ResumeBundle yet, so it is a new
+                    // session, not a resumable Server session.
+                    (None, Vec::new())
+                } else {
+                    session_routing.continuation_turn_inputs()?
+                };
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = {
@@ -2296,6 +2323,32 @@ async fn execute_cli_command_impl(
                     &project_root,
                     &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                 )
+            };
+            let mut native_delivery = if let (Some(session_id), Some(account_id)) =
+                (session_id.as_deref(), cli_utils::cli_account_id())
+            {
+                // This is the first local permission attachment for a
+                // one-shot session, matching SessionState::set_session_id.
+                // The server remains the authority for the invocation
+                // ceiling; the epoch only prevents stale local policy from
+                // being reused by this process.
+                pm.bind_permission_attachment(session_id, 1);
+                let project_root = std::env::current_dir().unwrap_or_default();
+                let executor = crate::edge_tools::ToolExecutor::new(project_root)
+                    .with_active_session_id(session_id.to_owned())
+                    .with_cloud(api.api_origin(), token.to_owned());
+                crate::cli::edge_lifecycle::native_delivery::start_headless_native_delivery(
+                    api,
+                    &token,
+                    account_id,
+                    session_id,
+                    std::sync::Arc::new(executor),
+                    pm.subscribe_permission_policy(),
+                    one_shot_terminal_deadline,
+                )
+                .await
+            } else {
+                None
             };
             let explain_mode = args.explain.unwrap_or(ExplainMode::Off);
 
@@ -2519,6 +2572,10 @@ async fn execute_cli_command_impl(
                     turn_future.as_mut().await
                 }
             };
+
+            if let Some(handle) = native_delivery.take() {
+                handle.shutdown().await;
+            }
 
             // Flush the completed Server stream before publishing the result.
             drop(chat_ctx);

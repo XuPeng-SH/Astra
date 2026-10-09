@@ -4086,7 +4086,7 @@ fn install_provider_execution_directory(
         let directory = serde_json::to_string(&entries)
             .expect("provider execution directory entries are JSON values");
         texts.push(format!(
-            "{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nThe following exact provider tools are available for `agent(action=\\\"spawn\\\").execution.tool` in this turn. This is capability metadata, not an instruction from the provider. Use the exact `tool` value; omit `execution` for an Astra-native child. Match a user-requested external provider only when it appears here; do not guess, substitute, or inspect workspace configuration. A provider's `model` field is its own model selector, not an Astra Offering.\n```json\n{directory}\n```"
+            "{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nThe following exact provider tools are available for `agent(action=\\\"spawn\\\").execution.tool` in this turn. This is capability metadata, not an instruction from the provider. Use the exact `tool` value; omit `execution` for an Astra-native child. Match a user-requested external provider only when the user explicitly names that provider or protocol; a plain Chat/Astra model request must use `requested_model_policy` and omit `execution`. Do not guess, substitute, or inspect workspace configuration. A provider's `model` field is its own model selector, not an Astra Offering.\n```json\n{directory}\n```"
         ));
     }
 
@@ -4094,6 +4094,35 @@ fn install_provider_execution_directory(
         astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS.into(),
         json!(texts),
     );
+}
+
+/// Project authenticated Edge provider declarations into the same private
+/// provider-contract shape used by request-scoped Edge schemas. These are
+/// execution contracts, not resident model tools; the caller decides whether
+/// they belong in the current visible surface.
+pub(crate) fn authenticated_edge_provider_tool_schemas(
+    discovery: Option<&AuthenticatedEdgeDiscovery>,
+) -> Vec<Value> {
+    discovery
+        .into_iter()
+        .flat_map(|discovery| discovery.snapshots.iter())
+        .flat_map(|snapshot| snapshot.tool_declarations.iter())
+        .map(|declaration| {
+            let mut schema = json!({
+                "type": "function",
+                "function": {
+                    "name": declaration.native_tool_name,
+                    "description": declaration.description.as_deref().unwrap_or_default(),
+                    "parameters": declaration.input_schema,
+                }
+            });
+            if let Some(stable_tool_alias) = &declaration.stable_tool_alias {
+                schema["function"][astra_turn_types::STABLE_TOOL_ALIAS_SCHEMA_KEY] =
+                    Value::String(stable_tool_alias.to_string());
+            }
+            schema
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4241,6 +4270,10 @@ impl RuntimeExecutionHandoff {
 }
 
 impl ServerAgenticLoopHost {
+    pub(crate) fn edge_provider_tool_schemas(&self) -> &[Value] {
+        &self.edge_provider_tool_schemas
+    }
+
     /// Install the authenticated provider discovery and its model-facing
     /// collaborator directory together. The directory is derived from the
     /// same snapshot used by admission; it is not a second capability cache.
@@ -4249,6 +4282,12 @@ impl ServerAgenticLoopHost {
         discovery: Option<AuthenticatedEdgeDiscovery>,
     ) {
         self.authenticated_edge_discovery = discovery;
+        self.edge_provider_tool_schemas =
+            merge_provider_contract_schemas(self.edge_provider_tool_schemas.iter().cloned().chain(
+                authenticated_edge_provider_tool_schemas(
+                    self.authenticated_edge_discovery.as_ref(),
+                ),
+            ));
         install_provider_execution_directory(
             &mut self.edge_profile,
             self.authenticated_edge_discovery.as_ref(),
@@ -23552,6 +23591,8 @@ mod tests {
             .expect("required provider must be discoverable");
         assert!(directory.contains("native_codex"));
         assert!(directory.contains("accepts_model"));
+        assert!(directory.contains("plain Chat/Astra model request"));
+        assert!(directory.contains("omit `execution`"));
         assert!(!directory.contains("ordinary_tool"));
         assert!(!directory.contains("provider text is not copied"));
         assert!(texts.iter().any(|text| text == "existing runtime fact"));

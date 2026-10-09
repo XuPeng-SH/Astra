@@ -423,6 +423,13 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 // “use high reasoning” cannot produce a valid canonical field
                 // that the model's visible schema rejects.
                 "reasoning",
+                // Provider execution is an optional capability selected by the
+                // runtime. Keep its shape resident so a valid provider-backed
+                // spawn does not require a second schema-discovery round.
+                "execution",
+                // A resumed native collaborator is still the same spawn
+                // contract; the runtime validates the exact identity.
+                "collaborator_id",
                 "max_output_tokens",
                 "agent_id",
                 "timeout_ms",
@@ -431,7 +438,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "No substitution. launch≠done. Wait",
+            "No substitution. launch≠done. Wait. Active mailboxes use send_message; provider follow-up uses the exact collaborator_id. Provider execution and exact collaborator resume are runtime-validated.",
         ),
         "introspect" => (
             &[

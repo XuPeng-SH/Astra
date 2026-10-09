@@ -607,6 +607,18 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
     ).expect("ordinary delegation must not require model catalog fields");
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &json!({
+            "action":"spawn",
+            "description":"Provider stage",
+            "prompt":"Return the requested result",
+            "execution":{"tool":"native_codex"},
+            "collaborator_id":"runtime-generated-collaborator"
+        }),
+        agent,
+    )
+    .expect("resident agent contract must support provider stages and exact collaborator resume");
     let mut bounded_spawn = json!({"action":"spawn", "description":"Bounded child", "prompt":"Return the requested result", "max_output_tokens":256});
     astra_tools::schemas::validate_tool_arguments_against_schema("agent", &bounded_spawn, agent)
         .expect("the resident spawn exposes its first-request output ceiling");

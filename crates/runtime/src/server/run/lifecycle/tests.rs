@@ -5576,6 +5576,14 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
         let descriptor = snapshot.descriptors[0].descriptor_ref();
         let index = ResolvedProviderPolicyIndex::from_snapshots(&[snapshot]).unwrap();
         tool_executor.set_provider_policy_index(index.clone());
+        tool_executor.set_current_edge_provider_schemas(&[json!({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "authenticated native collaborator",
+                "parameters": {"type": "object"}
+            }
+        })]);
         let inputs = [
             SpawnAgentInput {
                 description: "Native stage".into(),
@@ -9772,6 +9780,7 @@ pub(crate) struct FaultInjectedRunStateStore {
     fail_status_calls: HashSet<usize>,
     fail_status_run_ids: HashSet<String>,
     fail_load_run_calls: HashSet<usize>,
+    fail_collaborator_stage_lookup: bool,
     cas_loss_run_ids: HashSet<String>,
     fail_terminal_transition_calls: HashSet<usize>,
     fail_append_calls: HashSet<usize>,
@@ -9823,6 +9832,7 @@ impl FaultInjectedRunStateStore {
             fail_status_calls: fail_status_calls.iter().copied().collect(),
             fail_status_run_ids: HashSet::new(),
             fail_load_run_calls: HashSet::new(),
+            fail_collaborator_stage_lookup: false,
             cas_loss_run_ids: HashSet::new(),
             fail_terminal_transition_calls: HashSet::new(),
             fail_append_calls: fail_append_calls.iter().copied().collect(),
@@ -9869,6 +9879,11 @@ impl FaultInjectedRunStateStore {
 
     pub(crate) fn with_failed_load_run_call(mut self, call: usize) -> Self {
         self.fail_load_run_calls.insert(call);
+        self
+    }
+
+    fn with_failed_collaborator_stage_lookup(mut self) -> Self {
+        self.fail_collaborator_stage_lookup = true;
         self
     }
 
@@ -10215,6 +10230,25 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .expect("control read counter lock")
             .load_run_control_calls += 1;
         self.inner.load_run_control(user_id, run_id).await
+    }
+
+    async fn load_collaborator_association_for_stage(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        stage_run_id: &str,
+    ) -> Result<
+        Option<astra_services::runs::DurableCollaboratorAssociation>,
+        astra_services::runs::CollaboratorStoreError,
+    > {
+        if self.fail_collaborator_stage_lookup {
+            return Err(astra_services::runs::CollaboratorStoreError::Persistence(
+                "injected collaborator stage lookup failure".into(),
+            ));
+        }
+        self.inner
+            .load_collaborator_association_for_stage(user_id, session_id, stage_run_id)
+            .await
     }
 
     async fn load_latest_terminal_cancellation_origin(
@@ -33876,6 +33910,65 @@ async fn submit_run_user_intent_is_idempotent_and_does_not_mutate_execution_stat
         "an exact retry must reconcile a lost acknowledgement after the run settles"
     );
     assert_eq!(terminal_retry.event_index, first.event_index);
+}
+
+#[tokio::test]
+async fn submit_run_user_intent_does_not_ack_when_native_stage_lookup_fails() {
+    let store =
+        Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_failed_collaborator_stage_lookup());
+    let svc = test_service_with_store(store);
+    svc.run_engine
+        .start_run_ext(
+            "run-native-routing-failure",
+            "user-1",
+            "session-1",
+            None,
+            None,
+            Some("native-agent"),
+            None,
+        )
+        .await
+        .expect("start durable run");
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-native-routing-failure",
+        "session-1",
+        RunStatus::Running,
+        None,
+    )
+    .await;
+
+    let response = err(svc
+        .submit_run_user_intent(
+            "run-native-routing-failure".into(),
+            "user-1".into(),
+            RunUserIntentData {
+                intent_id: "routing-failure-intent".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Continue with the current work."}),
+            },
+        )
+        .await);
+    assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.1.0.error_code.as_deref(),
+        Some("run_intent_routing_unavailable")
+    );
+
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "run-native-routing-failure")
+        .await
+        .expect("load durable run")
+        .expect("run exists");
+    assert!(
+        durable
+            .events
+            .iter()
+            .all(|event| event.get("event_type").and_then(Value::as_str) != Some("user_intent")),
+        "routing failure must not acknowledge or persist an undeliverable intent"
+    );
 }
 
 #[tokio::test]

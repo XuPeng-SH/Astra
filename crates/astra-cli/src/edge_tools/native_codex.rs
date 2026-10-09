@@ -16,12 +16,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub const TOOL_NAME: &str = "native_codex";
-const FRAME_BYTES: usize = 256 * 1024;
-const OUTPUT_BYTES: usize = 64 * 1024;
+pub(crate) const FRAME_BYTES: usize = 256 * 1024;
+pub(crate) const OUTPUT_BYTES: usize = 64 * 1024;
 // The canonical interaction contract permits at most one hour per request.
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(3600);
 const PRE_ACK_EVENTS: usize = 8;
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const MODEL_LIST_REQUEST_ID: i64 = 4;
 const INTERRUPT_REQUEST_ID: i64 = 5;
 const STEER_REQUEST_ID: i64 = 6;
@@ -30,7 +30,7 @@ const MODEL_LIST_PAGE_LIMIT: u64 = 64;
 const MODEL_LIST_MAX_PAGES: usize = 8;
 const MODEL_LIST_MAX_ITEMS: usize = 512;
 
-fn native_stage_remaining(
+pub(crate) fn native_stage_remaining(
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
 ) -> Result<Duration, &'static str> {
     let deadline = invocation
@@ -46,7 +46,9 @@ fn native_stage_remaining(
 // Reuse canonical workspace attribution if a consumer drops the invocation
 // before collecting settlement. Physical cleanup stays owned by the process
 // driver; releasing the async lease must not make that workspace look safe.
-struct UnsettledOnDrop(Option<astra_tools::workspace_observation::WorkspaceAttributionState>);
+pub(crate) struct UnsettledOnDrop(
+    pub(crate) Option<astra_tools::workspace_observation::WorkspaceAttributionState>,
+);
 impl Drop for UnsettledOnDrop {
     fn drop(&mut self) {
         if let Some(state) = &self.0 {
@@ -55,7 +57,7 @@ impl Drop for UnsettledOnDrop {
     }
 }
 
-fn prepare_native_process(
+pub(crate) fn prepare_native_process(
     executable: &std::path::Path,
     args: &[String],
 ) -> std::io::Result<(std::process::Command, BashInvocationOwner)> {
@@ -191,7 +193,7 @@ pub(crate) fn native_executable_identity(
     }
 }
 
-fn validate_runtime_grant(
+pub(crate) fn validate_runtime_grant(
     granted: &[String],
     expected: &astra_turn_types::ProviderRuntimeRequirements,
     policy: Option<&astra_sandbox::SandboxPolicy>,
@@ -246,11 +248,38 @@ pub(crate) fn native_executable_candidates() -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
+pub(crate) fn native_executable_candidates_for_names(names: &[&str]) -> Vec<std::path::PathBuf> {
+    std::env::var_os("PATH")
+        .as_deref()
+        .map(|path| native_executable_candidates_for_path_and_names(path, names))
+        .unwrap_or_default()
+}
+
 pub(crate) fn native_executable_snapshot() -> Vec<NativeExecutableIdentity> {
     native_executable_candidates()
         .into_iter()
         .filter_map(|path| native_executable_identity(&path).ok())
         .collect()
+}
+
+pub(crate) fn native_executable_snapshot_for_names(
+    names: &[&str],
+) -> Vec<NativeExecutableIdentity> {
+    native_executable_candidates_for_names(names)
+        .into_iter()
+        .filter_map(|path| native_executable_identity(&path).ok())
+        .collect()
+}
+
+/// Snapshot every installed native client that this CLI can select. The
+/// delivery supervisor uses one snapshot for invalidation regardless of which
+/// protocol won discovery; it must not have a Codex-only or Claude-only
+/// invalidation path.
+pub(crate) fn native_provider_executable_snapshot() -> Vec<NativeExecutableIdentity> {
+    let mut snapshot = native_executable_snapshot();
+    snapshot.extend(super::native_claude::executable_snapshot());
+    snapshot.extend(super::native_opencode::executable_snapshot());
+    snapshot
 }
 
 fn native_executable() -> Result<std::path::PathBuf, &'static str> {
@@ -266,6 +295,13 @@ fn native_executable_candidates_for_path(path: &std::ffi::OsStr) -> Vec<std::pat
     } else {
         &["codex"]
     };
+    native_executable_candidates_for_path_and_names(path, names)
+}
+
+pub(crate) fn native_executable_candidates_for_path_and_names(
+    path: &std::ffi::OsStr,
+    names: &[&str],
+) -> Vec<std::path::PathBuf> {
     let mut seen = std::collections::HashSet::new();
     std::env::split_paths(path)
         .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
@@ -706,7 +742,7 @@ fn selector_tokens(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn model_choice_names(models: &[&NativeModelListItem]) -> String {
+fn model_choice_labels(models: &[&NativeModelListItem]) -> Vec<String> {
     let visible: Vec<_> = models
         .iter()
         .copied()
@@ -732,7 +768,126 @@ fn model_choice_names(models: &[&NativeModelListItem]) -> String {
             break;
         }
     }
-    choices.join(", ")
+    choices
+}
+
+#[derive(Debug)]
+enum ModelSelectorError {
+    Ambiguous {
+        requested: String,
+        choices: Vec<String>,
+    },
+    Unavailable {
+        requested: String,
+        choices: Vec<String>,
+    },
+}
+
+impl ModelSelectorError {
+    fn observation(&self) -> Value {
+        match self {
+            Self::Ambiguous { requested, choices } => json!({
+                "status": "requires_user_choice",
+                "requested": requested,
+                "choices": choices,
+            }),
+            Self::Unavailable { requested, choices } => json!({
+                "status": "unavailable",
+                "requested": requested,
+                "choices": choices,
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for ModelSelectorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous { requested, choices } => write!(
+                formatter,
+                "The model name '{requested}' is ambiguous; please choose one: {}",
+                choices.join(", ")
+            ),
+            Self::Unavailable { requested, choices } if choices.is_empty() => write!(
+                formatter,
+                "The requested model '{requested}' is not available from this provider, and no choices were returned"
+            ),
+            Self::Unavailable { requested, choices } => write!(
+                formatter,
+                "The requested model '{requested}' is not available from this provider. Available choices: {}",
+                choices.join(", ")
+            ),
+        }
+    }
+}
+
+fn resolve_model_selector_diagnostic(
+    requested: &str,
+    models: &[NativeModelListItem],
+) -> Result<String, ModelSelectorError> {
+    let exact: Vec<_> = models
+        .iter()
+        .filter(|model| model.model == requested || model.id == requested)
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact[0].model.clone());
+    }
+    if exact.len() > 1 {
+        return Err(ModelSelectorError::Ambiguous {
+            requested: requested.to_owned(),
+            choices: model_choice_labels(&exact),
+        });
+    }
+
+    let normalized = normalized_model_selector(requested);
+    let display_matches: Vec<_> = models
+        .iter()
+        .filter(|model| normalized_model_selector(&model.display_name) == normalized)
+        .collect();
+    if display_matches.len() == 1 {
+        return Ok(display_matches[0].model.clone());
+    }
+    if display_matches.len() > 1 {
+        return Err(ModelSelectorError::Ambiguous {
+            requested: requested.to_owned(),
+            choices: model_choice_labels(&display_matches),
+        });
+    }
+
+    // A short name is useful only when it is an exact catalog component. Do
+    // not use substring, edit-distance, or provider-specific aliases: those
+    // make a natural request look convenient while silently selecting the
+    // wrong model. Ambiguous components remain a user clarification.
+    let requested_tokens = selector_tokens(requested);
+    let component_matches: Vec<_> = if requested_tokens.len() == 1 {
+        let requested_token = &requested_tokens[0];
+        models
+            .iter()
+            .filter(|model| !model.hidden)
+            .filter(|model| {
+                selector_tokens(&model.model)
+                    .into_iter()
+                    .chain(selector_tokens(&model.display_name))
+                    .any(|token| token == *requested_token)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if component_matches.len() == 1 {
+        return Ok(component_matches[0].model.clone());
+    }
+    if component_matches.len() > 1 {
+        return Err(ModelSelectorError::Ambiguous {
+            requested: requested.to_owned(),
+            choices: model_choice_labels(&component_matches),
+        });
+    }
+
+    Err(ModelSelectorError::Unavailable {
+        requested: requested.to_owned(),
+        choices: model_choice_labels(&models.iter().collect::<Vec<_>>()),
+    })
 }
 
 fn validate_requested_effort(
@@ -762,80 +917,6 @@ fn validate_requested_effort(
     ))
 }
 
-fn resolve_model_selector(
-    requested: &str,
-    models: &[NativeModelListItem],
-) -> Result<String, String> {
-    let exact: Vec<_> = models
-        .iter()
-        .filter(|model| model.model == requested || model.id == requested)
-        .collect();
-    if exact.len() == 1 {
-        return Ok(exact[0].model.clone());
-    }
-    if exact.len() > 1 {
-        return Err(format!(
-            "The model name '{requested}' is ambiguous; please choose one available model"
-        ));
-    }
-
-    let normalized = normalized_model_selector(requested);
-    let display_matches: Vec<_> = models
-        .iter()
-        .filter(|model| normalized_model_selector(&model.display_name) == normalized)
-        .collect();
-    if display_matches.len() == 1 {
-        return Ok(display_matches[0].model.clone());
-    }
-    if display_matches.len() > 1 {
-        return Err(format!(
-            "The model name '{requested}' is ambiguous; please choose one: {}",
-            model_choice_names(&display_matches)
-        ));
-    }
-
-    // A short name is useful only when it is an exact catalog component. Do
-    // not use substring, edit-distance, or provider-specific aliases: those
-    // make a natural request look convenient while silently selecting the
-    // wrong model. Ambiguous components remain a user clarification.
-    let requested_tokens = selector_tokens(requested);
-    let component_matches: Vec<_> = if requested_tokens.len() == 1 {
-        let requested_token = &requested_tokens[0];
-        models
-            .iter()
-            .filter(|model| !model.hidden)
-            .filter(|model| {
-                selector_tokens(&model.model)
-                    .into_iter()
-                    .chain(selector_tokens(&model.display_name))
-                    .any(|token| token == *requested_token)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if component_matches.len() == 1 {
-        return Ok(component_matches[0].model.clone());
-    }
-    if component_matches.len() > 1 {
-        return Err(format!(
-            "The model name '{requested}' is ambiguous; please choose one: {}",
-            model_choice_names(&component_matches)
-        ));
-    }
-
-    let choices = model_choice_names(&models.iter().collect::<Vec<_>>());
-    if choices.is_empty() {
-        Err(format!(
-            "The requested model '{requested}' is not available from this provider, and no choices were returned"
-        ))
-    } else {
-        Err(format!(
-            "The requested model '{requested}' is not available from this provider. Available choices: {choices}"
-        ))
-    }
-}
-
 #[derive(Default)]
 struct Evidence {
     thread: Option<String>,
@@ -859,12 +940,46 @@ struct Evidence {
     /// delivery owner uses this fact to withdraw capacity after publishing
     /// the current result; ordinary task errors do not withdraw the client.
     capability_unavailable: bool,
+    /// A bounded provider-owned JSON-RPC error code. Keep the code for
+    /// explain/trace and recovery classification without copying provider
+    /// messages, which may contain account or environment details.
+    provider_error_code: Option<i64>,
+    provider_error_class: Option<&'static str>,
+    /// A bounded provider subsystem label, when the protocol supplies one.
+    /// This keeps recovery explainable without exposing the provider's raw
+    /// error payload.
+    provider_error_service: Option<String>,
+    model_selection: Option<Value>,
     pre_ack: Vec<Value>,
 }
 
 fn mark_transport_failure(evidence: &mut Evidence, cancel: Option<&CancellationToken>) {
     if !cancel.is_some_and(CancellationToken::is_cancelled) {
         evidence.capability_unavailable = true;
+    }
+}
+
+fn classify_provider_error(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if ["auth", "login", "credential", "token"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        "authentication"
+    } else if ["directory", "cwd", "working directory", "workspace"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        "workspace"
+    } else if message.contains("config") {
+        "configuration"
+    } else if ["method", "unsupported", "capability"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        "capability"
+    } else {
+        "internal"
     }
 }
 
@@ -1087,7 +1202,7 @@ impl Evidence {
 }
 
 /// Decode only JSON-RPC envelopes. Never inspect free text for control flow.
-fn decode(frame: &[u8]) -> Result<Value, &'static str> {
+pub(crate) fn decode(frame: &[u8]) -> Result<Value, &'static str> {
     let value: Value = serde_json::from_slice(frame).map_err(|_| "invalid native JSON frame")?;
     if !value.is_object() {
         return Err("invalid native JSON-RPC envelope");
@@ -1114,7 +1229,7 @@ fn decode(frame: &[u8]) -> Result<Value, &'static str> {
     Ok(value)
 }
 
-async fn send(input: &FramedProcessInput, value: Value) -> Result<(), &'static str> {
+pub(crate) async fn send(input: &FramedProcessInput, value: Value) -> Result<(), &'static str> {
     let frame = serde_json::to_vec(&value).map_err(|_| "native request serialization failed")?;
     input
         .send_frame(&frame)
@@ -1579,6 +1694,23 @@ async fn rpc(
                 return Err("native acknowledgement request ID mismatch");
             }
             if envelope.get("error").is_some() {
+                let error = &envelope["error"];
+                evidence.provider_error_code = error.get("code").and_then(Value::as_i64);
+                evidence.provider_error_class = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(classify_provider_error);
+                evidence.provider_error_service = error
+                    .pointer("/data/service")
+                    .and_then(Value::as_str)
+                    .filter(|service| {
+                        !service.is_empty()
+                            && service.len() <= 64
+                            && service
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+                    })
+                    .map(str::to_owned);
                 if matches!(id.as_i64(), Some(1 | 7)) {
                     evidence.capability_unavailable = true;
                 }
@@ -1745,7 +1877,13 @@ async fn resolve_requested_model(
         }
         cursor = Some(next_cursor);
     }
-    let resolved = resolve_model_selector(requested, &models)?;
+    let resolved = match resolve_model_selector_diagnostic(requested, &models) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            evidence.model_selection = Some(error.observation());
+            return Err(error.to_string());
+        }
+    };
     if let Some(model) = models.iter().find(|model| model.model == resolved) {
         validate_requested_effort(stage.effort.as_deref(), model)?;
     }
@@ -2235,13 +2373,15 @@ impl ToolExecutor {
     /// Publish through the authenticated local-provider snapshot adapter.
     /// This declaration carries requirements, never permission or claim trust.
     /// The connection owner must prove consumer readiness before publishing it.
-    pub(crate) async fn native_collaborator_declaration_if_available(
+    pub(crate) async fn native_collaborator_declarations_if_available(
         &self,
         cancel: Option<&CancellationToken>,
         deadline: std::time::Instant,
     ) -> Option<(
-        astra_turn_types::ProviderToolDeclaration,
-        NativeExecutableIdentity,
+        Vec<(
+            astra_turn_types::ProviderToolDeclaration,
+            NativeExecutableIdentity,
+        )>,
         Vec<NativeExecutableIdentity>,
     )> {
         let supported = astra_core::sync_poison::recover_rwlock_read(&self.sandbox_policy)
@@ -2252,38 +2392,94 @@ impl ToolExecutor {
         }
         let root = self.effective_project_root().canonicalize().ok()?;
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
-        let initial_executables = native_executable_snapshot();
-        for executable in native_executable_candidates() {
-            if token.is_cancelled() {
-                return None;
-            }
-            if deadline <= std::time::Instant::now() {
-                return None;
-            }
-            let Ok(requirements) = runtime_requirements_for_executable(&executable) else {
-                continue;
+        let initial_executables = native_provider_executable_snapshot();
+        let mut declarations = Vec::new();
+        for protocol in [
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson,
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp,
+        ] {
+            let candidates = match protocol {
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
+                    native_executable_candidates()
+                }
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
+                    super::native_claude::executable_candidates()
+                }
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
+                    super::native_opencode::executable_candidates()
+                }
             };
-            let expected_identity =
-                native_executable_identity(std::path::Path::new(&requirements.executable)).ok()?;
-            if verify_installed_protocol(&executable, &root, &token, deadline)
-                .await
-                .is_ok()
-            {
+            for executable in candidates {
+                if token.is_cancelled() {
+                    return None;
+                }
+                if deadline <= std::time::Instant::now() {
+                    return None;
+                }
+                let Ok(requirements) = runtime_requirements_for_executable(&executable) else {
+                    continue;
+                };
+                let expected_identity =
+                    native_executable_identity(std::path::Path::new(&requirements.executable)).ok();
+                let Some(expected_identity) = expected_identity else {
+                    continue;
+                };
+                let verified = match protocol {
+                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
+                        verify_installed_protocol(&executable, &root, &token, deadline)
+                            .await
+                            .is_ok()
+                    }
+                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
+                        super::native_claude::verify_installed_protocol(
+                            &executable,
+                            &root,
+                            &token,
+                            deadline,
+                        )
+                        .await
+                        .is_ok()
+                    }
+                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
+                        super::native_opencode::verify_installed_protocol(
+                            &executable,
+                            &root,
+                            &token,
+                            deadline,
+                        )
+                        .await
+                        .is_ok()
+                    }
+                };
+                if !verified {
+                    continue;
+                }
                 let current_identity =
-                    native_executable_identity(std::path::Path::new(&requirements.executable))
-                        .ok()?;
-                let current_executables = native_executable_snapshot();
-                if current_identity != expected_identity
+                    native_executable_identity(std::path::Path::new(&requirements.executable));
+                let current_executables = native_provider_executable_snapshot();
+                if current_identity.as_ref().ok() != Some(&expected_identity)
                     || current_executables != initial_executables
                 {
                     return None;
                 }
-                return provider_declaration(requirements)
-                    .ok()
-                    .map(|declaration| (declaration, expected_identity, current_executables));
+                let declaration = match protocol {
+                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
+                        provider_declaration(requirements)
+                    }
+                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
+                        super::native_claude::provider_declaration(requirements)
+                    }
+                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
+                        super::native_opencode::provider_declaration(requirements)
+                    }
+                };
+                if let Ok(declaration) = declaration {
+                    declarations.push((declaration, expected_identity));
+                }
             }
         }
-        None
+        (!declarations.is_empty()).then_some((declarations, initial_executables))
     }
 
     /// Existing selected CLI execution entrypoint owns workspace and sandbox.
@@ -2547,6 +2743,10 @@ impl ToolExecutor {
                     "session_acknowledged": session_acknowledged, "turn_acknowledged": turn_acknowledged,
                     "dispatch_state": if turn_acknowledged {"acknowledged"} else if evidence.turn_queued {"unknown"} else {"not_dispatched"},
                     "native_terminal": evidence.terminal, "usage_snapshot": evidence.usage, "cost_usd": null,
+                    "provider_error_code": evidence.provider_error_code,
+                    "provider_error_class": evidence.provider_error_class,
+                    "provider_error_service": evidence.provider_error_service,
+                    "model_selection": evidence.model_selection,
                     "output_capped": evidence.output_capped, "target_released": target_released,
                     "interrupt_acknowledged": interrupt_acknowledged,
                     "settlement_authoritative": settled, "transport_settled_after_terminal": transport_ok,

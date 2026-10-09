@@ -1437,6 +1437,16 @@ impl RuntimeToolExecutor {
         *guard = schemas;
     }
 
+    /// Return the exact provider contract currently admitted for one public
+    /// name. Native stages carry this immutable schema into their child
+    /// executor so argument validation and readiness use the same contract as
+    /// the parent admission boundary.
+    pub(crate) fn current_edge_provider_schema(&self, name: &str) -> Option<Value> {
+        self.current_edge_provider_schemas_snapshot()
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+    }
+
     /// Install the host's current deferred contract projection. This is a
     /// private discovery/execution catalog, not a provider-visible schema
     /// surface; it may contain action branches narrowed by current typed
@@ -2257,6 +2267,7 @@ impl RuntimeToolExecutor {
                     self.execution_binding.executor().transport,
                     ToolTransportKind::EdgeLedger
                 )
+                && !self.edge_admitted_tools.contains(name)
             {
                 return ExecutorToolReadiness::UnknownTool;
             }

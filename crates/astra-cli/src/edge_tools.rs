@@ -84,8 +84,12 @@ mod fs_tools;
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
+#[path = "edge_tools/native_claude.rs"]
+pub mod native_claude;
 #[path = "edge_tools/native_codex.rs"]
 pub mod native_codex;
+#[path = "edge_tools/native_opencode.rs"]
+pub mod native_opencode;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
@@ -105,6 +109,13 @@ pub fn all_tool_schemas() -> Vec<Value> {
     // unsupported arguments are never advertised.
     astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
     schemas
+}
+
+pub(crate) fn is_native_collaborator_tool(name: &str) -> bool {
+    matches!(
+        name,
+        native_codex::TOOL_NAME | native_claude::TOOL_NAME | native_opencode::TOOL_NAME
+    )
 }
 
 const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
@@ -5063,18 +5074,31 @@ impl ToolExecutor {
                     )
                     .await
                 }
-                protocol => {
-                    let mut metadata = serde_json::Map::new();
-                    astra_tools::execution_outcome::insert_not_executed_fact(&mut metadata);
-                    astra_tools::ToolResult {
-                        output: format!(
-                            "native collaborator protocol {} is not installed on this CLI",
-                            protocol.extension_value()
-                        ),
-                        is_error: true,
-                        metadata: Some(metadata),
-                        exit_semantics: None,
-                    }
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
+                    self.execute_native_claude(
+                        args,
+                        invocation,
+                        cancel_token,
+                        execution_root,
+                        native_gate,
+                        execution_ceiling,
+                        runtime_approval,
+                        input_rx,
+                    )
+                    .await
+                }
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
+                    self.execute_native_opencode(
+                        args,
+                        invocation,
+                        cancel_token,
+                        execution_root,
+                        native_gate,
+                        execution_ceiling,
+                        runtime_approval,
+                        input_rx,
+                    )
+                    .await
                 }
             };
             *source_is_error = Some(result.is_error);

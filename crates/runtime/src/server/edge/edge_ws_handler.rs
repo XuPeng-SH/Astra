@@ -1632,8 +1632,12 @@ async fn fail_claimed_edge_dispatches(
 /// (a malicious edge could fabricate them) and ensures the executor type
 /// is consistent with an edge connection.
 ///
-/// Returns the sanitized capabilities JSON. Invalid, mismatched, absent, or
-/// unusable advertisements fail the handshake before registration.
+/// Returns the sanitized capabilities JSON. Invalid, mismatched, or absent
+/// advertisements fail the handshake before registration. An authenticated
+/// Edge may advertise no executable capacity: that is the control-only state
+/// used while replaying durable receipts after a local provider disappears.
+/// It cannot receive new tool work because it has neither a builtin tool
+/// surface nor a provider discovery declaration.
 fn validate_edge_capabilities(
     capabilities: Option<serde_json::Value>,
     edge_agent_id: &str,
@@ -1705,10 +1709,6 @@ fn validate_edge_capabilities(
             "edge advertised tools outside edge provider ownership — stripped"
         );
     }
-    if advert.binding.tool_surface.tool_names.is_empty() {
-        return Err("edge capabilities contain no admissible edge tools".to_string());
-    }
-
     let mut sanitized = serde_json::to_value(&advert)
         .map_err(|error| format!("edge capabilities could not be serialized: {error}"))?;
     if runtime_process_authorization_v1 {
@@ -1926,6 +1926,38 @@ mod tests {
         serde_json::to_value(advert).expect("edge advertisement serializes")
     }
 
+    fn provider_only_edge_advertisement() -> serde_json::Value {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut advert = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/workspace", &registry),
+        );
+        let declaration = astra_turn_types::ProviderToolDeclaration {
+            native_tool_id: astra_turn_types::NativeToolId::new("native_codex")
+                .expect("provider tool id"),
+            native_tool_name: "native_codex".to_string(),
+            stable_tool_alias: None,
+            title: Some("Native collaborator".to_string()),
+            description: Some("provider stage".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            claims: Default::default(),
+            task_support: astra_turn_types::ProviderTaskSupport::Required,
+            extension_fields: Default::default(),
+        };
+        let snapshot = astra_turn_types::ProviderDiscoverySnapshot::new(
+            astra_turn_types::ProviderIdentity::new("edge-agent").expect("provider identity"),
+            astra_turn_types::ProviderBindingRef::new("edge-binding").expect("binding"),
+            astra_turn_types::ProviderProtocolId::new("cli-local").expect("protocol"),
+            vec![declaration],
+        )
+        .expect("provider discovery snapshot");
+        advert.binding.tool_surface.tool_names.clear();
+        advert.binding.tool_surface.admissions.clear();
+        advert.binding.tool_surface.denials.clear();
+        advert.provider_discovery = vec![snapshot];
+        serde_json::to_value(advert).expect("provider-only edge advertisement serializes")
+    }
+
     fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
         EdgeServerMessage::ToolRequest {
             request_id: "dispatch-request".to_string(),
@@ -2055,6 +2087,36 @@ mod tests {
                 .all(|denial| denial.tool_name == "write_file"),
             "edge capability denials should only describe edge-owned runtime tools"
         );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_accepts_provider_only_edge() {
+        let sanitized = validate_edge_capabilities(
+            Some(provider_only_edge_advertisement()),
+            "edge-agent",
+            "user-1",
+        )
+        .expect("provider-only edge must be admissible");
+        let advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(sanitized).expect("sanitized advertisement");
+
+        assert!(advert.binding.tool_surface.tool_names.is_empty());
+        assert_eq!(advert.provider_discovery.len(), 1);
+        assert_eq!(
+            advert.provider_discovery[0].tool_declarations[0].native_tool_name,
+            "native_codex"
+        );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_accepts_control_only_edge() {
+        let capabilities = edge_advertisement_with_tools(&[]);
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
+            .expect("an authenticated control-only edge must be able to recover receipts");
+        let advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(sanitized).expect("sanitized advertisement");
+        assert!(advert.binding.tool_surface.tool_names.is_empty());
+        assert!(advert.provider_discovery.is_empty());
     }
 
     #[test]

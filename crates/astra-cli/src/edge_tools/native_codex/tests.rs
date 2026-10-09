@@ -789,25 +789,32 @@ fn native_model_selector_uses_provider_names_without_guessing() {
         model_item("sol-6", "gpt-6-sol", "GPT-6-Sol"),
     ];
     assert_eq!(
-        resolve_model_selector("gpt-5.6-luna", &models).unwrap(),
+        resolve_model_selector_diagnostic("gpt-5.6-luna", &models).unwrap(),
         "gpt-5.6-luna"
     );
     assert_eq!(
-        resolve_model_selector("luna-56", &models).unwrap(),
+        resolve_model_selector_diagnostic("luna-56", &models).unwrap(),
         "gpt-5.6-luna"
     );
     assert_eq!(
-        resolve_model_selector("gPt-5.6-lUnA", &models).unwrap(),
+        resolve_model_selector_diagnostic("gPt-5.6-lUnA", &models).unwrap(),
         "gpt-5.6-luna"
     );
-    let ambiguous = resolve_model_selector("luna", &models).unwrap_err();
+    let ambiguous = resolve_model_selector_diagnostic("luna", &models)
+        .unwrap_err()
+        .to_string();
     assert!(ambiguous.contains("choose one"));
     assert!(ambiguous.contains("GPT-5.6-Luna"));
     assert!(ambiguous.contains("GPT-6-Luna"));
     assert!(!ambiguous.contains("gpt-5.6-luna"));
-    assert_eq!(resolve_model_selector("sol", &models).unwrap(), "gpt-6-sol");
-    assert!(resolve_model_selector("GPT-6-Luna", &models).is_ok());
-    let unavailable = resolve_model_selector("missing", &models).unwrap_err();
+    assert_eq!(
+        resolve_model_selector_diagnostic("sol", &models).unwrap(),
+        "gpt-6-sol"
+    );
+    assert!(resolve_model_selector_diagnostic("GPT-6-Luna", &models).is_ok());
+    let unavailable = resolve_model_selector_diagnostic("missing", &models)
+        .unwrap_err()
+        .to_string();
     assert!(unavailable.contains("not available"));
     assert!(unavailable.contains("GPT-5.6-Luna"));
     assert!(!unavailable.contains("gpt-5.6-luna"));
@@ -816,7 +823,9 @@ fn native_model_selector_uses_provider_names_without_guessing() {
         model_item("luna-a", "provider-luna-a", "Luna"),
         model_item("luna-b", "provider-luna-b", "Luna"),
     ];
-    let duplicate = resolve_model_selector("luna", &duplicate_display).unwrap_err();
+    let duplicate = resolve_model_selector_diagnostic("luna", &duplicate_display)
+        .unwrap_err()
+        .to_string();
     assert!(duplicate.contains("Luna (provider-luna-a)"));
     assert!(duplicate.contains("Luna (provider-luna-b)"));
 
@@ -1313,6 +1322,9 @@ async fn live_native_codex_two_stages_same_session() {
                 "different_acknowledged_turn": different_turn,
                 "native_terminal": native["native_terminal"].as_str()
                     .filter(|status| matches!(*status, "completed" | "failed" | "interrupted")),
+                "provider_error_code": native["provider_error_code"].as_i64(),
+                "provider_error_class": native["provider_error_class"].as_str(),
+                "provider_error_service": native["provider_error_service"].as_str(),
                 "usage_scope": "stage_delta",
                 "usage_observed": usage.is_some(),
                 "usage": usage.map(astra_turn_types::CanonicalTokenUsage::to_json),
@@ -1598,6 +1610,14 @@ for line in sys.stdin:
         assert!(error.contains("GPT-5.6-Luna"));
         assert!(error.contains("GPT-6-Luna"));
         assert!(!error.contains("gpt-5.6-luna"));
+        assert_eq!(
+            evidence.model_selection,
+            Some(json!({
+                "status": "requires_user_choice",
+                "requested": "luna",
+                "choices": ["GPT-5.6-Luna", "GPT-6-Luna"]
+            }))
+        );
         assert!(evidence.thread.is_none());
         let outcome = process.cancel_and_wait().await.unwrap();
         assert!(outcome.settlement.unwrap().ownership.is_authoritative());

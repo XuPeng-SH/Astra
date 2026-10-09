@@ -7,10 +7,11 @@ use serde_json::Value;
 pub(crate) struct NativeInvocationInteractionGate {
     pub(crate) api: astra_thin_client::ThinClient,
     pub(crate) auth: String,
-    pub(crate) edge_transport_id: String,
+    pub(crate) edge_transport_id: std::sync::Arc<tokio::sync::RwLock<String>>,
     pub(crate) edge_agent_id: String,
     pub(crate) physical_workspace_id: String,
     pub(crate) identity: astra_turn_types::ToolInvocationIdentity,
+    pub(crate) provider: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
     pub(crate) deadline: std::time::Instant,
     pub(crate) ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
 }
@@ -31,8 +32,10 @@ impl NativeInvocationInteractionGate {
                 )
             })?;
         prompt.context = Some(format!(
-            "Codex · session {} · run {}",
-            self.identity.session_id, self.identity.run_id
+            "{} · session {} · run {}",
+            self.provider.display_name(),
+            self.identity.session_id,
+            self.identity.run_id
         ));
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         chat_stream::enqueue_interactive_request(
@@ -112,9 +115,10 @@ impl astra_tools::ProviderInteractionGate for NativeInvocationInteractionGate {
             interaction: interaction.clone(),
         };
         let (required_tx, mut required_rx) = tokio::sync::mpsc::channel(1);
+        let edge_transport_id = self.edge_transport_id.read().await.clone();
         let receive = self.api.post_tool_interaction_request(
             Some(&self.auth),
-            &self.edge_transport_id,
+            &edge_transport_id,
             &body,
             timeout,
             required_tx,
@@ -300,10 +304,12 @@ mod native_interaction_gate_tests {
         let gate = NativeInvocationInteractionGate {
             api: astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap(),
             auth: "fixture-token".into(),
-            edge_transport_id: "transport".into(),
+            edge_transport_id: std::sync::Arc::new(tokio::sync::RwLock::new("transport".into())),
             edge_agent_id: "agent".into(),
             physical_workspace_id: "physical-test".into(),
             identity,
+            provider:
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             ask_user_request_tx: Some(ask_tx),
         };
@@ -342,16 +348,20 @@ mod native_interaction_gate_tests {
     #[tokio::test]
     async fn native_gate_routes_exact_identity_and_never_renews_expired_budget() {
         let server = MockServer::start().await;
+        let edge_transport_id =
+            std::sync::Arc::new(tokio::sync::RwLock::new("old-transport".into()));
         let mut gate = NativeInvocationInteractionGate {
             api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
             auth: "fixture-token".into(),
-            edge_transport_id: "transport".into(),
+            edge_transport_id: edge_transport_id.clone(),
             edge_agent_id: "agent".into(),
             physical_workspace_id: "physical-test".into(),
             identity: astra_turn_types::ToolInvocationIdentity::new(
                 "account", "session", "run", "chain", "call",
             )
             .unwrap(),
+            provider:
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
             ask_user_request_tx: None,
         };
@@ -381,6 +391,10 @@ mod native_interaction_gate_tests {
             .expect(1)
             .mount(&server)
             .await;
+        // A reconnect replaces the server-issued identity while this
+        // invocation is still alive. The callback must use the replacement
+        // identity, not the transport that admitted the invocation.
+        *edge_transport_id.write().await = "transport".into();
         assert!(matches!(
             gate.request_interaction(&interaction).await,
             Decision::Submitted(_)

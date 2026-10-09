@@ -5702,6 +5702,19 @@ pub trait RunStateStore: Send + Sync {
         Err(CollaboratorStoreError::Unsupported)
     }
 
+    /// Resolve the stable association for its current stage run. The
+    /// association is deliberately stored on the stable anchor, while user
+    /// guidance is addressed to the latest stage run. This control-plane
+    /// lookup is not part of ordinary turn assembly.
+    async fn load_collaborator_association_for_stage(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _stage_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
     async fn confirm_collaborator_native_session(
         &self,
         _identity: &astra_turn_types::ToolInvocationIdentity,
@@ -17303,6 +17316,64 @@ impl RunStateStore for DatabaseRunStateStore {
         })?;
         connection.release();
         Ok(association)
+    }
+
+    async fn load_collaborator_association_for_stage(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        stage_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        // Stage events are intentionally owned by the stable association
+        // anchor. Resolve that owner from the durable receipt, then reuse the
+        // canonical association decoder. This is only used by current-run
+        // control input; ordinary turn assembly never performs this lookup.
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_collaborator_stage_association",
+                    stage_run_id,
+                    source,
+                )
+            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_collaborator_stage_association", stage_run_id, source)
+        })?;
+        admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
+        let anchor_run_id: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND event_type = ?
+               AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.receipt.run_id')) = ?
+             ORDER BY event_idx DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(COLLABORATOR_STAGE_EVENT)
+        .bind(stage_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "find_collaborator_stage_association_anchor",
+                stage_run_id,
+                source,
+            )
+        })?;
+        let association = if let Some(anchor_run_id) = anchor_run_id {
+            Self::collaborator_association_tx(&mut tx, user_id, session_id, &anchor_run_id).await?
+        } else {
+            None
+        };
+        tx.rollback().await.map_err(|source| {
+            db_error(
+                "release_collaborator_stage_association",
+                stage_run_id,
+                source,
+            )
+        })?;
+        connection.release();
+        Ok(association.filter(|association| association.latest_stage.run_id == stage_run_id))
     }
 
     async fn confirm_collaborator_native_session(

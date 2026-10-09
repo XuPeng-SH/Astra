@@ -8244,7 +8244,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> crate::edge_tools::ToolExecutionOutcome {
-    if tool_name == crate::edge_tools::native_codex::TOOL_NAME {
+    if crate::edge_tools::is_native_collaborator_tool(&tool_name) {
         return crate::edge_tools::ToolExecutionOutcome::error(
             "Native collaborators require canonical child dispatch with an immutable execution grant, not a root tool callback".into(),
         );

@@ -13862,6 +13862,11 @@ impl AgenticRunLifecycleService {
             executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
         }
         executor.set_provider_policy_index(runtime_capabilities.provider_policy_index.clone());
+        // The authenticated Edge discovery is the authority for native
+        // collaborator contracts. Keep the exact schema in the same private
+        // provider lane used by ordinary Edge contracts; it is not added to
+        // the resident model tool surface.
+        executor.set_current_edge_provider_schemas(host.edge_provider_tool_schemas());
         // Wire the plan repository so enter/exit_plan_mode tools work and
         // the write-tool guard can check `active_plan_id`.
         if let Some(shared) = &self.shared_pool {
@@ -18855,10 +18860,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
-        let native_target = (input.delivery
-            == astra_turn_types::UserIntentDelivery::GuideCurrentRun)
-            .then(|| native_collaborator_target(&durable))
-            .flatten();
+        let native_target = if input.delivery
+            == astra_turn_types::UserIntentDelivery::GuideCurrentRun
+        {
+            self.native_collaborator_target(&durable)
+                .await
+                .map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Current-run guidance routing is temporarily unavailable: {error}"),
+                        "run_intent_routing_unavailable",
+                    )
+                })?
+        } else {
+            None
+        };
         let intent_input = input.input.clone();
         let event = json!({
             "event_type": "user_intent",
@@ -19582,15 +19598,63 @@ impl RunLifecycleService for AgenticRunLifecycleService {
     }
 }
 
-/// Find the native child target from the durable stage admission already
-/// loaded for this request. The run record is the capability fact; no model
-/// name, executable version, or display label is consulted.
-fn native_collaborator_target(run: &DurableRunRecord) -> Option<astra_messaging::AgentAddress> {
-    let agent_id = run.agent_id.as_deref()?.trim();
-    if agent_id.is_empty() {
-        return None;
+impl AgenticRunLifecycleService {
+    /// Find the native child target from the durable stage admission already
+    /// loaded for this request. The stable collaborator association owns its
+    /// stage history on the anchor, while current-run guidance is addressed to
+    /// the latest stage run. Resolve that relation through the canonical store
+    /// only on this explicit control path; ordinary turns do not pay for it.
+    async fn native_collaborator_target(
+        &self,
+        run: &DurableRunRecord,
+    ) -> Result<Option<astra_messaging::AgentAddress>, astra_services::runs::CollaboratorStoreError>
+    {
+        let Some(agent_id) = run.agent_id.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if agent_id.is_empty() {
+            return Ok(None);
+        }
+        if native_stage_admitted_on_run(run) {
+            return Ok(Some(astra_messaging::AgentAddress::new(
+                run.run_id.clone(),
+                agent_id,
+            )));
+        }
+        let association = self
+            .run_engine
+            .store()
+            .load_collaborator_association_for_stage(&run.user_id, &run.session_id, &run.run_id)
+            .await;
+        match association {
+            Ok(Some(association))
+                if association.latest_native_execution.is_some()
+                    && association.latest_stage.run_id == run.run_id =>
+            {
+                Ok(Some(astra_messaging::AgentAddress::new(
+                    run.run_id.clone(),
+                    agent_id,
+                )))
+            }
+            Ok(_) | Err(astra_services::runs::CollaboratorStoreError::Unsupported) => Ok(None),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id = %run.run_id,
+                    error = %error,
+                    "native collaborator stage lookup failed while routing current-run guidance"
+                );
+                Err(error)
+            }
+        }
     }
-    let native_stage = run.events.iter().rev().any(|event| {
+}
+
+/// Find the native child target from stage admission facts already present on
+/// the requested run. The run record is the capability fact; no model name,
+/// executable version, or display label is consulted.
+fn native_stage_admitted_on_run(run: &DurableRunRecord) -> bool {
+    run.events.iter().rev().any(|event| {
         event.get("event_type").and_then(Value::as_str) == Some("collaborator_stage_admitted")
             && serde_json::from_value::<astra_services::runs::CollaboratorStageAdmission>(
                 event.get("admission").cloned().unwrap_or(Value::Null),
@@ -19598,8 +19662,7 @@ fn native_collaborator_target(run: &DurableRunRecord) -> Option<astra_messaging:
             .is_ok_and(|admission| {
                 admission.anchor_run_id == run.run_id && admission.native_execution.is_some()
             })
-    });
-    native_stage.then(|| astra_messaging::AgentAddress::new(run.run_id.clone(), agent_id))
+    })
 }
 
 impl AgenticRunLifecycleService {
@@ -21553,6 +21616,9 @@ pub(crate) struct PreparedNativeSubrunExecution {
     /// process-scoped route without changing the collaborator.
     pub live_edge_agent_id: String,
     pub tool_name: String,
+    /// The exact schema selected by the parent provider admission. A native
+    /// child must not reconstruct this from its name or from its prompt.
+    pub provider_schema: Value,
     pub arguments: Value,
     pub policy: astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
     pub run_state_store: Arc<dyn astra_services::runs::RunStateStore>,
@@ -21688,6 +21754,11 @@ impl ServerSpawnAgentExecutor {
         if !executor.provider_is_collaborator_stage(&request.tool) {
             return Err("selected provider is not an admitted collaborator stage".into());
         }
+        let provider_schema = executor
+            .current_edge_provider_schema(&request.tool)
+            .ok_or_else(|| {
+                "selected collaborator has no current authenticated provider schema".to_string()
+            })?;
         let provider = native_collaborator_provider(&policy)?;
         let binding = &parent
             .execution_contract
@@ -21859,6 +21930,7 @@ impl ServerSpawnAgentExecutor {
             },
             live_edge_agent_id,
             tool_name: request.tool.clone(),
+            provider_schema,
             arguments,
             policy,
             run_state_store: Arc::clone(engine.store()),
@@ -22177,10 +22249,10 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                     .await
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| {
-                        "collaborator has no durable execution association".to_string()
+                        "unknown collaborator_id; omit collaborator_id for a new spawn and reuse the exact collaborator_id returned by an earlier launch for a follow-up".to_string()
                     })?;
                 if association.latest_stage.anchor_run_id != collaborator_id {
-                    return Err("collaborator receipt is not its durable association anchor".into());
+                    return Err("collaborator_id is not the durable association anchor; use the exact collaborator_id returned by the earlier launch".into());
                 }
                 let original = engine
                     .load_run(&parent.user_id, &association.latest_stage.run_id)
@@ -23279,6 +23351,14 @@ impl ServerSubRunExecutor {
     }
     pub(crate) fn with_native_execution(mut self, native: PreparedNativeSubrunExecution) -> Self {
         self.admitted_model_execution = None;
+        let mut edge_tools = self.edge_tools.as_ref().clone();
+        if !edge_tools.iter().any(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(schema)
+                == Some(native.tool_name.as_str())
+        }) {
+            edge_tools.push(native.provider_schema.clone());
+        }
+        self.edge_tools = Arc::new(edge_tools);
         self.native_execution = Some(native);
         self
     }
@@ -23342,12 +23422,17 @@ impl ServerSubRunExecutor {
         }
         let args =
             serde_json::to_string(&native.arguments).map_err(|error| invalid(error.to_string()))?;
-        let stage_deadline = config.execution_deadline.ok_or_else(|| {
-            invalid("native stage requires its server-admitted execution budget".into())
-        })?;
-        let permission_timeout = stage_deadline
-            .monotonic_work_deadline()
-            .saturating_duration_since(Instant::now());
+        // A missing run wall-clock budget means unbounded foreground work; it
+        // must not make a native child unusable. The Edge transport still
+        // supplies its own bounded invocation deadline. Keep only each
+        // pre-dispatch permission/mailbox control operation bounded when the
+        // parent has no run deadline.
+        let stage_work_deadline = config
+            .execution_deadline
+            .map(|deadline| tokio::time::Instant::from_std(deadline.monotonic_work_deadline()));
+        let permission_timeout = stage_work_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_else(|| Duration::from_secs(5));
         if permission_timeout.is_zero() {
             return Err(invalid(
                 "native stage execution budget expired before permission admission".into(),
@@ -23448,8 +23533,6 @@ impl ServerSubRunExecutor {
                 .expect("edge pool checked before native provider input pump");
             let edge_agent_id =
                 edge_agent_id.expect("edge agent checked before native provider input pump");
-            let edge_deadline =
-                tokio::time::Instant::from_std(stage_deadline.monotonic_work_deadline());
             let mut invocation = Box::pin(invocation);
             let mut mailbox_enabled = mailbox.is_some();
             let mut mailbox_retry_at: Option<tokio::time::Instant> = None;
@@ -23497,7 +23580,9 @@ impl ServerSubRunExecutor {
                                 &identity,
                                 &edge_agent_id,
                                 stage_message.input,
-                                edge_deadline,
+                                stage_work_deadline.unwrap_or_else(|| {
+                                    tokio::time::Instant::now() + Duration::from_secs(5)
+                                }),
                                 config.cancel_token.as_deref(),
                             )
                             .await;
@@ -25769,6 +25854,16 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ))
                 .with_cancel_token(Some(local_cancel_token.clone()));
 
+            if let Some(native) = self.native_execution.as_ref() {
+                // This is a selected, authenticated provider stage, not an
+                // arbitrary model-authored tool name. Reuse the existing
+                // Edge admission set so EdgeWs readiness accepts the exact
+                // provider contract without widening ordinary dynamic tools.
+                executor = executor.with_edge_admitted_tools(std::slice::from_ref(
+                    &native.tool_name,
+                ));
+            }
+
             // A child is a first-class durable run. Its approval and ask-user
             // interactions use the same journal/callback contract as the
             // root, rather than degrading to a missing-gate error merely
@@ -25949,6 +26044,17 @@ impl SubRunExecutor for ServerSubRunExecutor {
             local_execution_lease_lost.clone(),
             input_wake,
         );
+
+        if self.native_execution.is_some()
+            && let Some(executor) = loop_state.runtime_tool_executor.as_deref()
+        {
+            // Native stages bypass the ordinary model/tool-surface sync loop,
+            // but still use the same governed provider route. Install the
+            // inherited Edge contract before that route performs readiness
+            // admission; otherwise a valid provider binding looks like an
+            // unknown tool only for native children.
+            executor.set_current_edge_provider_schemas(&self.edge_tools);
+        }
 
         let live_started_at = Instant::now();
         let live_agent_id = config.agent_profile.agent_id.clone();

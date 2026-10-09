@@ -219,6 +219,7 @@ fn remote_child_recovery_capacity() -> &'static Arc<Semaphore> {
 fn effective_spawn_allowed_tools(
     requested: Option<&[String]>,
     profile_defaults: &HashSet<String>,
+    execution_tool: Option<&str>,
 ) -> Vec<String> {
     let profile_defaults = astra_turn_core::tool_allowlist::normalize_tool_names(profile_defaults);
     let profile_is_unrestricted = profile_defaults.contains("*");
@@ -231,6 +232,16 @@ fn effective_spawn_allowed_tools(
     };
     if tools.iter().any(|tool| tool == "*") {
         return vec!["*".to_string()];
+    }
+    // A provider execution is a separate, explicitly admitted capability. It
+    // must not require the model to repeat the provider tool in the child's
+    // ordinary tool allowlist; doing so makes a native stage fail in a
+    // read-only/default persona before its provider admission is reached.
+    if let Some(execution_tool) = execution_tool
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty())
+    {
+        tools.push(execution_tool.to_ascii_lowercase());
     }
     tools.sort();
     tools.dedup();
@@ -247,8 +258,8 @@ fn parent_coordination_addendum(agent_prompt: &str) -> String {
     format!(
         "{}\n\n## Parent coordination\n\
          The runtime owns your run identity and parent routing; use `to=\"parent\"` for the typed parent target. \
-         Stay within the delegated task boundary. If you need an answer from your parent, use `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", ...)`; `ask_user` addresses the human, not your parent. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
-         A parent question is control flow, never terminal output. After sending one through agent(action=\"send_message\", to=\"parent\", message_type=\"question\", ...), wait for the correlated answer and do not finish the run until the delegated brief is complete. \
+         Stay within the delegated task boundary. Parent communication is a typed protocol: whenever the brief requires a parent answer, your next action MUST be `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", message=...)`; `ask_user` addresses the human, not your parent. Never put a question to the parent in ordinary text or in the terminal result: plain text cannot create a request ID and cannot be answered. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
+         A parent question is control flow, never terminal output. After the question tool returns `queued`, use `agent(action=\"wait\")` and wait for the correlated answer; do not finish the run until that answer is observed and the delegated brief is complete. \
          Routine tool-by-tool progress does not need reporting. Complete the entire delegated brief before returning: every explicit operation, condition, and requested output is required. Do not return an intermediate calculation, partial checklist, plan, or first step as the terminal result. Before finishing, verify that the result answers the full brief; if something remains incomplete, state exactly what remains and why. Return only the answer, evidence, or decision the parent needs. Honor the brief's requested output format exactly; persona and summary defaults must not add explanation or formatting. Otherwise keep a one-shot result to one line when sufficient. Do not paste file contents, diffs, or large logs into the result—store detailed artifacts where the task requires them and summarize the relevant evidence. Your terminal result is delivered to the parent automatically.",
         agent_prompt,
     )
@@ -6671,8 +6682,14 @@ impl DynamicAgentSpawner {
             ));
         }
 
-        let effective_allowed_tools =
-            effective_spawn_allowed_tools(input.allowed_tools.as_deref(), &agent_def.allowed_tools);
+        let effective_allowed_tools = effective_spawn_allowed_tools(
+            input.allowed_tools.as_deref(),
+            &agent_def.allowed_tools,
+            input
+                .execution
+                .as_ref()
+                .map(|execution| execution.tool.as_str()),
+        );
         let effective_inherited_skills = context.inherited_skills.clone();
         let child_recursion_depth =
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
@@ -11716,7 +11733,10 @@ pub(crate) mod tests {
         assert!(first.contains("runtime owns your run identity"));
         assert!(first.contains("to=\"parent\""));
         assert!(first.contains("message_type=\"question\""));
+        assert!(first.contains("next action MUST be"));
+        assert!(first.contains("Never put a question to the parent in ordinary text"));
         assert!(first.contains("A parent question is control flow, never terminal output"));
+        assert!(first.contains("returns `queued`"));
         assert!(first.contains("wait for the correlated answer"));
         assert!(first.contains("`ask_user` addresses the human"));
         assert!(first.contains("Return only the answer, evidence, or decision"));
@@ -11880,14 +11900,14 @@ pub(crate) mod tests {
             "read_file".to_string(),
         ];
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&requested), &restricted),
+            effective_spawn_allowed_tools(Some(&requested), &restricted, None),
             vec!["read_file".to_string()],
             "a read-only/restricted profile cannot be widened by spawn arguments"
         );
 
         let unrestricted = ["*".to_string()].into_iter().collect();
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&requested), &unrestricted),
+            effective_spawn_allowed_tools(Some(&requested), &unrestricted, None),
             vec!["read_file".to_string(), "write_file".to_string()],
             "a full profile honors the normalized explicit child boundary"
         );
@@ -11899,7 +11919,8 @@ pub(crate) mod tests {
             assert_eq!(
                 effective_spawn_allowed_tools(
                     Some(&["tool_search".to_string(), "write_file".to_string()]),
-                    &profile.allowed_tools
+                    &profile.allowed_tools,
+                    None,
                 ),
                 vec!["tool_search".to_string()],
                 "{} must retain discovery while rejecting mutation",
@@ -11912,9 +11933,20 @@ pub(crate) mod tests {
             .find(|definition| definition.agent_type == "explore")
             .expect("explore profile");
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&["web_fetch".to_string()]), &explore.allowed_tools,),
+            effective_spawn_allowed_tools(
+                Some(&["web_fetch".to_string()]),
+                &explore.allowed_tools,
+                None,
+            ),
             vec!["web_fetch".to_string()],
             "a read-only research profile must retain an explicitly narrowed read-only web capability"
+        );
+
+        let native =
+            effective_spawn_allowed_tools(None, &explore.allowed_tools, Some("native_codex"));
+        assert!(
+            native.contains(&"native_codex".to_string()),
+            "an explicitly admitted provider execution must not depend on persona tool defaults"
         );
     }
 

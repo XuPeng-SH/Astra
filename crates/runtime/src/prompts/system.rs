@@ -680,10 +680,13 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     }
     if agent_visible {
         body.push_str(
-"         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Absent fields/actions: Tool Availability Protocol; preserve constraints. Default `agent_type`: read-only `explore`; review: `code-review`; mutation: `task`/`general-purpose`. Defaults: omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, set an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not controls; never invent reasoning, read config/credentials, or substitute unavailable/prohibited models.\n",
+            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Absent fields/actions: Tool Availability Protocol; preserve constraints. Default `agent_type`: read-only `explore`; review: `code-review`; mutation: `task`/`general-purpose`. Defaults: omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, set an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not controls; never invent reasoning, read config/credentials, or substitute unavailable/prohibited models.\n",
         );
         body.push_str(
-            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Decisions: `agent(send_message, message_type=question)` then wait; answer with the incoming `request_id`. Final prose is not a coordination message; running is not failure.\n",
+            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Use `agent(send_message, message_type=question)` only for an active parent/child/peer mailbox, then wait; answer with the incoming `request_id`. A completed provider collaborator is continued by a new `agent(action=\"spawn\", collaborator_id=<exact prior receipt>)`, never by agent_id, run_id, name, or a constructed mailbox address. If a provider returns a typed model-selection requirement, ask the user once with its exact choices and retry only after the choice; never guess or present the unstarted child as a task failure. Final prose is not a coordination message; running is not failure.\n",
+        );
+        body.push_str(
+            "         - A plain Chat/Astra model request selects `requested_model_policy`; use `execution` only when the user explicitly names an external provider or protocol. Never turn an internal model name into a provider-owned execution request.\n",
         );
     }
     if tool_visible(tool_names, "bash") {

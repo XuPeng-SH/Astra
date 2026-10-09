@@ -292,7 +292,9 @@ fn native_bootstrap_fingerprint(
     name: &str,
     args: &serde_json::Value,
 ) -> Option<astra_turn_core::approval_fingerprint::ApprovalFingerprint> {
-    if name != "sandbox_expand:native_codex" {
+    if astra_turn_core::provider_resolution::NativeCollaboratorProtocol::from_permission_scope(name)
+        .is_none()
+    {
         return None;
     }
     let hash = args.get("provider_snapshot_hash")?.as_str()?;

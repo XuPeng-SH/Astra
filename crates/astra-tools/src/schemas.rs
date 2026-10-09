@@ -1435,7 +1435,7 @@ fn provider_child_execution_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Use a currently available provider-owned agent tool, not an Astra model Offering. Omit for normal internal model execution. Do not combine with requested_model_policy.",
+        "description": "Use a currently available provider-owned agent tool only when the user explicitly names that external provider or protocol (for example Codex, Claude Code, or OpenCode), not merely a model name. A plain model request such as a Chat/Astra Offering must use requested_model_policy and must omit execution. Omit for normal internal model execution. Do not combine with requested_model_policy.",
         "properties": {
             "tool": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Exact tool name from the current capability surface; never a shell command or executable path."},
             "model": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional model requested from that tool. Not an Astra Offering or proof of the model actually used."}
@@ -1446,7 +1446,7 @@ fn provider_child_execution_schema() -> Value {
 
 fn collaborator_identity_schema() -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": 256,
-        "description": "Resume the exact runtime-generated collaborator identity from an earlier launch, keeping its conversation. Never supply a third-party session ID or a made-up name. This starts a new independently settled stage, not a replay of its previous result."})
+        "description": "For a new collaborator, omit this field. For a follow-up, copy the exact runtime-generated collaborator_id returned by an earlier launch to keep its conversation. A completed provider collaborator does not accept send_message; continue it with a new spawn carrying this exact collaborator_id. Never use an agent_id, run_id, mailbox address, third-party session ID, or made-up name. This starts a new independently settled stage, not a replay of its previous result."})
 }
 
 fn fanout_reasoning_schema() -> Value {
@@ -1475,20 +1475,20 @@ fn agent_parameters_schema() -> Value {
             "send_message": ["local", "server"]
         },
         "x-astra-surface-descriptions": {
-            "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
+            "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
         },
         "x-astra-surface-discovery-summaries": {
-            "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question"
+            "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;external execution only when user names provider;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question;active mailbox only;provider follow-up uses exact collaborator_id"
         },
         "x-astra-per-action-discovery-summaries": {
-            "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+            "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;external execution only when user names provider;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
             "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
             "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
             "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
             "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
-            "send_message": "action+to+message; child asks parent via to=parent, message_type=question (not ask_user); parent answers with the exact request_id"
+            "send_message": "action+to+message; active mailbox only; child asks parent via message_type=question (not ask_user); parent answers request_id; completed provider follow-up uses spawn+exact collaborator_id"
         },
-        "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+        "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;external execution only when user names provider;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
         "properties": {
             "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
             "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
@@ -2783,6 +2783,11 @@ mod tests {
         let policy_description = properties["requested_model_policy"]["description"]
             .as_str()
             .expect("requested model policy description");
+        let provider_execution_description = properties["execution"]["description"]
+            .as_str()
+            .expect("provider execution description");
+        assert!(provider_execution_description.contains("only when the user explicitly names"));
+        assert!(provider_execution_description.contains("must use requested_model_policy"));
         assert!(policy_description.contains("Optional execution-model override"));
         assert!(policy_description.contains("Omit to inherit the parent Offering"));
         assert!(
@@ -2904,6 +2909,8 @@ mod tests {
                 assert!(
                     description.contains("use model_catalog only when model choices are unknown")
                 );
+                assert!(description.contains("active parent/child/peer mailboxes only"));
+                assert!(description.contains("exact collaborator_id"));
                 assert!(description.contains(
                     "propose requested_model_policy with an exact authorized Offering ID or configured name"
                 ));
@@ -2961,12 +2968,12 @@ mod tests {
                 );
                 let selection = crate::tool_search::tool_selection_contract(&message).unwrap();
                 assert_eq!(selection["description_truncated"], false);
-                assert!(
-                    selection["description"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("message_type=question")
-                            && text.contains("not ask_user"))
-                );
+                assert!(selection["description"].as_str().is_some_and(|text| {
+                    text.contains("message_type=question")
+                        && text.contains("not ask_user")
+                        && text.contains("active mailbox only")
+                        && text.contains("exact collaborator_id")
+                }));
             }
 
             for (action, guidance) in [

@@ -76,6 +76,7 @@ impl EdgeBoundExecutionPlan {
                     binding.policy.isolation,
                     astra_runtime_env::IsolationIntent::None
                         | astra_runtime_env::IsolationIntent::Process
+                        | astra_runtime_env::IsolationIntent::ProviderEnforced
                 )
             {
                 return Err(invalid());
