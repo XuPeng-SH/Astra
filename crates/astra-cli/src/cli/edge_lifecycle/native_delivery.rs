@@ -1395,6 +1395,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_authentication_has_a_bounded_startup_deadline() {
+        use futures_util::StreamExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (consumer, _owner) = consumer(workspace.path(), runtime.path(), None);
+        let discovery = Arc::new(snapshot(&consumer.requirements, workspace.path()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = ws.next().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut config = (*consumer.config).clone();
+        config.websocket_url = endpoint;
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_native_delivery(
+                config,
+                discovery,
+                Instant::now() + Duration::from_millis(100),
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("authentication must not hang past the test guard");
+        let error = match error {
+            Ok(_) => panic!("an unauthenticated peer cannot publish native capacity"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("deadline"),
+            "unexpected bounded startup error: {error}"
+        );
+        peer.abort();
+        let _ = peer.await;
+    }
+
+    #[tokio::test]
     async fn authenticated_shared_ws_reaches_cli_native_entrypoint_and_withdraws_capacity() {
         use astra_server_types::edge_ws_protocol::{
             EdgeExecutionCeiling, EdgeServerMessage, ToolInvocationIdentity,
