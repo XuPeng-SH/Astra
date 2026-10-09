@@ -57,6 +57,75 @@ impl Drop for UnsettledOnDrop {
     }
 }
 
+/// The provider adapters decide what their protocol considers a successful
+/// turn. This owner decides the provider-independent physical facts: whether
+/// the child scope settled, whether a successful exit was observed, and
+/// whether the bounded post-terminal cancellation completed. Keeping those
+/// facts here prevents each adapter from growing a second process lifecycle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeProcessSettlement {
+    pub(crate) authoritative: bool,
+    pub(crate) exited_successfully: bool,
+    pub(crate) cancelled_after_terminal: bool,
+    pub(crate) target_released: Option<bool>,
+}
+
+impl NativeProcessSettlement {
+    pub(crate) fn transport_settled(self, accept_cancelled: bool) -> bool {
+        self.exited_successfully || (accept_cancelled && self.cancelled_after_terminal)
+    }
+}
+
+pub(crate) async fn settle_native_process(
+    process: FramedProcess,
+    driven: Result<(), String>,
+    token: &CancellationToken,
+    unsettled: &mut UnsettledOnDrop,
+) -> (Result<(), String>, NativeProcessSettlement) {
+    let mut cancelled_after_terminal = false;
+    let outcome = if driven.is_ok() {
+        // A native terminal event is protocol evidence only. The process owner
+        // still closes stdin and waits for authoritative descendant settlement.
+        let completion = process.wait();
+        tokio::pin!(completion);
+        tokio::select! {
+            result = &mut completion => result,
+            _ = tokio::time::sleep(SHUTDOWN_GRACE) => {
+                cancelled_after_terminal = true;
+                token.cancel();
+                completion.await
+            }
+        }
+    } else {
+        process.cancel_and_wait().await
+    };
+    let authoritative = outcome
+        .as_ref()
+        .ok()
+        .and_then(|outcome| outcome.settlement.as_ref())
+        .is_some_and(|settlement| settlement.ownership.is_authoritative());
+    if authoritative {
+        unsettled.0.take();
+    }
+    let exited_successfully = outcome.as_ref().is_ok_and(|outcome| {
+        matches!(outcome.end, FramedProcessEnd::Exited)
+            && outcome.status.is_some_and(|status| status.success())
+    });
+    let target_released = outcome
+        .as_ref()
+        .ok()
+        .and_then(|outcome| outcome.target_released);
+    (
+        driven,
+        NativeProcessSettlement {
+            authoritative,
+            exited_successfully,
+            cancelled_after_terminal,
+            target_released,
+        },
+    )
+}
+
 pub(crate) fn prepare_native_process(
     executable: &std::path::Path,
     args: &[String],

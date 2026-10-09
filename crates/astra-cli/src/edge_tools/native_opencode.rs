@@ -7,7 +7,7 @@
 
 use super::{ApprovedNativeRuntime, ToolExecutor, native_codex};
 use astra_edge::EdgeInvocationInput;
-use astra_sandbox::{FramedProcess, FramedProcessEnd, FramedProcessLimits};
+use astra_sandbox::{FramedProcess, FramedProcessLimits};
 use astra_tools::{ProviderInteractionGate, ToolResult};
 use astra_turn_types::{ProviderRuntimeRequirements, ProviderStageInputAck};
 use serde_json::{Value, json};
@@ -675,38 +675,12 @@ impl ToolExecutor {
             _ = token.cancelled() => Err("native OpenCode invocation cancelled".to_string()),
             result = drive(&mut process, &stage, &cwd_text, &mut evidence, native_codex::OUTPUT_BYTES, &token, input_rx) => result,
         };
-        let mut cleanup_cancelled = false;
-        let outcome = if driven.is_ok() {
-            let completion = process.wait();
-            tokio::pin!(completion);
-            tokio::select! {
-                result = &mut completion => result,
-                _ = tokio::time::sleep(native_codex::SHUTDOWN_GRACE) => {
-                    cleanup_cancelled = true;
-                    token.cancel();
-                    completion.await
-                }
-            }
-        } else {
-            process.cancel_and_wait().await
-        };
-        let settled = outcome
-            .as_ref()
-            .ok()
-            .and_then(|outcome| outcome.settlement.as_ref())
-            .is_some_and(|settlement| settlement.ownership.is_authoritative());
-        if settled {
-            unsettled.0.take();
-        }
-        let transport_ok = outcome.as_ref().is_ok_and(|outcome| {
-            (matches!(outcome.end, FramedProcessEnd::Exited)
-                && outcome.status.is_some_and(|status| status.success()))
-                || (cleanup_cancelled && matches!(outcome.end, FramedProcessEnd::Cancelled))
-        });
-        let target_released = outcome
-            .as_ref()
-            .ok()
-            .and_then(|outcome| outcome.target_released);
+        let (driven, settlement) =
+            native_codex::settle_native_process(process, driven, &token, &mut unsettled).await;
+        let settled = settlement.authoritative;
+        let cleanup_cancelled = settlement.cancelled_after_terminal;
+        let transport_ok = settlement.transport_settled(true);
+        let target_released = settlement.target_released;
         let is_error = driven.is_err()
             || evidence.session_id.is_none()
             || !evidence.terminal

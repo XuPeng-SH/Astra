@@ -638,35 +638,11 @@ impl ToolExecutor {
             _ = token.cancelled() => Err("native Claude invocation cancelled".to_string()),
             result = drive(&mut process, &mut evidence, native_codex::OUTPUT_BYTES, &token, input_rx) => result,
         };
-        let outcome = if driven.is_ok() {
-            let completion = process.wait();
-            tokio::pin!(completion);
-            tokio::select! {
-                result = &mut completion => result,
-                _ = tokio::time::sleep(native_codex::SHUTDOWN_GRACE) => {
-                    token.cancel();
-                    completion.await
-                }
-            }
-        } else {
-            process.cancel_and_wait().await
-        };
-        let settled = outcome
-            .as_ref()
-            .ok()
-            .and_then(|outcome| outcome.settlement.as_ref())
-            .is_some_and(|settlement| settlement.ownership.is_authoritative());
-        if settled {
-            unsettled.0.take();
-        }
-        let transport_ok = outcome.as_ref().is_ok_and(|outcome| {
-            matches!(outcome.end, FramedProcessEnd::Exited)
-                && outcome.status.is_some_and(|status| status.success())
-        });
-        let target_released = outcome
-            .as_ref()
-            .ok()
-            .and_then(|outcome| outcome.target_released);
+        let (driven, settlement) =
+            native_codex::settle_native_process(process, driven, &token, &mut unsettled).await;
+        let settled = settlement.authoritative;
+        let transport_ok = settlement.transport_settled(false);
+        let target_released = settlement.target_released;
         let is_error = driven.is_err()
             || evidence.session_id.is_none()
             || !evidence.terminal
