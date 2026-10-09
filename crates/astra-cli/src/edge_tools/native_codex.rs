@@ -246,6 +246,13 @@ pub(crate) fn native_executable_candidates() -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
+pub(crate) fn native_executable_snapshot() -> Vec<NativeExecutableIdentity> {
+    native_executable_candidates()
+        .into_iter()
+        .filter_map(|path| native_executable_identity(&path).ok())
+        .collect()
+}
+
 fn native_executable() -> Result<std::path::PathBuf, &'static str> {
     native_executable_candidates()
         .into_iter()
@@ -2232,7 +2239,11 @@ impl ToolExecutor {
         &self,
         cancel: Option<&CancellationToken>,
         deadline: std::time::Instant,
-    ) -> Option<astra_turn_types::ProviderToolDeclaration> {
+    ) -> Option<(
+        astra_turn_types::ProviderToolDeclaration,
+        NativeExecutableIdentity,
+        Vec<NativeExecutableIdentity>,
+    )> {
         let supported = astra_core::sync_poison::recover_rwlock_read(&self.sandbox_policy)
             .as_ref()
             .is_some_and(|policy| policy.isolation != astra_sandbox::IsolationLevel::Strict);
@@ -2241,6 +2252,7 @@ impl ToolExecutor {
         }
         let root = self.effective_project_root().canonicalize().ok()?;
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
+        let initial_executables = native_executable_snapshot();
         for executable in native_executable_candidates() {
             if token.is_cancelled() {
                 return None;
@@ -2251,11 +2263,24 @@ impl ToolExecutor {
             let Ok(requirements) = runtime_requirements_for_executable(&executable) else {
                 continue;
             };
+            let expected_identity =
+                native_executable_identity(std::path::Path::new(&requirements.executable)).ok()?;
             if verify_installed_protocol(&executable, &root, &token, deadline)
                 .await
                 .is_ok()
             {
-                return provider_declaration(requirements).ok();
+                let current_identity =
+                    native_executable_identity(std::path::Path::new(&requirements.executable))
+                        .ok()?;
+                let current_executables = native_executable_snapshot();
+                if current_identity != expected_identity
+                    || current_executables != initial_executables
+                {
+                    return None;
+                }
+                return provider_declaration(requirements)
+                    .ok()
+                    .map(|declaration| (declaration, expected_identity, current_executables));
             }
         }
         None

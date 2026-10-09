@@ -5366,13 +5366,6 @@ pub struct CollaboratorNativeExecutionLocator {
 pub struct CollaboratorAssociation {
     pub provider: CollaboratorProvider,
     pub execution_boundary: CollaboratorExecutionBoundary,
-    /// Stable digest of the admitted prepared execution identity. This is
-    /// evidence, not a substitute for model or execution-boundary admission.
-    pub execution_identity_fingerprint: String,
-    /// Credential-free native selection on the existing association event.
-    /// Internal agents have no external native session or execution locator.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_execution: Option<CollaboratorNativeExecutionLocator>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -5382,6 +5375,15 @@ pub struct CollaboratorStageAdmission {
     pub source_message_id: String,
     /// Immutable intent digest, excluding the newly proposed child run ID.
     pub request_fingerprint: String,
+    /// Digest of this stage's current execution admission. It is deliberately
+    /// stage-scoped: replacing a compatible local client must not invalidate
+    /// the stable collaborator association, but the new stage still records
+    /// the exact descriptor and policy that admitted it.
+    pub execution_identity_fingerprint: String,
+    /// Credential-free native selection for this stage. Internal agents do
+    /// not have an external native execution locator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_execution: Option<CollaboratorNativeExecutionLocator>,
     pub expected_previous_stage_run_id: Option<String>,
     pub expected_parent_generation: u64,
     pub association: CollaboratorAssociation,
@@ -5417,6 +5419,7 @@ pub struct CollaboratorNativeSession {
 pub struct DurableCollaboratorAssociation {
     pub association: CollaboratorAssociation,
     pub latest_stage: CollaboratorStageReceipt,
+    pub latest_native_execution: Option<CollaboratorNativeExecutionLocator>,
     pub native_session: Option<CollaboratorNativeSession>,
 }
 
@@ -5477,10 +5480,7 @@ fn validate_collaborator_admission(
     record: &DurableRunRecord,
     admission: &CollaboratorStageAdmission,
 ) -> Result<(), CollaboratorStoreError> {
-    match (
-        &admission.association.provider,
-        &admission.association.native_execution,
-    ) {
+    match (&admission.association.provider, &admission.native_execution) {
         (CollaboratorProvider::InternalModel, None) => {}
         (CollaboratorProvider::InternalModel, Some(_)) | (_, None) => {
             return Err(CollaboratorStoreError::InvalidAdmission {
@@ -5516,10 +5516,7 @@ fn validate_collaborator_admission(
         ),
         (
             "execution_identity_fingerprint",
-            admission
-                .association
-                .execution_identity_fingerprint
-                .as_str(),
+            admission.execution_identity_fingerprint.as_str(),
         ),
     ] {
         if value.trim().is_empty() || value.len() > 512 {
@@ -5569,6 +5566,8 @@ fn collaborator_replay_receipt(
         || original.association != admission.association
         || original.source_message_id != admission.source_message_id
         || original.request_fingerprint != admission.request_fingerprint
+        || original.execution_identity_fingerprint != admission.execution_identity_fingerprint
+        || original.native_execution != admission.native_execution
         || original.expected_previous_stage_run_id != admission.expected_previous_stage_run_id
     {
         return Err(CollaboratorStoreError::SourceMessageConflict {
@@ -15448,6 +15447,8 @@ impl DatabaseRunStateStore {
         .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
             anchor_run_id: anchor_run_id.into(),
         })?;
+        let latest_admission: CollaboratorStageAdmission =
+            decode_collaborator_fact(&latest, "admission")?;
         let native_session = Self::collaborator_event_tx(
             tx,
             user_id,
@@ -15462,6 +15463,7 @@ impl DatabaseRunStateStore {
         Ok(Some(DurableCollaboratorAssociation {
             association,
             latest_stage: decode_collaborator_fact(&latest, "receipt")?,
+            latest_native_execution: latest_admission.native_execution,
             native_session,
         }))
     }
@@ -17432,8 +17434,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 }
             })?;
         let locator = association
-            .association
-            .native_execution
+            .latest_native_execution
             .as_ref()
             .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
         if fingerprint.tool
@@ -35361,13 +35362,13 @@ mod tests {
             anchor_run_id: anchor_id.clone(),
             source_message_id: Uuid::new_v4().to_string(),
             request_fingerprint: "source-intent-digest".into(),
+            execution_identity_fingerprint: "prepared-identity-digest".into(),
+            native_execution: None,
             expected_previous_stage_run_id: None,
             expected_parent_generation: 0,
             association: CollaboratorAssociation {
                 provider: CollaboratorProvider::InternalModel,
                 execution_boundary: CollaboratorExecutionBoundary::ServerManaged,
-                execution_identity_fingerprint: "prepared-identity-digest".into(),
-                native_execution: None,
             },
         };
         let mut child = durable_run_record(&anchor_id);

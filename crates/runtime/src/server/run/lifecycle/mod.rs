@@ -19596,8 +19596,7 @@ fn native_collaborator_target(run: &DurableRunRecord) -> Option<astra_messaging:
                 event.get("admission").cloned().unwrap_or(Value::Null),
             )
             .is_ok_and(|admission| {
-                admission.anchor_run_id == run.run_id
-                    && admission.association.native_execution.is_some()
+                admission.anchor_run_id == run.run_id && admission.native_execution.is_some()
             })
     });
     native_stage.then(|| astra_messaging::AgentAddress::new(run.run_id.clone(), agent_id))
@@ -21766,29 +21765,29 @@ impl ServerSpawnAgentExecutor {
             .as_deref()
             .filter(|id| !id.trim().is_empty())
             .ok_or("native collaborator has no physical materialization identity")?;
+        let execution_identity_fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &policy.descriptor,
+                    &policy_content_id,
+                    &request.model,
+                    &physical_workspace_id,
+                ))
+                .map_err(|error| error.to_string())?,
+            )
+        );
+        let native_execution = astra_services::runs::CollaboratorNativeExecutionLocator {
+            descriptor: policy.descriptor.clone(),
+            public_tool_name: request.tool.clone(),
+            requested_model: request.model.clone(),
+            policy_content_id: policy_content_id.clone(),
+        };
         let mut association = astra_services::runs::CollaboratorAssociation {
             provider: provider.clone(),
             execution_boundary: astra_services::runs::CollaboratorExecutionBoundary::UserRunner {
                 runner_id: physical_workspace_id.to_string(),
             },
-            execution_identity_fingerprint: format!(
-                "sha256:{:x}",
-                Sha256::digest(
-                    serde_json::to_vec(&(
-                        &policy.descriptor,
-                        &policy_content_id,
-                        &request.model,
-                        &physical_workspace_id
-                    ))
-                    .map_err(|error| error.to_string())?
-                )
-            ),
-            native_execution: Some(astra_services::runs::CollaboratorNativeExecutionLocator {
-                descriptor: policy.descriptor.clone(),
-                public_tool_name: request.tool.clone(),
-                requested_model: request.model.clone(),
-                policy_content_id: policy_content_id.clone(),
-            }),
         };
         let (anchor_run_id, previous, native_session) = if input.collaborator_id.is_some() {
             let durable = durable_followup.ok_or_else(|| {
@@ -21796,17 +21795,6 @@ impl ServerSpawnAgentExecutor {
             })?;
             if durable.association.provider != association.provider
                 || durable.association.execution_boundary != association.execution_boundary
-                || durable.association.execution_identity_fingerprint
-                    != association.execution_identity_fingerprint
-                || durable
-                    .association
-                    .native_execution
-                    .as_ref()
-                    .is_none_or(|locator| {
-                        locator.descriptor != policy.descriptor
-                            || locator.requested_model != request.model
-                            || locator.policy_content_id != policy_content_id
-                    })
             {
                 return Err("native collaborator selected execution changed".into());
             }
@@ -21857,6 +21845,8 @@ impl ServerSpawnAgentExecutor {
                 anchor_run_id,
                 source_message_id,
                 request_fingerprint,
+                execution_identity_fingerprint,
+                native_execution: Some(native_execution),
                 expected_previous_stage_run_id: previous,
                 expected_parent_generation,
                 association,
@@ -22215,8 +22205,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 // loop under a stable collaborator handle.
                 ensure_collaborator_context_continuation(&original)?;
                 let locator = association
-                    .association
-                    .native_execution
+                    .latest_native_execution
                     .as_ref()
                     .ok_or_else(|| {
                         "native collaborator has no durable execution locator".to_string()

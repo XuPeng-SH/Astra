@@ -5494,6 +5494,7 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
         ),
     );
     binding.execution_binding_generation = Some(7);
+    binding.physical_workspace_id = Some("selected-materialization".into());
     parent.execution_contract = Some((binding, Default::default()));
     assert!(executor.set_runtime_context(parent.clone()).await);
     let mut context = test_spawn_context("native-parent");

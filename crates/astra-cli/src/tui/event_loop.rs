@@ -5425,6 +5425,8 @@ struct ViewActionBackends {
     session_attachment_epoch: u64,
     file_writer: Option<super::file_writer::TuiFileWriter>,
     agent_workbench_tx: tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
+    native_delivery_refresh:
+        crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle,
 }
 
 /// Dispatch actions emitted by a live projection refresh. This keeps the
@@ -6938,6 +6940,7 @@ async fn dispatch_bottom_pane_view_action(
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::RefreshAgentMonitor => {
+            backends.native_delivery_refresh.request();
             if server_agent_observer.request_refresh() {
                 server_agent_observer.maybe_refresh();
                 reconcile_server_agent_observer(
@@ -8569,6 +8572,7 @@ pub(crate) async fn run_tui_session(
                                         session_id: state.session_id.clone(),
                                         file_writer: Some(file_writer.clone()),
                                         agent_workbench_tx: agent_workbench_tx.clone(),
+                                        native_delivery_refresh: state.native_delivery_refresh_handle(),
                                         session_attachment_epoch: state.session_attachment_epoch,
                                     },
                                     &frame_requester,
@@ -9048,6 +9052,7 @@ pub(crate) async fn run_tui_session(
                                                     ),
                                                     file_writer: Some(file_writer.clone()),
                                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                                    native_delivery_refresh: state.native_delivery_refresh_handle(),
                                                     session_attachment_epoch: state.session_attachment_epoch,
                                                 },
                                                 &frame_requester,
@@ -9405,6 +9410,7 @@ pub(crate) async fn run_tui_session(
                                             slash_dispatch::session_hub_snapshot(&state);
                                         let turn_session_id = state.session_id.clone();
                                         let turn_session_attachment_epoch = state.session_attachment_epoch;
+                                        let native_delivery_refresh = state.native_delivery_refresh_handle();
                                         let turn_permission_policy = state.perm_manager.subscribe_permission_policy();
                                         let turn_submission_id =
                                             uuid::Uuid::now_v7().to_string();
@@ -9717,6 +9723,7 @@ pub(crate) async fn run_tui_session(
                                                                             session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                             file_writer: Some(file_writer.clone()),
                                                                             agent_workbench_tx: agent_workbench_tx.clone(),
+                                                                            native_delivery_refresh: native_delivery_refresh.clone(),
                                                                             session_attachment_epoch: turn_session_attachment_epoch,
                                                                         },
                                                                         &frame_requester,
@@ -10172,6 +10179,7 @@ pub(crate) async fn run_tui_session(
                                                                                 session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                                 file_writer: Some(file_writer.clone()),
                                                                                 agent_workbench_tx: agent_workbench_tx.clone(),
+                                                                                native_delivery_refresh: native_delivery_refresh.clone(),
                                                                                 session_attachment_epoch: turn_session_attachment_epoch,
                                                                             },
                                                                             &restored_local_agent_task_projections,
@@ -10868,6 +10876,7 @@ pub(crate) async fn run_tui_session(
                                                             session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                             file_writer: Some(file_writer.clone()),
                                                             agent_workbench_tx: agent_workbench_tx.clone(),
+                                                            native_delivery_refresh: native_delivery_refresh.clone(),
                                                             session_attachment_epoch: turn_session_attachment_epoch,
                                                         },
                                                         &restored_local_agent_task_projections,
@@ -11371,6 +11380,7 @@ pub(crate) async fn run_tui_session(
                                         session_id: state.session_id.clone(),
                                         file_writer: Some(file_writer.clone()),
                                         agent_workbench_tx: agent_workbench_tx.clone(),
+                                        native_delivery_refresh: state.native_delivery_refresh_handle(),
                                         session_attachment_epoch: state.session_attachment_epoch,
                                     },
                                     &restored_local_agent_task_projections,
@@ -12109,6 +12119,7 @@ pub(crate) async fn run_tui_session(
                         session_id: state.session_id.clone(),
                         file_writer: Some(file_writer.clone()),
                         agent_workbench_tx: agent_workbench_tx.clone(),
+                        native_delivery_refresh: state.native_delivery_refresh_handle(),
                         session_attachment_epoch: state.session_attachment_epoch,
                     },
                     &restored_local_agent_task_projections,
@@ -12311,6 +12322,7 @@ pub(crate) async fn run_tui_session(
                                     session_id: state.session_id.clone(),
                                     file_writer: Some(file_writer.clone()),
                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                    native_delivery_refresh: state.native_delivery_refresh_handle(),
                                     session_attachment_epoch: state.session_attachment_epoch,
                                 },
                             );
@@ -12330,6 +12342,7 @@ pub(crate) async fn run_tui_session(
                                     session_id: state.session_id.clone(),
                                     file_writer: Some(file_writer.clone()),
                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                    native_delivery_refresh: state.native_delivery_refresh_handle(),
                                     session_attachment_epoch: state.session_attachment_epoch,
                                 },
                                 &restored_local_agent_task_projections,
@@ -12607,6 +12620,7 @@ pub(crate) async fn run_tui_session(
     if let Some(handle) = state.native_delivery.take() {
         handle.shutdown().await;
     }
+    state.native_delivery_refresh.clear();
     state.native_delivery_session_id = None;
     state.native_delivery_attachment_epoch = None;
     state.native_delivery_shutdown = None;
@@ -15249,6 +15263,7 @@ mod tests {
                     session_attachment_epoch: 1,
                     file_writer: None,
                     agent_workbench_tx: tx,
+                    native_delivery_refresh: Default::default(),
                 },
                 &mut widget,
                 &mut pane,
@@ -20228,6 +20243,7 @@ mod tests {
                     session_attachment_epoch: 9,
                     file_writer: None,
                     agent_workbench_tx: tx,
+                    native_delivery_refresh: Default::default(),
                 },
                 &mut pane,
                 &mut widget,
@@ -20579,6 +20595,7 @@ mod tests {
                 session_attachment_epoch: 0,
                 file_writer: None,
                 agent_workbench_tx,
+                native_delivery_refresh: Default::default(),
             },
             &[],
             &mut widget,
@@ -20889,6 +20906,7 @@ mod tests {
                 session_id: Some("durable-root-session".into()),
                 file_writer: None,
                 agent_workbench_tx,
+                native_delivery_refresh: Default::default(),
                 session_attachment_epoch: 0,
             },
             &FrameRequester::test_dummy(),
@@ -20955,6 +20973,7 @@ mod tests {
                 session_id: Some("durable-root-session".into()),
                 file_writer: None,
                 agent_workbench_tx,
+                native_delivery_refresh: Default::default(),
                 session_attachment_epoch: 0,
             },
             &FrameRequester::test_dummy(),

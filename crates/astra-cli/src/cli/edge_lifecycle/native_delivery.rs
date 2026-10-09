@@ -33,6 +33,36 @@ enum NativeDeliveryError {
     Other(String),
 }
 
+/// Stable UI-facing request path for the session-owned delivery supervisor.
+/// The sender behind this handle changes when a transport owner is replaced;
+/// a TUI action must therefore retain the indirection, not a sender tied to a
+/// previous owner.
+#[derive(Clone, Default)]
+pub(crate) struct NativeDeliveryRefreshHandle {
+    sender: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+}
+
+impl NativeDeliveryRefreshHandle {
+    pub(crate) fn request(&self) {
+        let sender = self.sender.lock().ok().and_then(|sender| sender.clone());
+        if let Some(sender) = sender {
+            let _ = sender.try_send(());
+        }
+    }
+
+    fn bind(&self, sender: mpsc::Sender<()>) {
+        if let Ok(mut current) = self.sender.lock() {
+            *current = Some(sender);
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        if let Ok(mut current) = self.sender.lock() {
+            *current = None;
+        }
+    }
+}
+
 impl NativeDeliveryError {
     fn other(message: impl Into<String>) -> Self {
         Self::Other(message.into())
@@ -94,7 +124,7 @@ pub(crate) struct NativeDeliveryHandle {
     cancellation: CancellationToken,
     withdrawal: CancellationToken,
     refresh_tx: mpsc::Sender<()>,
-    discovered_executables: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    discovered_executables: Arc<std::sync::Mutex<Vec<native_codex::NativeExecutableIdentity>>>,
     task: Option<tokio::task::JoinHandle<()>>,
     /// Set after the first discovery/handshake/publication attempt completes.
     /// `true` means the optional capability is settled for this turn; it does
@@ -117,25 +147,22 @@ impl NativeDeliveryHandle {
         self.withdrawal.cancel();
     }
 
-    fn request_refresh(&self) {
+    fn request_refresh_if_environment_changed(&self) {
         // Capacity one coalesces repeated environment changes. The existing
         // supervisor remains the single owner of discovery and reconnection.
-        let current = native_codex::native_executable_candidates();
+        let current = native_codex::native_executable_snapshot();
         let changed = self
             .discovered_executables
             .lock()
             .ok()
             .is_some_and(|selected| *selected != current);
         if changed {
-            if let Ok(mut selected) = self.discovered_executables.lock() {
-                *selected = current;
-            }
             let _ = self.refresh_tx.try_send(());
         }
     }
 
     fn executable_changed(&self) -> bool {
-        let current = native_codex::native_executable_candidates();
+        let current = native_codex::native_executable_snapshot();
         self.discovered_executables
             .lock()
             .ok()
@@ -158,6 +185,16 @@ impl NativeDeliveryHandle {
             let _ = task.await;
         }
         self.task.take();
+    }
+}
+
+async fn capability_withdrawal_requested(
+    external: &CancellationToken,
+    internal: &CancellationToken,
+) {
+    tokio::select! {
+        _ = external.cancelled() => {}
+        _ = internal.cancelled() => {}
     }
 }
 
@@ -660,8 +697,15 @@ async fn install_native_delivery(
     cancellation: &CancellationToken,
     withdrawal: CancellationToken,
     refresh_tx: mpsc::Sender<()>,
-    discovered_executables: Arc<std::sync::Mutex<Vec<PathBuf>>>,
-) -> Result<NativeDeliveryHandle, NativeDeliveryError> {
+    discovered_executables: Arc<std::sync::Mutex<Vec<native_codex::NativeExecutableIdentity>>>,
+) -> Result<
+    (
+        NativeDeliveryHandle,
+        bool,
+        Option<Vec<native_codex::NativeExecutableIdentity>>,
+    ),
+    NativeDeliveryError,
+> {
     if config.account_id.is_empty()
         || config.edge_agent_id.is_empty()
         || config.edge_transport_id.is_empty()
@@ -678,26 +722,32 @@ async fn install_native_delivery(
     let root_text = root
         .to_str()
         .ok_or_else(|| NativeDeliveryError::other("native workspace is not UTF-8"))?;
-    let snapshot = match config
+    let (snapshot, verified_executables) = match config
         .executor
         .native_collaborator_declaration_if_available(Some(cancellation), admission_deadline)
         .await
     {
-        Some(declaration) => Some(Arc::new(
-            discovery_snapshot(
-                &config.edge_agent_id,
-                &config.materialization_id,
-                root_text,
-                declaration,
+        Some((declaration, executable_identity, verified_executables)) => {
+            let snapshot = Arc::new(
+                discovery_snapshot(
+                    &config.edge_agent_id,
+                    &config.materialization_id,
+                    root_text,
+                    declaration,
+                )
+                .map_err(NativeDeliveryError::other)?,
+            );
+            (
+                Some((snapshot, executable_identity)),
+                Some(verified_executables),
             )
-            .map_err(NativeDeliveryError::other)?,
-        )),
+        }
         None if astra_edge::has_pending_invocation_results(config.journal_path.clone()).await => {
             // Provider capability is optional, but an authenticated Edge owner
             // must still be able to replay an already durable result. It runs
             // withdrawn until discovery succeeds, so this recovery path cannot
             // admit new provider work.
-            None
+            (None, None)
         }
         None => {
             return Err(NativeDeliveryError::other(
@@ -705,7 +755,8 @@ async fn install_native_delivery(
             ));
         }
     };
-    connect_native_delivery(
+    let provider_available = snapshot.is_some();
+    let delivery = connect_native_delivery(
         config,
         snapshot,
         admission_deadline,
@@ -714,21 +765,28 @@ async fn install_native_delivery(
         refresh_tx,
         discovered_executables,
     )
-    .await
+    .await?;
+    Ok((delivery, provider_available, verified_executables))
 }
 
 // The capability-only installation path is shared by production and real transport
 // tests; tests replace only the external peer, not Astra auth/custody/dispatch.
 async fn connect_native_delivery(
     config: NativeDeliveryConfig,
-    snapshot: Option<Arc<ProviderDiscoverySnapshot>>,
+    snapshot: Option<(
+        Arc<ProviderDiscoverySnapshot>,
+        native_codex::NativeExecutableIdentity,
+    )>,
     admission_deadline: Instant,
     cancellation: &CancellationToken,
     withdrawal: CancellationToken,
     refresh_tx: mpsc::Sender<()>,
-    discovered_executables: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    discovered_executables: Arc<std::sync::Mutex<Vec<native_codex::NativeExecutableIdentity>>>,
 ) -> Result<NativeDeliveryHandle, NativeDeliveryError> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (snapshot, expected_executable_identity) = snapshot
+        .map(|(snapshot, identity)| (Some(snapshot), Some(identity)))
+        .unwrap_or((None, None));
     let workspace_root = config
         .executor
         .effective_project_root()
@@ -764,6 +822,14 @@ async fn connect_native_delivery(
                 std::path::Path::new(&requirements.executable),
             )
             .map_err(NativeDeliveryError::other)?;
+            if expected_executable_identity
+                .as_ref()
+                .is_some_and(|expected| *expected != executable_identity)
+            {
+                return Err(NativeDeliveryError::other(
+                    "native executable changed during discovery",
+                ));
+            }
             Ok::<_, NativeDeliveryError>((
                 declaration.native_tool_name.clone(),
                 protocol,
@@ -853,34 +919,33 @@ async fn connect_native_delivery(
         // Recovery can connect without a currently usable provider. The Edge
         // owner replays durable receipts, while every new request is denied
         // and the capability remains withdrawn.
-        withdrawal.cancel();
         Arc::new(UnavailableNativeExecutor)
     };
     let task_cancel = owner_cancel.clone();
     let task_withdrawal = capability_withdrawal.clone();
     let task_external_withdrawal = withdrawal.clone();
-    let bridge_withdrawal = task_withdrawal.clone();
     let task_config = config.clone();
     let (installed_tx, installed_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let withdrawal_bridge = tokio::spawn(async move {
-            task_external_withdrawal.cancelled().await;
-            bridge_withdrawal.cancel();
-        });
         let owner = astra_edge::serve_connection_with_drain(
             socket,
             context,
             callback,
             task_cancel.clone(),
-            Some(task_withdrawal),
+            Some(task_withdrawal.clone()),
         );
         tokio::pin!(owner);
         let mut ended_before_ready = false;
         let ready = tokio::select! {
             biased;
             _ = &mut owner => { ended_before_ready = true; false },
+            _ = capability_withdrawal_requested(&task_external_withdrawal, &task_withdrawal) => {
+                task_withdrawal.cancel();
+                false
+            }
             result = ready_rx => result.is_ok(),
         };
+        let mut withdrawal_published = false;
         if ready {
             // The same task owns publication and withdrawal ordering. An
             // initializer cannot publish after an already-settled owner has
@@ -900,14 +965,77 @@ async fn connect_native_delivery(
                     let _ = result.await;
                     false
                 },
+                _ = capability_withdrawal_requested(&task_external_withdrawal, &task_withdrawal) => {
+                    task_withdrawal.cancel();
+                    // Keep polling the Edge owner while the REST withdrawal
+                    // settles. It owns the WebSocket input lane for already
+                    // admitted work; awaiting the HTTP request by itself
+                    // would make steer/cancel traffic look hung.
+                    tokio::select! {
+                        biased;
+                        _ = &mut owner => {
+                            owner_ended = true;
+                            let _ = result.await;
+                        }
+                        _ = &mut result => {}
+                    }
+                    let withdrawal = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        publish(&task_config, None),
+                    );
+                    tokio::pin!(withdrawal);
+                    if owner_ended {
+                        let _ = withdrawal.await;
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = &mut owner => {
+                                owner_ended = true;
+                                let _ = withdrawal.await;
+                            }
+                            _ = &mut withdrawal => {}
+                        }
+                    }
+                    withdrawal_published = true;
+                    false
+                }
                 result = &mut result => result.is_ok_and(|result| result.is_ok()),
             };
             let _ = installed_tx.send(published);
             if !owner_ended {
                 if !published {
-                    task_cancel.cancel();
+                    if !withdrawal_published {
+                        task_cancel.cancel();
+                    }
                 }
-                let _ = owner.await;
+                if withdrawal_published {
+                    let _ = owner.await;
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = &mut owner => {}
+                        _ = capability_withdrawal_requested(&task_external_withdrawal, &task_withdrawal) => {
+                            task_withdrawal.cancel();
+                            let withdrawal = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                publish(&task_config, None),
+                            );
+                            tokio::pin!(withdrawal);
+                            tokio::select! {
+                                biased;
+                                _ = &mut owner => {
+                                    owner_ended = true;
+                                    let _ = withdrawal.await;
+                                }
+                                _ = &mut withdrawal => {}
+                            }
+                            withdrawal_published = true;
+                            if !owner_ended {
+                                let _ = owner.await;
+                            }
+                        }
+                    }
+                }
             }
         } else {
             let _ = installed_tx.send(false);
@@ -918,14 +1046,18 @@ async fn connect_native_delivery(
         }
         // Withdraw capacity when admission/transport ends. No native work can
         // be dispatched through a disconnected consumer.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            publish(&task_config, None),
-        )
-        .await;
-        withdrawal_bridge.abort();
+        // The external-withdrawal branches publish before waiting for a long
+        // admitted child to settle. Natural owner termination reaches this
+        // single publication point after settlement.
+        if !ready || !withdrawal_published {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                publish(&task_config, None),
+            )
+            .await;
+        }
     });
-    let handle = NativeDeliveryHandle {
+    let mut handle = NativeDeliveryHandle {
         cancellation: owner_cancel,
         withdrawal,
         refresh_tx,
@@ -940,7 +1072,15 @@ async fn connect_native_delivery(
             result.ok().and_then(Result::ok).unwrap_or(false),
     };
     if !installed {
-        handle.shutdown().await;
+        if capability_withdrawal.is_cancelled() {
+            // Capability withdrawal is a drain, not session teardown. Keep
+            // the owner alive long enough to settle admitted work and its
+            // durable receipts; only a publication/transport failure uses
+            // the cancelling shutdown path.
+            handle.wait().await;
+        } else {
+            handle.shutdown().await;
+        }
         return Err(NativeDeliveryError::other(
             "native delivery recovery or capacity publication failed",
         ));
@@ -974,7 +1114,7 @@ pub(crate) async fn ensure_session_native_delivery(
             // not a reason to create a second owner. The current owner drains
             // admitted work; its supervisor coalesces this request and probes
             // the current environment before advertising again.
-            handle.request_refresh();
+            handle.request_refresh_if_environment_changed();
         }
         wait_for_native_delivery_ready(handle).await;
         // Capacity is optional. A slow or unavailable provider must not block
@@ -983,7 +1123,10 @@ pub(crate) async fn ensure_session_native_delivery(
     }
 
     if let Some(handle) = state.native_delivery.take() {
+        state.native_delivery_refresh.clear();
         handle.shutdown().await;
+    } else {
+        state.native_delivery_refresh.clear();
     }
     state.native_delivery_session_id = None;
     state.native_delivery_attachment_epoch = None;
@@ -1071,8 +1214,9 @@ pub(crate) async fn ensure_session_native_delivery(
     let task_session_id = session_id.to_owned();
     let supervisor_cancel = task_cancel.clone();
     let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
+    state.native_delivery_refresh.bind(refresh_tx.clone());
     let discovered_executables = Arc::new(std::sync::Mutex::new(
-        native_codex::native_executable_candidates(),
+        native_codex::native_executable_snapshot(),
     ));
     let task_discovered_executables = discovered_executables.clone();
     let task_refresh_tx = refresh_tx.clone();
@@ -1095,12 +1239,20 @@ pub(crate) async fn ensure_session_native_delivery(
             )
             .await;
             match result {
-                Ok(mut delivery) => {
+                Ok((mut delivery, provider_available, verified_executables)) => {
+                    // Only the candidate identities that completed discovery
+                    // and the transport handshake become the next refresh
+                    // baseline. A request-side PATH probe is only a hint.
+                    if let Some(verified_executables) = verified_executables {
+                        if let Ok(mut selected) = task_discovered_executables.lock() {
+                            *selected = verified_executables;
+                        }
+                    }
                     // The first successful provider binding settles the
                     // startup wait. Later disconnects are handled by this
                     // same session owner, never by replaying an invocation.
                     let _ = startup_tx.take().map(|tx| tx.send(true));
-                    was_available = true;
+                    was_available = provider_available;
                     let mut refresh_requested = false;
                     tokio::select! {
                         _ = supervisor_cancel.cancelled() => {
@@ -1131,43 +1283,48 @@ pub(crate) async fn ensure_session_native_delivery(
                         "native collaborator transport ended; retrying capability discovery"
                     );
                 }
-                Err(error) if !was_available => {
-                    // Initial discovery is optional capacity. Do not keep a
-                    // missing client in a hot retry loop; the next user turn
-                    // performs a fresh probe and can bind it if it appears.
-                    let _ = startup_tx.take().map(|tx| tx.send(true));
-                    tracing::warn!(session_id = %task_session_id, %error, "native collaborator delivery unavailable");
+                Err(error) if error.is_authentication() => {
+                    // The supervisor captured the credentials for this
+                    // session owner. Rejected credentials require the next
+                    // turn to rebuild the owner from the current token; a
+                    // refresh must not keep retrying a frozen bearer.
+                    tracing::warn!(
+                        session_id = %task_session_id,
+                        %error,
+                        "native collaborator credentials need a fresh session probe"
+                    );
                     break;
                 }
-                Err(error) => {
-                    if error.is_authentication() {
-                        // The supervisor captured the credentials for its
-                        // session owner. Once the server rejects them, keep
-                        // no live owner around: the next turn will rebuild
-                        // this optional capability with the current account
-                        // snapshot instead of retrying a stale bearer token.
-                        tracing::warn!(
-                            session_id = %task_session_id,
-                            %error,
-                            "native collaborator credentials need a fresh session probe"
-                        );
-                        break;
-                    }
-                    if !astra_edge::has_pending_invocation_results(config.journal_path.clone())
-                        .await
+                Err(error) if !was_available => {
+                    // Initial discovery is optional capacity. Keep the
+                    // session supervisor alive but idle so an explicit TUI
+                    // refresh can discover a client that appears or becomes
+                    // authenticated later. This is not a retry loop: no
+                    // provider work or timer runs until the user requests it.
+                    let _ = startup_tx.take().map(|tx| tx.send(true));
+                    tracing::warn!(session_id = %task_session_id, %error, "native collaborator delivery unavailable");
+                    if astra_edge::has_pending_invocation_results(config.journal_path.clone()).await
                     {
-                        // A disconnected optional provider with no durable
-                        // receipt left to replay has no work for a background
-                        // reconnect loop. The next user turn owns the next
-                        // capability probe, so an installation appearing
-                        // later is still discovered without a hot retry.
-                        tracing::debug!(
-                            session_id = %task_session_id,
-                            %error,
-                            "native collaborator unavailable with no pending receipt"
-                        );
-                        break;
+                        // A recovery-only owner has durable custody to
+                        // preserve. Keep the existing bounded retry path so
+                        // a transient transport failure cannot strand it.
+                        reconnect_failures = reconnect_failures.saturating_add(1);
+                    } else {
+                        tokio::select! {
+                            _ = supervisor_cancel.cancelled() => break,
+                            refresh = refresh_rx.recv() => {
+                                if refresh.is_none() {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
                     }
+                }
+                Err(error) => {
+                    // Keep the existing bounded backoff probe. A user refresh
+                    // coalesces into the same owner; no journal read is needed
+                    // merely to decide how to log this transport failure.
                     reconnect_failures = reconnect_failures.saturating_add(1);
                     tracing::warn!(
                         session_id = %task_session_id,
@@ -1246,6 +1403,25 @@ mod tests {
             native_delivery_authentication_error(astra_edge::EdgeAuthenticationError::Rejected)
                 .is_authentication()
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_handle_targets_the_current_session_owner() {
+        let refresh = NativeDeliveryRefreshHandle::default();
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        refresh.bind(first_tx);
+        refresh.request();
+        assert!(first_rx.recv().await.is_some());
+
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        refresh.bind(second_tx);
+        refresh.request();
+        assert!(second_rx.recv().await.is_some());
+        assert!(first_rx.try_recv().is_err());
+
+        refresh.clear();
+        refresh.request();
+        assert!(second_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1743,7 +1919,10 @@ mod tests {
             Duration::from_secs(2),
             connect_native_delivery(
                 config,
-                Some(discovery),
+                Some((
+                    discovery,
+                    native_codex::native_executable_identity(&executable).unwrap(),
+                )),
                 Instant::now() + Duration::from_millis(100),
                 &CancellationToken::new(),
                 CancellationToken::new(),
@@ -1758,6 +1937,86 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("deadline"));
+        peer.abort();
+        let _ = peer.await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_provider_can_keep_the_edge_owner_for_receipt_recovery() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let http = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&http)
+            .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _auth = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(
+                serde_json::to_string(
+                    &astra_server_types::edge_ws_protocol::EdgeServerMessage::AuthOk {
+                        user_id: "account-test".into(),
+                        edge_id: "edge-test".into(),
+                        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR
+                            .into(),
+                    },
+                )
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            while ws.next().await.is_some() {}
+        });
+        let permission_owner = SessionState {
+            perm_manager: PermissionManager::with_project_mode(
+                PermissionMode::Prompt,
+                workspace.path(),
+            ),
+            ..SessionState::default()
+        };
+        let config = NativeDeliveryConfig {
+            websocket_url: endpoint,
+            api: astra_thin_client::ThinClient::new(&http.uri(), None).unwrap(),
+            auth: "test-only-token".into(),
+            account_id: "account-test".into(),
+            edge_agent_id: "edge-test".into(),
+            edge_transport_id: "transport-test".into(),
+            workspace_id: None,
+            materialization_id: "materialization-test".into(),
+            journal_path: workspace.path().join("journal.json"),
+            executor: Arc::new(ToolExecutor::new(workspace.path())),
+            ask_user_request_tx: None,
+            permission_policy: permission_owner.perm_manager.subscribe_permission_policy(),
+            approval_request_tx: None,
+        };
+        let handle = connect_native_delivery(
+            config,
+            None,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            CancellationToken::new(),
+            mpsc::channel(1).0,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+        .await
+        .expect("transport recovery must not require a currently installed provider");
+        let requests = http.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let registration: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            registration["capabilities"]["provider_discovery"],
+            json!([])
+        );
+        handle.shutdown().await;
         peer.abort();
         let _ = peer.await;
     }
@@ -1939,7 +2198,10 @@ mod tests {
         };
         let handle = connect_native_delivery(
             config,
-            Some(discovery),
+            Some((
+                discovery,
+                native_codex::native_executable_identity(&executable).unwrap(),
+            )),
             Instant::now() + Duration::from_secs(5),
             &CancellationToken::new(),
             CancellationToken::new(),

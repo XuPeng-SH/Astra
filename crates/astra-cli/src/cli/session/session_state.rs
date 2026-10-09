@@ -523,6 +523,10 @@ pub(crate) struct SessionState {
     /// foreground turn without becoming a second lifecycle owner.
     pub(crate) native_delivery:
         Option<crate::cli::edge_lifecycle::native_delivery::NativeDeliveryHandle>,
+    /// Stable request path for TUI refresh actions. The underlying transport
+    /// sender is replaced when the session supervisor reconnects.
+    pub(crate) native_delivery_refresh:
+        crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle,
     pub(crate) native_delivery_session_id: Option<String>,
     pub(crate) native_delivery_attachment_epoch: Option<u64>,
     /// Set by the interactive surface. Turn cancellation must never cancel
@@ -675,6 +679,7 @@ impl Default for SessionState {
             tui_approval_request_tx: None,
             tui_ask_user_request_tx: None,
             native_delivery: None,
+            native_delivery_refresh: Default::default(),
             native_delivery_session_id: None,
             native_delivery_attachment_epoch: None,
             native_delivery_shutdown: None,
@@ -702,6 +707,12 @@ fn default_auto_approve_from_env() -> bool {
 }
 
 impl SessionState {
+    pub(crate) fn native_delivery_refresh_handle(
+        &self,
+    ) -> crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle {
+        self.native_delivery_refresh.clone()
+    }
+
     /// Apply a format selected through `/explain` and remember its precedence
     /// across config reloads during this CLI session.
     pub(crate) fn set_explain_report_format_override(&mut self, format: ExplainReportFormat) {
@@ -710,6 +721,7 @@ impl SessionState {
     }
 
     fn advance_session_attachment(&mut self) {
+        self.native_delivery_refresh.clear();
         if let Some(handle) = self.native_delivery.as_ref() {
             // The handle remains stored so the next attachment can await
             // transport settlement before publishing a replacement.

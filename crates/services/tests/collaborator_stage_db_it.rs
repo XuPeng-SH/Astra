@@ -101,13 +101,13 @@ fn admission(anchor_run_id: &str, provider: CollaboratorProvider) -> Collaborato
         anchor_run_id: anchor_run_id.into(),
         source_message_id: Uuid::new_v4().to_string(),
         request_fingerprint: "immutable-source-intent-digest".into(),
+        execution_identity_fingerprint: "prepared-identity-digest".into(),
+        native_execution: native_execution.clone(),
         expected_previous_stage_run_id: None,
         expected_parent_generation: 1,
         association: CollaboratorAssociation {
             provider,
             execution_boundary,
-            execution_identity_fingerprint: "prepared-identity-digest".into(),
-            native_execution,
         },
     }
 }
@@ -246,8 +246,7 @@ impl Fixture {
             .unwrap()
             .unwrap();
         let tool = association
-            .association
-            .native_execution
+            .latest_native_execution
             .map(|locator| DurableToolReference::Provider {
                 descriptor: locator.descriptor,
             })
@@ -328,13 +327,7 @@ impl Fixture {
             "executor": {"kind":"edge_agent", "executor_id":"selected-runner", "transport":"edge_ws"}
         }})];
         let stage = admission(&child.run_id, CollaboratorProvider::Codex);
-        let descriptor = stage
-            .association
-            .native_execution
-            .as_ref()
-            .unwrap()
-            .descriptor
-            .clone();
+        let descriptor = stage.native_execution.as_ref().unwrap().descriptor.clone();
         let receipt = self
             .store
             .insert_run_with_collaborator_stage(child, stage, None)
@@ -728,7 +721,6 @@ async fn native_interaction_real_producer_accepts_reconnect_and_rejects_wrong_wo
             "epoch" => forged.control_epoch += 1,
             "descriptor" => {
                 forged.descriptor = admission("other", CollaboratorProvider::Claude)
-                    .association
                     .native_execution
                     .unwrap()
                     .descriptor
@@ -1246,7 +1238,7 @@ async fn native_binding_uses_real_ledger_terminal_outcome_for_each_external_prov
                 .unwrap();
             assert_eq!(association.native_session, Some(native));
             assert_eq!(
-                association.association.native_execution, request.association.native_execution,
+                association.latest_native_execution, request.native_execution,
                 "reopening the owner preserves the native model and descriptor, not only their digest"
             );
             fixture
