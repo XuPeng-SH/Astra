@@ -24,6 +24,31 @@ use tokio::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
+/// Check whether a previously opened invocation journal may need a delivery
+/// owner even when the optional provider is currently unavailable. The journal
+/// remains the only source of recovery facts; this helper deliberately avoids
+/// creating a new journal for an ordinary session with no prior native work.
+pub async fn has_pending_invocation_results(path: PathBuf) -> bool {
+    let wal_path = path.with_extension("json.wal");
+    let state_exists = match tokio::fs::try_exists(&path).await {
+        Ok(exists) => exists,
+        Err(_) => return true,
+    };
+    let wal_exists = match tokio::fs::try_exists(&wal_path).await {
+        Ok(exists) => exists,
+        Err(_) => return true,
+    };
+    if !state_exists && !wal_exists {
+        return false;
+    }
+    match EdgeInvocationJournal::open(path).await {
+        Ok(journal) => journal
+            .pending_results()
+            .map_or(true, |results| !results.is_empty()),
+        Err(_) => true,
+    }
+}
+
 /// Convert an API/server base URL into the WebSocket endpoint used by Edge
 /// owners. CLI hosts use this same conversion so HTTP configuration and native
 /// delivery cannot silently diverge.
@@ -425,8 +450,8 @@ impl EdgeInvocationTracker {
         true
     }
 
-    fn cancel_all(self) {
-        for active in self.in_flight.into_values() {
+    fn cancel_all(&self) {
+        for active in self.in_flight.values() {
             active.cancel.cancel();
         }
     }
@@ -436,9 +461,24 @@ impl EdgeInvocationTracker {
 /// active invocations, persists their actual results and joins owned work.
 pub async fn serve_connection(
     socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    context: EdgeConnectionContext,
+    executor: Arc<dyn EdgeInvocationExecutor>,
+    shutdown: CancellationToken,
+) -> Result<(), EdgeConnectionError> {
+    serve_connection_with_drain(socket, context, executor, shutdown, None).await
+}
+
+/// Serve an authenticated socket with an optional capability-withdrawal
+/// signal. Withdrawal is intentionally different from shutdown: it stops new
+/// tool admission but lets already admitted invocations publish their durable
+/// results before the socket is closed. The existing shutdown path remains the
+/// owner for user/session teardown and still cancels active work.
+pub async fn serve_connection_with_drain(
+    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     mut context: EdgeConnectionContext,
     executor: Arc<dyn EdgeInvocationExecutor>,
     shutdown: CancellationToken,
+    drain: Option<CancellationToken>,
 ) -> Result<(), EdgeConnectionError> {
     if shutdown.is_cancelled() {
         return Ok(());
@@ -495,10 +535,24 @@ pub async fn serve_connection(
     );
 
     let connection_result = async {
-    loop {
+        let mut draining = false;
+        loop {
+        if draining && tasks.is_empty() && completed_rx.is_empty() && input_ack_rx.is_empty() {
+            break;
+        }
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
+            _ = async {
+                if let Some(drain) = drain.as_ref() {
+                    drain.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if !draining => {
+                draining = true;
+                tracing::info!("Edge capability withdrawal started; draining admitted invocations");
+            }
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Err(error)) = joined {
                     return Err(Box::new(error) as EdgeConnectionError);
@@ -547,7 +601,14 @@ pub async fn serve_connection(
                                         .await?;
                                     continue;
                                 }
-                                let execution_permit = execution_budget.try_acquire();
+                                // During capability withdrawal, preserve the journal's
+                                // identity/replay decision but do not admit a new
+                                // execution. Existing Running/Completed records must
+                                // still resolve as Active/Replay instead of being
+                                // replaced by a transport-level rejection.
+                                let execution_permit = (!draining)
+                                    .then(|| execution_budget.try_acquire())
+                                    .flatten();
                                 match journal
                                     .prepare(
                                         &request_id,
@@ -828,14 +889,18 @@ pub async fn serve_connection(
                 }
             }
         }
-    }
+        }
 
-    Ok(())
+        Ok(())
     }.await;
 
-    // Every exit (including journal and socket errors) settles this connection's
-    // executions before reconnect can acquire the journal and dispatch again.
-    invocations.cancel_all();
+    // Explicit shutdown is user/session teardown and owns cancellation. A
+    // capability withdrawal or transport failure is not permission to discard
+    // admitted work: keep custody, persist its result, and let a later
+    // connection replay it from the journal.
+    if shutdown.is_cancelled() {
+        invocations.cancel_all();
+    }
     // A failed append may have left a partial WAL record. Do not append again
     // until open() has validated/recovered it. Other connection failures do
     // not prevent preserving the results produced during cancellation.
@@ -852,6 +917,8 @@ pub async fn serve_connection(
         &mut completed_rx,
         &mut journal,
         journal_writable,
+        &shutdown,
+        &invocations,
     )
     .await;
     if let Err(error) = &cleanup_result {
@@ -887,13 +954,31 @@ async fn settle_invocations(
     completed_rx: &mut mpsc::Receiver<CompletedEdgeInvocation>,
     journal: &mut EdgeInvocationJournal,
     mut journal_writable: bool,
+    shutdown: &CancellationToken,
+    invocations: &EdgeInvocationTracker,
 ) -> Result<(), EdgeConnectionError> {
     let mut failure: Option<EdgeConnectionError> = None;
+    let mut shutdown_observed = shutdown.is_cancelled();
+    if shutdown_observed {
+        invocations.cancel_all();
+    }
     // Spawned tasks continue running while we receive. Drain before joining:
     // queued completions have already released their execution permits, so
     // even a queue larger than the concurrency budget can fill up.
     // The connection must drop its sender before calling this function.
-    while let Some(completed) = completed_rx.recv().await {
+    loop {
+        let completed = tokio::select! {
+            biased;
+            _ = shutdown.cancelled(), if !shutdown_observed => {
+                shutdown_observed = true;
+                invocations.cancel_all();
+                continue;
+            }
+            completed = completed_rx.recv() => completed,
+        };
+        let Some(completed) = completed else {
+            break;
+        };
         if journal_writable {
             let request_id = completed.request_id.clone();
             if let Err(error) = persist_completion(journal, completed).await {
@@ -903,7 +988,19 @@ async fn settle_invocations(
             }
         }
     }
-    while let Some(joined) = tasks.join_next().await {
+    loop {
+        let joined = tokio::select! {
+            biased;
+            _ = shutdown.cancelled(), if !shutdown_observed => {
+                shutdown_observed = true;
+                invocations.cancel_all();
+                continue;
+            }
+            joined = tasks.join_next() => joined,
+        };
+        let Some(joined) = joined else {
+            break;
+        };
         if let Err(error) = joined {
             tracing::error!(component = "edge", operation = "settle_invocations", stage = "join", error = %error, "Edge invocation task failed during cleanup");
             if failure.is_none() {
@@ -927,6 +1024,199 @@ mod tests {
         ) -> BoxFuture<'_, astra_tools::ToolResult> {
             Box::pin(async { panic!("readiness failure must not dispatch a tool") })
         }
+    }
+
+    struct BlockingExecutor {
+        started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl EdgeInvocationExecutor for BlockingExecutor {
+        fn execute(
+            &self,
+            _: EdgeInvocation,
+            _: CancellationToken,
+        ) -> BoxFuture<'_, astra_tools::ToolResult> {
+            let started = self.started.lock().unwrap().take();
+            let release = self.release.clone();
+            Box::pin(async move {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                release.notified().await;
+                astra_tools::ToolResult::text("finished".to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_withdrawal_keeps_journal_identity_for_running_work() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(BlockingExecutor {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: release.clone(),
+        });
+        let shutdown = CancellationToken::new();
+        let withdrawal = CancellationToken::new();
+        let (ready, ready_rx) = oneshot::channel();
+        let journal_path = directory.path().join("journal.json");
+        let server = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let withdrawal = withdrawal.clone();
+            let workspace = directory.path().to_owned();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
+                    .await
+                    .unwrap();
+                serve_connection_with_drain(
+                    socket,
+                    EdgeConnectionContext {
+                        account_id: "user".into(),
+                        edge_agent_id: "edge".into(),
+                        workspace_dir: workspace,
+                        journal_path,
+                        ready: Some(ready),
+                    },
+                    executor,
+                    shutdown,
+                    Some(withdrawal),
+                )
+                .await
+            }
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        ready_rx.await.unwrap();
+
+        let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+            "user", "session", "run", "turn", "call",
+        )
+        .unwrap();
+        let request = EdgeServerMessage::ToolRequest {
+            request_id: identity.storage_key(),
+            identity: Box::new(identity.clone()),
+            delivery_generation: 1,
+            tool: "native_provider".into(),
+            args: serde_json::json!({}),
+            execution_ceiling: None,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: 30,
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
+        };
+        client
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        started_rx.await.unwrap();
+
+        withdrawal.cancel();
+        let new_identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+            "user", "session", "run", "turn", "new-call",
+        )
+        .unwrap();
+        let new_request = EdgeServerMessage::ToolRequest {
+            request_id: new_identity.storage_key(),
+            identity: Box::new(new_identity.clone()),
+            delivery_generation: 1,
+            tool: "native_provider".into(),
+            args: serde_json::json!({}),
+            execution_ceiling: None,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: 30,
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
+        };
+        client
+            .send(Message::Text(
+                serde_json::to_string(&new_request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let new_result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let frame = client.next().await.unwrap().unwrap();
+                let Message::Text(text) = frame else { continue };
+                let message: EdgeClientMessage = serde_json::from_str(&text).unwrap();
+                if let EdgeClientMessage::ToolResult { .. } = message {
+                    break message;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        match new_result {
+            EdgeClientMessage::ToolResult {
+                identity,
+                is_error,
+                tool_result_fields,
+                ..
+            } => {
+                assert_eq!(identity, new_identity);
+                assert!(is_error);
+                assert_eq!(
+                    tool_result_fields.unwrap()["outcome_certainty"],
+                    "not_dispatched"
+                );
+            }
+            other => panic!("expected new work rejection, got {other:?}"),
+        }
+
+        // The duplicate is still Running. It must join the journal identity,
+        // not be turned into a new not-dispatched result while draining.
+        client
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        release.notify_waiters();
+        let original_result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let frame = client.next().await.unwrap().unwrap();
+                let Message::Text(text) = frame else { continue };
+                let message: EdgeClientMessage = serde_json::from_str(&text).unwrap();
+                if let EdgeClientMessage::ToolResult { .. } = message {
+                    break message;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        match original_result {
+            EdgeClientMessage::ToolResult {
+                identity: returned_identity,
+                output,
+                is_error,
+                ..
+            } => {
+                assert_eq!(returned_identity, identity);
+                assert_eq!(output, "finished");
+                assert!(!is_error);
+            }
+            other => panic!("expected original completion, got {other:?}"),
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1119,6 +1409,102 @@ mod tests {
         assert_cleanup_drains(true).await;
     }
 
+    #[tokio::test]
+    async fn pending_result_probe_distinguishes_optional_capacity_from_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        assert!(!has_pending_invocation_results(path.clone()).await);
+        assert!(!tokio::fs::try_exists(&path).await.unwrap());
+
+        let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+            "user", "session", "run", "turn", "call",
+        )
+        .unwrap();
+        let request_id = identity.storage_key();
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        journal
+            .prepare(
+                &request_id,
+                &identity,
+                1,
+                "native_provider",
+                &serde_json::json!({}),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(journal);
+        assert!(has_pending_invocation_results(path.clone()).await);
+
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(journal.acknowledge(&request_id, 1).await.unwrap());
+        drop(journal);
+        assert!(!has_pending_invocation_results(path).await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_settlement_cancels_and_joins_admitted_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+            "user", "session", "run", "turn", "call",
+        )
+        .unwrap();
+        let request_id = identity.storage_key();
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        journal
+            .prepare(
+                &request_id,
+                &identity,
+                1,
+                "native_provider",
+                &serde_json::json!({}),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut tracker = EdgeInvocationTracker::default();
+        let (cancel, _input_rx) = tracker.begin(&request_id, 1).unwrap();
+        let (completed_tx, mut completed_rx) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
+        let task_cancel = cancel.clone();
+        tasks.spawn(async move {
+            task_cancel.cancelled().await;
+            completed_tx
+                .send(CompletedEdgeInvocation {
+                    request_id,
+                    generation: 1,
+                    result: astra_tools::ToolResult::text("cancelled".to_string()),
+                    duration_ms: 1,
+                })
+                .await
+                .unwrap();
+        });
+        let shutdown = CancellationToken::new();
+        let mut settle = Box::pin(settle_invocations(
+            &mut tasks,
+            &mut completed_rx,
+            &mut journal,
+            true,
+            &shutdown,
+            &tracker,
+        ));
+        tokio::select! {
+            result = &mut settle => panic!("settlement completed before shutdown: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(1)) => shutdown.cancel(),
+        }
+        tokio::time::timeout(Duration::from_secs(1), &mut settle)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(settle);
+        assert!(tasks.is_empty());
+        assert!(cancel.is_cancelled());
+    }
+
     async fn assert_cleanup_drains(fail_first_completion: bool) {
         let state = tempfile::tempdir().unwrap();
         let path = state.path().join("journal.json");
@@ -1168,9 +1554,18 @@ mod tests {
         }
         assert_eq!(rx.len(), 1);
         drop(tx);
+        let shutdown = CancellationToken::new();
+        let invocations = EdgeInvocationTracker::default();
         let settled = tokio::time::timeout(
             Duration::from_secs(5),
-            settle_invocations(&mut tasks, &mut rx, &mut journal, true),
+            settle_invocations(
+                &mut tasks,
+                &mut rx,
+                &mut journal,
+                true,
+                &shutdown,
+                &invocations,
+            ),
         )
         .await
         .unwrap();

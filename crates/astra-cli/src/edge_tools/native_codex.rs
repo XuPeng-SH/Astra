@@ -25,6 +25,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const MODEL_LIST_REQUEST_ID: i64 = 4;
 const INTERRUPT_REQUEST_ID: i64 = 5;
 const STEER_REQUEST_ID: i64 = 6;
+const ACCOUNT_READ_REQUEST_ID: i64 = 7;
 const MODEL_LIST_PAGE_LIMIT: u64 = 64;
 const MODEL_LIST_MAX_PAGES: usize = 8;
 const MODEL_LIST_MAX_ITEMS: usize = 512;
@@ -84,7 +85,18 @@ fn prepare_native_process(
 /// Choosing this provider does not approve these model-readable directories.
 pub(crate) fn installed_runtime_requirements()
 -> Result<astra_turn_types::ProviderRuntimeRequirements, &'static str> {
-    let executable = native_executable()?;
+    runtime_requirements_for_executable(&native_executable()?)
+}
+
+pub(crate) fn runtime_requirements_for_executable(
+    executable: &std::path::Path,
+) -> Result<astra_turn_types::ProviderRuntimeRequirements, &'static str> {
+    let executable = executable
+        .canonicalize()
+        .map_err(|_| "native executable is unavailable")?;
+    if !executable.is_file() || !native_executable_is_runnable(&executable) {
+        return Err("native executable is unavailable");
+    }
     let mut paths = std::collections::BTreeSet::new();
     paths.insert(
         executable
@@ -130,6 +142,53 @@ pub(crate) fn installed_runtime_requirements()
     astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(&metadata)
         .map_err(|_| "native runtime requirements exceed the contract bounds")?
         .ok_or("native runtime requirements are missing")
+}
+
+/// Identity of the installed artifact used for a published capability. This
+/// is not a release/version allowlist: it only detects replacement of the
+/// executable that was actually probed, so a new compatible installation can
+/// be discovered and negotiated normally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeExecutableIdentity {
+    canonical_path: std::path::PathBuf,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+pub(crate) fn native_executable_identity(
+    executable: &std::path::Path,
+) -> Result<NativeExecutableIdentity, &'static str> {
+    let canonical_path = executable
+        .canonicalize()
+        .map_err(|_| "native executable is unavailable")?;
+    let metadata = std::fs::metadata(&canonical_path)
+        .map_err(|_| "native executable metadata is unavailable")?;
+    if !metadata.is_file() || !native_executable_is_runnable(&canonical_path) {
+        return Err("native executable is unavailable");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(NativeExecutableIdentity {
+            canonical_path,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(NativeExecutableIdentity {
+            canonical_path,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
 }
 
 fn validate_runtime_grant(
@@ -180,14 +239,55 @@ fn validate_runtime_grant(
     Ok(())
 }
 
-fn native_executable() -> Result<std::path::PathBuf, &'static str> {
+pub(crate) fn native_executable_candidates() -> Vec<std::path::PathBuf> {
     std::env::var_os("PATH")
+        .as_deref()
+        .map(native_executable_candidates_for_path)
+        .unwrap_or_default()
+}
+
+fn native_executable() -> Result<std::path::PathBuf, &'static str> {
+    native_executable_candidates()
         .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join("codex"))
-        .find(|path| path.is_file())
-        .and_then(|path| path.canonicalize().ok())
+        .next()
         .ok_or("native executable is unavailable")
+}
+
+fn native_executable_candidates_for_path(path: &std::ffi::OsStr) -> Vec<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["codex.exe", "codex.cmd", "codex.bat", "codex"]
+    } else {
+        &["codex"]
+    };
+    let mut seen = std::collections::HashSet::new();
+    std::env::split_paths(path)
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .filter_map(|path| {
+            let canonical = path.canonicalize().ok()?;
+            if canonical.is_file()
+                && native_executable_is_runnable(&canonical)
+                && seen.insert(canonical.clone())
+            {
+                Some(canonical)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn native_executable_is_runnable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Project Astra's already-approved path rules into the native provider's
@@ -326,8 +426,14 @@ async fn verify_installed_protocol(
     executable: &std::path::Path,
     cwd: &std::path::Path,
     cancel: &CancellationToken,
-    timeout: Duration,
+    deadline: std::time::Instant,
 ) -> Result<(), &'static str> {
+    let timeout = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .min(Duration::from_secs(2));
+    if timeout.is_zero() {
+        return Err("native protocol probe deadline expired");
+    }
     let (mut command, owner) = prepare_native_process(executable, &["app-server".into()])
         .map_err(|_| "native protocol probe ownership unavailable")?;
     command.current_dir(cwd);
@@ -346,15 +452,39 @@ async fn verify_installed_protocol(
 
     let mut evidence = Evidence::default();
     let input = process.input();
-    let probe = initialize_protocol(
-        &mut process,
-        &input,
-        &mut evidence,
-        OUTPUT_BYTES,
-        None,
-        cancel,
-    )
-    .await;
+    let probe = match tokio::time::timeout(timeout, async {
+        let probe = initialize_protocol(
+            &mut process,
+            &input,
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            cancel,
+        )
+        .await;
+        if probe.is_ok() {
+            verify_provider_authentication(
+                &mut process,
+                &input,
+                &mut evidence,
+                cancel,
+                OUTPUT_BYTES,
+            )
+            .await
+        } else {
+            probe
+        }
+    })
+    .await
+    {
+        Ok(probe) => probe,
+        Err(_) => Err("native protocol probe deadline expired"),
+    };
+    // `FramedProcess` owns the physical cleanup deadline and descendant
+    // settlement. Do not wrap this future in another timeout: dropping the
+    // join future here would abandon the only owner that can prove cleanup,
+    // allowing the next PATH candidate to be probed while the old process is
+    // still alive.
     let outcome = process
         .cancel_and_wait()
         .await
@@ -480,6 +610,15 @@ fn valid_id(id: &str) -> bool {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct NativeInitializeResponse {
+    user_agent: String,
+    codex_home: String,
+    platform_family: String,
+    platform_os: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeModelListItem {
     id: String,
     model: String,
@@ -490,7 +629,7 @@ struct NativeModelListItem {
     supported_reasoning_efforts: Vec<NativeReasoningEffort>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeReasoningEffort {
     reasoning_effort: String,
@@ -501,6 +640,47 @@ struct NativeReasoningEffort {
 struct NativeModelListPage {
     data: Vec<NativeModelListItem>,
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeAccountReadResponse {
+    account: Option<NativeAccount>,
+    requires_openai_auth: bool,
+}
+
+/// The current protocol requires an account object to carry a discriminator.
+/// Keep the rest of the provider-owned fields opaque so a new account kind
+/// does not become a release/version allowlist in Astra, while malformed
+/// values such as `account: false` still fail closed.
+#[derive(Debug, Deserialize)]
+struct NativeAccount {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(flatten)]
+    _provider_fields: serde_json::Map<String, Value>,
+}
+
+fn validate_model_list_item(
+    model: &NativeModelListItem,
+    existing: &[NativeModelListItem],
+) -> Result<(), String> {
+    if !valid_id(&model.id)
+        || !valid_id(&model.model)
+        || model.display_name.trim().is_empty()
+        || model.display_name.len() > 256
+        || model.display_name.chars().any(char::is_control)
+        || model
+            .supported_reasoning_efforts
+            .iter()
+            .any(|effort| !valid_id(&effort.reasoning_effort))
+        || existing
+            .iter()
+            .any(|candidate| candidate.id == model.id || candidate.model == model.model)
+    {
+        return Err("native model catalog contains an invalid or duplicate model".into());
+    }
+    Ok(())
 }
 
 fn normalized_model_selector(value: &str) -> String {
@@ -668,7 +848,17 @@ struct Evidence {
     output: String,
     final_output: Option<String>,
     output_capped: bool,
+    /// The provider itself failed a typed capability/readiness contract. The
+    /// delivery owner uses this fact to withdraw capacity after publishing
+    /// the current result; ordinary task errors do not withdraw the client.
+    capability_unavailable: bool,
     pre_ack: Vec<Value>,
+}
+
+fn mark_transport_failure(evidence: &mut Evidence, cancel: Option<&CancellationToken>) {
+    if !cancel.is_some_and(CancellationToken::is_cancelled) {
+        evidence.capability_unavailable = true;
+    }
 }
 
 impl Evidence {
@@ -928,8 +1118,24 @@ async fn send(input: &FramedProcessInput, value: Value) -> Result<(), &'static s
 fn initialize() -> Value {
     json!({"id": 1, "method": "initialize", "params": {
         "clientInfo": {"name": "astra", "version": env!("CARGO_PKG_VERSION")},
-        "capabilities": {"experimentalApi": true}
+        "capabilities": {
+            "experimentalApi": true,
+            // Require an explicit user login before the provider may start a
+            // gateway OAuth flow. Capability discovery must never open a
+            // browser or mutate authentication state as a side effect.
+            "explicitGatewayOauth": true
+        }
     }})
+}
+
+fn account_read_request() -> Value {
+    // `refreshToken: false` is a read-only readiness check. It observes the
+    // provider's current auth state without starting a login or refresh flow.
+    json!({
+        "id": ACCOUNT_READ_REQUEST_ID,
+        "method": "account/read",
+        "params": {"refreshToken": false}
+    })
 }
 
 fn model_list_request(cursor: Option<&str>) -> Value {
@@ -1191,7 +1397,10 @@ async fn serve_native_interaction(
                 match decision {
                     ProviderInteractionDecision::Submitted(payload) if payload.is_object() => {
                         validate_interaction_response(method, &envelope["params"], &payload)?;
-                        send(input, json!({"id": envelope["id"], "result": payload})).await?;
+                        if let Err(error) = send(input, json!({"id": envelope["id"], "result": payload})).await {
+                            mark_transport_failure(evidence, cancel);
+                            return Err(error);
+                        }
                         return Ok(pending_response);
                     }
                     ProviderInteractionDecision::Submitted(_) => {
@@ -1278,16 +1487,28 @@ async fn rpc(
     mut input_rx: Option<&mut Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>>,
 ) -> Result<Value, &'static str> {
     let id = request["id"].clone();
-    send(input, request).await?;
+    if let Err(error) = send(input, request).await {
+        mark_transport_failure(evidence, cancel);
+        return Err(error);
+    }
     if id == json!(3) {
         evidence.turn_queued = true;
     }
     loop {
-        let frame = process
-            .recv_frame()
-            .await
-            .ok_or("native EOF before request acknowledgement")?;
-        let envelope = decode(&frame)?;
+        let frame = match process.recv_frame().await {
+            Some(frame) => frame,
+            None => {
+                evidence.capability_unavailable = true;
+                return Err("native EOF before request acknowledgement");
+            }
+        };
+        let envelope = match decode(&frame) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                mark_transport_failure(evidence, cancel);
+                return Err(error);
+            }
+        };
         if let Some(method) = envelope.get("method").and_then(Value::as_str) {
             if evidence.turn.is_none()
                 && (id == json!(3) || (id == json!(2) && method == "thread/tokenUsage/updated"))
@@ -1351,12 +1572,16 @@ async fn rpc(
                 return Err("native acknowledgement request ID mismatch");
             }
             if envelope.get("error").is_some() {
+                if matches!(id.as_i64(), Some(1 | 7)) {
+                    evidence.capability_unavailable = true;
+                }
                 return Err(match id.as_i64() {
                     Some(1) => "native initialize request rejected",
                     Some(2) => "native thread request rejected",
                     Some(3) => "native turn request rejected",
                     Some(4) => "native model catalog request rejected",
                     Some(5) => "native interrupt request rejected",
+                    Some(7) => "native account readiness request rejected",
                     _ => "native request rejected",
                 });
             }
@@ -1394,10 +1619,67 @@ async fn initialize_protocol(
         None,
     )
     .await?;
-    if !response.is_object() {
+    let initialized: NativeInitializeResponse = serde_json::from_value(response).map_err(|_| {
+        evidence.capability_unavailable = true;
+        "native initialize returned an invalid result"
+    })?;
+    if !valid_id(&initialized.user_agent)
+        || !std::path::Path::new(&initialized.codex_home).is_absolute()
+        || !valid_id(&initialized.platform_family)
+        || !valid_id(&initialized.platform_os)
+    {
+        evidence.capability_unavailable = true;
         return Err("native initialize returned an invalid result");
     }
-    send(input, json!({"method": "initialized"})).await
+    if let Err(error) = send(input, json!({"method": "initialized"})).await {
+        mark_transport_failure(evidence, Some(cancel));
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Initialization and account/read prove that the installed client is an
+/// authenticated provider boundary. Model availability is deliberately
+/// separate: a provider may be usable with its default model even when its
+/// catalog is empty or temporarily unavailable, while an explicitly requested
+/// model is resolved against the live catalog immediately before its turn.
+async fn verify_provider_authentication(
+    process: &mut FramedProcess,
+    input: &FramedProcessInput,
+    evidence: &mut Evidence,
+    cancel: &CancellationToken,
+    output_limit: usize,
+) -> Result<(), &'static str> {
+    let response = rpc(
+        process,
+        input,
+        account_read_request(),
+        evidence,
+        output_limit,
+        None,
+        Some(cancel),
+        None,
+        None,
+    )
+    .await?;
+    let account: NativeAccountReadResponse = serde_json::from_value(response).map_err(|_| {
+        evidence.capability_unavailable = true;
+        "native account readiness response is invalid"
+    })?;
+    // Codex's account/read contract explicitly distinguishes providers which
+    // need OpenAI authentication from providers which do not. A nonempty
+    // model catalog is not sufficient: it may be a cached catalog after
+    // logout. Keep this typed check independent of account display strings.
+    if account
+        .account
+        .as_ref()
+        .is_some_and(|account| !valid_id(&account.kind))
+        || (account.requires_openai_auth && account.account.is_none())
+    {
+        evidence.capability_unavailable = true;
+        return Err("native provider authentication is unavailable");
+    }
+    Ok(())
 }
 
 async fn resolve_requested_model(
@@ -1442,21 +1724,7 @@ async fn resolve_requested_model(
             return Err("native model catalog exceeds the bounded selection limit".into());
         }
         for model in page.data {
-            if !valid_id(&model.id)
-                || !valid_id(&model.model)
-                || model.display_name.trim().is_empty()
-                || model.display_name.len() > 256
-                || model.display_name.chars().any(char::is_control)
-                || model
-                    .supported_reasoning_efforts
-                    .iter()
-                    .any(|effort| !valid_id(&effort.reasoning_effort))
-                || models.iter().any(|existing: &NativeModelListItem| {
-                    existing.id == model.id || existing.model == model.model
-                })
-            {
-                return Err("native model catalog contains an invalid or duplicate model".into());
-            }
+            validate_model_list_item(&model, &models)?;
             models.push(model);
         }
         let Some(next_cursor) = page.next_cursor else {
@@ -1485,12 +1753,20 @@ async fn next_envelope(
     if !evidence.pre_ack.is_empty() {
         return Ok(evidence.pre_ack.remove(0));
     }
-    decode(
-        &process
-            .recv_frame()
-            .await
-            .ok_or("native EOF without matching terminal evidence")?,
-    )
+    let frame = match process.recv_frame().await {
+        Some(frame) => frame,
+        None => {
+            evidence.capability_unavailable = true;
+            return Err("native EOF without matching terminal evidence");
+        }
+    };
+    match decode(&frame) {
+        Ok(envelope) => Ok(envelope),
+        Err(error) => {
+            evidence.capability_unavailable = true;
+            Err(error)
+        }
+    }
 }
 
 fn acknowledge_thread(
@@ -1832,6 +2108,9 @@ async fn drive_with_input(
 ) -> Result<(), String> {
     let input = process.input();
     initialize_protocol(process, &input, evidence, output_limit, gate, cancel).await?;
+    verify_provider_authentication(process, &input, evidence, cancel, output_limit)
+        .await
+        .map_err(str::to_owned)?;
     let resolved_model =
         resolve_requested_model(process, &input, stage, evidence, output_limit, gate, cancel)
             .await?;
@@ -1952,6 +2231,7 @@ impl ToolExecutor {
     pub(crate) async fn native_collaborator_declaration_if_available(
         &self,
         cancel: Option<&CancellationToken>,
+        deadline: std::time::Instant,
     ) -> Option<astra_turn_types::ProviderToolDeclaration> {
         let supported = astra_core::sync_poison::recover_rwlock_read(&self.sandbox_policy)
             .as_ref()
@@ -1960,13 +2240,25 @@ impl ToolExecutor {
             return None;
         }
         let root = self.effective_project_root().canonicalize().ok()?;
-        let requirements = installed_runtime_requirements().ok()?;
-        let executable = std::path::Path::new(&requirements.executable);
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
-        verify_installed_protocol(executable, &root, &token, Duration::from_secs(2))
-            .await
-            .ok()?;
-        provider_declaration(requirements).ok()
+        for executable in native_executable_candidates() {
+            if token.is_cancelled() {
+                return None;
+            }
+            if deadline <= std::time::Instant::now() {
+                return None;
+            }
+            let Ok(requirements) = runtime_requirements_for_executable(&executable) else {
+                continue;
+            };
+            if verify_installed_protocol(&executable, &root, &token, deadline)
+                .await
+                .is_ok()
+            {
+                return provider_declaration(requirements).ok();
+            }
+        }
+        None
     }
 
     /// Existing selected CLI execution entrypoint owns workspace and sandbox.
@@ -2034,9 +2326,17 @@ impl ToolExecutor {
         let Some(cwd_text) = cwd.to_str() else {
             return failure("native workspace path is not UTF-8");
         };
-        let requirements = match installed_runtime_requirements() {
-            Ok(requirements) => requirements,
-            Err(reason) => return failure(reason),
+        let requirements = match runtime_approval {
+            Some(approved) => match runtime_requirements_for_executable(std::path::Path::new(
+                &approved.requirements.executable,
+            )) {
+                Ok(requirements) => requirements,
+                Err(reason) => return failure(reason),
+            },
+            None => match installed_runtime_requirements() {
+                Ok(requirements) => requirements,
+                Err(reason) => return failure(reason),
+            },
         };
         // Apply read-only bootstrap approval to this invocation's private
         // policy copy, never to the shared executor's general file authority.
@@ -2237,6 +2537,9 @@ impl ToolExecutor {
         }
         if let Some(usage) = stage_usage {
             metadata.insert("collaborator_usage".into(), json!(usage));
+        }
+        if evidence.capability_unavailable {
+            metadata.insert("native_capability_unavailable".into(), Value::Bool(true));
         }
         ToolResult {
             output,

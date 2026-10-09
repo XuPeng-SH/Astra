@@ -164,7 +164,7 @@ use crate::server::run::engine::{
 };
 use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
-use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
+use crate::server::server_loop_host::{self, ServerAgenticLoopHost, ServerAgenticLoopHostBuilder};
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
     ToolExecutionService, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
@@ -18855,6 +18855,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let native_target = (input.delivery
+            == astra_turn_types::UserIntentDelivery::GuideCurrentRun)
+            .then(|| native_collaborator_target(&durable))
+            .flatten();
+        let intent_input = input.input.clone();
         let event = json!({
             "event_type": "user_intent",
             "idempotency_key": format!("user_intent:{intent_id}"),
@@ -18974,6 +18979,50 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         break;
                     }
                 }
+            }
+        }
+        if let Some(target) = native_target {
+            let event_index = usize::try_from(event_index).map_err(|_| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "accepted user guidance has an unrepresentable durable event index",
+                )
+            })?;
+            // The session mailbox is the stable user/root sender. It may be
+            // detached between turns; the transport retains its identity and
+            // can still deliver to a live native child or its durable inbox.
+            let sender = self
+                .server_agent_mailbox_router
+                .registered_address(&durable.session_id)
+                .await
+                .unwrap_or_else(|| {
+                    astra_messaging::AgentAddress::new(durable.session_id.clone(), "root-agent")
+                });
+            let content = crate::turn::run_control::user_intent_content(&intent_input)
+                .expect("validated user guidance retains actionable content");
+            let message = astra_messaging::AgentMessage::new(
+                sender,
+                astra_messaging::MessageTarget::Direct { address: target },
+                astra_messaging::MessagePayload::Text {
+                    content,
+                    summary: None,
+                },
+            )
+            .with_correlation(intent_id.clone())
+            .with_durable_user_intent(astra_messaging::DurableUserIntentReference {
+                intent_id: intent_id.clone(),
+                event_index,
+                delivery: input.delivery,
+                input: intent_input,
+            });
+            if let Err(error) = self.server_agent_mailbox_router.send(message).await {
+                return Err(error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "user guidance was durably accepted but could not reach the active collaborator: {error}"
+                    ),
+                    "run_intent_delivery_unavailable",
+                ));
             }
         }
         Ok(RunUserIntentRecord {
@@ -19531,6 +19580,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             durable.status,
         ))
     }
+}
+
+/// Find the native child target from the durable stage admission already
+/// loaded for this request. The run record is the capability fact; no model
+/// name, executable version, or display label is consulted.
+fn native_collaborator_target(run: &DurableRunRecord) -> Option<astra_messaging::AgentAddress> {
+    let agent_id = run.agent_id.as_deref()?.trim();
+    if agent_id.is_empty() {
+        return None;
+    }
+    let native_stage = run.events.iter().rev().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("collaborator_stage_admitted")
+            && serde_json::from_value::<astra_services::runs::CollaboratorStageAdmission>(
+                event.get("admission").cloned().unwrap_or(Value::Null),
+            )
+            .is_ok_and(|admission| {
+                admission.anchor_run_id == run.run_id
+                    && admission.association.native_execution.is_some()
+            })
+    });
+    native_stage.then(|| astra_messaging::AgentAddress::new(run.run_id.clone(), agent_id))
 }
 
 impl AgenticRunLifecycleService {
@@ -21523,19 +21593,31 @@ fn ensure_collaborator_context_continuation(
 /// signals, permissions, and structured replies retain their existing
 /// mailbox owners and are delivered to the canonical loop at its next
 /// provider boundary; the native adapter must not reinterpret them.
+struct ProviderStageMessage {
+    input: astra_turn_types::ProviderStageInput,
+    durable_user_intent: Option<astra_messaging::DurableUserIntentReference>,
+}
+
 fn provider_stage_input_from_message(
     message: &astra_messaging::AgentMessage,
-) -> Option<astra_turn_types::ProviderStageInput> {
+) -> Option<ProviderStageMessage> {
     let astra_messaging::MessagePayload::Text { content, .. } = &message.payload else {
         return None;
     };
     let input = astra_turn_types::ProviderStageInput::Text {
-        input_id: message.id.clone(),
+        input_id: message
+            .durable_user_intent
+            .as_ref()
+            .map(|intent| intent.intent_id.clone())
+            .unwrap_or_else(|| message.id.clone()),
         content: content.clone(),
         correlation_id: message.correlation_id.clone(),
         expected_turn_id: None,
     };
-    input.validate().ok().map(|()| input)
+    input.validate().ok().map(|()| ProviderStageMessage {
+        input,
+        durable_user_intent: message.durable_user_intent.clone(),
+    })
 }
 
 fn native_stage_reasoning_arguments(
@@ -21683,7 +21765,7 @@ impl ServerSpawnAgentExecutor {
             .physical_workspace_id
             .as_deref()
             .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| "native collaborator has no physical materialization identity")?;
+            .ok_or("native collaborator has no physical materialization identity")?;
         let mut association = astra_services::runs::CollaboratorAssociation {
             provider: provider.clone(),
             execution_boundary: astra_services::runs::CollaboratorExecutionBoundary::UserRunner {
@@ -23215,6 +23297,7 @@ impl ServerSubRunExecutor {
     async fn execute_native_stage(
         &self,
         config: &SubRunConfig,
+        host: &mut ServerAgenticLoopHost,
         state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
         plan_mode_active: bool,
     ) -> Result<crate::turn::agentic_loop::host::AgenticLoopOutcome, astra_core::ClassifiedError>
@@ -23412,7 +23495,7 @@ impl ServerSubRunExecutor {
                             lease.commit();
                             continue;
                         };
-                        let Some(stage_input) = provider_stage_input_from_message(&message) else {
+                        let Some(stage_message) = provider_stage_input_from_message(&message) else {
                             // Keep this non-text protocol message for the
                             // ordinary loop. `defer(true)` removes it from
                             // readiness until the native stage returns, while
@@ -23424,13 +23507,68 @@ impl ServerSubRunExecutor {
                             .deliver_provider_stage_input(
                                 &identity,
                                 &edge_agent_id,
-                                stage_input,
+                                stage_message.input,
                                 edge_deadline,
                                 config.cancel_token.as_deref(),
                             )
                             .await;
                         match delivered {
                             Ok(ack) if ack.accepted => {
+                                if let Some(reference) = stage_message.durable_user_intent.as_ref()
+                                {
+                                    let event = crate::turn::run_control::QueuedUserIntent {
+                                        intent_id: reference.intent_id.clone(),
+                                        delivery: reference.delivery,
+                                        status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                                        event_index: reference.event_index,
+                                        input: reference.input.clone(),
+                                    };
+                                    state.user_intents.stage_pending_apply_events(
+                                        std::slice::from_ref(&event),
+                                    );
+                                    let Some(run_control) = state.run_control.clone() else {
+                                        mailbox_enabled = false;
+                                        tracing::error!(
+                                            target: "astra_runtime::run_lifecycle",
+                                            run_id = %config.run_id,
+                                            intent_id = %reference.intent_id,
+                                            "native guidance was accepted without a durable run-control owner"
+                                        );
+                                        continue;
+                                    };
+                                    let applied =
+                                        crate::turn::agentic_loop::execution_phase::apply_pending_user_intents(
+                                            host,
+                                            state,
+                                            run_control.as_ref(),
+                                            &config.user_id,
+                                            &config.session_id,
+                                            &config.run_id,
+                                            std::slice::from_ref(&reference.event_index),
+                                            None,
+                                            true,
+                                        )
+                                        .await;
+                                    match applied {
+                                        Ok(Some(_)) => {}
+                                        Ok(None) | Err(_) => {
+                                            // The provider has accepted the
+                                            // text, but durable application is
+                                            // not proven. Preserve transport
+                                            // custody and stop blind retries;
+                                            // recovery can retry the same
+                                            // stable intent ID safely.
+                                            mailbox_enabled = false;
+                                            tracing::warn!(
+                                                target: "astra_runtime::run_lifecycle",
+                                                run_id = %config.run_id,
+                                                intent_id = %reference.intent_id,
+                                                "native guidance accepted but durable application is not yet proven"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
                                 mailbox_retry_at = None;
                                 lease.commit();
                                 if let Some(mailbox) = mailbox.as_mut()
@@ -25827,7 +25965,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = if self.native_execution.is_some() {
             let plan_mode_active = host.plan_mode_active(&loop_state);
-            self.execute_native_stage(&config, &mut loop_state, plan_mode_active)
+            self.execute_native_stage(&config, &mut host, &mut loop_state, plan_mode_active)
                 .await
         } else {
             run_agentic_loop_with_host(&mut host, &mut loop_state).await

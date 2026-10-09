@@ -131,8 +131,11 @@ def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 request=recv()
 assert request['method']=='initialize'
-emit({'id':1,'result':{}})
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
 assert request['method']=='thread/start'
 emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
@@ -205,8 +208,11 @@ def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 request=recv()
 assert request['method']=='initialize'
-emit({'id':1,'result':{}})
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
 assert request['method']=='thread/start'
 emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
@@ -303,8 +309,12 @@ def recv(): return json.loads(sys.stdin.readline())
 def emit(value): print(json.dumps(value),flush=True)
 request=recv()
 assert request['id']==1 and request['method']=='initialize'
-emit({'id':1,'result':{'serverInfo':{'name':'fixture'}}})
+assert request['params']['capabilities']['explicitGatewayOauth'] is True
+emit({'id':1,'result':{'userAgent':'codex-cli fixture','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
@@ -321,6 +331,133 @@ for line in sys.stdin: pass
     )
     .await
     .expect("a valid initialize response establishes the protocol contract");
+    verify_provider_authentication(&mut process, &input, &mut evidence, &token, OUTPUT_BYTES)
+        .await
+        .expect("current provider authentication establishes the capability boundary");
+    let outcome = process.cancel_and_wait().await.unwrap();
+    assert!(
+        outcome
+            .settlement
+            .is_some_and(|settlement| settlement.ownership.is_authoritative())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn discovery_readiness_rejects_a_cached_catalog_without_current_authentication() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(value): print(json.dumps(value),flush=True)
+request=recv()
+assert request['id']==1 and request['method']=='initialize'
+emit({'id':1,'result':{'userAgent':'codex-cli fixture','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':True}})
+for line in sys.stdin:
+    request=json.loads(line)
+    assert request['method']!='model/list', 'readiness must not trust the cached catalog after logout'
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let input = process.input();
+    let mut evidence = Evidence::default();
+    initialize_protocol(
+        &mut process,
+        &input,
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        &token,
+    )
+    .await
+    .unwrap();
+    let error =
+        verify_provider_authentication(&mut process, &input, &mut evidence, &token, OUTPUT_BYTES)
+            .await
+            .unwrap_err();
+    assert_eq!(error, "native provider authentication is unavailable");
+    let outcome = process.cancel_and_wait().await.unwrap();
+    assert!(
+        outcome
+            .settlement
+            .is_some_and(|settlement| settlement.ownership.is_authoritative())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn discovery_rejects_a_malformed_account_without_treating_it_as_authenticated() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(value): print(json.dumps(value),flush=True)
+request=recv()
+assert request['id']==1 and request['method']=='initialize'
+emit({'id':1,'result':{'userAgent':'codex-cli fixture','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':False,'requiresOpenaiAuth':True}})
+for line in sys.stdin: pass
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let input = process.input();
+    let mut evidence = Evidence::default();
+    initialize_protocol(
+        &mut process,
+        &input,
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        &token,
+    )
+    .await
+    .unwrap();
+    let error =
+        verify_provider_authentication(&mut process, &input, &mut evidence, &token, OUTPUT_BYTES)
+            .await
+            .unwrap_err();
+    assert_eq!(error, "native account readiness response is invalid");
+    assert!(evidence.capability_unavailable);
+    let outcome = process.cancel_and_wait().await.unwrap();
+    assert!(
+        outcome
+            .settlement
+            .is_some_and(|settlement| settlement.ownership.is_authoritative())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn discovery_handshake_rejects_a_malformed_initialize_object() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(value): print(json.dumps(value),flush=True)
+request=recv()
+assert request['id']==1 and request['method']=='initialize'
+emit({'id':1,'result':{}})
+for line in sys.stdin: pass
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let input = process.input();
+    let mut evidence = Evidence::default();
+    let error = initialize_protocol(
+        &mut process,
+        &input,
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        &token,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "native initialize returned an invalid result");
     let outcome = process.cancel_and_wait().await.unwrap();
     assert!(
         outcome
@@ -421,6 +558,29 @@ fn runtime_grant_requires_exact_installation_local_authority_and_portable_bounds
     assert!(
         validate_runtime_grant(&expected.read_paths, &expected, Some(&outside_policy)).is_err()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_path_discovery_skips_a_non_runnable_shadow() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let shadow = first.path().join("codex");
+    let usable = second.path().join("codex");
+    std::fs::write(&shadow, b"not runnable").unwrap();
+    std::fs::write(&usable, b"runnable").unwrap();
+    let mut permissions = std::fs::metadata(&shadow).unwrap().permissions();
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(&shadow, permissions).unwrap();
+    let mut permissions = std::fs::metadata(&usable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&usable, permissions).unwrap();
+
+    let path = std::env::join_paths([first.path(), second.path(), second.path()]).unwrap();
+    let candidates = native_executable_candidates_for_path(&path);
+    assert_eq!(candidates, vec![usable.canonicalize().unwrap()]);
 }
 
 #[test]
@@ -1302,8 +1462,11 @@ import json,sys
 def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 assert recv()['method']=='initialize'
-emit({'id':1,'result':{}})
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
 assert request['method']=='thread/start'
 assert request['params']['approvalPolicy']=='never'
@@ -1329,8 +1492,11 @@ import json,sys
 def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 assert recv()['method']=='initialize'
-emit({'id':1,'result':{}})
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
 assert request['id']==4
 assert request['method']=='model/list'
@@ -1396,8 +1562,11 @@ import json,sys
 def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 assert recv()['method']=='initialize'
-emit({'id':1,'result':{}})
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
 assert request['id']==4 and request['method']=='model/list'
 assert request['params']['includeHidden'] is True
@@ -1441,8 +1610,11 @@ import json,sys
 def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 assert recv()['method']=='initialize'
-emit({'id':1,'result':{}})
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
 assert request['id']==4 and request['method']=='model/list'
 emit({'id':4,'result':{'data':[], 'nextCursor':None}})
@@ -1480,8 +1652,11 @@ import json,select,sys
 def recv(): return json.loads(sys.stdin.readline())
 def emit(v): print(json.dumps(v),flush=True)
 assert recv()['method']=='initialize'
-emit({'id':1,'result':{}})
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
 assert request['id']==4 and request['method']=='model/list'
 emit({'id':4,'result':{'data':[{'id':'luna-56','model':'gpt-5.6-luna','displayName':'GPT-5.6-Luna'}], 'nextCursor':None}})
