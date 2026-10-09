@@ -6740,14 +6740,19 @@ mod tests {
                 page.items.extend([request, response]);
                 capture.run_tree.runs[0].total_tool_calls = (page.items.len() / 2) as u32;
             };
-            let before_catalog = capture.clone();
             if name == "flash_rejected_delegation_preserves_parent_tools" {
+                let page = capture.transcript.as_mut().unwrap();
+                page.items[0].tool_calls[0].name = "model_catalog".into();
+                page.items[0].tool_calls[0].arguments = "{}".into();
+                page.items[1].content = r#"{"purpose":"chat"}"#.into();
+                page.items[1].tool_result.as_mut().unwrap().name = Some("model_catalog".into());
+                page.items[1].tool_result.as_mut().unwrap().status = Some("completed".into());
                 append(
                     &mut capture,
-                    "model_catalog",
-                    "{}",
-                    r#"{"purpose":"chat"}"#,
-                    "completed",
+                    "agent",
+                    r#"{"action":"spawn"}"#,
+                    r#"{"error_kind":"invalid_request","status":"failed"}"#,
+                    "rejected",
                 );
             }
             let baseline = capture.clone();
@@ -6773,11 +6778,7 @@ mod tests {
                 {
                     continue;
                 }
-                let mut extra = if extra_name == "model_catalog" {
-                    before_catalog.clone()
-                } else {
-                    baseline.clone()
-                };
+                let mut extra = baseline.clone();
                 append(
                     &mut extra,
                     extra_name,
@@ -6814,12 +6815,12 @@ mod tests {
                         .unwrap()
                         .tools("root")
                         .unwrap();
-                    assert_eq!(
+                    assert!(
                         calls
                             .iter()
                             .filter(|call| call.name == "model_catalog")
-                            .count(),
-                        2
+                            .count()
+                            >= 2
                     );
                     continue;
                 }

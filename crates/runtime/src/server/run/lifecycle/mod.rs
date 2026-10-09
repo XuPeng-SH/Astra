@@ -21939,7 +21939,7 @@ impl ServerSpawnAgentExecutor {
             max_output_tokens: None,
             executor: Arc::clone(self),
             parent: parent.clone(),
-            execution: ServerPreparedExecution::Native(native),
+            execution: ServerPreparedExecution::Native(Box::new(native)),
             requested_model_policy: None,
             resolved_selection: None,
             thinking,
@@ -21951,14 +21951,14 @@ impl ServerSpawnAgentExecutor {
 
 #[derive(Clone)]
 enum ServerPreparedExecution {
-    Internal(astra_services::AdmittedModelExecution),
-    Native(PreparedNativeSubrunExecution),
+    Internal(Box<astra_services::AdmittedModelExecution>),
+    Native(Box<PreparedNativeSubrunExecution>),
 }
 
 impl ServerPreparedExecution {
     fn model(&self) -> Option<&astra_services::AdmittedModelExecution> {
         match self {
-            Self::Internal(model) => Some(model),
+            Self::Internal(model) => Some(model.as_ref()),
             Self::Native(_) => None,
         }
     }
@@ -22499,7 +22499,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                 max_output_tokens: input.max_output_tokens,
                 executor: Arc::clone(&self),
                 parent: parent.clone(),
-                execution: ServerPreparedExecution::Internal(execution),
+                execution: ServerPreparedExecution::Internal(Box::new(execution)),
                 requested_model_policy: admitted_input.requested_model_policy,
                 resolved_selection: Some(resolved_selection),
                 thinking,
@@ -22978,7 +22978,7 @@ impl ServerSpawnAgentExecutor {
                     return Err("prepared native task changed before launch".into());
                 }
                 native.arguments["anchor_run_id"] = json!(native.stage_admission.anchor_run_id);
-                executor.with_native_execution(native)
+                executor.with_native_execution(*native)
             }
         };
         let execution = AssertUnwindSafe(executor.execute(subrun))

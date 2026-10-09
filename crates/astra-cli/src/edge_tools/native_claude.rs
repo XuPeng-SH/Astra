@@ -660,7 +660,7 @@ impl ToolExecutor {
                     .as_ref()
                     .err()
                     .map(String::as_str)
-                    .or(evidence.provider_error.as_deref())
+                    .or(evidence.provider_error)
                     .unwrap_or("native Claude stage did not complete with settled transport"),
             );
         }
@@ -741,7 +741,7 @@ mod tests {
         .unwrap();
         assert!(evidence.capability_unavailable);
         assert_eq!(
-            evidence.provider_error.as_deref(),
+            evidence.provider_error,
             Some("Claude Code authentication is required")
         );
         assert_eq!(evidence.provider_error_class, Some("authentication"));

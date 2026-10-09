@@ -5059,8 +5059,34 @@ mod tests {
         request: &DelegationRequest,
         offering_id: &str,
     ) {
+        let model_name = format!("resolved-{offering_id}");
+        start_model_parent_with_identity(run_engine, request, offering_id, &model_name).await;
+    }
+
+    async fn start_model_parent_with_identity(
+        run_engine: &RunEngine,
+        request: &DelegationRequest,
+        offering_id: &str,
+        model_name: &str,
+    ) {
+        start_model_parent_with_identity_and_thinking(
+            run_engine,
+            request,
+            offering_id,
+            model_name,
+            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+        )
+        .await;
+    }
+
+    async fn start_model_parent_with_identity_and_thinking(
+        run_engine: &RunEngine,
+        request: &DelegationRequest,
+        offering_id: &str,
+        model_name: &str,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    ) {
         use crate::server::run::engine::{RunGenerationControls, RunStartContext};
-        use astra_turn_core::thinking_config::ThinkingConfig;
 
         run_engine
             .start_run_with_context(
@@ -5068,16 +5094,17 @@ mod tests {
                 &request.user_id,
                 &request.session_id,
                 RunStartContext {
+                    model_identity_admitted: true,
                     model_selection: Some(astra_turn_types::ModelSelection {
                         offering_id: offering_id.to_string(),
                     }),
                     resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
                         offering_id: offering_id.to_string(),
-                        model_name: format!("resolved-{offering_id}"),
+                        model_name: model_name.to_string(),
                         source_identity: None,
                     }),
                     generation_controls: Some(RunGenerationControls {
-                        thinking: ThinkingConfig::ModelDefault,
+                        thinking,
                         first_output_max_tokens: None,
                         preserve_thinking: false,
                     }),
@@ -5816,14 +5843,7 @@ mod tests {
             .await?
             .is_none()
         {
-            engine
-                .run_engine
-                .start_run(
-                    &request.parent_run_id,
-                    &request.user_id,
-                    &request.session_id,
-                )
-                .await?;
+            start_model_parent(&engine.run_engine, request, "offer-parent").await;
         }
         persist_parent_contract_fixture(&engine.run_engine, request).await
     }
@@ -7091,7 +7111,8 @@ mod tests {
         let mut request = fan_out_request(vec!["coder"]);
         request.delegation_id = "delegation-cancel-awaits-executor".into();
         request.parent_run_id = "parent-cancel-awaits-executor".into();
-        persist_durable_parent_fixture(&engine, &request)
+        start_model_parent(&engine.run_engine, &request, "offer-coder").await;
+        persist_parent_contract_fixture(&engine.run_engine, &request)
             .await
             .unwrap();
 
@@ -8155,13 +8176,20 @@ mod tests {
             context: HashMap::new(),
             execution_metadata: None,
         };
-        persist_durable_parent_fixture(&engine, &request)
-            .await
-            .unwrap();
-
         let expected = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
+        start_model_parent_with_identity_and_thinking(
+            &engine.run_engine,
+            &request,
+            "offer-coder",
+            "resolved-offer-coder",
+            expected.clone(),
+        )
+        .await;
+        persist_parent_contract_fixture(&engine.run_engine, &request)
+            .await
+            .unwrap();
         let result = bind_test_engine(&engine)
             .execute_with_forward_headers_and_live_events(
                 request,
@@ -11791,6 +11819,13 @@ mod tests {
                     fan_out_request(vec!["coder"])
                 };
                 request.parent_run_id = "run-step2".into();
+                start_model_parent_with_identity(
+                    &run_engine,
+                    &request,
+                    "opaque-offering-id",
+                    model,
+                )
+                .await;
                 let parent = engine
                     .spawner
                     .as_ref()

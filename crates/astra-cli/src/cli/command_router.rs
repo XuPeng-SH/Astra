@@ -1170,6 +1170,13 @@ mod token_refresh_error_tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "gateway-token-session"
+            })))
+            .mount(&server)
+            .await;
         // Headless chat performs the same explicit Edge admission as the TUI
         // when the registry is enabled. Keep this test focused on gateway
         // auth/model selection by providing that protocol boundary too.

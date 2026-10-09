@@ -651,7 +651,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     );
     if tool_visible(tool_names, "tool_search") {
         body.push_str(
-            "         - Select deferred tools or absent resident fields with `tool_search(query=\"select:NAME\")`, then `invoke_tool`. Reuse contracts across turns; runtime revalidates access. Selection never adds schemas to `tools[]`.\n",
+            "         - Absent fields/actions: Tool Availability Protocol; select via `tool_search(query=\"select:NAME\")`, then `invoke_tool`. Reuse contracts; runtime revalidates access; selection never adds schemas to `tools[]`.\n",
         );
     } else {
         body.push_str(
@@ -675,18 +675,15 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
             "         - `task` is an agent type, not a callable tool name. {surface_guidance}; `start_work` tracks durable outcomes. Task controls are not Work. Preserve scope, whole-result format and alternatives; defer requested child choices only.\n"
         ));
         body.push_str(
-            "         - Launch before child-specific checks. Preserve user-assigned model/task pairs and verbatim output constraints; no extra metadata/templates. Keep parent-only reporting out of child briefs. Use runtime model/status receipts, not child self-report. Parent work never replaces child work. One child per objective; fanout controls groups, not duplication.\n",
+            "         - Launch before child-specific checks. Preserve user-assigned model/task pairs and verbatim output constraints. Keep parent-only reporting out of child briefs; use runtime model/status receipts, not child self-report. Parent work never replaces child work. fanout controls groups, not duplication.\n",
         );
     }
     if agent_visible {
         body.push_str(
-            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Absent fields/actions: Tool Availability Protocol; preserve constraints. Default `agent_type`: read-only `explore`; review: `code-review`; mutation: `task`/`general-purpose`. Defaults: omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, set an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not controls; never invent reasoning, read config/credentials, or substitute unavailable/prohibited models.\n",
+            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, use an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not controls; preserve constraints, never inspect config/credentials, or substitute unavailable/prohibited models.\n",
         );
         body.push_str(
-            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Use `agent(send_message, message_type=question)` only for an active parent/child/peer mailbox, then wait; answer with the incoming `request_id`. A completed provider collaborator is continued by a new `agent(action=\"spawn\", collaborator_id=<exact prior receipt>)`, never by agent_id, run_id, name, or a constructed mailbox address. If a provider returns a typed model-selection requirement, ask the user once with its exact choices and retry only after the choice; never guess or present the unstarted child as a task failure. Final prose is not a coordination message; running is not failure.\n",
-        );
-        body.push_str(
-            "         - A plain Chat/Astra model request selects `requested_model_policy`; use `execution` only when the user explicitly names an external provider or protocol. Never turn an internal model name into a provider-owned execution request.\n",
+            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Use `agent(send_message, message_type=question)` only for an active mailbox; answer with the incoming `request_id`. Continue a completed provider collaborator with spawn+exact collaborator_id, never another identity. Ask once on typed model selection; never guess or present an unstarted child as failure. Final prose is not a coordination message; running is not failure.\n",
         );
     }
     if tool_visible(tool_names, "bash") {

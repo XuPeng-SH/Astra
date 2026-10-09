@@ -631,11 +631,20 @@ pub async fn serve_connection_with_drain(
     if shutdown.is_cancelled() {
         return Ok(());
     }
+    // This convenience entry point owns the invocation owner for exactly one
+    // attachment.  A protocol/transport error therefore cannot leave admitted
+    // work running after the owner is dropped.  Keep the caller's token
+    // uncancelled and use a child for the local cleanup decision; the
+    // session-scoped owner API below still preserves work across reconnects.
+    let cleanup_shutdown = shutdown.child_token();
     let mut owner = EdgeInvocationOwner::open(&context, executor).await?;
     let connection_result = owner
-        .serve_connection(socket, context, shutdown.clone(), drain)
+        .serve_connection(socket, context, cleanup_shutdown.clone(), drain)
         .await;
-    let cleanup_result = owner.settle(&shutdown).await;
+    if connection_result.is_err() {
+        cleanup_shutdown.cancel();
+    }
+    let cleanup_result = owner.settle(&cleanup_shutdown).await;
     if let Err(error) = &cleanup_result {
         tracing::error!(
             component = "edge",

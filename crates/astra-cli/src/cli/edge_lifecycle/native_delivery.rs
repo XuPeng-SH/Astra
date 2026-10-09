@@ -746,6 +746,7 @@ async fn publish(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_native_delivery_config(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -970,6 +971,7 @@ pub(crate) async fn start_headless_native_delivery(
 
 // The capability-only installation path is shared by production and real transport
 // tests; tests replace only the external peer, not Astra auth/custody/dispatch.
+#[allow(clippy::too_many_arguments)]
 async fn connect_native_delivery(
     config: NativeDeliveryConfig,
     providers: Option<Vec<NativeProviderCandidate>>,
@@ -1322,6 +1324,7 @@ async fn connect_native_delivery(
 /// is only the current delivery attachment. This is deliberately the only
 /// place that decides whether a transport is replaced, withdrawn, retried, or
 /// finally settled.
+#[allow(clippy::too_many_arguments)]
 fn spawn_native_delivery_supervisor(
     config: NativeDeliveryConfig,
     cancellation: CancellationToken,

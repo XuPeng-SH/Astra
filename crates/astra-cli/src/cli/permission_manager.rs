@@ -292,11 +292,7 @@ fn native_bootstrap_fingerprint(
     name: &str,
     args: &serde_json::Value,
 ) -> Option<astra_turn_core::approval_fingerprint::ApprovalFingerprint> {
-    if astra_turn_core::provider_resolution::NativeCollaboratorProtocol::from_permission_scope(name)
-        .is_none()
-    {
-        return None;
-    }
+    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::from_permission_scope(name)?;
     let hash = args.get("provider_snapshot_hash")?.as_str()?;
     let binding = args.get("provider_binding")?.as_str()?;
     let path = args.get("directory")?.as_str()?;

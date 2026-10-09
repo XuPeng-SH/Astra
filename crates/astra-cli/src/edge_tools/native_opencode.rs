@@ -328,6 +328,7 @@ fn classify_rpc_error(error: &Value) -> RpcError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rpc(
     process: &mut FramedProcess,
     input: &astra_sandbox::FramedProcessInput,

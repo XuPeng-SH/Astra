@@ -1446,7 +1446,8 @@ fn provider_child_execution_schema() -> Value {
 
 fn collaborator_identity_schema() -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": 256,
-        "description": "For a new collaborator, omit this field. For a follow-up, copy the exact runtime-generated collaborator_id returned by an earlier launch to keep its conversation. A completed provider collaborator does not accept send_message; continue it with a new spawn carrying this exact collaborator_id. Never use an agent_id, run_id, mailbox address, third-party session ID, or made-up name. This starts a new independently settled stage, not a replay of its previous result."})
+    "description": "For a new collaborator, omit this field. For a follow-up, copy the exact runtime-generated collaborator_id returned by an earlier launch to keep its conversation. A completed provider collaborator does not accept send_message; continue it with a new spawn carrying this exact collaborator_id. Never use an agent_id, run_id, mailbox address, third-party session ID, or made-up name. This starts a new independently settled stage, not a replay of its previous result.",
+    })
 }
 
 fn fanout_reasoning_schema() -> Value {
@@ -1478,17 +1479,17 @@ fn agent_parameters_schema() -> Value {
             "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
         },
         "x-astra-surface-discovery-summaries": {
-            "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;external execution only when user names provider;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question;active mailbox only;provider follow-up uses exact collaborator_id"
+            "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question"
         },
         "x-astra-per-action-discovery-summaries": {
-            "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;external execution only when user names provider;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+            "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
             "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
             "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
             "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
             "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
             "send_message": "action+to+message; active mailbox only; child asks parent via message_type=question (not ask_user); parent answers request_id; completed provider follow-up uses spawn+exact collaborator_id"
         },
-        "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;external execution only when user names provider;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+        "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question",
         "properties": {
             "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
             "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},

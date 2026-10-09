@@ -1150,7 +1150,12 @@ mod tests {
                 .unwrap();
                 let request = EdgeServerMessage::ToolRequest {
                     request_id: identity.storage_key(), identity: Box::new(identity), delivery_generation: 1,
-                    tool: "bash".into(), args: serde_json::json!({"command": format!("touch started-{i}; sleep 2; touch leaked-{i}")}),
+                    // Keep both admitted commands active until the malformed
+                    // request forces the connection down.  A short sleep made
+                    // this test depend on CI scheduling: one command could
+                    // complete successfully before the failure was observed,
+                    // making the recovery assertion nondeterministic.
+                    tool: "bash".into(), args: serde_json::json!({"command": format!("touch started-{i}; sleep 30; touch leaked-{i}")}),
                     runtime_process_authorization: managed.then(|| Box::new(astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext { authorization: "Bearer test-grant".into() })), runtime_process_authorization_required: managed, timeout_secs: 30,
                     execution_deadline_unix_ms: None,
                     execution_timeout_ms: None,

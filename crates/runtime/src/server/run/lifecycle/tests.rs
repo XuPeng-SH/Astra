@@ -2768,6 +2768,35 @@ fn test_admitted_model_execution() -> astra_services::AdmittedModelExecution {
         .expect("valid test model execution")
 }
 
+async fn start_model_bound_test_parent(
+    run_engine: &RunEngine,
+    run_id: &str,
+    user_id: &str,
+    session_id: &str,
+    execution: &astra_services::AdmittedModelExecution,
+) {
+    run_engine
+        .start_run_with_context(
+            run_id,
+            user_id,
+            session_id,
+            crate::server::run::engine::RunStartContext {
+                model_identity_admitted: true,
+                model_selection: Some(ModelSelection {
+                    offering_id: execution.offering_id.clone(),
+                }),
+                resolved_model_selection: Some(ResolvedModelSelection {
+                    offering_id: execution.offering_id.clone(),
+                    model_name: execution.model_name.clone(),
+                    source_identity: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("durable model-bound parent");
+}
+
 fn test_model_record_at(name: String, base_url: &str) -> astra_services::ModelRecord {
     astra_services::ModelRecord {
         model_id: format!("model-{name}"),
@@ -8559,10 +8588,15 @@ async fn two_fresh_server_children_fail_closed_without_durable_owner_pod_capabil
         Arc::new(astra_turn_core::orchestration_progress::ProgressBroadcaster::default());
     let mut progress_rx = progress.subscribe();
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-    run_engine
-        .start_run("root-fanout-run", "user-a", "session-1")
-        .await
-        .expect("durable fanout parent");
+    let parent_execution = test_admitted_model_execution();
+    start_model_bound_test_parent(
+        &run_engine,
+        "root-fanout-run",
+        "user-a",
+        "session-1",
+        &parent_execution,
+    )
+    .await;
     let mut executor = ServerSpawnAgentExecutor::new(
         test_settings(),
         test_encryptor(),
@@ -14790,11 +14824,6 @@ async fn child_and_grandchild_execute_with_their_own_frozen_workspace_contracts(
             &workspace.workspace,
         )
         .await);
-    service
-        .run_engine
-        .start_run("authority-parent-run", "user-1", "session-1")
-        .await
-        .unwrap();
     let execution = astra_services::AdmittedModelExecution::from_endpoint(
         "model-test-model".into(),
         "test-model".into(),
@@ -14804,6 +14833,14 @@ async fn child_and_grandchild_execute_with_their_own_frozen_workspace_contracts(
         None,
         128_000,
     );
+    start_model_bound_test_parent(
+        &service.run_engine,
+        "authority-parent-run",
+        "user-1",
+        "session-1",
+        &execution,
+    )
+    .await;
     let check = |label: &str| astra_turn_types::StopHook {
         label: label.into(),
         command: "true".into(),
@@ -14992,10 +15029,14 @@ async fn durable_subrun_model_policy_conflict_is_rejected_before_activation() {
         128_000,
     );
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-    run_engine
-        .start_run("authority-parent-run", "user-1", "session-1")
-        .await
-        .expect("durable parent");
+    start_model_bound_test_parent(
+        &run_engine,
+        "authority-parent-run",
+        "user-1",
+        "session-1",
+        &admitted,
+    )
+    .await;
     let executor = ServerSubRunExecutor::new(
         test_settings(),
         test_encryptor(),
@@ -15139,10 +15180,14 @@ async fn durable_subrun_retry_requires_the_exact_prestarted_generation_before_pr
         128_000,
     );
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-    run_engine
-        .start_run("authority-parent-run", "user-1", "session-1")
-        .await
-        .expect("durable parent");
+    start_model_bound_test_parent(
+        &run_engine,
+        "authority-parent-run",
+        "user-1",
+        "session-1",
+        &admitted,
+    )
+    .await;
     let executor = ServerSubRunExecutor::new(
         test_settings(),
         test_encryptor(),
@@ -15300,10 +15345,14 @@ async fn durable_subrun_user_cancel_during_authority_confirmation_projects_durab
             .with_pending_activation_renewal(Arc::clone(&renewal_entered)),
     );
     let run_engine = RunEngine::new(store);
-    run_engine
-        .start_run("authority-parent-run", "user-1", "session-1")
-        .await
-        .expect("durable parent");
+    start_model_bound_test_parent(
+        &run_engine,
+        "authority-parent-run",
+        "user-1",
+        "session-1",
+        &admitted,
+    )
+    .await;
     let executor = Arc::new(
         ServerSubRunExecutor::new(
             test_settings(),
@@ -15403,10 +15452,14 @@ async fn durable_subrun_refused_activation_renewal_projects_exact_user_marker() 
     let store =
         Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_refused_activation_renewal());
     let run_engine = RunEngine::new(store);
-    run_engine
-        .start_run("authority-parent-run", "user-1", "session-1")
-        .await
-        .expect("durable parent");
+    start_model_bound_test_parent(
+        &run_engine,
+        "authority-parent-run",
+        "user-1",
+        "session-1",
+        &admitted,
+    )
+    .await;
     let executor = ServerSubRunExecutor::new(
         test_settings(),
         test_encryptor(),
@@ -15450,20 +15503,22 @@ async fn durable_subrun_refused_activation_renewal_projects_exact_user_marker() 
 async fn activation_user_winner_converges_recovered_subrun_grandchildren() {
     let store = Arc::new(InMemoryRunStateStore::new());
     let run_engine = RunEngine::new(store.clone());
-    run_engine
-        .start_run("authority-parent-run", "user-1", "session-1")
-        .await
-        .expect("durable parent");
+    let execution = test_admitted_model_execution();
+    start_model_bound_test_parent(
+        &run_engine,
+        "authority-parent-run",
+        "user-1",
+        "session-1",
+        &execution,
+    )
+    .await;
     let executor = ServerSubRunExecutor::new(
         test_settings(),
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
     )
     .with_run_engine(run_engine.clone());
-    let config = test_executable_subrun_config(
-        "activation-recovered-subrun",
-        test_admitted_model_execution(),
-    );
+    let config = test_executable_subrun_config("activation-recovered-subrun", execution);
     executor
         .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
         .await
@@ -15626,20 +15681,22 @@ async fn activation_cancellation_cas_cannot_terminalize_a_rotated_generation() {
             .with_terminal_transition_delay(Duration::from_millis(100)),
     );
     let run_engine = RunEngine::new(store.clone());
-    run_engine
-        .start_run("authority-parent-run", "user-1", "session-1")
-        .await
-        .expect("durable parent");
+    let execution = test_admitted_model_execution();
+    start_model_bound_test_parent(
+        &run_engine,
+        "authority-parent-run",
+        "user-1",
+        "session-1",
+        &execution,
+    )
+    .await;
     let executor = ServerSubRunExecutor::new(
         test_settings(),
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
     )
     .with_run_engine(run_engine.clone());
-    let config = test_executable_subrun_config(
-        "activation-generation-rotation",
-        test_admitted_model_execution(),
-    );
+    let config = test_executable_subrun_config("activation-generation-rotation", execution);
     let authority = executor
         .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
         .await
@@ -16849,8 +16906,25 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
 #[tokio::test]
 async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal() {
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let parent_execution = test_admitted_model_execution();
     run_engine
-        .start_run("parent-run", "user-1", "session/unsafe")
+        .start_run_with_context(
+            "parent-run",
+            "user-1",
+            "session/unsafe",
+            crate::server::run::engine::RunStartContext {
+                model_identity_admitted: true,
+                model_selection: Some(ModelSelection {
+                    offering_id: parent_execution.offering_id.clone(),
+                }),
+                resolved_model_selection: Some(ResolvedModelSelection {
+                    offering_id: parent_execution.offering_id.clone(),
+                    model_name: parent_execution.model_name.clone(),
+                    source_identity: None,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("durable parent run");
     let executor = ServerSubRunExecutor::new(
