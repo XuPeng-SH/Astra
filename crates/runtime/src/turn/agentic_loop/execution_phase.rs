@@ -4508,16 +4508,6 @@ pub(crate) async fn apply_provider_stage_user_intent<H: AgenticLoopHost>(
     .map(|(ack, _)| ack))
 }
 
-pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
-    NormalizedPromptCacheUsage::new(
-        turn_result.accum.prompt_tokens,
-        turn_result.accum.cache_read_tokens,
-        turn_result.accum.cache_creation_tokens,
-    )
-    .total_input_tokens()
-    .saturating_add(turn_result.accum.completion_tokens)
-}
-
 fn runtime_feedback_run_usage(
     state: &AgenticLoopState,
     accum: &astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum,
