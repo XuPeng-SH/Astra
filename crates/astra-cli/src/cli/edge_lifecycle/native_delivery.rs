@@ -2575,4 +2575,227 @@ mod tests {
         );
         assert_eq!(last["capabilities"]["provider_discovery"], json!([]));
     }
+
+    /// Keep one composition test between the production Edge owner and an
+    /// external protocol process. Adapter-only tests cannot catch a routing
+    /// or settlement break between those two owners.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires an explicit freshly built Astra invocation supervisor binary"]
+    async fn authenticated_shared_ws_executes_native_provider_through_cli_entrypoint() {
+        use astra_server_types::edge_ws_protocol::{
+            EdgeExecutionCeiling, EdgeServerMessage, ToolInvocationIdentity,
+        };
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let http = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&http)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let executable = runtime.path().join("codex");
+        std::fs::write(
+            &executable,
+            r##"#!/usr/bin/env python3
+import json, sys
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        raise SystemExit(0)
+    return json.loads(line)
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+request = recv()
+assert request["method"] == "initialize"
+emit({"id": 1, "result": {"userAgent": "codex-cli harness", "codexHome": "/tmp/codex", "platformFamily": "unix", "platformOs": "linux"}})
+assert recv()["method"] == "initialized"
+request = recv()
+assert request["id"] == 7 and request["method"] == "account/read"
+emit({"id": 7, "result": {"account": None, "requiresOpenaiAuth": False}})
+request = recv()
+assert request["method"] == "thread/start"
+profile = request["params"]["permissions"]
+emit({"id": 2, "result": {"thread": {"id": "edge-thread", "status": {"type": "idle"}}, "cwd": request["params"]["cwd"], "approvalPolicy": "never", "approvalsReviewer": "user", "activePermissionProfile": {"id": profile}, "sandbox": {"type": "readOnly", "networkAccess": False}}})
+request = recv()
+assert request["method"] == "turn/start"
+emit({"id": 3, "result": {"turn": {"id": "edge-turn", "status": "inProgress"}}})
+emit({"method": "item/agentMessage/delta", "params": {"threadId": "edge-thread", "turnId": "edge-turn", "delta": "NATIVE_EDGE_SUCCESS"}})
+emit({"method": "turn/completed", "params": {"threadId": "edge-thread", "turn": {"id": "edge-turn", "status": "completed"}}})
+for line in sys.stdin:
+    pass
+"##,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+        }
+
+        let (mut consumer, mut permission_owner) = consumer(workspace.path(), runtime.path(), None);
+        permission_owner
+            .perm_manager
+            .set_mode(PermissionMode::Bypass);
+        // Use the same bounded discovery owner as production. The Linux
+        // runtime declaration includes the system paths needed by a shebang;
+        // a hand-written subset would make the revalidation test dishonest.
+        let requirements = native_codex::runtime_requirements_for_executable(&executable)
+            .expect("harness provider requirements");
+        consumer.requirements = requirements.clone();
+        consumer.snapshot = Arc::new(snapshot(&requirements, workspace.path()));
+        let snapshot = consumer.snapshot.clone();
+        let mut config = (*consumer.config).clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.websocket_url = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
+        config.api = astra_thin_client::ThinClient::new(&http.uri(), None).unwrap();
+
+        let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let root = workspace
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let auth: EdgeClientMessage =
+                serde_json::from_slice(&ws.next().await.unwrap().unwrap().into_data()).unwrap();
+            assert!(matches!(auth, EdgeClientMessage::Auth { .. }));
+            ws.send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::AuthOk {
+                    user_id: "account-test".into(),
+                    edge_id: "ws-native-success".into(),
+                    interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            dispatch_rx.await.unwrap();
+
+            let identity = ToolInvocationIdentity::new(
+                "account-test",
+                "session-test",
+                "run-success",
+                "chain-success",
+                "call-success",
+            )
+            .unwrap();
+            let request = EdgeServerMessage::ToolRequest {
+                request_id: identity.storage_key(),
+                identity: Box::new(identity.clone()),
+                delivery_generation: 1,
+                tool: native_codex::TOOL_NAME.into(),
+                args: json!({"task": "Return the harness result", "anchor_run_id": "run-success"}),
+                execution_ceiling: Some(Box::new(EdgeExecutionCeiling {
+                    workspace_root: root,
+                    workspace_id: None,
+                    materialization_id: Some("materialization-test".into()),
+                    execution_binding_generation: 1,
+                    runtime_read_paths: requirements.read_paths.clone(),
+                    workspace_write_allowed: false,
+                    network_allowed: false,
+                })),
+                runtime_process_authorization: None,
+                runtime_process_authorization_required: false,
+                timeout_secs: 120,
+                execution_deadline_unix_ms: Some(
+                    (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64)
+                        + 15_000,
+                ),
+                execution_timeout_ms: Some(15_000),
+                command_timeout_cap_ms: Some(120_000),
+            };
+            ws.send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+            loop {
+                match ws.next().await {
+                    Some(Ok(frame)) if frame.is_text() => {
+                        let message: EdgeClientMessage =
+                            serde_json::from_slice(&frame.into_data()).unwrap();
+                        if matches!(message, EdgeClientMessage::Ping {}) {
+                            continue;
+                        }
+                        let EdgeClientMessage::ToolResult {
+                            identity: actual,
+                            output,
+                            is_error,
+                            tool_result_fields,
+                            ..
+                        } = message
+                        else {
+                            panic!("expected native tool result");
+                        };
+                        assert_eq!(actual, identity);
+                        assert!(!is_error, "native entrypoint failed: {output}");
+                        assert_eq!(output.trim(), "NATIVE_EDGE_SUCCESS");
+                        let fields = tool_result_fields.expect("native evidence");
+                        assert_eq!(
+                            fields["native_collaborator"]["native_terminal"],
+                            "completed"
+                        );
+                        assert_eq!(
+                            fields["native_collaborator"]["transport_settled_after_terminal"],
+                            true
+                        );
+                        result_tx.send(()).unwrap();
+                        break;
+                    }
+                    Some(Ok(frame)) if frame.is_close() => {
+                        panic!("Edge owner closed before result")
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => panic!("Edge peer failed: {error}"),
+                    None => panic!("Edge peer ended before result"),
+                }
+            }
+        });
+
+        let provider = NativeProviderCandidate {
+            snapshot,
+            executable_identity: native_codex::native_executable_identity(&executable).unwrap(),
+        };
+        let (handle, _) = connect_native_delivery(
+            config,
+            Some(vec![provider]),
+            Instant::now() + Duration::from_secs(15),
+            &CancellationToken::new(),
+            CancellationToken::new(),
+            mpsc::channel(1).0,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            None,
+        )
+        .await
+        .expect("native delivery should publish the tested provider");
+        dispatch_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), result_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        handle.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
