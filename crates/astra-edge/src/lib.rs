@@ -133,6 +133,7 @@ pub async fn authenticate_connection(
     (
         WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
         String,
+        String,
     ),
     EdgeAuthenticationError,
 > {
@@ -162,6 +163,7 @@ pub async fn authenticate_connection(
         match response {
             EdgeServerMessage::AuthOk {
                 user_id,
+                edge_id,
                 interaction_api_major,
             } => {
                 if interaction_api_major != astra_server_types::AGENT_INTERACTION_API_MAJOR {
@@ -170,10 +172,13 @@ pub async fn authenticate_connection(
                 if user_id.trim().is_empty() {
                     return Err(EdgeAuthenticationError::InvalidAccount);
                 }
+                if edge_id.trim().is_empty() {
+                    return Err(EdgeAuthenticationError::Protocol);
+                }
                 if expected_account.is_some_and(|expected| expected != user_id) {
                     return Err(EdgeAuthenticationError::AccountMismatch);
                 }
-                Ok(user_id)
+                Ok((user_id, edge_id))
             }
             EdgeServerMessage::AuthError { .. } => Err(EdgeAuthenticationError::Rejected),
             _ => Err(EdgeAuthenticationError::Protocol),
@@ -185,7 +190,8 @@ pub async fn authenticate_connection(
         result = tokio::time::timeout_at(deadline, exchange) =>
             result.map_err(|_| EdgeAuthenticationError::Timeout)??,
     };
-    Ok((socket, account))
+    let (account, edge_id) = account;
+    Ok((socket, account, edge_id))
 }
 
 /// Account is the actual AuthOk identity, not a caller-local fallback.
@@ -1018,19 +1024,19 @@ mod tests {
     async fn authentication_uses_server_identity_and_rejects_untrusted_acknowledgements() {
         let cases = [
             (
-                serde_json::json!({"type":"edge_auth_ok","user_id":"account","interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR}),
+                serde_json::json!({"type":"edge_auth_ok","user_id":"account","edge_id":"ws-account","interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR}),
                 None,
             ),
             (
-                serde_json::json!({"type":"edge_auth_ok","user_id":"other","interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR}),
+                serde_json::json!({"type":"edge_auth_ok","user_id":"other","edge_id":"ws-other","interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR}),
                 Some("mismatch"),
             ),
             (
-                serde_json::json!({"type":"edge_auth_ok","user_id":" ","interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR}),
+                serde_json::json!({"type":"edge_auth_ok","user_id":" ","edge_id":"ws-invalid-account","interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR}),
                 Some("account"),
             ),
             (
-                serde_json::json!({"type":"edge_auth_ok","user_id":"account","interaction_api_major":"invalid"}),
+                serde_json::json!({"type":"edge_auth_ok","user_id":"account","edge_id":"ws-invalid-contract","interaction_api_major":"invalid"}),
                 Some("contract"),
             ),
             (
@@ -1077,7 +1083,11 @@ mod tests {
                 authenticate_connection(socket, auth, Some("account"), &CancellationToken::new())
                     .await;
             match failure {
-                None => assert_eq!(result.unwrap().1, "account"),
+                None => {
+                    let (_, account, edge_id) = result.unwrap();
+                    assert_eq!(account, "account");
+                    assert_eq!(edge_id, "ws-account");
+                }
                 Some(kind) => {
                     let error = result.unwrap_err();
                     assert_eq!(error.is_permanent(), kind != "closed");

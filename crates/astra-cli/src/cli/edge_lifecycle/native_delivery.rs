@@ -563,7 +563,6 @@ async fn connect_native_delivery(
         .ok_or("native delivery requires a bound permission attachment")?;
     let expected_session_id = attachment.session_id().to_owned();
     let expected_attachment_epoch = attachment.attachment_epoch();
-    let config = Arc::new(config);
     let mut request = config
         .websocket_url
         .as_str()
@@ -593,10 +592,17 @@ async fn connect_native_delivery(
         workspace_dir: Some(workspace_root.to_string_lossy().into_owned()),
         capabilities: Some(capabilities(&config, None)),
     };
-    let (socket, account_id) =
+    let (socket, account_id, edge_transport_id) =
         astra_edge::authenticate_connection(socket, auth, Some(&config.account_id), cancellation)
             .await
             .map_err(|_| "native delivery authentication failed")?;
+    // The server owns the transport identity. The local agent label is only
+    // an authenticated capability selector and must never be reused as the
+    // REST callback identity.
+    let config = Arc::new(NativeDeliveryConfig {
+        edge_transport_id,
+        ..config
+    });
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let context = EdgeConnectionContext {
         account_id,
@@ -1343,11 +1349,12 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
-            matchers::{method, path},
+            matchers::{header, method, path},
         };
         let http = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/agents/edge"))
+            .and(header("X-Astra-Edge-Id", "ws-native-test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
             .mount(&http)
             .await;
@@ -1385,6 +1392,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&EdgeServerMessage::AuthOk {
                     user_id: "account-test".into(),
+                    edge_id: "ws-native-test".into(),
                     interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
                 })
                 .unwrap()

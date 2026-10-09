@@ -631,6 +631,7 @@ async fn handle_edge_connection(
         &ws_sink,
         EdgeServerMessage::AuthOk {
             user_id: user_id.clone(),
+            edge_id: edge_id_for_registry.clone(),
             interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         },
     )

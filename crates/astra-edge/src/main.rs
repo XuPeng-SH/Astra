@@ -782,7 +782,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let socket = write
         .reunite(read)
         .map_err(|_| "Edge socket halves could not be reunited")?;
-    let (socket, authenticated_account) =
+    let (socket, authenticated_account, _authenticated_edge_id) =
         astra_edge::authenticate_connection(socket, auth_msg, None, &CancellationToken::new())
             .await?;
     // Only the token snapshot proven by this connection may advance persistence.
@@ -1015,6 +1015,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&EdgeServerMessage::AuthOk {
                     user_id: "user".into(),
+                    edge_id: "ws-budget-test".into(),
                     interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
                 })
                 .unwrap()
@@ -1130,6 +1131,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&EdgeServerMessage::AuthOk {
                     user_id: "user".into(),
+                    edge_id: "ws-cleanup-test".into(),
                     interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
                 })
                 .unwrap()
@@ -1231,6 +1233,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&EdgeServerMessage::AuthOk {
                     user_id: "user".into(),
+                    edge_id: "ws-recovery-test".into(),
                     interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
                 })
                 .unwrap()

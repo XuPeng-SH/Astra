@@ -393,6 +393,12 @@ async fn ws_auth(
         "edge authentication failed: {resp_json}"
     );
     assert_eq!(resp_json["user_id"], "test-user-1");
+    assert!(
+        resp_json["edge_id"]
+            .as_str()
+            .is_some_and(|edge_id| edge_id.starts_with("ws-")),
+        "successful authentication must return the server-owned registry identity: {resp_json}"
+    );
 
     ws
 }

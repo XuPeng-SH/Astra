@@ -15,7 +15,7 @@
 //!
 //! **Server → Edge** (JSON text frames):
 //! ```text
-//! {"type": "edge_auth_ok", "user_id": "...", "interaction_api_major": "3"}
+//! {"type": "edge_auth_ok", "user_id": "...", "edge_id": "ws-...", "interaction_api_major": "3"}
 //! {"type": "edge_auth_error", "message": "..."}
 //! {"type": "edge_tool_request", "request_id": "...", "tool": "...", "args": {...}}
 //! {"type": "edge_tool_input", "request_id": "...", "delivery_generation": 1, "input": {...}}
@@ -181,6 +181,10 @@ pub enum EdgeServerMessage {
     #[serde(rename = "edge_auth_ok")]
     AuthOk {
         user_id: String,
+        /// Server-issued identity of this authenticated WebSocket registry
+        /// generation. REST callbacks must echo this exact value; an
+        /// edge-local agent label is not a transport identity.
+        edge_id: String,
         interaction_api_major: String,
     },
 
@@ -474,11 +478,13 @@ mod tests {
     fn edge_auth_ok_serializes() {
         let msg = EdgeServerMessage::AuthOk {
             user_id: "u-123".into(),
+            edge_id: "ws-test".into(),
             interaction_api_major: crate::AGENT_INTERACTION_API_MAJOR.into(),
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_auth_ok");
         assert_eq!(v["user_id"], "u-123");
+        assert_eq!(v["edge_id"], "ws-test");
         assert_eq!(
             v["interaction_api_major"],
             crate::AGENT_INTERACTION_API_MAJOR
@@ -632,6 +638,7 @@ mod tests {
         let msg: EdgeServerMessage = serde_json::from_value(json!({
             "type": "edge_auth_ok",
             "user_id": "u1",
+            "edge_id": "ws-u1",
             "interaction_api_major": crate::AGENT_INTERACTION_API_MAJOR,
         }))
         .unwrap();

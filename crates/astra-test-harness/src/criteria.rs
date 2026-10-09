@@ -471,6 +471,11 @@ pub enum Criterion {
         /// order or model prose.
         #[serde(default)]
         min_turns_after_producer: Option<u32>,
+        /// Optional upper bound for the visible-turn distance. Together with
+        /// the minimum this can bind a consumer to the immediately previous
+        /// producer turn without inferring identity from event order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_turns_after_producer: Option<u32>,
     },
 
     /// LLM judger — calls a scoring model with the prompt +
@@ -772,6 +777,9 @@ fn default_cache_read_min_pairs() -> u32 {
 pub enum JournalToolDocument {
     Arguments,
     Result,
+    /// The durable invocation's authenticated run identity. This virtual
+    /// scalar supports cross-turn provenance checks.
+    RunId,
     /// Executor-authored failure evidence for an invocation that did not
     /// produce a successful result. This is intentionally separate from
     /// `Result` so a failed command cannot be mistaken for a successful tool
@@ -1603,6 +1611,9 @@ fn journal_tool_document(
         JournalToolDocument::Result => call.result.as_ref(),
         JournalToolDocument::Error => call.error.as_ref(),
         JournalToolDocument::RuntimeMetadata => Some(&call.runtime_metadata),
+        // RunId is a virtual scalar handled by the bounded value-flow
+        // evaluator; it has no borrowed JSON document on the call itself.
+        JournalToolDocument::RunId => None,
     }
 }
 
@@ -4295,6 +4306,8 @@ fn evaluate_one_with_primary_cache(
             consumer_paths,
             consumer_filters,
             min_turns_after_producer,
+            max_turns_after_producer,
+            ..
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_value_flow_bound");
@@ -4309,13 +4322,20 @@ fn evaluate_one_with_primary_cache(
                     let consumer_document = journal_tool_document(&call, *consumer_document);
                     let matched_value = consumer_document.and_then(|document| {
                         produced.iter().find(|(value, producer_turn)| {
-                            let turn_separation_ok = min_turns_after_producer.is_none_or(|min| {
+                            let turn_separation_ok = if min_turns_after_producer.is_none()
+                                && max_turns_after_producer.is_none()
+                            {
+                                true
+                            } else {
                                 producer_turn.zip(call.turn).is_some_and(
                                     |(producer_turn, consumer_turn)| {
-                                        consumer_turn >= producer_turn.saturating_add(min)
+                                        let distance = consumer_turn.saturating_sub(producer_turn);
+                                        min_turns_after_producer.is_none_or(|min| distance >= min)
+                                            && max_turns_after_producer
+                                                .is_none_or(|max| distance <= max)
                                     },
                                 )
-                            });
+                            };
                             turn_separation_ok
                                 && consumer_paths.iter().any(|path| {
                                     flow_destinations_at_path(document, path)
@@ -4330,10 +4350,21 @@ fn evaluate_one_with_primary_cache(
                     }
                 }
                 if call.name == *producer && call_matches_predicates(&call, producer_filters) {
-                    let producer_value = journal_tool_document(&call, *producer_document)
-                        .and_then(|document| document.pointer(producer_path));
-                    if let Some(value) = producer_value.filter(|value| is_flow_scalar(value)) {
-                        produced.push((value.clone(), call.turn));
+                    let producer_value = if *producer_document == JournalToolDocument::RunId {
+                        (producer_path.is_empty())
+                            .then(|| {
+                                call.run_id
+                                    .as_deref()
+                                    .map(|run_id| serde_json::Value::String(run_id.to_owned()))
+                            })
+                            .flatten()
+                    } else {
+                        journal_tool_document(&call, *producer_document)
+                            .and_then(|document| document.pointer(producer_path))
+                            .cloned()
+                    };
+                    if let Some(value) = producer_value.filter(is_flow_scalar) {
+                        produced.push((value, call.turn));
                     }
                 }
             }
@@ -5463,11 +5494,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
         }
         Criterion::JournalToolValueFlowBound {
             producer,
+            producer_document,
             producer_path,
             producer_filters,
             consumer,
             consumer_paths,
             consumer_filters,
+            min_turns_after_producer,
+            max_turns_after_producer,
             ..
         } => {
             for predicate in producer_filters.iter().chain(consumer_filters) {
@@ -5502,11 +5536,22 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                 .chain(consumer_paths.iter().map(|path| (path, "consumer_paths")))
                 .chain(filter_paths)
             {
-                if path.is_empty() || !path.starts_with('/') {
+                if (path.is_empty() && *producer_document != JournalToolDocument::RunId)
+                    || (!path.is_empty() && !path.starts_with('/'))
+                {
                     return Err(format!(
-                        "JournalToolValueFlowBound.{label} must be a non-empty RFC 6901 JSON pointer; got {path:?}"
+                        "JournalToolValueFlowBound.{label} must be an RFC 6901 JSON pointer; got {path:?}"
                     ));
                 }
+            }
+            if max_turns_after_producer
+                .zip(*min_turns_after_producer)
+                .is_some_and(|(max, min)| max < min)
+            {
+                return Err(
+                    "JournalToolValueFlowBound.max_turns_after_producer must be >= min_turns_after_producer"
+                        .into(),
+                );
             }
             Ok(())
         }
@@ -9546,6 +9591,7 @@ mod tests {
                 },
             ],
             min_turns_after_producer: None,
+            max_turns_after_producer: None,
         };
         let splice_session = mk_session(&[(
             "turn",
@@ -9665,6 +9711,7 @@ mod tests {
                 },
             ],
             min_turns_after_producer: Some(1),
+            max_turns_after_producer: None,
         };
         let producer = call(
             "remember-1",
@@ -9709,6 +9756,98 @@ mod tests {
         assert!(
             result[0].passed,
             "later-turn evidence should satisfy the gate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_id_flow_binds_previous_root_to_the_prior_turn_producer() {
+        let criterion = Criterion::JournalToolValueFlowBound {
+            producer: "agent".into(),
+            producer_document: JournalToolDocument::RunId,
+            producer_path: "".into(),
+            producer_filters: vec![JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/action".into(),
+                equals: Some(serde_json::json!("spawn")),
+                contains: None,
+            }],
+            consumer: "introspect".into(),
+            consumer_document: JournalToolDocument::Result,
+            consumer_paths: vec!["/run_id".into()],
+            consumer_filters: vec![JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/explain/target".into(),
+                equals: Some(serde_json::json!("previous")),
+                contains: None,
+            }],
+            min_turns_after_producer: Some(1),
+            max_turns_after_producer: Some(1),
+        };
+        let spawn = serde_json::json!({
+            "tool_call_id": "spawn-1",
+            "name": "agent",
+            "ok": true,
+            "args_full": r#"{"action":"spawn"} "#,
+            "result_full": "{}"
+        });
+        let introspect_previous = serde_json::json!({
+            "tool_call_id": "introspect-1",
+            "name": "introspect",
+            "ok": true,
+            "args_full": r#"{"explain":{"target":"previous"}}"#,
+            "result_full": r#"{"run_id":"root-1"}"#
+        });
+        let valid = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 1,
+                    "run_id": "root-1",
+                    "tool_calls": [spawn.clone()]
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "run_id": "root-2",
+                    "tool_calls": [introspect_previous.clone()]
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&valid),
+        );
+        assert!(result[0].passed, "valid previous-root binding: {result:?}");
+
+        let current_turn_spawn = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 1,
+                    "run_id": "root-1",
+                    "tool_calls": []
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "run_id": "root-2",
+                    "tool_calls": [spawn, introspect_previous]
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&current_turn_spawn),
+        );
+        assert!(
+            !result[0].passed,
+            "a current-turn spawn cannot certify an unrelated previous root: {result:?}"
         );
     }
 
