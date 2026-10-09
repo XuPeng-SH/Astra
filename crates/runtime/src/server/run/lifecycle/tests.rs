@@ -5451,6 +5451,16 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
         None,
         None,
     ));
+    let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (edge_tx, _edge_rx) = tokio::sync::mpsc::channel(1);
+    let edge_generation = edge_pool.register(
+        "user-a",
+        "selected-cli",
+        None,
+        Some("/user-local/not-server".into()),
+        edge_tx,
+    );
+    let edge_pool_for_assertion = edge_pool.clone();
     let executor = Arc::new(
         ServerSpawnAgentExecutor::new(
             test_settings(),
@@ -5459,7 +5469,8 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
         )
         .with_run_engine(RunEngine::new(Arc::new(
             astra_services::runs::InMemoryRunStateStore::new(),
-        ))),
+        )))
+        .with_edge_connection_pool(Some(edge_pool)),
     );
     let mut parent = test_spawn_runtime_context("native-parent", "user-a");
     parent
@@ -5475,7 +5486,10 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
         ExecutorBinding::edge_agent(
             "selected-cli",
             "Selected CLI",
-            ToolTransportKind::EdgeWs,
+            // Ordinary CLI/TUI admission records the request's durable ledger
+            // transport. Native dispatch resolves the authenticated live
+            // websocket later, at the canonical edge transport owner.
+            ToolTransportKind::EdgeLedger,
             crate::server::tool_execution_binding::ExecutorStatus::Online,
         ),
     );
@@ -5632,6 +5646,18 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
             .prepare_native_spawn(&request, &context, &parent, None)
             .await
             .is_ok()
+    );
+    assert!(edge_pool_for_assertion.unregister_generation(
+        "user-a",
+        "selected-cli",
+        edge_generation,
+    ));
+    assert!(
+        executor
+            .prepare_native_spawn(&request, &context, &parent, None)
+            .await
+            .is_err(),
+        "native collaborators must not create a child when their live Edge is remote or disconnected"
     );
     let mut missing_slot = context.clone();
     missing_slot
@@ -25009,6 +25035,7 @@ async fn provider_interaction_requires_an_authenticated_provider_run_owner() {
             request_id: "provider-interaction-request".into(),
             payload: json!({"type": "provider.test.select"}),
             timeout_ms: None,
+            provider_stage_input_id: None,
         },
     )
     .await;
@@ -25067,6 +25094,7 @@ async fn provider_interaction_wait_is_registered_and_resolved_durably() {
                 request_id: "provider-interaction-request".into(),
                 payload: json!({"type": "provider.test.select"}),
                 timeout_ms: None,
+                provider_stage_input_id: None,
             },
         )
         .await
@@ -25198,6 +25226,7 @@ async fn provider_interaction_slow_ack_observer_cannot_extend_stage_deadline() {
         request_id: "slow-question".into(),
         payload: json!({"question":"continue?"}),
         timeout_ms: Some(60_000),
+        provider_stage_input_id: None,
     };
     // A full observer queue must not prevent canonical timeout settlement.
     let decision = tokio::time::timeout(
@@ -25258,6 +25287,7 @@ async fn provider_submission_before_wait_admission_resumes_the_original_gate() {
                 request_id: "provider-pre-wait-request".into(),
                 payload: json!({"type": "provider.test.select"}),
                 timeout_ms: None,
+                provider_stage_input_id: None,
             },
         )
         .await
@@ -25398,6 +25428,7 @@ async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedPro
                 request_id: interaction_request_id,
                 payload: json!({"type": "provider.test.select"}),
                 timeout_ms: None,
+                provider_stage_input_id: None,
             },
         )
         .await
@@ -34477,6 +34508,42 @@ async fn submit_run_user_intent_rejects_oversized_content() {
         }),
         "oversized input must not be appended before validation"
     );
+}
+
+#[tokio::test]
+async fn submit_run_user_intent_rejects_multibyte_provider_input_overflow() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+    engine
+        .start_run("run-multibyte-input", "user-1", "session-1")
+        .await
+        .unwrap();
+
+    let e = err(svc
+        .submit_run_user_intent(
+            "run-multibyte-input".into(),
+            "user-1".into(),
+            RunUserIntentData {
+                intent_id: "intent-multibyte-large".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "界".repeat(11_000)}),
+            },
+        )
+        .await);
+
+    assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE);
+    let durable = engine
+        .load_run("user-1", "run-multibyte-input")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(durable.events.iter().all(|event| {
+        event
+            .get("data")
+            .and_then(|data| data.get("intent_id"))
+            .and_then(Value::as_str)
+            != Some("intent-multibyte-large")
+    }));
 }
 
 #[tokio::test]

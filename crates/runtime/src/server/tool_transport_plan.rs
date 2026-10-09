@@ -38,6 +38,7 @@ pub(crate) struct EdgeBoundExecutionPlan {
     runtime_edge_dispatch_authorization:
         Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
     runtime_edge_dispatch_authorization_required: bool,
+    requires_live_provider_interaction: bool,
 }
 
 impl EdgeBoundExecutionPlan {
@@ -159,6 +160,11 @@ impl EdgeBoundExecutionPlan {
                 .clone(),
             runtime_edge_dispatch_authorization_required: request
                 .runtime_edge_dispatch_authorization_required,
+            requires_live_provider_interaction: request
+                .policy
+                .resolved_provider_policy
+                .as_ref()
+                .is_some_and(|policy| policy.is_collaborator_stage()),
         })
     }
 
@@ -246,6 +252,10 @@ impl EdgeBoundExecutionPlan {
 
     pub(crate) fn runtime_edge_dispatch_authorization_required(&self) -> bool {
         self.runtime_edge_dispatch_authorization_required
+    }
+
+    pub(crate) fn requires_live_provider_interaction(&self) -> bool {
+        self.requires_live_provider_interaction
     }
 
     pub(crate) fn wait_timeout(&self) -> Duration {

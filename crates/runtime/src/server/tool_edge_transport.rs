@@ -82,7 +82,8 @@ pub(crate) async fn execute_edge_bound(
     // records intent before socket delivery and can accept a replayed result
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
-    if plan.runtime_process_authorization().is_none()
+    if !plan.requires_live_provider_interaction()
+        && plan.runtime_process_authorization().is_none()
         && plan.runtime_edge_dispatch_authorization().is_none()
     {
         match try_edge_dispatch(
@@ -117,6 +118,9 @@ pub(crate) async fn execute_edge_bound(
                     .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
             }
         }
+    } else if plan.requires_live_provider_interaction() {
+        diagnostics
+            .push("edge-dispatch: collaborator stage requires live websocket delivery".to_string());
     } else if plan.runtime_process_authorization().is_some() {
         diagnostics.push(
             "edge-dispatch: process authorization requires live websocket delivery".to_string(),

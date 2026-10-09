@@ -122,6 +122,13 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn physical_workspace_id(&self) -> String {
+        astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+            "fixture-materialization",
+            "/selected-runner",
+        )
+    }
+
     async fn cleanup(&self) {
         // This fixture owns a freshly generated user. Never widen cleanup to
         // other users, even when test binaries share the same database.
@@ -402,6 +409,16 @@ fn interaction_event(
     }})
 }
 
+fn interaction_event_with_stage_input(
+    origin: &ToolInvocationInteractionOrigin,
+    native_id: serde_json::Value,
+    stage_input_id: &str,
+) -> serde_json::Value {
+    let mut event = interaction_event(origin, native_id);
+    event["data"]["interaction"]["provider_stage_input_id"] = json!(stage_input_id);
+    event
+}
+
 async fn register_interaction(
     store: &DatabaseRunStateStore,
     origin: &ToolInvocationInteractionOrigin,
@@ -483,7 +500,12 @@ async fn native_interaction_real_producer_register_begin_resolve_and_early_answe
         let (ledger, identity) = fixture.interaction_invocation().await;
         let origin = fixture
             .store
-            .derive_tool_interaction_origin(&identity, "selected-runner")
+            .derive_tool_interaction_origin(
+                &identity,
+                "selected-runner",
+                &fixture.physical_workspace_id(),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(origin.owner_generation, 1);
@@ -582,19 +604,101 @@ async fn native_interaction_real_producer_register_begin_resolve_and_early_answe
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and real MatrixOne"]
-async fn native_interaction_real_producer_rejects_wrong_edge_and_forged_generation() {
+async fn native_interaction_provisional_stage_fence_does_not_consume_unacknowledged_guidance() {
+    let fixture = Fixture::new().await;
+    let (_ledger, identity) = fixture.interaction_invocation().await;
+    let intent_id = "guidance-before-provider-ack";
+    fixture
+        .store
+        .append_event(
+            &fixture.user_id,
+            &fixture.session_id,
+            &identity.run_id,
+            json!({
+                "event_type": "user_intent",
+                "idempotency_key": format!("user_intent:{intent_id}"),
+                "data": {
+                    "intent_id": intent_id,
+                    "delivery": "guide_current_run",
+                    "input": {"content": "continue with the review"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let source = fixture
+        .store
+        .load_run_event_by_idempotency_key(
+            &fixture.user_id,
+            &identity.run_id,
+            "user_intent",
+            &format!("user_intent:{intent_id}"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let source_index = source["index"].as_i64().unwrap();
+    let provisional = fixture
+        .store
+        .derive_tool_interaction_origin(
+            &identity,
+            "selected-runner",
+            &fixture.physical_workspace_id(),
+            Some(intent_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(source_index, provisional.control_epoch);
+    let event = interaction_event_with_stage_input(&provisional, json!(7), intent_id);
+
+    assert_eq!(
+        register_interaction(&fixture.store, &provisional, &event)
+            .await
+            .unwrap(),
+        AtomicRunInteractionBatchRegistration::Registered
+    );
+    assert_eq!(
+        begin_interaction(&fixture.store, &provisional)
+            .await
+            .unwrap(),
+        DurableRunInteractionWaitOutcome::Waiting
+    );
+
+    let durable = fixture
+        .store
+        .load_run(&fixture.user_id, &identity.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        durable.events.iter().all(|event| {
+            event.get("event_type").and_then(|value| value.as_str()) != Some("user_intent_applied")
+        }),
+        "registering a pre-ACK provider question must not consume guidance"
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and real MatrixOne"]
+async fn native_interaction_real_producer_accepts_reconnect_and_rejects_wrong_workspace() {
     let fixture = Fixture::new().await;
     let (_ledger, identity) = fixture.interaction_invocation().await;
     assert!(matches!(
         fixture
             .store
-            .derive_tool_interaction_origin(&identity, "other-runner")
+            .derive_tool_interaction_origin(&identity, "other-runner", "other-physical", None)
             .await,
         Err(ToolInteractionAdmissionError::Unproven)
     ));
     let origin = fixture
         .store
-        .derive_tool_interaction_origin(&identity, "selected-runner")
+        .derive_tool_interaction_origin(
+            &identity,
+            "reconnected-runner",
+            &fixture.physical_workspace_id(),
+            None,
+        )
         .await
         .unwrap();
     let before = fixture
@@ -611,7 +715,7 @@ async fn native_interaction_real_producer_rejects_wrong_edge_and_forged_generati
         "binding",
         "epoch",
         "descriptor",
-        "edge",
+        "physical_workspace",
         "owner",
     ] {
         let mut forged = origin.clone();
@@ -629,7 +733,7 @@ async fn native_interaction_real_producer_rejects_wrong_edge_and_forged_generati
                     .unwrap()
                     .descriptor
             }
-            "edge" => forged.edge_agent_id = "other-runner".into(),
+            "physical_workspace" => forged.physical_workspace_id = "other-physical".into(),
             "owner" => forged.owner_generation += 1,
             _ => unreachable!(),
         }
@@ -702,7 +806,12 @@ async fn native_interaction_real_producer_unknown_dispatch_fences_answer() {
     let (ledger, identity) = fixture.interaction_invocation().await;
     let origin = fixture
         .store
-        .derive_tool_interaction_origin(&identity, "selected-runner")
+        .derive_tool_interaction_origin(
+            &identity,
+            "selected-runner",
+            &fixture.physical_workspace_id(),
+            None,
+        )
         .await
         .unwrap();
     register_interaction(
@@ -723,7 +832,12 @@ async fn native_interaction_real_producer_unknown_dispatch_fences_answer() {
     assert!(matches!(
         fixture
             .store
-            .derive_tool_interaction_origin(&identity, "selected-runner")
+            .derive_tool_interaction_origin(
+                &identity,
+                "selected-runner",
+                &fixture.physical_workspace_id(),
+                None,
+            )
             .await,
         Err(ToolInteractionAdmissionError::Unproven)
     ));
@@ -753,7 +867,12 @@ async fn native_interaction_real_producer_settlement_lease_and_cancel_fence_answ
         let (ledger, identity) = fixture.interaction_invocation().await;
         let origin = fixture
             .store
-            .derive_tool_interaction_origin(&identity, "selected-runner")
+            .derive_tool_interaction_origin(
+                &identity,
+                "selected-runner",
+                &fixture.physical_workspace_id(),
+                None,
+            )
             .await
             .unwrap();
         register_interaction(
@@ -817,7 +936,12 @@ async fn native_interaction_real_producer_settlement_lease_and_cancel_fence_answ
             matches!(
                 fixture
                     .store
-                    .derive_tool_interaction_origin(&identity, "selected-runner")
+                    .derive_tool_interaction_origin(
+                        &identity,
+                        "selected-runner",
+                        &fixture.physical_workspace_id(),
+                        None,
+                    )
                     .await,
                 Err(ToolInteractionAdmissionError::Unproven)
             ),

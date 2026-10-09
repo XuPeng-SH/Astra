@@ -692,6 +692,7 @@ async fn handle_edge_connection(
             workspace_id.clone(),
             Some(registration_lease.current.registry_id.clone()),
             registration_lease.current.materialization_id.clone(),
+            Some(edge_id_for_registry.clone()),
             pool_tx,
         );
     // Independently poll publication and its deadline even while a message or
@@ -1018,6 +1019,43 @@ async fn handle_edge_connection(
                                             edge_agent_id = %edge_agent_id,
                                             request_id = %request_id,
                                             "Edge WS: result was not durably accepted; withholding acknowledgement"
+                                        );
+                                    }
+                                }
+                                Ok(EdgeClientMessage::ToolInputAck {
+                                    request_id,
+                                    delivery_generation,
+                                    ack,
+                                }) => {
+                                    if ack.input_id.trim().is_empty()
+                                        || ack.input_id != ack.input_id.trim()
+                                    {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge WS: rejected provider input acknowledgement with invalid input identity"
+                                        );
+                                        continue;
+                                    }
+                                    let accepted = state
+                                        .edge_connection_pool
+                                        .deliver_provider_stage_input_ack(
+                                            &user_id,
+                                            &edge_agent_id,
+                                            &request_id,
+                                            delivery_generation,
+                                            ack,
+                                        );
+                                    if !accepted {
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            delivery_generation,
+                                            "Edge WS: provider input acknowledgement had no matching waiter"
                                         );
                                     }
                                 }

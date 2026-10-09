@@ -2784,10 +2784,12 @@ mod tests {
             )
             .unwrap(),
             edge_agent_id: "edge".into(),
+            physical_workspace_id: "physical-test".into(),
             interaction: astra_turn_types::ProviderInteractionRequest {
                 request_id: "question".into(),
                 payload: serde_json::json!({"question": "Choose a direction"}),
                 timeout_ms: Some(10_000),
+                provider_stage_input_id: None,
             },
         };
         for (case, terminal_id, required_run, expected_ok) in [

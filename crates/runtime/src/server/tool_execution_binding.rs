@@ -422,6 +422,10 @@ pub struct ExecutionBindingSnapshot {
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_binding_generation: Option<u64>,
+    /// Stable physical checkout identity for native Edge execution. The live
+    /// executor id may change after a CLI restart; this identity must not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_workspace_id: Option<String>,
 }
 
 impl ExecutionBindingSnapshot {
@@ -435,6 +439,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: Some(runtime),
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 
@@ -444,6 +449,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: None,
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 }

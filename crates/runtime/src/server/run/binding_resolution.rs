@@ -88,6 +88,12 @@ pub(crate) fn binding_snapshot_fields(snapshot: &ExecutionBindingSnapshot) -> Ma
             Value::from(generation),
         );
     }
+    if let Some(physical_workspace_id) = snapshot.physical_workspace_id.as_deref() {
+        fields.insert(
+            "physical_workspace_id".to_string(),
+            Value::String(physical_workspace_id.to_string()),
+        );
+    }
     fields
 }
 
@@ -213,6 +219,7 @@ pub(crate) fn durable_run_execution_contract(
         "executor",
         "transport",
         "execution_binding_generation",
+        "physical_workspace_id",
         "runtime",
     ] {
         if workspace.get(key) != executor.get(key) {
@@ -262,6 +269,16 @@ pub(crate) fn durable_run_execution_contract(
     snapshot.execution_binding_generation = workspace
         .get("execution_binding_generation")
         .map(|value| value.as_u64().ok_or("binding generation is malformed"))
+        .transpose()?;
+    snapshot.physical_workspace_id = workspace
+        .get("physical_workspace_id")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or("physical workspace identity is malformed")
+        })
         .transpose()?;
     Ok((snapshot, checks))
 }

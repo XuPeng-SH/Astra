@@ -2064,8 +2064,13 @@ async fn begin_durable_server_interaction_wait(
     kind: astra_services::runs::DurableRunInteractionKind,
     required_event: &Value,
 ) -> Result<DurableServerInteractionWaitStart, String> {
+    // This gate only needs the current control projection. Hydrating the full
+    // event journal here was redundant: registration below rechecks the exact
+    // run/session under the canonical session and run locks. Keeping this
+    // first read narrow matters for long-lived runs and for many sessions
+    // sharing the same database pool.
     let run = run_engine
-        .load_run(user_id, run_id)
+        .load_run_control(user_id, run_id)
         .await?
         .filter(|run| run.session_id == session_id)
         .ok_or_else(|| format!("durable run {run_id} disappeared or crossed session scope"))?;
@@ -10484,6 +10489,7 @@ impl AgenticRunLifecycleService {
         let binding_is_edge = binding.workspace.kind
             == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
             || binding.executor.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent;
+        let mut selected_binding = binding.clone();
         if binding_is_edge {
             if request_is_server {
                 return Err(error_response_coded(
@@ -10492,16 +10498,43 @@ impl AgenticRunLifecycleService {
                     "execution_binding_provider_mismatch",
                 ));
             }
-            let requested_matches =
+            let requested_workspace_matches =
                 request.workspace_binding.as_ref().is_some_and(|workspace| {
                     workspace.kind == binding.workspace.kind
                         && workspace.root.as_deref().map(str::trim)
                             == binding.workspace.root.as_deref().map(str::trim)
-                }) && request.executor_binding.as_ref().is_some_and(|executor| {
-                    executor.kind == binding.executor.kind
-                        && executor.executor_id.as_deref().map(str::trim)
-                            == binding.executor.executor_id.as_deref().map(str::trim)
                 });
+            let requested_executor = request.executor_binding.as_ref();
+            let requested_executor_matches = requested_executor.is_some_and(|executor| {
+                executor.kind == binding.executor.kind
+                    && executor
+                        .executor_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty())
+            });
+            // The durable executor id identifies the previous live route, not
+            // the physical checkout. A restarted CLI gets a new process-scoped
+            // route id, while the authenticated materialization identity below
+            // proves it is the same checkout. Requiring the old process id here
+            // made an ordinary restart look like an implicit provider handoff.
+            if requested_workspace_matches
+                && requested_executor_matches
+                && let Some(requested_executor) = requested_executor
+            {
+                let mut effective_executor = binding.executor.clone();
+                effective_executor.executor_id = requested_executor.executor_id.clone();
+                if requested_executor.display_name.is_some() {
+                    effective_executor.display_name = requested_executor.display_name.clone();
+                }
+                if requested_executor.transport.is_some() {
+                    effective_executor.transport = requested_executor.transport;
+                }
+                if requested_executor.status.is_some() {
+                    effective_executor.status = requested_executor.status;
+                }
+                selected_binding.executor = effective_executor;
+            }
+            let requested_matches = requested_workspace_matches && requested_executor_matches;
             if !requested_matches {
                 return Err(error_response_coded(
                     StatusCode::CONFLICT,
@@ -10544,10 +10577,14 @@ impl AgenticRunLifecycleService {
         {
             Some(server_loop_host::AuthenticatedEdgeDiscovery {
                 user_id: user_id.to_owned(),
-                executor_id: binding.executor.executor_id.clone().ok_or_else(|| {
-                    error_response(StatusCode::CONFLICT, "selected Edge executor is missing")
-                })?,
-                workspace_root: binding.workspace.root.clone().ok_or_else(|| {
+                executor_id: selected_binding
+                    .executor
+                    .executor_id
+                    .clone()
+                    .ok_or_else(|| {
+                        error_response(StatusCode::CONFLICT, "selected Edge executor is missing")
+                    })?,
+                workspace_root: selected_binding.workspace.root.clone().ok_or_else(|| {
                     error_response(StatusCode::CONFLICT, "selected Edge root is missing")
                 })?,
                 physical_workspace_id: binding.physical_workspace_id.clone().ok_or_else(|| {
@@ -10562,9 +10599,9 @@ impl AgenticRunLifecycleService {
         } else {
             None
         };
-        request.workspace_binding = Some(binding.workspace);
-        request.executor_binding = Some(binding.executor);
-        request.execution_binding_generation = Some(binding.generation);
+        request.workspace_binding = Some(selected_binding.workspace);
+        request.executor_binding = Some(selected_binding.executor);
+        request.execution_binding_generation = Some(selected_binding.generation);
         Ok(authenticated_edge_discovery)
     }
 
@@ -10677,6 +10714,23 @@ impl AgenticRunLifecycleService {
                 StatusCode::PRECONDITION_REQUIRED,
                 "the selected Edge is registered with a different workspace root",
                 "execution_binding_provider_required",
+            ));
+        }
+
+        // Native provider stages use the existing bidirectional WebSocket for
+        // live guidance and input acknowledgements. The registry is shared
+        // across pods, but the in-memory socket is not; accepting a remote
+        // registry row here would create a durable Session that cannot deliver
+        // its first native invocation on this server. Ordinary EdgeLedger
+        // requests have a durable relay and do not take this branch.
+        let requires_local_socket = request.executor_binding.as_ref().is_some_and(|executor| {
+            executor.transport == Some(astra_services::runs::ToolTransportKindRequest::EdgeWs)
+        });
+        if requires_local_socket && pool_edge.is_none() && registry_edge.is_some() {
+            return Err(error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the selected Edge is connected to another server; retry this turn through that Edge connection",
+                "edge_route_unavailable",
             ));
         }
 
@@ -17075,6 +17129,11 @@ impl AgenticRunLifecycleService {
                         ExecutionBindingSnapshot::inferred(workspace, executor)
                     })
                 });
+            if let Some(discovery) = runtime_capabilities.authenticated_edge_discovery.as_ref()
+                && let Some(snapshot) = execution_bindings.as_mut()
+            {
+                snapshot.physical_workspace_id = Some(discovery.physical_workspace_id.clone());
+            }
             if let Some(generation) = request.execution_binding_generation {
                 let Some(snapshot) = execution_bindings.as_mut() else {
                     return Err(error_response_coded(
@@ -18525,6 +18584,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         identity: astra_turn_types::ToolInvocationIdentity,
         edge_agent_id: String,
+        physical_workspace_id: String,
         interaction: astra_turn_types::ProviderInteractionRequest,
         stream_event_tx: Option<mpsc::Sender<Value>>,
     ) -> Result<astra_turn_types::ProviderInteractionResponse, (StatusCode, Json<ErrorResponse>)>
@@ -18544,7 +18604,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let origin = self
             .run_engine
             .store()
-            .derive_tool_interaction_origin(&identity, &edge_agent_id)
+            .derive_tool_interaction_origin(
+                &identity,
+                &edge_agent_id,
+                &physical_workspace_id,
+                interaction.provider_stage_input_id.as_deref(),
+            )
             .await
             .map_err(|error| {
                 let status = match &error {
@@ -18555,24 +18620,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 };
                 error_response(status, error.to_string())
             })?;
-        let run = self
-            .run_engine
-            .load_run(&user_id, &identity.run_id)
-            .await
-            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?
-            .filter(|run| run.session_id == identity.session_id)
-            .ok_or_else(|| {
-                error_response(StatusCode::NOT_FOUND, "Tool interaction run not found")
-            })?;
-        let cutoff = run
-            .execution_restrictions()
-            .map_err(|error| error_response(StatusCode::CONFLICT, error.to_string()))?
-            .and_then(|restrictions| match restrictions {
-                astra_services::runs::DurableExecutionRestrictions::V1 {
-                    execution_work_deadline_unix_ms,
-                    ..
-                } => execution_work_deadline_unix_ms,
-            });
+        // `derive_tool_interaction_origin` already validated the exact run,
+        // session and live invocation under the store's admission boundary.
+        // It also carries the immutable work deadline from run-start. Do not
+        // call load_run here: that path re-reads and decodes the entire event
+        // journal for a value that was already part of the admission fact.
+        let cutoff = origin.execution_work_deadline_unix_ms;
         let admitted_deadline = if let Some(cutoff) = cutoff {
             let now_unix_ms =
                 u64::try_from(chrono::Utc::now().timestamp_millis()).map_err(|_| {
@@ -18777,6 +18830,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "user intent must contain actionable content",
             ));
         }
+        let intent_id = input.intent_id.trim().to_string();
+        if input.delivery == astra_turn_types::UserIntentDelivery::GuideCurrentRun {
+            let content = crate::turn::run_control::user_intent_content(&input.input)
+                .expect("actionable user intent was checked above");
+            let provider_input = astra_turn_types::ProviderStageInput::Text {
+                input_id: intent_id.clone(),
+                content,
+                correlation_id: None,
+                expected_turn_id: None,
+            };
+            if provider_input.validate().is_err() {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "current-run guidance exceeds the provider stage input byte budget",
+                ));
+            }
+        }
         if user_intent_text_len(&input.input) > MAX_USER_INTENT_CHARS {
             return Err(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -18785,7 +18855,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
-        let intent_id = input.intent_id.trim().to_string();
         let event = json!({
             "event_type": "user_intent",
             "idempotency_key": format!("user_intent:{intent_id}"),
@@ -21410,6 +21479,10 @@ async fn admit_model_offering_batch(
 pub(crate) struct PreparedNativeSubrunExecution {
     pub stage_admission: astra_services::runs::CollaboratorStageAdmission,
     pub identity: crate::orchestration::PreparedSpawnProviderIdentity,
+    /// Current authenticated route. The durable association stores the
+    /// physical materialization identity, so a CLI restart can use a new
+    /// process-scoped route without changing the collaborator.
+    pub live_edge_agent_id: String,
     pub tool_name: String,
     pub arguments: Value,
     pub policy: astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
@@ -21444,6 +21517,141 @@ fn ensure_collaborator_context_continuation(
         );
     }
     Ok(())
+}
+
+/// Convert only a normal agent text message into provider input. Progress,
+/// signals, permissions, and structured replies retain their existing
+/// mailbox owners and are delivered to the canonical loop at its next
+/// provider boundary; the native adapter must not reinterpret them.
+fn provider_stage_input_from_message(
+    message: &astra_messaging::AgentMessage,
+) -> Option<astra_turn_types::ProviderStageInput> {
+    let astra_messaging::MessagePayload::Text { content, .. } = &message.payload else {
+        return None;
+    };
+    let input = astra_turn_types::ProviderStageInput::Text {
+        input_id: message.id.clone(),
+        content: content.clone(),
+        correlation_id: message.correlation_id.clone(),
+        expected_turn_id: None,
+    };
+    input.validate().ok().map(|()| input)
+}
+
+fn provider_stage_input_from_user_intent(
+    event: &crate::turn::run_control::QueuedUserIntent,
+) -> Option<astra_turn_types::ProviderStageInput> {
+    let content = crate::turn::run_control::user_intent_content(&event.input)?;
+    Some(astra_turn_types::ProviderStageInput::Text {
+        input_id: event.intent_id.clone(),
+        content,
+        correlation_id: None,
+        expected_turn_id: None,
+    })
+}
+
+enum NativeProviderInputPumpResult {
+    Idle,
+    Accepted,
+    Deferred,
+    Stopped,
+}
+
+async fn deliver_next_native_user_intent<H: AgenticLoopHost>(
+    pool: &astra_server_types::edge_connection_pool::EdgeConnectionPool,
+    identity: &astra_turn_types::ToolInvocationIdentity,
+    edge_agent_id: &str,
+    edge_deadline: tokio::time::Instant,
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    host: &mut H,
+    state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
+    user_id: &str,
+    run_id: &str,
+) -> Result<NativeProviderInputPumpResult, astra_core::ClassifiedError> {
+    let pending = match crate::turn::agentic_loop::execution_phase::next_provider_stage_user_intent(
+        host, state, user_id, run_id,
+    )
+    .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                error = %error,
+                "native provider stage could not observe current-run guidance; retaining it"
+            );
+            return Ok(NativeProviderInputPumpResult::Deferred);
+        }
+    };
+    let Some((event, next_cursor, commit_cursor)) = pending else {
+        return Ok(NativeProviderInputPumpResult::Idle);
+    };
+    let Some(stage_input) = provider_stage_input_from_user_intent(&event) else {
+        return Ok(NativeProviderInputPumpResult::Idle);
+    };
+    let ack = match pool
+        .deliver_provider_stage_input(
+            identity,
+            edge_agent_id,
+            stage_input,
+            edge_deadline,
+            cancel_token,
+        )
+        .await
+    {
+        Ok(ack) => ack,
+        Err(error) => {
+            tracing::debug!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                error = %error,
+                may_have_reached_provider = error.may_have_reached_provider,
+                "native provider guidance delivery did not complete"
+            );
+            return Ok(if error.may_have_reached_provider {
+                NativeProviderInputPumpResult::Stopped
+            } else {
+                NativeProviderInputPumpResult::Deferred
+            });
+        }
+    };
+    if ack.accepted {
+        let outcome = crate::turn::agentic_loop::execution_phase::apply_provider_stage_user_intent(
+            host,
+            state,
+            &event,
+            next_cursor,
+            commit_cursor,
+        )
+        .await?;
+        Ok(match outcome {
+            Some(
+                crate::turn::run_control::UserIntentApplyAck::Applied
+                | crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned,
+            ) => NativeProviderInputPumpResult::Accepted,
+            Some(crate::turn::run_control::UserIntentApplyAck::Paused) | None => {
+                // The provider has accepted the input. A failed durable apply
+                // must be retried by the canonical run-control owner, not by
+                // sending the same instruction to the provider again.
+                NativeProviderInputPumpResult::Stopped
+            }
+        })
+    } else {
+        tracing::warn!(
+            target: "astra_runtime::run_lifecycle",
+            run_id,
+            intent_id = %event.intent_id,
+            reason = ack.reason.as_deref().unwrap_or("provider rejected input"),
+            "native provider rejected current-run guidance"
+        );
+        // The provider did not accept this input, so the durable source must
+        // retain it for the next safe provider boundary. A question/approval
+        // can temporarily occupy the native protocol; do not permanently
+        // disable the run's guidance lane merely because this attempt was
+        // rejected.
+        Ok(NativeProviderInputPumpResult::Deferred)
+    }
 }
 
 fn native_stage_reasoning_arguments(
@@ -21524,11 +21732,37 @@ impl ServerSpawnAgentExecutor {
         if binding.executor.kind != ExecutorBindingKind::EdgeAgent
             || !matches!(
                 binding.executor.transport,
-                ToolTransportKind::EdgeWs | ToolTransportKind::EdgeLedger
+                ToolTransportKind::EdgeLedger | ToolTransportKind::EdgeWs
             )
             || binding.workspace.kind != WorkspaceBindingKind::EdgeWorkspace
         {
-            return Err("native collaborators require an explicitly selected CLI/User Runner; Server execution is forbidden".into());
+            return Err(
+                "native collaborators require an Edge executor and workspace binding".into(),
+            );
+        }
+        let workspace_root = binding
+            .workspace
+            .cwd
+            .as_deref()
+            .filter(|root| !root.trim().is_empty())
+            .ok_or_else(|| "native collaborator requires a bound workspace root".to_string())?;
+        let live_edge_agent_id = binding.executor.executor_id.clone();
+        let edge_pool = self.edge_connection_pool.as_ref().ok_or_else(|| {
+            "native collaborator requires the live Edge WebSocket transport".to_string()
+        })?;
+        let local_edge_connected =
+            edge_pool
+                .get_all_user_edges(&parent.user_id)
+                .iter()
+                .any(|edge| {
+                    edge.edge_agent_id == live_edge_agent_id
+                        && edge.workspace_dir.as_deref() == Some(workspace_root)
+                });
+        if !local_edge_connected {
+            return Err(
+                "native collaborator Edge is not connected to this server for the selected workspace"
+                    .into(),
+            );
         }
         let binding_generation = binding.execution_binding_generation.ok_or_else(|| {
             "native collaborator execution binding has no durable generation".to_string()
@@ -21561,10 +21795,15 @@ impl ServerSpawnAgentExecutor {
         let policy_content_id = policy
             .baseline_content_id()
             .map_err(|error| error.to_string())?;
+        let physical_workspace_id = binding
+            .physical_workspace_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| "native collaborator has no physical materialization identity")?;
         let mut association = astra_services::runs::CollaboratorAssociation {
             provider: provider.clone(),
             execution_boundary: astra_services::runs::CollaboratorExecutionBoundary::UserRunner {
-                runner_id: binding.executor.executor_id.clone(),
+                runner_id: physical_workspace_id.to_string(),
             },
             execution_identity_fingerprint: format!(
                 "sha256:{:x}",
@@ -21573,7 +21812,7 @@ impl ServerSpawnAgentExecutor {
                         &policy.descriptor,
                         &policy_content_id,
                         &request.model,
-                        &binding.executor.executor_id
+                        &physical_workspace_id
                     ))
                     .map_err(|error| error.to_string())?
                 )
@@ -21662,6 +21901,7 @@ impl ServerSpawnAgentExecutor {
                 execution_binding_generation: binding_generation,
                 requested_model: request.model.clone(),
             },
+            live_edge_agent_id,
             tool_name: request.tool.clone(),
             arguments,
             policy,
@@ -23088,11 +23328,12 @@ impl ServerSubRunExecutor {
         self
     }
 
-    async fn execute_native_stage(
+    async fn execute_native_stage<H: AgenticLoopHost>(
         &self,
         config: &SubRunConfig,
         state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
         plan_mode_active: bool,
+        host: &mut H,
     ) -> Result<crate::turn::agentic_loop::host::AgenticLoopOutcome, astra_core::ClassifiedError>
     {
         use crate::server::tool_execution_binding::{
@@ -23203,6 +23444,14 @@ impl ServerSubRunExecutor {
             }
         };
         const INVOCATION_ID: &str = "native-stage";
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            &config.user_id,
+            &config.session_id,
+            &config.run_id,
+            &config.run_id,
+            INVOCATION_ID,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
         let control_epoch = i64::try_from(state.user_intents.user_intent_cursor())
             .map_err(|_| invalid("native stage control epoch overflowed".into()))?;
         let dispatch_started_at = Instant::now();
@@ -23211,26 +23460,289 @@ impl ServerSubRunExecutor {
             &native.policy,
             crate::server::tool_route_selection::ToolExecutionRouteKind::EdgeBound,
         );
-        let deferred = executor
-            .execute_invocation_before_governance(
-                &config.run_id,
-                &config.run_id,
-                INVOCATION_ID,
-                &native.tool_name,
-                &native.arguments,
-                Some(&native.policy),
-                Some(&permission_grant),
-                Some(DurableDispatchAdmission {
-                    expected_control_epoch: control_epoch,
-                    expected_owner_generation: generation,
-                    expected_execution_binding_generation: Some(
-                        native.identity.execution_binding_generation,
-                    ),
-                }),
-                None,
-                None,
-            )
-            .await;
+        let invocation = executor.execute_invocation_before_governance(
+            &config.run_id,
+            &config.run_id,
+            INVOCATION_ID,
+            &native.tool_name,
+            &native.arguments,
+            Some(&native.policy),
+            Some(&permission_grant),
+            Some(DurableDispatchAdmission {
+                expected_control_epoch: control_epoch,
+                expected_owner_generation: generation,
+                expected_execution_binding_generation: Some(
+                    native.identity.execution_binding_generation,
+                ),
+            }),
+            None,
+            None,
+        );
+        let edge_agent_id = match &association.association.execution_boundary {
+            astra_services::runs::CollaboratorExecutionBoundary::UserRunner { .. } => {
+                Some(native.live_edge_agent_id.clone())
+            }
+            _ => None,
+        };
+        let can_pump_provider = self.edge_connection_pool.is_some() && edge_agent_id.is_some();
+        let deferred = if can_pump_provider {
+            let mut mailbox = state.messaging.mailbox.take();
+            let pool = self
+                .edge_connection_pool
+                .as_ref()
+                .expect("edge pool checked before native provider input pump");
+            let edge_agent_id =
+                edge_agent_id.expect("edge agent checked before native provider input pump");
+            let edge_deadline =
+                tokio::time::Instant::from_std(stage_deadline.monotonic_work_deadline());
+            let mut input_wake = state.user_intents.wake.clone();
+            let mut invocation = Box::pin(invocation);
+            let mut user_intents_enabled = state.run_control.is_some();
+            let mut poll_user_intents = user_intents_enabled;
+            let mut mailbox_enabled = mailbox.is_some();
+            // The two input owners have independent retry clocks. A provider
+            // rejecting one user guidance item must not pause mailbox delivery
+            // (or vice versa) for the lifetime of the native stage.
+            let mut user_intent_retry_at: Option<tokio::time::Instant> = None;
+            let mut mailbox_retry_at: Option<tokio::time::Instant> = None;
+            let deferred = loop {
+                if poll_user_intents {
+                    poll_user_intents = false;
+                    let input_result = deliver_next_native_user_intent(
+                        pool,
+                        &identity,
+                        &edge_agent_id,
+                        edge_deadline,
+                        config.cancel_token.as_deref(),
+                        host,
+                        state,
+                        &config.user_id,
+                        &config.run_id,
+                    )
+                    .await;
+                    match input_result {
+                        Err(error) => {
+                            // Applying provider-accepted guidance can wait for
+                            // a durable pause to clear. If cancellation wins
+                            // that wait, the invocation future is still the
+                            // owner of the live provider request. Cancel and
+                            // settle it through the existing executor before
+                            // returning; dropping it here would skip the
+                            // transport's ToolCancel and durable completion.
+                            if let Some(cancel_token) = config.cancel_token.as_ref() {
+                                cancel_token.cancel();
+                            }
+                            let cancelled_invocation = invocation.await;
+                            let _ = executor
+                                .finish_governed_tool_result(
+                                    runtime_tool_executor::govern_runtime_tool_result(
+                                        cancelled_invocation.result,
+                                        false,
+                                    ),
+                                    cancelled_invocation.pending,
+                                )
+                                .await;
+                            // The native stage temporarily owns the mailbox
+                            // while the provider invocation is active. An
+                            // authoritative poll failure must return that
+                            // owner before leaving this scope; otherwise
+                            // AgentMailbox::Drop detaches the subscription and
+                            // loses later messages.
+                            if let Some(mut mailbox) = mailbox.take() {
+                                mailbox.retry_deferred();
+                                state.messaging.mailbox = Some(mailbox);
+                            }
+                            return Err(error);
+                        }
+                        Ok(result) => match result {
+                            NativeProviderInputPumpResult::Idle => {}
+                            NativeProviderInputPumpResult::Accepted => {
+                                user_intent_retry_at = None;
+                                poll_user_intents = true;
+                            }
+                            NativeProviderInputPumpResult::Deferred => {
+                                user_intent_retry_at =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                            }
+                            NativeProviderInputPumpResult::Stopped => {
+                                user_intent_retry_at = None;
+                                user_intents_enabled = false;
+                            }
+                        },
+                    }
+                    continue;
+                }
+
+                let has_input_wake = input_wake.is_some() && user_intents_enabled;
+                let has_mailbox = mailbox_enabled && mailbox_retry_at.is_none();
+                tokio::select! {
+                    biased;
+                    result = &mut invocation => break result,
+                    wake = async {
+                        match input_wake.as_mut() {
+                            Some(wake) => wake.changed().await.ok(),
+                            None => None,
+                        }
+                    }, if has_input_wake => {
+                        if wake.is_none() {
+                            input_wake = None;
+                            user_intents_enabled = false;
+                        } else {
+                            poll_user_intents = true;
+                        }
+                    }
+                    _ = async {
+                        match user_intent_retry_at {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    }, if user_intent_retry_at.is_some() => {
+                        user_intent_retry_at = None;
+                        poll_user_intents = true;
+                    }
+                    _ = async {
+                        match mailbox_retry_at {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    }, if mailbox_retry_at.is_some() => {
+                        mailbox_retry_at = None;
+                    }
+                    ready = async {
+                        match mailbox.as_mut() {
+                            Some(mailbox) => mailbox.wait_ready().await,
+                            None => false,
+                        }
+                    }, if has_mailbox => {
+                        if !ready {
+                            mailbox_enabled = false;
+                            continue;
+                        }
+                        let mailbox_ref = mailbox
+                            .as_mut()
+                            .expect("mailbox presence was checked before polling");
+                        let lease = mailbox_ref.lease_bounded(1);
+                        let Some(message) = lease.messages().first().cloned() else {
+                            lease.commit();
+                            continue;
+                        };
+                        let Some(stage_input) = provider_stage_input_from_message(&message) else {
+                            // Keep this non-text protocol message for the
+                            // ordinary loop. `defer(true)` removes it from
+                            // readiness until the native stage returns, while
+                            // later eligible text messages remain available.
+                            lease.defer(true);
+                            continue;
+                        };
+                        let delivered = pool
+                            .deliver_provider_stage_input(
+                                &identity,
+                                &edge_agent_id,
+                                stage_input,
+                                edge_deadline,
+                                config.cancel_token.as_deref(),
+                            )
+                            .await;
+                        match delivered {
+                            Ok(ack) if ack.accepted => {
+                                mailbox_retry_at = None;
+                                lease.commit();
+                                if let Some(mailbox) = mailbox.as_mut()
+                                    && let Err(error) = mailbox
+                                        .acknowledge_received(std::slice::from_ref(&message))
+                                        .await
+                                {
+                                    mailbox.defer_acknowledgement(message);
+                                    tracing::debug!(
+                                        target: "astra_runtime::run_lifecycle",
+                                        error = %error,
+                                        "provider input was accepted but mailbox acknowledgement needs retry"
+                                    );
+                                }
+                            }
+                            Ok(ack) => {
+                                // Do not consume a message the provider did
+                                // not accept. Keep the exact envelope and
+                                // retry it at the next provider boundary;
+                                // answering a concurrent question must not
+                                // permanently close the mailbox lane.
+                                mailbox_retry_at =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                                tracing::warn!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %config.run_id,
+                                    message_id = %message.id,
+                                    reason = ack.reason.as_deref().unwrap_or("provider rejected input"),
+                                    "native provider rejected mailbox guidance"
+                                );
+                            }
+                            Err(error) if !error.may_have_reached_provider => {
+                                // Dropping the lease restores this exact
+                                // envelope. Only a definitely undelivered
+                                // request may be retried automatically.
+                                mailbox_retry_at =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                            }
+                            Err(error) => {
+                                // The provider may have accepted the input.
+                                // Keep the envelope with its canonical mailbox
+                                // owner, but never resend it blindly in this
+                                // stage.
+                                mailbox_enabled = false;
+                                mailbox_retry_at = None;
+                                tracing::warn!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %config.run_id,
+                                    message_id = %message.id,
+                                    error = %error,
+                                    "native provider mailbox delivery is unknown; automatic retry disabled"
+                                );
+                            }
+                        }
+                    }
+                }
+            };
+            // Messages outside the provider-input contract were deliberately
+            // parked for the canonical loop. The native stage has now ended,
+            // so make them visible before handing the single mailbox owner
+            // back; otherwise a parked message would not wake the next turn.
+            if let Some(mut mailbox) = mailbox {
+                mailbox.retry_deferred();
+                state.messaging.mailbox = Some(mailbox);
+            }
+            crate::turn::agentic_loop::lifecycle::acknowledge_adopted_mailbox_messages(state).await;
+            deferred
+        } else {
+            invocation.await
+        };
+        let mut provider_apply_pending = false;
+        if can_pump_provider {
+            // Retry only events that were already accepted by the provider and
+            // staged before their durable apply. Do not run the ordinary
+            // settlement poll here: a newly arrived, rejected, or
+            // delivery-unknown event has no provider acceptance fact and must
+            // remain with its canonical owner.
+            let pending_apply_indices = state.user_intents.pending_apply_event_indices();
+            if !pending_apply_indices.is_empty() {
+                let run_control = state.run_control.clone().ok_or_else(|| {
+                    invalid("native stage has pending guidance but no run-control owner".into())
+                })?;
+                let apply_outcome =
+                    crate::turn::agentic_loop::execution_phase::apply_pending_user_intents(
+                        host,
+                        state,
+                        run_control.as_ref(),
+                        &config.user_id,
+                        &config.session_id,
+                        &config.run_id,
+                        &pending_apply_indices,
+                        None,
+                        false,
+                    )
+                    .await?;
+                provider_apply_pending = apply_outcome.is_none();
+            }
+        }
         let dispatch_control = deferred.dispatch_control;
         let replayed = deferred.confirmed_invocation.is_some();
         let replay_record = deferred.confirmed_invocation;
@@ -23245,14 +23757,6 @@ impl ServerSubRunExecutor {
         let invocation = record.as_deref().ok_or_else(|| {
             invalid("native stage result has no authoritative invocation receipt".into())
         })?;
-        let identity = astra_turn_types::ToolInvocationIdentity::new(
-            &config.user_id,
-            &config.session_id,
-            &config.run_id,
-            &config.run_id,
-            INVOCATION_ID,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
         invocation
             .validate()
             .map_err(|error| invalid(error.to_string()))?;
@@ -23407,6 +23911,11 @@ impl ServerSubRunExecutor {
             .is_some_and(|token| token.is_cancelled())
         {
             return Ok(AgenticLoopOutcome::Cancelled);
+        }
+        if provider_apply_pending {
+            return Ok(AgenticLoopOutcome::Waiting(
+                "native_guidance_apply_pending".into(),
+            ));
         }
         if let Some(stage_state) = result
             .metadata
@@ -25565,7 +26074,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = if self.native_execution.is_some() {
             let plan_mode_active = host.plan_mode_active(&loop_state);
-            self.execute_native_stage(&config, &mut loop_state, plan_mode_active).await
+            self.execute_native_stage(&config, &mut loop_state, plan_mode_active, &mut host)
+                .await
         } else {
             run_agentic_loop_with_host(&mut host, &mut loop_state).await
         };

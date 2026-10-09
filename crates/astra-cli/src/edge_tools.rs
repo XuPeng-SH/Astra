@@ -4532,6 +4532,7 @@ impl ToolExecutor {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4540,6 +4541,7 @@ impl ToolExecutor {
     /// exact authenticated callback identity/generation to the existing
     /// DurableRunUserPromptGate. Never store a mutable global question gate:
     /// foreground and child invocations may share this edge executor.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_native_provider_invocation(
         &self,
         protocol: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
@@ -4550,6 +4552,7 @@ impl ToolExecutor {
         gate: &dyn astra_tools::ProviderInteractionGate,
         execution_ceiling: &astra_server_types::edge_ws_protocol::EdgeExecutionCeiling,
         runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>,
     ) -> ToolExecutionOutcome {
         self.execute_run_with_native_interaction(
             tool_name,
@@ -4560,6 +4563,7 @@ impl ToolExecutor {
             Some(execution_ceiling),
             Some(protocol),
             runtime_approval,
+            Some(input_rx),
         )
         .await
         .into_outcome()
@@ -4577,6 +4581,7 @@ impl ToolExecutor {
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
         native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
         runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
     ) -> EdgeToolRun {
         let canonical_native = runtime_approval.filter(|approval| {
             native_protocol.is_none_or(|protocol| protocol == approval.protocol)
@@ -4794,6 +4799,7 @@ impl ToolExecutor {
                 execution_ceiling,
                 native_protocol,
                 runtime_approval,
+                input_rx,
             )
             .await;
         let ToolExecutionFacts {
@@ -5036,6 +5042,7 @@ impl ToolExecutor {
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
         native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
         runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
     ) -> String {
         let ToolExecutionFacts {
             fields: tool_result_fields,
@@ -5052,6 +5059,7 @@ impl ToolExecutor {
                         native_gate,
                         execution_ceiling,
                         runtime_approval,
+                        input_rx,
                     )
                     .await
                 }

@@ -18,6 +18,7 @@
 //! {"type": "edge_auth_ok", "user_id": "...", "interaction_api_major": "3"}
 //! {"type": "edge_auth_error", "message": "..."}
 //! {"type": "edge_tool_request", "request_id": "...", "tool": "...", "args": {...}}
+//! {"type": "edge_tool_input", "request_id": "...", "delivery_generation": 1, "input": {...}}
 //! {"type": "edge_pong"}
 //! {"type": "edge_closing", "reason": "..."}
 //! ```
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub use astra_turn_types::ToolInvocationIdentity;
+use astra_turn_types::{ProviderStageInput, ProviderStageInputAck};
 
 /// Edge can inject request-scoped provider authorization into one bash
 /// subprocess without receiving file-transfer metadata or bytes.
@@ -134,6 +136,17 @@ pub enum EdgeClientMessage {
         tool_result_fields: Option<Map<String, Value>>,
     },
 
+    /// Acknowledgement that an input sent to an active provider stage was
+    /// accepted or rejected by the provider adapter. A missing acknowledgement
+    /// is a transport failure; this message does not claim model output was
+    /// produced.
+    #[serde(rename = "edge_tool_input_ack")]
+    ToolInputAck {
+        request_id: String,
+        delivery_generation: u64,
+        ack: ProviderStageInputAck,
+    },
+
     /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
     Ping {},
@@ -207,6 +220,16 @@ pub enum EdgeServerMessage {
         command_timeout_cap_ms: Option<u64>,
     },
 
+    /// Deliver one already-admitted semantic input to the active provider
+    /// stage for this invocation. The request identity and delivery
+    /// generation fence it to the exact in-flight execution.
+    #[serde(rename = "edge_tool_input")]
+    ToolInput {
+        request_id: String,
+        delivery_generation: u64,
+        input: ProviderStageInput,
+    },
+
     /// Server heartbeat response.
     #[serde(rename = "edge_pong")]
     Pong {},
@@ -241,6 +264,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::AuthOk { .. } => "auth_ok",
             EdgeServerMessage::AuthError { .. } => "auth_error",
             EdgeServerMessage::ToolRequest { .. } => "tool_request",
+            EdgeServerMessage::ToolInput { .. } => "tool_input",
             EdgeServerMessage::Pong {} => "pong",
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
@@ -518,6 +542,49 @@ mod tests {
             EdgeClientMessage::ToolResult { duration_ms, .. } => assert_eq!(duration_ms, None),
             _ => panic!("expected ToolResult"),
         }
+    }
+
+    #[test]
+    fn provider_stage_input_round_trips_with_exact_turn_fence() {
+        let input = ProviderStageInput::Text {
+            input_id: "message-1".into(),
+            content: "continue".into(),
+            correlation_id: Some("parent-turn".into()),
+            expected_turn_id: Some("turn-7".into()),
+        };
+        let message = EdgeServerMessage::ToolInput {
+            request_id: "run/session/call".into(),
+            delivery_generation: 9,
+            input: input.clone(),
+        };
+        let decoded: EdgeServerMessage =
+            serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeServerMessage::ToolInput {
+                request_id,
+                delivery_generation: 9,
+                input: decoded_input,
+            } if request_id == "run/session/call" && decoded_input == input
+        ));
+
+        let ack = EdgeClientMessage::ToolInputAck {
+            request_id: "run/session/call".into(),
+            delivery_generation: 9,
+            ack: ProviderStageInputAck::accepted(&input, Some("turn-7".into())),
+        };
+        let decoded: EdgeClientMessage =
+            serde_json::from_value(serde_json::to_value(ack).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeClientMessage::ToolInputAck {
+                request_id,
+                delivery_generation: 9,
+                ack,
+            } if request_id == "run/session/call"
+                && ack.input_id == "message-1"
+                && ack.provider_turn_id.as_deref() == Some("turn-7")
+        ));
     }
 
     #[test]

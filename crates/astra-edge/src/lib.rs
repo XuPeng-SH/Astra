@@ -7,6 +7,7 @@ mod invocation_journal;
 use astra_server_types::edge_ws_protocol::{
     EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
 };
+use astra_turn_types::{ProviderStageInput, ProviderStageInputAck};
 use futures_util::{SinkExt, StreamExt, future::BoxFuture};
 use invocation_journal::{DurableEdgeResult, EdgeInvocationJournal, JournalError, PrepareOutcome};
 use serde_json::Value;
@@ -208,6 +209,17 @@ pub struct EdgeInvocation {
     pub execution_ceiling: Option<Box<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>>,
     pub runtime_process_authorization:
         Option<Box<astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext>>,
+    /// Bounded semantic inputs addressed to this invocation. Ordinary tool
+    /// executors may ignore the receiver; provider-stage adapters consume it.
+    pub input_rx: mpsc::Receiver<EdgeInvocationInput>,
+}
+
+/// One input delivered to a running provider invocation. The adapter resolves
+/// the acknowledgement only after its provider protocol has accepted or
+/// rejected the input, keeping transport delivery distinct from processing.
+pub struct EdgeInvocationInput {
+    pub input: ProviderStageInput,
+    pub ack: oneshot::Sender<ProviderStageInputAck>,
 }
 
 pub trait EdgeInvocationExecutor: Send + Sync {
@@ -219,6 +231,7 @@ pub trait EdgeInvocationExecutor: Send + Sync {
 }
 
 const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = 128;
+const MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION: usize = 64;
 
 fn command_deadline(
     deadline: Instant,
@@ -303,6 +316,12 @@ struct CompletedEdgeInvocation {
     duration_ms: u64,
 }
 
+struct CompletedProviderStageInput {
+    request_id: String,
+    generation: u64,
+    ack: ProviderStageInputAck,
+}
+
 fn rejected_tool_message(
     request_id: String,
     identity: astra_turn_types::ToolInvocationIdentity,
@@ -329,6 +348,7 @@ fn valid_runtime_process_authorization(
 struct InFlightEdgeInvocation {
     generation: u64,
     cancel: CancellationToken,
+    input_tx: mpsc::Sender<EdgeInvocationInput>,
 }
 
 #[derive(Default)]
@@ -337,19 +357,25 @@ struct EdgeInvocationTracker {
 }
 
 impl EdgeInvocationTracker {
-    fn begin(&mut self, request_id: &str, generation: u64) -> Result<CancellationToken, u64> {
+    fn begin(
+        &mut self,
+        request_id: &str,
+        generation: u64,
+    ) -> Result<(CancellationToken, mpsc::Receiver<EdgeInvocationInput>), u64> {
         if let Some(active) = self.in_flight.get(request_id) {
             return Err(active.generation);
         }
         let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::channel(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
         self.in_flight.insert(
             request_id.to_string(),
             InFlightEdgeInvocation {
                 generation,
                 cancel: cancel.clone(),
+                input_tx,
             },
         );
-        Ok(cancel)
+        Ok((cancel, input_rx))
     }
 
     fn cancel_if_current(&self, request_id: &str, generation: u64) -> bool {
@@ -361,6 +387,24 @@ impl EdgeInvocationTracker {
         }
         active.cancel.cancel();
         true
+    }
+
+    fn send_input(
+        &self,
+        request_id: &str,
+        generation: u64,
+        input: EdgeInvocationInput,
+    ) -> Result<(), EdgeInvocationInput> {
+        let Some(active) = self.in_flight.get(request_id) else {
+            return Err(input);
+        };
+        if active.generation != generation {
+            return Err(input);
+        }
+        active
+            .input_tx
+            .try_send(input)
+            .map_err(|error| error.into_inner())
     }
 
     fn finish_if_current(&mut self, request_id: &str, generation: u64) -> bool {
@@ -395,6 +439,8 @@ pub async fn serve_connection(
     }
     let (mut write, mut read) = socket.split();
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
+    let (input_ack_tx, mut input_ack_rx) =
+        mpsc::channel::<CompletedProviderStageInput>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
     let execution_budget = EdgeExecutionBudget::new();
     let mut invocations = EdgeInvocationTracker::default();
     let mut tasks = JoinSet::new();
@@ -581,8 +627,8 @@ pub async fn serve_connection(
                                         "edge invocation journal admitted {request_id} without execution capacity"
                                     )
                                 })?;
-                                let cancel = match invocations.begin(&request_id, delivery_generation) {
-                                    Ok(cancel) => cancel,
+                                let (cancel, input_rx) = match invocations.begin(&request_id, delivery_generation) {
+                                    Ok(value) => value,
                                     Err(active_generation) => {
                                         return Err(format!(
                                             "edge invocation tracker conflicts with durable journal for {request_id}: active generation {active_generation}, incoming {delivery_generation}"
@@ -608,6 +654,7 @@ pub async fn serve_connection(
                                             command_timeout_cap_ms,
                                             execution_ceiling,
                                             runtime_process_authorization,
+                                            input_rx,
                                         }, cancel.clone()).await
                                     };
                                     // The executor owns asynchronous subprocess cleanup.
@@ -628,6 +675,68 @@ pub async fn serve_connection(
                                         duration_ms: start.elapsed().as_millis() as u64,
                                     };
                                     let _ = completed_tx.send(completion).await;
+                                });
+                            }
+                            Ok(EdgeServerMessage::ToolInput {
+                                request_id,
+                                delivery_generation,
+                                input,
+                            }) => {
+                                let (ack_tx, ack_rx) = oneshot::channel();
+                                if let Err(error) = input.validate() {
+                                    let ack = ProviderStageInputAck::rejected(
+                                        &input,
+                                        error.to_string(),
+                                    );
+                                    write
+                                        .send(Message::Text(
+                                            serde_json::to_string(&EdgeClientMessage::ToolInputAck {
+                                                request_id,
+                                                delivery_generation,
+                                                ack,
+                                            })?
+                                            .into(),
+                                        ))
+                                        .await?;
+                                    continue;
+                                }
+                                if let Err(input) = invocations.send_input(
+                                    &request_id,
+                                    delivery_generation,
+                                    EdgeInvocationInput { input, ack: ack_tx },
+                                ) {
+                                    let ack = ProviderStageInputAck::rejected(
+                                        &input.input,
+                                        "provider invocation is no longer accepting input",
+                                    );
+                                    write
+                                        .send(Message::Text(
+                                            serde_json::to_string(&EdgeClientMessage::ToolInputAck {
+                                                request_id,
+                                                delivery_generation,
+                                                ack,
+                                            })?
+                                            .into(),
+                                        ))
+                                        .await?;
+                                    continue;
+                                }
+                                let input_ack_tx = input_ack_tx.clone();
+                                tokio::spawn(async move {
+                                    // A dropped adapter acknowledgement is a
+                                    // transport failure. Do not invent a
+                                    // third business disposition; the pool's
+                                    // bounded wait will retry the same input
+                                    // identity on the next opportunity.
+                                    if let Ok(ack) = ack_rx.await {
+                                        let _ = input_ack_tx
+                                            .send(CompletedProviderStageInput {
+                                                request_id,
+                                                generation: delivery_generation,
+                                                ack,
+                                            })
+                                            .await;
+                                    }
                                 });
                             }
                             Ok(EdgeServerMessage::Pong {}) => {
@@ -696,6 +805,14 @@ pub async fn serve_connection(
                     pending.delivery_generation,
                 );
                 write.send(Message::Text(serde_json::to_string(&result_msg)?.into())).await?;
+            }
+            Some(completed) = input_ack_rx.recv() => {
+                let message = EdgeClientMessage::ToolInputAck {
+                    request_id: completed.request_id,
+                    delivery_generation: completed.generation,
+                    ack: completed.ack,
+                };
+                write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
             }
             _ = heartbeat.tick() => {
                 let ping = EdgeClientMessage::Ping {};
@@ -1197,11 +1314,41 @@ mod tests {
         let second_cancel = tracker.begin("request-2", 2).unwrap();
 
         assert!(!tracker.cancel_if_current("request-1", first_generation + 1));
-        assert!(!first_cancel.is_cancelled());
+        assert!(!first_cancel.0.is_cancelled());
         assert!(tracker.cancel_if_current("request-1", first_generation));
-        assert!(first_cancel.is_cancelled());
-        assert!(!second_cancel.is_cancelled());
+        assert!(first_cancel.0.is_cancelled());
+        assert!(!second_cancel.0.is_cancelled());
         assert!(!tracker.cancel_if_current("missing", first_generation));
+    }
+
+    #[test]
+    fn invocation_tracker_fences_input_to_generation_and_bounds_queue() {
+        let mut tracker = EdgeInvocationTracker::default();
+        let generation = 4;
+        let (_cancel, mut input_rx) = tracker.begin("request-1", generation).unwrap();
+        let input = || EdgeInvocationInput {
+            input: ProviderStageInput::Text {
+                input_id: uuid::Uuid::new_v4().to_string(),
+                content: "continue".into(),
+                correlation_id: None,
+                expected_turn_id: None,
+            },
+            ack: tokio::sync::oneshot::channel().0,
+        };
+        assert!(
+            tracker
+                .send_input("request-1", generation + 1, input())
+                .is_err()
+        );
+        for _ in 0..MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION {
+            assert!(tracker.send_input("request-1", generation, input()).is_ok());
+        }
+        assert!(
+            tracker
+                .send_input("request-1", generation, input())
+                .is_err()
+        );
+        assert!(input_rx.try_recv().is_ok());
     }
 
     #[test]

@@ -145,6 +145,7 @@ pub enum UserIntentPollIssueKind {
     InvalidDelivery,
     MissingInput,
     NoActionableContent,
+    InvalidProviderStageInput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

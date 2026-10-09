@@ -332,6 +332,7 @@ pub trait RunLifecycleService: Send + Sync {
         _user_id: String,
         _identity: astra_turn_types::ToolInvocationIdentity,
         _edge_agent_id: String,
+        _physical_workspace_id: String,
         _interaction: astra_turn_types::ProviderInteractionRequest,
         _stream_event_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     ) -> Result<astra_turn_types::ProviderInteractionResponse, (StatusCode, Json<ErrorResponse>)>
@@ -2132,6 +2133,22 @@ where
             return Err(db_error("admit_session_scoped_run_write", run_id, source));
         }
     }
+    load_run_metadata_after_session_admission_tx(tx, user_id, expected_session_id, run_id).await
+}
+
+/// Load a run after the caller has already admitted and locked the session
+/// execution slot in this transaction.  Keeping this separate from the
+/// public exact-session helper avoids reacquiring the same session and slot
+/// locks for every related run in one collaborator admission/read.
+async fn load_run_metadata_after_session_admission_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<DurableRunRecord>>
+where
+    T: TransactionConnection,
+{
     let sql = format!(
         "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
@@ -2144,6 +2161,69 @@ where
         .await
         .map_err(|source| db_error("load_run_metadata_for_exact_session_tx", run_id, source))?;
     row.map(run_record_from_row).transpose()
+}
+
+async fn load_run_metadata_with_lease_after_session_admission_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<(DurableRunRecord, bool)>>
+where
+    T: TransactionConnection,
+{
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS},
+                CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
+                    AS owner_lease_live
+         FROM agent_runs
+         WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+    );
+    let row = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(expected_session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "load_run_metadata_with_lease_after_session_admission_tx",
+                run_id,
+                source,
+            )
+        })?;
+    row.map(|row| {
+        let owner_lease_live = row
+            .try_get::<i64, _>("owner_lease_live")
+            .map_err(|source| db_error("decode_run_metadata_owner_lease_live", run_id, source))?;
+        Ok((run_record_from_row(row)?, owner_lease_live == 1))
+    })
+    .transpose()
+}
+
+async fn load_run_metadata_with_lease_for_exact_session_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<(DurableRunRecord, bool)>>
+where
+    T: TransactionConnection,
+{
+    match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => return Ok(None),
+        Err(source) => {
+            return Err(db_error("admit_session_scoped_run_write", run_id, source));
+        }
+    }
+    load_run_metadata_with_lease_after_session_admission_tx(
+        tx,
+        user_id,
+        expected_session_id,
+        run_id,
+    )
+    .await
 }
 
 async fn lock_work_interaction_attachment_tx(
@@ -3652,10 +3732,18 @@ pub struct AtomicRunInteractionBatchRegistrationRequest<'a> {
 pub struct ToolInvocationInteractionOrigin {
     pub identity: astra_turn_types::ToolInvocationIdentity,
     pub edge_agent_id: String,
+    /// Stable checkout identity used across Edge reconnects. The executor
+    /// label above remains audit context, but is connection-scoped and cannot
+    /// authorize a resumed interaction on its own.
+    pub physical_workspace_id: String,
     pub descriptor: astra_turn_types::ResolvedToolDescriptorRef,
     pub execution_binding_generation: u64,
     pub owner_generation: u64,
     pub control_epoch: i64,
+    /// Copied from the run-start restrictions while the origin is derived.
+    /// Interaction callers must not reload and decode the full run journal
+    /// just to recover this immutable admission fact.
+    pub execution_work_deadline_unix_ms: Option<u64>,
 }
 
 fn tool_interaction_origin(
@@ -5589,6 +5677,8 @@ pub trait RunStateStore: Send + Sync {
         &self,
         _identity: &astra_turn_types::ToolInvocationIdentity,
         _edge_agent_id: &str,
+        _physical_workspace_id: &str,
+        _provider_stage_input_id: Option<&str>,
     ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
         Err(ToolInteractionAdmissionError::Unsupported)
     }
@@ -14925,12 +15015,23 @@ impl DatabaseRunStateStore {
         {
             return Err(ToolInteractionAdmissionError::Unproven);
         }
+        let provider_stage_input_id =
+            match event.pointer("/data/interaction/provider_stage_input_id") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or(ToolInteractionAdmissionError::Unproven)?,
+                ),
+            };
         let actual = Self::load_tool_interaction_origin_tx(
             tx,
             run,
             &origin.identity,
             &origin.edge_agent_id,
+            &origin.physical_workspace_id,
             require_live_budget,
+            provider_stage_input_id,
         )
         .await?;
         if actual != origin {
@@ -14944,7 +15045,9 @@ impl DatabaseRunStateStore {
         run: &DurableRunRecord,
         identity: &astra_turn_types::ToolInvocationIdentity,
         edge_agent_id: &str,
+        physical_workspace_id: &str,
         require_live_budget: bool,
+        provider_stage_input_id: Option<&str>,
     ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
         use astra_turn_types::{
             DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
@@ -14954,6 +15057,7 @@ impl DatabaseRunStateStore {
             || identity.session_id != run.session_id
             || identity.run_id != run.run_id
             || edge_agent_id.trim().is_empty()
+            || physical_workspace_id.trim().is_empty()
         {
             return Err(rejected());
         }
@@ -14993,12 +15097,13 @@ impl DatabaseRunStateStore {
         let DurableToolReference::Provider { descriptor } = fingerprint.tool else {
             return Err(rejected());
         };
+        let admitted_executor_id = decision
+            .snapshot
+            .pointer("/executor/executor_id")
+            .and_then(serde_json::Value::as_str);
         if fingerprint.policy_decision_id != decision.decision_id
-            || decision
-                .snapshot
-                .pointer("/executor/executor_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(edge_agent_id)
+            || admitted_executor_id.is_none()
+            || admitted_executor_id.is_some_and(|executor_id| executor_id.trim().is_empty())
         {
             return Err(rejected());
         }
@@ -15047,12 +15152,12 @@ impl DatabaseRunStateStore {
             .pointer("/data/owner_generation")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(rejected)?;
-        let control_epoch = grant
+        let grant_control_epoch = grant
             .pointer("/data/expected_control_epoch")
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(rejected)?;
         if owner_generation != run.run_generation
-            || control_epoch < -1
+            || grant_control_epoch < -1
             || grant
                 .pointer("/data/action_id")
                 .and_then(serde_json::Value::as_str)
@@ -15063,6 +15168,77 @@ impl DatabaseRunStateStore {
                 != Some(identity.session_id.as_str())
         {
             return Err(rejected());
+        }
+        // A long-lived provider stage can accept and durably apply user
+        // guidance without creating a new tool invocation grant. Advance the
+        // interaction frontier through the *source* intent coordinates, not
+        // the later journal coordinates of the applied facts. An applied fact
+        // is appended after all intents that were already accepted; using its
+        // own event_idx could therefore jump over a newer, still-unapplied
+        // intent that was appended before the applied fact. The source
+        // coordinate keeps that intent visible to the fence below.
+        let mut control_epoch = Self::load_applied_user_intent_source_frontier_tx(
+            tx,
+            &identity.user_id,
+            &identity.session_id,
+            &identity.run_id,
+            grant_control_epoch,
+        )
+        .await?;
+        if let Some(provider_stage_input_id) = provider_stage_input_id {
+            // A question may arrive while the corresponding steer is still
+            // awaiting its provider response. The source intent is then a
+            // provisional fence only; it becomes an applied frontier only
+            // after the transport reports an accepted steer.
+            let source = sqlx::query(
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_type = 'user_intent' AND idempotency_key = ?
+                 ORDER BY event_idx DESC LIMIT 1",
+            )
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(format!("user_intent:{provider_stage_input_id}"))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| {
+                ToolInteractionAdmissionError::Store(db_error(
+                    "load_tool_interaction_provider_stage_source",
+                    &run.run_id,
+                    source,
+                ))
+            })?;
+            if let Some(source) = source {
+                let payload_json: String = source.try_get("payload_json").map_err(|error| {
+                    ToolInteractionAdmissionError::Store(db_error(
+                        "decode_tool_interaction_provider_stage_source_payload",
+                        &run.run_id,
+                        error,
+                    ))
+                })?;
+                let payload: serde_json::Value = serde_json::from_str(&payload_json)
+                    .map_err(|_| ToolInteractionAdmissionError::Unproven)?;
+                if payload
+                    .pointer("/data/intent_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(provider_stage_input_id)
+                    || payload
+                        .pointer("/data/delivery")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("guide_current_run")
+                {
+                    return Err(ToolInteractionAdmissionError::Unproven);
+                }
+                let source_index: i64 = source.try_get("event_idx").map_err(|error| {
+                    ToolInteractionAdmissionError::Store(db_error(
+                        "decode_tool_interaction_provider_stage_source_index",
+                        &run.run_id,
+                        error,
+                    ))
+                })?;
+                control_epoch = control_epoch.max(source_index);
+            }
         }
         let started: Option<String> = sqlx::query_scalar(
             "SELECT payload_json FROM agent_run_events
@@ -15081,16 +15257,17 @@ impl DatabaseRunStateStore {
             .pointer("/data/execution_binding_generation")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(rejected)?;
+        let mut execution_work_deadline_unix_ms = None;
         if let Some(restrictions) = started.pointer("/data/execution_restrictions") {
             let restrictions: DurableExecutionRestrictions =
                 serde_json::from_value(restrictions.clone()).map_err(|_| rejected())?;
             restrictions.validate().map_err(|_| rejected())?;
             let DurableExecutionRestrictions::V1 {
-                execution_work_deadline_unix_ms,
+                execution_work_deadline_unix_ms: work_deadline,
                 ..
             } = restrictions;
-            if require_live_budget
-                && execution_work_deadline_unix_ms.is_some_and(|deadline| deadline <= now_unix_ms)
+            execution_work_deadline_unix_ms = work_deadline;
+            if require_live_budget && work_deadline.is_some_and(|deadline| deadline <= now_unix_ms)
             {
                 return Err(ToolInteractionAdmissionError::DeadlineExpired);
             }
@@ -15122,14 +15299,14 @@ impl DatabaseRunStateStore {
             || binding.generation != execution_binding_generation
             || binding.state != crate::SessionExecutionBindingStateV1::Ready
             || binding.executor.kind != ExecutorBindingRequestKind::EdgeAgent
-            || binding.executor.executor_id.as_deref() != Some(edge_agent_id)
+            || binding.physical_workspace_id.as_deref() != Some(physical_workspace_id)
         {
             return Err(rejected());
         }
         let dispatched: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM edge_pending_dispatch
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ?
-               AND request_id = ? AND edge_agent_id = ?
+               AND request_id = ?
                AND status = 'dispatched' AND result_json IS NULL FOR UPDATE",
         )
         .bind(&identity.user_id)
@@ -15137,7 +15314,6 @@ impl DatabaseRunStateStore {
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(identity.storage_key())
-        .bind(edge_agent_id)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|source| {
@@ -15153,16 +15329,56 @@ impl DatabaseRunStateStore {
         Ok(ToolInvocationInteractionOrigin {
             identity: identity.clone(),
             edge_agent_id: edge_agent_id.to_string(),
+            physical_workspace_id: physical_workspace_id.to_string(),
             descriptor,
             execution_binding_generation,
             owner_generation,
             control_epoch,
+            execution_work_deadline_unix_ms,
+        })
+    }
+
+    /// Return the greatest source `user_intent` coordinate durably applied
+    /// after the caller's original control epoch. Applied facts are appended
+    /// later than their source intents, so their journal `event_idx` is not a
+    /// valid interaction frontier: it can skip a newer source intent that is
+    /// still waiting to be applied.
+    async fn load_applied_user_intent_source_frontier_tx(
+        tx: &mut Transaction<'_, MySql>,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        lower_bound: i64,
+    ) -> Result<i64, ToolInteractionAdmissionError> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(
+                    MAX(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.event_index')) AS SIGNED)),
+                    ?
+             )
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND event_type = 'user_intent_applied' AND event_idx > ?",
+        )
+        .bind(lower_bound)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(lower_bound)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|source| {
+            ToolInteractionAdmissionError::Store(db_error(
+                "load_tool_interaction_applied_guidance_frontier",
+                run_id,
+                source,
+            ))
         })
     }
 
     async fn collaborator_event_tx(
         tx: &mut Transaction<'_, MySql>,
         user_id: &str,
+        session_id: &str,
         anchor_run_id: &str,
         event_type: &str,
         source_key: Option<&str>,
@@ -15170,10 +15386,11 @@ impl DatabaseRunStateStore {
         let row = if let Some(source_key) = source_key {
             sqlx::query(
                 "SELECT payload_json, event_idx FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND event_type = ?
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?
                    AND idempotency_key = ? LIMIT 1",
             )
             .bind(user_id)
+            .bind(session_id)
             .bind(anchor_run_id)
             .bind(event_type)
             .bind(source_key)
@@ -15183,10 +15400,11 @@ impl DatabaseRunStateStore {
             sqlx::query(
                 "SELECT payload_json, event_idx FROM agent_run_events
                  FORCE INDEX (idx_agent_run_events_control_type_idx)
-                 WHERE user_id = ? AND run_id = ? AND event_type = ?
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?
                  ORDER BY event_idx DESC LIMIT 1",
             )
             .bind(user_id)
+            .bind(session_id)
             .bind(anchor_run_id)
             .bind(event_type)
             .fetch_optional(&mut **tx)
@@ -15202,11 +15420,13 @@ impl DatabaseRunStateStore {
     async fn collaborator_association_tx(
         tx: &mut Transaction<'_, MySql>,
         user_id: &str,
+        session_id: &str,
         anchor_run_id: &str,
     ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
         let Some(event) = Self::collaborator_event_tx(
             tx,
             user_id,
+            session_id,
             anchor_run_id,
             COLLABORATOR_ASSOCIATED_EVENT,
             None,
@@ -15216,15 +15436,22 @@ impl DatabaseRunStateStore {
             return Ok(None);
         };
         let association = decode_collaborator_fact(&event, "association")?;
-        let latest =
-            Self::collaborator_event_tx(tx, user_id, anchor_run_id, COLLABORATOR_STAGE_EVENT, None)
-                .await?
-                .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
-                    anchor_run_id: anchor_run_id.into(),
-                })?;
+        let latest = Self::collaborator_event_tx(
+            tx,
+            user_id,
+            session_id,
+            anchor_run_id,
+            COLLABORATOR_STAGE_EVENT,
+            None,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
+            anchor_run_id: anchor_run_id.into(),
+        })?;
         let native_session = Self::collaborator_event_tx(
             tx,
             user_id,
+            session_id,
             anchor_run_id,
             COLLABORATOR_NATIVE_SESSION_EVENT,
             None,
@@ -15255,16 +15482,21 @@ impl DatabaseRunStateStore {
         CollaboratorStoreError,
     > {
         validate_collaborator_admission(record, admission)?;
-        let anchor = self
-            .load_run_metadata_for_exact_session_tx(
+        let anchor = load_run_metadata_after_session_admission_tx(
+            tx,
+            &record.user_id,
+            &record.session_id,
+            &admission.anchor_run_id,
+        )
+        .await?;
+        let existing = if anchor.is_some() {
+            Self::collaborator_association_tx(
                 tx,
                 &record.user_id,
                 &record.session_id,
                 &admission.anchor_run_id,
             )
-            .await?;
-        let existing = if anchor.is_some() {
-            Self::collaborator_association_tx(tx, &record.user_id, &admission.anchor_run_id).await?
+            .await?
         } else {
             None
         };
@@ -15277,6 +15509,7 @@ impl DatabaseRunStateStore {
             if let Some(event) = Self::collaborator_event_tx(
                 tx,
                 &record.user_id,
+                &record.session_id,
                 &admission.anchor_run_id,
                 COLLABORATOR_STAGE_EVENT,
                 Some(&collaborator_source_key(&admission.source_message_id)),
@@ -15293,17 +15526,16 @@ impl DatabaseRunStateStore {
                     anchor_run_id: admission.anchor_run_id.clone(),
                 });
             }
-            let previous = self
-                .load_run_metadata_for_exact_session_tx(
-                    tx,
-                    &record.user_id,
-                    &record.session_id,
-                    &existing.latest_stage.run_id,
-                )
-                .await?
-                .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
-                    run_id: existing.latest_stage.run_id.clone(),
-                })?;
+            let previous = load_run_metadata_after_session_admission_tx(
+                tx,
+                &record.user_id,
+                &record.session_id,
+                &existing.latest_stage.run_id,
+            )
+            .await?
+            .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+                run_id: existing.latest_stage.run_id.clone(),
+            })?;
             if !durable_run_status_is_terminal(&previous.status) {
                 return Err(CollaboratorStoreError::PreviousStageActive {
                     run_id: previous.run_id,
@@ -15351,17 +15583,16 @@ impl DatabaseRunStateStore {
                 .ok_or(CollaboratorStoreError::InvalidAdmission {
                     field: "parent_run_id",
                 })?;
-        let parent = self
-            .load_run_metadata_for_exact_session_tx(
-                tx,
-                &record.user_id,
-                &record.session_id,
-                parent_id,
-            )
-            .await?
-            .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
-                run_id: parent_id.into(),
-            })?;
+        let parent = load_run_metadata_after_session_admission_tx(
+            tx,
+            &record.user_id,
+            &record.session_id,
+            parent_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: parent_id.into(),
+        })?;
         let live: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_runs
              WHERE user_id = ? AND session_id = ? AND run_id = ?
@@ -15539,18 +15770,18 @@ impl DatabaseRunStateStore {
                 )
             })?;
             admit_collaborator_session_tx(&mut tx, &record.user_id, &record.session_id).await?;
-            let anchor = self
-                .load_run_metadata_for_exact_session_tx(
-                    &mut tx,
-                    &record.user_id,
-                    &record.session_id,
-                    &admission.anchor_run_id,
-                )
-                .await?;
+            let anchor = load_run_metadata_after_session_admission_tx(
+                &mut tx,
+                &record.user_id,
+                &record.session_id,
+                &admission.anchor_run_id,
+            )
+            .await?;
             let receipt = if anchor.is_some() {
                 Self::collaborator_event_tx(
                     &mut tx,
                     &record.user_id,
+                    &record.session_id,
                     &admission.anchor_run_id,
                     COLLABORATOR_STAGE_EVENT,
                     Some(&collaborator_source_key(&admission.source_message_id)),
@@ -15562,7 +15793,7 @@ impl DatabaseRunStateStore {
                 None
             };
             let receipt = if let Some(receipt) = receipt {
-                self.load_run_metadata_for_exact_session_tx(
+                load_run_metadata_after_session_admission_tx(
                     &mut tx,
                     &record.user_id,
                     &record.session_id,
@@ -16954,6 +17185,8 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         identity: &astra_turn_types::ToolInvocationIdentity,
         edge_agent_id: &str,
+        physical_workspace_id: &str,
+        provider_stage_input_id: Option<&str>,
     ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
@@ -16972,9 +17205,16 @@ impl RunStateStore for DatabaseRunStateStore {
             )
             .await?
             .ok_or(ToolInteractionAdmissionError::Unproven)?;
-        let origin =
-            Self::load_tool_interaction_origin_tx(&mut tx, &run, identity, edge_agent_id, true)
-                .await?;
+        let origin = Self::load_tool_interaction_origin_tx(
+            &mut tx,
+            &run,
+            identity,
+            edge_agent_id,
+            physical_workspace_id,
+            true,
+            provider_stage_input_id,
+        )
+        .await?;
         tx.rollback().await.map_err(|source| {
             db_error("derive_tool_interaction_rollback", &identity.run_id, source)
         })?;
@@ -17044,11 +17284,15 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("begin_collaborator_association", anchor_run_id, source))?;
         admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
-        let anchor = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, session_id, anchor_run_id)
-            .await?;
+        let anchor = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            user_id,
+            session_id,
+            anchor_run_id,
+        )
+        .await?;
         let association = if anchor.is_some() {
-            Self::collaborator_association_tx(&mut tx, user_id, anchor_run_id).await?
+            Self::collaborator_association_tx(&mut tx, user_id, session_id, anchor_run_id).await?
         } else {
             None
         };
@@ -17082,38 +17326,41 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("begin_collaborator_native_session", anchor_id, source))?;
         admit_collaborator_session_tx(&mut tx, &identity.user_id, &identity.session_id).await?;
-        let anchor = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                &identity.user_id,
-                &identity.session_id,
-                anchor_id,
-            )
-            .await?
-            .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
-                run_id: anchor_id.clone(),
-            })?;
-        let association = Self::collaborator_association_tx(&mut tx, &identity.user_id, anchor_id)
-            .await?
-            .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
-                anchor_run_id: anchor_id.clone(),
-            })?;
+        let anchor = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            &identity.user_id,
+            &identity.session_id,
+            anchor_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: anchor_id.clone(),
+        })?;
+        let association = Self::collaborator_association_tx(
+            &mut tx,
+            &identity.user_id,
+            &identity.session_id,
+            anchor_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
+            anchor_run_id: anchor_id.clone(),
+        })?;
         if association.association.provider != native_session.provider
             || association.latest_stage.run_id != identity.run_id
         {
             return Err(CollaboratorStoreError::NativeSessionUnproven);
         }
-        let stage = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                &identity.user_id,
-                &identity.session_id,
-                &identity.run_id,
-            )
-            .await?
-            .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
-                run_id: identity.run_id.clone(),
-            })?;
+        let stage = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            &identity.user_id,
+            &identity.session_id,
+            &identity.run_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: identity.run_id.clone(),
+        })?;
         if stage.run_generation != expected_owner_generation
             || stage.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
         {
@@ -17130,6 +17377,7 @@ impl RunStateStore for DatabaseRunStateStore {
             let event = Self::collaborator_event_tx(
                 &mut tx,
                 &identity.user_id,
+                &identity.session_id,
                 anchor_id,
                 COLLABORATOR_NATIVE_SESSION_EVENT,
                 None,
@@ -21287,15 +21535,14 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut tx = connection.begin().await.map_err(|source| {
             db_error("begin_guarded_interaction_batch", request.run_id, source).to_string()
         })?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
+        let Some((run, owner_lease_live)) = load_run_metadata_with_lease_for_exact_session_tx(
+            &mut tx,
+            request.user_id,
+            request.expected_session_id,
+            request.run_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?
         else {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -21378,25 +21625,7 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::Inactive { status });
         }
-        let lease_active: i64 = sqlx::query_scalar(
-            "SELECT CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
-             FROM agent_runs
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(request.user_id)
-        .bind(request.expected_session_id)
-        .bind(request.run_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "load_guarded_interaction_batch_lease",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if lease_active != 1 {
+        if !owner_lease_live {
             tx.rollback().await.map_err(|source| {
                 db_error(
                     "rollback_guarded_interaction_batch_expired",
@@ -36375,6 +36604,103 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup frontier sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_applied_guidance_frontier_uses_source_intent_and_keeps_later_intent_visible_on_matrixone()
+     {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("guidance-frontier-source-u-{nonce}");
+        let session_id = format!("guidance-frontier-source-s-{nonce}");
+        let run_id = format!("guidance-frontier-source-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store
+            .insert_run(run)
+            .await
+            .expect("insert source frontier run");
+
+        for (intent_id, content) in [("intent-a", "first"), ("intent-b", "second")] {
+            store
+                .append_event(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    json!({
+                        "event_type": "user_intent",
+                        "idempotency_key": format!("user_intent:{intent_id}"),
+                        "data": {
+                            "intent_id": intent_id,
+                            "delivery": "guide_current_run",
+                            "input": {"content": content}
+                        }
+                    }),
+                )
+                .await
+                .expect("append accepted guidance");
+        }
+        // The applied fact is intentionally appended after both source
+        // intents. Its data.event_index identifies intent-a's source event;
+        // using this row's physical event_idx would incorrectly skip intent-b.
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                json!({
+                    "event_type": "user_intent_applied",
+                    "idempotency_key": "user_intent_applied:intent-a",
+                    "data": {
+                        "intent_id": "intent-a",
+                        "event_index": 1,
+                        "status": "applied",
+                        "content": "first"
+                    }
+                }),
+            )
+            .await
+            .expect("append applied guidance fact");
+
+        let mut connection = pool.get().begin().await.expect("begin frontier read");
+        let frontier = DatabaseRunStateStore::load_applied_user_intent_source_frontier_tx(
+            &mut connection,
+            &user_id,
+            &session_id,
+            &run_id,
+            -1,
+        )
+        .await
+        .expect("read source guidance frontier");
+        assert_eq!(frontier, 1, "frontier must use intent-a's source index");
+        let newer: Option<i64> = sqlx::query_scalar(
+            "SELECT event_idx FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
+               AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .bind(frontier)
+        .fetch_optional(&mut *connection)
+        .await
+        .expect("seek unapplied later guidance");
+        assert_eq!(
+            newer,
+            Some(2),
+            "intent-b must still fence the provider question"
+        );
+        connection.rollback().await.expect("rollback frontier read");
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup source frontier session");
     }
 
     #[tokio::test]

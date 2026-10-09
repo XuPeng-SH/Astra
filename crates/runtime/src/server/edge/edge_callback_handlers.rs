@@ -1379,6 +1379,26 @@ pub(crate) async fn post_tool_interaction_request_handler(
                 "Tool interaction is not from the selected registered Edge",
             )
         })?;
+    let (Some(materialization_id), Some(worktree_path)) = (
+        edge.materialization_id.as_deref(),
+        edge.worktree_path.as_deref(),
+    ) else {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Tool interaction requires a registered physical workspace",
+        ));
+    };
+    let physical_workspace_id =
+        astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+            materialization_id,
+            worktree_path,
+        );
+    if body.physical_workspace_id != physical_workspace_id {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Tool interaction is not from the selected physical workspace",
+        ));
+    }
     validate_session_id(&body.identity.session_id)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     body.interaction
@@ -1394,6 +1414,7 @@ pub(crate) async fn post_tool_interaction_request_handler(
                 user.user_id,
                 body.identity,
                 edge.edge_agent_id,
+                body.physical_workspace_id,
                 body.interaction,
                 Some(tx.clone()),
             )
@@ -1739,7 +1760,7 @@ pub(crate) async fn post_agents_edge_register_handler(
             "edge_agent_id required",
         ));
     }
-    let edge_id = edge_id_from_headers(&headers);
+    let requested_edge_id = edge_id_from_headers(&headers);
     let registration_lock = state
         .edge_connection_pool
         .registration_lock(&user.user_id, &body.edge_agent_id);
@@ -1750,6 +1771,17 @@ pub(crate) async fn post_agents_edge_register_handler(
             .get_all_user_edges(&user.user_id)
             .into_iter()
             .find(|connection| connection.edge_agent_id == body.edge_agent_id);
+        // A live WebSocket owns a connection-scoped registry edge ID (usually
+        // `ws-*`). Native CLI publication arrives over REST after that socket
+        // is ready. Reusing the caller-supplied agent label here would replace
+        // the socket's durable owner and make its next heartbeat look stale.
+        // Update the same generation when it is already connected; standalone
+        // REST registrations retain their authenticated header identity.
+        let registration_edge_id = connected
+            .as_ref()
+            .and_then(|connection| connection.registry_edge_id.as_deref())
+            .unwrap_or(requested_edge_id.as_str())
+            .to_owned();
         let refresh = |rec: &astra_services::EdgeAgentRecord| {
             if let Some(connection) = connected.as_ref().filter(|connection| {
                 connection.registry_id.as_deref() == Some(rec.registry_id.as_str())
@@ -1773,7 +1805,7 @@ pub(crate) async fn post_agents_edge_register_handler(
                 .register_or_update_with_lease_and_materialization(
                     &user.user_id,
                     &body.edge_agent_id,
-                    &edge_id,
+                    &registration_edge_id,
                     body.hostname.as_deref(),
                     body.worktree_path.as_deref(),
                     body.capabilities,
@@ -1821,7 +1853,7 @@ pub(crate) async fn post_agents_edge_register_handler(
                 .register_or_update(
                     &user.user_id,
                     &body.edge_agent_id,
-                    &edge_id,
+                    &registration_edge_id,
                     body.hostname.as_deref(),
                     body.worktree_path.as_deref(),
                     body.capabilities,

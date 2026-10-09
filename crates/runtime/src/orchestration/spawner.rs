@@ -7669,11 +7669,19 @@ impl DynamicAgentSpawner {
         // optional user-facing `name` field.
         let addr = AgentAddress::new(&run_id, &agent_id);
         let delegation_id = Some(context.parent_run_id.clone());
-        let mailbox = match self
-            .mailbox_router
-            .register(addr.clone(), delegation_id)
-            .await
-        {
+        let mailbox = match if native_execution {
+            self.mailbox_router
+                .register_with_capabilities(
+                    addr.clone(),
+                    delegation_id,
+                    astra_messaging::MailboxCapabilities::provider_stage_text_only(),
+                )
+                .await
+        } else {
+            self.mailbox_router
+                .register(addr.clone(), delegation_id)
+                .await
+        } {
             Ok(mailbox) => Some(mailbox),
             Err(error) => {
                 self.active_agents.write().await.remove(&agent_id);

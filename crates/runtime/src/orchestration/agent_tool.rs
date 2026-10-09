@@ -801,6 +801,18 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
             Err(error) => return rejected_delivery_message(error.to_string()).into(),
         };
 
+    if message_type == "question"
+        && router
+            .target_accepts_structured_requests(&target)
+            .await
+            .is_some_and(|accepts| !accepts)
+    {
+        return rejected_agent_message(
+            "the target mailbox cannot accept structured questions while its current execution is active; send concise text guidance or wait for its next agent boundary",
+        )
+        .into();
+    }
+
     // Replies must target a mailbox that actually survives long enough
     // to receive them. Interactive root execution uses a turn-scoped run_id,
     // while its mailbox is session-scoped; child/server agents normally use
@@ -3615,6 +3627,47 @@ pub(crate) mod tests {
         assert!(
             matches!(&received.payload, MessagePayload::Text { content: actual, .. } if actual == &content)
         );
+    }
+
+    #[tokio::test]
+    async fn question_to_text_only_provider_stage_is_rejected_before_obligation() {
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+            Arc::new(astra_messaging::InProcessTransport::new()),
+            Arc::new(DelegationTracker::new()),
+        ));
+        let _sender = router
+            .register(
+                astra_messaging::types::AgentAddress::new("parent-run", "lead"),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut receiver = router
+            .register_with_capabilities(
+                astra_messaging::types::AgentAddress::new("child-run", "native"),
+                Some("parent-run".into()),
+                astra_messaging::MailboxCapabilities::provider_stage_text_only(),
+            )
+            .await
+            .unwrap();
+        let obligations = crate::messaging::reply_obligations::ReplyObligations::default();
+
+        let output = handle_agent_send_message_with_router(
+            &json!({
+                "to": "native",
+                "message": "Can you confirm the provider result?",
+                "message_type": "question"
+            }),
+            &router,
+            "parent-run",
+            "lead",
+            &obligations,
+        )
+        .await;
+        let receipt: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt["status"], "rejected", "{receipt}");
+        assert!(!obligations.has_pending("parent-run"));
+        assert!(receiver.try_recv().is_none());
     }
 
     #[test]

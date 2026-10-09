@@ -38,6 +38,232 @@ fn test_requirements() -> astra_turn_types::ProviderRuntimeRequirements {
 }
 
 #[test]
+fn provider_text_input_maps_to_one_fenced_codex_steer_request() {
+    let evidence = Evidence {
+        thread: Some("thread-1".into()),
+        turn: Some("turn-7".into()),
+        ..Evidence::default()
+    };
+    let input = ProviderStageInput::Text {
+        input_id: "message-1".into(),
+        content: "continue with the requested change".into(),
+        correlation_id: None,
+        expected_turn_id: Some("turn-7".into()),
+    };
+    let request = turn_steer_request(&evidence, &input).unwrap();
+    assert_eq!(request["method"], "turn/steer");
+    assert_eq!(request["params"]["threadId"], "thread-1");
+    assert_eq!(request["params"]["expectedTurnId"], "turn-7");
+    assert_eq!(request["params"]["clientUserMessageId"], "message-1");
+    assert_eq!(
+        request["params"]["input"][0]["text"],
+        "continue with the requested change"
+    );
+
+    let mismatched = ProviderStageInput::Text {
+        input_id: "message-1".into(),
+        content: "continue with the requested change".into(),
+        correlation_id: None,
+        expected_turn_id: Some("turn-old".into()),
+    };
+    assert!(turn_steer_request(&evidence, &mismatched).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn malformed_steer_ack_is_transport_unknown_not_provider_rejection() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+request=recv()
+assert request['method']=='turn/steer'
+emit({'id':6,'result':{}})
+for line in sys.stdin: pass
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let mut evidence = Evidence {
+        thread: Some("thread".into()),
+        turn: Some("turn".into()),
+        ..Evidence::default()
+    };
+    let input = process.input();
+    let mut input_rx = None;
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let result = submit_stage_input(
+        &mut process,
+        &input,
+        &mut evidence,
+        None,
+        &token,
+        ProviderStageInput::Text {
+            input_id: "malformed-steer-ack".into(),
+            content: "continue".into(),
+            correlation_id: None,
+            expected_turn_id: Some("turn".into()),
+        },
+        OUTPUT_BYTES,
+        ack_tx,
+        &mut input_rx,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(ack_rx.await.is_err());
+    assert!(
+        process
+            .cancel_and_wait()
+            .await
+            .unwrap()
+            .settlement
+            .unwrap()
+            .ownership
+            .is_authoritative()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn active_native_turn_accepts_a_fenced_mailbox_text_input() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+request=recv()
+assert request['method']=='initialize'
+emit({'id':1,'result':{}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['method']=='thread/start'
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
+request=recv()
+assert request['method']=='turn/start'
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+request=recv()
+assert request['method']=='turn/steer'
+assert request['params']['threadId']=='thread'
+assert request['params']['expectedTurnId']=='turn'
+assert request['params']['clientUserMessageId']=='message-1'
+assert request['params']['input'][0]['text']=='continue'
+emit({'id':6,'result':{'turnId':'turn'}})
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
+for line in sys.stdin: pass
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    input_tx
+        .send(EdgeInvocationInput {
+            input: ProviderStageInput::Text {
+                input_id: "message-1".into(),
+                content: "continue".into(),
+                correlation_id: None,
+                expected_turn_id: Some("turn".into()),
+            },
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+    drop(input_tx);
+    let mut evidence = Evidence::default();
+    drive_with_input(
+        &mut process,
+        &stage(),
+        "/workspace",
+        &test_profile(),
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        &token,
+        Some(input_rx),
+    )
+    .await
+    .unwrap();
+    let ack = ack_rx.await.unwrap();
+    assert!(ack.accepted);
+    assert_eq!(ack.provider_turn_id.as_deref(), Some("turn"));
+    assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+    assert!(
+        process
+            .wait()
+            .await
+            .unwrap()
+            .settlement
+            .unwrap()
+            .ownership
+            .is_authoritative()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn active_native_turn_does_not_forge_acceptance_after_terminal_evidence() {
+    let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+request=recv()
+assert request['method']=='initialize'
+emit({'id':1,'result':{}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['method']=='thread/start'
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
+request=recv()
+assert request['method']=='turn/start'
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
+request=recv()
+assert request['method']=='turn/steer'
+for line in sys.stdin: pass
+"#;
+    let token = CancellationToken::new();
+    let mut process = transport::process(script, token.clone()).await;
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    input_tx
+        .send(EdgeInvocationInput {
+            input: ProviderStageInput::Text {
+                input_id: "message-after-terminal".into(),
+                content: "too late".into(),
+                correlation_id: None,
+                expected_turn_id: Some("turn".into()),
+            },
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+    drop(input_tx);
+    let mut evidence = Evidence::default();
+    drive_with_input(
+        &mut process,
+        &stage(),
+        "/workspace",
+        &test_profile(),
+        &mut evidence,
+        OUTPUT_BYTES,
+        None,
+        &token,
+        Some(input_rx),
+    )
+    .await
+    .unwrap();
+    assert!(ack_rx.await.is_err());
+    assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+    assert!(
+        process
+            .wait()
+            .await
+            .unwrap()
+            .settlement
+            .unwrap()
+            .ownership
+            .is_authoritative()
+    );
+}
+
+#[test]
 fn provider_declaration_carries_bounded_runtime_requirements_in_the_existing_extension() {
     let requirements = test_requirements();
     let declaration = provider_declaration(requirements.clone()).unwrap();
@@ -178,6 +404,7 @@ fn questionnaire() -> ProviderInteractionRequest {
     ProviderInteractionRequest {
         request_id: "rpc-question".into(),
         timeout_ms: Some(10_000),
+        provider_stage_input_id: None,
         payload: json!({"provider":"codex", "method":"item/tool/requestUserInput", "params":{"questions":[
             {"id":"native-first", "header":"First", "question":"Choose first?", "isOther":true,
              "options":[{"label":"A", "description":"First option"},{"label":"B", "description":"Second option"}]},
@@ -594,13 +821,13 @@ fn completed_agent_message_is_authoritative_over_truncated_progress() {
 #[test]
 fn original_native_questions_and_rpc_id_type_are_preserved() {
     let envelope = json!({"id": "native-question", "method": "item/tool/requestUserInput", "params": {"threadId": "thread", "turnId": "turn", "itemId": "item", "questions": [{"id": "q", "question": "Which?"}], "isBlocking": true}});
-    let request = interaction_request(&envelope, &active()).unwrap();
+    let request = interaction_request(&envelope, &active(), None).unwrap();
     assert_eq!(request.payload["native_request_id"], envelope["id"]);
     assert_eq!(request.payload["params"], envelope["params"]);
     assert_eq!(request.request_id, "\"native-question\"");
     let mut wrong = envelope;
     wrong["params"]["turnId"] = json!("other");
-    assert!(interaction_request(&wrong, &active()).is_err());
+    assert!(interaction_request(&wrong, &active(), None).is_err());
 }
 
 #[tokio::test]
@@ -647,6 +874,7 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
             &NoTaskGate,
             &fixture_execution_ceiling(&executor),
             None,
+            tokio::sync::mpsc::channel(1).1,
         )
         .await;
     assert!(denied.is_error);
@@ -670,6 +898,7 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
             &NoTaskGate,
             &fixture_execution_ceiling(&executor),
             None,
+            tokio::sync::mpsc::channel(1).1,
         )
         .await;
     assert!(denied.is_error);
@@ -800,6 +1029,7 @@ async fn live_native_codex_two_stages_same_session() {
                 &gate,
                 &ceiling,
                 None,
+                tokio::sync::mpsc::channel(1).1,
             )
             .await;
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -954,7 +1184,7 @@ mod transport {
         }
     }
 
-    async fn process(script: &str, token: CancellationToken) -> FramedProcess {
+    pub(super) async fn process(script: &str, token: CancellationToken) -> FramedProcess {
         let (command, owner) = BashInvocationOwner::prepare_with_supervisor_helper(
             std::env::current_exe().unwrap(),
             [
@@ -1348,6 +1578,413 @@ for line in sys.stdin: pass
         assert!(
             process
                 .wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_owner_steer_waits_for_interaction_reply_before_returning_ack() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+request=recv()
+assert request['method']=='turn/steer'
+emit({'id':'native-question','method':'item/tool/requestUserInput','params':{'threadId':'thread','turnId':'turn','itemId':'item','isBlocking':True,'questions':[{'id':'q','header':'Choice','question':'Proceed?'}]}})
+emit({'id':6,'result':{'turnId':'turn'}})
+answer=recv()
+assert answer=={'id':'native-question','result':{'answers':{'q':{'answers':['Proceed']}}}}
+for line in sys.stdin: pass
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let mut evidence = Evidence {
+            thread: Some("thread".into()),
+            turn: Some("turn".into()),
+            ..Evidence::default()
+        };
+        let input = process.input();
+        let mut input_rx = None;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let ack = submit_stage_input(
+            &mut process,
+            &input,
+            &mut evidence,
+            Some(&AnswerGate),
+            &token,
+            ProviderStageInput::Text {
+                input_id: "steer-with-question".into(),
+                content: "continue after checking the question".into(),
+                correlation_id: None,
+                expected_turn_id: Some("turn".into()),
+            },
+            OUTPUT_BYTES,
+            ack_tx,
+            &mut input_rx,
+        )
+        .await;
+        assert!(ack.is_ok());
+        assert!(ack_rx.await.unwrap().accepted);
+        assert!(
+            process
+                .cancel_and_wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    struct DelayedGate;
+
+    #[async_trait::async_trait]
+    impl ProviderInteractionGate for DelayedGate {
+        async fn request_interaction(
+            &self,
+            _: &ProviderInteractionRequest,
+        ) -> ProviderInteractionDecision {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            ProviderInteractionDecision::Cancelled
+        }
+    }
+
+    struct RecordingInputFenceGate {
+        seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderInteractionGate for RecordingInputFenceGate {
+        async fn request_interaction(
+            &self,
+            request: &ProviderInteractionRequest,
+        ) -> ProviderInteractionDecision {
+            *self.seen.lock().expect("input fence lock") = request.provider_stage_input_id.clone();
+            ProviderInteractionDecision::Cancelled
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn question_after_provider_ack_keeps_the_provisional_input_fence() {
+        let script = format!(
+            "{PREFIX}{}",
+            r#"
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+request=recv()
+assert request['method']=='turn/steer'
+emit({'id':6,'result':{'turnId':'turn'}})
+emit({'id':'native-question','method':'item/tool/requestUserInput','params':{'threadId':'thread','turnId':'turn','itemId':'item','isBlocking':True,'questions':[{'id':'q','header':'Choice','question':'Proceed?'}]}})
+for line in sys.stdin: pass
+"#
+        );
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        input_tx
+            .send(EdgeInvocationInput {
+                input: ProviderStageInput::Text {
+                    input_id: "accepted-before-question".into(),
+                    content: "continue before asking".into(),
+                    correlation_id: None,
+                    expected_turn_id: Some("turn".into()),
+                },
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
+        drop(input_tx);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let gate = RecordingInputFenceGate { seen: seen.clone() };
+        let mut evidence = Evidence::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            drive_with_input(
+                &mut process,
+                &stage(),
+                "/workspace",
+                &test_profile(),
+                &mut evidence,
+                OUTPUT_BYTES,
+                Some(&gate),
+                &token,
+                Some(input_rx),
+            ),
+        )
+        .await
+        .expect("question after the steer ACK must be handled promptly");
+        assert!(result.is_err());
+        assert!(ack_rx.await.unwrap().accepted);
+        assert_eq!(
+            seen.lock().expect("input fence lock").as_deref(),
+            Some("accepted-before-question")
+        );
+        assert_eq!(
+            evidence.last_accepted_stage_input_id.as_deref(),
+            Some("accepted-before-question")
+        );
+        assert!(
+            process
+                .cancel_and_wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    struct BlockingAnswerGate {
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderInteractionGate for BlockingAnswerGate {
+        async fn request_interaction(
+            &self,
+            _: &ProviderInteractionRequest,
+        ) -> ProviderInteractionDecision {
+            self.entered.notify_one();
+            self.release.notified().await;
+            ProviderInteractionDecision::Submitted(
+                json!({"answers": {"q": {"answers": ["Proceed"]}}}),
+            )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn question_first_classifies_later_guidance_before_the_ack_deadline() {
+        let script = format!(
+            "{PREFIX}{}",
+            r#"
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+emit({'id':'native-question','method':'item/tool/requestUserInput','params':{'threadId':'thread','turnId':'turn','itemId':'item','isBlocking':True,'questions':[{'id':'q','header':'Choice','question':'Proceed?'}]}})
+answer=recv()
+assert answer=={'id':'native-question','result':{'answers':{'q':{'answers':['Proceed']}}}}
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
+for line in sys.stdin: pass
+"#
+        );
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate = BlockingAnswerGate {
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        let mut evidence = Evidence::default();
+        let stage = stage();
+        let profile = test_profile();
+        let mut driving = Box::pin(drive_with_input(
+            &mut process,
+            &stage,
+            "/workspace",
+            &profile,
+            &mut evidence,
+            OUTPUT_BYTES,
+            Some(&gate),
+            &token,
+            Some(input_rx),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = entered.notified() => {},
+                result = &mut driving => panic!("drive ended before the provider question: {result:?}"),
+            }
+        })
+        .await
+        .expect("provider question must reach the interaction gate");
+        input_tx
+            .send(EdgeInvocationInput {
+                input: ProviderStageInput::Text {
+                    input_id: "guidance-after-question".into(),
+                    content: "please also check the new constraint".into(),
+                    correlation_id: None,
+                    expected_turn_id: Some("turn".into()),
+                },
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
+        drop(input_tx);
+        let ack = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                ack = &mut ack_rx => ack.expect("guidance ACK sender must remain live"),
+                result = &mut driving => panic!("drive ended before guidance was classified: {result:?}"),
+            }
+        })
+        .await
+        .expect("question-first guidance must be classified before the ACK deadline");
+        assert!(!ack.accepted);
+        release.notify_one();
+        driving.await.unwrap();
+        assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+        assert!(
+            process
+                .wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn steer_interaction_failure_stops_the_native_stage_instead_of_being_swallowed() {
+        let script = format!(
+            "{PREFIX}{}",
+            r#"
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+request=recv()
+assert request['method']=='turn/steer'
+emit({'id':6,'error':{'code':'rejected','message':'not accepted'}})
+for line in sys.stdin: pass
+"#
+        );
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        input_tx
+            .send(EdgeInvocationInput {
+                input: ProviderStageInput::Text {
+                    input_id: "steer-error".into(),
+                    content: "continue".into(),
+                    correlation_id: None,
+                    expected_turn_id: Some("turn".into()),
+                },
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
+        drop(input_tx);
+        let stage = stage();
+        let profile = test_profile();
+        let mut evidence = Evidence::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            drive_with_input(
+                &mut process,
+                &stage,
+                "/workspace",
+                &profile,
+                &mut evidence,
+                OUTPUT_BYTES,
+                None,
+                &token,
+                Some(input_rx),
+            ),
+        )
+        .await
+        .expect("steer failure must not leave the stage waiting");
+        assert_eq!(result.unwrap_err(), "native request rejected");
+        assert!(ack_rx.await.is_err());
+        assert!(
+            process
+                .cancel_and_wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_owner_steer_ack_is_sent_before_a_slow_interaction_finishes() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+request=recv()
+assert request['method']=='turn/steer'
+emit({'id':'native-question','method':'item/tool/requestUserInput','params':{'threadId':'thread','turnId':'turn','itemId':'item','isBlocking':True,'questions':[{'id':'q','header':'Choice','question':'Proceed?'}]}})
+emit({'id':6,'result':{'turnId':'turn'}})
+for line in sys.stdin: pass
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let mut evidence = Evidence {
+            thread: Some("thread".into()),
+            turn: Some("turn".into()),
+            ..Evidence::default()
+        };
+        let input = process.input();
+        let (input_tx, input_receiver) = tokio::sync::mpsc::channel(1);
+        let (queued_ack_tx, mut queued_ack_rx) = tokio::sync::oneshot::channel();
+        input_tx
+            .send(EdgeInvocationInput {
+                input: ProviderStageInput::Text {
+                    input_id: "queued-during-question".into(),
+                    content: "also continue with this".into(),
+                    correlation_id: None,
+                    expected_turn_id: Some("turn".into()),
+                },
+                ack: queued_ack_tx,
+            })
+            .await
+            .unwrap();
+        drop(input_tx);
+        let mut input_rx = Some(input_receiver);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        let mut submission = Box::pin(submit_stage_input(
+            &mut process,
+            &input,
+            &mut evidence,
+            Some(&DelayedGate),
+            &token,
+            ProviderStageInput::Text {
+                input_id: "steer-before-slow-question".into(),
+                content: "continue".into(),
+                correlation_id: None,
+                expected_turn_id: Some("turn".into()),
+            },
+            OUTPUT_BYTES,
+            ack_tx,
+            &mut input_rx,
+        ));
+        let ack = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                ack = &mut ack_rx => ack.expect("provider ACK sender must remain live"),
+                result = &mut submission => panic!("submission ended before its early ACK: {result:?}"),
+            }
+        })
+        .await
+        .expect("provider ACK must not wait for user interaction");
+        assert!(ack.accepted);
+        let queued_ack = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                ack = &mut queued_ack_rx => ack.expect("queued guidance ACK sender must remain live"),
+                result = &mut submission => panic!("submission ended before queued guidance was classified: {result:?}"),
+            }
+        })
+        .await
+        .expect("queued guidance must be classified before the ACK deadline");
+        assert!(!queued_ack.accepted);
+        token.cancel();
+        assert!(submission.await.is_err());
+        assert!(
+            process
+                .cancel_and_wait()
                 .await
                 .unwrap()
                 .settlement

@@ -457,6 +457,156 @@ pub enum ProviderTaskSupport {
     Required,
 }
 
+/// Maximum serialized size of one semantic input sent to an active provider
+/// stage.  Inputs are control messages, not a second transcript; large
+/// context belongs in an existing artifact or the next stage request.
+pub const MAX_PROVIDER_STAGE_INPUT_BYTES: usize = 32 * 1024;
+
+/// Provider-neutral input that can be delivered at a safe boundary of an
+/// active collaborator run.  The canonical run/message owner supplies the
+/// identity; adapters only translate this value to their wire protocol.
+///
+/// This is deliberately smaller than [`AgentMessage`].  Progress, shutdown,
+/// and permission traffic keep their existing owners and must not be smuggled
+/// into a provider's user prompt. Structured provider questions and answers
+/// continue through the existing interaction-gate contract; this type only
+/// represents an unsolicited text supplement to an active turn.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderStageInput {
+    Text {
+        /// Stable logical identity used to deduplicate a retry after a
+        /// transport acknowledgement becomes unknown.
+        input_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        /// The adapter fills this from its currently acknowledged turn when
+        /// the canonical owner has not observed one yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_turn_id: Option<String>,
+    },
+}
+
+impl ProviderStageInput {
+    pub fn input_id(&self) -> &str {
+        let Self::Text { input_id, .. } = self;
+        input_id
+    }
+
+    pub fn expected_turn_id(&self) -> Option<&str> {
+        let Self::Text {
+            expected_turn_id, ..
+        } = self;
+        expected_turn_id.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderContractError> {
+        let valid_id = |value: &str| !value.trim().is_empty() && value == value.trim();
+        if !valid_id(self.input_id()) {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "input_id must be a non-empty identifier".into(),
+            ));
+        }
+        let Self::Text { content, .. } = self;
+        if content.trim().is_empty() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "text input must not be empty".into(),
+            ));
+        }
+        if self
+            .expected_turn_id()
+            .is_some_and(|turn_id| !valid_id(turn_id))
+        {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "expected_turn_id must be a non-empty identifier".into(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_PROVIDER_STAGE_INPUT_BYTES {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "provider stage input exceeds its byte budget".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Evidence returned by the provider adapter for one stage input. `accepted`
+/// is the only provider-level decision. A missing acknowledgement is a
+/// transport failure and is handled by the caller's bounded retry path; it is
+/// not another business state. Acceptance does not claim that a model has
+/// already emitted a response; durable application remains owned by the
+/// existing run-control facts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderStageInputAck {
+    pub input_id: String,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ProviderStageInputAck {
+    pub fn accepted(input: &ProviderStageInput, provider_turn_id: Option<String>) -> Self {
+        Self {
+            input_id: input.input_id().to_owned(),
+            accepted: true,
+            provider_turn_id,
+            reason: None,
+        }
+    }
+
+    pub fn rejected(input: &ProviderStageInput, reason: impl Into<String>) -> Self {
+        Self {
+            input_id: input.input_id().to_owned(),
+            accepted: false,
+            provider_turn_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn validate_for(&self, input: &ProviderStageInput) -> Result<(), ProviderContractError> {
+        if self.input_id != input.input_id() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "input acknowledgement does not match input_id".into(),
+            ));
+        }
+        if self.accepted && self.reason.is_some() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "accepted input acknowledgement must not carry a rejection reason".into(),
+            ));
+        }
+        if !self.accepted && self.provider_turn_id.is_some() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "rejected input acknowledgement must not carry a provider turn".into(),
+            ));
+        }
+        if self
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.len() > 4096)
+        {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "input acknowledgement reason exceeds its byte budget".into(),
+            ));
+        }
+        if self
+            .provider_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| turn_id.trim().is_empty() || turn_id != turn_id.trim())
+        {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "provider_turn_id must be a non-empty identifier".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Losslessly normalized tool declaration before Astra policy resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolDeclaration {
@@ -900,6 +1050,13 @@ pub struct ProviderInteractionRequest {
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// The provider-stage input that was still awaiting its steer ACK when
+    /// this interaction arrived. It is an internal coordination fact, not
+    /// provider business payload; the server uses it only as a provisional
+    /// durable fence and applies current-run guidance only after an accepted
+    /// provider steer ACK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_stage_input_id: Option<String>,
 }
 
 impl ProviderInteractionRequest {
@@ -924,6 +1081,17 @@ impl ProviderInteractionRequest {
                 "timeout_ms must be between 1 and {}",
                 Self::MAX_TIMEOUT_MS
             )));
+        }
+        if self
+            .provider_stage_input_id
+            .as_deref()
+            .is_some_and(|input_id| {
+                input_id.trim().is_empty() || input_id != input_id.trim() || input_id.len() > 512
+            })
+        {
+            return Err(ProviderContractError::InvalidProviderInteraction(
+                "provider_stage_input_id must be a bounded identifier".into(),
+            ));
         }
         Ok(())
     }
@@ -1032,6 +1200,8 @@ pub enum ProviderContractError {
     EmptyIdentifier { kind: &'static str },
     #[error("invalid provider interaction: {0}")]
     InvalidProviderInteraction(String),
+    #[error("invalid provider stage input: {0}")]
+    InvalidProviderStageInput(String),
     #[error("duplicate native tool id '{native_tool_id}' in provider snapshot")]
     DuplicateNativeToolId { native_tool_id: String },
     #[error("tool '{native_tool_id}' {field} must be a JSON object")]
@@ -1339,6 +1509,7 @@ mod tests {
                 "options": [{"opaque": "value"}],
             }),
             timeout_ms: Some(600_000),
+            provider_stage_input_id: None,
         };
         request.validate().unwrap();
 
@@ -1357,6 +1528,7 @@ mod tests {
             request_id: "interaction-1".to_string(),
             payload: json!({}),
             timeout_ms: None,
+            provider_stage_input_id: None,
         };
 
         for response in [
@@ -1378,5 +1550,71 @@ mod tests {
         ] {
             assert!(response.validate_for(&request).is_err());
         }
+    }
+
+    #[test]
+    fn provider_stage_input_is_bounded_and_acknowledgements_are_fenced() {
+        let input = ProviderStageInput::Text {
+            input_id: "message-1".into(),
+            content: "please continue with the failing test".into(),
+            correlation_id: Some("turn-1".into()),
+            expected_turn_id: Some("turn-7".into()),
+        };
+        input.validate().unwrap();
+        let encoded = serde_json::to_vec(&input).unwrap();
+        assert!(encoded.len() <= MAX_PROVIDER_STAGE_INPUT_BYTES);
+
+        let ack = ProviderStageInputAck::accepted(&input, Some("turn-7".into()));
+        ack.validate_for(&input).unwrap();
+        let wrong = ProviderStageInputAck {
+            input_id: "message-2".into(),
+            ..ack
+        };
+        assert!(wrong.validate_for(&input).is_err());
+        assert!(
+            ProviderStageInputAck {
+                input_id: input.input_id().into(),
+                accepted: true,
+                provider_turn_id: None,
+                reason: Some("not actually accepted".into()),
+            }
+            .validate_for(&input)
+            .is_err()
+        );
+        assert!(
+            ProviderStageInputAck {
+                input_id: input.input_id().into(),
+                accepted: false,
+                provider_turn_id: Some("turn-7".into()),
+                reason: Some("rejected".into()),
+            }
+            .validate_for(&input)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_stage_input_rejects_empty_and_oversized_content() {
+        assert!(
+            ProviderStageInput::Text {
+                input_id: "message-1".into(),
+                content: "   ".into(),
+                correlation_id: None,
+                expected_turn_id: None,
+            }
+            .validate()
+            .is_err()
+        );
+
+        assert!(
+            ProviderStageInput::Text {
+                input_id: "message-1".into(),
+                content: "x".repeat(MAX_PROVIDER_STAGE_INPUT_BYTES),
+                correlation_id: None,
+                expected_turn_id: None,
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

@@ -783,7 +783,7 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
     let mut agent = edge_agent_record("edge-1");
     let mut advert: astra_runtime_env::RuntimeEnvironmentAdvertisement =
         serde_json::from_value(agent.capabilities.clone().unwrap()).unwrap();
-    advert.provider_discovery = vec![discovery];
+    advert.provider_discovery = vec![discovery.clone()];
     agent.capabilities = Some(serde_json::to_value(&advert).unwrap());
     let mut invocation = request(
         "structured_worker",
@@ -816,6 +816,7 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
     invocation.policy.execution_binding_generation = Some(7);
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
         .unwrap();
+    assert!(!plan.requires_live_provider_interaction());
     assert!(plan.dispatch_payload_json().is_err());
     for filesystem in [
         astra_runtime_env::FilesystemPolicy::NoAccess,
@@ -904,6 +905,47 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
     let mut unadmitted = invocation.clone();
     unadmitted.policy.resolved_provider_policy = None;
     assert!(select(&agent, &unadmitted).is_err());
+
+    let mut collaborator_tool = discovery.tool_declarations[0].clone();
+    collaborator_tool.task_support = ProviderTaskSupport::Required;
+    collaborator_tool
+        .extension_fields
+        .insert(PROVIDER_COLLABORATOR_STAGE_KEY.into(), Value::Bool(true));
+    collaborator_tool.extension_fields.insert(
+        astra_turn_core::provider_resolution::NativeCollaboratorProtocol::EXTENSION_KEY.into(),
+        Value::String(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer
+                .extension_value()
+                .into(),
+        ),
+    );
+    let collaborator_discovery = ProviderDiscoverySnapshot::new(
+        ProviderIdentity::new("selected-runtime").unwrap(),
+        ProviderBindingRef::new(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-edge-1",
+                "/Users/test/project",
+            ),
+        )
+        .unwrap(),
+        ProviderProtocolId::new("cli-local").unwrap(),
+        vec![collaborator_tool],
+    )
+    .unwrap();
+    let collaborator_resolved = resolve_provider_snapshot(
+        &collaborator_discovery,
+        &ProviderClaimTrustPolicy::default(),
+        &aliases,
+    )
+    .unwrap();
+    let collaborator_index =
+        ResolvedProviderPolicyIndex::from_snapshots(&[collaborator_resolved]).unwrap();
+    let mut collaborator_invocation = invocation.clone();
+    collaborator_invocation.policy.resolved_provider_policy =
+        collaborator_index.resolve("structured_worker").cloned();
+    let collaborator_plan = EdgeBoundExecutionPlan::try_from_request(&collaborator_invocation)
+        .expect("collaborator policy should produce an edge plan");
+    assert!(collaborator_plan.requires_live_provider_interaction());
     for change in [
         "schema",
         "root",

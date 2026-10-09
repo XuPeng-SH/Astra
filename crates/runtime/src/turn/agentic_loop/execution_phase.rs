@@ -3816,7 +3816,7 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
 /// normal empty-poll cadence has not elapsed. This is the ownership handoff
 /// that prevents a remotely accepted intent from falling between the final
 /// model response and terminal run settlement.
-async fn inject_polled_user_intents_before_settlement<H: AgenticLoopHost>(
+pub(crate) async fn inject_polled_user_intents_before_settlement<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
@@ -4072,114 +4072,50 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
                 .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
             return Ok(applied_model_guidance);
         } else {
-            let apply_authority = state
-                .current_run_owner_generation
-                .map(UserIntentAdmissionAuthority::DurableOwnerGeneration)
-                .unwrap_or(UserIntentAdmissionAuthority::ProcessLocal);
-            // Resume retries the same acknowledgement, not the snapshot page:
-            // pause must not spend pagination capacity or advance its cursor.
-            loop {
-                match run_control
-                    .mark_user_intents_applied(
-                        &user_id,
-                        &expected_session_id,
-                        &run_id,
-                        &release_event_indices,
-                        apply_authority,
-                    )
-                    .await
-                {
-                    Ok(crate::turn::run_control::UserIntentApplyAck::Paused) => {
-                        let pause_flag =
-                            state.cancellation.pause_flag.as_ref().ok_or_else(|| {
-                                astra_core::ClassifiedError::new(
-                                    astra_core::ErrorKind::ContractViolation,
-                                    "paused input consumer has no shared execution pause control",
-                                )
-                            })?;
-                        pause_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        if wait_for_pause_clear_or_cancel(host, state).await? {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::Cancelled,
-                                "run cancelled while accepted guidance was awaiting resume",
-                            ));
-                        }
-                        continue;
+            if let Some((ack, model_context_changed)) = apply_pending_user_intents(
+                host,
+                state,
+                run_control.as_ref(),
+                &user_id,
+                &expected_session_id,
+                &run_id,
+                &release_event_indices,
+                Some(observed.next_cursor),
+                force_poll,
+            )
+            .await?
+            {
+                applied_model_guidance |= model_context_changed;
+                if ack == crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned {
+                    state.user_intents.note_user_intent_poll_finished(
+                        poll_started,
+                        USER_INTENT_EMPTY_POLL_INTERVAL,
+                    );
+                    tracing::debug!(
+                        run_id = %run_id,
+                        ?release_event_indices,
+                        "terminal run won user intent application race"
+                    );
+                    if force_poll {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "run terminated while applying authoritative user guidance; stale provider actions were discarded",
+                        ));
                     }
-                    Ok(crate::turn::run_control::UserIntentApplyAck::Applied) => {
-                        let acknowledged = state
-                            .user_intents
-                            .acknowledge_apply_events(&release_event_indices);
-                        applied_model_guidance |=
-                            apply_acknowledged_user_intents(host, state, &acknowledged);
-                        for event in &acknowledged {
-                            if crate::turn::run_control::runtime_notification_content(&event.input)
-                                .is_none()
-                            {
-                                host.on_user_intent_applied(event).await;
-                            }
-                        }
-                        state
-                            .user_intents
-                            .commit_observed_cursor(observed.next_cursor);
-                    }
-                    Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned) => {
-                        let returned = state
-                            .user_intents
-                            .return_pending_apply_events(&release_event_indices);
-                        for event in &returned {
-                            if crate::turn::run_control::runtime_notification_content(&event.input)
-                                .is_none()
-                            {
-                                host.on_user_intent_returned(event).await;
-                            }
-                        }
-                        state
-                            .user_intents
-                            .commit_observed_cursor(observed.next_cursor);
-                        state.user_intents.note_user_intent_poll_finished(
-                            poll_started,
-                            USER_INTENT_EMPTY_POLL_INTERVAL,
-                        );
-                        tracing::debug!(
-                            run_id = %run_id,
-                            ?release_event_indices,
-                            "terminal run won user intent application race"
-                        );
-                        if force_poll {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::Cancelled,
-                                "run terminated while applying authoritative user guidance; stale provider actions were discarded",
-                            ));
-                        }
-                        return Ok(applied_model_guidance);
-                    }
-                    Err(error) => {
-                        state
-                            .user_intents
-                            .note_apply_ack_failure(tokio::time::Instant::now());
-                        state.user_intents.note_user_intent_poll_finished(
-                            poll_started,
-                            USER_INTENT_EMPTY_POLL_INTERVAL,
-                        );
-                        tracing::warn!(
-                            run_id = %run_id,
-                            ?release_event_indices,
-                            error = %error,
-                            "failed to durably acknowledge user intent application"
-                        );
-                        if force_poll {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::ContractViolation,
-                                format!(
-                                    "authoritative user guidance could not be durably acknowledged before the action boundary: {error}"
-                                ),
-                            ));
-                        }
-                        return Ok(applied_model_guidance);
-                    }
+                    return Ok(applied_model_guidance);
                 }
-                break;
+            } else if force_poll {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!(
+                        "authoritative user guidance could not be durably acknowledged before the action boundary for run {run_id}"
+                    ),
+                ));
+            } else {
+                state
+                    .user_intents
+                    .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
+                return Ok(applied_model_guidance);
             }
         }
 
@@ -4300,6 +4236,286 @@ fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
         );
     }
     !model_guidance.is_empty()
+}
+
+/// A native provider stage has no ordinary model boundary at which the
+/// agentic loop can consume current-run guidance. It still uses the same
+/// durable outbox and apply acknowledgement as every other run; this small
+/// boundary only exposes the next accepted text until the provider confirms
+/// it.
+pub(crate) async fn next_provider_stage_user_intent<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    user_id: &str,
+    run_id: &str,
+) -> Result<
+    Option<(crate::turn::run_control::QueuedUserIntent, usize, bool)>,
+    astra_core::ClassifiedError,
+> {
+    let run_control = state.run_control.clone().ok_or_else(|| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "native provider stage has no canonical run-control owner",
+        )
+    })?;
+    let mut pages = 0_usize;
+    let mut inspected_facts = 0_usize;
+    loop {
+        let page_start_cursor = state.user_intents.user_intent_cursor();
+        let poll = run_control
+            .poll_user_intents(user_id, run_id, page_start_cursor)
+            .await;
+        if let Some(error) = poll.error {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Unknown,
+                format!("native provider stage could not poll current-run guidance: {error}"),
+            ));
+        }
+
+        pages = pages.saturating_add(1);
+        inspected_facts = inspected_facts.saturating_add(poll.snapshot_page_fact_count);
+        let page_has_more = poll.snapshot_has_more;
+        let page_cursor = poll.next_cursor;
+        if page_cursor < page_start_cursor
+            || (poll.snapshot_page_fact_count > 0 && page_cursor == page_start_cursor)
+            || (page_has_more && poll.snapshot_page_fact_count == 0)
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!(
+                    "authoritative user-intent pagination made no forward progress for native provider stage: cursor {page_start_cursor} -> {page_cursor}, facts={}, has_more={page_has_more}",
+                    poll.snapshot_page_fact_count
+                ),
+            ));
+        }
+        if pages > MAX_USER_INTENT_BOUNDARY_PAGES
+            || inspected_facts > MAX_USER_INTENT_BOUNDARY_FACTS
+            || (page_has_more && pages == MAX_USER_INTENT_BOUNDARY_PAGES)
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!(
+                    "authoritative user-intent snapshot exceeds the boundary drain limit for native provider stage: pages={pages}, facts={inspected_facts}"
+                ),
+            ));
+        }
+
+        for issue in &poll.issues {
+            tracing::warn!(
+                target: "astra_runtime::agentic_loop",
+                run_id,
+                event_index = issue.event_index,
+                intent_id = issue.intent_id.as_deref().unwrap_or(""),
+                kind = ?issue.kind,
+                "invalid durable current-run guidance was isolated before native provider delivery"
+            );
+        }
+
+        let mut replayed = Vec::new();
+        let mut inputs = Vec::new();
+        for event in poll.inputs {
+            if event.status == astra_turn_types::UserIntentStatus::Applied {
+                if !state.user_intents.has_applied_user_intent(&event.intent_id) {
+                    replayed.push(event);
+                }
+            } else if crate::turn::run_control::user_intent_content(&event.input).is_some() {
+                inputs.push(event);
+            }
+        }
+
+        // An applied event can be replayed after a process restart. Restore the
+        // local projection without sending the provider input a second time; the
+        // durable event is already the source of truth for that delivery.
+        if !replayed.is_empty() {
+            apply_acknowledged_user_intents(host, state, &replayed);
+        }
+
+        // Do not advance past a still-pending input. The next poll will filter
+        // already-applied source events and return the same pending input until
+        // the provider boundary and durable apply acknowledgement both succeed.
+        let commit_cursor = inputs.len() == 1;
+        if let Some(input) = inputs.into_iter().next() {
+            return Ok(Some((input, page_cursor, commit_cursor)));
+        }
+
+        state.user_intents.commit_observed_cursor(page_cursor);
+        if !page_has_more {
+            return Ok(None);
+        }
+    }
+}
+
+/// Complete the durable acknowledgement for events that have already been
+/// staged by the canonical user-intent owner. This function deliberately does
+/// not poll for new input: a native provider may have rejected or ambiguously
+/// delivered a different event, and that event must not become applied merely
+/// because a settlement boundary was reached.
+pub(crate) async fn apply_pending_user_intents<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    run_control: &dyn RunControlProvider,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    event_indices: &[usize],
+    commit_cursor: Option<usize>,
+    strict: bool,
+) -> Result<Option<(crate::turn::run_control::UserIntentApplyAck, bool)>, astra_core::ClassifiedError>
+{
+    let authority = state
+        .current_run_owner_generation
+        .map(UserIntentAdmissionAuthority::DurableOwnerGeneration)
+        .unwrap_or(UserIntentAdmissionAuthority::ProcessLocal);
+    loop {
+        match run_control
+            .mark_user_intents_applied(user_id, session_id, run_id, event_indices, authority)
+            .await
+        {
+            Ok(crate::turn::run_control::UserIntentApplyAck::Paused) => {
+                let pause_flag = state.cancellation.pause_flag.as_ref().ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "paused input consumer has no shared execution pause control",
+                    )
+                })?;
+                pause_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                if wait_for_pause_clear_or_cancel(host, state).await? {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Cancelled,
+                        "run cancelled while accepted guidance was awaiting resume",
+                    ));
+                }
+            }
+            Ok(crate::turn::run_control::UserIntentApplyAck::Applied) => {
+                let acknowledged = state.user_intents.acknowledge_apply_events(event_indices);
+                let model_context_changed =
+                    apply_acknowledged_user_intents(host, state, &acknowledged);
+                for event in &acknowledged {
+                    if crate::turn::run_control::runtime_notification_content(&event.input)
+                        .is_none()
+                    {
+                        host.on_user_intent_applied(event).await;
+                    }
+                }
+                if let Some(cursor) = commit_cursor {
+                    state.user_intents.commit_observed_cursor(cursor);
+                }
+                return Ok(Some((
+                    crate::turn::run_control::UserIntentApplyAck::Applied,
+                    model_context_changed,
+                )));
+            }
+            Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned) => {
+                let returned = state
+                    .user_intents
+                    .return_pending_apply_events(event_indices);
+                for event in &returned {
+                    if crate::turn::run_control::runtime_notification_content(&event.input)
+                        .is_none()
+                    {
+                        host.on_user_intent_returned(event).await;
+                    }
+                }
+                if let Some(cursor) = commit_cursor {
+                    state.user_intents.commit_observed_cursor(cursor);
+                }
+                return Ok(Some((
+                    crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned,
+                    false,
+                )));
+            }
+            Err(error) => {
+                state
+                    .user_intents
+                    .note_apply_ack_failure(tokio::time::Instant::now());
+                tracing::warn!(
+                    run_id,
+                    ?event_indices,
+                    error = %error,
+                    "failed to durably acknowledge user intent application"
+                );
+                if strict {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        format!(
+                            "authoritative user guidance could not be durably acknowledged before the action boundary: {error}"
+                        ),
+                    ));
+                }
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Commit one provider-confirmed current-run input through the canonical
+/// durable user-intent owner. A provider ACK is not enough to tell the user
+/// that guidance was applied; the durable disposition and host projection
+/// must complete first.
+pub(crate) async fn apply_provider_stage_user_intent<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    event: &crate::turn::run_control::QueuedUserIntent,
+    next_cursor: usize,
+    commit_cursor: bool,
+) -> Result<Option<crate::turn::run_control::UserIntentApplyAck>, astra_core::ClassifiedError> {
+    let run_control = state.run_control.clone().ok_or_else(|| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "native provider stage has no canonical run-control owner",
+        )
+    })?;
+    let user_id = state.context_manifest_user_id.clone().ok_or_else(|| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "native provider stage has no immutable user identity",
+        )
+    })?;
+    let session_id = state.current_session_id.clone().ok_or_else(|| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "native provider stage has no immutable session identity",
+        )
+    })?;
+    let run_id = state.current_run_id.clone().ok_or_else(|| {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "native provider stage has no immutable run identity",
+        )
+    })?;
+    if state.current_run_owner_generation.is_none() {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "native provider stage has no durable execution-owner generation",
+        ));
+    }
+    state
+        .user_intents
+        .stage_pending_apply_events(std::slice::from_ref(event));
+    let indices = [event.event_index];
+    Ok(apply_pending_user_intents(
+        host,
+        state,
+        run_control.as_ref(),
+        &user_id,
+        &session_id,
+        &run_id,
+        &indices,
+        commit_cursor.then_some(next_cursor),
+        false,
+    )
+    .await?
+    .map(|(ack, _)| ack))
+}
+
+pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
+    NormalizedPromptCacheUsage::new(
+        turn_result.accum.prompt_tokens,
+        turn_result.accum.cache_read_tokens,
+        turn_result.accum.cache_creation_tokens,
+    )
+    .total_input_tokens()
+    .saturating_add(turn_result.accum.completion_tokens)
 }
 
 fn runtime_feedback_run_usage(
@@ -24107,6 +24323,124 @@ mod tests {
             state.volatile_pending.is_empty(),
             "real deferred user input must not be duplicated as runtime context"
         );
+    }
+
+    #[tokio::test]
+    async fn native_provider_guidance_publishes_applied_only_after_provider_boundary() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-native-guidance".into());
+        state.context_manifest_user_id = Some("user-native-guidance".into());
+        state.current_run_owner_generation = Some(7);
+        let provider = Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll {
+                next_cursor: 1,
+                snapshot_has_more: true,
+                snapshot_page_fact_count: 1,
+                ..UserIntentPoll::default()
+            },
+            UserIntentPoll {
+                next_cursor: 2,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "native-input-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": "continue with the review"}),
+                }],
+                ..UserIntentPoll::default()
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        let pending = next_provider_stage_user_intent(
+            &mut host,
+            &mut state,
+            "user-native-guidance",
+            "run-native-guidance",
+        )
+        .await
+        .unwrap();
+        let (event, next_cursor, commit_cursor) = pending.expect("one pending input");
+        assert_eq!(
+            state.user_intents.user_intent_cursor(),
+            1,
+            "settled pages may advance the cursor; the pending page remains uncommitted"
+        );
+        assert_eq!(*provider.poll_calls.lock().await, vec![0, 1]);
+        assert!(host.user_intent_applied_indices.is_empty());
+
+        assert!(matches!(
+            apply_provider_stage_user_intent(
+                &mut host,
+                &mut state,
+                &event,
+                next_cursor,
+                commit_cursor,
+            )
+            .await
+            .unwrap(),
+            Some(crate::turn::run_control::UserIntentApplyAck::Applied)
+        ));
+        assert_eq!(state.user_intents.user_intent_cursor(), 2);
+        assert_eq!(host.user_intent_context_indices, vec![1]);
+        assert_eq!(host.user_intent_applied_indices, vec![1]);
+        assert_eq!(*provider.released.lock().await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn native_apply_retry_does_not_poll_or_consume_new_guidance() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-native-apply-retry".into());
+        state.current_session_id = Some("session-native-apply-retry".into());
+        state.context_manifest_user_id = Some("user-native-apply-retry".into());
+        state.current_run_owner_generation = Some(7);
+        let accepted = crate::turn::run_control::QueuedUserIntent {
+            intent_id: "accepted-by-provider".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+            event_index: 1,
+            input: serde_json::json!({"content": "apply this accepted guidance"}),
+        };
+        state
+            .user_intents
+            .stage_pending_apply_events(std::slice::from_ref(&accepted));
+        let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
+            next_cursor: 3,
+            snapshot_page_fact_count: 1,
+            inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                intent_id: "new-undelivered-guidance".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                event_index: 2,
+                input: serde_json::json!({"content": "do not apply this yet"}),
+            }],
+            ..UserIntentPoll::default()
+        }]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+        let pending = state.user_intents.pending_apply_event_indices();
+
+        assert!(matches!(
+            apply_pending_user_intents(
+                &mut host,
+                &mut state,
+                provider.as_ref(),
+                "user-native-apply-retry",
+                "session-native-apply-retry",
+                "run-native-apply-retry",
+                &pending,
+                None,
+                false,
+            )
+            .await
+            .unwrap(),
+            Some((crate::turn::run_control::UserIntentApplyAck::Applied, true))
+        ));
+        assert_eq!(provider.poll_call_count().await, 0);
+        assert_eq!(state.message, "apply this accepted guidance");
+        assert!(state.user_intents.pending_apply_event_indices().is_empty());
     }
 
     #[tokio::test]

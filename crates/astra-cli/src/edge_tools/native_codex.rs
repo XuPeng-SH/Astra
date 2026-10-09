@@ -4,11 +4,12 @@
 //! matching `turn/completed` notification establishes a native terminal result.
 
 use super::{ApprovedNativeRuntime, ToolExecutor};
+use astra_edge::EdgeInvocationInput;
 use astra_sandbox::{
     BashInvocationOwner, FramedProcess, FramedProcessEnd, FramedProcessInput, FramedProcessLimits,
 };
 use astra_tools::{ProviderInteractionDecision, ProviderInteractionGate, ToolResult};
-use astra_turn_types::ProviderInteractionRequest;
+use astra_turn_types::{ProviderInteractionRequest, ProviderStageInput, ProviderStageInputAck};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -24,6 +25,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPPORTED_VERSION: &[u8] = b"codex-cli 0.160.0";
 const MODEL_LIST_REQUEST_ID: i64 = 4;
 const INTERRUPT_REQUEST_ID: i64 = 5;
+const STEER_REQUEST_ID: i64 = 6;
 const MODEL_LIST_PAGE_LIMIT: u64 = 64;
 const MODEL_LIST_MAX_PAGES: usize = 8;
 const MODEL_LIST_MAX_ITEMS: usize = 512;
@@ -643,6 +645,11 @@ fn resolve_model_selector(
 struct Evidence {
     thread: Option<String>,
     turn: Option<String>,
+    /// The last provider-stage input accepted by the native turn. The server
+    /// may still be completing its durable apply when the provider asks the
+    /// next question, so keep this provisional fence until a later input
+    /// replaces it. The server remains the authority for whether it exists.
+    last_accepted_stage_input_id: Option<String>,
     resolved_model: Option<String>,
     acknowledged_model: Option<String>,
     resumed: bool,
@@ -976,12 +983,291 @@ fn turn_request(
     json!({"id": 3, "method": "turn/start", "params": params})
 }
 
+fn turn_steer_request(
+    evidence: &Evidence,
+    input: &ProviderStageInput,
+) -> Result<Value, &'static str> {
+    let ProviderStageInput::Text {
+        input_id,
+        content,
+        expected_turn_id,
+        ..
+    } = input;
+    let thread = evidence
+        .thread
+        .as_deref()
+        .ok_or("native thread is not acknowledged")?;
+    let turn = evidence
+        .turn
+        .as_deref()
+        .ok_or("native turn is not acknowledged")?;
+    if expected_turn_id
+        .as_ref()
+        .is_some_and(|expected| expected != turn)
+    {
+        return Err("provider input expected a different active turn");
+    }
+    Ok(json!({
+        "id": STEER_REQUEST_ID,
+        "method": "turn/steer",
+        "params": {
+            "threadId": thread,
+            "clientUserMessageId": input_id,
+            "input": [{"type": "text", "text": content, "text_elements": []}],
+            "expectedTurnId": turn,
+        }
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_stage_input(
+    process: &mut FramedProcess,
+    input: &FramedProcessInput,
+    evidence: &mut Evidence,
+    gate: Option<&dyn ProviderInteractionGate>,
+    cancel: &CancellationToken,
+    stage_input: ProviderStageInput,
+    output_limit: usize,
+    ack_sender: tokio::sync::oneshot::Sender<ProviderStageInputAck>,
+    input_rx: &mut Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
+) -> Result<(), &'static str> {
+    if let Err(error) = stage_input.validate() {
+        let _ = ack_sender.send(ProviderStageInputAck::rejected(
+            &stage_input,
+            error.to_string(),
+        ));
+        return Ok(());
+    }
+    let request = match turn_steer_request(evidence, &stage_input) {
+        Ok(request) => request,
+        Err(reason) => {
+            let _ = ack_sender.send(ProviderStageInputAck::rejected(&stage_input, reason));
+            return Ok(());
+        }
+    };
+    let mut pending_ack = PendingStageInputAck {
+        input: stage_input,
+        sender: Some(ack_sender),
+        confirmed: None,
+        failure: None,
+    };
+    match rpc(
+        process,
+        input,
+        request,
+        evidence,
+        output_limit,
+        gate,
+        Some(cancel),
+        Some(&mut pending_ack),
+        Some(input_rx),
+    )
+    .await
+    {
+        Ok(response) => {
+            pending_ack.confirm(&response, evidence)?;
+            Ok(())
+        }
+        // A terminal notification can race the steer response. It does not
+        // prove whether the provider accepted the input, so keep the result
+        // transport-ambiguous rather than inventing a negative ACK.
+        Err(_reason) if evidence.terminal.is_some() => {
+            // A terminal notification raced the steer response. The input
+            // was not acknowledged, so dropping its sender is the truthful
+            // result; the completed provider stage owns the final outcome.
+            Ok(())
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
+struct PendingStageInputAck {
+    input: ProviderStageInput,
+    sender: Option<tokio::sync::oneshot::Sender<ProviderStageInputAck>>,
+    confirmed: Option<ProviderStageInputAck>,
+    failure: Option<&'static str>,
+}
+
+impl PendingStageInputAck {
+    fn confirm(
+        &mut self,
+        response: &Value,
+        evidence: &mut Evidence,
+    ) -> Result<ProviderStageInputAck, &'static str> {
+        if let Some(ack) = &self.confirmed {
+            return Ok(ack.clone());
+        }
+        if let Some(reason) = self.failure {
+            return Err(reason);
+        }
+        let result = if evidence.terminal.is_some() {
+            Err("native turn completed before the input was acknowledged")
+        } else {
+            let Some(turn_id) = response.get("turnId").and_then(Value::as_str) else {
+                return self.fail("native turn/steer acknowledgement has no turnId");
+            };
+            if !valid_id(turn_id) || evidence.turn.as_deref() != Some(turn_id) {
+                return self.fail("native turn/steer acknowledgement changed the active turn");
+            }
+            Ok(ProviderStageInputAck::accepted(
+                &self.input,
+                Some(turn_id.to_owned()),
+            ))
+        }?;
+        if result.accepted {
+            evidence.last_accepted_stage_input_id = Some(self.input.input_id().to_owned());
+        }
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result.clone());
+        }
+        self.confirmed = Some(result.clone());
+        Ok(result)
+    }
+
+    fn fail(&mut self, reason: &'static str) -> Result<ProviderStageInputAck, &'static str> {
+        self.sender.take();
+        self.failure = Some(reason);
+        Err(reason)
+    }
+}
+
+enum NativeRpcResponse {
+    Result(Value),
+    Error(&'static str),
+}
+
+/// Serve one provider request while another JSON-RPC response is pending.
+/// Every protocol wait uses this same dispatcher so steering cannot swallow a
+/// question, approval, or terminal event. If the request response arrives
+/// while an interaction is outstanding, retain it until the interaction reply
+/// is sent; the provider may still be blocked on that reply.
+#[allow(clippy::too_many_arguments)]
+async fn serve_native_interaction(
+    process: &mut FramedProcess,
+    input: &FramedProcessInput,
+    evidence: &mut Evidence,
+    envelope: &Value,
+    gate: &dyn ProviderInteractionGate,
+    cancel: Option<&CancellationToken>,
+    output_limit: usize,
+    expected_response_id: Option<&Value>,
+    mut early_stage_ack: Option<&mut PendingStageInputAck>,
+    mut input_rx: Option<&mut Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>>,
+) -> Result<Option<NativeRpcResponse>, &'static str> {
+    let method = envelope
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or("invalid native request method")?;
+    let provider_stage_input_id = early_stage_ack
+        .as_deref()
+        .map(|pending| pending.input.input_id().to_owned())
+        .or_else(|| evidence.last_accepted_stage_input_id.clone());
+    let request = interaction_request(envelope, evidence, provider_stage_input_id)?;
+    let decision = tokio::time::timeout(INTERACTION_TIMEOUT, gate.request_interaction(&request));
+    tokio::pin!(decision);
+    let mut pending_response = None;
+    loop {
+        let input_ready = input_rx.as_ref().is_some_and(|receiver| receiver.is_some());
+        tokio::select! {
+            biased;
+            _ = async {
+                match cancel {
+                    Some(cancel) => {
+                        cancel.cancelled().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err("native interaction cancelled"),
+            decision_result = &mut decision => {
+                let decision = decision_result.map_err(|_| "native interaction timed out")?;
+                match decision {
+                    ProviderInteractionDecision::Submitted(payload) if payload.is_object() => {
+                        validate_interaction_response(method, &envelope["params"], &payload)?;
+                        send(input, json!({"id": envelope["id"], "result": payload})).await?;
+                        return Ok(pending_response);
+                    }
+                    ProviderInteractionDecision::Submitted(_) => {
+                        return Err("invalid native interaction response");
+                    }
+                    ProviderInteractionDecision::Cancelled => {
+                        return Err("native interaction cancelled");
+                    }
+                    ProviderInteractionDecision::Timeout => {
+                        return Err("native interaction timed out");
+                    }
+                    ProviderInteractionDecision::Error(_) => {
+                        return Err("native interaction failed");
+                    }
+                }
+            }
+            stage_input = async {
+                match input_rx.as_deref_mut() {
+                    Some(Some(receiver)) => receiver.recv().await,
+                    None => None,
+                    Some(None) => None,
+                }
+            }, if input_ready => {
+                match stage_input {
+                    Some(stage_input) => {
+                        let _ = stage_input.ack.send(ProviderStageInputAck::rejected(
+                            &stage_input.input,
+                            "native provider interaction is pending; guidance remains queued for a later boundary",
+                        ));
+                    }
+                    None => {
+                        if let Some(receiver) = input_rx.as_deref_mut() {
+                            *receiver = None;
+                        }
+                    }
+                }
+            }
+            event = next_envelope(process, evidence) => {
+                let event = event?;
+                if event.get("id").is_some() {
+                    if expected_response_id.is_some_and(|expected| event["id"] == *expected) {
+                        let response = if event.get("error").is_some() {
+                            NativeRpcResponse::Error("native request rejected")
+                        } else if let Some(early_stage_ack) = early_stage_ack.as_deref_mut() {
+                            match early_stage_ack.confirm(&event["result"], evidence) {
+                                Ok(_) => NativeRpcResponse::Result(event["result"].clone()),
+                                Err(reason) => NativeRpcResponse::Error(reason),
+                            }
+                        } else {
+                            NativeRpcResponse::Result(event["result"].clone())
+                        };
+                        if pending_response.replace(response).is_some() {
+                            return Err("native request produced multiple responses while interaction was pending");
+                        }
+                        continue;
+                    }
+                    return Err("native concurrent interaction exceeds invocation bound");
+                }
+                let method = event
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .ok_or("unexpected native response during interaction")?;
+                evidence.notification(method, &event["params"], output_limit)?;
+                if evidence.terminal.is_some() {
+                    // The caller observes terminal evidence and closes the
+                    // stage; it must not keep waiting for a user response.
+                    return Ok(pending_response);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn rpc(
     process: &mut FramedProcess,
     input: &FramedProcessInput,
     request: Value,
     evidence: &mut Evidence,
     output_limit: usize,
+    gate: Option<&dyn ProviderInteractionGate>,
+    cancel: Option<&CancellationToken>,
+    mut early_stage_ack: Option<&mut PendingStageInputAck>,
+    mut input_rx: Option<&mut Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>>,
 ) -> Result<Value, &'static str> {
     let id = request["id"].clone();
     send(input, request).await?;
@@ -1018,9 +1304,39 @@ async fn rpc(
                 }
                 evidence.pre_ack.push(envelope);
             } else if envelope.get("id").is_some() {
-                return Err("native request before active turn acknowledgement");
+                let gate = gate.ok_or("native interaction gate is not connected")?;
+                let response = serve_native_interaction(
+                    process,
+                    input,
+                    evidence,
+                    &envelope,
+                    gate,
+                    cancel,
+                    output_limit,
+                    Some(&id),
+                    early_stage_ack.as_deref_mut(),
+                    input_rx.as_deref_mut(),
+                )
+                .await?;
+                if let Some(response) = response {
+                    return match response {
+                        NativeRpcResponse::Result(result) => {
+                            if let Some(early_stage_ack) = early_stage_ack.as_deref_mut() {
+                                early_stage_ack.confirm(&result, evidence)?;
+                            }
+                            Ok(result)
+                        }
+                        NativeRpcResponse::Error(reason) => Err(reason),
+                    };
+                }
+                if evidence.terminal.is_some() {
+                    return Err("native stage completed before request acknowledgement");
+                }
             } else if evidence.turn.is_some() {
                 evidence.notification(method, &envelope["params"], output_limit)?;
+                if evidence.terminal.is_some() {
+                    return Err("native stage completed before request acknowledgement");
+                }
             }
         } else {
             if envelope["id"] != id {
@@ -1036,7 +1352,11 @@ async fn rpc(
                     _ => "native request rejected",
                 });
             }
-            return Ok(envelope["result"].clone());
+            let result = envelope["result"].clone();
+            if let Some(early_stage_ack) = early_stage_ack.as_deref_mut() {
+                early_stage_ack.confirm(&result, evidence)?;
+            }
+            return Ok(result);
         }
     }
 }
@@ -1047,6 +1367,8 @@ async fn resolve_requested_model(
     stage: &Stage,
     evidence: &mut Evidence,
     output_limit: usize,
+    gate: Option<&dyn ProviderInteractionGate>,
+    cancel: &CancellationToken,
 ) -> Result<Option<String>, String> {
     let Some(requested) = stage.model.as_deref() else {
         // Omitting the selector is the provider-default path. It must not
@@ -1064,6 +1386,10 @@ async fn resolve_requested_model(
             model_list_request(cursor.as_deref()),
             evidence,
             output_limit,
+            gate,
+            Some(cancel),
+            None,
+            None,
         )
         .await
         .map_err(str::to_owned)?;
@@ -1221,6 +1547,7 @@ fn verify_sandbox(result: &Value, requested: &Value, cwd: &str) -> Result<(), &'
 fn interaction_request(
     envelope: &Value,
     evidence: &Evidence,
+    provider_stage_input_id: Option<String>,
 ) -> Result<ProviderInteractionRequest, &'static str> {
     let method = envelope["method"]
         .as_str()
@@ -1243,6 +1570,7 @@ fn interaction_request(
             .map_err(|_| "invalid native request ID")?,
         payload: json!({"provider": "codex", "native_request_id": envelope["id"], "method": method, "params": envelope["params"]}),
         timeout_ms: Some(INTERACTION_TIMEOUT.as_millis() as u64),
+        provider_stage_input_id,
     };
     request
         .validate()
@@ -1437,17 +1765,59 @@ async fn drive(
     gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    drive_with_input(
+        process,
+        stage,
+        cwd,
+        sandbox,
+        evidence,
+        output_limit,
+        gate,
+        cancel,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_with_input(
+    process: &mut FramedProcess,
+    stage: &Stage,
+    cwd: &str,
+    sandbox: &Value,
+    evidence: &mut Evidence,
+    output_limit: usize,
+    gate: Option<&dyn ProviderInteractionGate>,
+    cancel: &CancellationToken,
+    mut input_rx: Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
+) -> Result<(), String> {
     let input = process.input();
-    rpc(process, &input, initialize(), evidence, output_limit).await?;
+    rpc(
+        process,
+        &input,
+        initialize(),
+        evidence,
+        output_limit,
+        gate,
+        Some(cancel),
+        None,
+        None,
+    )
+    .await?;
     send(&input, json!({"method": "initialized"})).await?;
     let resolved_model =
-        resolve_requested_model(process, &input, stage, evidence, output_limit).await?;
+        resolve_requested_model(process, &input, stage, evidence, output_limit, gate, cancel)
+            .await?;
     let response = rpc(
         process,
         &input,
         thread_request(stage, cwd, sandbox, resolved_model.as_deref()),
         evidence,
         output_limit,
+        gate,
+        Some(cancel),
+        None,
+        None,
     )
     .await?;
     acknowledge_thread(stage, &response, evidence)?;
@@ -1466,54 +1836,73 @@ async fn drive(
         ),
         evidence,
         output_limit,
+        gate,
+        Some(cancel),
+        None,
+        None,
     )
     .await?;
     acknowledge_turn(&response, evidence)?;
     loop {
-        let envelope = next_envelope(process, evidence).await?;
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("native invocation cancelled".into()),
+            envelope = next_envelope(process, evidence) => Some(envelope?),
+            stage_input = async {
+                match input_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => None,
+                }
+            }, if input_rx.is_some() => {
+                if let Some(stage_input) = stage_input {
+                    let ack = submit_stage_input(
+                        process,
+                        &input,
+                        evidence,
+                        gate,
+                        cancel,
+                        stage_input.input,
+                        output_limit,
+                        stage_input.ack,
+                        &mut input_rx,
+                    )
+                    .await;
+                    if let Err(reason) = ack {
+                        return Err(reason.into());
+                    }
+                    if evidence.terminal.is_some() {
+                        return Ok(());
+                    }
+                } else {
+                    input_rx = None;
+                }
+                None
+            }
+        };
+        let Some(envelope) = next else {
+            continue;
+        };
         let method = envelope
             .get("method")
             .and_then(Value::as_str)
             .ok_or("unexpected native response")?;
         if envelope.get("id").is_some() {
-            let request = interaction_request(&envelope, evidence)?;
             let gate = gate.ok_or("native interaction gate is not connected")?;
-            // One in-flight native request on this invocation. Framed queues
-            // remain bounded while awaiting the canonical interaction owner.
-            let decision =
-                tokio::time::timeout(INTERACTION_TIMEOUT, gate.request_interaction(&request));
-            tokio::pin!(decision);
-            let decision = loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err("native invocation cancelled".into()),
-                    decision = &mut decision => break decision.map_err(|_| "native interaction timed out")?,
-                    event = next_envelope(process, evidence) => {
-                        let event = event?;
-                        if event.get("id").is_some() { return Err("native concurrent interaction exceeds invocation bound".into()); }
-                        let method = event["method"].as_str().ok_or("unexpected native response during interaction")?;
-                        evidence.notification(method, &event["params"], output_limit)?;
-                        if evidence.terminal.is_some() { return Ok(()); }
-                    }
-                }
-            };
-            match decision {
-                ProviderInteractionDecision::Submitted(payload) if payload.is_object() => {
-                    validate_interaction_response(method, &envelope["params"], &payload)?;
-                    send(&input, json!({"id": envelope["id"], "result": payload})).await?;
-                }
-                ProviderInteractionDecision::Submitted(_) => {
-                    return Err("invalid native interaction response".into());
-                }
-                ProviderInteractionDecision::Cancelled => {
-                    return Err("native interaction cancelled".into());
-                }
-                ProviderInteractionDecision::Timeout => {
-                    return Err("native interaction timed out".into());
-                }
-                ProviderInteractionDecision::Error(_) => {
-                    return Err("native interaction failed".into());
-                }
+            serve_native_interaction(
+                process,
+                &input,
+                evidence,
+                &envelope,
+                gate,
+                Some(cancel),
+                output_limit,
+                None,
+                None,
+                Some(&mut input_rx),
+            )
+            .await?;
+            if evidence.terminal.is_some() {
+                return Ok(());
             }
         } else {
             evidence.notification(method, &envelope["params"], output_limit)?;
@@ -1565,6 +1954,7 @@ impl ToolExecutor {
         gate: Option<&dyn ProviderInteractionGate>,
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
         runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
     ) -> ToolResult {
         let stage = match Stage::parse(args) {
             Ok(stage) => stage,
@@ -1703,7 +2093,7 @@ impl ToolExecutor {
         let driven = tokio::select! {
             biased;
             _ = token.cancelled() => Err("native invocation cancelled".into()),
-            result = drive(&mut process, &stage, cwd_text, &sandbox, &mut evidence, output_limit, Some(gate), &token) => result,
+            result = drive_with_input(&mut process, &stage, cwd_text, &sandbox, &mut evidence, output_limit, Some(gate), &token, input_rx) => result,
         };
         // EOF after a terminal notification closes the native server normally.
         // Any protocol failure/cancellation uses the same physical owner; both
@@ -1718,7 +2108,17 @@ impl ToolExecutor {
             let input = process.input();
             interrupt_acknowledged = tokio::time::timeout(
                 Duration::from_secs(1),
-                rpc(&mut process, &input, request, &mut evidence, output_limit),
+                rpc(
+                    &mut process,
+                    &input,
+                    request,
+                    &mut evidence,
+                    output_limit,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
             )
             .await
             .is_ok_and(|result| result.is_ok_and(|result| result.is_object()));

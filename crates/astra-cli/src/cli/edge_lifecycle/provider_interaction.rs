@@ -9,6 +9,7 @@ pub(crate) struct NativeInvocationInteractionGate {
     pub(crate) auth: String,
     pub(crate) edge_transport_id: String,
     pub(crate) edge_agent_id: String,
+    pub(crate) physical_workspace_id: String,
     pub(crate) identity: astra_turn_types::ToolInvocationIdentity,
     pub(crate) deadline: std::time::Instant,
     pub(crate) ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
@@ -107,6 +108,7 @@ impl astra_tools::ProviderInteractionGate for NativeInvocationInteractionGate {
         let body = astra_thin_client::ToolInteractionRequest {
             identity: self.identity.clone(),
             edge_agent_id: self.edge_agent_id.clone(),
+            physical_workspace_id: self.physical_workspace_id.clone(),
             interaction: interaction.clone(),
         };
         let (required_tx, mut required_rx) = tokio::sync::mpsc::channel(1);
@@ -271,6 +273,7 @@ mod native_interaction_gate_tests {
         let interaction = astra_turn_types::ProviderInteractionRequest {
             request_id: "rpc".into(),
             timeout_ms: Some(5000),
+            provider_stage_input_id: None,
             payload: serde_json::json!({"provider":"codex", "method":"item/tool/requestUserInput",
                 "params":{"questions":[{"id":"q", "header":"Direction", "question":"Choose a direction", "isOther":true}]}}),
         };
@@ -278,6 +281,7 @@ mod native_interaction_gate_tests {
             request: ToolInteractionRequest {
                 identity: identity.clone(),
                 edge_agent_id: "agent".into(),
+                physical_workspace_id: "physical-test".into(),
                 interaction: interaction.clone(),
             },
             answer: tokio::sync::Mutex::new(None),
@@ -298,6 +302,7 @@ mod native_interaction_gate_tests {
             auth: "fixture-token".into(),
             edge_transport_id: "transport".into(),
             edge_agent_id: "agent".into(),
+            physical_workspace_id: "physical-test".into(),
             identity,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             ask_user_request_tx: Some(ask_tx),
@@ -342,6 +347,7 @@ mod native_interaction_gate_tests {
             auth: "fixture-token".into(),
             edge_transport_id: "transport".into(),
             edge_agent_id: "agent".into(),
+            physical_workspace_id: "physical-test".into(),
             identity: astra_turn_types::ToolInvocationIdentity::new(
                 "account", "session", "run", "chain", "call",
             )
@@ -353,10 +359,12 @@ mod native_interaction_gate_tests {
             request_id: "native-rpc".into(),
             payload: serde_json::json!({"provider":"codex", "params":{"turnId":"turn"}}),
             timeout_ms: Some(60_000),
+            provider_stage_input_id: None,
         };
         let body = astra_thin_client::ToolInteractionRequest {
             identity: gate.identity.clone(),
             edge_agent_id: gate.edge_agent_id.clone(),
+            physical_workspace_id: gate.physical_workspace_id.clone(),
             interaction: interaction.clone(),
         };
         Mock::given(method("POST"))

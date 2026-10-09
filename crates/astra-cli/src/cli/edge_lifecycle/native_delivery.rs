@@ -390,6 +390,11 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                 auth: config.auth.clone(),
                 edge_transport_id: config.edge_transport_id.clone(),
                 edge_agent_id: config.edge_agent_id.clone(),
+                physical_workspace_id:
+                    astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                        &config.materialization_id,
+                        &self.workspace_root.to_string_lossy(),
+                    ),
                 identity: invocation.identity.clone(),
                 deadline: invocation.execution_deadline,
                 ask_user_request_tx: config.ask_user_request_tx.clone(),
@@ -419,6 +424,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
             if cancel.is_cancelled() || Instant::now() >= invocation.execution_deadline {
                 return rejected("native invocation cancelled or expired before dispatch");
             }
+            let native_input_rx = invocation.input_rx;
             let outcome = config
                 .executor
                 .execute_native_provider_invocation(
@@ -430,6 +436,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                     &gate,
                     ceiling,
                     Some(&approval),
+                    native_input_rx,
                 )
                 .await;
             ToolResult {
@@ -990,6 +997,7 @@ mod tests {
             execution_deadline: Instant::now() + Duration::from_secs(5),
             command_timeout_cap_ms: Some(120_000),
             runtime_process_authorization: None,
+            input_rx: tokio::sync::mpsc::channel(1).1,
             execution_ceiling: Some(Box::new(
                 astra_server_types::edge_ws_protocol::EdgeExecutionCeiling {
                     workspace_root: consumer.workspace_root.to_str().unwrap().into(),
