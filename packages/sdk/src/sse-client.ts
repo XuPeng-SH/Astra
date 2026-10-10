@@ -74,6 +74,7 @@ export class SSEClient {
   private options: Required<Pick<SSEClientOptions, 'url' | 'onEvent' | 'maxRetries' | 'retryDelayMs'>> &
     SSEClientOptions;
   private controller: AbortController | null = null;
+  private heartbeatController: AbortController | null = null;
   private retryCount = 0;
   private closed = false;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
@@ -88,19 +89,27 @@ export class SSEClient {
   }
 
   async connect(): Promise<void> {
+    this.closed = false;
     this.retryCount = 0;
     await this.connectAttempt();
   }
 
   private async connectAttempt(): Promise<void> {
-    this.closed = false;
+    if (this.closed || this.options.signal?.aborted) return;
     this.sawTerminalEvent = false;
     this.options.onStateChange?.('connecting');
+    if (this.closed || this.options.signal?.aborted) return;
 
     this.controller = new AbortController();
-    const linkedSignal = this.options.signal
+    const linked = this.options.signal
       ? combineSignals(this.options.signal, this.controller.signal)
-      : this.controller.signal;
+      : { signal: this.controller.signal, dispose: () => {} };
+    const linkedSignal = linked.signal;
+    // Heartbeat aborts only the stalled fetch, not the cancellable retry wait.
+    const heartbeatController = new AbortController();
+    this.heartbeatController = heartbeatController;
+    const fetchSignal = combineSignals(linkedSignal, heartbeatController.signal);
+    let retry = false;
 
     try {
       let headers = headersInitToRecord({
@@ -118,7 +127,7 @@ export class SSEClient {
         method: this.options.method ?? 'GET',
         headers,
         body: this.options.body,
-        signal: linkedSignal,
+        signal: fetchSignal.signal,
       });
 
       if (!response.ok) {
@@ -137,21 +146,30 @@ export class SSEClient {
 
       this.options.onStateChange?.('connected');
       await this.readStream(response.body);
+      if (heartbeatController.signal.aborted && !this.sawTerminalEvent) {
+        throw new Error('Heartbeat timeout');
+      }
 
       if (!this.closed) {
         this.options.onStateChange?.('disconnected');
       }
     } catch (err) {
-      if (this.closed || linkedSignal.aborted) return;
+      if (this.closed || linkedSignal.aborted || this.sawTerminalEvent) return;
       const message = err instanceof Error ? err.message : 'Unknown error';
       this.options.onStateChange?.('error');
       this.options.onEvent({
         type: 'error',
-        message: `Connection error: ${message}`,
+        message: heartbeatController.signal.aborted
+          ? `Connection timed out after ${this.options.heartbeatTimeoutMs}ms without heartbeat`
+          : `Connection error: ${message}`,
         retryable: this.retryCount < this.options.maxRetries,
       } as StreamEvent);
-      await this.maybeRetry();
+      retry = await this.maybeRetry(linkedSignal);
+    } finally {
+      fetchSignal.dispose();
+      linked.dispose();
     }
+    if (retry) await this.connectAttempt();
   }
 
   close(): void {
@@ -159,6 +177,7 @@ export class SSEClient {
     this.clearHeartbeatTimer();
     this.controller?.abort();
     this.controller = null;
+    this.heartbeatController = null;
     this.options.onStateChange?.('disconnected');
   }
 
@@ -243,13 +262,7 @@ export class SSEClient {
       // keeps the HTTP body open after it has published that event must not
       // turn an otherwise completed turn into a retryable heartbeat error.
       if (this.closed || this.sawTerminalEvent) return;
-      this.controller?.abort();
-      this.options.onStateChange?.('error');
-      this.options.onEvent({
-        type: 'error',
-        message: `Connection timed out after ${this.options.heartbeatTimeoutMs}ms without heartbeat`,
-        retryable: true,
-      } as StreamEvent);
+      this.heartbeatController?.abort();
     }, this.options.heartbeatTimeoutMs);
   }
 
@@ -260,24 +273,40 @@ export class SSEClient {
     }
   }
 
-  private async maybeRetry(): Promise<void> {
+  private async maybeRetry(signal: AbortSignal): Promise<boolean> {
     this.retryCount++;
-    if (this.closed || this.retryCount > this.options.maxRetries) return;
+    if (this.closed || signal.aborted || this.retryCount > this.options.maxRetries) return false;
 
     const delay = this.options.retryDelayMs * Math.pow(1.5, this.retryCount - 1);
-    await new Promise((r) => setTimeout(r, delay));
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, delay);
+      signal.addEventListener('abort', finish, { once: true });
+      if (signal.aborted) finish();
+    });
 
-    if (!this.closed) {
-      await this.connectAttempt();
-    }
+    return !this.closed && !signal.aborted;
   }
 }
 
-function combineSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+function combineSignals(a: AbortSignal, b: AbortSignal): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   a.addEventListener('abort', onAbort, { once: true });
   b.addEventListener('abort', onAbort, { once: true });
   if (a.aborted || b.aborted) controller.abort();
-  return controller.signal;
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      a.removeEventListener('abort', onAbort);
+      b.removeEventListener('abort', onAbort);
+    },
+  };
 }

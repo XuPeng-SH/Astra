@@ -107,6 +107,14 @@ Delegation requires a configured **delegation engine** on the server; otherwise 
 
 ### Streaming (SSE)
 
+Calling `SSEClient.close()` or aborting its external signal interrupts a pending
+retry delay and settles `connect()` without another fetch attempt. Explicitly
+calling `connect()` again can reopen a closed client if its external signal has
+not been aborted.
+Heartbeat timeouts abort the stalled fetch and use the same bounded retry
+budget as transport failures. Each timeout emits one error whose `retryable`
+flag reflects the remaining budget; user cancellation still interrupts backoff.
+
 `streamChat` uses **`POST /chat/stream`** with a **JSON body** (the Web
 dashboard's typed BFF integration lives in
 `web/app/api/chats/[chatId]/stream/route.ts`).
