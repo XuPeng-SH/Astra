@@ -14514,7 +14514,7 @@ async fn server_subrun_initializes_descendant_admission_identity_from_owned_run(
         .insert("turn_chain_id".into(), json!("foreign-chain"));
     crate::server::run::insert_active_run_session_fixture(&pool, owner, &session).await;
     let engine = svc.run_engine.clone();
-    engine.start_run(&parent, owner, &session).await.unwrap();
+    start_model_bound_test_parent(&engine, &parent, owner, &session, &admitted).await;
     let ledger = svc
         .invocation_ledger
         .clone()
