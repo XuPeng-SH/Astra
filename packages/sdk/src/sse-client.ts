@@ -25,30 +25,94 @@ export async function readHttpErrorMessage(response: Response): Promise<string> 
 }
 
 /**
- * Parse a complete SSE response body (one or more `data: {json}\\n\\n` blocks) into stream events.
+ * Parse a complete SSE response body into stream events (LF, CRLF, or CR lines).
  * Used for buffered endpoints such as `GET /chat/runs/{id}/stream`.
  */
 export function parseSseDataEvents(raw: string): StreamEvent[] {
   const events: StreamEvent[] = [];
-  const blocks = raw.split(/\n\n+/);
-  for (const block of blocks) {
-    const lines = block.split('\n').filter((l) => l.length > 0);
-    let data = '';
-    for (const line of lines) {
-      if (line.startsWith('data: ')) {
-        data += line.slice(6);
-      } else if (line.startsWith('data:')) {
-        data += line.slice(5).trimStart();
+  const parser = new SseDataParser((data) => {
+    const event = parseSseEvent(data);
+    if (event !== undefined) events.push(event);
+  });
+  parser.push(raw);
+  parser.finish();
+  return events;
+}
+
+function parseSseEvent(data: string): StreamEvent | undefined {
+  try {
+    return JSON.parse(data) as StreamEvent;
+  } catch {
+    // Ignore malformed JSON.
+    return undefined;
+  }
+}
+
+/** Shared incremental line/data framing for buffered and live SSE consumers. */
+class SseDataParser {
+  private line = '';
+  private data: string[] = [];
+  private skipLf = false;
+  private atStart = true;
+
+  constructor(
+    private onData: (data: string) => void,
+    private onRawLine?: (line: string) => void,
+  ) {}
+
+  push(text: string): void {
+    if (text.length === 0) return;
+    if (this.atStart) {
+      this.atStart = false;
+      if (text.startsWith('\uFEFF')) text = text.slice(1);
+    }
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      if (this.skipLf) {
+        this.skipLf = false;
+        if (char === '\n') {
+          start = i + 1;
+          continue;
+        }
+      }
+      if (char === '\r' || char === '\n') {
+        this.processLine(this.line + text.slice(start, i));
+        this.line = '';
+        this.skipLf = char === '\r';
+        start = i + 1;
       }
     }
-    if (!data.trim()) continue;
-    try {
-      events.push(JSON.parse(data) as StreamEvent);
-    } catch {
-      // skip malformed
-    }
+    this.line += text.slice(start);
   }
-  return events;
+
+  finish(): void {
+    if (this.line.length > 0) this.processLine(this.line);
+    this.line = '';
+    // Preserve the SDK's existing tolerance for a final event without a blank line.
+    this.dispatch();
+  }
+
+  private processLine(line: string): void {
+    this.onRawLine?.(line);
+    if (line === '') {
+      this.dispatch();
+      return;
+    }
+    const colon = line.indexOf(':');
+    const field = colon === -1 ? line : line.slice(0, colon);
+    if (field !== 'data') return;
+    let value = colon === -1 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    this.data.push(value);
+  }
+
+  private dispatch(): void {
+    if (this.data.length === 0) return;
+    const data = this.data.join('\n');
+    this.data = [];
+    this.onData(data);
+  }
 }
 
 function isTerminalEvent(event: StreamEvent): boolean {
@@ -183,8 +247,12 @@ export class SSEClient {
 
   private async readStream(body: ReadableStream<Uint8Array>): Promise<void> {
     const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    // Preserve the BOM here; SseDataParser owns removing exactly one leading BOM.
+    const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+    const parser = new SseDataParser(
+      (data) => this.processSSEData(data),
+      this.options.onRawLine,
+    );
     let streamFailed = false;
     let streamError: unknown;
 
@@ -194,13 +262,7 @@ export class SSEClient {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop() ?? '';
-
-        for (const part of parts) {
-          this.processSSEChunk(part);
-        }
+        parser.push(decoder.decode(value, { stream: true }));
       }
     } catch (error) {
       // Once the server has published a protocol terminal, a trailing socket
@@ -212,15 +274,12 @@ export class SSEClient {
         streamError = error;
       }
     } finally {
-      // Flush remaining buffer (handles events without trailing \n\n)
-      buffer += decoder.decode();
-      if (buffer.trim().length > 0) {
-        this.processSSEChunk(buffer);
-      }
+      parser.push(decoder.decode());
+      parser.finish();
       this.clearHeartbeatTimer();
       reader.releaseLock();
     }
-    if (streamFailed) throw streamError;
+    if (streamFailed && !this.sawTerminalEvent) throw streamError;
     if (this.options.requireTerminalEvent && !this.sawTerminalEvent) {
       throw new Error(
         'SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)',
@@ -228,29 +287,15 @@ export class SSEClient {
     }
   }
 
-  private processSSEChunk(chunk: string): void {
-    const lines = chunk.split('\n');
-    let data = '';
-
-    for (const line of lines) {
-      this.options.onRawLine?.(line);
-
-      if (line.startsWith('data: ')) {
-        data += line.slice(6);
-      } else if (line.startsWith('data:')) {
-        data += line.slice(5);
-      }
-    }
-
-    if (!data) return;
-
+  private processSSEData(data: string): void {
+    const event = parseSseEvent(data);
+    if (event === undefined) return;
     try {
-      const event = JSON.parse(data) as StreamEvent;
       this.resetHeartbeatTimer();
       this.sawTerminalEvent ||= isTerminalEvent(event);
       this.options.onEvent(event);
     } catch {
-      // Ignore malformed JSON
+      // Preserve the existing tolerance for invalid events or callback errors.
     }
   }
 

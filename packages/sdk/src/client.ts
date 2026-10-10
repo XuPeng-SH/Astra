@@ -3074,7 +3074,8 @@ export class AstraClient {
       throw new AstraApiError(res.status, body, path);
     }
 
-    const text = await res.text();
+    // Response.text() strips a BOM before the shared parser can apply its rule.
+    const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await res.arrayBuffer());
     return parseSseDataEvents(text);
   }
 
