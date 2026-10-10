@@ -741,6 +741,33 @@ degraded, quarantine and fallback facts
 Observation records decisions and outcomes. It must not implement alternate
 fallback, retry, or cache control flow.
 
+Native stages carry a bounded `native_stage_observation` through the existing
+tool terminal event and its external projection. Its checked stage delta is
+separate from the last native request snapshot and model context capacity;
+neither is a measurement of current context occupancy. Missing cache lanes or
+resume baselines remain unknown. The runtime invocation count and health do
+not describe provider-internal tools. Observation does not authorize completion
+or retry and requires no additional run, ledger, or artifact lookup.
+
+Native receipts use the existing host terminal custody even when no live
+observer is attached. Terminal presentation is bounded after execution metadata
+and again after generation/idempotency attachment, within the existing durable
+observation-window budget. Arguments are discarded before usable control
+results; exact routing is retained or replaced by an explicit repair gap.
+Canonical results and answers are not shortened. Native terminals use the
+existing exact-generation, idempotent precommit, including pause/cancel
+reconciliation. Later atomic settlement does not insert the same terminal
+again. Correcting missing native custody adds one semantic row and its existing
+precommit transaction; it is not zero additional storage. Observation requires
+no additional lookup or separate lifecycle.
+
+Codex permission masks project the shared sensitive-path rules into two
+deterministic brace globs per admitted directory, retaining literal credential
+file denies and existing logical aliases. Grant selection is unchanged; roots
+containing glob syntax fail before dispatch. This reduces prompt overhead, not
+the isolation boundary, and does not claim protection for arbitrary future
+files beyond the native client's existing mask semantics.
+
 ## Required invariants and tests
 
 ### Unit and property tests

@@ -17332,9 +17332,9 @@ impl RunStateStore for DatabaseRunStateStore {
         stage_run_id: &str,
     ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
         // Stage events are intentionally owned by the stable association
-        // anchor. Resolve that owner from the durable receipt, then reuse the
-        // canonical association decoder. This is only used by current-run
-        // control input; ordinary turn assembly never performs this lookup.
+        // anchor. Resolve that owner through the indexed stage binding, then
+        // reuse the canonical association decoder. Ordinary child guidance
+        // can reach this lookup too; an indexed miss is simply no association.
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| {
@@ -17348,7 +17348,7 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("begin_collaborator_stage_association", stage_run_id, source)
         })?;
         admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
-        let indexed_anchor_run_id: Option<String> = sqlx::query_scalar(
+        let anchor_run_id: Option<String> = sqlx::query_scalar(
             "SELECT run_id FROM agent_run_events
              FORCE INDEX (idx_agent_run_events_owner_session_subject)
              WHERE user_id = ? AND session_id = ? AND event_type = ?
@@ -17368,33 +17368,6 @@ impl RunStateStore for DatabaseRunStateStore {
                 source,
             )
         })?;
-        // Current writes bind the stage run directly and stay on the covering
-        // index above. A bounded payload lookup is only for durable facts
-        // written before that binding was populated; it is not part of the
-        // ordinary path and does not add a write or a second state owner.
-        let anchor_run_id = if indexed_anchor_run_id.is_some() {
-            indexed_anchor_run_id
-        } else {
-            sqlx::query_scalar(
-                "SELECT run_id FROM agent_run_events
-                 WHERE user_id = ? AND session_id = ? AND event_type = ?
-                   AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.receipt.run_id')) = ?
-                 ORDER BY event_idx DESC LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(COLLABORATOR_STAGE_EVENT)
-            .bind(stage_run_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error(
-                    "find_legacy_collaborator_stage_association_anchor",
-                    stage_run_id,
-                    source,
-                )
-            })?
-        };
         let association = if let Some(anchor_run_id) = anchor_run_id {
             Self::collaborator_association_tx(&mut tx, user_id, session_id, &anchor_run_id).await?
         } else {
@@ -27374,6 +27347,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     .unwrap_or(serde_json::Value::Null),
             );
             copy_execution_boundary_fields(&mut out, &data);
+            for key in [
+                "run_id",
+                "session_id",
+                "index",
+                "event_idx",
+                "run_generation",
+            ] {
+                insert_if_present(&mut out, &data, key);
+            }
             serde_json::Value::Object(out)
         }
         "tool_result" => {
@@ -27399,6 +27381,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             out.insert("result".to_string(), result);
             copy_explicit_artifacts(&mut out, &data);
             copy_execution_boundary_fields(&mut out, &data);
+            if let Some(observation) = data
+                .get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+                .and_then(astra_turn_types::project_native_collaborator_observation)
+            {
+                out.insert(
+                    astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                    observation,
+                );
+            }
             project_external_tool_call_end(serde_json::Value::Object(out))
         }
         "run_started" => {
@@ -27918,12 +27909,28 @@ fn project_explain_analyze(event: serde_json::Value) -> serde_json::Value {
 }
 
 const EXTERNAL_TOOL_EVENT_MAX_BYTES: usize = 64 * 1024;
+/// Reserve cursor overhead in the largest durable observation window.
+pub const MAX_TOOL_TERMINAL_PRESENTATION_BYTES: usize =
+    MAX_RUN_OBSERVATION_BYTES / MAX_RUN_OBSERVATION_EVENTS - 128;
 const EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES: usize = 48 * 1024;
 const EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES: usize = 8 * 1024;
 const EXTERNAL_TOOL_ARGUMENTS_INLINE_MAX_BYTES: usize = 8 * 1024;
 const EXTERNAL_TOOL_ARGUMENTS_PREVIEW_MAX_BYTES: usize = 2 * 1024;
 
 fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value {
+    let mut event = project_tool_terminal_presentation(event, EXTERNAL_TOOL_EVENT_MAX_BYTES);
+    if let Some(object) = event.as_object_mut() {
+        object.remove("idempotency_key");
+    }
+    event
+}
+
+/// Bound presentation, not the authoritative tool result. Call after execution
+/// binding fields are attached and before publishing or persisting the event.
+pub fn project_tool_terminal_presentation(
+    event: serde_json::Value,
+    max_bytes: usize,
+) -> serde_json::Value {
     let original_event_bytes = encoded_json_len(&event);
     let original_event_sha256 = sha256_hex(
         serde_json::to_string(&event)
@@ -27933,23 +27940,59 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
     let Some(source) = event.as_object() else {
         return event;
     };
+    let native_observation = source
+        .get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+        .and_then(astra_turn_types::project_native_collaborator_observation);
 
     let mut out = serde_json::Map::from_iter([(
         "type".to_string(),
         serde_json::Value::String("tool_call_end".to_string()),
     )]);
-    for key in ["call_id", "tool"]
-        .into_iter()
-        .chain(EXTERNAL_EXECUTION_BOUNDARY_FIELDS.iter().copied())
+    for key in [
+        "call_id",
+        "tool",
+        "run_id",
+        "session_id",
+        "tool_call_id",
+        "index",
+        "event_idx",
+        "run_generation",
+        "idempotency_key",
+    ]
+    .into_iter()
+    .chain(EXTERNAL_EXECUTION_BOUNDARY_FIELDS.iter().copied())
     {
         if let Some(value) = source.get(key) {
             out.insert(key.to_string(), value.clone());
         }
     }
     copy_explicit_artifacts(&mut out, source);
+    // Replaying a presentation must not replace original evidence with the
+    // hash or size of its preview.
+    for key in [
+        "result_truncated",
+        "result_bytes",
+        "result_sha256",
+        "result_integrity",
+        "payload_truncated",
+        "event_bytes",
+        "event_sha256",
+        "result_omitted",
+        "arguments_omitted",
+        "native_stage_observation_omitted",
+        "executor_omitted",
+    ] {
+        insert_if_present(&mut out, source, key);
+    }
+    if let Some(observation) = &native_observation {
+        out.insert(
+            astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+            observation.clone(),
+        );
+    }
 
     if let Some(result) = source.get("result").or_else(|| source.get("output")) {
-        let (result, evidence) = project_external_tool_result(result.clone());
+        let (result, evidence) = project_external_tool_result(result.clone(), max_bytes);
         out.insert("result".to_string(), result);
         if let Some((original_bytes, content_sha256)) = evidence {
             out.insert(
@@ -27994,16 +28037,16 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
     }
 
     let mut projected = serde_json::Value::Object(out);
-    if encoded_json_len(&projected) > EXTERNAL_TOOL_EVENT_MAX_BYTES {
+    if encoded_json_len(&projected) > max_bytes {
         let call_id = source
             .get("call_id")
             .and_then(serde_json::Value::as_str)
-            .map(|value| truncate_utf8_bytes(value, 1024))
+            .map(str::to_owned)
             .unwrap_or_default();
         let tool = source
             .get("tool")
             .and_then(serde_json::Value::as_str)
-            .map(|value| truncate_utf8_bytes(value, 1024))
+            .map(str::to_owned)
             .unwrap_or_default();
         let projected_result = projected.get("result").cloned();
         let projected_arguments = projected.get("arguments").cloned();
@@ -28029,6 +28072,57 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
         let fallback_obj = fallback
             .as_object_mut()
             .expect("tool terminal fallback is an object");
+        for key in [
+            "run_id",
+            "session_id",
+            "tool_call_id",
+            "index",
+            "event_idx",
+            "run_generation",
+            "idempotency_key",
+            "result_truncated",
+            "result_bytes",
+            "result_sha256",
+            "result_integrity",
+            "event_bytes",
+            "event_sha256",
+            "result_omitted",
+            "arguments_omitted",
+            "native_stage_observation_omitted",
+            "executor_omitted",
+        ]
+        .into_iter()
+        .chain(
+            EXTERNAL_EXECUTION_BOUNDARY_FIELDS
+                .iter()
+                .copied()
+                .filter(|key| {
+                    !matches!(
+                        *key,
+                        "status"
+                            | "success"
+                            | "executed"
+                            | "disposition"
+                            | "duration_ms"
+                            | "error_kind"
+                    )
+                }),
+        ) {
+            insert_if_present(fallback_obj, projected.as_object().unwrap(), key);
+        }
+        if projected
+            .get("executor")
+            .is_some_and(|executor| encoded_json_len(executor) > max_bytes)
+        {
+            fallback_obj.remove("executor");
+            fallback_obj.insert("executor_omitted".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(observation) = native_observation {
+            fallback_obj.insert(
+                astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                observation,
+            );
+        }
         for (key, value) in [
             ("result", projected_result),
             ("arguments", projected_arguments),
@@ -28043,12 +28137,88 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
                 fallback_obj.insert(key.to_string(), value);
             }
         }
+        // Identity, execution facts and native observations take precedence
+        // over previews. Encoded JSON can be much larger than raw UTF-8 text.
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj.remove("arguments").is_some() {
+                fallback_obj.insert("arguments_omitted".into(), serde_json::Value::Bool(true));
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj.remove("executor").is_some() {
+                fallback_obj.insert("executor_omitted".into(), serde_json::Value::Bool(true));
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes
+            && let Some(result) = fallback.get("result")
+        {
+            let original = source
+                .get("result")
+                .or_else(|| source.get("output"))
+                .unwrap_or(result);
+            let encoded = serde_json::to_vec(original).unwrap();
+            let (original_bytes, content_sha256) =
+                external_lifecycle_projection_integrity(original)
+                    .map(|(bytes, digest)| (bytes, digest.to_owned()))
+                    .unwrap_or_else(|| (encoded.len(), sha256_hex(&encoded)));
+            let remaining = max_bytes.saturating_sub(
+                encoded_json_len(&fallback).saturating_sub(encoded_json_len(result)),
+            );
+            if let Some(control) = project_external_lifecycle_result(
+                result,
+                original_bytes,
+                &content_sha256,
+                remaining,
+            ) {
+                fallback["result"] = control;
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if let Some(result) = fallback_obj.remove("result") {
+                fallback_obj.insert("result_omitted".into(), serde_json::Value::Bool(true));
+                if !fallback_obj.contains_key("result_sha256") {
+                    let original = source
+                        .get("result")
+                        .or_else(|| source.get("output"))
+                        .unwrap_or(&result);
+                    let encoded = serde_json::to_vec(original).unwrap();
+                    let (bytes, digest) = external_lifecycle_projection_integrity(original)
+                        .map(|(bytes, digest)| (bytes, digest.to_owned()))
+                        .unwrap_or_else(|| (encoded.len(), sha256_hex(&encoded)));
+                    fallback_obj.insert("result_bytes".into(), serde_json::json!(bytes));
+                    fallback_obj.insert("result_sha256".into(), serde_json::json!(digest));
+                }
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj
+                .remove(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+                .is_some()
+            {
+                fallback_obj.insert(
+                    "native_stage_observation_omitted".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
         projected = fallback;
     }
-    assert!(
-        encoded_json_len(&projected) <= EXTERNAL_TOOL_EVENT_MAX_BYTES,
-        "external tool event projection exceeded its hard byte limit"
-    );
+    if encoded_json_len(&projected) > max_bytes {
+        // Never shorten an identity and accidentally attach facts to a
+        // different invocation. The normal snapshot-repair contract applies.
+        projected = serde_json::json!({
+            "type": "stream_gap", "run_id": source.get("run_id"),
+            "dropped_event_count": 1, "repair": "refresh_run_snapshot",
+            "event_sha256": original_event_sha256, "event_bytes": original_event_bytes
+        });
+        if encoded_json_len(&projected) > max_bytes {
+            return serde_json::Value::Null;
+        }
+    }
     projected
 }
 
@@ -28066,21 +28236,31 @@ fn copy_explicit_artifacts(
 
 fn project_external_tool_result(
     result: serde_json::Value,
+    event_budget: usize,
 ) -> (serde_json::Value, Option<(usize, String)>) {
     let encoded =
         serde_json::to_string(&result).expect("serializing a serde_json::Value must not fail");
-    if encoded.len() <= EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES {
+    let result_budget =
+        EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES.min(event_budget.saturating_mul(3) / 4);
+    if encoded.len() <= result_budget {
         return (result, None);
     }
 
-    let original_bytes = encoded.len();
-    let content_sha256 = sha256_hex(encoded.as_bytes());
-    if let Some(projected) =
-        project_external_lifecycle_result(&result, original_bytes, content_sha256.as_str())
-    {
+    let (original_bytes, content_sha256) = external_lifecycle_projection_integrity(&result)
+        .map(|(bytes, digest)| (bytes, digest.to_owned()))
+        .unwrap_or_else(|| (encoded.len(), sha256_hex(encoded.as_bytes())));
+    if let Some(projected) = project_external_lifecycle_result(
+        &result,
+        original_bytes,
+        content_sha256.as_str(),
+        result_budget,
+    ) {
         return (projected, Some((original_bytes, content_sha256)));
     }
-    let preview = truncate_utf8_bytes(&encoded, EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES);
+    let preview = truncate_utf8_bytes(
+        &encoded,
+        EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES.min(event_budget / 4),
+    );
     (
         serde_json::json!({
             "type": "astra.external_tool_result_summary.v1",
@@ -28098,10 +28278,32 @@ fn project_external_tool_result(
 /// for data tools, but it is insufficient for lifecycle tools: clients must
 /// still be able to identify and control the accepted Work unit. Selection is
 /// driven by the versioned Work observation, not by tool names or prose.
+fn external_lifecycle_projection_integrity(result: &serde_json::Value) -> Option<(usize, &str)> {
+    if result.get("type")?.as_str()? != "astra.external_tool_lifecycle_summary.v1"
+        || !result.get("truncated")?.as_bool()?
+    {
+        return None;
+    }
+    let observation = serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(
+        result
+            .get(astra_core::work_unit::WORK_UNIT_OBSERVATION_FIELD)?
+            .clone(),
+    )
+    .ok()?;
+    if !observation.is_valid() {
+        return None;
+    }
+    let bytes = usize::try_from(result.get("original_bytes")?.as_u64()?).ok()?;
+    let digest = result.get("content_sha256")?.as_str()?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((bytes, digest))
+}
+
 fn project_external_lifecycle_result(
     result: &serde_json::Value,
     original_bytes: usize,
     content_sha256: &str,
+    result_budget: usize,
 ) -> Option<serde_json::Value> {
     let parsed = match result {
         serde_json::Value::String(output) => serde_json::from_str(output).ok()?,
@@ -28114,6 +28316,8 @@ fn project_external_lifecycle_result(
             serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(value.clone()).ok()
         })
         .filter(astra_core::work_unit::WorkUnitObservation::is_valid)?;
+    let (original_bytes, content_sha256) = external_lifecycle_projection_integrity(&parsed)
+        .unwrap_or((original_bytes, content_sha256));
 
     let mut compact = serde_json::Map::from_iter([
         (
@@ -28139,7 +28343,6 @@ fn project_external_lifecycle_result(
         "agent_id",
         "run_id",
         "group_id",
-        "title",
         "target_count",
         "transcript_location",
         "parent_run_id",
@@ -28150,9 +28353,13 @@ fn project_external_lifecycle_result(
             compact.insert(key.to_string(), value.clone());
         }
     }
-    if encoded_json_len(&serde_json::Value::Object(compact.clone()))
-        > EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES
-    {
+    if parsed["control_membership_omitted"] == "oversized" {
+        compact.insert(
+            "control_membership_omitted".into(),
+            serde_json::json!("oversized"),
+        );
+    }
+    if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
         // A syntactically valid observation may contain future extension
         // fields. Treat its byte size as untrusted input and fall back to the
         // generic bounded projection rather than exporting an oversized
@@ -28167,9 +28374,7 @@ fn project_external_lifecycle_result(
             continue;
         };
         compact.insert(key.to_string(), value);
-        if encoded_json_len(&serde_json::Value::Object(compact.clone()))
-            > EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES
-        {
+        if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
             compact.remove(key);
             compact.insert(
                 "control_membership_omitted".to_string(),
@@ -28178,8 +28383,16 @@ fn project_external_lifecycle_result(
             break;
         }
     }
+    if let Some(title) = parsed.get("title") {
+        compact.insert("title".into(), title.clone());
+        if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
+            compact.remove("title");
+        }
+    }
     let compact = serde_json::Value::Object(compact);
-    debug_assert!(encoded_json_len(&compact) <= EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
+    if encoded_json_len(&compact) > result_budget {
+        return None;
+    }
     Some(compact)
 }
 
@@ -40730,6 +40943,50 @@ mod tests {
     }
 
     #[test]
+    fn tool_terminal_presentation_preserves_scope_and_integrity_or_reports_a_gap() {
+        let event = json!({
+            "type": "tool_call_end", "run_id": "run", "session_id": "session", "call_id": "call",
+            "tool": "tool", "result": "界\\\"\n".repeat(12_000), "arguments": "x".repeat(8_000),
+            "executed": null, "status": "completed", "success": true,
+            "transport": "server_local", "executor": {"kind": "server_local"},
+            "workspace": {"path": "/workspace"}
+        });
+        let bounded = project_tool_terminal_presentation(event.clone(), 3968);
+        assert!(encoded_json_len(&bounded) <= 3968);
+        for key in [
+            "run_id",
+            "session_id",
+            "call_id",
+            "tool",
+            "executed",
+            "transport",
+            "executor",
+            "workspace",
+        ] {
+            assert_eq!(bounded[key], event[key], "{key}");
+        }
+        assert_eq!(bounded["result_bytes"], encoded_json_len(&event["result"]));
+        assert_eq!(
+            project_tool_terminal_presentation(bounded.clone(), 3968),
+            bounded
+        );
+        let mut receipt = event.clone();
+        receipt["result"] = json!({"status": "completed", "agent_id": "agent"});
+        receipt["arguments"] = json!({"instruction": "x".repeat(5_000)});
+        let receipt = project_tool_terminal_presentation(receipt, 3968);
+        assert_eq!(receipt["result"]["agent_id"], "agent");
+        assert_eq!(receipt["arguments_omitted"], true);
+        for key in ["call_id", "workspace"] {
+            let mut oversized = event.clone();
+            oversized[key] = json!("界".repeat(4_000));
+            let gap = project_tool_terminal_presentation(oversized, 3968);
+            assert_eq!(gap["type"], "stream_gap");
+            assert_eq!(gap["run_id"], "run");
+            assert_eq!(gap["repair"], "refresh_run_snapshot");
+        }
+    }
+
+    #[test]
     fn large_tool_results_are_bounded_on_the_external_client_surface() {
         let output = "界".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
         let original_bytes = serde_json::to_string(&serde_json::Value::String(output.clone()))
@@ -40784,14 +41041,15 @@ mod tests {
         let result = json!({
             "status": "completed",
             "group_id": "review-group",
-            "target_count": 2,
+            "target_count": 3,
             "results": [{"result": "x".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES * 2)}],
             "fanout": {
                 "group_id": "review-group",
-                "target_count": 2,
+                "target_count": 3,
                 "slots": [
                     {"slot_index": 0, "agent_id": "a", "run_id": "run-a", "status": "completed"},
-                    {"slot_index": 1, "agent_id": "b", "run_id": "run-b", "status": "completed"}
+                    {"slot_index": 1, "agent_id": "b", "run_id": "run-b", "status": "completed"},
+                    {"slot_index": 2, "agent_id": "c".repeat(256), "run_id": "r".repeat(256), "status": "completed"}
                 ]
             },
             "work_unit_observation": {
@@ -40804,17 +41062,94 @@ mod tests {
             }
         })
         .to_string();
-        let transformed = transform_run_event_for_client(json!({
+        let event = json!({
             "type": "tool_call_end",
             "call_id": "call-fanout",
             "tool": "agent_fanout",
             "result": result,
             "success": true,
-        }));
+        });
+        let durable = project_tool_terminal_presentation(event.clone(), 3968);
+        assert!(encoded_json_len(&durable) <= 3968);
+        assert_eq!(durable["result"]["group_id"], "review-group");
+        assert_eq!(durable["result"]["fanout"]["slots"][1]["run_id"], "run-b");
+        let mut pressure_result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        pressure_result["results"] = json!([{"result":"x".repeat(1_500)}]);
+        assert!(encoded_json_len(&pressure_result) < 3968 * 3 / 4);
+        let pressure = json!({
+            "type":"tool_call_end", "run_id":"run", "session_id":"session",
+            "call_id":"call-fanout", "tool":"agent_fanout", "success":true,
+            "result":pressure_result, "arguments":{"instruction":"x".repeat(5_000)},
+            "workspace":{"path":"x".repeat(1_700)}
+        });
+        let mut without_arguments = pressure.clone();
+        without_arguments
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        assert!(encoded_json_len(&without_arguments) > 3968);
+        let compact = project_tool_terminal_presentation(pressure.clone(), 3968);
+        assert!(encoded_json_len(&compact) <= 3968);
+        assert_eq!(compact["result"]["group_id"], "review-group");
+        assert_eq!(compact["result"]["fanout"]["slots"][1]["run_id"], "run-b");
+        assert_eq!(
+            compact["result"]["original_bytes"],
+            encoded_json_len(&pressure["result"])
+        );
+        assert_eq!(
+            compact["result"]["content_sha256"],
+            sha256_hex(&serde_json::to_vec(&pressure["result"]).unwrap())
+        );
+        assert_eq!(compact["arguments_omitted"], true);
+        assert_eq!(compact["workspace"], pressure["workspace"]);
+        assert_eq!(
+            project_tool_terminal_presentation(compact.clone(), 3968),
+            compact
+        );
+        let mut rebound = durable.clone();
+        rebound["run_id"] = json!("run");
+        rebound["session_id"] = json!("session");
+        rebound["run_generation"] = json!(7);
+        rebound["idempotency_key"] = json!("subrun-tool:7:".to_owned() + &"k".repeat(190));
+        rebound["workspace"] = json!({"path":""});
+        let padding = (3968 + 64usize).saturating_sub(encoded_json_len(&rebound));
+        rebound["workspace"]["path"] = json!("x".repeat(padding));
+        assert!(encoded_json_len(&rebound) > 3968);
+        let rebound = project_tool_terminal_presentation(rebound, 3968);
+        assert!(encoded_json_len(&rebound) <= 3968);
+        assert_eq!(rebound["result"]["group_id"], "review-group");
+        assert_eq!(
+            rebound["result"]["original_bytes"],
+            durable["result"]["original_bytes"]
+        );
+        assert_eq!(
+            rebound["result"]["content_sha256"],
+            durable["result"]["content_sha256"]
+        );
+        assert_eq!(rebound["result_sha256"], durable["result_sha256"]);
+        assert_eq!(
+            project_tool_terminal_presentation(rebound.clone(), 3968),
+            rebound
+        );
+        let mut omitted = durable["result"].clone();
+        omitted.as_object_mut().unwrap().remove("fanout");
+        omitted["control_membership_omitted"] = json!("oversized");
+        let retained =
+            project_external_lifecycle_result(&omitted, 1, &"0".repeat(64), 2000).unwrap();
+        assert_eq!(
+            retained["original_bytes"],
+            durable["result"]["original_bytes"]
+        );
+        assert_eq!(
+            retained["content_sha256"],
+            durable["result"]["content_sha256"]
+        );
+        assert_eq!(retained["control_membership_omitted"], "oversized");
+        let transformed = transform_run_event_for_client(event);
 
         assert_eq!(transformed["success"], true);
         assert_eq!(transformed["result"]["group_id"], "review-group");
-        assert_eq!(transformed["result"]["target_count"], 2);
+        assert_eq!(transformed["result"]["target_count"], 3);
         assert_eq!(
             transformed["result"]["work_unit_observation"]["kind"],
             "agent_fanout"
@@ -40974,7 +41309,7 @@ mod tests {
 
     #[test]
     fn oversized_execution_metadata_cannot_erase_the_terminal_outcome() {
-        let transformed = transform_run_event_for_client(json!({
+        let event = json!({
             "type": "tool_call_end",
             "call_id": "call-terminal",
             "tool": "introspect",
@@ -40989,21 +41324,57 @@ mod tests {
                 "untrusted_extension": "x".repeat(2 * 1024 * 1024),
             },
             "error_kind": "e".repeat(2 * 1024 * 1024),
-        }));
-
-        assert_eq!(transformed["type"], "tool_call_end");
-        assert_eq!(transformed["call_id"], "call-terminal");
-        assert_eq!(transformed["tool"], "introspect");
-        assert_eq!(transformed["result"]["snapshot"], "available");
-        assert_eq!(transformed["arguments"]["scope"], "current_run");
-        assert_eq!(transformed["status"], "rejected");
-        assert_eq!(transformed["success"], false);
-        assert_eq!(transformed["executed"], false);
-        assert_eq!(transformed["duration_ms"], 37);
-        assert_eq!(transformed["payload_truncated"], true);
-        assert_eq!(transformed["error_kind"].as_str().map(str::len), Some(1024));
-        assert!(transformed.get("executor").is_none());
-        assert!(encoded_json_len(&transformed) <= EXTERNAL_TOOL_EVENT_MAX_BYTES);
+        });
+        for budget in [
+            EXTERNAL_TOOL_EVENT_MAX_BYTES,
+            MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+        ] {
+            let transformed = project_tool_terminal_presentation(event.clone(), budget);
+            assert_eq!(transformed["type"], "tool_call_end");
+            assert_eq!(transformed["call_id"], "call-terminal");
+            assert_eq!(transformed["tool"], "introspect");
+            assert_eq!(transformed["result"]["snapshot"], "available");
+            assert_eq!(transformed["arguments"]["scope"], "current_run");
+            assert_eq!(transformed["status"], "rejected");
+            assert_eq!(transformed["success"], false);
+            assert_eq!(transformed["executed"], false);
+            assert_eq!(transformed["duration_ms"], 37);
+            assert_eq!(transformed["payload_truncated"], true);
+            assert_eq!(transformed["error_kind"].as_str().map(str::len), Some(1024));
+            assert!(transformed.get("executor").is_none());
+            assert_eq!(transformed["executor_omitted"], true);
+            assert!(encoded_json_len(&transformed) <= budget);
+            assert_eq!(
+                project_tool_terminal_presentation(transformed.clone(), budget),
+                transformed
+            );
+        }
+        let mut small = event;
+        small["executor"] = json!({"kind":"server_local"});
+        small["error_kind"] = json!("rejected");
+        let projected =
+            project_tool_terminal_presentation(small.clone(), MAX_TOOL_TERMINAL_PRESENTATION_BYTES);
+        assert_eq!(projected["executor"], small["executor"]);
+        assert!(projected.get("executor_omitted").is_none());
+        small["executor"]["extension"] = json!("x".repeat(3_000));
+        small["result"] = json!({"snapshot":"x".repeat(1_000)});
+        let budget = MAX_TOOL_TERMINAL_PRESENTATION_BYTES;
+        assert!(encoded_json_len(&small["executor"]) < budget);
+        assert!(encoded_json_len(&small["result"]) < budget);
+        assert!(encoded_json_len(&small) > budget);
+        let projected = project_tool_terminal_presentation(small.clone(), budget);
+        assert_eq!(projected["type"], "tool_call_end");
+        assert_eq!(projected["call_id"], small["call_id"]);
+        assert_eq!(projected["result"], small["result"]);
+        assert_eq!(projected["executed"], false);
+        assert_eq!(projected["status"], "rejected");
+        assert_eq!(projected["success"], false);
+        assert_eq!(projected["executor_omitted"], true);
+        assert!(encoded_json_len(&projected) <= budget);
+        assert_eq!(
+            project_tool_terminal_presentation(projected.clone(), budget),
+            projected
+        );
     }
 
     /// Covers all event types that reach the client via transform_run_event_for_client:

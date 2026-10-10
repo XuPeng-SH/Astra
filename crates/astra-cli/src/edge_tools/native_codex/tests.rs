@@ -362,13 +362,13 @@ import json,sys,time
 def recv(): return json.loads(sys.stdin.readline())
 def emit(value): print(json.dumps(value),flush=True)
 assert recv()['method']=='initialize'
-time.sleep(1.2)
+time.sleep(0.2)
 emit({'id':1,'result':{'userAgent':'fixture','codexHome':'/fixture','platformFamily':'unix','platformOs':'linux'}})
 assert recv()['method']=='initialized'
 assert recv()['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 assert recv()['method']=='model/list'
-time.sleep(1.2)
+time.sleep(2.2)
 emit({'id':4,'result':{'data':[{'id':'provider-model','model':'provider-model','displayName':'Provider Model'}],'nextCursor':None}})
 for line in sys.stdin: pass
 "#,
@@ -386,6 +386,37 @@ for line in sys.stdin: pass
     .expect("authenticated discovery returns its model catalog");
     assert!(catalog.is_complete());
     assert_eq!(catalog.models[0].selector, "provider-model");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "real authenticated Codex protocol/catalog probe; explicit native harness opt-in"]
+async fn live_native_discovery_reports_current_catalog_without_model_execution() {
+    assert_eq!(
+        std::env::var("ASTRA_NATIVE_CODEX_HARNESS").as_deref(),
+        Ok("1")
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let catalog = verify_installed_protocol(
+        &native_executable().unwrap(),
+        directory.path(),
+        &CancellationToken::new(),
+        started + Duration::from_secs(5),
+    )
+    .await
+    .expect("installed protocol must authenticate and settle")
+    .expect("authenticated protocol returns catalog status");
+    println!(
+        "discovery elapsed_ms={} catalog_complete={} models={}",
+        started.elapsed().as_millis(),
+        catalog.is_complete(),
+        catalog.models.len()
+    );
+    assert!(
+        catalog.is_complete(),
+        "current native catalog must be available; no model work was dispatched"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -637,11 +668,15 @@ fn native_profile_is_rootless_and_tracks_admitted_workspace_authority() {
     let filesystem = config["filesystem"].as_object().unwrap();
     assert!(!filesystem.contains_key(":minimal"));
     assert!(!filesystem.contains_key("/etc"));
-    assert_eq!(filesystem["/workspace/*.kube/config*"], "deny");
-    assert_eq!(filesystem["/workspace/**/*.kube/config*"], "deny");
-    assert_eq!(filesystem["/workspace/**/*.env*/**"], "deny");
-    assert_eq!(filesystem["/workspace/.[aA][wW][sS]/**"], "deny");
-    assert_eq!(filesystem["/workspace/**/.[aA][wW][sS]/**"], "deny");
+    for path in [
+        "/workspace/.kube/config",
+        "/workspace/nested/.kube/config",
+        "/workspace/nested/.env/private",
+        "/workspace/.AWS/credentials",
+        "/workspace/nested/.AWS/credentials",
+    ] {
+        assert!(profile_denies(filesystem, path), "{path}");
+    }
     assert!(!filesystem.contains_key("/workspace/*config*"));
     assert_eq!(
         expected_profile_sandbox(&read_only, "/workspace").unwrap(),
@@ -666,7 +701,11 @@ fn native_profile_is_rootless_and_tracks_admitted_workspace_authority() {
         assert_eq!(projected["filesystem"][":minimal"], "read");
         assert_eq!(projected["filesystem"]["/etc"], "deny");
         assert_eq!(projected["filesystem"]["/proc"], "deny");
-        assert_eq!(projected["filesystem"]["/lib64/**/.env"], "deny");
+        assert!(profile_denies(
+            projected["filesystem"].as_object().unwrap(),
+            "/lib64/nested/.env"
+        ));
+        assert!(projected["filesystem"].as_object().unwrap().len() <= 100);
         assert!(projected["filesystem"].get("/").is_none());
         let nested =
             permission_profile("/usr/src/astra-profile-fixture", true, false, &approved).unwrap();
@@ -675,6 +714,100 @@ fn native_profile_is_rootless_and_tracks_admitted_workspace_authority() {
             nested["filesystem"]["/usr/src/astra-profile-fixture/id_rsa"],
             "deny"
         );
+    }
+}
+
+fn deny_matcher(pattern: &str) -> globset::GlobMatcher {
+    // The native client's POSIX permission matcher uses these exact options.
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .allow_unclosed_class(true)
+        .backslash_escape(true)
+        .build()
+        .unwrap()
+        .compile_matcher()
+}
+
+fn profile_denies(filesystem: &serde_json::Map<String, Value>, path: &str) -> bool {
+    filesystem
+        .iter()
+        .filter(|(_, permission)| *permission == "deny")
+        .any(|(pattern, _)| deny_matcher(pattern).is_match(path))
+}
+
+#[test]
+fn compact_native_masks_preserve_canonical_rule_matches() {
+    let rules = astra_sandbox::sensitive_path_rules();
+    let mut old = Vec::new();
+    let mut samples = vec!["ordinary".to_owned(), "safe/configuration".to_owned()];
+    for substring in rules.path_substrings {
+        let substring = substring.trim_start_matches('/');
+        if substring.is_empty() {
+            continue;
+        }
+        old.extend([
+            format!("/workspace/*{substring}*"),
+            format!("/workspace/**/*{substring}*"),
+            format!("/workspace/*{substring}*/**"),
+            format!("/workspace/**/*{substring}*/**"),
+        ]);
+        samples.extend([
+            substring.to_owned(),
+            format!("prefix{substring}suffix"),
+            substring.to_uppercase(),
+        ]);
+    }
+    for name in rules.credential_file_names {
+        old.extend([
+            format!("/workspace/{name}"),
+            format!("/workspace/**/{name}"),
+        ]);
+        samples.extend([(*name).to_owned(), format!("prefix{name}suffix")]);
+    }
+    for marker in rules.credential_directories {
+        let marker = marker.trim_start_matches('/');
+        let pattern = case_insensitive_glob_literal(marker);
+        old.extend([
+            format!("/workspace/{pattern}"),
+            format!("/workspace/{pattern}/**"),
+            format!("/workspace/**/{pattern}"),
+            format!("/workspace/**/{pattern}/**"),
+        ]);
+        samples.extend([
+            marker.to_owned(),
+            marker.to_uppercase(),
+            format!("prefix{marker}suffix"),
+        ]);
+    }
+    let old = old
+        .iter()
+        .map(|pattern| deny_matcher(pattern))
+        .collect::<Vec<_>>();
+    let profile = test_profile();
+    let config = requested_profile_config(&profile).unwrap();
+    let filesystem = config["filesystem"].as_object().unwrap();
+    let compact = filesystem
+        .iter()
+        .filter(|(_, permission)| *permission == "deny")
+        .map(|(pattern, _)| deny_matcher(pattern))
+        .collect::<Vec<_>>();
+    for sample in samples {
+        for prefix in ["", "nested/", "nested/deeper/"] {
+            for suffix in ["", "/child", "/child/deeper"] {
+                let path = format!("/workspace/{prefix}{sample}{suffix}");
+                assert_eq!(
+                    old.iter().any(|matcher| matcher.is_match(&path)),
+                    compact.iter().any(|matcher| matcher.is_match(&path)),
+                    "{path}"
+                );
+            }
+        }
+    }
+    for root in ["/workspace/[alias]", "/workspace/*", "/workspace/{alias}"] {
+        assert!(permission_profile(root, false, false, &test_requirements()).is_err());
+        let mut requirements = test_requirements();
+        requirements.read_paths.push(root.into());
+        assert!(permission_profile("/workspace", false, false, &requirements).is_err());
     }
 }
 
@@ -1035,6 +1168,10 @@ fn usage_is_last_snapshot_not_sum_and_absence_is_unknown() {
             .unwrap();
     }
     assert_eq!(evidence.usage.as_ref().unwrap()["total"]["totalTokens"], 35);
+    assert_eq!(
+        evidence.stage_usage_with_inclusive().unwrap().unwrap().0,
+        Some(30)
+    );
     // Missing cache-write evidence cannot be filled with an invented zero.
     assert_eq!(
         evidence.stage_usage().unwrap().unwrap().to_json(),
@@ -1068,6 +1205,10 @@ fn usage_receipt_is_disjoint_stage_delta_not_thread_total_or_last_response() {
     assert_eq!(
         evidence.stage_usage().unwrap().unwrap().to_json(),
         json!({"input_tokens": 20, "cached_input_tokens": 20, "cache_creation_tokens": 10, "output_tokens": 10, "total_tokens": 60})
+    );
+    assert_eq!(
+        evidence.stage_usage_with_inclusive().unwrap().unwrap().0,
+        Some(50)
     );
     assert!(
         evidence
@@ -1291,11 +1432,319 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
     drop(lease);
 }
 
-/// Opt-in paid-provider evidence for the selected ToolExecutor adapter only.
-/// These are fixture-owned invocation identities and explicit test admission,
-/// not a forged provider principal or proof of durable Server admission/UX.
-/// Provider credentials are consumed by Codex itself; this test never opens
-/// credentials/configuration or prints native output/errors/configuration.
+/// Probe actual OS enforcement without model calls or credential inspection.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "real Codex permission enforcement; requires explicit opt-in and fresh supervisor, no model calls"]
+async fn live_native_permission_masks_enforce_read_write_and_network_boundaries() {
+    assert_eq!(
+        std::env::var("ASTRA_NATIVE_CODEX_HARNESS").as_deref(),
+        Ok("1")
+    );
+    assert!(std::env::var_os("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN").is_some());
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir_all(root.join("nested/.AWS")).unwrap();
+    std::fs::write(root.join("control.txt"), "readable-control").unwrap();
+    for path in [
+        root.join("id_rsa"),
+        root.join("nested/.env"),
+        root.join("nested/.AWS/credentials"),
+        directory.path().join("outside.txt"),
+    ] {
+        std::fs::write(path, "synthetic-denied-control").unwrap();
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let requirements = installed_runtime_requirements().unwrap();
+    let executable = native_executable().unwrap();
+    let mut args = vec!["app-server".to_owned()];
+    let mut profiles = Vec::new();
+    for network in [false, true] {
+        let profile =
+            permission_profile(root.to_str().unwrap(), false, network, &requirements).unwrap();
+        let id = profile["profileId"].as_str().unwrap().to_owned();
+        let config = requested_profile_config(&profile).unwrap();
+        // CLI dotted keys do not parse quoted path segments. Pass the map
+        // as one TOML value, preserving every actual projected rule.
+        let filesystem = config["filesystem"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(path, permission)| format!("{}={permission}", json!(path)))
+            .collect::<Vec<_>>()
+            .join(",");
+        args.extend([
+            "--config".into(),
+            format!("permissions.{id}.filesystem={{{filesystem}}}"),
+        ]);
+        args.extend([
+            "--config".into(),
+            format!("permissions.{id}.network.enabled={network}"),
+        ]);
+        println!(
+            "{}",
+            json!({"event":"native_permission_projection", "network":network,
+            "filesystem_entries":config["filesystem"].as_object().unwrap().len(),
+            "filesystem_json_bytes":serde_json::to_vec(&config["filesystem"]).unwrap().len()})
+        );
+        profiles.push(id);
+    }
+    args.extend([
+        "--config".into(),
+        format!("default_permissions={}", json!(profiles[0])),
+    ]);
+    let (mut command, owner) = prepare_native_process(&executable, &args).unwrap();
+    command.current_dir(&root);
+    let cancel = CancellationToken::new();
+    let mut process = owner
+        .spawn_framed(
+            command,
+            FramedProcessLimits {
+                max_frame_bytes: FRAME_BYTES,
+                max_queued_frames: 4,
+                max_stderr_bytes: 4096,
+                timeout: Duration::from_secs(40),
+            },
+            cancel.child_token(),
+        )
+        .unwrap();
+    let input = process.input();
+    let mut evidence = Evidence::default();
+    let probes = async {
+        initialize_protocol(&mut process, &input, &mut evidence, OUTPUT_BYTES, None, &cancel).await?;
+        let mut results = Vec::new();
+        let mut commands = vec![(vec!["/bin/cat".to_owned(), root.join("control.txt").display().to_string()], true, 0)];
+        for path in [root.join("id_rsa"), root.join("nested/.env"), root.join("nested/.AWS/credentials"), directory.path().join("outside.txt")] {
+            commands.push((vec!["/bin/cat".into(), path.display().to_string()], false, 0));
+        }
+        commands.push((vec!["/bin/sh".into(), "-c".into(), "printf changed > \"$1\"".into(), "probe".into(), root.join("new-file").display().to_string()], false, 0));
+        for profile in 0..2 {
+            commands.push((vec!["/usr/bin/python3".into(), "-c".into(), "import socket,sys; socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=1).close()".into(), port.clone()], profile == 1, profile));
+        }
+        for (index, (command, expected_success, profile)) in commands.into_iter().enumerate() {
+            let response = rpc(&mut process, &input,
+                json!({"id":index+50, "method":"command/exec", "params":{
+                    "command":command, "cwd":root, "permissionProfile":profiles[profile],
+                    "timeoutMs":3000, "outputBytesCap":2048,
+                }}), &mut evidence, OUTPUT_BYTES, None, Some(&cancel), None, None).await?;
+            let code = response["exitCode"].as_i64().ok_or("command probe lacks exit evidence")?;
+            results.push((index, code == 0, expected_success));
+            if index == 0 && response["stdout"].as_str() != Some("readable-control") {
+                return Err("positive read control did not return the actual file");
+            }
+        }
+        Ok::<_, &'static str>(results)
+    }.await;
+    let cleanup = process.cancel_and_wait().await.unwrap();
+    if probes.is_err() {
+        let (diagnostic, _) =
+            astra_text_utils::credential_redaction::redact_credentials_for_display(
+                &String::from_utf8_lossy(&cleanup.stderr),
+            );
+        eprintln!("native permission probe failed after settled cleanup: {diagnostic}");
+    }
+    assert!(
+        cleanup
+            .settlement
+            .as_ref()
+            .is_some_and(|settlement| settlement.ownership.is_authoritative())
+    );
+    for (index, success, expected) in
+        probes.expect("real permission probes failed after settled cleanup")
+    {
+        assert_eq!(success, expected, "native permission probe {index}");
+    }
+    assert!(!root.join("new-file").exists());
+}
+
+/// Public CLI -> real ServerSubRunExecutor -> durable projection -> Introspect.
+/// No fixture-installed sender, invented provider principal or direct adapter
+/// invocation can make this pass. Credentials stay with the ordinary CLI.
+#[tokio::test]
+#[ignore = "paid providers, fresh CLI/server and signed-in account; explicit native parent harness opt-in"]
+async fn live_native_parent_retains_observation_through_durable_custody() {
+    assert_eq!(
+        std::env::var("ASTRA_NATIVE_CODEX_HARNESS").as_deref(),
+        Ok("1")
+    );
+    let binary = std::env::var("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN").unwrap();
+    let api = std::env::var("ASTRA_NATIVE_PARENT_HARNESS_API_URL").unwrap();
+    let parent = std::env::var("ASTRA_NATIVE_PARENT_HARNESS_MODEL").unwrap();
+    let native = std::env::var("ASTRA_NATIVE_CODEX_HARNESS_MODEL").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = uuid::Uuid::new_v4().to_string();
+    let path = directory.path().join("control.txt");
+    std::fs::write(&path, &marker).unwrap();
+
+    async fn cli_json(binary: &str, api: &str, cwd: &std::path::Path, args: &[&str]) -> Value {
+        let mut command = tokio::process::Command::new(binary);
+        command
+            .args(["--api-url", api])
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(180), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "public CLI did not complete successfully"
+        );
+        assert!(output.stdout.len() <= 16 * 1024 * 1024);
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    let prompt = format!(
+        "使用 Codex 的 {native} 模型、xhigh，读取 {}。只返回文件内容，不要由当前代理代替执行。",
+        path.display()
+    );
+    let result = cli_json(
+        &binary,
+        &api,
+        directory.path(),
+        &[
+            "chat",
+            "--no-resume",
+            "--model",
+            &parent,
+            "--auto-approve",
+            "--json",
+            "--message",
+            &prompt,
+        ],
+    )
+    .await;
+    assert_eq!(result["success"], true);
+    assert!(result["text"].as_str().unwrap().contains(&marker));
+    let session = result["session_id"].as_str().unwrap();
+    let root = result["run_id"].as_str().unwrap();
+    let capture = cli_json(
+        &binary,
+        &api,
+        directory.path(),
+        &[
+            "session",
+            "show",
+            session,
+            "--execution",
+            "--transcript",
+            "--run-events",
+        ],
+    )
+    .await;
+    assert_eq!(capture["session_id"], session);
+    assert_eq!(capture["run_tree"]["truncated"], false);
+    let children = capture["run_tree"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|run| run["parent_run_id"] == root)
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["status"], "completed");
+    let child = children[0]["run_id"].as_str().unwrap();
+    let projection = capture["run_projections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|projection| projection["run_id"] == child)
+        .unwrap();
+    let terminals = projection["recent_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "tool_call_end")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "native terminal must have one durable custodian"
+    );
+    assert_eq!(terminals[0]["run_id"], child);
+    let observation = &terminals[0]["native_stage_observation"];
+    assert_eq!(observation["dispatch_state"], "acknowledged");
+    assert_eq!(observation["native_terminal"], "completed");
+    assert_eq!(observation["settlement_authoritative"], true);
+    assert_eq!(observation["acknowledged_model"], native);
+    let parent_calls = capture["transcript"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["run_id"] == root)
+        .flat_map(|item| item["tool_calls"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
+    assert!(
+        parent_calls.iter().any(|call| call["name"] == "agent"),
+        "parent must actually delegate"
+    );
+    for call in parent_calls {
+        assert!(
+            matches!(call["name"].as_str(), Some("agent" | "introspect")),
+            "parent must not substitute its own execution"
+        );
+    }
+
+    let prompt = format!(
+        "调用 introspect 获取运行 {child} 的观测，只原样返回其中 native_stage_observations 的 JSON 数组，不要代码围栏。不要重新执行任务。"
+    );
+    let followup = cli_json(
+        &binary,
+        &api,
+        directory.path(),
+        &[
+            "chat",
+            "--session-id",
+            session,
+            "--model",
+            &parent,
+            "--auto-approve",
+            "--json",
+            "--message",
+            &prompt,
+        ],
+    )
+    .await;
+    assert_eq!(followup["success"], true);
+    let followup_run = followup["run_id"].as_str().unwrap();
+    let inspected = cli_json(
+        &binary,
+        &api,
+        directory.path(),
+        &["session", "show", session, "--execution", "--transcript"],
+    )
+    .await;
+    let call_ids = inspected["transcript"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["run_id"] == followup_run)
+        .filter(|item| item["tool_result"]["name"] == "introspect")
+        .map(|item| item["tool_result"]["tool_use_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !call_ids.is_empty(),
+        "followup must actually call Introspect"
+    );
+    // Both audit and terminal channels intentionally carry previews. Verify
+    // actual user delivery, not whether a preview can be parsed as full JSON.
+    let delivered: Value = serde_json::from_str(followup["text"].as_str().unwrap()).unwrap();
+    let facts = delivered
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|document| document["run_id"] == child)
+        .expect("Introspect must deliver the exact child observation to the user");
+    assert_eq!(facts["native_stage_observation"], *observation);
+    println!(
+        "{}",
+        json!({"event":"native_parent_custody_verified", "stage_inclusive_input_tokens":observation["stage_inclusive_input_tokens"], "last_request_input_tokens":observation["last_request_input_tokens"], "stage_usage":observation["stage_usage"]})
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "live Codex task; requires explicit opt-in, model, auth, native sandbox and fresh supervisor binary"]
@@ -1510,6 +1959,17 @@ async fn live_native_codex_two_stages_same_session() {
         assert_eq!(native["settlement_authoritative"], true);
         assert_eq!(native["transport_settled_after_terminal"], true);
         assert_eq!(fields["workspace_effect_settled"], true);
+        let observation = astra_turn_types::project_native_collaborator_observation(
+            &fields[astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY],
+        )
+        .expect("live stage observation survives the shared bounded projection");
+        assert_eq!(
+            observation["native_session_id"],
+            native["native_session_id"]
+        );
+        assert_eq!(observation["native_turn_id"], native["native_turn_id"]);
+        assert_eq!(observation["native_terminal"], "completed");
+        assert_eq!(observation["settlement_authoritative"], true);
         let acknowledged: astra_services::runs::CollaboratorNativeSession = serde_json::from_value(
             fields[astra_services::runs::COLLABORATOR_NATIVE_SESSION_METADATA_KEY].clone(),
         )

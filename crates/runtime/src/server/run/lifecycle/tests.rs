@@ -23960,6 +23960,38 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
         .as_str()
         .expect("stable terminal identity");
     assert_eq!(idempotency_key, "subrun-tool-terminal:7:child-call-1");
+    let oversized_identity = json!({
+        "type":"tool_call_end", "run_id":"child-run",
+        "call_id":"x".repeat(8192), "result":"observed"
+    });
+    let gap =
+        durable_subrun_host_terminal_events(vec![oversized_identity.clone()], Some(7), "child-run");
+    assert_eq!(gap[0]["type"], "stream_gap");
+    assert_eq!(gap[0]["run_id"], "child-run");
+    assert!(
+        gap[0]["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("subrun-gap:7:")
+    );
+    assert!(
+        serde_json::to_vec(&gap[0]).unwrap().len()
+            <= astra_services::runs::MAX_TOOL_TERMINAL_PRESENTATION_BYTES
+    );
+    assert_eq!(
+        durable_subrun_host_terminal_events(vec![oversized_identity], Some(7), "child-run"),
+        gap
+    );
+    let distinct = durable_subrun_host_terminal_events(
+        vec![json!({
+            "type":"tool_call_end", "run_id":"child-run",
+            "call_id":"y".repeat(8192), "result":"another observation"
+        })],
+        Some(7),
+        "child-run",
+    );
+    assert_ne!(distinct[0]["event_sha256"], gap[0]["event_sha256"]);
+    assert_ne!(distinct[0]["idempotency_key"], gap[0]["idempotency_key"]);
     assert!(
         durable[0]
             .as_object()

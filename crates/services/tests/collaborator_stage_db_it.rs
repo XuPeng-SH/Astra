@@ -68,6 +68,141 @@ fn record(user_id: &str, session_id: &str, parent: Option<&str>) -> DurableRunRe
     }
 }
 
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and real MatrixOne"]
+async fn terminal_presentation_survives_maximum_durable_observation_window() {
+    let fixture = Fixture::new().await;
+    let full = json!({
+        "type": "tool_call_end", "run_id": fixture.parent_id,
+        "session_id": fixture.session_id, "call_id": "large-call", "tool": "native_codex",
+        "result": "界\\\"\n".repeat(12_000), "status": "completed", "success": true,
+        "native_stage_observation": {
+            "native_session_id": "thread", "native_turn_id": "turn", "dispatch_state": "acknowledged",
+            "settlement_authoritative": true, "native_terminal": "completed",
+            "stage_inclusive_input_tokens": 30, "stage_usage": {"cached_input_tokens": 10, "output_tokens": 5},
+            "last_request_input_tokens": null, "model_context_window": null,
+            "acknowledged_model": null, "provider_error_code": null, "provider_error_class": null
+        }
+    });
+    let event = astra_services::runs::project_tool_terminal_presentation(full.clone(), 4096 - 128);
+    assert!(serde_json::to_vec(&event).unwrap().len() <= 4096 - 128);
+    assert_eq!(
+        event["native_stage_observation"],
+        full["native_stage_observation"]
+    );
+    let replay =
+        astra_services::runs::project_tool_terminal_presentation(event.clone(), 4096 - 128);
+    assert_eq!(
+        replay, event,
+        "replay must preserve original integrity facts"
+    );
+    fixture
+        .store
+        .append_event(
+            &fixture.user_id,
+            &fixture.session_id,
+            &fixture.parent_id,
+            event.clone(),
+        )
+        .await
+        .unwrap();
+    let observation = fixture
+        .store
+        .load_run_observation(&fixture.user_id, &fixture.parent_id, 256)
+        .await
+        .unwrap()
+        .unwrap();
+    // insert_run already records run_created; presentation adds exactly one
+    // event, not a second observation ledger or auxiliary fact row.
+    assert_eq!(observation.total_event_count, 2);
+    assert_eq!(observation.run.events.len(), 2);
+    let retained = observation
+        .run
+        .events
+        .iter()
+        .find(|event| event["call_id"] == "large-call")
+        .unwrap();
+    assert_eq!(retained["index"], 1);
+    assert_eq!(retained["run_id"], fixture.parent_id);
+    assert_eq!(retained["session_id"], fixture.session_id);
+    assert_eq!(retained["call_id"], "large-call");
+    assert_eq!(
+        retained["native_stage_observation"],
+        event["native_stage_observation"]
+    );
+    assert_eq!(retained["result_sha256"], event["result_sha256"]);
+    assert!(
+        fixture
+            .store
+            .load_run_observation("foreign-owner", &fixture.parent_id, 256)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let initial = astra_services::runs::project_tool_terminal_presentation(
+        json!({
+            "type":"tool_call_end", "call_id":"lifecycle-call", "tool":"agent_fanout",
+            "result":{
+                "group_id":"group", "target_count":3, "results":[{"result":"x".repeat(10_000)}],
+                "fanout":{"group_id":"group", "slots":[{"run_id":"child-a"},{"run_id":"child-b"},{"run_id":"r".repeat(512)}]},
+                "work_unit_observation":{"id":"group", "kind":"agent_fanout", "status":"completed",
+                    "revision":1, "mode":"current", "wake_policy":"none"}
+            }
+        }),
+        4096 - 128,
+    );
+    let mut rebound = initial.clone();
+    rebound["run_id"] = json!(fixture.parent_id);
+    rebound["session_id"] = json!(fixture.session_id);
+    rebound["run_generation"] = json!(1);
+    rebound["idempotency_key"] = json!("subrun-tool:1:lifecycle-call");
+    rebound["workspace"] = json!({"path":""});
+    let padding =
+        (4096 - 128 + 64usize).saturating_sub(serde_json::to_vec(&rebound).unwrap().len());
+    rebound["workspace"]["path"] = json!("x".repeat(padding));
+    assert!(serde_json::to_vec(&rebound).unwrap().len() > 4096 - 128);
+    let rebound = astra_services::runs::project_tool_terminal_presentation(rebound, 4096 - 128);
+    assert_eq!(rebound["result"]["group_id"], "group");
+    assert_eq!(
+        rebound["result"]["content_sha256"],
+        initial["result"]["content_sha256"]
+    );
+    assert_eq!(
+        rebound["result"]["original_bytes"],
+        initial["result"]["original_bytes"]
+    );
+    assert_eq!(
+        astra_services::runs::project_tool_terminal_presentation(rebound.clone(), 4096 - 128),
+        rebound
+    );
+    fixture
+        .store
+        .append_event(
+            &fixture.user_id,
+            &fixture.session_id,
+            &fixture.parent_id,
+            rebound.clone(),
+        )
+        .await
+        .unwrap();
+    let observation = fixture
+        .store
+        .load_run_observation(&fixture.user_id, &fixture.parent_id, 256)
+        .await
+        .unwrap()
+        .unwrap();
+    let retained = observation
+        .run
+        .events
+        .iter()
+        .find(|event| event["call_id"] == "lifecycle-call")
+        .unwrap();
+    assert_eq!(retained["result"], rebound["result"]);
+    assert_eq!(retained["result_sha256"], initial["result_sha256"]);
+    assert_eq!(retained["run_generation"], 1);
+    fixture.cleanup().await;
+}
+
 fn admission(anchor_run_id: &str, provider: CollaboratorProvider) -> CollaboratorStageAdmission {
     let native_execution = (provider != CollaboratorProvider::InternalModel).then(|| {
         let tool_name = match provider {
@@ -1398,6 +1533,54 @@ async fn failed_child_insert_rolls_back_already_staged_anchor_receipt() {
         .unwrap()
         .unwrap();
     assert_eq!(association.latest_stage.run_id, first.run_id);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn stage_association_index_misses_preserve_ordinary_children_and_release_session_locks() {
+    let fixture = Fixture::new().await;
+    let (_, stage) = fixture.first(CollaboratorProvider::InternalModel).await;
+    let ordinary = fixture.child();
+    fixture.store.insert_run(ordinary.clone()).await.unwrap();
+    let association = fixture
+        .store
+        .load_collaborator_association_for_stage(
+            &fixture.user_id,
+            &fixture.session_id,
+            &stage.run_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(association.latest_stage.run_id, stage.run_id);
+    for target in [&ordinary.run_id, &Uuid::new_v4().to_string()] {
+        let next = fixture.child();
+        let (missing, inserted) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                fixture.store.load_collaborator_association_for_stage(
+                    &fixture.user_id,
+                    &fixture.session_id,
+                    target
+                ),
+                fixture.store.insert_run(next),
+            )
+        })
+        .await
+        .expect("indexed miss must release session locks for concurrent writes");
+        assert!(missing.unwrap().is_none());
+        inserted.unwrap();
+    }
+    assert_eq!(
+        fixture
+            .store
+            .load_run(&fixture.user_id, &ordinary.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
     fixture.cleanup().await;
 }
 

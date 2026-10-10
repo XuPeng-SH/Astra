@@ -418,6 +418,15 @@ fn permission_profile(
 ) -> Result<Value, &'static str> {
     let id = format!("astra_admitted_{}", uuid::Uuid::new_v4().simple());
     let mut filesystem = serde_json::Map::new();
+    // These are literal grant roots, not user-supplied glob expressions.
+    // Codex discovers masks from the static prefix; escaping that prefix would
+    // change its discovery semantics, so reject unrepresentable boundaries.
+    if std::iter::once(cwd)
+        .chain(requirements.read_paths.iter().map(String::as_str))
+        .any(|root| root.contains(['*', '?', '[', ']', '{', '}', '\\']))
+    {
+        return Err("native runtime boundary contains glob syntax");
+    }
     // Never inherit a root-readable built-in profile. Platform bootstrap is
     // enabled below only after proving it is covered by the runtime grant.
     if cwd == "/" || astra_sandbox::is_sensitive_system_dir(std::path::Path::new(cwd)) {
@@ -455,6 +464,28 @@ fn permission_profile(
     }
 
     let rules = astra_sandbox::sensitive_path_rules();
+    let mut descendants = std::collections::BTreeSet::new();
+    for substring in rules.path_substrings {
+        let substring = substring.trim_start_matches('/');
+        if !substring.is_empty() {
+            descendants.insert(format!("*{substring}*"));
+        }
+    }
+    descendants.extend(
+        rules
+            .credential_directories
+            .iter()
+            .map(|marker| case_insensitive_glob_literal(marker.trim_start_matches('/'))),
+    );
+    let mut entries = descendants.clone();
+    entries.extend(
+        rules
+            .credential_file_names
+            .iter()
+            .map(|name| (*name).to_owned()),
+    );
+    let entries = entries.into_iter().collect::<Vec<_>>().join(",");
+    let descendants = descendants.into_iter().collect::<Vec<_>>().join(",");
     // The only roots exposed to the provider are the selected workspace and
     // the explicitly captured installed-runtime paths. Scope the canonical
     // sensitive-path rules to those roots, using prefixes accepted by Codex's
@@ -484,25 +515,12 @@ fn permission_profile(
         if root.is_empty() || root == "/" {
             return Err("native runtime boundary cannot project a filesystem root");
         }
-        for substring in rules.path_substrings {
-            let substring = substring.trim_start_matches('/');
-            if !substring.is_empty() {
-                filesystem.insert(format!("{root}/*{substring}*"), json!("deny"));
-                filesystem.insert(format!("{root}/**/*{substring}*"), json!("deny"));
-                filesystem.insert(format!("{root}/*{substring}*/**"), json!("deny"));
-                filesystem.insert(format!("{root}/**/*{substring}*/**"), json!("deny"));
-            }
-        }
+        filesystem.insert(format!("{root}/**/{{{entries}}}"), json!("deny"));
+        filesystem.insert(format!("{root}/**/{{{descendants}}}/**"), json!("deny"));
         for name in rules.credential_file_names {
+            // Literal denies survive a later cwd write grant, including when
+            // the cwd is beneath another approved runtime root.
             filesystem.insert(format!("{root}/{name}"), json!("deny"));
-            filesystem.insert(format!("{root}/**/{name}"), json!("deny"));
-        }
-        for marker in rules.credential_directories {
-            let marker = case_insensitive_glob_literal(marker.trim_start_matches('/'));
-            filesystem.insert(format!("{root}/{marker}"), json!("deny"));
-            filesystem.insert(format!("{root}/{marker}/**"), json!("deny"));
-            filesystem.insert(format!("{root}/**/{marker}"), json!("deny"));
-            filesystem.insert(format!("{root}/**/{marker}/**"), json!("deny"));
         }
     }
 
@@ -578,6 +596,7 @@ async fn verify_installed_protocol(
     cancel: &CancellationToken,
     deadline: std::time::Instant,
 ) -> Result<Option<astra_turn_types::ProviderModelCatalog>, &'static str> {
+    let started = std::time::Instant::now();
     let timeout = deadline
         .saturating_duration_since(std::time::Instant::now())
         .min(Duration::from_secs(2));
@@ -623,9 +642,7 @@ async fn verify_installed_protocol(
         Err(_) => Err("native protocol probe deadline expired"),
     };
     let model_catalog = if probe.is_ok() && !cancel.is_cancelled() {
-        let catalog_timeout = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .min(Duration::from_secs(2));
+        let catalog_timeout = deadline.saturating_duration_since(std::time::Instant::now());
         if catalog_timeout.is_zero() {
             Some(astra_turn_types::ProviderModelCatalog::unavailable())
         } else {
@@ -636,7 +653,21 @@ async fn verify_installed_protocol(
             .await
             {
                 Ok(Ok(catalog)) => Some(catalog),
-                Ok(Err(_)) | Err(_) => Some(astra_turn_types::ProviderModelCatalog::unavailable()),
+                failure => {
+                    tracing::debug!(
+                        phase = "model_catalog",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        remaining_ms = deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_millis() as u64,
+                        timed_out = failure.is_err(),
+                        cancelled = cancel.is_cancelled(),
+                        provider_error_code = evidence.provider_error_code,
+                        provider_error_class = evidence.provider_error_class,
+                        "native discovery did not obtain a validated catalog"
+                    );
+                    Some(astra_turn_types::ProviderModelCatalog::unavailable())
+                }
             }
         }
     } else {
@@ -651,6 +682,22 @@ async fn verify_installed_protocol(
         .cancel_and_wait()
         .await
         .map_err(|_| "native protocol probe settlement unavailable")?;
+    tracing::debug!(
+        phase = "discovery_settlement",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        remaining_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64,
+        protocol_authenticated = probe.is_ok(),
+        catalog_available = model_catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.is_complete()),
+        authoritative = outcome
+            .settlement
+            .as_ref()
+            .is_some_and(|settlement| settlement.ownership.is_authoritative()),
+        "native discovery settled"
+    );
     if probe.is_err()
         || !outcome
             .settlement
@@ -1196,7 +1243,14 @@ fn classify_provider_error(message: &str) -> &'static str {
 }
 
 impl Evidence {
+    #[cfg(test)]
     fn stage_usage(&self) -> Result<Option<astra_turn_types::CanonicalTokenUsage>, &'static str> {
+        Ok(self.stage_usage_with_inclusive()?.map(|(_, usage)| usage))
+    }
+
+    fn stage_usage_with_inclusive(
+        &self,
+    ) -> Result<Option<(Option<u64>, astra_turn_types::CanonicalTokenUsage)>, &'static str> {
         let Some(snapshot) = &self.usage else {
             return Ok(None);
         };
@@ -1227,6 +1281,14 @@ impl Evidence {
         let cached = delta("cachedInputTokens")?;
         let creation = delta("cacheWriteInputTokens")?;
         let output = delta("outputTokens")?;
+        if inclusive_input.is_some_and(|input| {
+            cached
+                .unwrap_or_default()
+                .checked_add(creation.unwrap_or_default())
+                .is_none_or(|known| known > input)
+        }) {
+            return Err("native usage input lanes overlap inconsistently");
+        }
         // Native cached/write input are subsets of input; reasoning is a
         // subset of output. Persist disjoint lanes, never add those twice.
         let input = match (inclusive_input, cached, creation) {
@@ -1239,7 +1301,7 @@ impl Evidence {
             _ => None,
         };
         astra_turn_types::CanonicalTokenUsage::new(input, cached, creation, output)
-            .map(Some)
+            .map(|usage| Some((inclusive_input, usage)))
             .map_err(|_| "native usage exceeds canonical accounting bounds")
     }
 
@@ -1404,7 +1466,7 @@ impl Evidence {
                         }
                     }
                     self.usage = Some(snapshot);
-                    self.stage_usage()?;
+                    self.stage_usage_with_inclusive()?;
                 }
             }
             _ => {} // Non-outcome notifications do not establish run facts.
@@ -2970,9 +3032,36 @@ impl ToolExecutor {
             || evidence.terminal.as_deref() != Some("completed")
             || !settled
             || !transport_ok;
-        let stage_usage = evidence.stage_usage().ok().flatten();
+        let stage_accounting = evidence.stage_usage_with_inclusive().ok().flatten();
+        let stage_usage = stage_accounting.map(|(_, usage)| usage);
         let session_acknowledged = evidence.thread.is_some();
         let turn_acknowledged = evidence.turn.is_some();
+        let observation = astra_turn_types::NativeCollaboratorObservation {
+            native_session_id: evidence.thread.clone(),
+            native_turn_id: evidence.turn.clone(),
+            dispatch_state: if turn_acknowledged {
+                astra_turn_types::NativeStageDispatchState::Acknowledged
+            } else if evidence.turn_queued {
+                astra_turn_types::NativeStageDispatchState::Unknown
+            } else {
+                astra_turn_types::NativeStageDispatchState::NotDispatched
+            },
+            native_terminal: evidence.terminal.clone(),
+            settlement_authoritative: settled,
+            stage_inclusive_input_tokens: stage_accounting.and_then(|(input, _)| input),
+            stage_usage,
+            last_request_input_tokens: evidence
+                .usage
+                .as_ref()
+                .and_then(|usage| usage["last"]["inputTokens"].as_u64()),
+            model_context_window: evidence
+                .usage
+                .as_ref()
+                .and_then(|usage| usage["modelContextWindow"].as_u64()),
+            acknowledged_model: evidence.acknowledged_model.clone(),
+            provider_error_code: evidence.provider_error_code,
+            provider_error_class: evidence.provider_error_class.map(str::to_owned),
+        };
         let native_session =
             evidence
                 .thread
@@ -3026,6 +3115,14 @@ impl ToolExecutor {
         }
         if let Some(usage) = stage_usage {
             metadata.insert("collaborator_usage".into(), json!(usage));
+        }
+        if let Some(observation) =
+            astra_turn_types::project_native_collaborator_observation(&json!(observation))
+        {
+            metadata.insert(
+                astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                observation,
+            );
         }
         if evidence.capability_unavailable {
             metadata.insert("native_capability_unavailable".into(), Value::Bool(true));

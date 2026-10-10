@@ -21434,6 +21434,10 @@ fn durable_subrun_host_terminal_events(
                         .unwrap_or("idless")
                         .to_string(),
                 ),
+                Some("stream_gap") if event["run_id"].as_str() == Some(run_id) => (
+                    "subrun-gap",
+                    format!("{:x}", Sha256::digest(serde_json::to_vec(&event).ok()?)),
+                ),
                 Some("agent_communication") => {
                     let communication = serde_json::from_value::<
                         astra_turn_types::AgentCommunicationEvent,
@@ -21470,6 +21474,20 @@ fn durable_subrun_host_terminal_events(
                         "idempotency_key".to_string(),
                         Value::String(format!("{prefix}:{generation}:{identity}")),
                     );
+                }
+            }
+            if durable_event_type(&event) == Some("tool_call_end") {
+                event = astra_services::runs::project_tool_terminal_presentation(
+                    event,
+                    astra_services::runs::MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+                );
+                // Identity overflow creates a repair fact, not a tool fact.
+                // Its own stable identity must survive the final envelope.
+                if durable_event_type(&event) == Some("stream_gap")
+                    && let Some(generation) = execution_owner_generation
+                {
+                    let digest = Sha256::digest(serde_json::to_vec(&event).ok()?);
+                    event["idempotency_key"] = json!(format!("subrun-gap:{generation}:{digest:x}"));
                 }
             }
             Some(event)
@@ -23823,6 +23841,48 @@ impl ServerSubRunExecutor {
                     .map_err(|error| invalid(error.to_string()))?,
             )),
         );
+        let request = executor.tool_execution_request_for_invocation(
+            &identity,
+            &native.tool_name,
+            &native.arguments,
+            Some(&native.policy),
+        );
+        if let Some(mut terminal) = crate::server::tool_route_boundary::tool_call_end_event(
+            &request,
+            &result,
+            tool_record.ms,
+        ) {
+            terminal.insert("session_id".into(), json!(config.session_id));
+            terminal.insert(
+                "disposition".into(),
+                json!(tool_record.effective_disposition()),
+            );
+            terminal.insert(
+                "executed".into(),
+                if settled {
+                    json!(tool_record.was_executed())
+                } else {
+                    Value::Null
+                },
+            );
+            terminal.insert("success".into(), json!(settled.then_some(succeeded)));
+            terminal.insert(
+                "status".into(),
+                json!(if !settled {
+                    "unknown"
+                } else if invocation.state == ToolInvocationState::Rejected {
+                    "rejected"
+                } else if succeeded {
+                    "completed"
+                } else {
+                    "failed"
+                }),
+            );
+            // The same retained terminal custody used by ordinary tools must
+            // exist even when this child has no live WorkSurface sender.
+            host.emit_committed_lifecycle_projection(Value::Object(terminal))
+                .await;
+        }
         state.tool_ledger_receipt.observe_round(
             &ToolLedgerAttemptBatch::from_validated_provider_calls(&[json!({"id": INVOCATION_ID})]),
             std::slice::from_ref(&tool_record),

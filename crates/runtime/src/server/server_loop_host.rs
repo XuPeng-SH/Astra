@@ -13105,13 +13105,19 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    async fn emit_committed_lifecycle_projection(&mut self, mut event: Value) {
+    pub(crate) async fn emit_committed_lifecycle_projection(&mut self, mut event: Value) {
         if self.validate_progress_event_lane(&event).is_err() {
             return;
         }
         self.start_explain_analyze_tool_call(&event);
         self.finish_explain_analyze_tool_call(&event);
         self.attach_execution_metadata_to_tool_event(&mut event);
+        if event["type"] == "tool_call_end" {
+            event = astra_services::runs::project_tool_terminal_presentation(
+                event,
+                astra_services::runs::MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+            );
+        }
         let sender = self
             .event_tx
             .as_ref()

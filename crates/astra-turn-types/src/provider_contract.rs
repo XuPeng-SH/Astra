@@ -24,6 +24,143 @@ pub const STABLE_TOOL_ALIAS_SCHEMA_KEY: &str = "x-astra-stable-tool-alias";
 pub const STABLE_TOOL_ALIAS_METADATA_KEY: &str = "astra/stableToolAlias";
 
 pub const PROVIDER_RUNTIME_REQUIREMENTS_KEY: &str = "astra.runtimeRequirements";
+
+/// Bounded observation of one native stage, not execution authority or a
+/// physical model-attempt receipt. Internal tool activity is not reported by
+/// this protocol and must not be inferred from the outer invocation result.
+pub const NATIVE_COLLABORATOR_OBSERVATION_KEY: &str = "native_stage_observation";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCollaboratorObservation {
+    pub native_session_id: Option<String>,
+    pub native_turn_id: Option<String>,
+    pub dispatch_state: NativeStageDispatchState,
+    pub native_terminal: Option<String>,
+    pub settlement_authoritative: bool,
+    pub stage_inclusive_input_tokens: Option<u64>,
+    pub stage_usage: Option<crate::CanonicalTokenUsage>,
+    pub last_request_input_tokens: Option<u64>,
+    pub model_context_window: Option<u64>,
+    pub acknowledged_model: Option<String>,
+    pub provider_error_code: Option<i64>,
+    pub provider_error_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeStageDispatchState {
+    Acknowledged,
+    Unknown,
+    NotDispatched,
+}
+
+/// One projection used by the producer, durable event and external observation
+/// boundaries. No provider payload, prompt or unbounded error string survives.
+pub fn project_native_collaborator_observation(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if object.len() > 12
+        || object.iter().any(|(key, value)| {
+            key.len() > 64 || value.as_str().is_some_and(|text| text.len() > 256)
+        })
+        || object.get("stage_usage").is_some_and(|usage| {
+            !usage.is_null()
+                && !usage
+                    .as_object()
+                    .is_some_and(|usage| usage.len() <= 6 && usage.values().all(Value::is_u64))
+        })
+    {
+        return None;
+    }
+    let observation = NativeCollaboratorObservation::deserialize(value).ok()?;
+    if matches!(
+        observation.dispatch_state,
+        NativeStageDispatchState::Acknowledged
+    ) && (observation
+        .native_session_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || observation
+            .native_turn_id
+            .as_deref()
+            .is_none_or(str::is_empty))
+    {
+        return None;
+    }
+    if observation
+        .stage_inclusive_input_tokens
+        .is_some_and(|input| {
+            input > i64::MAX as u64
+                || observation.stage_usage.is_some_and(|usage| {
+                    [
+                        usage.input_tokens(),
+                        usage.cached_input_tokens(),
+                        usage.cache_creation_tokens(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .try_fold(0_u64, u64::checked_add)
+                    .is_none_or(|known| known > input)
+                })
+        })
+    {
+        return None;
+    }
+    let projected = serde_json::to_value(observation).ok()?;
+    (serde_json::to_vec(&projected).ok()?.len() <= 4096).then_some(projected)
+}
+
+#[cfg(test)]
+mod native_observation_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_native_observation_is_bounded_nullable_and_not_authority() {
+        let value = serde_json::json!({
+            "native_session_id": "thread", "native_turn_id": "turn",
+            "dispatch_state": "acknowledged", "native_terminal": "completed",
+            "settlement_authoritative": true,
+            "stage_inclusive_input_tokens": 30,
+            "stage_usage": {"cached_input_tokens": 10, "output_tokens": 5},
+            "last_request_input_tokens": 12, "model_context_window": 100,
+            "acknowledged_model": "model", "provider_error_code": null,
+            "provider_error_class": null,
+        });
+        assert_eq!(
+            project_native_collaborator_observation(&value),
+            Some(value.clone())
+        );
+        for (key, invalid) in [
+            ("native_session_id", Value::Null),
+            ("native_turn_id", Value::String(String::new())),
+            ("acknowledged_model", Value::String("x".repeat(257))),
+            ("stage_inclusive_input_tokens", serde_json::json!(9)),
+            (
+                "stage_usage",
+                serde_json::json!({"cached_input_tokens": -1}),
+            ),
+            (
+                "stage_usage",
+                serde_json::json!({"cached_input_tokens": {"raw":"payload"}}),
+            ),
+        ] {
+            let mut invalid_value = value.clone();
+            invalid_value[key] = invalid;
+            assert!(
+                project_native_collaborator_observation(&invalid_value).is_none(),
+                "{key}"
+            );
+        }
+        let mut unknown = value;
+        unknown["dispatch_state"] = serde_json::json!("unknown");
+        unknown["native_turn_id"] = Value::Null;
+        unknown["stage_inclusive_input_tokens"] = Value::Null;
+        unknown["stage_usage"] = Value::Null;
+        assert!(project_native_collaborator_observation(&unknown).is_some());
+        unknown["raw_provider_payload"] = serde_json::json!("not permitted");
+        assert!(project_native_collaborator_observation(&unknown).is_none());
+    }
+}
 /// Lossless provider-owned model evidence. Keep this in the existing
 /// extension map so peers that do not project the typed catalog still retain
 /// it when they recompute the discovery snapshot hash.

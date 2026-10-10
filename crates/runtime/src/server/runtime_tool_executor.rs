@@ -3122,7 +3122,7 @@ impl RuntimeToolExecutor {
         request
     }
 
-    fn tool_execution_request_for_invocation(
+    pub(crate) fn tool_execution_request_for_invocation(
         &self,
         identity: &astra_turn_types::ToolInvocationIdentity,
         name: &str,
