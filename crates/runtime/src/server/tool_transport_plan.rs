@@ -52,7 +52,12 @@ impl EdgeBoundExecutionPlan {
         binding: &astra_runtime_env::RunBinding,
     ) -> Result<Self, astra_turn_types::ToolInvocationContractError> {
         let mut plan = Self::try_from_request(request)?;
-        plan.timeout_secs = timeout_secs_from_policy(binding).unwrap_or(Self::DEFAULT_TIMEOUT_SECS);
+        // A collaborator stage contains many commands. The command ceiling
+        // must not become its whole-stage lifetime when no run cutoff exists.
+        if !plan.requires_live_provider_interaction {
+            plan.timeout_secs =
+                timeout_secs_from_policy(binding).unwrap_or(Self::DEFAULT_TIMEOUT_SECS);
+        }
         plan.command_timeout_cap_ms =
             timeout_secs_from_policy(binding).map(|secs| secs.saturating_mul(1000));
         if let Some(requirements) = request

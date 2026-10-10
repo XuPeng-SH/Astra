@@ -557,7 +557,9 @@ async fn verify_installed_protocol(
                 max_frame_bytes: FRAME_BYTES,
                 max_queued_frames: 4,
                 max_stderr_bytes: 4096,
-                timeout: timeout.min(Duration::from_secs(2)),
+                // The physical owner covers the whole discovery, not only
+                // handshake/authentication. Each phase remains bounded below.
+                timeout: deadline.saturating_duration_since(std::time::Instant::now()),
             },
             cancel.child_token(),
         )

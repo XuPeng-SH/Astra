@@ -970,6 +970,25 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
     let collaborator_plan = EdgeBoundExecutionPlan::try_from_request(&collaborator_invocation)
         .expect("collaborator policy should produce an edge plan");
     assert!(collaborator_plan.requires_live_provider_interaction());
+    let mut command_binding = advert.binding.clone();
+    command_binding.policy.resources.max_execution_secs = Some(7.2);
+    let stage_plan = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &collaborator_invocation,
+        &command_binding,
+    )
+    .unwrap();
+    assert_eq!(stage_plan.execution_timeout_secs(), 300);
+    assert_eq!(stage_plan.command_timeout_cap_ms(), Some(8_000));
+    collaborator_invocation.policy.admission_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    collaborator_invocation.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    let bounded_stage = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &collaborator_invocation,
+        &command_binding,
+    )
+    .unwrap();
+    assert!(bounded_stage.execution_timeout_secs() <= 3);
+    assert_eq!(bounded_stage.command_timeout_cap_ms(), Some(8_000));
     for change in [
         "schema",
         "root",

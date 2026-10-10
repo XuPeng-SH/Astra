@@ -252,6 +252,14 @@ invocation deadline and cancellation. The Linux CI composition test drives the
 authenticated WebSocket owner through this executor and the production process
 supervisor, including contention, cancellation, expiry and changed admission.
 
+Native discovery's physical process lifetime covers its complete caller budget;
+handshake/authentication and model-list waits cannot renew that cutoff. A typed
+collaborator uses its admitted whole-stage deadline, or the transport's existing
+bounded stage fallback when none exists, independently of each command's limit.
+An explicit model request cannot be replaced by a provider default merely because
+discovery is unavailable; only unconstrained or explicitly accepted defaults may
+omit the selector.
+
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
 receipts: an escaped descendant could write later. That uncertainty quarantines

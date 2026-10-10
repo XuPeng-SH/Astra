@@ -350,6 +350,46 @@ for line in sys.stdin: pass
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[ignore = "requires a freshly built production invocation supervisor"]
+async fn discovery_preserves_the_whole_budget_across_protocol_phases() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("provider");
+    std::fs::write(
+        &executable,
+        r#"#!/usr/bin/env python3
+import json,sys,time
+def recv(): return json.loads(sys.stdin.readline())
+def emit(value): print(json.dumps(value),flush=True)
+assert recv()['method']=='initialize'
+time.sleep(1.2)
+emit({'id':1,'result':{'userAgent':'fixture','codexHome':'/fixture','platformFamily':'unix','platformOs':'linux'}})
+assert recv()['method']=='initialized'
+assert recv()['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
+assert recv()['method']=='model/list'
+time.sleep(1.2)
+emit({'id':4,'result':{'data':[{'id':'provider-model','model':'provider-model','displayName':'Provider Model'}],'nextCursor':None}})
+for line in sys.stdin: pass
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let catalog = verify_installed_protocol(
+        &executable,
+        root.path(),
+        &CancellationToken::new(),
+        std::time::Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap()
+    .expect("authenticated discovery returns its model catalog");
+    assert!(catalog.is_complete());
+    assert_eq!(catalog.models[0].selector, "provider-model");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn discovery_readiness_rejects_a_cached_catalog_without_current_authentication() {
     let script = r#"
 import json,sys
