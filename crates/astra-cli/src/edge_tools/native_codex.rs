@@ -345,10 +345,10 @@ pub(crate) fn native_executable_snapshot_for_names(
 /// protocol won discovery; it must not have a Codex-only or Claude-only
 /// invalidation path.
 pub(crate) fn native_provider_executable_snapshot() -> Vec<NativeExecutableIdentity> {
-    let mut snapshot = native_executable_snapshot();
-    snapshot.extend(super::native_claude::executable_snapshot());
-    snapshot.extend(super::native_opencode::executable_snapshot());
-    snapshot
+    // Codex is the only native collaborator adapter advertised by this
+    // capability. Other protocol translators remain isolated until their
+    // provider-specific permission and live-contract tests are complete.
+    native_executable_snapshot()
 }
 
 fn native_executable() -> Result<std::path::PathBuf, &'static str> {
@@ -539,7 +539,7 @@ async fn verify_installed_protocol(
     cwd: &std::path::Path,
     cancel: &CancellationToken,
     deadline: std::time::Instant,
-) -> Result<(), &'static str> {
+) -> Result<Option<astra_turn_types::ProviderModelCatalog>, &'static str> {
     let timeout = deadline
         .saturating_duration_since(std::time::Instant::now())
         .min(Duration::from_secs(2));
@@ -565,7 +565,7 @@ async fn verify_installed_protocol(
     let mut evidence = Evidence::default();
     let input = process.input();
     let probe = match tokio::time::timeout(timeout, async {
-        let probe = initialize_protocol(
+        initialize_protocol(
             &mut process,
             &input,
             &mut evidence,
@@ -573,24 +573,34 @@ async fn verify_installed_protocol(
             None,
             cancel,
         )
-        .await;
-        if probe.is_ok() {
-            verify_provider_authentication(
-                &mut process,
-                &input,
-                &mut evidence,
-                cancel,
-                OUTPUT_BYTES,
-            )
+        .await?;
+        verify_provider_authentication(&mut process, &input, &mut evidence, cancel, OUTPUT_BYTES)
             .await
-        } else {
-            probe
-        }
     })
     .await
     {
         Ok(probe) => probe,
         Err(_) => Err("native protocol probe deadline expired"),
+    };
+    let model_catalog = if probe.is_ok() && !cancel.is_cancelled() {
+        let catalog_timeout = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(Duration::from_secs(2));
+        if catalog_timeout.is_zero() {
+            Some(astra_turn_types::ProviderModelCatalog::unavailable())
+        } else {
+            match tokio::time::timeout(
+                catalog_timeout,
+                fetch_model_catalog(&mut process, &input, &mut evidence, OUTPUT_BYTES, cancel),
+            )
+            .await
+            {
+                Ok(Ok(catalog)) => Some(catalog),
+                Ok(Err(_)) | Err(_) => Some(astra_turn_types::ProviderModelCatalog::unavailable()),
+            }
+        }
+    } else {
+        None
     };
     // `FramedProcess` owns the physical cleanup deadline and descendant
     // settlement. Do not wrap this future in another timeout: dropping the
@@ -610,7 +620,7 @@ async fn verify_installed_protocol(
             .err()
             .unwrap_or("native protocol probe did not settle"));
     }
-    Ok(())
+    Ok(model_catalog)
 }
 
 /// Provider-owned schema for the selected CLI edge, not a built-in tool or an
@@ -620,7 +630,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_NAME,
-            "description": "Execute one admitted native Codex collaborator stage in the selected CLI workspace. The model is resolved from Codex model/list: use the provider model name or an unambiguous short name; if a name has multiple matches, ask the user to choose. Omit it to use the provider default. Resume only an exact acknowledged native_session_id. Run/control/deadline authority comes from the invocation, never arguments.",
+        "description": "Execute one admitted native Codex collaborator stage in the selected CLI workspace. If supplied, model must be the exact provider selector, declared alias, or declared display name from the current model/list catalog; never guess a partial name. Omit it to use the provider default. Resume only an exact acknowledged native_session_id. Run/control/deadline authority comes from the invocation, never arguments.",
             "parameters": {
                 "type": "object", "additionalProperties": false,
                 "properties": {
@@ -638,6 +648,7 @@ pub fn schema() -> Value {
 
 fn provider_declaration(
     requirements: astra_turn_types::ProviderRuntimeRequirements,
+    model_catalog: Option<astra_turn_types::ProviderModelCatalog>,
 ) -> Result<astra_turn_types::ProviderToolDeclaration, astra_turn_types::ProviderContractError> {
     let schema = schema();
     let mut extension_fields = serde_json::Map::new();
@@ -656,6 +667,12 @@ fn provider_declaration(
                 .extension_value()
         ),
     );
+    if let Some(catalog) = model_catalog {
+        extension_fields.insert(
+            astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(),
+            json!(catalog),
+        );
+    }
     astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(&extension_fields)?;
     let declaration = astra_turn_types::ProviderToolDeclaration {
         native_tool_id: astra_turn_types::NativeToolId::new(TOOL_NAME)?,
@@ -735,6 +752,8 @@ struct NativeModelListItem {
     id: String,
     model: String,
     display_name: String,
+    #[serde(skip)]
+    aliases: Vec<String>,
     #[serde(default)]
     hidden: bool,
     #[serde(default)]
@@ -795,20 +814,109 @@ fn validate_model_list_item(
     Ok(())
 }
 
+fn provider_model_catalog(
+    models: Vec<NativeModelListItem>,
+) -> Result<astra_turn_types::ProviderModelCatalog, String> {
+    let models = models
+        .into_iter()
+        .map(|model| astra_turn_types::ProviderModelDescriptor {
+            selector: model.model,
+            display_name: model.display_name,
+            aliases: std::iter::once(model.id).chain(model.aliases).collect(),
+            reasoning_efforts: model
+                .supported_reasoning_efforts
+                .into_iter()
+                .map(|effort| effort.reasoning_effort)
+                .collect(),
+            hidden: model.hidden,
+        })
+        .collect();
+    astra_turn_types::ProviderModelCatalog::new(models).map_err(|error| error.to_string())
+}
+
+fn native_models_from_provider_catalog(
+    catalog: &astra_turn_types::ProviderModelCatalog,
+) -> Vec<NativeModelListItem> {
+    catalog
+        .models
+        .iter()
+        .map(|model| NativeModelListItem {
+            id: model
+                .aliases
+                .first()
+                .cloned()
+                .unwrap_or_else(|| model.selector.clone()),
+            model: model.selector.clone(),
+            display_name: model.display_name.clone(),
+            aliases: model.aliases.clone(),
+            hidden: model.hidden,
+            supported_reasoning_efforts: model
+                .reasoning_efforts
+                .iter()
+                .cloned()
+                .map(|reasoning_effort| NativeReasoningEffort { reasoning_effort })
+                .collect(),
+        })
+        .collect()
+}
+
+async fn fetch_model_catalog(
+    process: &mut FramedProcess,
+    input: &FramedProcessInput,
+    evidence: &mut Evidence,
+    output_limit: usize,
+    cancel: &CancellationToken,
+) -> Result<astra_turn_types::ProviderModelCatalog, String> {
+    let mut models = Vec::new();
+    let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for page_index in 0..MODEL_LIST_MAX_PAGES {
+        let response = rpc(
+            process,
+            input,
+            model_list_request(cursor.as_deref()),
+            evidence,
+            output_limit,
+            None,
+            Some(cancel),
+            None,
+            None,
+        )
+        .await
+        .map_err(str::to_owned)?;
+        let page: NativeModelListPage = serde_json::from_value(response)
+            .map_err(|_| "native model catalog response is invalid".to_owned())?;
+        if models
+            .len()
+            .checked_add(page.data.len())
+            .is_none_or(|total| total > MODEL_LIST_MAX_ITEMS)
+        {
+            return Err("native model catalog exceeds the bounded selection limit".into());
+        }
+        for model in page.data {
+            validate_model_list_item(&model, &models)?;
+            models.push(model);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return provider_model_catalog(models);
+        };
+        if !valid_id(&next_cursor) || !seen_cursors.insert(next_cursor.clone()) {
+            return Err("native model catalog pagination is invalid".into());
+        }
+        if page_index + 1 == MODEL_LIST_MAX_PAGES {
+            return Err("native model catalog pagination exceeds the bounded limit".into());
+        }
+        cursor = Some(next_cursor);
+    }
+    Err("native model catalog pagination did not terminate".into())
+}
+
 fn normalized_model_selector(value: &str) -> String {
     value
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
-}
-
-fn selector_tokens(value: &str) -> Vec<String> {
-    normalized_model_selector(value)
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 fn model_choice_labels(models: &[&NativeModelListItem]) -> Vec<String> {
@@ -894,9 +1002,14 @@ fn resolve_model_selector_diagnostic(
     requested: &str,
     models: &[NativeModelListItem],
 ) -> Result<String, ModelSelectorError> {
+    // A provider selector is an opaque identity. Preserve a byte-exact
+    // selection when the catalog contains case-distinct identities; relaxed
+    // matching is only a convenience after no exact selector was found.
     let exact: Vec<_> = models
         .iter()
-        .filter(|model| model.model == requested || model.id == requested)
+        .filter(|model| {
+            model.model == requested || model.aliases.iter().any(|alias| alias == requested)
+        })
         .collect();
     if exact.len() == 1 {
         return Ok(exact[0].model.clone());
@@ -909,6 +1022,26 @@ fn resolve_model_selector_diagnostic(
     }
 
     let normalized = normalized_model_selector(requested);
+    let normalized_selector_matches: Vec<_> = models
+        .iter()
+        .filter(|model| {
+            normalized_model_selector(&model.model) == normalized
+                || model
+                    .aliases
+                    .iter()
+                    .any(|alias| normalized_model_selector(alias) == normalized)
+        })
+        .collect();
+    if normalized_selector_matches.len() == 1 {
+        return Ok(normalized_selector_matches[0].model.clone());
+    }
+    if normalized_selector_matches.len() > 1 {
+        return Err(ModelSelectorError::Ambiguous {
+            requested: requested.to_owned(),
+            choices: model_choice_labels(&normalized_selector_matches),
+        });
+    }
+
     let display_matches: Vec<_> = models
         .iter()
         .filter(|model| normalized_model_selector(&model.display_name) == normalized)
@@ -920,36 +1053,6 @@ fn resolve_model_selector_diagnostic(
         return Err(ModelSelectorError::Ambiguous {
             requested: requested.to_owned(),
             choices: model_choice_labels(&display_matches),
-        });
-    }
-
-    // A short name is useful only when it is an exact catalog component. Do
-    // not use substring, edit-distance, or provider-specific aliases: those
-    // make a natural request look convenient while silently selecting the
-    // wrong model. Ambiguous components remain a user clarification.
-    let requested_tokens = selector_tokens(requested);
-    let component_matches: Vec<_> = if requested_tokens.len() == 1 {
-        let requested_token = &requested_tokens[0];
-        models
-            .iter()
-            .filter(|model| !model.hidden)
-            .filter(|model| {
-                selector_tokens(&model.model)
-                    .into_iter()
-                    .chain(selector_tokens(&model.display_name))
-                    .any(|token| token == *requested_token)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if component_matches.len() == 1 {
-        return Ok(component_matches[0].model.clone());
-    }
-    if component_matches.len() > 1 {
-        return Err(ModelSelectorError::Ambiguous {
-            requested: requested.to_owned(),
-            choices: model_choice_labels(&component_matches),
         });
     }
 
@@ -1896,8 +1999,8 @@ async fn resolve_requested_model(
     stage: &Stage,
     evidence: &mut Evidence,
     output_limit: usize,
-    gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
+    cached_catalog: Option<&astra_turn_types::ProviderModelCatalog>,
 ) -> Result<Option<String>, String> {
     let Some(requested) = stage.model.as_deref() else {
         // Omitting the selector is the provider-default path. It must not
@@ -1905,59 +2008,52 @@ async fn resolve_requested_model(
         return Ok(None);
     };
 
-    let mut models = Vec::new();
-    let mut cursor = None;
-    let mut seen_cursors = std::collections::HashSet::new();
-    for page_index in 0..MODEL_LIST_MAX_PAGES {
-        let response = rpc(
-            process,
-            input,
-            model_list_request(cursor.as_deref()),
-            evidence,
-            output_limit,
-            gate,
-            Some(cancel),
-            None,
-            None,
-        )
-        .await
-        .map_err(str::to_owned)?;
-        let page: NativeModelListPage = serde_json::from_value(response)
-            .map_err(|_| "native model catalog response is invalid".to_owned())?;
-        if models
-            .len()
-            .checked_add(page.data.len())
-            .is_none_or(|total| total > MODEL_LIST_MAX_ITEMS)
-        {
-            return Err("native model catalog exceeds the bounded selection limit".into());
-        }
-        for model in page.data {
-            validate_model_list_item(&model, &models)?;
-            models.push(model);
-        }
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        if !valid_id(&next_cursor) || !seen_cursors.insert(next_cursor.clone()) {
-            return Err("native model catalog pagination is invalid".into());
-        }
-        if page_index + 1 == MODEL_LIST_MAX_PAGES {
-            return Err("native model catalog pagination exceeds the bounded limit".into());
-        }
-        cursor = Some(next_cursor);
-    }
-    let resolved = match resolve_model_selector_diagnostic(requested, &models) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            evidence.model_selection = Some(error.observation());
-            return Err(error.to_string());
-        }
+    let can_refresh_cached_catalog = cached_catalog.is_some_and(|catalog| catalog.is_complete());
+    let mut models = if let Some(catalog) = cached_catalog.filter(|catalog| catalog.is_complete()) {
+        native_models_from_provider_catalog(catalog)
+    } else {
+        fetch_model_catalog(process, input, evidence, output_limit, cancel)
+            .await
+            .map(|catalog| native_models_from_provider_catalog(&catalog))?
     };
-    if let Some(model) = models.iter().find(|model| model.model == resolved) {
-        validate_requested_effort(stage.effort.as_deref(), model)?;
+    let mut refreshed_cached_catalog = false;
+    loop {
+        let resolved = match resolve_model_selector_diagnostic(requested, &models) {
+            Ok(resolved) => resolved,
+            Err(_error)
+                if can_refresh_cached_catalog
+                    && !refreshed_cached_catalog
+                    && !cancel.is_cancelled() =>
+            {
+                // A discovery snapshot is a bounded optimization, not
+                // authority that either model identity or its capabilities
+                // are unchanged. Refresh once for any cached rejection.
+                let refreshed =
+                    fetch_model_catalog(process, input, evidence, output_limit, cancel).await?;
+                models = native_models_from_provider_catalog(&refreshed);
+                refreshed_cached_catalog = true;
+                continue;
+            }
+            Err(error) => {
+                evidence.model_selection = Some(error.observation());
+                return Err(error.to_string());
+            }
+        };
+        if let Some(model) = models.iter().find(|model| model.model == resolved)
+            && let Err(error) = validate_requested_effort(stage.effort.as_deref(), model)
+        {
+            if can_refresh_cached_catalog && !refreshed_cached_catalog && !cancel.is_cancelled() {
+                let refreshed =
+                    fetch_model_catalog(process, input, evidence, output_limit, cancel).await?;
+                models = native_models_from_provider_catalog(&refreshed);
+                refreshed_cached_catalog = true;
+                continue;
+            }
+            return Err(error);
+        }
+        evidence.resolved_model = Some(resolved.clone());
+        return Ok(Some(resolved));
     }
-    evidence.resolved_model = Some(resolved.clone());
-    Ok(Some(resolved))
 }
 
 async fn next_envelope(
@@ -2318,16 +2414,51 @@ async fn drive_with_input(
     output_limit: usize,
     gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
+    input_rx: Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
+) -> Result<(), String> {
+    drive_with_cached_catalog(
+        process,
+        stage,
+        cwd,
+        sandbox,
+        evidence,
+        output_limit,
+        gate,
+        cancel,
+        input_rx,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_with_cached_catalog(
+    process: &mut FramedProcess,
+    stage: &Stage,
+    cwd: &str,
+    sandbox: &Value,
+    evidence: &mut Evidence,
+    output_limit: usize,
+    gate: Option<&dyn ProviderInteractionGate>,
+    cancel: &CancellationToken,
     mut input_rx: Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
+    cached_catalog: Option<&astra_turn_types::ProviderModelCatalog>,
 ) -> Result<(), String> {
     let input = process.input();
     initialize_protocol(process, &input, evidence, output_limit, gate, cancel).await?;
     verify_provider_authentication(process, &input, evidence, cancel, output_limit)
         .await
         .map_err(str::to_owned)?;
-    let resolved_model =
-        resolve_requested_model(process, &input, stage, evidence, output_limit, gate, cancel)
-            .await?;
+    let resolved_model = resolve_requested_model(
+        process,
+        &input,
+        stage,
+        evidence,
+        output_limit,
+        cancel,
+        cached_catalog,
+    )
+    .await?;
     let response = rpc(
         process,
         &input,
@@ -2463,89 +2594,39 @@ impl ToolExecutor {
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
         let initial_executables = native_provider_executable_snapshot();
         let mut declarations = Vec::new();
-        for protocol in [
-            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
-            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson,
-            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp,
-        ] {
-            let candidates = match protocol {
-                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
-                    native_executable_candidates()
-                }
-                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
-                    super::native_claude::executable_candidates()
-                }
-                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
-                    super::native_opencode::executable_candidates()
-                }
+        for executable in native_executable_candidates() {
+            if token.is_cancelled() {
+                return None;
+            }
+            if deadline <= std::time::Instant::now() {
+                return None;
+            }
+            let Ok(requirements) = runtime_requirements_for_executable(&executable) else {
+                continue;
             };
-            for executable in candidates {
-                if token.is_cancelled() {
-                    return None;
-                }
-                if deadline <= std::time::Instant::now() {
-                    return None;
-                }
-                let Ok(requirements) = runtime_requirements_for_executable(&executable) else {
-                    continue;
-                };
-                let expected_identity =
-                    native_executable_identity(std::path::Path::new(&requirements.executable)).ok();
-                let Some(expected_identity) = expected_identity else {
-                    continue;
-                };
-                let verified = match protocol {
-                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
-                        verify_installed_protocol(&executable, &root, &token, deadline)
-                            .await
-                            .is_ok()
-                    }
-                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
-                        super::native_claude::verify_installed_protocol(
-                            &executable,
-                            &root,
-                            &token,
-                            deadline,
-                        )
-                        .await
-                        .is_ok()
-                    }
-                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
-                        super::native_opencode::verify_installed_protocol(
-                            &executable,
-                            &root,
-                            &token,
-                            deadline,
-                        )
-                        .await
-                        .is_ok()
-                    }
-                };
-                if !verified {
-                    continue;
-                }
-                let current_identity =
-                    native_executable_identity(std::path::Path::new(&requirements.executable));
-                let current_executables = native_provider_executable_snapshot();
-                if current_identity.as_ref().ok() != Some(&expected_identity)
-                    || current_executables != initial_executables
-                {
-                    return None;
-                }
-                let declaration = match protocol {
-                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
-                        provider_declaration(requirements)
-                    }
-                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
-                        super::native_claude::provider_declaration(requirements)
-                    }
-                    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
-                        super::native_opencode::provider_declaration(requirements)
-                    }
-                };
-                if let Ok(declaration) = declaration {
-                    declarations.push((declaration, expected_identity));
-                }
+            let Some(expected_identity) =
+                native_executable_identity(std::path::Path::new(&requirements.executable)).ok()
+            else {
+                continue;
+            };
+            let Ok(model_catalog) =
+                verify_installed_protocol(&executable, &root, &token, deadline).await
+            else {
+                continue;
+            };
+            if token.is_cancelled() {
+                continue;
+            }
+            let current_identity =
+                native_executable_identity(std::path::Path::new(&requirements.executable));
+            let current_executables = native_provider_executable_snapshot();
+            if current_identity.as_ref().ok() != Some(&expected_identity)
+                || current_executables != initial_executables
+            {
+                return None;
+            }
+            if let Ok(declaration) = provider_declaration(requirements, model_catalog) {
+                declarations.push((declaration, expected_identity));
             }
         }
         (!declarations.is_empty()).then_some((declarations, initial_executables))
@@ -2569,6 +2650,10 @@ impl ToolExecutor {
             Ok(stage) => stage,
             Err(reason) => return failure(reason),
         };
+        let cached_catalog = runtime_approval
+            .and_then(|approval| approval.snapshot.tool_declarations.first())
+            .and_then(|declaration| declaration.model_catalog().ok())
+            .flatten();
         let Some(gate) = gate else {
             return failure("canonical native interaction route is not connected");
         };
@@ -2706,7 +2791,7 @@ impl ToolExecutor {
         let driven = tokio::select! {
             biased;
             _ = token.cancelled() => Err("native invocation cancelled".into()),
-            result = drive_with_input(&mut process, &stage, cwd_text, &sandbox, &mut evidence, output_limit, Some(gate), &token, input_rx) => result,
+            result = drive_with_cached_catalog(&mut process, &stage, cwd_text, &sandbox, &mut evidence, output_limit, Some(gate), &token, input_rx, cached_catalog.as_ref()) => result,
         };
         // EOF after a terminal notification closes the native server normally.
         // Any protocol failure/cancellation uses the same physical owner; both

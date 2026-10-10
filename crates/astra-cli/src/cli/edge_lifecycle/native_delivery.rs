@@ -20,7 +20,14 @@ use astra_turn_types::{
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +38,32 @@ const NATIVE_DELIVERY_STARTUP_WAIT: std::time::Duration = std::time::Duration::f
 enum NativeDeliveryError {
     Authentication(String),
     Other(String),
+}
+
+/// Resolve credentials from the already captured CLI owner at dispatch time.
+/// This covers both native login rotation and legacy profile refresh without
+/// letting a reconnect reselect the process's current account.
+#[derive(Clone, Debug)]
+struct SessionOwnerBearerProvider {
+    api: astra_thin_client::ThinClient,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+}
+
+impl astra_thin_client::client::BearerProvider for SessionOwnerBearerProvider {
+    fn token(
+        &self,
+    ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+    {
+        Box::pin(async {
+            crate::cli::session::session_runtime::owner_access_token(&self.api, &self.owner, None)
+                .await
+                .ok_or_else(|| {
+                    astra_thin_client::ThinClientError::InvalidInput(
+                        "CLI owner authentication is unavailable".into(),
+                    )
+                })
+        })
+    }
 }
 
 /// Stable UI-facing request path for the session-owned delivery supervisor.
@@ -81,6 +114,37 @@ impl std::fmt::Display for NativeDeliveryError {
     }
 }
 
+async fn delivery_auth_token(
+    config: &NativeDeliveryConfig,
+    admission_deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<String, NativeDeliveryError> {
+    let token = async {
+        if let Some(provider) = &config.auth_provider {
+            provider.token().await.map_err(|_| {
+                NativeDeliveryError::other("native delivery authentication unavailable")
+            })
+        } else {
+            Ok(config.auth.read().await.clone())
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            Err(NativeDeliveryError::other("native delivery authentication cancelled"))
+        }
+        result = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(admission_deadline),
+            token,
+        ) => match result {
+            Ok(result) => result,
+            Err(_) => Err(NativeDeliveryError::other(
+                "native delivery authentication deadline expired",
+            )),
+        }
+    }
+}
+
 fn native_delivery_authentication_error(
     error: astra_edge::EdgeAuthenticationError,
 ) -> NativeDeliveryError {
@@ -125,6 +189,9 @@ type SharedEdgeInvocationOwner = Arc<tokio::sync::Mutex<astra_edge::EdgeInvocati
 pub(crate) struct NativeDeliveryHandle {
     cancellation: CancellationToken,
     withdrawal: CancellationToken,
+    auth: Arc<tokio::sync::RwLock<String>>,
+    account_id: String,
+    auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     refresh_tx: mpsc::Sender<()>,
     discovered_executables: Arc<std::sync::Mutex<Vec<native_codex::NativeExecutableIdentity>>>,
     invocation_owner: Option<SharedEdgeInvocationOwner>,
@@ -133,6 +200,9 @@ pub(crate) struct NativeDeliveryHandle {
     /// `true` means the optional capability is settled for this turn; it does
     /// not claim that a provider was available.
     ready: tokio::sync::watch::Receiver<bool>,
+    /// Session-scoped availability, shared by the supervisor and its current
+    /// transport attachment. A failed probe is recoverable on a later turn.
+    provider_available: Arc<AtomicBool>,
 }
 
 impl Drop for NativeDeliveryHandle {
@@ -170,6 +240,30 @@ impl NativeDeliveryHandle {
             .lock()
             .ok()
             .is_none_or(|selected| *selected != current)
+    }
+
+    fn request_refresh(&self) {
+        // The channel is bounded to one item, so repeated turns cannot create
+        // an unbounded discovery queue or a second supervisor.
+        let _ = self.refresh_tx.try_send(());
+    }
+
+    async fn update_auth(&self, token: &str) {
+        *self.auth.write().await = token.to_owned();
+    }
+
+    fn credential_generation_changed(&self) -> bool {
+        self.auth_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.is_current())
+    }
+
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    fn provider_available(&self) -> bool {
+        self.provider_available.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -242,7 +336,12 @@ async fn wait_for_native_delivery_ready(handle: &NativeDeliveryHandle) {
 pub(crate) struct NativeDeliveryConfig {
     pub(crate) websocket_url: String,
     pub(crate) api: astra_thin_client::ThinClient,
-    pub(crate) auth: String,
+    pub(crate) auth: Arc<tokio::sync::RwLock<String>>,
+    /// The selected native login owns rotation and generation checks. Keep
+    /// this provider alongside the session config so a background reconnect
+    /// can obtain the current credential without waiting for another turn.
+    pub(crate) auth_provider: Option<Arc<dyn astra_thin_client::client::BearerProvider>>,
+    pub(crate) auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub(crate) account_id: String,
     pub(crate) edge_agent_id: String,
     /// The server-issued connection identity is transport-scoped. Keep the
@@ -599,6 +698,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
             let gate = NativeInvocationInteractionGate {
                 api: config.api.clone(),
                 auth: config.auth.clone(),
+                auth_provider: config.auth_provider.clone(),
                 edge_transport_id: config.edge_transport_id.clone(),
                 edge_agent_id: config.edge_agent_id.clone(),
                 physical_workspace_id:
@@ -738,9 +838,17 @@ async fn publish(
     body.materialization_id = Some(config.materialization_id.clone());
     body.capabilities = Some(capabilities(config, snapshots));
     let edge_transport_id = config.edge_transport_id.read().await.clone();
+    let auth = if let Some(provider) = &config.auth_provider {
+        provider
+            .token()
+            .await
+            .map_err(|_| "native capacity authentication is unavailable".to_string())?
+    } else {
+        config.auth.read().await.clone()
+    };
     config
         .api
-        .post_agents_edge_register(Some(&config.auth), Some(&edge_transport_id), &body)
+        .post_agents_edge_register(Some(&auth), Some(&edge_transport_id), &body)
         .await
         .map_err(|_| "native capacity registration failed".to_string())?;
     Ok(())
@@ -759,11 +867,24 @@ fn build_native_delivery_config(
     ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
 ) -> Result<NativeDeliveryConfig, String> {
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let auth_owner = (!crate::cli::session::session_runtime::uses_environment_access_token(token)
+        && owner.is_current()
+        && owner.profile_name.is_some()
+        && owner.server_account_id.is_some())
+    .then_some(owner.clone());
     Ok(NativeDeliveryConfig {
         websocket_url: astra_edge::edge_ws_url(&api.api_origin())
             .map_err(|error| format!("invalid WebSocket endpoint: {error}"))?,
-        api: api.clone(),
-        auth: token.to_owned(),
+        api: api.clone().without_bearer_provider(),
+        auth: Arc::new(tokio::sync::RwLock::new(token.to_owned())),
+        auth_provider: auth_owner.clone().map(|owner| {
+            Arc::new(SessionOwnerBearerProvider {
+                api: api.clone().without_bearer_provider(),
+                owner,
+            }) as Arc<dyn astra_thin_client::client::BearerProvider>
+        }),
+        auth_owner,
         account_id,
         edge_transport_id: Arc::new(tokio::sync::RwLock::new(edge_agent_id.clone())),
         edge_agent_id,
@@ -781,6 +902,7 @@ fn build_native_delivery_config(
 /// executor and UI channels. No standalone model-tool projection is installed.
 /// Installation neither evaluates local permission nor asks for bootstrap
 /// approval: discovery becomes a grant only inside a fenced invocation.
+#[allow(clippy::too_many_arguments)]
 async fn install_native_delivery(
     config: NativeDeliveryConfig,
     admission_deadline: Instant,
@@ -789,6 +911,7 @@ async fn install_native_delivery(
     refresh_tx: mpsc::Sender<()>,
     discovered_executables: Arc<std::sync::Mutex<Vec<native_codex::NativeExecutableIdentity>>>,
     invocation_owner: Option<SharedEdgeInvocationOwner>,
+    provider_available: Arc<AtomicBool>,
 ) -> Result<
     (
         NativeDeliveryHandle,
@@ -862,7 +985,7 @@ async fn install_native_delivery(
             ));
         }
     };
-    let provider_available = providers.is_some();
+    let provider_is_available = providers.is_some();
     let delivery = connect_native_delivery(
         config,
         providers,
@@ -872,10 +995,16 @@ async fn install_native_delivery(
         refresh_tx,
         discovered_executables,
         invocation_owner,
+        provider_available,
     )
     .await?;
     let owner = delivery.1;
-    Ok((delivery.0, provider_available, verified_executables, owner))
+    Ok((
+        delivery.0,
+        provider_is_available,
+        verified_executables,
+        owner,
+    ))
 }
 
 /// Install the same native Edge owner and reconnect supervisor for a one-shot
@@ -981,6 +1110,7 @@ async fn connect_native_delivery(
     refresh_tx: mpsc::Sender<()>,
     discovered_executables: Arc<std::sync::Mutex<Vec<native_codex::NativeExecutableIdentity>>>,
     invocation_owner: Option<SharedEdgeInvocationOwner>,
+    provider_available: Arc<AtomicBool>,
 ) -> Result<(NativeDeliveryHandle, SharedEdgeInvocationOwner), NativeDeliveryError> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let workspace_root = config
@@ -1046,9 +1176,10 @@ async fn connect_native_delivery(
         .as_str()
         .into_client_request()
         .map_err(|_| NativeDeliveryError::other("invalid Edge WebSocket endpoint"))?;
+    let auth = delivery_auth_token(&config, admission_deadline, cancellation).await?;
     request.headers_mut().insert(
         "authorization",
-        format!("Bearer {}", config.auth)
+        format!("Bearer {auth}")
             .parse()
             .map_err(|_| NativeDeliveryError::other("invalid Edge authentication header"))?,
     );
@@ -1290,11 +1421,15 @@ async fn connect_native_delivery(
     let mut handle = NativeDeliveryHandle {
         cancellation: owner_cancel,
         withdrawal,
+        auth: config.auth.clone(),
+        account_id: config.account_id.clone(),
+        auth_owner: config.auth_owner.clone(),
         refresh_tx,
         discovered_executables,
         invocation_owner: Some(invocation_owner.clone()),
         task: Some(task),
         ready: tokio::sync::watch::channel(true).1,
+        provider_available,
     };
     let installed = tokio::select! {
         biased;
@@ -1338,11 +1473,15 @@ fn spawn_native_delivery_supervisor(
     let supervisor_cancel = cancellation.clone();
     let ready_rx = ready_tx.subscribe();
     let task_config = config.clone();
+    let handle_auth = config.auth.clone();
+    let handle_account_id = config.account_id.clone();
+    let handle_auth_owner = config.auth_owner.clone();
     let task_refresh_tx = refresh_tx.clone();
     let task_discovered_executables = discovered_executables.clone();
+    let provider_available = Arc::new(AtomicBool::new(false));
+    let task_provider_available = provider_available.clone();
     let task = tokio::spawn(async move {
         let mut startup_tx = Some(ready_tx);
-        let mut was_available = false;
         let mut reconnect_failures = 0_u32;
         let mut invocation_owner: Option<SharedEdgeInvocationOwner> = None;
         let mut first_admission_deadline = first_admission_deadline;
@@ -1361,10 +1500,12 @@ fn spawn_native_delivery_supervisor(
                 task_refresh_tx.clone(),
                 task_discovered_executables.clone(),
                 invocation_owner.clone(),
+                task_provider_available.clone(),
             )
             .await;
             match result {
                 Ok((mut delivery, provider_available, verified_executables, owner)) => {
+                    task_provider_available.store(provider_available, Ordering::Release);
                     invocation_owner = Some(owner);
                     if let Some(verified_executables) = verified_executables {
                         if let Ok(mut selected) = task_discovered_executables.lock() {
@@ -1372,7 +1513,6 @@ fn spawn_native_delivery_supervisor(
                         }
                     }
                     let _ = startup_tx.take().map(|tx| tx.send(true));
-                    was_available = provider_available;
                     let mut refresh_requested = false;
                     tokio::select! {
                         _ = supervisor_cancel.cancelled() => {
@@ -1405,20 +1545,13 @@ fn spawn_native_delivery_supervisor(
                         "native collaborator transport ended; retrying capability discovery"
                     );
                 }
-                Err(error) if error.is_authentication() => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        %error,
-                        "native collaborator credentials need a fresh session probe"
-                    );
-                    break;
-                }
-                Err(error) if !was_available => {
+                Err(error) => {
+                    task_provider_available.store(false, Ordering::Release);
                     let _ = startup_tx.take().map(|tx| tx.send(true));
                     tracing::warn!(
                         session_id = %session_id,
                         %error,
-                        "native collaborator delivery unavailable"
+                        "native collaborator reconnect unavailable"
                     );
                     let recovery_required = if let Some(owner) = invocation_owner.as_ref() {
                         owner.lock().await.has_unsettled_work()
@@ -1426,28 +1559,25 @@ fn spawn_native_delivery_supervisor(
                         astra_edge::has_pending_invocation_results(task_config.journal_path.clone())
                             .await
                     };
-                    if recovery_required {
-                        reconnect_failures = reconnect_failures.saturating_add(1);
-                    } else {
+                    // Once a transport has been established, a failed
+                    // reconnect is a transport failure, not an optional
+                    // capability probe. Keep the existing backoff loop alive
+                    // even when there is no currently unsettled invocation;
+                    // otherwise one transient outage permanently strands the
+                    // session until an unrelated refresh request arrives.
+                    if invocation_owner.is_none() && !recovery_required {
                         tokio::select! {
                             _ = supervisor_cancel.cancelled() => break,
                             refresh = refresh_rx.recv() => {
                                 if refresh.is_none() {
                                     break;
                                 }
+                                reconnect_failures = 0;
                             }
                         }
                         continue;
                     }
-                }
-                Err(error) => {
                     reconnect_failures = reconnect_failures.saturating_add(1);
-                    tracing::warn!(
-                        session_id = %session_id,
-                        attempt = reconnect_failures,
-                        %error,
-                        "native collaborator reconnect unavailable"
-                    );
                 }
             }
 
@@ -1461,6 +1591,12 @@ fn spawn_native_delivery_supervisor(
             };
             tokio::select! {
                 _ = supervisor_cancel.cancelled() => break,
+                refresh = refresh_rx.recv() => {
+                    if refresh.is_none() {
+                        break;
+                    }
+                    reconnect_failures = 0;
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
             }
         }
@@ -1471,11 +1607,15 @@ fn spawn_native_delivery_supervisor(
     NativeDeliveryHandle {
         cancellation,
         withdrawal: CancellationToken::new(),
+        auth: handle_auth,
+        account_id: handle_account_id,
+        auth_owner: handle_auth_owner,
         refresh_tx,
         discovered_executables,
         invocation_owner: None,
         task: Some(task),
         ready: ready_rx,
+        provider_available,
     }
 }
 
@@ -1495,17 +1635,32 @@ pub(crate) async fn ensure_session_native_delivery(
     session_id: &str,
 ) {
     let attachment_epoch = state.session_attachment_epoch;
+    let account_id = state
+        .ingestion_user_id
+        .clone()
+        .or_else(crate::cli::cli_config::cli_utils::cli_account_id)
+        .filter(|value| !value.trim().is_empty());
     if let Some(handle) = state.native_delivery.as_ref()
         && state.native_delivery_session_id.as_deref() == Some(session_id)
         && state.native_delivery_attachment_epoch == Some(attachment_epoch)
+        && account_id.as_deref() == Some(handle.account_id())
+        && !handle.credential_generation_changed()
         && !handle.is_finished()
     {
+        handle.update_auth(token).await;
         if handle.executable_changed() {
             // A PATH/launcher change is an explicit capability invalidation,
             // not a reason to create a second owner. The current owner drains
             // admitted work; its supervisor coalesces this request and probes
             // the current environment before advertising again.
             handle.request_refresh_if_environment_changed();
+        }
+        if !handle.provider_available() {
+            // A settled but unavailable optional capability must be retried on
+            // a later normal turn. Authentication/network failure is not a
+            // permanent session state, and the bounded refresh channel
+            // coalesces concurrent requests.
+            handle.request_refresh();
         }
         wait_for_native_delivery_ready(handle).await;
         // Capacity is optional. A slow or unavailable provider must not block
@@ -1531,10 +1686,6 @@ pub(crate) async fn ensure_session_native_delivery(
         return;
     }
 
-    let account_id = state
-        .ingestion_user_id
-        .clone()
-        .or_else(crate::cli::cli_config::cli_utils::cli_account_id);
     let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
         tracing::debug!("native collaborator delivery skipped: account identity unavailable");
         return;
@@ -1649,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn authentication_failure_ends_the_owner_for_credential_refresh() {
+    fn authentication_failure_is_typed_for_recovery() {
         assert!(NativeDeliveryError::Authentication("rejected".into()).is_authentication());
         assert!(!NativeDeliveryError::other("deadline").is_authentication());
         assert!(!NativeDeliveryError::other("connection failed").is_authentication());
@@ -1813,7 +1964,9 @@ mod tests {
             config: Arc::new(NativeDeliveryConfig {
                 websocket_url: "ws://127.0.0.1:1/edge/ws".into(),
                 api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
-                auth: "test-only-token".into(),
+                auth: Arc::new(tokio::sync::RwLock::new("test-only-token".into())),
+                auth_provider: None,
+                auth_owner: None,
                 account_id: "account-test".into(),
                 edge_agent_id: "edge-test".into(),
                 edge_transport_id: Arc::new(tokio::sync::RwLock::new("transport-test".into())),
@@ -2248,6 +2401,7 @@ mod tests {
                 mpsc::channel(1).0,
                 Arc::new(std::sync::Mutex::new(Vec::new())),
                 None,
+                Arc::new(AtomicBool::new(false)),
             ),
         )
         .await
@@ -2259,6 +2413,44 @@ mod tests {
         assert!(error.to_string().contains("deadline"));
         peer.abort();
         let _ = peer.await;
+    }
+
+    #[tokio::test]
+    async fn credential_refresh_cannot_block_delivery_shutdown() {
+        #[derive(Debug)]
+        struct NeverBearer;
+
+        impl astra_thin_client::client::BearerProvider for NeverBearer {
+            fn token(
+                &self,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<String, astra_thin_client::ThinClientError>,
+            > {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (consumer, _owner) = consumer(workspace.path(), runtime.path(), None);
+        let mut config = (*consumer.config).clone();
+        config.auth_provider = Some(Arc::new(NeverBearer));
+        let cancellation = CancellationToken::new();
+        let pending = delivery_auth_token(
+            &config,
+            Instant::now() + Duration::from_secs(60),
+            &cancellation,
+        );
+        tokio::pin!(pending);
+        let guard = tokio::time::timeout(Duration::from_millis(100), async {
+            cancellation.cancel();
+            pending.await
+        })
+        .await
+        .expect("credential acquisition must observe cancellation");
+        assert!(guard.is_err());
+        assert!(guard.unwrap_err().to_string().contains("cancelled"));
     }
 
     #[tokio::test]
@@ -2306,7 +2498,9 @@ mod tests {
         let config = NativeDeliveryConfig {
             websocket_url: endpoint,
             api: astra_thin_client::ThinClient::new(&http.uri(), None).unwrap(),
-            auth: "test-only-token".into(),
+            auth: Arc::new(tokio::sync::RwLock::new("test-only-token".into())),
+            auth_provider: None,
+            auth_owner: None,
             account_id: "account-test".into(),
             edge_agent_id: "edge-test".into(),
             edge_transport_id: Arc::new(tokio::sync::RwLock::new("transport-test".into())),
@@ -2327,6 +2521,7 @@ mod tests {
             mpsc::channel(1).0,
             Arc::new(std::sync::Mutex::new(Vec::new())),
             None,
+            Arc::new(AtomicBool::new(false)),
         )
         .await
         .expect("transport recovery must not require a currently installed provider");
@@ -2489,12 +2684,21 @@ mod tests {
                         assert_eq!(fields["workspace_effect_settled"], true);
                         break;
                     }
-                    Some(Ok(frame)) if frame.is_close() => break,
+                    Some(Ok(frame)) if frame.is_close() => {
+                        panic!("stale native capability closed before returning ToolResult")
+                    }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) | None => break,
+                    Some(Err(error)) => panic!(
+                        "stale native capability transport failed before returning ToolResult: {error}"
+                    ),
+                    None => {
+                        panic!("stale native capability peer ended before returning ToolResult")
+                    }
                 }
             }
-            let _ = result_tx.send(());
+            result_tx
+                .send(())
+                .expect("test observer must still be waiting for ToolResult");
             while let Some(frame) = ws.next().await {
                 if frame.is_err() || frame.is_ok_and(|frame| frame.is_close()) {
                     break;
@@ -2512,7 +2716,9 @@ mod tests {
         let config = NativeDeliveryConfig {
             websocket_url: endpoint,
             api: astra_thin_client::ThinClient::new(&http.uri(), None).unwrap(),
-            auth: "test-only-token".into(),
+            auth: Arc::new(tokio::sync::RwLock::new("test-only-token".into())),
+            auth_provider: None,
+            auth_owner: None,
             account_id: "account-test".into(),
             edge_agent_id: "edge-test".into(),
             edge_transport_id: Arc::new(tokio::sync::RwLock::new("transport-test".into())),
@@ -2536,6 +2742,7 @@ mod tests {
             mpsc::channel(1).0,
             Arc::new(std::sync::Mutex::new(Vec::new())),
             None,
+            Arc::new(AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -2787,6 +2994,7 @@ for line in sys.stdin:
             mpsc::channel(1).0,
             Arc::new(std::sync::Mutex::new(Vec::new())),
             None,
+            Arc::new(AtomicBool::new(false)),
         )
         .await
         .expect("native delivery should publish the tested provider");

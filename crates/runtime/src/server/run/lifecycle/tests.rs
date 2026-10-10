@@ -2775,12 +2775,45 @@ async fn start_model_bound_test_parent(
     session_id: &str,
     execution: &astra_services::AdmittedModelExecution,
 ) {
+    start_model_bound_test_run(
+        run_engine, run_id, user_id, session_id, None, execution, false,
+    )
+    .await;
+}
+
+async fn start_model_bound_test_parent_with_explain(
+    run_engine: &RunEngine,
+    run_id: &str,
+    user_id: &str,
+    session_id: &str,
+    execution: &astra_services::AdmittedModelExecution,
+) {
+    start_model_bound_test_run(
+        run_engine, run_id, user_id, session_id, None, execution, true,
+    )
+    .await;
+}
+
+async fn start_model_bound_test_run(
+    run_engine: &RunEngine,
+    run_id: &str,
+    user_id: &str,
+    session_id: &str,
+    parent_run_id: Option<&str>,
+    execution: &astra_services::AdmittedModelExecution,
+    explain_analyze_requested: bool,
+) {
     run_engine
-        .start_run_with_context(
+        .start_run_ext_with_context(
             run_id,
             user_id,
             session_id,
+            parent_run_id,
+            None,
+            None,
+            None,
             crate::server::run::engine::RunStartContext {
+                explain_analyze_requested,
                 model_identity_admitted: true,
                 model_selection: Some(ModelSelection {
                     offering_id: execution.offering_id.clone(),
@@ -2795,6 +2828,26 @@ async fn start_model_bound_test_parent(
         )
         .await
         .expect("durable model-bound parent");
+}
+
+async fn start_model_bound_test_child(
+    run_engine: &RunEngine,
+    run_id: &str,
+    user_id: &str,
+    session_id: &str,
+    parent_run_id: &str,
+    execution: &astra_services::AdmittedModelExecution,
+) {
+    start_model_bound_test_run(
+        run_engine,
+        run_id,
+        user_id,
+        session_id,
+        Some(parent_run_id),
+        execution,
+        false,
+    )
+    .await;
 }
 
 fn test_model_record_at(name: String, base_url: &str) -> astra_services::ModelRecord {
@@ -30931,18 +30984,16 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
             .await
             .expect("complete prior Explain run before starting the next root")
     );
-    svc.run_engine
-        .start_run_with_context(
-            &current,
-            user,
-            &session,
-            RunStartContext {
-                explain_analyze_requested: true,
-                ..RunStartContext::default()
-            },
-        )
-        .await
-        .unwrap();
+    let current_execution =
+        crate::server::model_execution_admission::inheritance_test_support::genesis_execution();
+    start_model_bound_test_parent_with_explain(
+        &svc.run_engine,
+        &current,
+        user,
+        &session,
+        &current_execution,
+    )
+    .await;
     let executor = explain_test_executor(&pool, &svc, user, &session, &current);
     let (first, fetches) =
         crate::server::explain_analyze_artifact::count_explain_artifact_fetches(executor.execute(
@@ -30988,10 +31039,17 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
     {
         let parent = format!("explain-child-parent-{}", Uuid::new_v4());
         let child = format!("explain-grandchild-{}", Uuid::new_v4());
-        svc.run_engine
-            .start_run_ext(&parent, user, &session, Some(&current), None, None, None)
-            .await
-            .expect("start delegated parent under the current Explain root");
+        use crate::server::model_execution_admission::inheritance_test_support::genesis_execution;
+        let parent_execution = genesis_execution();
+        start_model_bound_test_child(
+            &svc.run_engine,
+            &parent,
+            user,
+            &session,
+            &current,
+            &parent_execution,
+        )
+        .await;
         use crate::server::provider_test_support::{
             ProviderGateway, ProviderResponse, ProviderScript,
         };
@@ -31004,7 +31062,7 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
         ])]).await;
         let native_base = format!("{}/v1", native_gateway.base_url);
         use crate::server::model_execution_admission::inheritance_test_support::{
-            OFFERING_ID, ServiceBackedOffering, genesis_execution,
+            OFFERING_ID, ServiceBackedOffering,
         };
         let mut admitted = genesis_execution();
         admitted.base_url = native_base;

@@ -1435,10 +1435,10 @@ fn provider_child_execution_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Use a currently available provider-owned agent tool only when the user explicitly names that external provider or protocol (for example Codex, Claude Code, or OpenCode), not merely a model name. A plain model request such as a Chat/Astra Offering must use requested_model_policy and must omit execution. Omit for normal internal model execution. Do not combine with requested_model_policy.",
+        "description": "Use a currently available provider-owned agent tool when the user names that provider/protocol or when the requested model uniquely matches a model in the current provider directory. Choose the exact tool and, when supplied, exact model selector from that directory; do not inspect workspace configuration or use Bash to discover it. A plain model request that matches an authorized Astra Offering uses requested_model_policy and omits execution. If a request matches neither, or matches multiple capacities, ask once for the missing choice. Omit for normal internal model execution. Do not combine with requested_model_policy.",
         "properties": {
             "tool": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Exact tool name from the current capability surface; never a shell command or executable path."},
-            "model": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional model requested from that tool. Not an Astra Offering or proof of the model actually used."}
+            "model": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional exact provider selector from the current provider model_catalog. Omit to use that provider's default. Not an Astra Offering or proof of the model actually used."}
         },
         "required": ["tool"]
     })
@@ -1476,20 +1476,20 @@ fn agent_parameters_schema() -> Value {
             "send_message": ["local", "server"]
         },
         "x-astra-surface-descriptions": {
-            "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
+            "server": "Server-owned single-agent lifecycle. If visible, call it directly; use the current provider directory for provider-owned capacities and model_catalog only for unknown Astra Offering choices. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For Astra model requests, propose requested_model_policy with an exact authorized Offering ID or configured name; for provider-owned requests, copy the exact execution tool/model from the current provider directory. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
         },
         "x-astra-surface-discovery-summaries": {
-            "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question"
+            "server": "requested_model_policy:omit unasked;provider directory for provider capacity;model_catalog for Astra Offering;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question"
         },
         "x-astra-per-action-discovery-summaries": {
-            "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+            "spawn": "requested_model_policy:omit unasked;provider directory for provider capacity;model_catalog for Astra Offering;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
             "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
             "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
             "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
             "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
             "send_message": "action+to+message; active mailbox only; child asks parent via message_type=question (not ask_user); parent answers request_id; completed provider follow-up uses spawn+exact collaborator_id"
         },
-        "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question",
+        "x-astra-discovery-summary": "requested_model_policy:omit unasked;provider directory for provider capacity;model_catalog for Astra Offering;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question",
         "properties": {
             "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
             "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
@@ -2117,7 +2117,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
-         Model policy is an optional override: omit `requested_model_policy` to inherit the parent Offering. If the user requests another execution model, set this policy using an exact authorized Offering ID or configured name, never a `model` field. If the `agent` tool is visible, call it directly; discover unknown model choices through `model_catalog`, not tool or filesystem exploration. Never guess an Offering ID, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when needed.\n\n\
+         Model policy is an optional override: omit `requested_model_policy` to inherit the parent Offering. For an Astra Offering override, use an exact authorized Offering ID or configured name, never a `model` field. For a provider-owned capacity, use the exact `execution.tool` and provider `execution.model` from the current provider directory; the provider selector is not an Astra Offering. Discover unknown Astra Offering choices through `model_catalog`, not tool or filesystem exploration. Never guess, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when needed.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\"}`\n\n\
          ## Execution mode\n\
@@ -2777,7 +2777,7 @@ mod tests {
             .as_str()
             .expect("agent description");
         assert!(description.contains("`requested_model_policy`, `reasoning`"));
-        assert!(description.contains("Never guess an Offering ID, inspect configuration"));
+        assert!(description.contains("Never guess, inspect configuration"));
         assert!(!description.contains("Optional: `agent_type`, `model`"));
         let properties = &agent["function"]["parameters"]["properties"];
         assert!(properties.get("model").is_none());
@@ -2787,8 +2787,9 @@ mod tests {
         let provider_execution_description = properties["execution"]["description"]
             .as_str()
             .expect("provider execution description");
-        assert!(provider_execution_description.contains("only when the user explicitly names"));
-        assert!(provider_execution_description.contains("must use requested_model_policy"));
+        assert!(provider_execution_description.contains("requested model uniquely matches"));
+        assert!(provider_execution_description.contains("ask once for the missing choice"));
+        assert!(provider_execution_description.contains("uses requested_model_policy"));
         assert!(policy_description.contains("Optional execution-model override"));
         assert!(policy_description.contains("Omit to inherit the parent Offering"));
         assert!(
@@ -2908,7 +2909,9 @@ mod tests {
             assert!(description.contains("ask_user"));
             if surface == "server" {
                 assert!(
-                    description.contains("use model_catalog only when model choices are unknown")
+                    description.contains(
+                        "use the current provider directory for provider-owned capacities"
+                    )
                 );
                 assert!(description.contains("active parent/child/peer mailboxes only"));
                 assert!(description.contains("exact collaborator_id"));

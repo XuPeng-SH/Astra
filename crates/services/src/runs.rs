@@ -15362,16 +15362,16 @@ impl DatabaseRunStateStore {
         run_id: &str,
         lower_bound: i64,
     ) -> Result<i64, ToolInteractionAdmissionError> {
-        sqlx::query_scalar(
-            "SELECT COALESCE(
+        let frontier: String = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(
                     MAX(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.event_index')) AS SIGNED)),
                     ?
-             )
+             ) AS CHAR)
              FROM agent_run_events
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND event_type = 'user_intent_applied' AND event_idx > ?",
         )
-        .bind(lower_bound)
+        .bind(lower_bound.to_string())
         .bind(user_id)
         .bind(session_id)
         .bind(run_id)
@@ -15383,6 +15383,13 @@ impl DatabaseRunStateStore {
                 "load_tool_interaction_applied_guidance_frontier",
                 run_id,
                 source,
+            ))
+        })?;
+        frontier.trim().parse().map_err(|_| {
+            ToolInteractionAdmissionError::Store(db_error(
+                "load_tool_interaction_applied_guidance_frontier",
+                run_id,
+                sqlx::Error::Protocol("applied guidance frontier is not an integer".into()),
             ))
         })
     }
@@ -17341,10 +17348,11 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("begin_collaborator_stage_association", stage_run_id, source)
         })?;
         admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
-        let anchor_run_id: Option<String> = sqlx::query_scalar(
+        let indexed_anchor_run_id: Option<String> = sqlx::query_scalar(
             "SELECT run_id FROM agent_run_events
+             FORCE INDEX (idx_agent_run_events_owner_session_subject)
              WHERE user_id = ? AND session_id = ? AND event_type = ?
-               AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.receipt.run_id')) = ?
+               AND subject_run_id = ?
              ORDER BY event_idx DESC LIMIT 1",
         )
         .bind(user_id)
@@ -17360,6 +17368,33 @@ impl RunStateStore for DatabaseRunStateStore {
                 source,
             )
         })?;
+        // Current writes bind the stage run directly and stay on the covering
+        // index above. A bounded payload lookup is only for durable facts
+        // written before that binding was populated; it is not part of the
+        // ordinary path and does not add a write or a second state owner.
+        let anchor_run_id = if indexed_anchor_run_id.is_some() {
+            indexed_anchor_run_id
+        } else {
+            sqlx::query_scalar(
+                "SELECT run_id FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND event_type = ?
+                   AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.receipt.run_id')) = ?
+                 ORDER BY event_idx DESC LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(COLLABORATOR_STAGE_EVENT)
+            .bind(stage_run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error(
+                    "find_legacy_collaborator_stage_association_anchor",
+                    stage_run_id,
+                    source,
+                )
+            })?
+        };
         let association = if let Some(anchor_run_id) = anchor_run_id {
             Self::collaborator_association_tx(&mut tx, user_id, session_id, &anchor_run_id).await?
         } else {
@@ -26920,12 +26955,15 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
-    let subject_run_id = matches!(
-        event_type.as_str(),
-        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
-    )
-    .then(|| extract_optional_string(event, "run_id"))
-    .flatten();
+    let subject_run_id = match event_type.as_str() {
+        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE => {
+            extract_optional_string(event, "run_id")
+        }
+        COLLABORATOR_STAGE_EVENT => event
+            .get("receipt")
+            .and_then(|receipt| extract_optional_string(receipt, "run_id")),
+        _ => None,
+    };
     let interaction_request_id = extract_interaction_request_id(event);
     let event_id = extract_optional_string(event, "event_id")
         .or_else(|| extract_optional_string(event, "id"))
@@ -30035,6 +30073,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(terminal.subject_run_id, None);
+
+        let stage = build_run_event_insert_row(
+            "user-1",
+            "anchor-run",
+            "session-1",
+            Some("root"),
+            10,
+            "pod-a",
+            &json!({
+                "event_type": COLLABORATOR_STAGE_EVENT,
+                "receipt": {"run_id": "stage-run"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(stage.subject_run_id.as_deref(), Some("stage-run"));
     }
 
     #[derive(Clone)]
@@ -30830,7 +30883,7 @@ mod tests {
         assert_ne!(
             left.is_ok(),
             right.is_ok(),
-            "one generation permits one owner only"
+            "one generation permits one owner only: left={left:?}, right={right:?}"
         );
         let winner = left.or(right).unwrap();
         assert_eq!(winner.run().run_generation, before.run_generation + 1);

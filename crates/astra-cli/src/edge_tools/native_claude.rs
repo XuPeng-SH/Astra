@@ -207,30 +207,16 @@ struct Evidence {
     capability_unavailable: bool,
 }
 
+/// Claude's event protocol supplies an error enum in this field. Only exact
+/// enum values may change capability state; free-form provider text remains a
+/// generic provider error and can never be mistaken for an auth/model signal.
 fn classify_provider_error(value: &str) -> &'static str {
-    let value = value.to_ascii_lowercase();
-    if ["auth", "login", "credential", "token"]
-        .iter()
-        .any(|needle| value.contains(needle))
-    {
-        "authentication"
-    } else if ["model", "not_found", "not found"]
-        .iter()
-        .any(|needle| value.contains(needle))
-    {
-        "model"
-    } else if ["billing", "quota", "payment"]
-        .iter()
-        .any(|needle| value.contains(needle))
-    {
-        "billing"
-    } else if ["permission", "denied", "forbidden"]
-        .iter()
-        .any(|needle| value.contains(needle))
-    {
-        "permission"
-    } else {
-        "provider"
+    match value {
+        "authentication_failed" | "auth_failed" => "authentication",
+        "model_not_found" | "model_unavailable" => "model",
+        "billing_error" | "quota_exceeded" => "billing",
+        "permission_denied" => "permission",
+        _ => "provider",
     }
 }
 
@@ -249,6 +235,37 @@ fn record_provider_error(evidence: &mut Evidence, value: &str) {
     evidence.provider_error_class = Some(class);
     evidence.provider_error = Some(provider_error_message(class));
     evidence.capability_unavailable |= matches!(class, "authentication" | "model" | "billing");
+}
+
+fn claude_cli_args(read_only: bool) -> Vec<String> {
+    let tools = if read_only {
+        "Read,Glob,Grep"
+    } else {
+        // Claude's native file tools remain useful for implementation, while
+        // command, MCP and network authority stays with Astra's owners.
+        "Read,Edit,Write,Glob,Grep"
+    };
+    vec![
+        "--print".into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--include-partial-messages".into(),
+        // `allowedTools` only pre-approves tools; it does not prevent a
+        // project/user settings file from making more tools available.
+        // Restricted mode ignores those settings and `--tools` is the actual
+        // availability boundary for this invocation.
+        "--restricted".into(),
+        "--strict-mcp-config".into(),
+        "--tools".into(),
+        tools.into(),
+        "--permission-mode".into(),
+        if read_only {
+            "dontAsk".into()
+        } else {
+            "acceptEdits".into()
+        },
+    ]
 }
 
 fn valid_id(value: &str) -> bool {
@@ -562,29 +579,7 @@ impl ToolExecutor {
         let read_only = !ceiling.workspace_write_allowed
             || self.read_only_execution
             || self.plan_mode_authoring_active().await;
-        let allowed_tools = if read_only {
-            "Read,Glob,Grep"
-        } else {
-            // Do not grant Bash through a generic CLI flag. Claude's native
-            // file tools remain useful for implementation, while command and
-            // network authority stays with Astra's existing tool owner.
-            "Read,Edit,Write,Glob,Grep"
-        };
-        let mut args = vec![
-            "--print".into(),
-            "--output-format".into(),
-            "stream-json".into(),
-            "--verbose".into(),
-            "--include-partial-messages".into(),
-            "--permission-mode".into(),
-            if read_only {
-                "dontAsk".into()
-            } else {
-                "acceptEdits".into()
-            },
-            "--allowedTools".into(),
-            allowed_tools.into(),
-        ];
+        let mut args = claude_cli_args(read_only);
         if let Some(model) = &stage.model {
             args.extend(["--model".into(), model.clone()]);
         }
@@ -749,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_text_is_not_copied_into_evidence() {
+    fn unknown_provider_error_text_is_not_control_flow() {
         let mut evidence = Evidence::default();
         ingest(
             br#"{"type":"assistant","error":"authentication_failed: secret-token-value","message":{"content":[]}}"#,
@@ -757,16 +752,39 @@ mod tests {
             native_codex::OUTPUT_BYTES,
         )
         .unwrap();
-        assert_eq!(evidence.provider_error_class, Some("authentication"));
+        assert_eq!(evidence.provider_error_class, Some("provider"));
         assert_eq!(
             evidence.provider_error,
-            Some("Claude Code authentication is required")
+            Some("Claude Code reported a provider error")
         );
         assert!(
             !evidence
                 .provider_error
                 .is_some_and(|message| message.contains("secret-token-value"))
         );
+    }
+
+    #[test]
+    fn claude_cli_tools_are_an_availability_boundary() {
+        let read_only = claude_cli_args(true);
+        assert!(read_only.iter().any(|arg| arg == "--restricted"));
+        assert!(read_only.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert_eq!(
+            read_only
+                .iter()
+                .position(|arg| arg == "--tools")
+                .map(|index| &read_only[index + 1]),
+            Some(&"Read,Glob,Grep".to_owned())
+        );
+        assert!(!read_only.iter().any(|arg| arg == "--allowedTools"));
+
+        let writable = claude_cli_args(false);
+        let tools = writable
+            .iter()
+            .position(|arg| arg == "--tools")
+            .map(|index| writable[index + 1].as_str());
+        assert_eq!(tools, Some("Read,Edit,Write,Glob,Grep"));
+        assert!(!writable.iter().any(|arg| arg == "Bash"));
     }
 
     #[test]

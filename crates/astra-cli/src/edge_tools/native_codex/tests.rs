@@ -272,7 +272,7 @@ for line in sys.stdin: pass
 #[test]
 fn provider_declaration_carries_bounded_runtime_requirements_in_the_existing_extension() {
     let requirements = test_requirements();
-    let declaration = provider_declaration(requirements.clone()).unwrap();
+    let declaration = provider_declaration(requirements.clone(), None).unwrap();
     let roundtrip = astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
         &declaration.extension_fields,
     )
@@ -776,6 +776,7 @@ fn model_item(id: &str, model: &str, display_name: &str) -> NativeModelListItem 
         id: id.into(),
         model: model.into(),
         display_name: display_name.into(),
+        aliases: vec![id.into()],
         hidden: false,
         supported_reasoning_efforts: Vec::new(),
     }
@@ -800,17 +801,14 @@ fn native_model_selector_uses_provider_names_without_guessing() {
         resolve_model_selector_diagnostic("gPt-5.6-lUnA", &models).unwrap(),
         "gpt-5.6-luna"
     );
-    let ambiguous = resolve_model_selector_diagnostic("luna", &models)
+    let unavailable_component = resolve_model_selector_diagnostic("luna", &models)
         .unwrap_err()
         .to_string();
-    assert!(ambiguous.contains("choose one"));
-    assert!(ambiguous.contains("GPT-5.6-Luna"));
-    assert!(ambiguous.contains("GPT-6-Luna"));
-    assert!(!ambiguous.contains("gpt-5.6-luna"));
-    assert_eq!(
-        resolve_model_selector_diagnostic("sol", &models).unwrap(),
-        "gpt-6-sol"
-    );
+    assert!(unavailable_component.contains("not available"));
+    let unavailable_selector = resolve_model_selector_diagnostic("sol", &models)
+        .unwrap_err()
+        .to_string();
+    assert!(unavailable_selector.contains("not available"));
     assert!(resolve_model_selector_diagnostic("GPT-6-Luna", &models).is_ok());
     let unavailable = resolve_model_selector_diagnostic("missing", &models)
         .unwrap_err()
@@ -836,6 +834,29 @@ fn native_model_selector_uses_provider_names_without_guessing() {
     let unsupported = validate_requested_effort(Some("xhigh"), &models[0]).unwrap_err();
     assert!(unsupported.contains("GPT-5.6-Luna"));
     assert!(unsupported.contains("high"));
+
+    models[2].aliases = vec!["sol".into()];
+    assert_eq!(
+        resolve_model_selector_diagnostic("sol", &models).unwrap(),
+        "gpt-6-sol"
+    );
+
+    let case_distinct = vec![
+        model_item("first", "CaseModel", "First Model"),
+        model_item("second", "casemodel", "Second Model"),
+    ];
+    assert_eq!(
+        resolve_model_selector_diagnostic("CaseModel", &case_distinct).unwrap(),
+        "CaseModel"
+    );
+    assert_eq!(
+        resolve_model_selector_diagnostic("casemodel", &case_distinct).unwrap(),
+        "casemodel"
+    );
+    assert!(matches!(
+        resolve_model_selector_diagnostic("CASEMODEL", &case_distinct),
+        Err(ModelSelectorError::Ambiguous { .. })
+    ));
 }
 
 #[test]
@@ -1489,7 +1510,7 @@ assert request['params']['config']['default_permissions']==profile
 config=request['params']['config']['permissions'][profile]
 assert 'extends' not in config
 assert config['filesystem']['/workspace']=='read'
-emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':profile},'sandbox':{'type':'readOnly','networkAccess':False}}})
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'model':request['params'].get('model'),'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':profile},'sandbox':{'type':'readOnly','networkAccess':False}}})
 request=recv()
 assert request['method']=='turn/start'
 assert request['params']['approvalPolicy']=='never'
@@ -1568,6 +1589,142 @@ for line in sys.stdin: pass
     }
 
     #[tokio::test]
+    async fn discovered_provider_catalog_is_reused_without_a_second_model_list() {
+        let script = format!(
+            "{PREFIX}{}",
+            r#"
+assert request['params']['model']=='provider-model-v2'
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
+for line in sys.stdin: pass
+"#
+        );
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let mut stage = stage();
+        stage.model = Some("v2".into());
+        let catalog = astra_turn_types::ProviderModelCatalog::new(vec![
+            astra_turn_types::ProviderModelDescriptor {
+                selector: "provider-model-v2".into(),
+                display_name: "Provider Model V2".into(),
+                aliases: vec!["v2".into()],
+                reasoning_efforts: vec!["high".into()],
+                hidden: false,
+            },
+        ])
+        .unwrap();
+        let mut evidence = Evidence::default();
+        drive_with_cached_catalog(
+            &mut process,
+            &stage,
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+            None,
+            Some(&catalog),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            evidence.resolved_model.as_deref(),
+            Some("provider-model-v2")
+        );
+        assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+        assert!(
+            process
+                .wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_catalog_effort_rejection_refreshes_before_failing() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+assert recv()['method']=='initialize'
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
+request=recv()
+assert request['id']==4 and request['method']=='model/list'
+emit({'id':4,'result':{'data':[{
+    'id':'v2',
+    'model':'provider-model-v2',
+    'displayName':'Provider Model V2',
+    'supportedReasoningEfforts':[{'reasoningEffort':'xhigh'}]
+}], 'nextCursor':None}})
+request=recv()
+assert request['method']=='thread/start'
+assert request['params']['model']=='provider-model-v2'
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'model':request['params']['model'],'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
+request=recv()
+assert request['method']=='turn/start'
+assert request['params']['model']=='provider-model-v2'
+assert request['params']['effort']=='xhigh'
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
+for line in sys.stdin: pass
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(&script, token.clone()).await;
+        let mut stage = stage();
+        stage.model = Some("v2".into());
+        stage.effort = Some("xhigh".into());
+        let catalog = astra_turn_types::ProviderModelCatalog::new(vec![
+            astra_turn_types::ProviderModelDescriptor {
+                selector: "provider-model-v2".into(),
+                display_name: "Provider Model V2".into(),
+                aliases: vec!["v2".into()],
+                reasoning_efforts: vec!["high".into()],
+                hidden: false,
+            },
+        ])
+        .unwrap();
+        let mut evidence = Evidence::default();
+        drive_with_cached_catalog(
+            &mut process,
+            &stage,
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+            None,
+            Some(&catalog),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            evidence.resolved_model.as_deref(),
+            Some("provider-model-v2")
+        );
+        assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+        assert!(
+            process
+                .wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    #[tokio::test]
     async fn ambiguous_model_name_stops_before_provider_start_and_returns_user_choices() {
         let script = r#"
 import json,sys
@@ -1583,8 +1740,8 @@ request=recv()
 assert request['id']==4 and request['method']=='model/list'
 assert request['params']['includeHidden'] is True
 emit({'id':4,'result':{'data':[
-    {'id':'luna-56','model':'gpt-5.6-luna','displayName':'GPT-5.6-Luna'},
-    {'id':'luna-6','model':'gpt-6-luna','displayName':'GPT-6-Luna'}
+    {'id':'luna-56','model':'gpt-5.6-luna','displayName':'Luna'},
+    {'id':'luna-6','model':'gpt-6-luna','displayName':'Luna'}
 ], 'nextCursor':None}})
 for line in sys.stdin:
     request=json.loads(line)
@@ -1607,15 +1764,14 @@ for line in sys.stdin:
         )
         .await
         .unwrap_err();
-        assert!(error.contains("GPT-5.6-Luna"));
-        assert!(error.contains("GPT-6-Luna"));
-        assert!(!error.contains("gpt-5.6-luna"));
+        assert!(error.contains("Luna (gpt-5.6-luna)"));
+        assert!(error.contains("Luna (gpt-6-luna)"));
         assert_eq!(
             evidence.model_selection,
             Some(json!({
                 "status": "requires_user_choice",
                 "requested": "luna",
-                "choices": ["GPT-5.6-Luna", "GPT-6-Luna"]
+                "choices": ["Luna (gpt-5.6-luna)", "Luna (gpt-6-luna)"]
             }))
         );
         assert!(evidence.thread.is_none());

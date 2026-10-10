@@ -207,6 +207,53 @@ fn append_text(target: &mut String, text: &str, limit: usize, capped: &mut bool)
     *capped |= keep < text.len();
 }
 
+fn opencode_permission_environment(read_only: bool, network_allowed: bool) -> String {
+    let web_tools = if network_allowed { "allow" } else { "deny" };
+    let edit = if read_only { "deny" } else { "allow" };
+    let mut read = serde_json::Map::new();
+    read.insert("*".into(), json!("allow"));
+    // OpenCode's permission object is the provider-side projection of the
+    // canonical sandbox matcher. Keep the catch-all first because OpenCode
+    // applies the last matching rule; no second sensitive-path policy is
+    // introduced here.
+    let rules = astra_sandbox::sensitive_path_rules();
+    for substring in rules.path_substrings {
+        let pattern = substring.trim_start_matches('/');
+        if !pattern.is_empty() {
+            read.insert(format!("*{pattern}*"), json!("deny"));
+        }
+    }
+    for name in rules.credential_file_names {
+        read.insert(format!("*{name}"), json!("deny"));
+    }
+    for marker in rules.credential_directories {
+        let marker = marker.trim_start_matches('/');
+        if !marker.is_empty() {
+            read.insert(format!("*{marker}*"), json!("deny"));
+        }
+    }
+    json!({
+        "read": read,
+        "list": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "lsp": "allow",
+        "edit": edit,
+        "bash": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "mcp": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "webfetch": web_tools,
+        "websearch": web_tools,
+        "todoread": "deny",
+        "todowrite": "deny",
+        "doom_loop": "deny"
+    })
+    .to_string()
+}
+
 fn ingest_update(update: &Value, evidence: &mut Evidence, output_limit: usize) {
     if update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk")
         && let Some(text) = update
@@ -620,6 +667,17 @@ impl ToolExecutor {
                     "native OpenCode runtime approval does not match the selected provider",
                 );
             }
+            let Some(local_policy) = policy.as_mut() else {
+                return failure(
+                    "native OpenCode runtime approval requires a selected local sandbox policy",
+                );
+            };
+            for path in &approved.requirements.read_paths {
+                if astra_sandbox::is_never_readable_path(std::path::Path::new(path)) {
+                    return failure("native OpenCode runtime approval includes a forbidden path");
+                }
+                local_policy.allowed_paths.push(path.into());
+            }
         }
         if native_codex::validate_runtime_grant(
             &ceiling.runtime_read_paths,
@@ -644,12 +702,24 @@ impl ToolExecutor {
                 }
             };
         command.current_dir(&cwd);
+        let read_only = !ceiling.workspace_write_allowed
+            || self.read_only_execution
+            || self.plan_mode_authoring_active().await;
+        let network_allowed =
+            ceiling.network_allowed && policy.as_ref().is_none_or(|policy| policy.network_allowed);
         if let Some(policy) = &mut policy {
             policy.project_root = cwd.clone();
             if astra_sandbox::sandbox_command(policy, &mut command).is_err() {
                 return failure("native OpenCode sandbox preparation failed");
             }
         }
+        // `sandbox_command` owns process environment setup. Add the
+        // call-scoped provider permissions afterwards so project/user
+        // OpenCode settings cannot widen the admitted surface.
+        command.env(
+            "OPENCODE_PERMISSION",
+            opencode_permission_environment(read_only, network_allowed),
+        );
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
         let timeout = match native_codex::native_stage_remaining(invocation) {
             Ok(timeout) => timeout,
@@ -815,6 +885,25 @@ mod tests {
     fn usage_requires_both_input_and_output_counters() {
         assert!(canonical_usage(&json!({"inputTokens":2,"outputTokens":1})).is_some());
         assert!(canonical_usage(&json!({"inputTokens":2})).is_none());
+    }
+
+    #[test]
+    fn permission_environment_projects_the_execution_ceiling() {
+        let read_only: Value =
+            serde_json::from_str(&opencode_permission_environment(true, false)).unwrap();
+        assert_eq!(read_only["read"]["*"], "allow");
+        assert_eq!(read_only["read"]["*.env*"], "deny");
+        assert_eq!(read_only["edit"], "deny");
+        assert_eq!(read_only["bash"], "deny");
+        assert_eq!(read_only["webfetch"], "deny");
+        assert_eq!(read_only["external_directory"], "deny");
+
+        let writable: Value =
+            serde_json::from_str(&opencode_permission_environment(false, true)).unwrap();
+        assert_eq!(writable["edit"], "allow");
+        assert_eq!(writable["websearch"], "allow");
+        assert_eq!(writable["bash"], "deny");
+        assert_eq!(writable["task"], "deny");
     }
 
     #[test]

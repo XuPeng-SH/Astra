@@ -24,12 +24,25 @@ pub const STABLE_TOOL_ALIAS_SCHEMA_KEY: &str = "x-astra-stable-tool-alias";
 pub const STABLE_TOOL_ALIAS_METADATA_KEY: &str = "astra/stableToolAlias";
 
 pub const PROVIDER_RUNTIME_REQUIREMENTS_KEY: &str = "astra.runtimeRequirements";
+/// Lossless provider-owned model evidence. Keep this in the existing
+/// extension map so peers that do not project the typed catalog still retain
+/// it when they recompute the discovery snapshot hash.
+pub const PROVIDER_MODEL_CATALOG_KEY: &str = "astra.modelCatalog";
 
 /// Typed declaration marker for a provider capacity that can continue an
 /// agent stage.  This is deliberately separate from `task_support`: ordinary
 /// asynchronous tools may require task support without being a collaborator
 /// transport.
 pub const PROVIDER_COLLABORATOR_STAGE_KEY: &str = "astra.collaboratorStage";
+
+/// Maximum number of provider-owned model records retained in one discovery
+/// snapshot. The catalog is capability evidence, not an unbounded provider
+/// response cache.
+pub const MAX_PROVIDER_MODEL_CATALOG_ITEMS: usize = 512;
+/// Bound provider-owned model evidence for transport and execution. Prompt
+/// publication has its own smaller budget; it must not make an otherwise
+/// valid exact provider selector unexecutable.
+pub const MAX_PROVIDER_MODEL_CATALOG_BYTES: usize = 192 * 1024;
 
 /// Installed-provider dependencies, not an authorization grant. The local
 /// runtime owner supplies these facts; canonical admission approves them.
@@ -38,6 +51,127 @@ pub const PROVIDER_COLLABORATOR_STAGE_KEY: &str = "astra.collaboratorStage";
 pub struct ProviderRuntimeRequirements {
     pub executable: String,
     pub read_paths: Vec<String>,
+}
+
+/// One model selector exposed by a provider-owned execution capacity.
+/// `selector` is the exact value sent back to that provider. Display names
+/// and aliases are evidence for model-side selection only; Astra never turns
+/// them into an Offering or guesses a nearby model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelDescriptor {
+    pub selector: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Bounded, provider-owned model capability evidence captured during
+/// discovery. It is deliberately optional: providers without a portable
+/// catalog can still execute their default model, while explicit selection
+/// must then be resolved by that provider's own adapter.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelCatalog {
+    pub models: Vec<ProviderModelDescriptor>,
+    /// `false` means discovery/authentication succeeded but the provider's
+    /// model directory was not available for this snapshot.  It is distinct
+    /// from `None` on a declaration, which means the protocol does not publish
+    /// a portable catalog at all.
+    #[serde(default = "default_complete_model_catalog")]
+    pub complete: bool,
+}
+
+fn default_complete_model_catalog() -> bool {
+    true
+}
+
+impl ProviderModelCatalog {
+    pub fn new(models: Vec<ProviderModelDescriptor>) -> Result<Self, ProviderContractError> {
+        let catalog = Self {
+            models,
+            complete: true,
+        };
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    pub fn unavailable() -> Self {
+        Self {
+            models: Vec::new(),
+            complete: false,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderContractError> {
+        if self.models.len() > MAX_PROVIDER_MODEL_CATALOG_ITEMS {
+            return Err(ProviderContractError::InvalidModelCatalog(
+                "model catalog exceeds its bounded item limit".into(),
+            ));
+        }
+        let mut selectors_and_aliases = BTreeSet::new();
+        for model in &self.models {
+            let valid = |value: &str| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.trim() == value
+                    && !value.chars().any(char::is_control)
+            };
+            if !valid(&model.selector)
+                || !valid(&model.display_name)
+                || model.aliases.len() > 16
+                || model.aliases.iter().any(|alias| !valid(alias))
+                || model.reasoning_efforts.len() > 16
+                || model.reasoning_efforts.iter().any(|effort| !valid(effort))
+                || !selectors_and_aliases.insert(model.selector.clone())
+            {
+                return Err(ProviderContractError::InvalidModelCatalog(
+                    "model catalog contains an invalid or duplicate model".into(),
+                ));
+            }
+            for alias in &model.aliases {
+                if alias != &model.selector && !selectors_and_aliases.insert(alias.clone()) {
+                    return Err(ProviderContractError::InvalidModelCatalog(
+                        "model catalog contains a duplicate selector or alias".into(),
+                    ));
+                }
+            }
+        }
+        if !self.complete && !self.models.is_empty() {
+            return Err(ProviderContractError::InvalidModelCatalog(
+                "an incomplete model catalog must not contain model records".into(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_PROVIDER_MODEL_CATALOG_BYTES {
+            return Err(ProviderContractError::InvalidModelCatalog(
+                "model catalog exceeds its serialized byte limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return only provider-declared visible models for model-facing context.
+    /// Execution retains hidden entries for exact provider validation.
+    pub fn visible_models(&self, limit: usize) -> impl Iterator<Item = &ProviderModelDescriptor> {
+        self.models
+            .iter()
+            .filter(move |model| self.complete && !model.hidden)
+            .take(limit)
+    }
 }
 
 impl ProviderRuntimeRequirements {
@@ -307,6 +441,8 @@ pub struct ResolvedToolDescriptorDraft {
     pub schema_hash: String,
     pub claims: ResolvedProviderToolClaims,
     pub task_support: ProviderTaskSupport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<ProviderModelCatalog>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extension_fields: Map<String, Value>,
     pub semantic_baseline: ResolvedToolSemantics,
@@ -328,6 +464,8 @@ pub struct ResolvedToolDescriptor {
     pub schema_hash: String,
     pub claims: ResolvedProviderToolClaims,
     pub task_support: ProviderTaskSupport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<ProviderModelCatalog>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extension_fields: Map<String, Value>,
     pub semantic_baseline: ResolvedToolSemantics,
@@ -359,6 +497,7 @@ impl ResolvedToolDescriptor {
             schema_hash: draft.schema_hash,
             claims: draft.claims,
             task_support: draft.task_support,
+            model_catalog: draft.model_catalog,
             extension_fields: draft.extension_fields,
             semantic_baseline: draft.semantic_baseline,
             provider_snapshot,
@@ -378,6 +517,7 @@ impl ResolvedToolDescriptor {
             schema_hash: self.schema_hash.clone(),
             claims: self.claims.clone(),
             task_support: self.task_support,
+            model_catalog: self.model_catalog.clone(),
             extension_fields: self.extension_fields.clone(),
             semantic_baseline: self.semantic_baseline.clone(),
         }
@@ -632,6 +772,19 @@ pub struct ProviderToolDeclaration {
 }
 
 impl ProviderToolDeclaration {
+    /// Decode the provider-owned model evidence from the lossless extension
+    /// map. The declaration remains the single source of truth; resolved
+    /// descriptors may cache the typed value only after snapshot validation.
+    pub fn model_catalog(&self) -> Result<Option<ProviderModelCatalog>, ProviderContractError> {
+        let Some(value) = self.extension_fields.get(PROVIDER_MODEL_CATALOG_KEY) else {
+            return Ok(None);
+        };
+        let catalog: ProviderModelCatalog = serde_json::from_value(value.clone())
+            .map_err(|error| ProviderContractError::InvalidModelCatalog(error.to_string()))?;
+        catalog.validate()?;
+        Ok(Some(catalog))
+    }
+
     pub fn is_collaborator_stage(&self) -> bool {
         self.task_support == ProviderTaskSupport::Required
             && self
@@ -674,6 +827,7 @@ impl ProviderToolDeclaration {
                 field: "output_schema",
             });
         }
+        self.model_catalog()?;
         for source in [
             self.claims.read_only.as_ref().map(|claim| &claim.source),
             self.claims.destructive.as_ref().map(|claim| &claim.source),
@@ -1196,6 +1350,8 @@ impl ProviderCallOutcome {
 pub enum ProviderContractError {
     #[error("invalid installed-provider runtime requirements")]
     InvalidRuntimeRequirements,
+    #[error("invalid provider model catalog: {0}")]
+    InvalidModelCatalog(String),
     #[error("{kind} must not be empty")]
     EmptyIdentifier { kind: &'static str },
     #[error("invalid provider interaction: {0}")]
@@ -1345,6 +1501,79 @@ mod tests {
         assert!(ProviderIdentity::new("  ").is_err());
         let parsed = serde_json::from_str::<ProviderBindingRef>(r#"""#);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn provider_model_catalog_is_bounded_and_preserves_capability_evidence() {
+        let catalog = ProviderModelCatalog::new(vec![ProviderModelDescriptor {
+            selector: "provider-model-v2".into(),
+            display_name: "Provider Model V2".into(),
+            aliases: vec!["v2".into()],
+            reasoning_efforts: vec!["high".into()],
+            hidden: false,
+        }])
+        .unwrap();
+        assert_eq!(catalog.visible_models(8).count(), 1);
+        let encoded = serde_json::to_value(&catalog).unwrap();
+        assert_eq!(encoded["models"][0]["selector"], "provider-model-v2");
+        assert_eq!(encoded["models"][0]["aliases"][0], "v2");
+        assert_eq!(encoded["models"][0]["reasoning_efforts"][0], "high");
+
+        assert!(
+            ProviderModelCatalog::new(
+                (0..=MAX_PROVIDER_MODEL_CATALOG_ITEMS)
+                    .map(|index| ProviderModelDescriptor {
+                        selector: format!("model-{index}"),
+                        display_name: format!("Model {index}"),
+                        aliases: Vec::new(),
+                        reasoning_efforts: Vec::new(),
+                        hidden: false,
+                    })
+                    .collect()
+            )
+            .is_err()
+        );
+
+        let larger_catalog = ProviderModelCatalog::new(
+            (0..150)
+                .map(|index| ProviderModelDescriptor {
+                    selector: format!("provider-model-{index}"),
+                    display_name: "x".repeat(256),
+                    aliases: vec![format!("provider-alias-{index}")],
+                    reasoning_efforts: vec!["high".into()],
+                    hidden: false,
+                })
+                .collect(),
+        );
+        assert!(larger_catalog.is_ok());
+    }
+
+    #[test]
+    fn model_catalog_extension_is_lossless_in_discovery_snapshot() {
+        let catalog = ProviderModelCatalog::new(vec![ProviderModelDescriptor {
+            selector: "provider-model-v2".into(),
+            display_name: "Provider Model V2".into(),
+            aliases: vec!["v2".into()],
+            reasoning_efforts: vec!["high".into()],
+            hidden: false,
+        }])
+        .unwrap();
+        let mut tool = declaration("native", json!({"type": "object"}));
+        tool.extension_fields.insert(
+            PROVIDER_MODEL_CATALOG_KEY.into(),
+            serde_json::to_value(&catalog).unwrap(),
+        );
+        let snapshot = snapshot(vec![tool]);
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            encoded["tool_declarations"][0]["extension_fields"][PROVIDER_MODEL_CATALOG_KEY],
+            serde_json::to_value(&catalog).unwrap()
+        );
+        let decoded: ProviderDiscoverySnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            decoded.tool_declarations[0].model_catalog().unwrap(),
+            Some(catalog)
+        );
     }
 
     #[test]

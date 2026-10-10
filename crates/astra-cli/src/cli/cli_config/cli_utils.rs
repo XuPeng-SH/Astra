@@ -300,7 +300,10 @@ impl CliOwnerAuthSnapshot {
         self.owner_scope == astra_services::local_owner_scope()
             && match (&self.native_binding, crate::cli::native_auth::active()) {
                 (Some(bound), Some(active)) => std::sync::Arc::ptr_eq(bound, &active),
-                (None, None) => true,
+                (None, None) => self
+                    .legacy_binding
+                    .as_ref()
+                    .is_none_or(|binding| binding.is_active()),
                 _ => false,
             }
     }

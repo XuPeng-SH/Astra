@@ -6,7 +6,11 @@ use serde_json::Value;
 /// No local question ledger or provider principal is created here.
 pub(crate) struct NativeInvocationInteractionGate {
     pub(crate) api: astra_thin_client::ThinClient,
-    pub(crate) auth: String,
+    /// Session-scoped authentication owned by the native delivery lifecycle.
+    /// An invocation may outlive a token refresh while waiting for the user;
+    /// reading it at each HTTP boundary avoids retaining an expired copy.
+    pub(crate) auth: std::sync::Arc<tokio::sync::RwLock<String>>,
+    pub(crate) auth_provider: Option<std::sync::Arc<dyn astra_thin_client::client::BearerProvider>>,
     pub(crate) edge_transport_id: std::sync::Arc<tokio::sync::RwLock<String>>,
     pub(crate) edge_agent_id: String,
     pub(crate) physical_workspace_id: String,
@@ -17,6 +21,14 @@ pub(crate) struct NativeInvocationInteractionGate {
 }
 
 impl NativeInvocationInteractionGate {
+    async fn auth_token(&self) -> Result<String, astra_thin_client::ThinClientError> {
+        if let Some(provider) = &self.auth_provider {
+            provider.token().await
+        } else {
+            Ok(self.auth.read().await.clone())
+        }
+    }
+
     async fn answer_question(
         &self,
         interaction: &astra_turn_types::ProviderInteractionRequest,
@@ -78,10 +90,11 @@ impl NativeInvocationInteractionGate {
             cancelled,
             payload,
         };
+        let auth = self.auth_token().await?;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.deadline),
             self.api
-                .post_provider_interaction_response(Some(&self.auth), &body),
+                .post_provider_interaction_response(Some(&auth), &body),
         )
         .await
         .map_err(|_| ThinClientError::AdmissionDeadlineExpired)??;
@@ -116,8 +129,12 @@ impl astra_tools::ProviderInteractionGate for NativeInvocationInteractionGate {
         };
         let (required_tx, mut required_rx) = tokio::sync::mpsc::channel(1);
         let edge_transport_id = self.edge_transport_id.read().await.clone();
+        let auth = match self.auth_token().await {
+            Ok(auth) => auth,
+            Err(error) => return native_interaction_error(error),
+        };
         let receive = self.api.post_tool_interaction_request(
-            Some(&self.auth),
+            Some(&auth),
             &edge_transport_id,
             &body,
             timeout,
@@ -254,8 +271,15 @@ mod native_interaction_gate_tests {
         }
         async fn respond(
             State(state): State<std::sync::Arc<Fixture>>,
+            headers: axum::http::HeaderMap,
             Json(body): Json<ProviderInteractionRespondRequest>,
         ) -> Json<Value> {
+            assert_eq!(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer rotated-token")
+            );
             assert_eq!(body.request_id, state.request.interaction.request_id);
             assert_eq!(body.run_id, state.request.identity.run_id);
             assert_eq!(body.session_id, state.request.identity.session_id);
@@ -303,7 +327,8 @@ mod native_interaction_gate_tests {
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
         let gate = NativeInvocationInteractionGate {
             api: astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap(),
-            auth: "fixture-token".into(),
+            auth: std::sync::Arc::new(tokio::sync::RwLock::new("fixture-token".into())),
+            auth_provider: None,
             edge_transport_id: std::sync::Arc::new(tokio::sync::RwLock::new("transport".into())),
             edge_agent_id: "agent".into(),
             physical_workspace_id: "physical-test".into(),
@@ -313,6 +338,7 @@ mod native_interaction_gate_tests {
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             ask_user_request_tx: Some(ask_tx),
         };
+        let auth = gate.auth.clone();
         let execute = gate.request_interaction(&interaction);
         tokio::pin!(execute);
         let prompt = tokio::select! {
@@ -327,6 +353,7 @@ mod native_interaction_gate_tests {
                 .unwrap()
                 .contains("session")
         );
+        *auth.write().await = "rotated-token".into();
         prompt
             .response_tx
             .send(chat_stream::AskUserResponse::Submitted(
@@ -352,7 +379,8 @@ mod native_interaction_gate_tests {
             std::sync::Arc::new(tokio::sync::RwLock::new("old-transport".into()));
         let mut gate = NativeInvocationInteractionGate {
             api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
-            auth: "fixture-token".into(),
+            auth: std::sync::Arc::new(tokio::sync::RwLock::new("fixture-token".into())),
+            auth_provider: None,
             edge_transport_id: edge_transport_id.clone(),
             edge_agent_id: "agent".into(),
             physical_workspace_id: "physical-test".into(),

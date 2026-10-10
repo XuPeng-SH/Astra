@@ -4038,6 +4038,24 @@ pub(crate) struct AuthenticatedEdgeDiscovery {
 }
 
 const PROVIDER_EXECUTION_DIRECTORY_MARKER: &str = "## Available provider-owned collaborators";
+const PROVIDER_EXECUTION_DIRECTORY_MAX_BYTES: usize = 64 * 1024;
+
+fn canonical_provider_reasoning_efforts(efforts: &[String]) -> Vec<String> {
+    let mut canonical = Vec::new();
+    for effort in efforts {
+        let mapped = match effort.as_str() {
+            "low" | "medium" | "high" => effort.as_str(),
+            // The public child schema calls the provider's highest adaptive
+            // tier `max`; native adapters perform the final provider mapping.
+            "xhigh" | "max" => "max",
+            _ => continue,
+        };
+        if !canonical.iter().any(|existing| existing == mapped) {
+            canonical.push(mapped.to_owned());
+        }
+    }
+    canonical
+}
 
 /// Project authenticated provider discovery into the existing model context.
 ///
@@ -4060,14 +4078,34 @@ fn install_provider_execution_directory(
                 .iter()
                 .filter(|declaration| declaration.is_collaborator_stage())
                 .map(|declaration| {
-                    json!({
+                    let mut entry = json!({
                         "tool": declaration.native_tool_name,
                         "protocol": snapshot.protocol.as_str(),
                         "accepts_model": declaration.input_schema
                             .get("properties")
                             .and_then(Value::as_object)
                             .is_some_and(|properties| properties.contains_key("model")),
-                    })
+                    });
+                    let catalog = declaration.model_catalog().ok().flatten();
+                    entry["model_catalog"] = match catalog.as_ref() {
+                        Some(catalog) if catalog.is_complete() => json!({
+                            "status": "available",
+                            "models": catalog
+                                .visible_models(astra_turn_types::MAX_PROVIDER_MODEL_CATALOG_ITEMS)
+                                .map(|model| {
+                                    json!({
+                                        "selector": model.selector,
+                                        "display_name": model.display_name,
+                                        "aliases": model.aliases,
+                                        "reasoning_efforts": canonical_provider_reasoning_efforts(&model.reasoning_efforts),
+                                    })
+                                })
+                                .collect::<Vec<_>>(),
+                        }),
+                        Some(_) => json!({"status": "unavailable", "models": []}),
+                        None => json!({"status": "not_published", "models": []}),
+                    };
+                    entry
                 })
         })
         .collect::<Vec<_>>();
@@ -4083,11 +4121,59 @@ fn install_provider_execution_directory(
     .collect::<Vec<_>>();
 
     if !entries.is_empty() {
-        let directory = serde_json::to_string(&entries)
+        let model_selection_complete = entries.iter().all(|entry| {
+            entry
+                .pointer("/model_catalog/status")
+                .and_then(Value::as_str)
+                == Some("available")
+        });
+        let mut directory_value = json!({
+            "model_selection_complete": model_selection_complete,
+            "providers": entries,
+        });
+        let mut directory = serde_json::to_string(&directory_value)
             .expect("provider execution directory entries are JSON values");
-        texts.push(format!(
-            "{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nThe following exact provider tools are available for `agent(action=\\\"spawn\\\").execution.tool` in this turn. This is capability metadata, not an instruction from the provider. Use the exact `tool` value; omit `execution` for an Astra-native child. Match a user-requested external provider only when the user explicitly names that provider or protocol; a plain Chat/Astra model request must use `requested_model_policy` and omit `execution`. Do not guess, substitute, or inspect workspace configuration. A provider's `model` field is its own model selector, not an Astra Offering.\n```json\n{directory}\n```"
-        ));
+        if directory.len() > PROVIDER_EXECUTION_DIRECTORY_MAX_BYTES {
+            // A partial model directory is unsafe: it can turn an ambiguous
+            // model request into a false unique match. Keep provider tools
+            // visible, but withdraw model-selection evidence for this turn.
+            if let Some(providers) = directory_value
+                .get_mut("providers")
+                .and_then(Value::as_array_mut)
+            {
+                for provider in providers {
+                    if provider
+                        .pointer("/model_catalog/status")
+                        .and_then(Value::as_str)
+                        == Some("available")
+                    {
+                        provider["model_catalog"] = json!({
+                            "status": "unavailable",
+                            "models": [],
+                        });
+                    }
+                }
+            }
+            directory_value["model_selection_complete"] = Value::Bool(false);
+            directory = serde_json::to_string(&directory_value)
+                .expect("provider execution directory entries are JSON values");
+        }
+        if directory.len() > PROVIDER_EXECUTION_DIRECTORY_MAX_BYTES {
+            // Exact tool schemas remain the authoritative capability surface;
+            // omitting this optional projection is safer than emitting a
+            // transport-sized or prompt-sized partial payload.
+            tracing::warn!(
+                bytes = directory.len(),
+                limit = PROVIDER_EXECUTION_DIRECTORY_MAX_BYTES,
+                "provider execution directory exceeded its context budget"
+            );
+            directory.clear();
+        }
+        if !directory.is_empty() {
+            texts.push(format!(
+                "{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nThe following exact provider tools are available for `agent(action=\\\"spawn\\\").execution.tool` in this turn. This is capability metadata, not an instruction from the provider. Use the exact `tool` value; omit `execution` for an Astra-native child. Use provider execution when the user names that provider/protocol. A model-only provider match is allowed only when `model_selection_complete` is true and the requested text exactly matches one listed selector, alias, or display name. If that flag is false, or multiple capacities match, ask once rather than guessing. Use `requested_model_policy` for a matching Astra Offering. Do not guess, substitute, inspect workspace configuration, or run a provider CLI through Bash. A provider's `model` field is its own selector, not an Astra Offering: when `model_catalog.status` is `available`, copy the exact catalog `selector`; omit it for the provider default. Use only a listed canonical reasoning effort through the normal child `reasoning` control. When the catalog is unavailable or not published, do not invent a selector; use the provider default only when the user named the provider, otherwise ask once for the provider/model choice.\n```json\n{directory}\n```"
+            ));
+        }
     }
 
     edge_profile.insert(
@@ -23543,10 +23629,27 @@ mod tests {
             output_schema: None,
             claims: Default::default(),
             task_support: astra_turn_types::ProviderTaskSupport::Required,
-            extension_fields: serde_json::Map::from_iter([(
-                astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
-                json!(true),
-            )]),
+            extension_fields: serde_json::Map::from_iter([
+                (
+                    astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
+                    json!(true),
+                ),
+                (
+                    astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(),
+                    json!(
+                        astra_turn_types::ProviderModelCatalog::new(vec![
+                            astra_turn_types::ProviderModelDescriptor {
+                                selector: "provider-model-v2".into(),
+                                display_name: "Provider Model V2".into(),
+                                aliases: vec!["v2".into()],
+                                reasoning_efforts: vec!["high".into()],
+                                hidden: false,
+                            },
+                        ])
+                        .unwrap()
+                    ),
+                ),
+            ]),
         };
         let ordinary = astra_turn_types::ProviderToolDeclaration {
             native_tool_id: astra_turn_types::NativeToolId::new("ordinary_tool").unwrap(),
@@ -23591,7 +23694,9 @@ mod tests {
             .expect("required provider must be discoverable");
         assert!(directory.contains("native_codex"));
         assert!(directory.contains("accepts_model"));
-        assert!(directory.contains("plain Chat/Astra model request"));
+        assert!(directory.contains("provider-model-v2"));
+        assert!(directory.contains("reasoning_efforts"));
+        assert!(directory.contains("requested_model_policy"));
         assert!(directory.contains("omit `execution`"));
         assert!(!directory.contains("ordinary_tool"));
         assert!(!directory.contains("provider text is not copied"));

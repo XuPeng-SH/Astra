@@ -344,6 +344,7 @@ pub fn resolve_provider_snapshot(
             schema_hash,
             claims,
             task_support: declaration.task_support,
+            model_catalog: declaration.model_catalog()?,
             extension_fields: declaration.extension_fields.clone(),
             semantic_baseline,
         });
