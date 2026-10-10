@@ -41,6 +41,11 @@ const run = await client.createRun({
 
 `register(username, password, { email?, displayName? })` sends `email`; if omitted, a placeholder `{username}@users.local.astra` is used so the server’s required field is satisfied.
 
+Custom HTTP headers are merged case-insensitively. The current access token
+replaces a configured Authorization header for REST and SSE requests; explicit
+per-request headers retain their override precedence. SSE POST requests preserve
+a custom Content-Type regardless of its casing.
+
 ### Runs, delegation, and session observability
 
 For HTTP chat streaming, `modelSelection: "auto"` opts into the Server's

@@ -1,4 +1,5 @@
 import type { StreamEvent, ConnectionState, SSEClientOptions } from './types';
+import { headersInitToRecord } from './http';
 
 /** Read Axum-style `{ detail }` or common `{ message, error }` from a failed fetch body. */
 export async function readHttpErrorMessage(response: Response): Promise<string> {
@@ -102,16 +103,15 @@ export class SSEClient {
       : this.controller.signal;
 
     try {
-      const headers: Record<string, string> = {
+      let headers = headersInitToRecord({
         Accept: 'text/event-stream',
         'Cache-Control': 'no-cache',
-        ...this.options.headers,
-      };
+      }, this.options.headers);
       if (this.options.token) {
-        headers['Authorization'] = `Bearer ${this.options.token}`;
+        headers = headersInitToRecord(headers, { Authorization: `Bearer ${this.options.token}` });
       }
-      if (this.options.method === 'POST' && !headers['Content-Type']) {
-        headers['Content-Type'] = 'application/json';
+      if (this.options.method === 'POST' && !new Headers(headers).has('Content-Type')) {
+        headers = headersInitToRecord(headers, { 'Content-Type': 'application/json' });
       }
 
       const response = await fetch(this.options.url, {

@@ -774,10 +774,8 @@ export class AstraClient {
     init?: RequestInit,
     extra?: Record<string, string>,
   ): Record<string, string> {
-    const headers: Record<string, string> = {
-      ...this.config.headers,
-      ...extra,
-    };
+    const headers = headersInitToRecord(this.config.headers ?? {}, extra);
+    const generated: Record<string, string> = {};
     const method = (init?.method ?? "GET").toUpperCase();
     if (
       init?.body != null &&
@@ -786,12 +784,12 @@ export class AstraClient {
         method === "PATCH" ||
         method === "DELETE")
     ) {
-      headers["Content-Type"] = "application/json";
+      generated["Content-Type"] = "application/json";
     }
     if (this.accessToken) {
-      headers["Authorization"] = `Bearer ${this.accessToken}`;
+      generated["Authorization"] = `Bearer ${this.accessToken}`;
     }
-    return headers;
+    return headersInitToRecord(headers, generated);
   }
 
   // ─── HTTP helpers ──────────────────────────────────────────────────
