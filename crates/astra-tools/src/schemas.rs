@@ -19,6 +19,11 @@ pub const SURFACE_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-surface-discovery-sum
 /// project this map after a typed action subset is selected; they never need
 /// to parse the full function description to discover which action remains.
 pub const PER_ACTION_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-per-action-discovery-summaries";
+/// Compact delegation guidance for the single-child and fan-out tools.
+/// Full invocation semantics stay in their function descriptions; the
+/// fan-out summary additionally preserves its cross-field slot invariant.
+const DELEGATION_DISCOVERY_SUMMARY: &str = "requested_model_policy:omit unasked;provider dir;model_catalog:Offering;no substitution/config reads;hard reqs;launched;propose final;no shell sleep;runtime waits;child question";
+const FANOUT_DISCOVERY_SUMMARY: &str = "requested_model_policy:omit unasked;provider dir;model_catalog:Offering;no substitution/config reads;hard reqs;slots=target_count;description+prompt;atomic;runtime waits";
 
 /// Rebuild the compact discovery summary after a typed action projection.
 ///
@@ -1479,17 +1484,17 @@ fn agent_parameters_schema() -> Value {
             "server": "Server-owned single-agent lifecycle. If visible, call it directly; use the current provider directory for provider-owned capacities and model_catalog only for unknown Astra Offering choices. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For Astra model requests, propose requested_model_policy with an exact authorized Offering ID or configured name; for provider-owned requests, copy the exact execution tool/model from the current provider directory. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
         },
         "x-astra-surface-discovery-summaries": {
-            "server": "requested_model_policy:omit unasked;provider directory for provider capacity;model_catalog for Astra Offering;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question"
+            "server": DELEGATION_DISCOVERY_SUMMARY
         },
         "x-astra-per-action-discovery-summaries": {
-            "spawn": "requested_model_policy:omit unasked;provider directory for provider capacity;model_catalog for Astra Offering;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
+            "spawn": DELEGATION_DISCOVERY_SUMMARY,
             "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
             "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
             "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
             "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
             "send_message": "action+to+message; active mailbox only; child asks parent via message_type=question (not ask_user); parent answers request_id; completed provider follow-up uses spawn+exact collaborator_id"
         },
-        "x-astra-discovery-summary": "requested_model_policy:omit unasked;provider directory for provider capacity;model_catalog for Astra Offering;no substitution/config reads;hard reqs bind;launched;propose final;no shell sleep;runtime waits;agent question",
+        "x-astra-discovery-summary": DELEGATION_DISCOVERY_SUMMARY,
         "properties": {
             "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
             "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
@@ -2147,16 +2152,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_results`: requires `action` and returned `group_id`. It takes a short non-blocking snapshot; the parent-owned completion boundary independently stages terminal child outcomes, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy inherits the parent Offering. Exact authorized Offering and reasoning overrides require atomic admission before any slot starts. Interpret each requested execution model and propose requested_model_policy with an exact authorized Offering ID or configured name. Discover unknown choices using model_catalog. Preserve versions and sources; never substitute or inspect workspace configuration or credentials. Quoted model names in task content are not model selection. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll.",
+        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy inherits the parent Offering. Exact Astra Offering and reasoning overrides require atomic admission before any slot starts. For provider-owned capacities, copy the exact `execution.tool` and provider `execution.model` from the current provider directory; for Astra Offerings, use `requested_model_policy` with an exact authorized Offering ID or configured name. Discover unknown Astra Offering choices through `model_catalog`. Preserve versions and sources; never substitute or inspect workspace configuration or credentials. Quoted model names in task content are not model selection. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll.",
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
-                        "start": "requested_model_policy: omit unless user requests override; then authorized ID/name; unknown=model_catalog; no substitution/config reads; hard requirements bind; target_count slots, description+prompt; atomic.",
+                        "start": FANOUT_DISCOVERY_SUMMARY,
                         "get_results": "action+group_id; use bounded result windows and follow next_call",
                         "stop_slot": "action+group_id+slot_index",
                         "stop_group": "action+group_id"
                     },
-                     "x-astra-discovery-summary": "requested_model_policy: omit unless user requests override; then authorized ID/name; unknown=model_catalog; no substitution/config reads; hard requirements bind; target_count slots, description+prompt; atomic.",
+                     "x-astra-discovery-summary": FANOUT_DISCOVERY_SUMMARY,
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
                         "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results, stop_slot, and stop_group."},
@@ -2828,15 +2833,12 @@ mod tests {
                         summary.contains("requested_model_policy"),
                         "{surface}: {summary}"
                     );
+                    assert!(summary.contains("provider dir"), "{surface}: {summary}");
                     assert!(
-                        summary.contains("authorized ID/name"),
+                        summary.contains("model_catalog:Offering"),
                         "{surface}: {summary}"
                     );
-                    assert!(
-                        summary.contains("hard requirements bind")
-                            || summary.contains("hard reqs bind"),
-                        "{surface}: {summary}"
-                    );
+                    assert!(summary.contains("hard reqs"), "{surface}: {summary}");
                     assert!(
                         summary.contains("no substitution/config reads"),
                         "{surface}: {summary}"
@@ -2847,26 +2849,32 @@ mod tests {
                         summary.contains("propose final") || summary.contains("proposes final"),
                         "{surface}: {summary}"
                     );
-                    assert!(summary.contains("agent question"), "{surface}: {summary}");
+                    assert!(summary.contains("child question"), "{surface}: {summary}");
                     assert!(summary.contains("shell sleep"), "{surface}: {summary}");
                     assert!(!summary.contains("foreground"), "{surface}: {summary}");
                 } else {
                     let lower = summary.to_ascii_lowercase();
-                    assert!(lower.contains("omit unless user requests override"));
                     assert!(
-                        lower.contains("authorized id/name"),
+                        lower.contains("provider dir"),
+                        "{surface}/{name}: {summary}"
+                    );
+                    assert!(
+                        lower.contains("model_catalog:offering"),
                         "{surface}/{name}: {summary}"
                     );
                     assert!(
                         lower.contains("model_catalog") && lower.contains("no substitution"),
                         "{surface}/{name}: {summary}"
                     );
+                    assert!(lower.contains("hard reqs"), "{surface}/{name}: {summary}");
                     assert!(
-                        lower.contains("hard requirements bind"),
+                        summary.contains("no substitution/config reads"),
                         "{surface}/{name}: {summary}"
                     );
                     assert!(
-                        summary.contains("no substitution/config reads"),
+                        summary.contains("slots=target_count")
+                            && summary.contains("description+prompt")
+                            && summary.contains("atomic"),
                         "{surface}/{name}: {summary}"
                     );
                 }
@@ -2889,7 +2897,7 @@ mod tests {
             }
             if surface == "server" {
                 assert!(summary.chars().count() <= 180, "{surface}: {summary}");
-                assert!(visible.contains("agent question"), "{surface}: {visible}");
+                assert!(visible.contains("child question"), "{surface}: {visible}");
             }
         }
     }
