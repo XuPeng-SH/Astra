@@ -653,6 +653,29 @@ fn native_profile_is_rootless_and_tracks_admitted_workspace_authority() {
         expected_profile_sandbox(&writable, "/workspace").unwrap(),
         ("workspaceWrite", true)
     );
+    #[cfg(target_os = "linux")]
+    {
+        let mut approved = test_requirements();
+        for root in PLATFORM_RUNTIME_ROOTS {
+            if let Ok(target) = std::path::Path::new(root).canonicalize() {
+                approved.read_paths.push(target.to_str().unwrap().into());
+            }
+        }
+        let projected = permission_profile("/workspace", false, false, &approved).unwrap();
+        let projected = requested_profile_config(&projected).unwrap();
+        assert_eq!(projected["filesystem"][":minimal"], "read");
+        assert_eq!(projected["filesystem"]["/etc"], "deny");
+        assert_eq!(projected["filesystem"]["/proc"], "deny");
+        assert_eq!(projected["filesystem"]["/lib64/**/.env"], "deny");
+        assert!(projected["filesystem"].get("/").is_none());
+        let nested =
+            permission_profile("/usr/src/astra-profile-fixture", true, false, &approved).unwrap();
+        let nested = requested_profile_config(&nested).unwrap();
+        assert_eq!(
+            nested["filesystem"]["/usr/src/astra-profile-fixture/id_rsa"],
+            "deny"
+        );
+    }
 }
 
 #[test]
@@ -1341,8 +1364,9 @@ async fn live_native_codex_two_stages_same_session() {
     let first_run = format!("native-live-run-{}", uuid::Uuid::now_v7());
     let second_run = format!("native-live-run-{}", uuid::Uuid::now_v7());
     let token = format!("native-history-{}", uuid::Uuid::now_v7().simple());
+    std::fs::write(root.join("opaque-token.txt"), &token).unwrap();
     let tasks = [
-        format!("Remember this opaque token for our next stage: {token}. Reply with that token only. Do not use tools, access files, or ask questions."),
+        "Use the shell to read opaque-token.txt in the current workspace. Remember its contents for our next stage and reply with those contents only. Do not modify files or ask questions.".to_string(),
         "Repeat only the opaque token I asked you to remember in the previous stage. Do not use tools, access files, or ask questions.".to_string(),
     ];
     let mut native_session: Option<String> = None;

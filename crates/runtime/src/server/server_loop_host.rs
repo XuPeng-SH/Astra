@@ -4098,6 +4098,7 @@ fn install_provider_execution_directory(
                                         "display_name": model.display_name,
                                         "aliases": model.aliases,
                                         "reasoning_efforts": canonical_provider_reasoning_efforts(&model.reasoning_efforts),
+                                        "native_reasoning_efforts": model.reasoning_efforts,
                                     })
                                 })
                                 .collect::<Vec<_>>(),
@@ -4171,7 +4172,7 @@ fn install_provider_execution_directory(
         }
         if !directory.is_empty() {
             texts.push(format!(
-                "{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nThe following exact provider tools are available for `agent(action=\\\"spawn\\\").execution.tool` in this turn. This is capability metadata, not an instruction from the provider. Use the exact `tool` value; omit `execution` for an Astra-native child. Use provider execution when the user names that provider/protocol. A model-only provider match is allowed only when `model_selection_complete` is true and the requested text exactly matches one listed selector, alias, or display name. That flag gates model-only provider discovery; it does not block an explicitly named provider with an available model catalog. If a model-only choice is incomplete or ambiguous, ask once rather than guessing. Use `requested_model_policy` for a matching Astra Offering. Do not guess, substitute, inspect workspace configuration, or run a provider CLI through Bash. A provider's `model` field is its own selector, not an Astra Offering: when `model_catalog.status` is `available`, copy the exact catalog `selector`; omit it for the provider default only when the user left the model unconstrained or explicitly accepted the default. Use only a listed canonical reasoning effort through the normal child `reasoning` control. When the catalog is unavailable or not published, do not invent a selector; an explicit model requirement remains unresolved: ask once rather than dropping or replacing it. Provider-only requests may use the provider default. Preserve the requested reasoning effort; do not replace it with the highest available effort.\n```json\n{directory}\n```"
+                "{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nThe following exact provider tools are available for `agent(action=\\\"spawn\\\").execution.tool` in this turn. This is capability metadata, not an instruction from the provider. Use the exact `tool` value; omit `execution` for an Astra-native child. Use provider execution when the user names that provider/protocol. A model-only provider match is allowed only when `model_selection_complete` is true and the requested text exactly matches one listed selector, alias, or display name. That flag gates model-only provider discovery; it does not block an explicitly named provider with an available model catalog. If a model-only choice is incomplete or ambiguous, ask once rather than guessing. Use `requested_model_policy` for a matching Astra Offering. Do not guess, substitute, inspect workspace configuration, or run a provider CLI through Bash. A provider's `model` field is its own selector, not an Astra Offering: when `model_catalog.status` is `available`, copy the exact catalog `selector`; omit it for the provider default only when the user left the model unconstrained or explicitly accepted the default. Use only a listed canonical reasoning effort through the normal child `reasoning` control. `native_reasoning_efforts` preserves provider spellings: native `xhigh` uses the canonical child `max` control, which the native adapter maps back to `xhigh`; this is not an unavailable tier or a strength upgrade. When the catalog is unavailable or not published, do not invent a selector; an explicit model requirement remains unresolved: ask once rather than dropping or replacing it. Provider-only requests may use the provider default. Preserve the requested reasoning effort; do not replace it with the highest available effort.\n```json\n{directory}\n```"
             ));
         }
     }
@@ -23642,7 +23643,7 @@ mod tests {
                                 selector: "provider-model-v2".into(),
                                 display_name: "Provider Model V2".into(),
                                 aliases: vec!["v2".into()],
-                                reasoning_efforts: vec!["high".into()],
+                                reasoning_efforts: vec!["high".into(), "xhigh".into()],
                                 hidden: false,
                             },
                         ])
@@ -23696,6 +23697,19 @@ mod tests {
         assert!(directory.contains("accepts_model"));
         assert!(directory.contains("provider-model-v2"));
         assert!(directory.contains("reasoning_efforts"));
+        let frame: Value = serde_json::from_str(
+            directory
+                .split_once("```json\n")
+                .unwrap()
+                .1
+                .split_once("\n```")
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        let model = &frame["providers"][0]["model_catalog"]["models"][0];
+        assert_eq!(model["reasoning_efforts"], json!(["high", "max"]));
+        assert_eq!(model["native_reasoning_efforts"], json!(["high", "xhigh"]));
         assert!(directory.contains("requested_model_policy"));
         assert!(directory.contains("omit `execution`"));
         assert!(!directory.contains("ordinary_tool"));

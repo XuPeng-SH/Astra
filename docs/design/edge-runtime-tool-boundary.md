@@ -260,6 +260,13 @@ An explicit model request cannot be replaced by a provider default merely becaus
 discovery is unavailable; only unconstrained or explicitly accepted defaults may
 omit the selector.
 
+Linux runtime authorization remains canonical. The native sparse filesystem
+also exposes a platform bootstrap alias only when its current resolved target
+is in the approved runtime requirements. Sensitive-path rules cover both views;
+Codex's explicit minimal bootstrap preserves the logical loader paths only when
+all existing platform runtime roots are approved. Its additional `/etc` and
+inherited `/proc` views remain denied; filesystem-root read is never granted.
+
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
 receipts: an escaped descendant could write later. That uncertainty quarantines

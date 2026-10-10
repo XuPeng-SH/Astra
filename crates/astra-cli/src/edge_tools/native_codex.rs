@@ -30,6 +30,16 @@ const CONFIG_READ_REQUEST_ID: i64 = 8;
 const MODEL_LIST_PAGE_LIMIT: u64 = 64;
 const MODEL_LIST_MAX_PAGES: usize = 8;
 const MODEL_LIST_MAX_ITEMS: usize = 512;
+#[cfg(target_os = "linux")]
+const PLATFORM_RUNTIME_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/nix/store",
+    "/run/current-system/sw",
+];
 
 pub(crate) fn native_stage_remaining(
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
@@ -177,15 +187,7 @@ pub(crate) fn runtime_requirements_for_executable(
             .to_owned(),
     );
     #[cfg(target_os = "linux")]
-    for path in [
-        "/bin",
-        "/sbin",
-        "/usr",
-        "/lib",
-        "/lib64",
-        "/nix/store",
-        "/run/current-system/sw",
-    ] {
+    for path in PLATFORM_RUNTIME_ROOTS {
         let path = std::path::Path::new(path);
         if path.exists() {
             let canonical = path
@@ -416,10 +418,8 @@ fn permission_profile(
 ) -> Result<Value, &'static str> {
     let id = format!("astra_admitted_{}", uuid::Uuid::new_v4().simple());
     let mut filesystem = serde_json::Map::new();
-    // Do not inherit Codex's built-in profiles or `:minimal`: both include a
-    // root/platform read baseline. The admitted runtime paths below are the
-    // complete platform bootstrap; keeping the profile rootless is what makes
-    // the native child boundary match Astra's path authority.
+    // Never inherit a root-readable built-in profile. Platform bootstrap is
+    // enabled below only after proving it is covered by the runtime grant.
     if cwd == "/" || astra_sandbox::is_sensitive_system_dir(std::path::Path::new(cwd)) {
         return Err("native workspace boundary is not readable by policy");
     }
@@ -433,15 +433,52 @@ fn permission_profile(
             .or_insert_with(|| json!("read"));
     }
 
+    // Ordinary top-level aliases are canonicalized by Codex. Its platform
+    // bootstrap preserves loader paths, but also includes /etc (and may
+    // include inherited /proc): those remain denied outside our grant.
+    #[cfg(target_os = "linux")]
+    let platform_bootstrap = PLATFORM_RUNTIME_ROOTS.iter().all(|root| {
+        let path = std::path::Path::new(root);
+        !path.exists()
+            || path.canonicalize().is_ok_and(|target| {
+                requirements
+                    .read_paths
+                    .iter()
+                    .any(|approved| std::path::Path::new(approved) == target)
+            })
+    });
+    #[cfg(target_os = "linux")]
+    if platform_bootstrap {
+        filesystem.insert(":minimal".into(), json!("read"));
+        filesystem.insert("/etc".into(), json!("deny"));
+        filesystem.insert("/proc".into(), json!("deny"));
+    }
+
     let rules = astra_sandbox::sensitive_path_rules();
     // The only roots exposed to the provider are the selected workspace and
     // the explicitly captured installed-runtime paths. Scope the canonical
     // sensitive-path rules to those roots, using prefixes accepted by Codex's
     // glob scanner. System-sensitive roots are not exposed at all, so they do
     // not need a broad deny glob that would conflict with platform bootstrap.
-    let mut scoped_roots = std::collections::BTreeSet::new();
-    scoped_roots.insert(cwd.to_owned());
+    let mut scoped_roots = std::collections::BTreeSet::from([cwd.to_owned()]);
     scoped_roots.extend(requirements.read_paths.iter().cloned());
+    #[cfg(target_os = "linux")]
+    if platform_bootstrap {
+        scoped_roots.extend(PLATFORM_RUNTIME_ROOTS.iter().map(|root| (*root).to_owned()));
+    }
+    // A parent directory's recursive rules already cover its descendants.
+    // Preserve distinct logical aliases, but do not duplicate their canonical
+    // subtrees or generate recursive rules beneath an executable file.
+    let directory_roots = scoped_roots
+        .iter()
+        .filter(|root| root.as_str() == cwd || std::path::Path::new(root).is_dir())
+        .collect::<Vec<_>>();
+    let scoped_roots = directory_roots.iter().filter(|root| {
+        root.as_str() == cwd
+            || !directory_roots.iter().any(|ancestor| {
+                ancestor != *root && std::path::Path::new(root).starts_with(ancestor)
+            })
+    });
     for root in scoped_roots {
         let root = root.trim_end_matches('/');
         if root.is_empty() || root == "/" {
