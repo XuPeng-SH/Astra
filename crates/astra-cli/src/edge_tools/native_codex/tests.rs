@@ -1157,6 +1157,7 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
             &fixture_execution_ceiling(&executor),
             None,
             tokio::sync::mpsc::channel(1).1,
+            &|| Ok(()),
         )
         .await;
     assert!(denied.is_error);
@@ -1181,6 +1182,7 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
             &fixture_execution_ceiling(&executor),
             None,
             tokio::sync::mpsc::channel(1).1,
+            &|| Ok(()),
         )
         .await;
     assert!(denied.is_error);
@@ -1188,6 +1190,42 @@ async fn selected_cli_entrypoint_requires_binding_policy_and_admitted_budget() {
     let fields = denied.tool_result_fields.unwrap();
     assert_eq!(fields["native_collaborator"]["target_released"], false);
     assert!(fields.get("collaborator_usage").is_none());
+
+    let lease = astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+        directory.path(),
+        None,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let uncancelled = CancellationToken::new();
+    let denied = tokio::time::timeout(
+        Duration::from_secs(2),
+        executor.execute_native_provider_invocation(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer,
+            TOOL_NAME,
+            &args,
+            ToolInvocationMetadata {
+                admission_deadline: Some(std::time::Instant::now() + Duration::from_millis(100)),
+                ..invocation
+            },
+            Some(&uncancelled),
+            &NoTaskGate,
+            &fixture_execution_ceiling(&executor),
+            None,
+            tokio::sync::mpsc::channel(1).1,
+            &|| panic!("expired lock wait must not reach provider dispatch"),
+        ),
+    )
+    .await
+    .expect("lease wait must use the admitted deadline without transport cancellation");
+    assert!(denied.is_error);
+    assert!(!uncancelled.is_cancelled());
+    assert_eq!(
+        denied.tool_result_fields.unwrap()["execution_started"],
+        false
+    );
+    drop(lease);
 }
 
 /// Opt-in paid-provider evidence for the selected ToolExecutor adapter only.
@@ -1312,6 +1350,7 @@ async fn live_native_codex_two_stages_same_session() {
                 &ceiling,
                 None,
                 tokio::sync::mpsc::channel(1).1,
+                &|| Ok(()),
             )
             .await;
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;

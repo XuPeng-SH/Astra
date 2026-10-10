@@ -243,6 +243,15 @@ no-options observation wrapper are retired from the Rust source API. Process
 coordination, generation watches, diagnostic paths, and guard cleanup remain
 shared; tests exercise the same acquisition paths as executors.
 
+Native collaborator delivery delegates workspace serialization to the CLI tool
+executor. It does not hold a workspace lease while asking for approval or acquire
+the executor's lease a second time. After acquiring the lease, the executor checks
+the current permission attachment, workspace and executable identity before
+dispatch; queueing cannot preserve revoked authority. Lease waits respect the
+invocation deadline and cancellation. The Linux CI composition test drives the
+authenticated WebSocket owner through this executor and the production process
+supervisor, including contention, cancellation, expiry and changed admission.
+
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
 receipts: an escaped descendant could write later. That uncertainty quarantines

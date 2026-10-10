@@ -686,26 +686,9 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
             {
                 return rejected("native bootstrap workspace no longer matches discovery");
             }
-            // Native provider execution may mutate the selected workspace even
-            // when its provider-owned protocol does not expose a typed effect.
-            // Use the same workspace observation owner as ordinary Edge tools
-            // before approval and keep the lease through process settlement.
-            let lease_wait = invocation
-                .execution_deadline
-                .saturating_duration_since(Instant::now())
-                .min(std::time::Duration::from_secs(120));
-            let Some(_workspace_mutation_lease) =
-                astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                    &self.workspace_root,
-                    Some(&cancel),
-                    lease_wait,
-                )
-                .await
-            else {
-                return rejected(
-                    "native workspace is busy or cancellation was requested before dispatch",
-                );
-            };
+            // The tool executor owns workspace serialization through process
+            // settlement. Delivery must not acquire the same non-reentrant
+            // lease before calling it, or hold the workspace during approval.
             let approval = match self.approve_bootstrap(&invocation, &cancel).await {
                 Ok(approval) => approval,
                 Err(reason) => return rejected(&reason),
@@ -740,45 +723,62 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                 command_timeout_cap_ms: invocation.command_timeout_cap_ms,
                 ..ToolInvocationMetadata::default()
             };
-            let needed = match dependencies_need_approval(
-                &config.permission_policy,
-                &self.expected_session_id,
-                self.expected_attachment_epoch,
-                &self.snapshot,
-                &self.requirements,
-            ) {
-                Ok(needed) => needed,
-                Err(reason) => return rejected(&reason),
-            };
-            if needed && approval.admission_source == ToolInvocationAdmissionSource::Policy {
-                return rejected("native bootstrap policy approval was revoked before dispatch");
-            }
-            if cancel.is_cancelled() || Instant::now() >= invocation.execution_deadline {
-                return rejected("native invocation cancelled or expired before dispatch");
-            }
-            // Revalidate immediately before dispatch, after any user approval
-            // wait. A capability snapshot is valid only while the exact
-            // installed executable it described remains usable. A changed or
-            // removed client withdraws this owner; the session supervisor will
-            // probe the environment again instead of repeatedly rejecting a
-            // stale published snapshot.
-            let current_requirements =
-                crate::edge_tools::native_codex::runtime_requirements_for_executable(
-                    std::path::Path::new(&self.requirements.executable),
-                );
-            let identity_matches =
-                self.expected_executable_identity
+            let deadline = invocation.execution_deadline;
+            let validate_dispatch = || -> Result<(), String> {
+                if config
+                    .executor
+                    .effective_project_root()
+                    .canonicalize()
+                    .ok()
                     .as_ref()
-                    .is_none_or(|expected| {
-                        native_codex::native_executable_identity(std::path::Path::new(
-                            &self.requirements.executable,
-                        ))
-                        .is_ok_and(|current| current == *expected)
-                    });
-            if current_requirements.as_ref().ok() != Some(&self.requirements) || !identity_matches {
-                self.invalidation.cancel();
-                return rejected("native provider capability changed; rediscovery is required");
-            }
+                    != Some(&self.workspace_root)
+                {
+                    return Err("native bootstrap workspace changed before dispatch".into());
+                }
+                let needed = dependencies_need_approval(
+                    &config.permission_policy,
+                    &self.expected_session_id,
+                    self.expected_attachment_epoch,
+                    &self.snapshot,
+                    &self.requirements,
+                )?;
+                if needed && approval.admission_source == ToolInvocationAdmissionSource::Policy {
+                    return Err(
+                        "native bootstrap policy approval was revoked before dispatch".into(),
+                    );
+                }
+                if cancel.is_cancelled() || Instant::now() >= deadline {
+                    return Err("native invocation cancelled or expired before dispatch".into());
+                }
+                // Revalidate immediately before dispatch, after any user approval
+                // wait. A capability snapshot is valid only while the exact
+                // installed executable it described remains usable. A changed or
+                // removed client withdraws this owner; the session supervisor will
+                // probe the environment again instead of repeatedly rejecting a
+                // stale published snapshot.
+                let current_requirements =
+                    crate::edge_tools::native_codex::runtime_requirements_for_executable(
+                        std::path::Path::new(&self.requirements.executable),
+                    );
+                let identity_matches =
+                    self.expected_executable_identity
+                        .as_ref()
+                        .is_none_or(|expected| {
+                            native_codex::native_executable_identity(std::path::Path::new(
+                                &self.requirements.executable,
+                            ))
+                            .is_ok_and(|current| current == *expected)
+                        });
+                if current_requirements.as_ref().ok() != Some(&self.requirements)
+                    || !identity_matches
+                {
+                    self.invalidation.cancel();
+                    return Err(
+                        "native provider capability changed; rediscovery is required".into(),
+                    );
+                }
+                Ok(())
+            };
             let native_input_rx = invocation.input_rx;
             let outcome = config
                 .executor
@@ -792,6 +792,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                     ceiling,
                     Some(&approval),
                     native_input_rx,
+                    &|| validate_dispatch().map_err(|reason| rejected(&reason)),
                 )
                 .await;
             if outcome
@@ -2813,6 +2814,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires an explicit freshly built Astra invocation supervisor binary"]
     async fn authenticated_shared_ws_executes_native_provider_through_cli_entrypoint() {
+        for scenario in ["released", "cancelled", "expired", "revoked", "replaced"] {
+            native_entrypoint_with_workspace_contention(scenario).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn native_entrypoint_with_workspace_contention(scenario: &'static str) {
         use astra_server_types::edge_ws_protocol::{
             EdgeExecutionCeiling, EdgeServerMessage, ToolInvocationIdentity,
         };
@@ -2852,6 +2860,9 @@ request = recv()
 assert request["id"] == 7 and request["method"] == "account/read"
 emit({"id": 7, "result": {"account": None, "requiresOpenaiAuth": False}})
 request = recv()
+assert request["id"] == 8 and request["method"] == "config/read"
+emit({"id": 8, "result": {"config": {"additional": {"mcp_servers": {}}}}})
+request = recv()
 assert request["method"] == "thread/start"
 profile = request["params"]["permissions"]
 emit({"id": 2, "result": {"thread": {"id": "edge-thread", "status": {"type": "idle"}}, "cwd": request["params"]["cwd"], "approvalPolicy": "never", "approvalsReviewer": "user", "activePermissionProfile": {"id": profile}, "sandbox": {"type": "readOnly", "networkAccess": False}}})
@@ -2884,13 +2895,23 @@ for line in sys.stdin:
         consumer.requirements = requirements.clone();
         consumer.snapshot = Arc::new(snapshot(&requirements, workspace.path()));
         let snapshot = consumer.snapshot.clone();
+        consumer.expected_executable_identity =
+            Some(native_codex::native_executable_identity(&executable).unwrap());
         let mut config = (*consumer.config).clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.websocket_url = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
         config.api = astra_thin_client::ThinClient::new(&http.uri(), None).unwrap();
 
         let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        let lease =
+            astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                workspace.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("hold a competing workspace operation");
         let root = workspace
             .path()
             .canonicalize()
@@ -2947,7 +2968,7 @@ for line in sys.stdin:
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64)
-                        + 15_000,
+                        + if scenario == "expired" { 500 } else { 15_000 },
                 ),
                 execution_timeout_ms: Some(15_000),
                 command_timeout_cap_ms: Some(120_000),
@@ -2957,6 +2978,20 @@ for line in sys.stdin:
             ))
             .await
             .unwrap();
+
+            if scenario == "cancelled" {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                ws.send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::ToolCancel {
+                        request_id: identity.storage_key(),
+                        delivery_generation: 1,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            }
 
             loop {
                 match ws.next().await {
@@ -2977,6 +3012,21 @@ for line in sys.stdin:
                             panic!("expected native tool result");
                         };
                         assert_eq!(actual, identity);
+                        if scenario != "released" {
+                            assert!(is_error, "blocked native call must fail: {output}");
+                            assert!(!output.contains("NATIVE_EDGE_SUCCESS"));
+                            if scenario == "revoked" {
+                                assert!(
+                                    output.contains("denied") || output.contains("revoked"),
+                                    "{output}"
+                                );
+                            }
+                            if scenario == "replaced" {
+                                assert!(output.contains("capability changed"), "{output}");
+                            }
+                            result_tx.send(()).unwrap();
+                            break;
+                        }
                         assert!(!is_error, "native entrypoint failed: {output}");
                         assert_eq!(output.trim(), "NATIVE_EDGE_SUCCESS");
                         let fields = tool_result_fields.expect("native evidence");
@@ -3019,7 +3069,42 @@ for line in sys.stdin:
         .await
         .expect("native delivery should publish the tested provider");
         dispatch_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), result_rx)
+        if matches!(scenario, "released" | "revoked" | "replaced") {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut result_rx)
+                    .await
+                    .is_err(),
+                "native execution must respect the competing workspace lease"
+            );
+            if scenario == "revoked" {
+                permission_owner.perm_manager.set_mode(PermissionMode::Deny);
+            }
+            if scenario == "replaced" {
+                std::fs::write(&executable, "#!/usr/bin/env python3\nraise RuntimeError('replaced executable must not run')\n").unwrap();
+            }
+            drop(lease);
+        } else {
+            // Keep the competing owner alive while cancellation/deadline is
+            // settled; neither condition should require workspace release.
+            tokio::time::timeout(Duration::from_secs(3), &mut result_rx)
+                .await
+                .expect("blocked invocation must settle promptly")
+                .unwrap();
+            drop(lease);
+            let next =
+                astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                    workspace.path(),
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("cancelled waiter must not leak workspace ownership");
+            drop(next);
+            handle.shutdown().await;
+            peer.await.unwrap();
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(10), &mut result_rx)
             .await
             .unwrap()
             .unwrap();

@@ -4544,6 +4544,7 @@ impl ToolExecutor {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4564,6 +4565,7 @@ impl ToolExecutor {
         execution_ceiling: &astra_server_types::edge_ws_protocol::EdgeExecutionCeiling,
         runtime_approval: Option<&ApprovedNativeRuntime>,
         input_rx: tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>,
+        validate_dispatch: &(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync),
     ) -> ToolExecutionOutcome {
         self.execute_run_with_native_interaction(
             tool_name,
@@ -4575,6 +4577,7 @@ impl ToolExecutor {
             Some(protocol),
             runtime_approval,
             Some(input_rx),
+            Some(validate_dispatch),
         )
         .await
         .into_outcome()
@@ -4593,6 +4596,7 @@ impl ToolExecutor {
         native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
         runtime_approval: Option<&ApprovedNativeRuntime>,
         input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
+        validate_dispatch: Option<&(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync)>,
     ) -> EdgeToolRun {
         let canonical_native = runtime_approval.filter(|approval| {
             native_protocol.is_none_or(|protocol| protocol == approval.protocol)
@@ -4731,7 +4735,11 @@ impl ToolExecutor {
             match astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
                 &execution_root,
                 cancel_token,
-                std::time::Duration::from_secs(120),
+                invocation
+                    .admission_deadline
+                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or(std::time::Duration::from_secs(120))
+                    .min(std::time::Duration::from_secs(120)),
             )
             .await
             {
@@ -4751,6 +4759,11 @@ impl ToolExecutor {
         } else {
             None
         };
+        if let Some(validate) = validate_dispatch
+            && let Err(result) = validate()
+        {
+            return EdgeToolRun::from_tool_result(result);
+        }
         // Structured writers have no trustworthy success fact in their
         // display string. Capture an owner-side bounded preimage while the
         // workspace lease is held, then stamp the result only if the bound
