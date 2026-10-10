@@ -26,6 +26,7 @@ const MODEL_LIST_REQUEST_ID: i64 = 4;
 const INTERRUPT_REQUEST_ID: i64 = 5;
 const STEER_REQUEST_ID: i64 = 6;
 const ACCOUNT_READ_REQUEST_ID: i64 = 7;
+const CONFIG_READ_REQUEST_ID: i64 = 8;
 const MODEL_LIST_PAGE_LIMIT: u64 = 64;
 const MODEL_LIST_MAX_PAGES: usize = 8;
 const MODEL_LIST_MAX_ITEMS: usize = 512;
@@ -1432,6 +1433,58 @@ fn account_read_request() -> Value {
     })
 }
 
+fn config_read_request(cwd: &str) -> Value {
+    // Read the provider's effective config through its protocol, rather than
+    // opening the user's config or credentials from Astra. The returned MCP
+    // names are only used to apply the provider's existing per-server disable
+    // semantics in the admitted thread.
+    json!({
+        "id": CONFIG_READ_REQUEST_ID,
+        "method": "config/read",
+        "params": {"includeLayers": false, "cwd": cwd}
+    })
+}
+
+async fn disabled_mcp_servers(
+    process: &mut FramedProcess,
+    input: &FramedProcessInput,
+    cwd: &str,
+    evidence: &mut Evidence,
+    output_limit: usize,
+    cancel: &CancellationToken,
+) -> Result<Value, String> {
+    let response = rpc(
+        process,
+        input,
+        config_read_request(cwd),
+        evidence,
+        output_limit,
+        None,
+        Some(cancel),
+        None,
+        None,
+    )
+    .await
+    .map_err(str::to_owned)?;
+    let Some(servers) = response
+        .pointer("/config/additional/mcp_servers")
+        .and_then(Value::as_object)
+    else {
+        return Ok(json!({}));
+    };
+    if servers.len() > MODEL_LIST_MAX_ITEMS {
+        return Err("native MCP configuration exceeds the bounded selection limit".into());
+    }
+    let mut disabled = serde_json::Map::with_capacity(servers.len());
+    for name in servers.keys() {
+        if !valid_id(name) {
+            return Err("native MCP configuration contains an invalid server name".into());
+        }
+        disabled.insert(name.clone(), json!({"enabled": false}));
+    }
+    Ok(Value::Object(disabled))
+}
+
 fn model_list_request(cursor: Option<&str>) -> Value {
     let mut params = json!({
         "limit": MODEL_LIST_PAGE_LIMIT,
@@ -1455,10 +1508,19 @@ fn thread_request(
     cwd: &str,
     sandbox: &Value,
     resolved_model: Option<&str>,
+    disabled_mcp_servers: &Value,
 ) -> Value {
     // Approval is not an authorization to expand the admitted sandbox. Native
     // commands within this ceiling still run; unsandboxed retries must not.
-    let mut params = json!({"cwd": cwd, "permissions": sandbox["profileId"], "config": sandbox["config"], "approvalPolicy": "never", "approvalsReviewer": "user"});
+    let mut config = sandbox["config"].clone();
+    config["mcp_servers"] = disabled_mcp_servers.clone();
+    // Apps and plugins can contribute MCP servers that are not present in the
+    // ordinary configured-server map. They are not part of Astra's admitted
+    // native capability, so keep Codex's existing feature switches off for
+    // this thread as well.
+    config["features.apps"] = json!(false);
+    config["features.plugins"] = json!(false);
+    let mut params = json!({"cwd": cwd, "permissions": sandbox["profileId"], "config": config, "approvalPolicy": "never", "approvalsReviewer": "user"});
     if let Some(model) = resolved_model {
         params["model"] = json!(model);
     }
@@ -1893,6 +1955,7 @@ async fn rpc(
                     Some(4) => "native model catalog request rejected",
                     Some(5) => "native interrupt request rejected",
                     Some(7) => "native account readiness request rejected",
+                    Some(8) => "native config read request rejected",
                     _ => "native request rejected",
                 });
             }
@@ -2449,6 +2512,8 @@ async fn drive_with_cached_catalog(
     verify_provider_authentication(process, &input, evidence, cancel, output_limit)
         .await
         .map_err(str::to_owned)?;
+    let disabled_mcp_servers =
+        disabled_mcp_servers(process, &input, cwd, evidence, output_limit, cancel).await?;
     let resolved_model = resolve_requested_model(
         process,
         &input,
@@ -2462,7 +2527,13 @@ async fn drive_with_cached_catalog(
     let response = rpc(
         process,
         &input,
-        thread_request(stage, cwd, sandbox, resolved_model.as_deref()),
+        thread_request(
+            stage,
+            cwd,
+            sandbox,
+            resolved_model.as_deref(),
+            &disabled_mcp_servers,
+        ),
         evidence,
         output_limit,
         gate,

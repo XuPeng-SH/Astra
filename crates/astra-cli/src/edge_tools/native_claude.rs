@@ -58,14 +58,15 @@ impl Stage {
                 .as_deref()
                 .is_some_and(|id| !valid(id))
             || stage.model.as_deref().is_some_and(|model| !valid(model))
-            || stage.effort.as_deref().is_some_and(|effort| {
-                !matches!(
-                    effort,
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                )
-            })
+            || stage
+                .effort
+                .as_deref()
+                .is_some_and(|effort| !matches!(effort, "none" | "low" | "medium" | "high" | "max"))
         {
             return Err("invalid native Claude stage arguments");
+        }
+        if stage.effort.as_deref() == Some("none") {
+            return Err("native Claude does not support disabling reasoning; omit effort");
         }
         Ok(stage)
     }
@@ -77,6 +78,8 @@ pub fn schema() -> Value {
     schema["function"]["description"] = json!(
         "Execute one admitted native Claude Code collaborator stage in the selected CLI workspace. The model is passed to Claude Code as an explicit provider argument; the provider's acknowledged session and result establish what actually ran. Resume only an exact acknowledged native_session_id. Run, control and deadline authority comes from the invocation, never arguments."
     );
+    schema["function"]["parameters"]["properties"]["effort"]["enum"] =
+        json!(["low", "medium", "high", "max"]);
     schema
 }
 
@@ -722,6 +725,14 @@ mod tests {
         assert_eq!(
             schema["function"]["parameters"]["required"][1],
             "anchor_run_id"
+        );
+        assert_eq!(
+            schema["function"]["parameters"]["properties"]["effort"]["enum"],
+            json!(["low", "medium", "high", "max"])
+        );
+        assert!(
+            Stage::parse(&json!({"task":"review","anchor_run_id":"anchor","effort":"none"}))
+                .is_err()
         );
     }
 

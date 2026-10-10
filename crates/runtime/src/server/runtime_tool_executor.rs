@@ -3402,6 +3402,7 @@ impl RuntimeToolExecutor {
         runtime_control_kind: Option<
             astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind,
         >,
+        force_read_only_workspace: bool,
     ) -> GovernableRuntimeToolResult {
         if runtime_control_kind.is_some_and(|kind| kind.tool_name() != name) {
             return GovernableRuntimeToolResult::completed(
@@ -3440,6 +3441,13 @@ impl RuntimeToolExecutor {
         request.policy.permission_grant = permission_grant.cloned();
         request.policy.delegation_model_admission =
             delegation_model_admission.map(|prepared| prepared.admission.clone());
+        if force_read_only_workspace && request.workspace.authority == WorkspaceAuthority::ReadWrite
+        {
+            // Plan mode is a capability ceiling, not a prompt hint. Apply the
+            // downgrade to the canonical request before transport derives its
+            // Edge execution ceiling; no later policy may widen it.
+            request.workspace.authority = WorkspaceAuthority::ReadOnly;
+        }
         if runtime_control_kind
             == Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement)
         {
@@ -5947,6 +5955,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
 
@@ -9250,7 +9259,7 @@ pub(crate) mod tests {
         ] {
             let outcome = exec
                 .execute_invocation_before_governance(
-                    "run", "chain", "call", name, args, None, None, None, None, kind,
+                    "run", "chain", "call", name, args, None, None, None, None, kind, false,
                 )
                 .await;
             assert_eq!(
@@ -9281,6 +9290,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(RuntimeControlInvocationKind::WorkSettlement),
+                false,
             )
             .await;
         assert_eq!(
@@ -9308,6 +9318,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(RuntimeControlInvocationKind::WorkSettlement),
+                false,
             )
             .await;
         assert_eq!(

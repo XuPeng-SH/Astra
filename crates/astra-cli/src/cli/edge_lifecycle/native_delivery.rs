@@ -686,6 +686,26 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
             {
                 return rejected("native bootstrap workspace no longer matches discovery");
             }
+            // Native provider execution may mutate the selected workspace even
+            // when its provider-owned protocol does not expose a typed effect.
+            // Use the same workspace observation owner as ordinary Edge tools
+            // before approval and keep the lease through process settlement.
+            let lease_wait = invocation
+                .execution_deadline
+                .saturating_duration_since(Instant::now())
+                .min(std::time::Duration::from_secs(120));
+            let Some(_workspace_mutation_lease) =
+                astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                    &self.workspace_root,
+                    Some(&cancel),
+                    lease_wait,
+                )
+                .await
+            else {
+                return rejected(
+                    "native workspace is busy or cancellation was requested before dispatch",
+                );
+            };
             let approval = match self.approve_bootstrap(&invocation, &cancel).await {
                 Ok(approval) => approval,
                 Err(reason) => return rejected(&reason),

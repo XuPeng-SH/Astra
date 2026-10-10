@@ -814,7 +814,7 @@ async fn direct_child_parent_cancelled(cancellation: &super::host::CancellationS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderBoundaryGate {
+pub(crate) enum ProviderBoundaryGate {
     Authorized,
     Paused,
 }
@@ -1059,7 +1059,7 @@ async fn continue_after_user_intent_settlement_fence(
     Ok(TurnExecutionControl::ContinueLoop)
 }
 
-async fn authorize_provider_boundary(
+pub(crate) async fn authorize_provider_boundary(
     state: &mut AgenticLoopState,
 ) -> Result<ProviderBoundaryGate, astra_core::ClassifiedError> {
     let (Some(run_control), Some(user_id), Some(run_id)) = (

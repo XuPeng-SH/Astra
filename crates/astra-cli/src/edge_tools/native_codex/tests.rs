@@ -137,6 +137,9 @@ request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
+request=recv()
 assert request['method']=='thread/start'
 emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
 request=recv()
@@ -213,6 +216,9 @@ assert recv()['method']=='initialized'
 request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
+request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
 request=recv()
 assert request['method']=='thread/start'
 emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
@@ -748,7 +754,13 @@ fn exact_thread_resume_and_native_turn_input() {
     stage.model = Some("chosen-model".into());
     stage.effort = Some("xhigh".into());
     let profile = test_profile();
-    let resume = thread_request(&stage, "/workspace", &profile, stage.model.as_deref());
+    let resume = thread_request(
+        &stage,
+        "/workspace",
+        &profile,
+        stage.model.as_deref(),
+        &json!({}),
+    );
     assert_eq!(resume["method"], "thread/resume");
     assert_eq!(resume["params"]["threadId"], "native-thread");
     assert_eq!(resume["params"]["excludeTurns"], true);
@@ -767,7 +779,11 @@ fn exact_thread_resume_and_native_turn_input() {
     assert_eq!(turn["params"]["permissions"], profile["profileId"]);
     assert!(turn["params"].get("sandboxPolicy").is_none());
     assert!(resume["params"].get("sandbox").is_none());
-    assert_eq!(resume["params"]["config"], profile["config"]);
+    let mut expected_config = profile["config"].clone();
+    expected_config["mcp_servers"] = json!({});
+    expected_config["features.apps"] = json!(false);
+    expected_config["features.plugins"] = json!(false);
+    assert_eq!(resume["params"]["config"], expected_config);
     assert_eq!(turn["params"]["effort"], "xhigh");
 }
 
@@ -1501,6 +1517,9 @@ request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
+request=recv()
 assert request['method']=='thread/start'
 assert request['params']['approvalPolicy']=='never'
 assert request['params']['permissions'].startswith('astra_admitted_')
@@ -1510,6 +1529,9 @@ assert request['params']['config']['default_permissions']==profile
 config=request['params']['config']['permissions'][profile]
 assert 'extends' not in config
 assert config['filesystem']['/workspace']=='read'
+assert request['params']['config']['mcp_servers']=={}
+assert request['params']['config']['features.apps'] is False
+assert request['params']['config']['features.plugins'] is False
 emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'model':request['params'].get('model'),'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':profile},'sandbox':{'type':'readOnly','networkAccess':False}}})
 request=recv()
 assert request['method']=='turn/start'
@@ -1517,6 +1539,114 @@ assert request['params']['approvalPolicy']=='never'
 assert request['params']['permissions']==profile
 assert 'sandboxPolicy' not in request['params']
 "#;
+
+    #[tokio::test]
+    async fn native_stage_disables_all_effective_mcp_servers_before_thread_start() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+assert recv()['method']=='initialize'
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/home/user/.codex','platformFamily':'unix','platformOs':'linux'}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
+request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{
+    'personal-tools': {'command':'do-not-copy'},
+    'workspace-tools': {'url':'https://example.invalid/mcp'}
+}}},'origins':{}}})
+request=recv()
+assert request['method']=='thread/start'
+assert request['params']['config']['mcp_servers']=={
+    'personal-tools': {'enabled':False},
+    'workspace-tools': {'enabled':False}
+}
+assert 'command' not in request['params']['config']['mcp_servers']['personal-tools']
+emit({'id':2,'result':{'thread':{'id':'thread','status':{'type':'idle'}},'cwd':'/workspace','approvalPolicy':'never','approvalsReviewer':'user','activePermissionProfile':{'id':request['params']['permissions']},'sandbox':{'type':'readOnly','networkAccess':False}}})
+request=recv()
+assert request['method']=='turn/start'
+emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
+emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
+for line in sys.stdin: pass
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(script, token.clone()).await;
+        let mut evidence = Evidence::default();
+        drive(
+            &mut process,
+            &stage(),
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.terminal.as_deref(), Some("completed"));
+        assert!(
+            process
+                .wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_stage_fails_closed_when_effective_mcp_config_cannot_be_read() {
+        let script = r#"
+import json,sys
+def recv(): return json.loads(sys.stdin.readline())
+def emit(v): print(json.dumps(v),flush=True)
+assert recv()['method']=='initialize'
+emit({'id':1,'result':{'userAgent':'codex-cli test','codexHome':'/home/user/.codex','platformFamily':'unix','platformOs':'linux'}})
+assert recv()['method']=='initialized'
+request=recv()
+assert request['id']==7 and request['method']=='account/read'
+emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
+request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'error':{'code':'config-unavailable','message':'config unavailable'}})
+for line in sys.stdin:
+    request=json.loads(line)
+    assert request['method'] not in ('thread/start','thread/resume','turn/start')
+"#;
+        let token = CancellationToken::new();
+        let mut process = process(script, token.clone()).await;
+        let mut evidence = Evidence::default();
+        let error = drive(
+            &mut process,
+            &stage(),
+            "/workspace",
+            &test_profile(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            None,
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "native config read request rejected");
+        assert!(evidence.thread.is_none());
+        assert!(
+            process
+                .cancel_and_wait()
+                .await
+                .unwrap()
+                .settlement
+                .unwrap()
+                .ownership
+                .is_authoritative()
+        );
+    }
 
     #[tokio::test]
     async fn model_selector_uses_standard_provider_catalog_before_starting_a_thread() {
@@ -1530,6 +1660,9 @@ assert recv()['method']=='initialized'
 request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
+request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
 request=recv()
 assert request['id']==4
 assert request['method']=='model/list'
@@ -1658,6 +1791,9 @@ request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
+request=recv()
 assert request['id']==4 and request['method']=='model/list'
 emit({'id':4,'result':{'data':[{
     'id':'v2',
@@ -1737,6 +1873,9 @@ request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
+request=recv()
 assert request['id']==4 and request['method']=='model/list'
 assert request['params']['includeHidden'] is True
 emit({'id':4,'result':{'data':[
@@ -1792,6 +1931,9 @@ request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
 request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
+request=recv()
 assert request['id']==4 and request['method']=='model/list'
 emit({'id':4,'result':{'data':[], 'nextCursor':None}})
 for line in sys.stdin:
@@ -1833,6 +1975,9 @@ assert recv()['method']=='initialized'
 request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
+request=recv()
+assert request['id']==8 and request['method']=='config/read'
+emit({'id':8,'result':{'config':{'additional':{'mcp_servers':{}}},'origins':{}}})
 request=recv()
 assert request['id']==4 and request['method']=='model/list'
 emit({'id':4,'result':{'data':[{'id':'luna-56','model':'gpt-5.6-luna','displayName':'GPT-5.6-Luna'}], 'nextCursor':None}})

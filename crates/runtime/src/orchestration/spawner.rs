@@ -2751,6 +2751,15 @@ pub trait PreparedSpawn: Send {
         None
     }
 
+    /// Provider-owned execution selected during trusted preparation. This is
+    /// distinct from the model-visible child tool allowlist: a native
+    /// collaborator may be admitted after the original request omitted its
+    /// provider tool. Launch must use the prepared value rather than
+    /// reconstructing it from that original request.
+    fn execution_tool_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Consume the prepared request and register controls synchronously at the
     /// spawner's atomic handle boundary. No I/O starts before the returned
     /// execution future is polled by the child supervisor.
@@ -6598,6 +6607,7 @@ impl DynamicAgentSpawner {
         &self,
         input: &SpawnAgentInput,
         context: &SpawnContext,
+        prepared_execution_tool: Option<&str>,
     ) -> Result<
         (
             astra_turn_core::orchestration_builtin_agents::AgentTypeDefinition,
@@ -6685,10 +6695,12 @@ impl DynamicAgentSpawner {
         let effective_allowed_tools = effective_spawn_allowed_tools(
             input.allowed_tools.as_deref(),
             &agent_def.allowed_tools,
-            input
-                .execution
-                .as_ref()
-                .map(|execution| execution.tool.as_str()),
+            prepared_execution_tool.or_else(|| {
+                input
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.tool.as_str())
+            }),
         );
         let effective_inherited_skills = context.inherited_skills.clone();
         let child_recursion_depth =
@@ -6761,7 +6773,14 @@ impl DynamicAgentSpawner {
                 )?;
             }
             Self::prepare_authorized_model_selection(input, context, parent_selection)?;
-            self.prepare_static_spawn(input, context)?;
+            self.prepare_static_spawn(
+                input,
+                context,
+                input
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.tool.as_str()),
+            )?;
         }
         if self.executor.is_none() {
             return Err(SpawnError::ExecutorUnavailable);
@@ -7276,32 +7295,33 @@ impl DynamicAgentSpawner {
                 )));
             }
         }
-        let static_preparation = match self.prepare_static_spawn(&input, context) {
-            Ok(preparation) => preparation,
-            Err(error) => {
-                let rejection_reason = match &error {
-                    SpawnError::UnknownAgentType(agent_type) => {
-                        format!("unknown agent type: {agent_type}")
-                    }
-                    SpawnError::DepthLimitExceeded(reason) => {
-                        format!("recursion depth limit exceeded: {reason}")
-                    }
-                    SpawnError::NestedForkInheritanceRejected => {
-                        "nested fork inheritance is rejected".to_string()
-                    }
-                    _ => error.to_string(),
-                };
-                self.record_fanout_spawn_rejected_for_input(
-                    fanout_slot.as_ref(),
-                    &input,
-                    context,
-                    reservation_owner_id,
-                    rejection_reason,
-                )
-                .await;
-                return Err(error);
-            }
-        };
+        let static_preparation =
+            match self.prepare_static_spawn(&input, context, preparation.execution_tool_name()) {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    let rejection_reason = match &error {
+                        SpawnError::UnknownAgentType(agent_type) => {
+                            format!("unknown agent type: {agent_type}")
+                        }
+                        SpawnError::DepthLimitExceeded(reason) => {
+                            format!("recursion depth limit exceeded: {reason}")
+                        }
+                        SpawnError::NestedForkInheritanceRejected => {
+                            "nested fork inheritance is rejected".to_string()
+                        }
+                        _ => error.to_string(),
+                    };
+                    self.record_fanout_spawn_rejected_for_input(
+                        fanout_slot.as_ref(),
+                        &input,
+                        context,
+                        reservation_owner_id,
+                        rejection_reason,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
 
         // Enforce fanout boundary: once a parent run uses a fixed-size
         // fanout group, bare spawns in that run are replacement/retry

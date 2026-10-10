@@ -5511,6 +5511,17 @@ fn native_stage_reasoning_is_explicit_and_does_not_inherit_parent_defaults() {
             .is_err()
         );
     }
+    assert_eq!(
+        native_stage_reasoning_arguments(&CollaboratorProvider::Codex, &ThinkingConfig::Off)
+            .unwrap()["effort"],
+        "none"
+    );
+    for provider in [CollaboratorProvider::Claude, CollaboratorProvider::OpenCode] {
+        assert!(
+            native_stage_reasoning_arguments(&provider, &ThinkingConfig::Off).is_err(),
+            "{provider:?} must not silently turn explicit reasoning-off into its default"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5695,6 +5706,7 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
         assert_eq!(native.descriptor, descriptor);
         assert_eq!(native.requested_model.as_deref(), Some("native-model"));
         assert_eq!(native.execution_binding_generation, 7);
+        assert_eq!(prepared[0].execution_tool_name(), Some(tool_name));
         assert!(matches!(
             prepared[1].execution_identity(),
             Some(crate::orchestration::PreparedSpawnIdentity::InternalModel(

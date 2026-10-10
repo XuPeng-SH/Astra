@@ -52,13 +52,13 @@ impl Stage {
                 .is_some_and(|id| !valid(id))
             || stage.model.as_deref().is_some_and(|model| !valid(model))
             || stage.effort.as_deref().is_some_and(|effort| {
-                !matches!(
-                    effort,
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                )
+                !matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max")
             })
         {
             return Err("invalid native OpenCode stage arguments");
+        }
+        if stage.effort.as_deref() == Some("none") {
+            return Err("native OpenCode does not support disabling reasoning; omit effort");
         }
         Ok(stage)
     }
@@ -70,6 +70,8 @@ pub fn schema() -> Value {
     schema["function"]["description"] = json!(
         "Execute one admitted native OpenCode collaborator stage through ACP in the selected CLI workspace. The model is passed through ACP configuration; the acknowledged session and prompt result establish what actually ran. Resume only an exact acknowledged native_session_id. Run, control and deadline authority comes from the invocation, never arguments."
     );
+    schema["function"]["parameters"]["properties"]["effort"]["enum"] =
+        json!(["low", "medium", "high", "xhigh", "max"]);
     schema
 }
 
@@ -837,6 +839,14 @@ mod tests {
         let schema = schema();
         assert_eq!(schema["function"]["name"], TOOL_NAME);
         assert_eq!(schema["function"]["parameters"]["required"][0], "task");
+        assert_eq!(
+            schema["function"]["parameters"]["properties"]["effort"]["enum"],
+            json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert!(
+            Stage::parse(&json!({"task":"review","anchor_run_id":"anchor","effort":"none"}))
+                .is_err()
+        );
     }
 
     #[test]

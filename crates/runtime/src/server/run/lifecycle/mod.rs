@@ -21692,7 +21692,12 @@ fn native_stage_reasoning_arguments(
     use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
     let effort = match thinking {
         ThinkingConfig::ModelDefault => return Ok(Map::new()),
-        ThinkingConfig::Off => "none",
+        ThinkingConfig::Off if *provider == astra_services::runs::CollaboratorProvider::Codex => {
+            "none"
+        }
+        ThinkingConfig::Off => {
+            return Err("selected native provider does not support disabling reasoning".into());
+        }
         ThinkingConfig::Adaptive {
             effort: ThinkingEffort::Low,
         } => "low",
@@ -21991,6 +21996,13 @@ impl PreparedSpawn for ServerPreparedSpawn {
                     native.stage_admission.anchor_run_id.clone()
                 })
             }
+            ServerPreparedExecution::Internal(_) => None,
+        }
+    }
+
+    fn execution_tool_name(&self) -> Option<&str> {
+        match &self.execution {
+            ServerPreparedExecution::Native(native) => Some(native.tool_name.as_str()),
             ServerPreparedExecution::Internal(_) => None,
         }
     }
@@ -23424,15 +23436,23 @@ impl ServerSubRunExecutor {
             serde_json::to_string(&native.arguments).map_err(|error| invalid(error.to_string()))?;
         // A missing run wall-clock budget means unbounded foreground work; it
         // must not make a native child unusable. The Edge transport still
-        // supplies its own bounded invocation deadline. Keep only each
-        // pre-dispatch permission/mailbox control operation bounded when the
-        // parent has no run deadline.
+        // supplies its own bounded invocation deadline. Reuse the same
+        // foreground/background approval policy as ordinary headless tools,
+        // then clamp it to any remaining stage budget.
         let stage_work_deadline = config
             .execution_deadline
             .map(|deadline| tokio::time::Instant::from_std(deadline.monotonic_work_deadline()));
+        let configured_permission_timeout =
+            crate::turn::agentic::headless_round::effective_permission_timeout(
+                state.permission_context.as_ref(),
+            )
+            .await;
         let permission_timeout = stage_work_deadline
-            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
-            .unwrap_or_else(|| Duration::from_secs(5));
+            .map(|deadline| {
+                configured_permission_timeout
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            })
+            .unwrap_or(configured_permission_timeout);
         if permission_timeout.is_zero() {
             return Err(invalid(
                 "native stage execution budget expired before permission admission".into(),
@@ -23517,6 +23537,7 @@ impl ServerSubRunExecutor {
             }),
             None,
             None,
+            plan_mode_active,
         );
         let edge_agent_id = match &association.association.execution_boundary {
             astra_services::runs::CollaboratorExecutionBoundary::UserRunner { .. } => {
@@ -23575,6 +23596,29 @@ impl ServerSubRunExecutor {
                             lease.defer(true);
                             continue;
                         };
+                        // Steering is a provider action, not merely mailbox
+                        // delivery. Recheck the canonical durable boundary
+                        // immediately before sending so a pause that arrived
+                        // after the local watcher update cannot reach Codex.
+                        match crate::turn::agentic_loop::execution_phase::
+                            authorize_provider_boundary(state)
+                            .await?
+                        {
+                            crate::turn::agentic_loop::execution_phase::ProviderBoundaryGate::Authorized => {}
+                            crate::turn::agentic_loop::execution_phase::ProviderBoundaryGate::Paused => {
+                                if crate::turn::agentic_loop::lifecycle::wait_for_pause_clear_or_cancel(
+                                    host, state,
+                                )
+                                .await?
+                                {
+                                    mailbox_enabled = false;
+                                }
+                                if !mailbox_enabled {
+                                    lease.defer(true);
+                                    continue;
+                                }
+                            }
+                        }
                         let delivered = pool
                             .deliver_provider_stage_input(
                                 &identity,
