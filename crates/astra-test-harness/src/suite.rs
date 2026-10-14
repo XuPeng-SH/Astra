@@ -1404,7 +1404,17 @@ impl<'a> SuiteRunner<'a> {
 
         loop {
             tokio::select! {
-                report = &mut execution => return report,
+                report = &mut execution => {
+                    if let Some(ref tx) = self.dashboard_tx {
+                        let _ = tx.send(crate::dashboard::DashboardEvent::CaseProgress {
+                            run_id: run_id.to_string(), case_name: case.name.clone(),
+                            model: model.to_string(), run_index, phase: "settled".into(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            sequence: crate::dashboard::next_dashboard_event_sequence(),
+                        });
+                    }
+                    return report;
+                },
                 _ = heartbeat.tick() => {
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     eprintln!(
@@ -1804,6 +1814,66 @@ mod tests {
             );
         }
         assert_eq!(case.prompt, "root {{model}}");
+    }
+
+    #[tokio::test]
+    async fn public_runner_progress_is_incremental_before_suite_publication() {
+        let exec = FakeExecutor::new();
+        exec.seed("passing", "m", outcome_ok("m", "answer", &[]));
+        exec.seed("failing", "m", outcome_ok("m", "answer", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observer = tokio::spawn(crate::progress::observe(
+            std::fs::File::create(&path).unwrap(),
+            rx,
+            cancel.clone(),
+        ));
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new("astra").with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: Some(tx.clone()),
+            run_id: "cli".into(),
+            cancel_flag: Some(cancel.clone()),
+        };
+        let report = runner
+            .run_all(&[
+                case_with("passing", vec![]),
+                case_with(
+                    "failing",
+                    vec![Criterion::TextContains {
+                        needle: "private-sentinel".into(),
+                    }],
+                ),
+            ])
+            .await;
+        tokio::task::yield_now().await;
+        let prefix = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(prefix.matches("case_completed").count(), 2);
+        assert!(!prefix.contains("private-sentinel"));
+        assert!(!prefix.contains("suite_completed"));
+        tx.send(crate::dashboard::DashboardEvent::SuiteCompleted {
+            run_id: "cli".into(),
+            report: Arc::new(report),
+            sequence: crate::dashboard::next_dashboard_event_sequence(),
+        })
+        .unwrap();
+        observer.await.unwrap().unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("suite_completed")
+        );
+        assert!(!cancel.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2928,6 +2998,7 @@ mod tests {
                 "suite_started",
                 "case_queued",
                 "case_started",
+                "case_progress",
                 "case_completed"
             ],
             "a case must never look started before its queue admission is visible"

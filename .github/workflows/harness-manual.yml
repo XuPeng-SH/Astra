@@ -157,6 +157,7 @@ jobs:
           CASE_FILTER: ${{ inputs.filter }}
           CASE_RUNS: ${{ inputs.runs }}
         run: |
+          run_started=$(date +%s)
           workspace="$RUNNER_TEMP/harness/workspace"
           git clone --quiet --no-hardlinks --no-checkout "$GITHUB_WORKSPACE" "$workspace"
           git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin/ |
@@ -166,14 +167,17 @@ jobs:
           git -C "$workspace" remote set-url origin "$(git remote get-url origin)"
           git -C "$workspace" checkout --quiet --detach "$ASTRA_BUILD_SOURCE_GIT_SHA"
           sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
-          ./target/debug/astra-test \
+          python3 scripts/harness/process_supervisor.py run \
+            --owner-pid "$$" --identity "manual-glm-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}" -- \
+            python3 scripts/ci/manual_harness.py run \
+            --root "$RUNNER_TEMP/harness" --started-at "$run_started" \
+            --timeout-seconds 3300 --grace-seconds 120 -- ./target/debug/astra-test \
             --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
             --suite "$GITHUB_WORKSPACE/crates/astra-test-harness/cases" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
             --filter "$CASE_FILTER" --force-model glm-5.3 \
             --judger-model glm-5.3 --parallel 1 --runs "$CASE_RUNS" \
-            --report-file "$RUNNER_TEMP/harness/report.json" \
-            > "$RUNNER_TEMP/harness/harness.log" 2>&1
+            --report-file "$RUNNER_TEMP/harness/report.json"
 
       - name: Diagnose failure without exposing provider responses
         if: ${{ failure() }}
@@ -228,73 +232,10 @@ jobs:
 
       - name: Publish safe result summary
         if: ${{ always() }}
+        env:
+          HARNESS_OUTCOME: ${{ steps.harness.outcome }}
         run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path(os.environ["RUNNER_TEMP"]) / "harness"
-          if not (root / "report.json").is_file():
-              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
-                  out.write("Harness did not produce a report. Check the failed setup/run step; this is not a pass.\n")
-              # Report persistence is only a warning in astra-test; this CI gate must fail closed.
-              raise SystemExit(1)
-          import math
-
-          def safe_criteria(criteria):
-              if not isinstance(criteria, list):
-                  raise ValueError("invalid criteria collection")
-              projected = []
-              for c in criteria:
-                  kind, severity, score = c["criterion"]["type"], c["severity"], c.get("score")
-                  if (not isinstance(kind, str) or severity not in ("hard", "soft", "quality")
-                      or type(c["passed"]) is not bool
-                      or (score is not None and (type(score) not in (int, float) or not math.isfinite(score)))):
-                      raise ValueError("invalid criterion fields")
-                  judge = kind in ("judger", "hard_judger")
-                  projected.append({"type": kind, "severity": severity, "score": score,
-                                    "passed": None if kind == "judger" and score is None else c["passed"],
-                                    "evaluation": "scored" if judge and score is not None else
-                                                  "unscored" if kind == "judger" else "reported"})
-              return projected
-
-          # Do not upload arbitrary provider responses, prompts, stderr or session archives.
-          metrics = ("duration_ms", "ttft_ms", "turn_rounds", "tool_calls_count",
-                     "prompt_tokens", "cached_input_tokens", "cache_creation_tokens", "completion_tokens")
-          try:
-              report = json.loads((root / "report.json").read_text())
-              if not isinstance(report, dict) or not isinstance(report.get("runs"), list):
-                  raise ValueError("invalid run collection")
-              rows = []
-              for r in report["runs"]:
-                  failure = r.get("failure_class")
-                  # Externally tagged Rust enum: retain the variant, never the provider payload.
-                  if isinstance(failure, dict):
-                      failure = next(iter(failure))
-                  steps = []
-                  raw_steps = r.get("steps", [])
-                  if not isinstance(raw_steps, list):
-                      raise ValueError("invalid step collection")
-                  for step in raw_steps:
-                      if type(step["step_index"]) is not int or step["step_index"] < 0 or type(step["passed"]) is not bool:
-                          raise ValueError("invalid step fields")
-                      steps.append({"step_index": step["step_index"], "passed": step["passed"],
-                                    "criteria": safe_criteria(step.get("criteria", []))})
-                  rows.append({"case": r["case_name"], "status": r["status"], "run_index": r["run_index"],
-                               "failure_class": failure, "exit_code": r["outcome"]["exit_code"],
-                               "criteria": safe_criteria(r.get("criteria", [])), "steps": steps,
-                               "token_usage_coverage": r["outcome"].get("token_usage_coverage"),
-                               "terminal_reported": {k: r["outcome"][k] for k in metrics}})
-          except (ValueError, KeyError, TypeError, OverflowError):
-              raise SystemExit("Invalid harness report; safe summary was not published") from None
-          summary = {"commit": os.environ["ASTRA_BUILD_SOURCE_GIT_SHA"], "model": "glm-5.3", "runs": rows,
-                     "wall_time_ms": report.get("wall_time_ms"),
-                     "accounting": "Terminal counters, not certified complete task-tree cost; absent cache coverage is unknown."}
-          (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
-              out.write("## GLM-5.3 harness\n\n" + str(len(rows)) + " case runs; " +
-                        str(sum(r["status"] == "passed" for r in rows)) + " passed.\n\n")
-              out.write("See summary.json for terminal-reported timing/token/cache counters. Missing coverage is not zero.\n")
-          PY
+          python3 scripts/ci/manual_harness.py summary --root "$RUNNER_TEMP/harness"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
@@ -302,6 +243,7 @@ jobs:
           name: harness-glm-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/harness/summary.json
+            ${{ runner.temp }}/harness/progress.safe.jsonl
             ${{ runner.temp }}/harness/binaries.sha256
             ${{ runner.temp }}/harness/diagnostic.json
             ${{ runner.temp }}/harness/report.preflight.json

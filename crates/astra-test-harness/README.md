@@ -225,6 +225,34 @@ Historical-fixture cases still require that history to exist in the selected
 repository. Filters match case names,
 not filenames. No match, unavailable cases and failed cases are not passes.
 
+During execution, Actions displays each case's start, periodic elapsed-time
+heartbeat, terminal result, harness lifecycle duration, error classification,
+failed root/step checks and cumulative counts. A heartbeat proves the harness
+is still waiting, not that the model is making progress. For example:
+
+```text
+[harness] PASSED [12/63] "delegation / glm-5.3 / run 1" · 62.90s · exit=0 · error=none · counts: 10 passed, 2 failed, 0 cancelled, 0 unavailable
+```
+
+The inner run budget is 55 minutes, followed by up to two minutes for existing
+cancellation and settlement before the outer 60-minute Actions limit. Completed
+results are saved incrementally; timeout/crash summaries retain completed rows,
+the last observed active case/elapsed time and queued cases. Unfinished cases
+remain unfinished, not passing or falsely certified as cancelled. Follow-up
+turns are shown under their owning case, not counted as additional cases.
+Deadline termination is unsuccessful even if its completed rows passed.
+The CI command runs inside the existing Linux harness process supervisor, so
+separately grouped or daemonized descendants are also reaped after hard stop.
+Final success requires the supervised Actions step to succeed, not merely a
+complete-looking inner report. The CI helper refuses unsupervised execution.
+
+`astra-test --progress-file PATH` opts into this same secret-free, versioned
+JSONL stream; it requires a new file and cannot be combined with dashboard mode.
+The CLI drains its observer before normal or failing suite exit. Observation
+loss or file-write failure cancels via the existing runner and fails closed.
+Selected custom source revisions must support this option and the repository
+helper; unsupported sources fail explicitly, without an old-log fallback.
+
 The registered model uses the local GLM-5.3 deployment's declared
 `reasoning_effort` protocol, 128,000-token context and 84,000-token output
 ceiling. Prices are deliberately omitted: supply deployment pricing separately
@@ -266,6 +294,12 @@ uploaded, because they may contain sensitive provider responses. A setup failure
 without a report fails the workflow. Safe failure diagnostics retain local
 Server readiness status, model registration/activation, lookup exit code and
 step outcomes, without retaining arbitrary provider error text.
+Artifacts also contain a validated safe progress prefix (`progress.safe.jsonl`)
+and complete or explicitly incomplete `summary.json`. A truncated trailing
+record or malformed stream never erases previously validated results and never
+turns an incomplete run into a pass. Raw progress input is not uploaded if its
+schema cannot be certified. Timing distinguishes whole-case lifecycle elapsed
+from agent-reported duration; token counters keep the existing coverage limits.
 
 ```sh
 # Local smoke: one case, no judger, parallel 4
