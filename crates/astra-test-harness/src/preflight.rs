@@ -37,6 +37,22 @@ pub enum PreflightError {
     ProbeWorkspaceUnavailable { detail: String },
 }
 
+impl PreflightError {
+    /// Stable public classification; never contains provider or credential text.
+    pub fn failure_class(&self) -> &'static str {
+        match self {
+            Self::BinaryNotFound => "binary_not_found",
+            Self::BinaryNotExecutable => "binary_not_executable",
+            Self::BuildIdentity { .. } => "build_identity",
+            Self::ServerUnreachable { .. } => "server_unreachable",
+            Self::ServerUnready { .. } => "server_unready",
+            Self::AuthFailed { .. } => "auth_failed",
+            Self::ModelUnavailable { .. } => "model_unavailable",
+            Self::ProbeWorkspaceUnavailable { .. } => "probe_workspace_unavailable",
+        }
+    }
+}
+
 const OWNER_READINESS_PROBE_USER: &str = "astra-owner-readiness-probe";
 const OWNER_READINESS_PROBE_QUERY: &str = "__astra_owner_auth_readiness_probe__";
 const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -59,6 +75,7 @@ pub fn write_preflight_result(
         "status": if result.is_ok() { "passed" } else { "failed" },
         "models": models,
         "unavailable_model": unavailable,
+        "failure_class": result.as_ref().err().map(PreflightError::failure_class),
     });
     std::fs::write(report.with_extension("preflight.json"), summary.to_string())
 }
@@ -1059,6 +1076,12 @@ mod tests {
                 model: "glm-5.2".into(),
                 detail: "private-provider-sentinel".into(),
             }),
+            Err(super::PreflightError::BuildIdentity {
+                detail: "private-provider-sentinel".into(),
+            }),
+            Err(super::PreflightError::AuthFailed {
+                detail: "private-provider-sentinel".into(),
+            }),
         ] {
             super::write_preflight_result(Some(&report), &models, &result).unwrap();
             let raw = std::fs::read_to_string(report.with_extension("preflight.json")).unwrap();
@@ -1066,15 +1089,24 @@ mod tests {
             let summary: serde_json::Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(summary["models"], serde_json::json!(models));
             assert_eq!(
+                summary["failure_class"],
+                serde_json::json!(
+                    result
+                        .as_ref()
+                        .err()
+                        .map(super::PreflightError::failure_class)
+                )
+            );
+            assert_eq!(
                 summary["status"],
                 if result.is_ok() { "passed" } else { "failed" }
             );
             assert_eq!(
                 summary["unavailable_model"],
-                if result.is_ok() {
-                    serde_json::Value::Null
-                } else {
+                if matches!(result, Err(super::PreflightError::ModelUnavailable { .. })) {
                     serde_json::json!("glm-5.2")
+                } else {
+                    serde_json::Value::Null
                 }
             );
         }

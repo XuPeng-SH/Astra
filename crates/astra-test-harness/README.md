@@ -321,6 +321,10 @@ is still waiting, not that the model is making progress. For example:
 [harness] PASSED [12/63] "delegation / glm-5.3 / run 1" · 62.90s · exit=0 · error=none · counts: 10 passed, 2 failed, 0 cancelled, 0 unavailable
 ```
 
+If preflight fails before any case event, its typed `failure_class` is retained
+in `report.preflight.json` and printed in the final Actions summary. Private
+provider messages and raw harness logs are not published to diagnose that failure.
+
 The inner run budget is 55 minutes, followed by up to two minutes for existing
 cancellation and settlement before the outer 60-minute Actions limit. Completed
 results are saved incrementally; timeout/crash summaries retain completed rows,

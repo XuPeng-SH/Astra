@@ -58,6 +58,24 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_preflight_without_case_events_exposes_only_typed_failure(self):
+        for failure in ("build_identity", "auth_failed", "server_unready", "private-sentinel",
+                        ["private-sentinel"]):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "report.preflight.json").write_text(json.dumps({
+                    "status": "failed", "failure_class": failure,
+                    "detail": "private-sentinel", "models": ["private-sentinel"]}))
+                (root / "harness.log").write_text("private-sentinel")
+                code, summary = self.publish(root, "failure", cli=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["counts"]["completed"], 0)
+                self.assertFalse(summary["success"])
+                self.assertEqual(summary.get("preflight_failure"),
+                                 failure if isinstance(failure, str) and failure != "private-sentinel" else None)
+                self.assertNotIn("private-sentinel", (root / "summary.json").read_text()
+                                 + (root / "job-summary").read_text())
+
     def publish(self, root, outcome="success", *, cli=False):
         with patch.dict(os.environ, {"ASTRA_BUILD_SOURCE_GIT_SHA":SHA, "GITHUB_STEP_SUMMARY":str(root / "job-summary"),
                                     "HARNESS_OUTCOME":outcome}):

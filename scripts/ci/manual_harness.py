@@ -344,6 +344,26 @@ def publish(root):
     if outcome not in ("success", "failure", "cancelled", "skipped"):
         outcome = None
     summary = replay.summary(execution, outcome)
+    # Preflight runs before the first progress event. Publish only its typed
+    # classification, never the private harness log or arbitrary error detail.
+    preflight_failure = None
+    try:
+        with (root / "report.preflight.json").open("rb") as source:
+            raw = source.read(16_385)
+        if len(raw) <= 16_384:
+            facts = json.loads(raw, object_pairs_hook=unique_fields)
+            if isinstance(facts, dict) and facts.get("status") == "failed":
+                failure = facts.get("failure_class")
+                if failure in ("binary_not_found", "binary_not_executable", "build_identity",
+                               "server_unreachable", "server_unready", "auth_failed",
+                               "model_unavailable", "probe_workspace_unavailable"):
+                    preflight_failure = failure
+    except (OSError, ValueError, TypeError, RecursionError):
+        pass
+    if preflight_failure:
+        summary["preflight_failure"] = preflight_failure
+        summary["success"] = False
+        print(f"[harness] Preflight failed: {preflight_failure}. No case pass is certified.", flush=True)
     write_json(root / "summary.json", summary)
     (root / "progress.safe.jsonl").write_bytes(b"".join(replay.records))
     def cell(value):
@@ -354,6 +374,8 @@ def publish(root):
                   "; termination: " + cell(execution["termination"]) + ".\n\n")
         if summary["incomplete_reason"]:
             out.write("Observation: " + cell(summary["incomplete_reason"]) + ".\n\n")
+        if preflight_failure:
+            out.write("Preflight failure: `" + preflight_failure + "`. No case pass is certified.\n\n")
         out.write("Counts: `" + json.dumps(summary["counts"]) + "`\n\n")
         out.write("| Case / model / repetition | Result | Case elapsed | Error class |\n|---|---|---:|---|\n")
         for row in summary["runs"]:
