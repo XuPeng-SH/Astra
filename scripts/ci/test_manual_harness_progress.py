@@ -31,7 +31,8 @@ def row(name, status="passed"):
     return {"case":name, "model":"model", "run_index":0, "status":status,
             "has_warnings":False, "failure_class":None if status == "passed" else "Unknown",
             "exit_code":0 if status == "passed" else 1, "criteria":checks,
-            "steps":[{"step_index":0, "passed":status == "passed", "duration_ms":100, "criteria":checks}],
+            "steps":[{"step_index":0, "passed":status == "passed", "duration_ms":100,
+                      "criteria":[dict(c) for c in checks]}],
             "token_usage_coverage":None, "terminal_reported":dict.fromkeys(h.METRICS, 10)}
 
 
@@ -57,10 +58,11 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
-    def publish(self, root, outcome="success"):
+    def publish(self, root, outcome="success", *, cli=False):
         with patch.dict(os.environ, {"ASTRA_BUILD_SOURCE_GIT_SHA":SHA, "GITHUB_STEP_SUMMARY":str(root / "job-summary"),
                                     "HARNESS_OUTCOME":outcome}):
-            code = h.publish(root)
+            code = subprocess.run([sys.executable, str(SCRIPT), "summary", "--root", str(root)],
+                                  capture_output=True, timeout=5).returncode if cli else h.publish(root)
         return code, json.loads((root / "summary.json").read_text())
 
     def test_terminal_statuses_and_grading_are_preserved_without_full_report(self):
@@ -132,6 +134,65 @@ class ManualHarnessProgressTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             replay.accept({**events(("passed",))[1], "sequence":3, "case":"excess-case"})
 
+    def test_required_check_consistency_at_each_owner_without_regrading(self):
+        for scope in ("root", "step"):
+            for severity in ("hard", "soft", "quality"):
+                for status in ("passed", "failed"):
+                    with self.subTest(scope=scope, severity=severity, status=status), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        data = events((status,))
+                        result = next(e["row"] for e in data if e["type"] == "case_completed")
+                        # A failed case can still have a passed step; only the owner matters.
+                        result["steps"][0]["passed"] = True
+                        for checks in (result["criteria"], result["steps"][0]["criteria"]):
+                            checks[1]["passed"] = True
+                        checks = result["criteria"] if scope == "root" else result["steps"][0]["criteria"]
+                        checks[1].update(severity=severity, passed=False)
+                        write_events(root, data)
+                        (root / "execution.json").write_text(json.dumps({"exit_code":0, "termination":"finished"}))
+                        code, summary = self.publish(root)
+                        invalid = severity == "hard" and (scope == "step" or status == "passed")
+                        self.assertEqual(summary["observation_error"], "invalid_progress" if invalid else None)
+                        self.assertEqual(summary["complete"], not invalid)
+                        self.assertEqual(code, 0 if not invalid and status == "passed" else 1)
+                        if not invalid:
+                            self.assertEqual(summary["runs"][0]["status"], status)
+
+    def test_malformed_tail_preserves_accepted_state_and_safe_prefix(self):
+        data = events(("passed", "passed", "passed"))
+        for event in data:
+            item = event.get("row", event)
+            if item.get("case") == "case-0":
+                item["case"] += " 中文"
+        end = next(i for i,e in enumerate(data) if e["type"] == "case_started" and e["case"] == "case-1") + 1
+        prefix = data[:end]  # One completed, one active, one queued.
+        poison = {**data[end], "phase":chr(0xd800)}
+        tails = [b'[' * 20000 + b'0' + b']' * 20000 + b'\n', json.dumps(poison).encode()+b'\n']
+        tails.extend(json.dumps({**data[end], "elapsed_ms":v}).encode()+b'\n' for v in (1 << 64, 10**400))
+        for tail in tails:
+            with self.subTest(tail_bytes=len(tail)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                write_events(root, prefix)
+                replay = h.Replay(SHA)
+                replay.read(root / "progress.jsonl")
+                baseline = (replay.sequence, replay.offset, replay.summary({}), list(replay.records))
+                write_events(root, prefix, tail + json.dumps(data[end]).encode()+b'\n')
+                replay.read(root / "progress.jsonl", final=True)
+                self.assertEqual(replay.error, "invalid_progress")
+                self.assertEqual((replay.sequence, replay.offset, replay.records), (baseline[0], baseline[1], baseline[3]))
+                self.assertEqual(replay.summary({})["running"], baseline[2]["running"])
+                code, summary = self.publish(root, cli=True)
+                self.assertEqual(code, 1)
+                self.assertFalse(summary["success"])
+                self.assertEqual(summary["counts"], baseline[2]["counts"])
+                self.assertEqual((root / "progress.safe.jsonl").read_bytes(), b''.join(baseline[3]))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_events(root, prefix + [{**data[end], "elapsed_ms":(1 << 64) - 1}])
+            _, summary = self.publish(root, cli=True)
+            self.assertIsNone(summary["observation_error"])
+            self.assertEqual(summary["running"][0]["elapsed_ms"], (1 << 64) - 1)
+
     def stub(self, root, mode):
         fixture = root / "fixture.json"
         data = events()
@@ -168,6 +229,8 @@ if mode=='detached':
         root.joinpath('detached.pid').write_text(str(os.getpid()))
         while True: time.sleep(.05)
 emit(data['prefix'])
+if mode=='malformed':
+    with out.open('a') as f: f.write(json.dumps(dict(data['all'][len(data['prefix'])],phase=chr(0xd800)))+'\\n'); f.flush()
 if mode=='graceful':
     def stop(sig,frame): emit(data['cancel']); raise SystemExit(0)
     signal.signal(signal.SIGINT,stop)
@@ -183,7 +246,8 @@ while True: time.sleep(.05)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_actual_supervisor_live_output_graceful_stop_and_hard_kill(self):
-        for mode, expected, complete in [("success",0,True), ("graceful",124,True), ("stuck",124,False), ("unsupported",2,False)]:
+        for mode, expected, complete in [("success",0,True), ("graceful",124,True), ("stuck",124,False), ("unsupported",2,False),
+                                         ("malformed",1,False)]:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 launcher = self.stub(root, mode)
@@ -207,6 +271,10 @@ while True: time.sleep(.05)
                 if mode == "stuck":
                     self.assertEqual(summary["counts"]["running"], 1)
                     self.assertEqual(summary["counts"]["cancelled"], 0)
+                if mode == "malformed":
+                    self.assertEqual(summary["observation_error"], "invalid_progress")
+                    self.assertEqual(summary["counts"]["passed"], 1)
+                    self.assertEqual(summary["running"][0]["elapsed_ms"], 0)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_user_cancel_is_forwarded_and_has_a_distinct_nonpassing_exit(self):

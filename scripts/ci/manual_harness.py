@@ -20,7 +20,7 @@ METRICS = ("duration_ms", "ttft_ms", "turn_rounds", "tool_calls_count", "prompt_
 
 
 def integer(value):
-    if type(value) is not int or value < 0:
+    if type(value) is not int or not 0 <= value <= (1 << 64) - 1:
         raise ValueError("invalid integer")
     return value
 
@@ -40,7 +40,7 @@ def unique_fields(pairs):
     return fields
 
 
-def safe_criteria(items):
+def safe_criteria(items, *, owner_passed):
     if not isinstance(items, list):
         raise ValueError("invalid criteria")
     for item in items:
@@ -60,6 +60,8 @@ def safe_criteria(items):
         expected = "scored" if judge and item["score"] is not None else "unscored" if unscored else "reported"
         if item["evaluation"] != expected or (item["passed"] is None) != unscored:
             raise ValueError("contradictory grading provenance")
+        if owner_passed and item["severity"] == "hard" and item["passed"] is False:
+            raise ValueError("passed owner contradicts required check")
     return items
 
 
@@ -72,7 +74,7 @@ def safe_row(row):
         raise ValueError("invalid terminal row")
     if row["failure_class"] is not None:
         identity(row["failure_class"])
-    safe_criteria(row["criteria"])
+    safe_criteria(row["criteria"], owner_passed=row["status"] == "passed")
     if not isinstance(row["steps"], list) or set(row["terminal_reported"]) != set(METRICS):
         raise ValueError("invalid steps or metrics")
     for value in row["terminal_reported"].values():
@@ -81,10 +83,8 @@ def safe_row(row):
         if set(step) != {"step_index", "passed", "duration_ms", "criteria"} or type(step["passed"]) is not bool:
             raise ValueError("unexpected step payload")
         integer(step["step_index"]), integer(step["duration_ms"])
-        safe_criteria(step["criteria"])
-    if row["status"] == "passed" and (
-        any(c["severity"] == "hard" and c["passed"] is False for c in row["criteria"])
-        or any(not step["passed"] for step in row["steps"])):
+        safe_criteria(step["criteria"], owner_passed=step["passed"])
+    if row["status"] == "passed" and any(not step["passed"] for step in row["steps"]):
         raise ValueError("passed status contradicts canonical checks")
     coverage = row["token_usage_coverage"]
     if coverage is not None:
@@ -190,13 +190,15 @@ class Replay:
                     break
                 try:
                     event = json.loads(line, object_pairs_hook=unique_fields)
+                    # Prepare publishable bytes before acceptance can change replay state.
+                    record = json.dumps(event, ensure_ascii=False, allow_nan=False).encode()+b"\n"
                     self.accept(event)
-                except (ValueError, KeyError, TypeError, AttributeError):
+                except (ValueError, KeyError, TypeError, AttributeError, RecursionError, OverflowError):
                     self.error = "invalid_progress"
                     break
                 if self.error:
                     break
-                self.records.append(json.dumps(event, ensure_ascii=False, allow_nan=False).encode()+b"\n")
+                self.records.append(record)
                 self.offset += len(line)
                 if emit:
                     self.print_event(event)
