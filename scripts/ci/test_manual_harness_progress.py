@@ -136,7 +136,9 @@ class ManualHarnessProgressTests(unittest.TestCase):
 
     def test_required_check_consistency_at_each_owner_without_regrading(self):
         for scope in ("root", "step"):
-            for severity in ("hard", "soft", "quality"):
+            for kind, severity, score, evaluation in (("hard_judger", "hard", None, "reported"),
+                                                      ("duration_between", "soft", None, "reported"),
+                                                      ("judger", "quality", 0.0, "scored")):
                 for status in ("passed", "failed"):
                     with self.subTest(scope=scope, severity=severity, status=status), tempfile.TemporaryDirectory() as tmp:
                         root = Path(tmp)
@@ -147,7 +149,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                         for checks in (result["criteria"], result["steps"][0]["criteria"]):
                             checks[1]["passed"] = True
                         checks = result["criteria"] if scope == "root" else result["steps"][0]["criteria"]
-                        checks[1].update(severity=severity, passed=False)
+                        checks[1].update(type=kind, severity=severity, score=score, evaluation=evaluation, passed=False)
                         write_events(root, data)
                         (root / "execution.json").write_text(json.dumps({"exit_code":0, "termination":"finished"}))
                         code, summary = self.publish(root)
@@ -157,6 +159,38 @@ class ManualHarnessProgressTests(unittest.TestCase):
                         self.assertEqual(code, 0 if not invalid and status == "passed" else 1)
                         if not invalid:
                             self.assertEqual(summary["runs"][0]["status"], status)
+
+    def test_judge_severity_contradictions_preserve_prefix_regardless_of_verdict(self):
+        for kind, correct in (("hard_judger", "hard"), ("judger", "quality")):
+            verdicts = (("passed", True), ("passed", False), ("failed", True), ("failed", False))
+            if kind == "judger":
+                verdicts += (("passed", None), ("failed", None))
+            for severity in (s for s in ("hard", "soft", "quality") if s != correct):
+                for scope in ("root", "step"):
+                    for status, passed in verdicts:
+                        with self.subTest(kind=kind, severity=severity, scope=scope, status=status, passed=passed), tempfile.TemporaryDirectory() as tmp:
+                            root = Path(tmp)
+                            data = events(("passed", status, "passed"))
+                            end = next(i for i,e in enumerate(data) if e["type"] == "case_completed" and e["row"]["case"] == "case-1")
+                            result = data[end]["row"]
+                            checks = result["criteria"] if scope == "root" else result["steps"][0]["criteria"]
+                            checks[1].update(type=kind, severity=severity, passed=passed,
+                                             score=0.5 if kind == "judger" and passed is not None else None,
+                                             evaluation="scored" if kind == "judger" and passed is not None else
+                                                        "unscored" if kind == "judger" else "reported")
+                            write_events(root, data[:end])
+                            baseline = h.Replay(SHA)
+                            baseline.read(root / "progress.jsonl")
+                            write_events(root, data)
+                            code, summary = self.publish(root)
+                            self.assertEqual(code, 1)
+                            self.assertEqual(summary["observation_error"], "invalid_progress")
+                            self.assertFalse(summary["complete"])
+                            self.assertFalse(summary["success"])
+                            self.assertEqual(summary["counts"], baseline.counts())
+                            self.assertEqual(summary["running"], list(baseline.active.values()))
+                            self.assertEqual(summary["waiting"], list(baseline.queued.values()))
+                            self.assertEqual((root / "progress.safe.jsonl").read_bytes(), b''.join(baseline.records))
 
     def test_malformed_tail_preserves_accepted_state_and_safe_prefix(self):
         data = events(("passed", "passed", "passed"))

@@ -190,7 +190,7 @@ pub async fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{criteria::CriterionSeverity, report::StepResult, runner::RunOutcome};
+    use crate::{report::StepResult, runner::RunOutcome};
 
     #[test]
     fn terminal_projection_preserves_grading_and_excludes_every_private_payload() {
@@ -233,10 +233,10 @@ mod tests {
         ]
         .into_iter()
         .map(|(criterion, score, passed)| CriterionResult {
+            severity: crate::criteria::criterion_severity(&criterion),
             criterion,
             passed,
             score,
-            severity: CriterionSeverity::Hard,
             detail: "private-sentinel".into(),
             full_detail: Some("private-sentinel".into()),
         })

@@ -56,6 +56,8 @@ def safe_criteria(items, *, owner_passed):
         # Validate the producer's schema contract; never recompute a grade or threshold.
         advisory = item["type"] == "judger"
         judge = advisory or item["type"] == "hard_judger"
+        if judge and item["severity"] != ("quality" if advisory else "hard"):
+            raise ValueError("contradictory judge severity")
         unscored = advisory and item["score"] is None
         expected = "scored" if judge and item["score"] is not None else "unscored" if unscored else "reported"
         if item["evaluation"] != expected or (item["passed"] is None) != unscored:

@@ -1498,7 +1498,11 @@ esac
                 matches!(error, super::PreflightError::BuildIdentity { .. }),
                 "{error}"
             );
-            assert_eq!(std::fs::read_to_string(&calls).unwrap(), expected_calls);
+            assert_eq!(
+                std::fs::read_to_string(&calls)
+                    .unwrap_or_else(|failure| panic!("{failure}; probe failed with {error}")),
+                expected_calls
+            );
             std::fs::remove_file(&calls).unwrap();
         }
     }
