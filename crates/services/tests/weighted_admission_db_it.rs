@@ -427,13 +427,13 @@ async fn owner_usage_aggregation_preserves_case_sensitive_identity() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;
     let controller =
-        DatabaseWeightedAdmissionController::new(pool, limits_with_owner(2, 1)).unwrap();
+        DatabaseWeightedAdmissionController::new(pool.clone(), limits_with_owner(2, 1)).unwrap();
     let upper = controller
         .try_reserve(
             &key("CaseOwner"),
             work(),
             Duration::from_secs(30),
-            "case-upper",
+            "case-shared-turn",
         )
         .await
         .expect("first owner reservation");
@@ -442,11 +442,24 @@ async fn owner_usage_aggregation_preserves_case_sensitive_identity() {
             &key("caseowner"),
             work(),
             Duration::from_secs(30),
-            "case-lower",
+            "case-shared-turn",
         )
         .await
         .expect("case-distinct owner must retain its own share");
     upper.release().await.expect("upper owner release");
+    let lower_usage: i64 = sqlx::query_scalar(
+        "SELECT CAST(provider_slots AS SIGNED) FROM session_weighted_admission_owner_usage
+         WHERE scope_name = ? AND isolation_domain = 'server'
+           AND owner_user_id = 'caseowner' AND BINARY owner_user_id = BINARY 'caseowner'",
+    )
+    .bind(ADMISSION_SCOPE)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        lower_usage, 1,
+        "releasing CaseOwner must not decrement caseowner"
+    );
     lower.release().await.expect("lower owner release");
 }
 
@@ -1192,6 +1205,196 @@ async fn repeated_gate_timeouts_do_not_exhaust_waiter_pool() {
         .expect("release durable gate holder");
     waiter_pool.close().await;
     reset_admission_scope(&holder_pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(admission_scope)]
+async fn expiry_frontier_is_conservative_across_shorter_renewal_and_release() {
+    let pool = common::setup_pool().await;
+    reset_admission_scope(&pool).await;
+    let controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(4)).unwrap();
+    let long = controller
+        .try_reserve(&key("long"), work(), Duration::from_secs(900), "long")
+        .await
+        .unwrap();
+    let early = controller
+        .try_reserve(&key("early"), work(), Duration::from_secs(300), "early")
+        .await
+        .unwrap();
+    let shortened = controller
+        .renew(long.reservation(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let frontier = || {
+        sqlx::query_scalar::<_, Option<chrono::NaiveDateTime>>(
+            "SELECT earliest_expiry_at FROM session_weighted_admission_gates WHERE scope_name = 'canonical_turn_v1'",
+        )
+    };
+    let short_at = chrono::DateTime::from_timestamp_millis(shortened.expires_at_unix_ms)
+        .unwrap()
+        .naive_utc();
+    assert_eq!(
+        frontier().fetch_one(pool.get()).await.unwrap(),
+        Some(short_at)
+    );
+    controller
+        .renew(&shortened, Duration::from_secs(900))
+        .await
+        .unwrap();
+    assert_eq!(
+        frontier().fetch_one(pool.get()).await.unwrap(),
+        Some(short_at),
+        "extension must not move the conservative frontier forward"
+    );
+    long.release().await.unwrap();
+    assert_eq!(
+        frontier().fetch_one(pool.get()).await.unwrap(),
+        Some(short_at)
+    );
+    // Model an already released earliest lease whose conservative deadline has
+    // passed, without sleeping or expiring the still-live independent lease.
+    sqlx::query("UPDATE session_weighted_admission_gates SET earliest_expiry_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name = ?")
+        .bind(ADMISSION_SCOPE).execute(pool.get()).await.unwrap();
+    let next = controller
+        .try_reserve(&key("next"), work(), Duration::from_secs(900), "next")
+        .await
+        .unwrap();
+    let early_at = chrono::DateTime::from_timestamp_millis(early.reservation().expires_at_unix_ms)
+        .unwrap()
+        .naive_utc();
+    assert_eq!(
+        frontier().fetch_one(pool.get()).await.unwrap(),
+        Some(early_at),
+        "a zero-delete due check refreshes the frontier from live rows"
+    );
+    early.release().await.unwrap();
+    next.release().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(admission_scope)]
+async fn denied_new_identity_commits_expiry_repair_without_breaking_full_replay() {
+    let pool = common::setup_pool().await;
+    reset_admission_scope(&pool).await;
+    let controller =
+        DatabaseWeightedAdmissionController::new(pool.clone(), limits_with_owner(2, 1)).unwrap();
+    let expired_key = key("expired");
+    let expired = controller
+        .try_reserve(&expired_key, work(), Duration::from_secs(900), "expired")
+        .await
+        .unwrap();
+    let live_key = key("live");
+    let live = controller
+        .try_reserve(&live_key, work(), Duration::from_secs(900), "live")
+        .await
+        .unwrap();
+    let mut tx = pool.get().begin().await.unwrap();
+    sqlx::query("UPDATE session_weighted_admission_reservations SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name = ? AND reservation_id = ?")
+        .bind(ADMISSION_SCOPE).bind(&expired.reservation().reservation_id).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE session_weighted_admission_gates SET earliest_expiry_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name = ?")
+        .bind(ADMISSION_SCOPE).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(matches!(
+        controller
+            .try_reserve(
+                &key("live"),
+                work(),
+                Duration::from_secs(900),
+                "owner-denied"
+            )
+            .await,
+        Err(DistributedAdmissionError::Capacity(
+            astra_services::WeightedAdmissionError::OwnerExhausted
+        ))
+    ));
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+    )
+    .bind(ADMISSION_SCOPE)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        retained, 1,
+        "rejected new work must not roll back expiry cleanup"
+    );
+    let total: i64 = sqlx::query_scalar("SELECT CAST(global_provider_slots AS SIGNED) FROM session_weighted_admission_gates WHERE scope_name = ? AND usage_initialized = 1")
+        .bind(ADMISSION_SCOPE).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(total, 1);
+    let replay = controller
+        .try_reserve(&live_key, work(), Duration::from_secs(900), "live")
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.reservation().reservation_id,
+        live.reservation().reservation_id
+    );
+    assert!(matches!(
+        controller
+            .try_reserve(
+                &live_key,
+                AdmissionWork {
+                    resident_bytes: 2,
+                    ..work()
+                },
+                Duration::from_secs(900),
+                "live"
+            )
+            .await,
+        Err(DistributedAdmissionError::IdempotencyMismatch)
+    ));
+    let reclaimed = controller
+        .try_reserve(&expired_key, work(), Duration::from_secs(900), "expired")
+        .await
+        .unwrap();
+    assert_ne!(
+        expired.reservation().reservation_id,
+        reclaimed.reservation().reservation_id
+    );
+    assert!(matches!(
+        controller
+            .try_reserve(
+                &key("global-denied"),
+                work(),
+                Duration::from_secs(900),
+                "global-denied"
+            )
+            .await,
+        Err(DistributedAdmissionError::Capacity(
+            astra_services::WeightedAdmissionError::GlobalExhausted
+        ))
+    ));
+    expired.release().await.unwrap();
+    assert!(matches!(
+        controller
+            .renew(expired.reservation(), Duration::from_secs(900))
+            .await,
+        Err(DistributedAdmissionError::Fenced)
+    ));
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+    )
+    .bind(ADMISSION_SCOPE)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        retained, 2,
+        "an old generation must not release a reconstructed identity"
+    );
+    replay.release().await.unwrap();
+    live.release().await.unwrap();
+    reclaimed.release().await.unwrap();
+    let owners: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_weighted_admission_owner_usage WHERE scope_name = ?",
+    )
+    .bind(ADMISSION_SCOPE)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(owners, 0);
 }
 
 #[tokio::test]

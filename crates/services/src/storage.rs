@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-16-v103";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-16-v104";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1887,6 +1887,7 @@ async fn reject_obsolete_weighted_admission_schema(
     const OWNER_USAGE: &str = "session_weighted_admission_owner_usage";
     const REQUIRED_GATE_COLUMNS: &[&str] = &[
         "usage_initialized",
+        "earliest_expiry_at",
         "global_resident_bytes",
         "global_context_tokens",
         "global_provider_slots",
@@ -1908,17 +1909,24 @@ async fn reject_obsolete_weighted_admission_schema(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is older than v82; missing {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            "weighted admission schema does not match the current contract; missing {}. Recreate database {database} with the current schema",
             missing.join(", ")
         )));
     }
     if !table_exists(pool, database, OWNER_USAGE).await? {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is incomplete for v82; missing table {OWNER_USAGE}. Compatibility migration is disabled; recreate database {database} with the current schema"
+            "weighted admission schema is incomplete; missing table {OWNER_USAGE}. Recreate database {database} with the current schema"
         )));
     }
 
     let mut mismatches = Vec::new();
+    if let Some(column) = gate_columns.get("earliest_expiry_at")
+        && (!column.data_type.eq_ignore_ascii_case("datetime") || !column.nullable)
+    {
+        mismatches.push(format!(
+            "{GATE}.earliest_expiry_at must be nullable DATETIME"
+        ));
+    }
     if let Some(column) = gate_columns.get("usage_initialized")
         && (!column.data_type.eq_ignore_ascii_case("tinyint") || column.nullable)
     {
@@ -1980,8 +1988,23 @@ async fn reject_obsolete_weighted_admission_schema(
     }
     if !mismatches.is_empty() {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is not the current v82 physical shape: {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            "weighted admission schema does not match the current physical shape: {}. Recreate database {database} with the current schema",
             mismatches.join(", ")
+        )));
+    }
+    let reservation_columns =
+        weighted_admission_table_shapes(pool, database, "session_weighted_admission_reservations")
+            .await?;
+    // Interrupted fresh bootstrap may not have created this table yet.
+    if !reservation_columns.is_empty()
+        && !reservation_columns
+            .get("idempotency_hash")
+            .is_some_and(|column| {
+                column.data_type.eq_ignore_ascii_case("varchar") && !column.nullable
+            })
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "weighted admission idempotency_hash must be NOT NULL VARCHAR; recreate database {database} with the current schema"
         )));
     }
     Ok(())
@@ -4105,6 +4128,7 @@ async fn ensure_core_schema_while_leased(
             scope_name VARCHAR(64) NOT NULL,
             capacity_hash CHAR(64) NULL,
             usage_initialized TINYINT NOT NULL DEFAULT 0,
+            earliest_expiry_at DATETIME(6) NULL,
             global_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
             global_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
             global_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
@@ -4128,10 +4152,10 @@ async fn ensure_core_schema_while_leased(
             scope_name VARCHAR(64) NOT NULL,
             reservation_id CHAR(36) NOT NULL,
             isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
             session_id VARCHAR(128) NOT NULL,
             branch_id VARCHAR(128) NOT NULL,
-            idempotency_hash CHAR(64) NOT NULL,
+            idempotency_hash VARCHAR(64) NOT NULL,
             resident_bytes BIGINT NOT NULL,
             context_tokens BIGINT NOT NULL,
             provider_slots BIGINT NOT NULL,
@@ -4139,9 +4163,8 @@ async fn ensure_core_schema_while_leased(
             io_bytes BIGINT NOT NULL,
             expires_at DATETIME(6) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, reservation_id),
-            UNIQUE KEY uq_weighted_admission_idempotency
-                (scope_name, isolation_domain, owner_user_id, idempotency_hash),
+            PRIMARY KEY (scope_name, isolation_domain, owner_user_id, idempotency_hash),
+            UNIQUE KEY uq_weighted_admission_reservation (scope_name, reservation_id),
             INDEX idx_weighted_admission_expiry (scope_name, expires_at),
             INDEX idx_weighted_admission_owner_expiry
                 (scope_name, isolation_domain, owner_user_id, expires_at)
@@ -6159,6 +6182,23 @@ async fn verify_core_schema_shape(
         &["uq_auth_user_roles_user_role"],
     )
     .await?;
+    ensure_index_shape(
+        &indexes,
+        "session_weighted_admission_reservations",
+        "PRIMARY",
+        &[
+            "scope_name",
+            "isolation_domain",
+            "owner_user_id",
+            "idempotency_hash",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_weighted_admission_reservations",
+        "uq_weighted_admission_reservation",
+        &["scope_name", "reservation_id"],
+    )?;
     ensure_index_shape(
         &indexes,
         "auth_user_roles",

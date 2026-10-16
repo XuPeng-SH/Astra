@@ -247,20 +247,7 @@ impl DatabaseWeightedAdmissionController {
             .begin_transaction(deadline, "begin_reservation")
             .await?;
         let mut gate = self.lock_admission_gate(&mut tx, deadline).await?;
-        let cleanup_result = admission_io!(
-            tx,
-            sqlx::query(
-                "DELETE FROM session_weighted_admission_reservations
-                 WHERE scope_name = ? AND expires_at <= NOW(6)",
-            )
-            .bind(DISTRIBUTED_ADMISSION_SCOPE)
-            .execute(&mut *tx)
-        )
-        .map_err(|source| distributed_database_error("cleanup_expired", source))?;
-        if cleanup_result.rows_affected() != 0 {
-            mark_materialized_usage_dirty(&mut tx).await?;
-            gate.usage_initialized = false;
-        }
+        reconcile_expired_reservations(&mut tx, &mut gate).await?;
         ensure_distributed_admission_capacity(&mut tx, self.limits, gate.capacity_hash.as_deref())
             .await?;
 
@@ -279,15 +266,35 @@ impl DatabaseWeightedAdmissionController {
             expires_at_unix_ms: expires_at.and_utc().timestamp_millis(),
             idempotency_hash,
         };
-        // Repair materialized totals before inserting the provisional row so
-        // the repair aggregate cannot count this request twice.
         ensure_materialized_admission_usage(&mut tx, &mut gate).await?;
-        // The idempotency index is the durable fast path for new requests.
-        // Attempt the insert before reading usage so the common path avoids a
-        // second indexed SELECT. A duplicate is then resolved from the same
-        // transaction and replayed without consuming capacity again; a
-        // capacity rejection rolls the provisional insert back with the
-        // transaction.
+        // A saturated gate must not write a new identity just to roll it back.
+        // Exact replay still succeeds at capacity; only new work is rejected.
+        let capacity = match gate.global_used.checked_add(work) {
+            Some(next) if next.fits_within(self.limits.global) => {
+                let owner_used = load_materialized_owner_usage(&mut tx, key).await?;
+                validate_available_work(self.limits, gate.global_used, owner_used, work)
+            }
+            _ => Err(WeightedAdmissionError::GlobalExhausted),
+        };
+        if let Err(capacity) = capacity {
+            let existing =
+                load_distributed_reservation(&mut tx, key, &reservation.idempotency_hash).await?;
+            if existing
+                .as_ref()
+                .is_some_and(|existing| existing.work != work)
+            {
+                return Err(DistributedAdmissionError::IdempotencyMismatch);
+            }
+            // No provisional row exists. Persist completed expiry/usage repair
+            // even on rejection, rather than repeating it on every request.
+            tx.commit()
+                .await
+                .map_err(|source| distributed_database_error("commit_capacity_decision", source))?;
+            return existing
+                .map(|existing| DistributedAdmissionPermit::new(self.clone(), existing))
+                .ok_or(DistributedAdmissionError::Capacity(capacity));
+        }
+        // The unique index remains the normal-path idempotency arbiter.
         match insert_distributed_reservation(&mut tx, &reservation, expires_at).await {
             Ok(()) => {}
             Err(DistributedAdmissionError::Database { operation, source })
@@ -310,16 +317,7 @@ impl DatabaseWeightedAdmissionController {
             Err(error) => return Err(error),
         }
 
-        let owner_used = load_materialized_owner_usage(&mut tx, key).await?;
-        let global_used = gate.global_used;
-        validate_available_work(self.limits, global_used, owner_used, work)?;
-        add_materialized_admission_usage(&mut tx, key, work).await?;
-        gate.global_used =
-            gate.global_used
-                .checked_add(work)
-                .ok_or(DistributedAdmissionError::Capacity(
-                    WeightedAdmissionError::GlobalExhausted,
-                ))?;
+        add_materialized_admission_usage(&mut tx, key, work, expires_at).await?;
         tx.commit()
             .await
             .map_err(|source| distributed_database_error("commit_reservation", source))?;
@@ -357,7 +355,8 @@ impl DatabaseWeightedAdmissionController {
     ) -> Result<DistributedAdmissionReservation, DistributedAdmissionError> {
         let _reservation_gate = self.acquire_reservation_gate(deadline).await?;
         let mut tx = self.begin_transaction(deadline, "begin_renewal").await?;
-        let now = self.lock_admission_gate(&mut tx, deadline).await?.now;
+        let gate = self.lock_admission_gate(&mut tx, deadline).await?;
+        let now = gate.now;
         let expires_at = now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
@@ -389,6 +388,11 @@ impl DatabaseWeightedAdmissionController {
         .map_err(|source| distributed_database_error("renew_reservation", source))?;
         if result.rows_affected() != 1 {
             return Err(DistributedAdmissionError::Fenced);
+        }
+        // TTL may be shortened. Extending or releasing a lease may leave a
+        // stale-low frontier, but never allow it to miss an earlier expiry.
+        if gate.usage_initialized && gate.earliest_expiry_at.is_none_or(|at| expires_at < at) {
+            store_expiry_frontier(&mut tx, Some(expires_at)).await?;
         }
         tx.commit()
             .await
@@ -428,7 +432,7 @@ impl DatabaseWeightedAdmissionController {
                 "DELETE FROM session_weighted_admission_reservations
                  WHERE scope_name = ? AND reservation_id = ?
                    AND isolation_domain = ? AND owner_user_id = ?
-                   AND session_id = ? AND branch_id = ?",
+                   AND session_id = ? AND branch_id = ? AND idempotency_hash = ?",
             )
             .bind(DISTRIBUTED_ADMISSION_SCOPE)
             .bind(&reservation.reservation_id)
@@ -436,6 +440,7 @@ impl DatabaseWeightedAdmissionController {
             .bind(&reservation.key.owner_user_id)
             .bind(&reservation.key.session_id)
             .bind(&reservation.key.branch_id)
+            .bind(&reservation.idempotency_hash)
             .execute(&mut *tx)
         )
         .map_err(|source| distributed_database_error("release_reservation", source))?;
@@ -671,13 +676,14 @@ struct LockedDistributedAdmissionGate {
     capacity_hash: Option<String>,
     usage_initialized: bool,
     global_used: AdmissionWork,
+    earliest_expiry_at: Option<chrono::NaiveDateTime>,
 }
 
 async fn lock_distributed_admission_gate(
     tx: &mut CancellationSafeTransaction,
 ) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
     let row = sqlx::query(
-        "SELECT capacity_hash, usage_initialized,
+        "SELECT capacity_hash, usage_initialized, earliest_expiry_at,
                 CAST(global_resident_bytes AS CHAR) AS global_resident_bytes,
                 CAST(global_context_tokens AS CHAR) AS global_context_tokens,
                 CAST(global_provider_slots AS CHAR) AS global_provider_slots,
@@ -718,11 +724,20 @@ async fn lock_distributed_admission_gate(
         cpu_units: aggregate_admission_u64(&row, "global_cpu_units")?,
         io_bytes: aggregate_admission_u64(&row, "global_io_bytes")?,
     };
+    let earliest_expiry_at: Option<chrono::NaiveDateTime> = row
+        .try_get("earliest_expiry_at")
+        .map_err(|source| distributed_database_error("decode_gate_expiry_frontier", source))?;
+    if usage_initialized && global_used.provider_slots != 0 && earliest_expiry_at.is_none() {
+        return Err(DistributedAdmissionError::Invalid(
+            "initialized admission usage has no expiry frontier".into(),
+        ));
+    }
     Ok(LockedDistributedAdmissionGate {
         now,
         capacity_hash,
         usage_initialized,
         global_used,
+        earliest_expiry_at,
     })
 }
 
@@ -889,28 +904,58 @@ async fn load_distributed_reservation(
     .transpose()
 }
 
-/// Mark the materialized totals dirty after a mutation that does not update
-/// them in the same code path (for example expiry cleanup or session delete).
-/// The next admission rebuilds the totals while holding the durable gate.
-async fn mark_materialized_usage_dirty(
+async fn store_expiry_frontier(
     tx: &mut CancellationSafeTransaction,
+    frontier: Option<chrono::NaiveDateTime>,
 ) -> Result<(), DistributedAdmissionError> {
     admission_io!(
         tx,
         sqlx::query(
             "UPDATE session_weighted_admission_gates
-             SET usage_initialized = 0, updated_at = NOW(6)
+             SET earliest_expiry_at = ?, updated_at = NOW(6)
              WHERE scope_name = ?",
+        )
+        .bind(frontier)
+        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .execute(&mut **tx)
+    )
+    .map_err(|source| distributed_database_error("store_expiry_frontier", source))?;
+    Ok(())
+}
+
+async fn reconcile_expired_reservations(
+    tx: &mut CancellationSafeTransaction,
+    gate: &mut LockedDistributedAdmissionGate,
+) -> Result<(), DistributedAdmissionError> {
+    if gate.usage_initialized && gate.earliest_expiry_at.is_none_or(|at| at > gate.now) {
+        return Ok(());
+    }
+    let deleted = admission_io!(
+        tx,
+        sqlx::query(
+            "DELETE FROM session_weighted_admission_reservations
+         WHERE scope_name = ? AND expires_at <= NOW(6)",
         )
         .bind(DISTRIBUTED_ADMISSION_SCOPE)
         .execute(&mut **tx)
     )
-    .map_err(|source| distributed_database_error("mark_usage_dirty", source))?;
+    .map_err(|source| distributed_database_error("cleanup_expired", source))?;
+    if deleted.rows_affected() != 0 {
+        // The same transaction publishes rebuilt counters and frontier before
+        // any successful commit, so no intermediate dirty UPDATE is needed.
+        gate.usage_initialized = false;
+    } else if gate.usage_initialized {
+        gate.earliest_expiry_at = admission_io!(tx, sqlx::query_scalar(
+            "SELECT MIN(expires_at) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+        ).bind(DISTRIBUTED_ADMISSION_SCOPE).fetch_one(&mut **tx))
+            .map_err(|source| distributed_database_error("refresh_expiry_frontier", source))?;
+        store_expiry_frontier(tx, gate.earliest_expiry_at).await?;
+    }
     Ok(())
 }
 
 /// Rebuild O(1) global and per-owner totals from reservation rows. This is a
-/// repair path, used once after schema upgrade or after an out-of-band delete;
+/// repair path, used on fresh initialization or after an out-of-band delete;
 /// normal reserve/release paths update the totals incrementally.
 async fn ensure_materialized_admission_usage(
     tx: &mut CancellationSafeTransaction,
@@ -926,6 +971,7 @@ async fn ensure_materialized_admission_usage(
         tx,
         sqlx::query(
             "SELECT
+                 MIN(expires_at) AS earliest_expiry_at,
                  CAST(COALESCE(SUM(CAST(resident_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS global_resident_bytes,
                  CAST(COALESCE(SUM(CAST(context_tokens AS DECIMAL(38, 0))), 0) AS CHAR) AS global_context_tokens,
                  CAST(COALESCE(SUM(CAST(provider_slots AS DECIMAL(38, 0))), 0) AS CHAR) AS global_provider_slots,
@@ -951,6 +997,9 @@ async fn ensure_materialized_admission_usage(
         )));
     }
     let global = decode_aggregate_admission_work(&row, "global_")?;
+    let earliest_expiry_at: Option<chrono::NaiveDateTime> = row
+        .try_get("earliest_expiry_at")
+        .map_err(|source| distributed_database_error("decode_usage_expiry_frontier", source))?;
 
     admission_io!(
         tx,
@@ -988,6 +1037,7 @@ async fn ensure_materialized_admission_usage(
         sqlx::query(
             "UPDATE session_weighted_admission_gates
              SET usage_initialized = 1,
+                 earliest_expiry_at = ?,
                  global_resident_bytes = ?,
                  global_context_tokens = ?,
                  global_provider_slots = ?,
@@ -996,6 +1046,7 @@ async fn ensure_materialized_admission_usage(
                  updated_at = NOW(6)
              WHERE scope_name = ?",
         )
+        .bind(earliest_expiry_at)
         .bind(global.resident_bytes.to_string())
         .bind(global.context_tokens.to_string())
         .bind(u64::from(global.provider_slots).to_string())
@@ -1007,6 +1058,7 @@ async fn ensure_materialized_admission_usage(
     .map_err(|source| distributed_database_error("publish_materialized_usage", source))?;
     gate.usage_initialized = true;
     gate.global_used = global;
+    gate.earliest_expiry_at = earliest_expiry_at;
     Ok(())
 }
 
@@ -1014,6 +1066,8 @@ async fn load_materialized_owner_usage(
     tx: &mut CancellationSafeTransaction,
     key: &SessionKeyV1,
 ) -> Result<AdmissionWork, DistributedAdmissionError> {
+    // Native equality enables the compound-key lookup; the binary guard keeps
+    // exact owner identity. A cast-only predicate scans the whole scope in MO.
     let row = admission_io!(
         tx,
         sqlx::query(
@@ -1024,10 +1078,11 @@ async fn load_materialized_owner_usage(
                     CAST(io_bytes AS CHAR) AS owner_io_bytes
              FROM session_weighted_admission_owner_usage
              WHERE scope_name = ? AND isolation_domain = ?
-               AND BINARY owner_user_id = BINARY ?",
+               AND owner_user_id = ? AND BINARY owner_user_id = BINARY ?",
         )
         .bind(DISTRIBUTED_ADMISSION_SCOPE)
         .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
         .bind(&key.owner_user_id)
         .fetch_optional(&mut **tx)
     )
@@ -1041,6 +1096,7 @@ async fn add_materialized_admission_usage(
     tx: &mut CancellationSafeTransaction,
     key: &SessionKeyV1,
     work: AdmissionWork,
+    expires_at: chrono::NaiveDateTime,
 ) -> Result<(), DistributedAdmissionError> {
     let resident_bytes = admission_i64("resident_bytes", work.resident_bytes)?;
     let context_tokens = admission_i64("context_tokens", work.context_tokens)?;
@@ -1052,6 +1108,9 @@ async fn add_materialized_admission_usage(
         sqlx::query(
             "UPDATE session_weighted_admission_gates
              SET global_resident_bytes = global_resident_bytes + ?,
+                 earliest_expiry_at = CASE
+                     WHEN earliest_expiry_at IS NULL OR earliest_expiry_at > ? THEN ?
+                     ELSE earliest_expiry_at END,
                  global_context_tokens = global_context_tokens + ?,
                  global_provider_slots = global_provider_slots + ?,
                  global_cpu_units = global_cpu_units + ?,
@@ -1060,6 +1119,8 @@ async fn add_materialized_admission_usage(
              WHERE scope_name = ? AND usage_initialized = 1",
         )
         .bind(resident_bytes)
+        .bind(expires_at)
+        .bind(expires_at)
         .bind(context_tokens)
         .bind(provider_slots)
         .bind(cpu_units)
@@ -1154,7 +1215,7 @@ async fn subtract_materialized_admission_usage(
                  io_bytes = io_bytes - ?,
                  updated_at = NOW(6)
              WHERE scope_name = ? AND isolation_domain = ?
-               AND BINARY owner_user_id = BINARY ?
+               AND owner_user_id = ? AND BINARY owner_user_id = BINARY ?
                AND resident_bytes >= ?
                AND context_tokens >= ?
                AND provider_slots >= ?
@@ -1168,6 +1229,7 @@ async fn subtract_materialized_admission_usage(
         .bind(io_bytes)
         .bind(DISTRIBUTED_ADMISSION_SCOPE)
         .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
         .bind(&key.owner_user_id)
         .bind(resident_bytes)
         .bind(context_tokens)
@@ -1187,12 +1249,13 @@ async fn subtract_materialized_admission_usage(
         sqlx::query(
             "DELETE FROM session_weighted_admission_owner_usage
              WHERE scope_name = ? AND isolation_domain = ?
-               AND BINARY owner_user_id = BINARY ?
+               AND owner_user_id = ? AND BINARY owner_user_id = BINARY ?
                AND resident_bytes = 0 AND context_tokens = 0
                AND provider_slots = 0 AND cpu_units = 0 AND io_bytes = 0",
         )
         .bind(DISTRIBUTED_ADMISSION_SCOPE)
         .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
         .bind(&key.owner_user_id)
         .execute(&mut **tx)
     )

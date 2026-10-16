@@ -68,7 +68,7 @@ Other SQL and malformed persisted-data errors retain their 500 behavior.
 
 ## Session-memory recovery journal
 
-Fresh schema contract `2026-10-16-v103` includes `agent_session_memory_work`, keyed
+Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed
 by canonical Astra owner and Session. It checkpoints the existing extraction
 and governance algorithms: frozen request/write inputs, stage receipts, a
 worker lease and bounded retry timing. Canonical Session status, execution

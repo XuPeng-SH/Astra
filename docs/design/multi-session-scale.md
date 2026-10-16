@@ -262,6 +262,31 @@ The next stage may introduce sharded/lease-based capacity only after measured
 lock wait, pool wait, or reservation-scan evidence justifies it, with crash and
 expiry tests.
 
+The current fresh-schema gate also holds a conservative earliest-expiry
+frontier beside its materialized usage. A clean future frontier avoids scanning
+all live reservations for expiry on each admission. Dirty state or a due
+frontier reconciles expiry before checking capacity; totals and frontier commit
+together. Insertions and shortened renewals lower the frontier. Release and
+extended renewals may leave it stale only in the earlier direction, causing an
+extra check rather than missing expired work. No process-local expiry cache or
+second cleanup owner is involved.
+
+Saturated admission resolves the exact idempotency identity before rejecting
+new work, without a provisional INSERT. Identical replay remains valid at full
+capacity; changed work remains a mismatch. Rejection commits completed expiry
+and usage repair, so a rejected burst does not repeatedly undo the same
+housekeeping. Owner reads and mutations retain binary identity checks while
+also bounding the native compound-key candidate. These changes reduce work
+inside the existing gate, not its cross-server serialization ceiling.
+
+Reservation storage is keyed by its existing logical idempotency identity
+`(scope, isolation domain, owner, idempotency hash)`. The hash is a bounded
+VARCHAR so native predicates can use that compound key without casting the
+stored column. A unique generation UUID remains separate: expiry and recreation
+produce a new UUID, and renew/release require both the logical key and that
+generation. A late old permit cannot release a new reservation for the same
+idempotency key. No additional index or identity ledger is introduced.
+
 ## Required scenarios
 
 The capacity harness must cover at least 1, 2, and 4 server processes and 1000
