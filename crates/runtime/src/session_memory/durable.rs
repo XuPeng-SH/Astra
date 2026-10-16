@@ -48,10 +48,10 @@ impl DurableMemoriaPort {
         let checked_owner = owner.clone();
         let previous = self
             .store
-            .with_fenced_state(
+            .inspect_fenced_state(
                 &self.claim.user_id,
                 &self.claim.session_id,
-                Some(&self.claim.token),
+                &self.claim.token,
                 true,
                 move |work| {
                     Box::pin(async move {
@@ -89,8 +89,8 @@ impl DurableMemoriaPort {
             if work.working_memory_id.as_ref().is_some_and(|id|!memories.iter().any(|memory|&memory.memory_id==id)) {
                 return Err("final working receipt is not reconciled; retain working memory".into());
             }
-            if work.latest_request.is_none()&&!memories.is_empty() {return Err("final extraction freshness is unknown; retain legacy working memory until a canonical turn settles".into());}
-            let facts=work.latest_request.as_ref().map(|request|serde_json::from_value(request["session_facts"].clone())).transpose().map_err(|error|error.to_string())?.unwrap_or_default();
+            if work.latest_turn.is_none()&&!memories.is_empty() {return Err("final extraction freshness is unknown; retain working memory until a canonical turn settles".into());}
+            let facts=work.latest_facts.as_ref().map(|facts|serde_json::from_value(facts.clone())).transpose().map_err(|error|error.to_string())?.unwrap_or_default();
             let plan=FinalizationPlan{fingerprint:work.completed_fingerprint.clone(),owner,facts,memories};
             work.plan=Some(serde_json::to_value(&plan).map_err(|error|error.to_string())?);
             Ok(plan)
@@ -112,7 +112,7 @@ impl DurableMemoriaPort {
         let session = self.claim.session_id.clone();
         let expected_active = self.claim.work.active_fingerprint.clone();
         let key_session = session.clone();
-        let prepared = self.store.with_fenced_state(&self.claim.user_id, &self.claim.session_id, Some(&self.claim.token), stage != "working", move |work| Box::pin(async move {
+        let (prepared, cached) = self.store.with_fenced_state(&self.claim.user_id, &self.claim.session_id, Some(&self.claim.token), stage != "working", move |work| Box::pin(async move {
             let generation = if stage == "working" {
                 if work.active_request.is_none() || work.active_fingerprint != expected_active { return Err("extraction generation was superseded".into()); }
                 work.active_fingerprint.clone()
@@ -128,7 +128,8 @@ impl DurableMemoriaPort {
                     if existing != &prepared { return Err("uncertain working write must replay its frozen payload".into()); }
                 } else { work.prepared_working = Some(prepared.clone()); }
             }
-            Ok(prepared)
+            let cached = work.receipts.get(&key).cloned();
+            Ok((prepared, cached))
         })).await?;
         let prepared_owner = prepared["owner"]
             .as_str()
@@ -139,25 +140,6 @@ impl DurableMemoriaPort {
             .ok_or("missing prepared key")?
             .to_string();
         let is_working = prepared["memory_type"] == "working";
-        let checked_owner = prepared_owner.clone();
-        let checked_key = key.clone();
-        let cached = self
-            .store
-            .with_fenced_state(
-                &self.claim.user_id,
-                &self.claim.session_id,
-                Some(&self.claim.token),
-                false,
-                move |work| {
-                    Box::pin(async move {
-                        if !is_working {
-                            ensure_current_plan(work, &checked_owner)?;
-                        }
-                        Ok(work.receipts.get(&checked_key).cloned())
-                    })
-                },
-            )
-            .await?;
         if let Some(id) = cached {
             return Ok(id);
         }
@@ -223,22 +205,15 @@ impl DurableMemoriaPort {
             && report.scene_persist_failures == 0;
         let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
         self.store
-            .with_fenced_state(
-                &self.claim.user_id,
-                &self.claim.session_id,
-                Some(&self.claim.token),
-                true,
-                move |work| {
-                    Box::pin(async move {
-                        ensure_settled(work)?;
-                        work.optional_complete = optional_complete && work.consolidation_complete;
-                        work.last_report = Some(report);
-                        Ok(())
-                    })
-                },
-            )
-            .await?;
-        self.store.release(&self.claim, optional_complete).await
+            .finish_claim(&self.claim, true, optional_complete, move |work| {
+                Box::pin(async move {
+                    ensure_settled(work)?;
+                    work.optional_complete = optional_complete && work.consolidation_complete;
+                    work.last_report = Some(report);
+                    Ok(())
+                })
+            })
+            .await
     }
 }
 
@@ -463,10 +438,10 @@ impl MemoriaPort for DurableMemoriaPort {
         let (client, _) = self.transport(true).await?;
         let id = memory_id.to_string();
         self.store
-            .with_fenced_state(
+            .inspect_fenced_state(
                 &self.claim.user_id,
                 &self.claim.session_id,
-                Some(&self.claim.token),
+                &self.claim.token,
                 false,
                 move |_work| {
                     Box::pin(async move {
@@ -494,10 +469,10 @@ impl MemoriaPort for DurableMemoriaPort {
         let checked_owner = owner.clone();
         let cached = self
             .store
-            .with_fenced_state(
+            .inspect_fenced_state(
                 &self.claim.user_id,
                 session_id,
-                Some(&self.claim.token),
+                &self.claim.token,
                 false,
                 move |work| {
                     Box::pin(async move {

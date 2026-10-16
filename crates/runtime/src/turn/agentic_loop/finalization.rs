@@ -2617,7 +2617,7 @@ mod tests {
         .await
         .unwrap();
         let request = work
-            .latest_request
+            .pending_request
             .expect("terminal finalization must persist its input");
         assert_eq!(request["session_facts"]["turn"], 1);
         assert_eq!(request["messages"], serde_json::json!(state.messages));

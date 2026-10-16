@@ -323,6 +323,28 @@ async fn restart_retries_lost_write_and_purge_receipts_without_duplicate_episode
     assert_eq!(status["pending"], false);
     assert_eq!(status["consolidation_complete"], true);
     assert_eq!(status["optional_complete"], true);
+    let sqlx::types::Json(work): sqlx::types::Json<SessionMemoryWork> = sqlx::query_scalar(
+        "SELECT state_json FROM agent_session_memory_work WHERE user_id=? AND session_id=?",
+    )
+    .bind(&f.user)
+    .bind(&f.session)
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    assert!(work.plan.is_none());
+    assert!(work.reflection.is_none());
+    assert!(work.receipts.is_empty());
+    assert!(work.purged_ids.is_empty());
+    assert!(work.active_request.is_none());
+    assert!(work.pending_request.is_none());
+    assert!(work.latest_facts.is_some());
+    assert!(work.last_report.is_some());
+    // A repeated close/exit must not need the retired inventory or repeat HTTP.
+    f.store
+        .request_finalization(&f.user, &f.session)
+        .await
+        .unwrap();
+    assert!(f.store.claim(&f.user, &f.session).await.unwrap().is_none());
     let backend = f.backend.lock().unwrap();
     assert_eq!(backend.writes.len(), 2);
     assert_eq!(backend.calls["episodic"], 2);
@@ -347,6 +369,19 @@ async fn optional_retry_preserves_consolidation_and_follow_up_invalidates_old_pu
     let status = f.store.status(&f.user, &f.session).await.unwrap();
     assert_eq!(status["consolidation_complete"], true);
     assert_eq!(status["optional_complete"], false);
+    let sqlx::types::Json(work): sqlx::types::Json<SessionMemoryWork> = sqlx::query_scalar(
+        "SELECT state_json FROM agent_session_memory_work WHERE user_id=? AND session_id=?",
+    )
+    .bind(&f.user)
+    .bind(&f.session)
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    assert!(
+        work.plan.is_some(),
+        "optional retry still needs its frozen inputs"
+    );
+    assert!(!work.receipts.is_empty());
     let report = attempt(&f).await;
     assert!(report.consolidation_complete());
     {

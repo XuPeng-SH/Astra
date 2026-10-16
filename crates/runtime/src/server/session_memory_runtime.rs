@@ -88,9 +88,9 @@ pub(crate) async fn drive_session_memory_work(
                 .map_err(|error| error.to_string())?;
             let mut facts: astra_turn_types::session_facts::SessionFacts = claim
                 .work
-                .latest_request
+                .latest_facts
                 .as_ref()
-                .map(|request| serde_json::from_value(request["session_facts"].clone()))
+                .map(|facts| serde_json::from_value(facts.clone()))
                 .transpose()
                 .map_err(|error| error.to_string())?
                 .unwrap_or_default();

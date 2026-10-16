@@ -105,7 +105,7 @@ validates every row against the attested Memoria owner. UC and personal Memoria
 namespaces need not equal `/auth/me.user_id`; an absent, malformed or mismatched
 attestation fails closed. No owner or grant cache is shared between operations.
 
-Fresh schema contract `2026-10-14-v102` includes `agent_session_memory_work`,
+Fresh schema contract `2026-10-16-v103` includes `agent_session_memory_work`,
 the durable journal for the existing extraction and governance algorithms. Normal turn finalization performs a one-second bounded
 handoff of authenticated canonical extraction input before terminal completion;
 expensive inference and Memoria work remain background operations. A missed
@@ -144,6 +144,22 @@ receipts are checkpointed separately. A failed archive cannot authorize cleanup.
 removes the captured owner/session working IDs and accepts an already absent ID
 on retry. A failed read never grants an empty successful purge. Optional
 reflection/scene retries preserve completed episode and cleanup stages.
+
+The journal stores at most one pending input and one different active input.
+Claiming moves input into active ownership rather than duplicating it. Successful
+extraction retires its transcript and prepared write, retaining publication turn,
+facts and fingerprints for canonical recovery and later finalization. Fenced
+inspection validates the same authority without rewriting or rescheduling the
+journal. Finishing combines the checkpoint and lease release in one transaction.
+Only full consolidation and optional-stage success retire the frozen inventory,
+receipts, purge IDs and reflection payload; failures retain exact replay inputs.
+Completion flags and the status report remain available after retirement.
+
+This bounds payload generations, not total retained sessions or arbitrary input
+bytes. Permanently failing work remains recoverable and can retain large inputs;
+Session deletion owns physical removal. More worker pods can process independent
+sessions, but the shared due index and the separate global admission gate remain
+database capacity limits; this is not a claim of unlimited horizontal throughput.
 
 CLI exit targets its idle generation; a follow-up turn invalidates that old
 maintenance request. Explicit close settles all already-admitted extraction and

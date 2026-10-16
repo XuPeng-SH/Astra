@@ -34,6 +34,224 @@ async fn setup() -> (SharedPool, MatrixOneSettings, String, String) {
     (pool, settings, user, session)
 }
 
+async fn persisted_work(pool: &SharedPool, user: &str, session: &str) -> serde_json::Value {
+    let sqlx::types::Json(value) = sqlx::query_scalar(
+        "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(user)
+    .bind(session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    value
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn independent_pools_preserve_one_active_and_newest_pending_input() {
+    let (pool, settings, user, session) = setup().await;
+    let other_pool = SharedPool::new(&settings).await.unwrap();
+    let store = SessionMemoryLifecycleStore::new(pool.clone());
+    let other = SessionMemoryLifecycleStore::new(other_pool);
+    let request =
+        |turn| json!({"session_facts":{"turn":turn},"messages":[{"content":"x".repeat(65536)}]});
+    store
+        .publish(&user, &session, request(1), "a".into())
+        .await
+        .unwrap();
+    store.request_extraction(&user, &session).await.unwrap();
+    let (a, b) = tokio::join!(store.claim(&user, &session), other.claim(&user, &session));
+    let claims: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
+    assert_eq!(claims.len(), 1, "one live lease across independent pools");
+    let claim = &claims[0];
+    assert!(claim.work.pending_request.is_none());
+    assert!(claim.work.active_request.is_some());
+    assert!(
+        serde_json::to_vec(&persisted_work(&pool, &user, &session).await)
+            .unwrap()
+            .len()
+            < 70000
+    );
+    store
+        .with_fenced_state(&user, &session, Some(&claim.token), false, |work| {
+            Box::pin(async move {
+                work.prepared_working = Some(json!({"content":"frozen-a"}));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    for (turn, fingerprint) in [(2, "b"), (3, "c"), (2, "older")] {
+        other
+            .publish(&user, &session, request(turn), fingerprint.into())
+            .await
+            .unwrap();
+    }
+    // Process death: a different pool recovers the expired attempt, not the newer input.
+    sqlx::query("UPDATE agent_session_memory_work SET lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    assert!(other.load_claim_work(claim).await.is_err());
+    let recovered = other.claim(&user, &session).await.unwrap().unwrap();
+    assert_eq!(recovered.work.active_fingerprint.as_deref(), Some("a"));
+    assert_eq!(
+        recovered.work.pending_request.as_ref().unwrap()["session_facts"]["turn"],
+        3
+    );
+    assert_eq!(
+        recovered.work.prepared_working.as_ref().unwrap()["content"],
+        "frozen-a"
+    );
+    assert!(store.finish_extraction(claim, true, 1).await.is_err());
+    other.finish_extraction(&recovered, true, 1).await.unwrap();
+    let next = store.claim(&user, &session).await.unwrap().unwrap();
+    assert_eq!(next.work.active_fingerprint.as_deref(), Some("c"));
+    assert!(next.work.pending_request.is_none());
+    store.finish_extraction(&next, true, 3).await.unwrap();
+    other
+        .publish(&user, &session, request(3), "c".into())
+        .await
+        .unwrap();
+    other
+        .publish(&user, &session, request(2), "older".into())
+        .await
+        .unwrap();
+    let work = persisted_work(&pool, &user, &session).await;
+    assert!(work["pending_request"].is_null());
+    assert!(work["active_request"].is_null());
+    assert_eq!(work["latest_turn"], 3);
+    assert_eq!(work["latest_fingerprint"], "c");
+    assert_eq!(work["latest_facts"]["turn"], 3);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn inspection_is_read_only_and_finish_is_atomic_with_bounded_terminal_state() {
+    let (pool, _, user, session) = setup().await;
+    let store = SessionMemoryLifecycleStore::new(pool.clone());
+    store
+        .publish(
+            &user,
+            &session,
+            json!({"session_facts":{"turn":1},"messages":["x".repeat(131072)]}),
+            "a".into(),
+        )
+        .await
+        .unwrap();
+    store.request_extraction(&user, &session).await.unwrap();
+    let claim = store.claim(&user, &session).await.unwrap().unwrap();
+    sqlx::query("UPDATE agent_session_memory_work SET updated_at='2000-01-01', next_attempt_at='2000-01-02' WHERE user_id=? AND session_id=?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    let snapshot = || async {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT state_json, lease_token, CAST(lease_expires_at AS CHAR) AS expiry, CAST(updated_at AS CHAR) AS updated, CAST(next_attempt_at AS CHAR) AS due, attempts FROM agent_session_memory_work WHERE user_id=? AND session_id=?")
+            .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        json!([
+            row.get::<sqlx::types::Json<serde_json::Value>, _>("state_json")
+                .0,
+            row.get::<String, _>("lease_token"),
+            row.get::<String, _>("expiry"),
+            row.get::<String, _>("updated"),
+            row.get::<String, _>("due"),
+            row.get::<i64, _>("attempts")
+        ])
+    };
+    let before = snapshot().await;
+    store.load_claim_work(&claim).await.unwrap();
+    assert_eq!(snapshot().await, before);
+    let result: Result<(), String> = store
+        .finish_claim(&claim, false, true, |work| {
+            Box::pin(async move {
+                work.active_request = None;
+                Err("abort checkpoint".into())
+            })
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        snapshot().await,
+        before,
+        "aborted finish keeps both payload and live lease"
+    );
+    let cancelled_store = store.clone();
+    let cancelled_claim = claim.clone();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        cancelled_store
+            .finish_claim(&cancelled_claim, false, true, |work| {
+                Box::pin(async move {
+                    work.active_request = None;
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<(), String>>().await
+                })
+            })
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        snapshot().await,
+        before,
+        "cancellation rolls back without releasing the claim"
+    );
+    store.finish_extraction(&claim, false, 1).await.unwrap();
+    assert!(persisted_work(&pool, &user, &session).await["active_request"].is_object());
+    sqlx::query("UPDATE agent_session_memory_work SET next_attempt_at=NOW(6) WHERE user_id=? AND session_id=?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    let claim = store.claim(&user, &session).await.unwrap().unwrap();
+    store.finish_extraction(&claim, true, 1).await.unwrap();
+    store.request_finalization(&user, &session).await.unwrap();
+    let claim = store.claim(&user, &session).await.unwrap().unwrap();
+    store
+        .finish_claim(&claim, true, true, |work| {
+            Box::pin(async move {
+                work.plan = Some(json!({"memories":["y".repeat(131072)]}));
+                work.receipts.insert("receipt".into(), "id".into());
+                work.purged_ids.insert("id".into());
+                work.reflection = Some(json!(["z".repeat(131072)]));
+                work.consolidation_complete = true;
+                work.optional_complete = true;
+                work.last_report = Some(json!({"success":true}));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let work = persisted_work(&pool, &user, &session).await;
+    assert!(serde_json::to_vec(&work).unwrap().len() < 4096);
+    assert!(work["plan"].is_null());
+    assert!(work["reflection"].is_null());
+    assert_eq!(work["receipts"], json!({}));
+    assert_eq!(work["purged_ids"], json!([]));
+    assert_eq!(work["last_report"]["success"], true);
+    assert_eq!(work["completed_turn"], 1);
+    store.request_finalization(&user, &session).await.unwrap();
+    assert!(store.claim(&user, &session).await.unwrap().is_none());
+    assert!(store.load_claim_work(&claim).await.is_err());
+    // A lost journal is not resurrected by a token-bearing inspection.
+    sqlx::query("DELETE FROM agent_session_memory_work WHERE user_id=? AND session_id=?")
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert!(store.load_claim_work(&claim).await.is_err());
+    assert!(
+        sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+            "SELECT state_json FROM agent_session_memory_work WHERE user_id=? AND session_id=?"
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_optional(pool.get())
+        .await
+        .unwrap()
+        .is_none()
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn close_enqueues_pending_generation_and_restart_recovers_exact_prepared_write() {
@@ -330,7 +548,7 @@ async fn close_without_any_journal_recovers_committed_context_after_restart() {
     );
     let claim = restarted.claim(&user, &session).await.unwrap().unwrap();
     assert!(claim.work.finalize_requested);
-    assert!(claim.work.latest_request.is_none());
+    assert!(claim.work.pending_request.is_none());
     let head = restarted
         .missing_input_head(&user, &session)
         .await
@@ -399,7 +617,7 @@ async fn large_json_journal_survives_close_status_claim_and_recovery_reads() {
     let claim = restarted.claim(&user, &session).await.unwrap().unwrap();
     let work = restarted.load_claim_work(&claim).await.unwrap();
     assert_eq!(
-        work.latest_request.as_ref().unwrap()["messages"][0]["content"]
+        work.active_request.as_ref().unwrap()["messages"][0]["content"]
             .as_str()
             .unwrap()
             .len(),

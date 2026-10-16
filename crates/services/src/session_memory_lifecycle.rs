@@ -19,7 +19,11 @@ pub struct SessionMemoryWork {
     pub session_closed: bool,
     #[serde(skip)]
     pub canonical_turn: u32,
-    pub latest_request: Option<Value>,
+    /// Latest input not yet owned by an extraction attempt.
+    pub pending_request: Option<Value>,
+    /// Publication metadata survives retirement of the transcript.
+    pub latest_turn: Option<u32>,
+    pub latest_facts: Option<Value>,
     pub latest_fingerprint: Option<String>,
     pub completed_fingerprint: Option<String>,
     pub completed_turn: Option<u32>,
@@ -77,6 +81,23 @@ pub struct SessionMemoryWorkClaim {
     pub work: SessionMemoryWork,
 }
 
+enum Persistence {
+    Inspect,
+    Update,
+    Finish { success: bool },
+}
+
+fn release_schedule(success: bool) -> (&'static str, &'static str) {
+    if success {
+        ("NOW(6)", "0")
+    } else {
+        (
+            "DATE_ADD(NOW(6), INTERVAL LEAST(960, 5 * POW(2, LEAST(GREATEST(attempts - 1, 0), 8))) SECOND)",
+            "attempts",
+        )
+    }
+}
+
 impl SessionMemoryLifecycleStore {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
@@ -98,23 +119,19 @@ impl SessionMemoryLifecycleStore {
                     .as_u64()
                     .or_else(|| request["session_facts"]["turn"].as_u64())
                     .ok_or("missing extraction turn")?;
-                let previous = work.latest_request.as_ref().and_then(|request| {
-                    request["inference_scope"]["turn"]
-                        .as_u64()
-                        .or_else(|| request["session_facts"]["turn"].as_u64())
-                });
-                if previous.is_some_and(|previous| turn < previous) {
+                let turn = u32::try_from(turn)
+                    .map_err(|_| "extraction turn exceeds supported memory coordinate")?;
+                if work.latest_turn.is_some_and(|previous| turn < previous) {
                     return Ok(());
                 }
                 if work.latest_fingerprint.as_ref() != Some(&fingerprint) {
-                    work.latest_request = Some(request);
+                    work.latest_turn = Some(turn);
+                    work.latest_facts = Some(request["session_facts"].clone());
+                    work.pending_request = Some(request);
                     work.latest_fingerprint = Some(fingerprint);
                     // A follow-up turn cancels stale exit maintenance. Explicit
                     // close rejects new requests at the session fence below.
-                    if !work.session_closed
-                        && work
-                            .finalize_turn
-                            .is_none_or(|target| turn > u64::from(target))
+                    if !work.session_closed && work.finalize_turn.is_none_or(|target| turn > target)
                     {
                         work.finalize_requested = false;
                         work.finalize_turn = None;
@@ -135,17 +152,7 @@ impl SessionMemoryLifecycleStore {
                     work.reset_plan();
                 }
                 work.finalize_requested = true;
-                let latest_turn = work
-                    .latest_request
-                    .as_ref()
-                    .and_then(|request| {
-                        request["inference_scope"]["turn"]
-                            .as_u64()
-                            .or_else(|| request["session_facts"]["turn"].as_u64())
-                    })
-                    .unwrap_or(0);
-                let latest_turn = u32::try_from(latest_turn)
-                    .map_err(|_| "extraction turn exceeds supported memory coordinate")?;
+                let latest_turn = work.latest_turn.unwrap_or(0);
                 work.finalize_turn = Some(work.canonical_turn.max(latest_turn));
                 Ok(())
             })
@@ -184,16 +191,7 @@ impl SessionMemoryLifecycleStore {
         if head.key.owner_user_id != user || head.key.session_id != session {
             return Err("canonical recovery head ownership mismatch".into());
         }
-        let latest = work
-            .latest_request
-            .as_ref()
-            .and_then(|request| {
-                request["inference_scope"]["turn"]
-                    .as_u64()
-                    .or_else(|| request["session_facts"]["turn"].as_u64())
-            })
-            .unwrap_or(0);
-        Ok((u64::from(head.cursor.completed_turn) > latest).then_some(head))
+        Ok((head.cursor.completed_turn > work.latest_turn.unwrap_or(0)).then_some(head))
     }
 
     pub async fn publish_recovery(
@@ -213,7 +211,9 @@ impl SessionMemoryLifecycleStore {
                     if work.canonical_turn != turn {
                         return Err("canonical recovery generation changed".into());
                     }
-                    work.latest_request = Some(request);
+                    work.latest_turn = Some(turn);
+                    work.latest_facts = Some(request["session_facts"].clone());
+                    work.pending_request = Some(request);
                     work.latest_fingerprint = Some(fingerprint);
                     work.extraction_requested = true;
                     if !work.session_closed
@@ -224,7 +224,7 @@ impl SessionMemoryLifecycleStore {
                     }
                     work.reset_plan();
                     if work.active_request.is_none() {
-                        work.active_request = work.latest_request.clone();
+                        work.active_request = work.pending_request.take();
                         work.active_fingerprint = work.latest_fingerprint.clone();
                     }
                     Ok(())
@@ -238,10 +238,10 @@ impl SessionMemoryLifecycleStore {
         &self,
         claim: &SessionMemoryWorkClaim,
     ) -> Result<SessionMemoryWork, String> {
-        self.with_fenced_state(
+        self.inspect_fenced_state(
             &claim.user_id,
             &claim.session_id,
-            Some(&claim.token),
+            &claim.token,
             false,
             |work| Box::pin(async move { Ok(work.clone()) }),
         )
@@ -304,7 +304,7 @@ impl SessionMemoryLifecycleStore {
         }
         let mut work = decode_work(&row)?;
         if work.extraction_pending() && work.active_request.is_none() {
-            work.active_request = work.latest_request.clone();
+            work.active_request = work.pending_request.take();
             work.active_fingerprint = work.latest_fingerprint.clone();
         }
         let token = uuid::Uuid::new_v4().to_string();
@@ -334,6 +334,68 @@ impl SessionMemoryLifecycleStore {
     where
         F: for<'a> FnOnce(&'a mut SessionMemoryWork) -> BoxFuture<'a, Result<R, String>> + Send,
     {
+        self.fenced_state(user, session, token, require_idle, Persistence::Update, f)
+            .await
+    }
+
+    /// Inspect under the same authority and lease fence without rewriting or
+    /// rescheduling the journal. The callback cannot mutate durable state.
+    pub async fn inspect_fenced_state<R: Send, F>(
+        &self,
+        user: &str,
+        session: &str,
+        token: &str,
+        require_idle: bool,
+        f: F,
+    ) -> Result<R, String>
+    where
+        F: for<'a> FnOnce(&'a SessionMemoryWork) -> BoxFuture<'a, Result<R, String>> + Send,
+    {
+        self.fenced_state(
+            user,
+            session,
+            Some(token),
+            require_idle,
+            Persistence::Inspect,
+            move |work| f(work),
+        )
+        .await
+    }
+
+    /// Commit the final checkpoint and its lease release as one transition.
+    pub async fn finish_claim<R: Send, F>(
+        &self,
+        claim: &SessionMemoryWorkClaim,
+        require_idle: bool,
+        success: bool,
+        f: F,
+    ) -> Result<R, String>
+    where
+        F: for<'a> FnOnce(&'a mut SessionMemoryWork) -> BoxFuture<'a, Result<R, String>> + Send,
+    {
+        self.fenced_state(
+            &claim.user_id,
+            &claim.session_id,
+            Some(&claim.token),
+            require_idle,
+            Persistence::Finish { success },
+            f,
+        )
+        .await
+    }
+
+    async fn fenced_state<R: Send, F>(
+        &self,
+        user: &str,
+        session: &str,
+        token: Option<&str>,
+        require_idle: bool,
+        persistence: Persistence,
+        f: F,
+    ) -> Result<R, String>
+    where
+        F: for<'a> FnOnce(&'a mut SessionMemoryWork) -> BoxFuture<'a, Result<R, String>> + Send,
+    {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|error| error.to_string())?;
@@ -347,7 +409,9 @@ impl SessionMemoryLifecycleStore {
         if require_idle {
             ensure_idle(&mut tx, user, session).await?;
         }
-        ensure_work_row(&mut tx, user, session).await?;
+        if token.is_none() {
+            ensure_work_row(&mut tx, user, session).await?;
+        }
         let row = sqlx::query("SELECT state_json, lease_token, (lease_expires_at > NOW(6)) AS lease_live FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE")
             .bind(user).bind(session).fetch_one(&mut *tx).await.map_err(|error| error.to_string())?;
         if let Some(token) = token
@@ -369,8 +433,39 @@ impl SessionMemoryLifecycleStore {
             work.canonical_turn = canonical_turn_tx(&mut tx, user, session).await?;
         }
         let result = f(&mut work).await?;
-        sqlx::query("UPDATE agent_session_memory_work SET state_json = ?, complete = ?, next_attempt_at = NOW(6), updated_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-            .bind(serde_json::to_string(&work).map_err(|error| error.to_string())?).bind(!work.pending()).bind(user).bind(session).execute(&mut *tx).await.map_err(|error| error.to_string())?;
+        if !matches!(persistence, Persistence::Inspect) {
+            let scheduling = match persistence {
+                Persistence::Finish { success } => {
+                    if success
+                        && work.optional_complete
+                        && work.consolidation_complete
+                        && !work.extraction_pending()
+                        && work.prepared_working.is_none()
+                    {
+                        work.plan = None;
+                        work.receipts.clear();
+                        work.purged_ids.clear();
+                        work.reflection = None;
+                    }
+                    let (due, attempts) = release_schedule(success);
+                    format!(
+                        "lease_token = NULL, lease_expires_at = NULL, next_attempt_at = {due}, attempts = {attempts}"
+                    )
+                }
+                _ => "next_attempt_at = NOW(6)".into(),
+            };
+            let query = format!(
+                "UPDATE agent_session_memory_work SET state_json = ?, complete = ?, {scheduling}, updated_at = NOW(6) WHERE user_id = ? AND session_id = ?"
+            );
+            sqlx::query(&query)
+                .bind(serde_json::to_string(&work).map_err(|error| error.to_string())?)
+                .bind(!work.pending())
+                .bind(user)
+                .bind(session)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         tx.commit().await.map_err(|error| error.to_string())?;
         connection.release();
         Ok(result)
@@ -382,27 +477,20 @@ impl SessionMemoryLifecycleStore {
         success: bool,
         turn: u32,
     ) -> Result<(), String> {
-        self.with_fenced_state(
-            &claim.user_id,
-            &claim.session_id,
-            Some(&claim.token),
-            false,
-            move |work| {
-                Box::pin(async move {
-                    if success {
-                        work.completed_fingerprint = work.active_fingerprint.take();
-                        work.completed_turn = Some(turn);
-                        work.active_request = None;
-                        work.prepared_working = None;
-                        work.extraction_requested =
-                            work.latest_fingerprint != work.completed_fingerprint;
-                    }
-                    Ok(())
-                })
-            },
-        )
-        .await?;
-        self.release(claim, success).await
+        self.finish_claim(claim, false, success, move |work| {
+            Box::pin(async move {
+                if success {
+                    work.completed_fingerprint = work.active_fingerprint.take();
+                    work.completed_turn = Some(turn);
+                    work.active_request = None;
+                    work.prepared_working = None;
+                    work.extraction_requested =
+                        work.latest_fingerprint != work.completed_fingerprint;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     pub async fn release(
@@ -412,12 +500,7 @@ impl SessionMemoryLifecycleStore {
     ) -> Result<(), String> {
         // A failure backs off but remains durable; successful progress is due
         // immediately for the next stage. Claim expiry recovers process death.
-        let due = if success {
-            "NOW(6)"
-        } else {
-            "DATE_ADD(NOW(6), INTERVAL LEAST(960, 5 * POW(2, LEAST(GREATEST(attempts - 1, 0), 8))) SECOND)"
-        };
-        let attempts = if success { "0" } else { "attempts" };
+        let (due, attempts) = release_schedule(success);
         let query = format!(
             "UPDATE agent_session_memory_work SET lease_token = NULL, lease_expires_at = NULL, next_attempt_at = {due}, attempts = {attempts}, updated_at = NOW(6) WHERE user_id = ? AND session_id = ? AND lease_token = ?"
         );

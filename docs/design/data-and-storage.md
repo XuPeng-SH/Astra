@@ -68,7 +68,7 @@ Other SQL and malformed persisted-data errors retain their 500 behavior.
 
 ## Session-memory recovery journal
 
-Fresh schema contract `2026-10-14-v102` adds `agent_session_memory_work`, keyed
+Fresh schema contract `2026-10-16-v103` includes `agent_session_memory_work`, keyed
 by canonical Astra owner and Session. It checkpoints the existing extraction
 and governance algorithms: frozen request/write inputs, stage receipts, a
 worker lease and bounded retry timing. Canonical Session status, execution
@@ -76,7 +76,13 @@ settlement and context heads remain authoritative; the journal does not grant
 memory access or create another context lifecycle. Session deletion removes
 its queued inputs through the existing deletion catalog.
 
-The startup shape guard requires all journal columns. An existing v101 database
+Completed extraction drops its input transcript; publication coordinates and
+facts survive independently. Only fully successful governance retires replay
+inventories and receipts. Fenced inspections do not persist state, and finishing
+commits state and lease release together. Uncertain/failed work keeps its exact
+replay data. There remains one row per retained Session, not a global byte bound.
+
+The startup shape guard requires all journal columns. An existing v102 database
 is rejected under the repository's fresh-schema policy; deployment requires a
 new/current-contract database rather than only changing the image. Bootstrap
 does not silently add the journal to an old completion marker. Database
