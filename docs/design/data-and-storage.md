@@ -139,6 +139,11 @@ Retention is a product contract:
 - Run mutations retain the deletion-fence → session → execution-slot → run
   lock order. A caller's exact-owner/session/run locking read also establishes
   existence; it does not need a separate existence query in that transaction.
+  Canonical owner-backed appends use their exact-session generation/lease
+  UPDATE as the run fence; appends without execution authority still require
+  explicit run-existence admission. Generic event appends retain the same
+  locked metadata reader but omit the unused checkpoint body. These changes
+  reduce SQL exchanges and returned bytes, not retained data or durability.
 - Run status snapshots omit checkpoint bodies and read their canonical binding
   and accounting facts in one bounded event query after the metadata lookup.
   A narrow type/index aggregate selects the earliest event of each binding type

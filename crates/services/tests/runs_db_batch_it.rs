@@ -595,6 +595,145 @@ async fn append_events_batch_isolates_idempotency_and_replay_by_owner() {
         .await;
 }
 
+/// Event appends must not fetch a recovery body they never consume.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let run = uuid::Uuid::new_v4().to_string();
+    let other_session = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')")
+        .bind(&user)
+        .bind(&other_session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record(run.clone(), user.clone(), session.clone()),
+    )
+    .await;
+    let baseline_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let baseline_index: i64 = sqlx::query_scalar(
+        "SELECT last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    for bytes in [0, 128, 512 * 1024] {
+        let body = (bytes > 0).then(|| {
+            json!({"version":"checkpoint_v1", "graceful":true, "payload":"x".repeat(bytes)})
+                .to_string()
+        });
+        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(&body)
+            .bind(&user)
+            .bind(&run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let event = make_idempotent_event(
+            "agent_progress",
+            &format!("body-{bytes}"),
+            json!({"bytes":bytes}),
+        );
+        for replay in [false, true] {
+            let queries = Queries::default();
+            let subscriber = tracing_subscriber::registry().with(queries.clone());
+            let started = std::time::Instant::now();
+            store
+                .append_events_batch(&user, &session, &run, std::slice::from_ref(&event))
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            let statements = queries.0.lock().unwrap();
+            let locked_run = statements
+                .iter()
+                .find(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
+                .expect("actual run-lock statement");
+            assert!(
+                locked_run.contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+                "append must omit recovery body: {locked_run}"
+            );
+            eprintln!(
+                "event_append checkpoint_bytes={bytes} replay={replay} statements={} elapsed_us={}",
+                statements.len(),
+                started.elapsed().as_micros()
+            );
+        }
+        let retained: Option<String> = sqlx::query_scalar(
+            "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user)
+        .bind(&run)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, body,
+            "read optimization must not remove recovery data"
+        );
+        assert!(
+            store
+                .append_events_batch(&user, &other_session, &run, std::slice::from_ref(&event))
+                .await
+                .is_err()
+        );
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        count,
+        baseline_count + 3,
+        "replay and rejected requests cannot insert events"
+    );
+    let index: i64 = sqlx::query_scalar(
+        "SELECT last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(index, baseline_index + 3);
+    for table in [
+        "agent_run_events",
+        "run_display_projections",
+        "agent_runs",
+        "agent_session_execution_slots",
+        "agent_session_lifecycle_fences",
+        "agent_sessions",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id IN (?, ?)"
+        ))
+        .bind(&user)
+        .bind(&session)
+        .bind(&other_session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+}
+
 /// Owner isolation: a dirty checkpoint row for another user with the same run_id
 /// and idempotency key must not suppress the owner's save or win latest-load.
 #[tokio::test]

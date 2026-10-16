@@ -2134,24 +2134,33 @@ where
             return Err(db_error("admit_session_scoped_run_write", run_id, source));
         }
     }
-    load_run_metadata_after_session_admission_tx(tx, user_id, expected_session_id, run_id).await
+    load_run_metadata_after_session_admission_tx(
+        tx,
+        user_id,
+        expected_session_id,
+        run_id,
+        AGENT_RUN_COLUMNS,
+    )
+    .await
 }
 
 /// Load a run after the caller has already admitted and locked the session
 /// execution slot in this transaction.  Keeping this separate from the
 /// public exact-session helper avoids reacquiring the same session and slot
-/// locks for every related run in one collaborator admission/read.
+/// locks for related runs, and lets event append omit the unused checkpoint
+/// body without adding a separate locking/decoding implementation.
 async fn load_run_metadata_after_session_admission_tx<T>(
     tx: &mut T,
     user_id: &str,
     expected_session_id: &str,
     run_id: &str,
+    columns: &'static str,
 ) -> DbStoreResult<Option<DurableRunRecord>>
 where
     T: TransactionConnection,
 {
     let sql = format!(
-        "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+        "SELECT {columns} FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
     );
     let row = sqlx::query(&sql)
@@ -3700,8 +3709,8 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      runtime_profile, start_request_fingerprint, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
-// Status, observation and recovery-candidate reads need metadata, not the
-// potentially large checkpoint body. Executable recovery loads it separately.
+// Status, observation, event append and recovery-candidate reads need metadata,
+// not the potentially large checkpoint body. Executable recovery loads it separately.
 const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
@@ -14678,16 +14687,25 @@ impl DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("begin_append_run_events_batch", run_id, source))?;
-        let run = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
-            .await?
-            .ok_or_else(|| {
-                db_error(
-                    "load_run_for_batch_append",
-                    run_id,
-                    sqlx::Error::RowNotFound,
-                )
-            })?;
+        crate::storage::admit_session_execution_write(&mut tx, expected_session_id, user_id)
+            .await
+            .map_err(|source| db_error("admit_append_run_events", run_id, source))?;
+        // Appending events needs the locked metadata, not the recovery body.
+        let run = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            user_id,
+            expected_session_id,
+            run_id,
+            AGENT_RUN_RECOVERY_COLUMNS,
+        )
+        .await?
+        .ok_or_else(|| {
+            db_error(
+                "load_run_for_batch_append",
+                run_id,
+                sqlx::Error::RowNotFound,
+            )
+        })?;
 
         // Keep equality on the persisted column, not a Rust-normalized key.
         // Ordinals associate even collation-equivalent spellings with their
@@ -15983,6 +16001,7 @@ impl DatabaseRunStateStore {
             &record.user_id,
             &record.session_id,
             &admission.anchor_run_id,
+            AGENT_RUN_COLUMNS,
         )
         .await?;
         let existing = if anchor.is_some() {
@@ -16027,6 +16046,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
                 &record.session_id,
                 &existing.latest_stage.run_id,
+                AGENT_RUN_COLUMNS,
             )
             .await?
             .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
@@ -16082,6 +16102,7 @@ impl DatabaseRunStateStore {
             &record.user_id,
             &record.session_id,
             parent_id,
+            AGENT_RUN_COLUMNS,
         )
         .await?
         .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
@@ -16286,6 +16307,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
                 &record.session_id,
                 &admission.anchor_run_id,
+                AGENT_RUN_COLUMNS,
             )
             .await?;
             let receipt = if anchor.is_some() {
@@ -16309,6 +16331,7 @@ impl DatabaseRunStateStore {
                     &record.user_id,
                     &record.session_id,
                     &receipt.run_id,
+                    AGENT_RUN_COLUMNS,
                 )
                 .await?
                 .map(|_| receipt)
@@ -17713,12 +17736,17 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("begin_collaborator_native_session", anchor_id, source))?;
         admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
-        let anchor =
-            load_run_metadata_after_session_admission_tx(&mut tx, user_id, session_id, anchor_id)
-                .await?
-                .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
-                    run_id: anchor_id.to_string(),
-                })?;
+        let anchor = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            user_id,
+            session_id,
+            anchor_id,
+            AGENT_RUN_COLUMNS,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: anchor_id.to_string(),
+        })?;
         let association =
             Self::collaborator_association_tx(&mut tx, user_id, session_id, anchor_id)
                 .await?
@@ -17730,12 +17758,17 @@ impl DatabaseRunStateStore {
                 anchor_run_id: anchor_id.into(),
             });
         }
-        let stage =
-            load_run_metadata_after_session_admission_tx(&mut tx, user_id, session_id, stage_id)
-                .await?
-                .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
-                    run_id: stage_id.to_string(),
-                })?;
+        let stage = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            user_id,
+            session_id,
+            stage_id,
+            AGENT_RUN_COLUMNS,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: stage_id.to_string(),
+        })?;
         // Reporting generation is a CAS fence, not the origin of the receipt.
         if stage.run_generation != expected_owner_generation {
             return Err(CollaboratorStoreError::ParentNotCurrent {
