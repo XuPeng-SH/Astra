@@ -280,9 +280,10 @@ Allowlist changes take effect only after they reach the trusted base branch.
 
 The authoritative selection is [ci-regression.txt](ci-regression.txt). The
 selector stages those original files unchanged into one suite; it does not copy
-prompts into the workflow or implement another grader. Seven cases are reused;
-the mixed-model handoff is added because older heterogeneous probes require
-GLM-5.2 rather than the configured GLM-5.3.
+prompts into the workflow or implement another grader. The 18 roots cover
+distinct delivery, tool, observability, context and delegation boundaries; child
+communication and inherited-model checks bind to the selected model rather than
+requiring an obsolete hard-coded provider version.
 
 | Case | Level / evidence |
 | --- | --- |
@@ -294,6 +295,16 @@ GLM-5.2 rather than the configured GLM-5.3.
 | `cache_provider_matrix_regression` | Four turns: stable-prefix/cache diagnostics (the optional cache-ratio check is not a hard cache-hit guarantee) |
 | `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
 | `same_model_fanout_handoff_flash` | Medium: two Flash children, exact slot identities, real child results and parent adoption |
+| `file_edit_prepared_bytes` | File creation, localized edit, read-back and exact on-disk bytes |
+| `read_only_shell_diagnostics` | Read-only shell authorization and truthful output delivery |
+| `introspection_reflection_source_boundary` | Distinct live-process and durable-session evidence |
+| `multi_turn_local_followup_focus` | Topic change, local follow-up and explicit historical recall |
+| `flash_rejected_delegation_preserves_parent_tools` | Parent remains usable after a rejected child request |
+| `flash_fanout_invalid_final_slot` | Atomic rejection: an invalid slot must not launch any child |
+| `flash_child_question_parent_answer` | Correlated child question, parent answer and actual result adoption |
+| `agent_workspace_evidence_chain` | Child reaches the inherited workspace, parent uses its evidence |
+| `work_two_step_execution_journey` | Durable Work establishment, execution and settlement |
+| `flash_model_name_is_output` | Quoted model name is task content, not an execution selector |
 
 All parents and the judge use DeepSeek-v4.1-Flash; this is not independent-model judging.
 Only Flash is registered by default, using the existing `HARNESS_GLM_BASE_URL` and
@@ -310,8 +321,8 @@ they are never silently substituted or omitted. No Jev configuration is required
 Run once, serially, with an aggregate **15-minute execution budget** plus at most
 two minutes for cancellation/settlement. This is a budget, not a measured
 performance claim: build, service startup, registration and artifact publication
-are separate and may make the entire workflow longer. Eight root cases include
-three cache follow-up turns. Per-case timings, results, error classes, usage
+are separate and may make the entire workflow longer. Eighteen roots include
+follow-up turns; these are not counted as additional roots. Per-case timings, results, error classes, usage
 coverage and partial-timeout summaries use the same safe live progress as the
 manual workflow. There is no retry-until-green policy. This sample does not
 replace full-suite, long-task, capacity or deterministic protocol coverage.
@@ -374,11 +385,20 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-The registered model uses the local GLM-5.3 deployment's declared
+Progress uses `astra.harness_progress.v3`. Argument failures include bounded
+validator-authored rule codes and canonical built-in field paths; array indices
+become `*`, and unknown/provider fields are opaque. Private error text, arguments,
+provider responses and judge rationale are not public artifacts. Issue/outcome
+omissions are counted. If a receipt lacks rule details, analysis explicitly says
+the exact invalid field is unknown; an argument rejection does not prove model
+admission was reached. The unavailable-model negative control intentionally
+requires one valid first attempt: accepting a schema error would erase coverage.
+
+The default registered model is DeepSeek-v4.1-Flash and uses the deployment's declared
 `reasoning_effort` protocol, 128,000-token context and 84,000-token output
 ceiling. Prices are deliberately omitted: supply deployment pricing separately
 before making monetary comparisons. Both advisory and required LLM graders run,
-using GLM-5.3 unless a criterion explicitly selects another model. Grading adds
+using DeepSeek-v4.1-Flash unless a criterion explicitly selects another model. Grading adds
 provider calls and cost; a same-model judge is not independent quality evidence.
 CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answer
 minimum); the Server bounds the effective request by the admitted Offering's

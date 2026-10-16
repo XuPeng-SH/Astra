@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v2"
+SCHEMA = "astra.harness_progress.v3"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -51,6 +51,30 @@ ERROR_KINDS = {"rate_limit", "payment_required", "server_error", "auth", "contex
                "delegation_model_scope_unresolved", "delegation_model_unavailable",
                "delegation_preparation_unavailable", "delegation_model_assessment_unavailable",
                "invalid_delegation_model_scope", "execution_time_budget_exhausted"}
+
+VALIDATION_CODES = frozenset("""
+required type const enum min_length max_length minimum maximum unique_items
+min_items max_items union additional_properties action_fields required_alternative malformed_json
+""".split())
+
+
+def safe_validation(value):
+    if value is None:
+        return
+    if (not isinstance(value, dict) or set(value) != {"issues", "omitted"}
+        or not isinstance(value["issues"], list) or len(value["issues"]) > 8
+        or len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()) > 4096):
+        raise ValueError("invalid validation summary")
+    integer(value["omitted"])
+    for issue in value["issues"]:
+        if (not isinstance(issue, dict) or set(issue) != {"code", "path"}
+            or not isinstance(issue["code"], str) or issue["code"] not in VALIDATION_CODES):
+            raise ValueError("invalid validation issue")
+        path = issue["path"]
+        if path is not None and (not isinstance(path, str)
+            or len(path.encode()) > 256 or (path and not path.startswith("/"))
+            or path.count("/") > 8):
+            raise ValueError("invalid validation location")
 
 
 def integer(value):
@@ -123,20 +147,24 @@ def safe_diagnostic(value, depth):
             for count in value["predicate_matches"]:
                 integer(count)
             outcomes = value["observed_outcomes"]
-            if not isinstance(outcomes, list) or len(outcomes) > 16:
+            if (not isinstance(outcomes, list) or len(outcomes) > 16
+                or len(json.dumps(outcomes, separators=(",", ":"), ensure_ascii=False).encode()) > 8192):
                 raise ValueError("invalid outcome observations")
             observed = value["outcomes_omitted"]
             for entry in outcomes:
                 if set(entry) != {"outcome", "count"} or integer(entry["count"]) == 0:
                     raise ValueError("invalid outcome count")
                 outcome = entry["outcome"]
-                if (set(outcome) != {"disposition", "ok", "status", "error_kind", "execution"}
+                if (set(outcome) != {"disposition", "ok", "status", "error_kind", "execution", "validation"}
                     or (outcome["ok"] is not None and type(outcome["ok"]) is not bool)
                     or outcome["disposition"] not in ("executed", "rejected", "reused", "suppressed", "deferred")
                     or outcome["status"] not in OUTCOME_STATUSES
                     or outcome["error_kind"] not in ERROR_KINDS
                     or outcome["execution"] not in ("executed", "not_executed", "unknown", "not_reported")):
                     raise ValueError("invalid outcome tags")
+                safe_validation(outcome["validation"])
+                if outcome["validation"] is not None and outcome["error_kind"] != "tool_invalid_args":
+                    raise ValueError("validation summary without argument rejection")
                 observed += entry["count"]
             if observed != value["considered"]:
                 raise ValueError("incomplete outcome accounting")
@@ -208,7 +236,17 @@ def check_lines(items, prefix):
                     reason += f"; omitted observations={diagnostic['outcomes_omitted']}"
                 kinds = {item["outcome"]["error_kind"] for item in diagnostic["observed_outcomes"]}
                 if "tool_invalid_args" in kinds:
-                    reason += "; Attribution: argument validation error reported; this does not prove the requested model was checked"
+                    reason += "; Failure stage: argument validation reported; this does not prove the requested model was checked"
+                    summaries = [entry["outcome"]["validation"] for entry in diagnostic["observed_outcomes"]
+                                 if entry["outcome"]["validation"] is not None]
+                    if not summaries:
+                        reason += "; validation rules unavailable in the captured receipt; exact invalid field is unknown"
+                    for summary in summaries:
+                        reason += "; validation rules=" + ", ".join(
+                            f"{issue['code']} at {('<root>' if issue['path'] == '' else issue['path']) if issue['path'] is not None else '<opaque>'}"
+                            for issue in summary["issues"])
+                        if summary["omitted"]:
+                            reason += f"; omitted validation issues={summary['omitted']}"
                 elif kinds & {"delegation_model_scope_unresolved", "delegation_model_unavailable", "invalid_delegation_model_scope"}:
                     reason += "; Attribution: delegation model admission error reported; child execution is a separate check"
                 elif "invalid_request" in kinds:

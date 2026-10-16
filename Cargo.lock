@@ -670,6 +670,7 @@ dependencies = [
  "astra-server-types",
  "astra-services",
  "astra-thin-client",
+ "astra-tools",
  "astra-turn-core",
  "astra-turn-types",
  "async-trait",

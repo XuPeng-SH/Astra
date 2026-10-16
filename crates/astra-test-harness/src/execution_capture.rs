@@ -204,8 +204,18 @@ impl ExecutionToolCall<'_> {
             Some(AgentFanoutControlExecutionFact::Unknown) => "unknown",
             None => "not_reported",
         };
+        let validation = (error_kind == "tool_invalid_args")
+            .then(|| {
+                result
+                    .as_ref()
+                    .and_then(|value| value.get("validation"))
+                    .and_then(|value| {
+                        astra_tools::schemas::validated_argument_diagnostic(self.name, value)
+                    })
+            })
+            .flatten();
         serde_json::json!({"disposition":self.disposition, "ok":self.ok, "status":status,
-            "error_kind":error_kind, "execution":execution})
+            "error_kind":error_kind, "execution":execution, "validation":validation})
     }
 }
 

@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-pub const SCHEMA: &str = "astra.harness_progress.v2";
+pub const SCHEMA: &str = "astra.harness_progress.v3";
 pub const MAX_RECORD_BYTES: usize = 262_144;
 
 fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<Value>> {
@@ -254,7 +254,7 @@ mod tests {
                 "kind":"tool_count", "min":1,"max":1,"actual":0,"considered":1,
                 "expected_ok":false,"outcome_matches":1,"error_matches":null,"predicate_matches":[1,0,0],
                 "observed_outcomes":[{"count":1,"outcome":{"disposition":"executed","ok":false,
-                    "status":"rejected","error_kind":"tool_invalid_args","execution":"not_reported"}}],
+                    "status":"rejected","error_kind":"tool_invalid_args","execution":"not_reported","validation":null}}],
                 "outcomes_omitted":0
             })
         );
@@ -351,75 +351,143 @@ mod tests {
     }
 
     #[test]
-    fn tool_outcome_buckets_are_bounded_without_changing_exact_counts() {
-        let mut capture = crate::execution_capture::tests::tool_capture();
-        let kinds = [
-            "rate_limit",
-            "payment_required",
-            "server_error",
-            "auth",
-            "context_window",
-            "invalid_request",
-            "contract_violation",
-            "stream_idle",
-            "provider_deadline",
-            "stream_transport",
-            "connection_pool_exhausted",
-            "budget_exhausted",
-            "tool_rounds_exhausted",
-            "network",
-            "tool_not_found",
-            "tool_invalid_args",
-            "policy_denied",
-        ];
-        capture.run_tree.runs[0].total_tool_calls = 20;
-        let page = capture.transcript.as_mut().unwrap();
-        let (request, result) = (page.items[0].clone(), page.items[1].clone());
-        page.items.drain(..2);
-        for index in 0..20 {
-            let mut request = request.clone();
-            let mut result = result.clone();
-            let id = format!("call-{index}");
-            request.item_seq = 10 + index * 2;
-            result.item_seq = request.item_seq + 1;
-            request.tool_calls[0].tool_use_id = id.clone();
-            result.tool_result.as_mut().unwrap().tool_use_id = id;
-            result.tool_result.as_mut().unwrap().status = Some("failed".into());
-            result.content = json!({"error_kind":kinds[if index < 17 {index as usize} else {0}],
-                "status":"failed", "error":"private-sentinel"})
-            .to_string();
-            page.items.extend([request, result]);
-        }
+    fn schema_rejection_flows_from_real_validator_to_safe_canonical_progress() {
+        let arguments = json!({"action":"spawn","prompt":"private-sentinel"});
+        let error = astra_tools::schemas::validate_tool_arguments("agent", &arguments).unwrap_err();
+        let receipt = error.rejection_output();
+        let mut capture =
+            serde_json::to_value(crate::execution_capture::tests::tool_capture()).unwrap();
+        capture["transcript"]["items"][0]["tool_calls"][0]["arguments"] =
+            arguments.to_string().into();
+        capture["transcript"]["items"][1]["tool_result"]["status"] = "rejected".into();
+        capture["transcript"]["items"][1]["content"] = receipt.to_string().into();
         let mut outcome = RunOutcome::new("model");
         outcome.run_id = Some("root".into());
         let mut stream = crate::runner::StreamCapture::default();
         stream.identity_verified = true;
-        stream.execution = Some(capture);
+        stream.execution = Some(serde_json::from_value(capture).unwrap());
         outcome.stream_capture = Some(stream);
         let criterion: Criterion = serde_json::from_value(json!({"type":"execution_tool_count",
-            "name":"agent", "min":1,"max":1,"ok":true,"root_only":true}))
+            "name":"agent","min":1,"max":1,"ok":true,"root_only":true}))
         .unwrap();
         let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
         let projected = criteria(&results, &outcome).unwrap();
-        let diagnostic = &projected[0]["diagnostic"];
-        assert_eq!(diagnostic["considered"], 20);
-        assert_eq!(diagnostic["actual"], 0);
-        assert_eq!(diagnostic["outcome_matches"], 0);
-        assert_eq!(diagnostic["outcomes_omitted"], 1);
-        let buckets = diagnostic["observed_outcomes"].as_array().unwrap();
-        assert_eq!(buckets.len(), 16);
-        assert_eq!(
-            buckets
-                .iter()
-                .map(|b| b["count"].as_u64().unwrap())
-                .sum::<u64>(),
-            19
-        );
+        assert_eq!(projected[0]["passed"], false);
+        let observed = &projected[0]["diagnostic"]["observed_outcomes"][0]["outcome"];
+        assert_eq!(observed["validation"], receipt["validation"]);
+        assert_eq!(observed["execution"], "not_executed");
         assert!(
             !serde_json::to_string(&projected)
                 .unwrap()
                 .contains("private-sentinel")
         );
+    }
+
+    #[test]
+    fn tool_outcome_buckets_are_bounded_without_changing_exact_counts() {
+        for with_validation in [false, true] {
+            let mut capture = crate::execution_capture::tests::tool_capture();
+            let kinds = [
+                "rate_limit",
+                "payment_required",
+                "server_error",
+                "auth",
+                "context_window",
+                "invalid_request",
+                "contract_violation",
+                "stream_idle",
+                "provider_deadline",
+                "stream_transport",
+                "connection_pool_exhausted",
+                "budget_exhausted",
+                "tool_rounds_exhausted",
+                "network",
+                "tool_not_found",
+                "tool_invalid_args",
+                "policy_denied",
+            ];
+            capture.run_tree.runs[0].total_tool_calls = 20;
+            let page = capture.transcript.as_mut().unwrap();
+            let (request, result) = (page.items[0].clone(), page.items[1].clone());
+            page.items.drain(..2);
+            for index in 0..20 {
+                let mut request = request.clone();
+                let mut result = result.clone();
+                let id = format!("call-{index}");
+                request.item_seq = 10 + index * 2;
+                result.item_seq = request.item_seq + 1;
+                request.tool_calls[0].tool_use_id = id.clone();
+                result.tool_result.as_mut().unwrap().tool_use_id = id;
+                result.tool_result.as_mut().unwrap().status = Some("failed".into());
+                result.content =
+                    json!({"error_kind":kinds[if index < 17 {index as usize} else {0}],
+                "status":"failed", "error":"private-sentinel"})
+                    .to_string();
+                if with_validation {
+                    let codes = [
+                        "required",
+                        "type",
+                        "const",
+                        "enum",
+                        "min_length",
+                        "max_length",
+                        "minimum",
+                        "maximum",
+                        "unique_items",
+                        "min_items",
+                        "max_items",
+                        "union",
+                        "additional_properties",
+                        "action_fields",
+                        "required_alternative",
+                        "malformed_json",
+                    ];
+                    let issue = json!({"code":codes[index as usize % codes.len()],"path":"/requested_model_policy/selector/model_name"});
+                    result.content = json!({"error_kind":"tool_invalid_args","status":"rejected",
+                    "validation":{"issues":vec![issue;8],"omitted":0}})
+                    .to_string();
+                }
+                page.items.extend([request, result]);
+            }
+            let mut outcome = RunOutcome::new("model");
+            outcome.run_id = Some("root".into());
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(capture);
+            outcome.stream_capture = Some(stream);
+            let criterion: Criterion =
+                serde_json::from_value(json!({"type":"execution_tool_count",
+            "name":"agent", "min":1,"max":1,"ok":true,"root_only":true}))
+                .unwrap();
+            let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+            let projected = criteria(&results, &outcome).unwrap();
+            let diagnostic = &projected[0]["diagnostic"];
+            assert_eq!(diagnostic["considered"], 20);
+            assert_eq!(diagnostic["actual"], 0);
+            assert_eq!(diagnostic["outcome_matches"], 0);
+            let buckets = diagnostic["observed_outcomes"].as_array().unwrap();
+            if with_validation {
+                assert!(diagnostic["outcomes_omitted"].as_u64().unwrap() > 0);
+                assert!(buckets.len() < 16);
+            } else {
+                assert_eq!(diagnostic["outcomes_omitted"], 1);
+                assert_eq!(buckets.len(), 16);
+            }
+            assert!(serde_json::to_vec(buckets).unwrap().len() <= 8192);
+            assert_eq!(
+                buckets
+                    .iter()
+                    .map(|b| b["count"].as_u64().unwrap())
+                    .sum::<u64>()
+                    + diagnostic["outcomes_omitted"].as_u64().unwrap(),
+                20
+            );
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+        }
     }
 
     #[test]

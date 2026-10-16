@@ -69,7 +69,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                          "kind":"tool_count", "min":1, "max":1, "actual":0,"considered":1,
                          "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0],
                          "observed_outcomes":[{"count":1,"outcome":{"disposition":"rejected","ok":False,
-                             "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed"}}],
+                             "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed","validation":None}}],
                          "outcomes_omitted":0}}
             result["criteria"] = [check]
             write_events(root, data)
@@ -81,7 +81,8 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("[1, 0, 0]", summary)
             self.assertIn("not configured", summary)
             self.assertIn("tool_invalid_args", summary)
-            self.assertIn("argument validation error reported", summary)
+            self.assertIn("Failure stage: argument validation", summary)
+            self.assertIn("exact invalid field is unknown", summary)
             command = subprocess.run([sys.executable, str(SCRIPT), "summary", "--root", str(root)],
                 env={**os.environ, "ASTRA_BUILD_SOURCE_GIT_SHA":SHA,
                      "GITHUB_STEP_SUMMARY":str(root / "job-summary"), "HARNESS_OUTCOME":"failure"},
@@ -93,6 +94,14 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertEqual(json.loads((root / "summary.json").read_text())["runs"][0]["criteria"][0]
                              ["diagnostic"]["observed_outcomes"], check["diagnostic"]["observed_outcomes"])
             outcome = check["diagnostic"]["observed_outcomes"][0]["outcome"]
+            outcome["validation"] = {"issues":[{"code":"required","path":"/description"}], "omitted":3}
+            write_events(root, data)
+            _, accepted = self.publish(root, "failure")
+            self.assertIsNone(accepted["observation_error"])
+            summary = (root / "job-summary").read_text()
+            self.assertIn("required at /description", summary)
+            self.assertIn("omitted validation issues=3", summary)
+            outcome["validation"] = None
             for status in ("timeout", "still_running", "launched"):
                 outcome["status"] = status
                 write_events(root, data)
@@ -100,7 +109,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 self.assertIsNone(accepted["observation_error"])
                 self.assertIn(status, (root / "job-summary").read_text())
             outcome["status"] = "rejected"
-            for field in ("status", "error_kind", "execution", "disposition", "ok"):
+            for field in ("status", "error_kind", "execution", "disposition", "ok", "validation"):
                 prior = outcome[field]
                 outcome[field] = "private-sentinel"
                 write_events(root, data)

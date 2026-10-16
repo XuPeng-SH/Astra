@@ -1135,6 +1135,7 @@ pub(crate) fn execution_contract_proof(
             let mut error_matches = 0;
             let mut predicate_matches = vec![0usize; predicates.len()];
             let mut observed_outcomes: Vec<serde_json::Value> = Vec::new();
+            let mut outcome_bytes = 0;
             let mut outcomes_omitted = 0usize;
             let count = calls
                 .iter()
@@ -1144,12 +1145,17 @@ pub(crate) fn execution_contract_proof(
                     }
                     considered += 1;
                     let outcome = call.safe_outcome();
+                    let bytes = serde_json::to_vec(&outcome)
+                        .expect("safe outcome serializes")
+                        .len()
+                        + 64;
                     if let Some(existing) = observed_outcomes
                         .iter_mut()
                         .find(|entry| entry["outcome"] == outcome)
                     {
                         existing["count"] = (existing["count"].as_u64().unwrap() + 1).into();
-                    } else if observed_outcomes.len() < 16 {
+                    } else if observed_outcomes.len() < 16 && outcome_bytes + bytes <= 8192 {
+                        outcome_bytes += bytes;
                         observed_outcomes.push(serde_json::json!({"outcome":outcome,"count":1}));
                     } else {
                         outcomes_omitted += 1;

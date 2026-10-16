@@ -146,11 +146,141 @@ pub fn action_contract_description(parameters: &Map<String, Value>) -> Option<St
 
 /// Structured failure returned when model-authored arguments do not satisfy
 /// the invocation constraints encoded in the advertised built-in schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCode {
+    Required,
+    Type,
+    Const,
+    Enum,
+    MinLength,
+    MaxLength,
+    Minimum,
+    Maximum,
+    UniqueItems,
+    MinItems,
+    MaxItems,
+    Union,
+    AdditionalProperties,
+    ActionFields,
+    RequiredAlternative,
+    MalformedJson,
+}
+
+/// One validator fact with a private rendering, not a second validation pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub code: ValidationCode,
+    location: Vec<String>,
+    message: String,
+}
+
+impl ValidationIssue {
+    fn new(code: ValidationCode, location: &[String], message: String) -> Self {
+        Self {
+            code,
+            location: location.to_vec(),
+            message,
+        }
+    }
+}
+
+impl fmt::Display for ValidationIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Only this projection may cross the public CI boundary. Private issue text,
+/// submitted keys and dynamic-provider property names are never serialized.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationDiagnostic {
+    code: ValidationCode,
+    path: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationSummary {
+    issues: Vec<ValidationDiagnostic>,
+    omitted: u64,
+}
+
+fn canonical_location(schema: &Value, path: &[String]) -> bool {
+    let Some((head, tail)) = path.split_first() else {
+        return true;
+    };
+    let child = if head == "*" {
+        schema.get("items")
+    } else {
+        schema
+            .get("properties")
+            .and_then(|properties| properties.get(head))
+    };
+    child.is_some_and(|child| canonical_location(child, tail))
+        || ["oneOf", "anyOf"].iter().any(|key| {
+            schema
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| {
+                    branches
+                        .iter()
+                        .any(|branch| canonical_location(branch, path))
+                })
+        })
+}
+
+fn safe_location(tool: &str, location: &[String]) -> Option<String> {
+    if location.len() > 8 {
+        return None;
+    }
+    let schema = builtin_tool_schema(tool)?
+        .get("function")?
+        .get("parameters")?;
+    if !canonical_location(schema, location) {
+        return None;
+    }
+    let path = location
+        .iter()
+        .map(|part| format!("/{}", part.replace('~', "~0").replace('/', "~1")))
+        .collect::<String>();
+    (path.len() <= 256).then_some(path)
+}
+
+/// Validate untrusted result data against the same public projection contract.
+/// A matching tool name alone never declassifies provider-supplied field names.
+pub fn validated_argument_diagnostic(tool: &str, value: &Value) -> Option<Value> {
+    if serde_json::to_vec(value).ok()?.len() > 4096 {
+        return None;
+    }
+    let summary: ValidationSummary = serde_json::from_value(value.clone()).ok()?;
+    if summary.issues.len() > 8 {
+        return None;
+    }
+    for issue in &summary.issues {
+        if let Some(path) = &issue.path {
+            let location = if path.is_empty() {
+                Vec::new()
+            } else {
+                path.strip_prefix('/')?
+                    .split('/')
+                    .map(|part| part.replace("~1", "/").replace("~0", "~"))
+                    .collect()
+            };
+            if safe_location(tool, &location).as_ref() != Some(path) {
+                return None;
+            }
+        }
+    }
+    serde_json::to_value(summary).ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolArgumentValidationError {
     pub tool_name: String,
     pub action: Option<String>,
-    pub issues: Vec<String>,
+    pub issues: Vec<ValidationIssue>,
     malformed_parse_error: Option<Value>,
 }
 
@@ -160,13 +290,45 @@ impl fmt::Display for ToolArgumentValidationError {
         if let Some(action) = self.action.as_deref() {
             write!(formatter, " (action `{action}`)")?;
         }
-        write!(formatter, ": {}", self.issues.join("; "))
+        write!(
+            formatter,
+            ": {}",
+            self.issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     }
 }
 
 impl std::error::Error for ToolArgumentValidationError {}
 
 impl ToolArgumentValidationError {
+    pub fn diagnostic(&self) -> Value {
+        let mut summary = ValidationSummary {
+            issues: self
+                .issues
+                .iter()
+                .take(8)
+                .map(|issue| ValidationDiagnostic {
+                    code: issue.code,
+                    path: safe_location(&self.tool_name, &issue.location),
+                })
+                .collect(),
+            omitted: self.issues.len().saturating_sub(8) as u64,
+        };
+        while serde_json::to_vec(&summary)
+            .expect("diagnostic serializes")
+            .len()
+            > 4096
+        {
+            summary.issues.pop();
+            summary.omitted += 1;
+        }
+        serde_json::to_value(summary).expect("diagnostic serializes")
+    }
+
     #[must_use]
     pub fn output(&self) -> String {
         if let Some(parse_error) = self.malformed_parse_error.as_ref() {
@@ -219,6 +381,7 @@ impl ToolArgumentValidationError {
             "executed": false,
             "error": self.output(),
             "recovery_evidence": evidence,
+            "validation": self.diagnostic(),
         })
     }
 
@@ -235,7 +398,8 @@ impl ToolArgumentValidationError {
     #[must_use]
     pub fn into_tool_result(self) -> crate::ToolResult {
         let evidence = self.failure_evidence();
-        crate::ToolResult::error(self.output()).with_failure_evidence(evidence)
+        crate::ToolResult::error(self.rejection_output().to_string())
+            .with_failure_evidence(evidence)
     }
 }
 
@@ -379,7 +543,8 @@ fn validate_schema_value(
     schema: &Value,
     path: &str,
     check_required: bool,
-    issues: &mut Vec<String>,
+    location: &mut Vec<String>,
+    issues: &mut Vec<ValidationIssue>,
 ) {
     // A shared outer type applies to every alternative. Reject it before
     // evaluating branches so a type error is not reported as an ambiguous
@@ -387,9 +552,13 @@ fn validate_schema_value(
     if let Some(expected) = schema.get("type")
         && !schema_type_matches(value, expected)
     {
-        issues.push(format!(
-            "{path} has type {}, expected {expected}",
-            json_type_name(value)
+        issues.push(ValidationIssue::new(
+            ValidationCode::Type,
+            location,
+            format!(
+                "{path} has type {}, expected {expected}",
+                json_type_name(value)
+            ),
         ));
         return;
     }
@@ -398,7 +567,7 @@ fn validate_schema_value(
             continue;
         };
         let mut matches = 0;
-        let mut best_failure: Option<Vec<String>> = None;
+        let mut best_failure: Option<Vec<ValidationIssue>> = None;
         let has_type_compatible_branch = alternatives.iter().any(|candidate| {
             candidate
                 .get("type")
@@ -413,7 +582,14 @@ fn validate_schema_value(
                 continue;
             }
             let mut candidate_issues = Vec::new();
-            validate_schema_value(value, candidate, path, true, &mut candidate_issues);
+            validate_schema_value(
+                value,
+                candidate,
+                path,
+                true,
+                location,
+                &mut candidate_issues,
+            );
             if candidate_issues.is_empty() {
                 matches += 1;
                 if keyword == "anyOf" {
@@ -427,26 +603,41 @@ fn validate_schema_value(
             }
         }
         if matches == 0 {
-            issues.extend(
-                best_failure
-                    .unwrap_or_else(|| vec![format!("{path} has no matching {keyword} branch")]),
-            );
+            issues.extend(best_failure.unwrap_or_else(|| {
+                vec![ValidationIssue::new(
+                    ValidationCode::Union,
+                    location,
+                    format!("{path} has no matching {keyword} branch"),
+                )]
+            }));
             return;
         }
         if keyword == "oneOf" && matches != 1 {
-            issues.push(format!("{path} must match exactly one advertised branch"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Union,
+                location,
+                format!("{path} must match exactly one advertised branch"),
+            ));
             return;
         }
     }
     if let Some(expected) = schema.get("const")
         && value != expected
     {
-        issues.push(format!("{path} must be {expected}"));
+        issues.push(ValidationIssue::new(
+            ValidationCode::Const,
+            location,
+            format!("{path} must be {expected}"),
+        ));
     }
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
         && !allowed.contains(value)
     {
-        issues.push(format!("{path} is outside its advertised enum"));
+        issues.push(ValidationIssue::new(
+            ValidationCode::Enum,
+            location,
+            format!("{path} is outside its advertised enum"),
+        ));
     }
 
     if let Some(text) = value.as_str() {
@@ -454,12 +645,20 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
             && (length < minimum || (minimum > 0 && text.trim().chars().count() < minimum as usize))
         {
-            issues.push(format!("{path} requires at least {minimum} character(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MinLength,
+                location,
+                format!("{path} requires at least {minimum} character(s)"),
+            ));
         }
         if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
             && length > maximum
         {
-            issues.push(format!("{path} accepts at most {maximum} character(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MaxLength,
+                location,
+                format!("{path} accepts at most {maximum} character(s)"),
+            ));
         }
     }
 
@@ -467,12 +666,20 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
             && number < minimum
         {
-            issues.push(format!("{path} must be at least {minimum}"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Minimum,
+                location,
+                format!("{path} must be at least {minimum}"),
+            ));
         }
         if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
             && number > maximum
         {
-            issues.push(format!("{path} must be at most {maximum}"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Maximum,
+                location,
+                format!("{path} must be at most {maximum}"),
+            ));
         }
     }
 
@@ -483,26 +690,44 @@ fn validate_schema_value(
                 .enumerate()
                 .any(|(index, value)| values[..index].contains(value))
         {
-            issues.push(format!("{path} requires unique items"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::UniqueItems,
+                location,
+                format!("{path} requires unique items"),
+            ));
         }
         if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
             && values.len() < minimum as usize
         {
-            issues.push(format!("{path} requires at least {minimum} item(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MinItems,
+                location,
+                format!("{path} requires at least {minimum} item(s)"),
+            ));
         }
         if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
             && values.len() > maximum as usize
         {
-            issues.push(format!("{path} accepts at most {maximum} item(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MaxItems,
+                location,
+                format!("{path} accepts at most {maximum} item(s)"),
+            ));
         }
         if let Some(item_schema) = schema.get("items") {
+            location.push("*".into());
             for (index, item) in values.iter().enumerate() {
                 let item_path = format!("{path} item {index}");
-                validate_schema_value(item, item_schema, &item_path, true, issues);
+                validate_schema_value(item, item_schema, &item_path, true, location, issues);
                 if item.as_str().is_some_and(|item| item.trim().is_empty()) {
-                    issues.push(format!("{item_path} must be non-empty"));
+                    issues.push(ValidationIssue::new(
+                        ValidationCode::Required,
+                        location,
+                        format!("{item_path} must be non-empty"),
+                    ));
                 }
             }
+            location.pop();
         }
     }
 
@@ -517,9 +742,13 @@ fn validate_schema_value(
                 } else {
                     format!("{path} ")
                 };
-                issues.push(format!(
-                    "{prefix}missing non-empty required field `{field}`"
+                location.push(field.into());
+                issues.push(ValidationIssue::new(
+                    ValidationCode::Required,
+                    location,
+                    format!("{prefix}missing non-empty required field `{field}`"),
                 ));
+                location.pop();
             }
         }
     }
@@ -539,13 +768,26 @@ fn validate_schema_value(
             } else {
                 format!("{path} has unknown field(s)")
             };
-            issues.push(format!("{label}: {}", unknown.join(", ")));
+            issues.push(ValidationIssue::new(
+                ValidationCode::AdditionalProperties,
+                location,
+                format!("{label}: {}", unknown.join(", ")),
+            ));
         }
     }
     if let Some(properties) = properties {
         for (field, child) in object {
             if let Some(child_schema) = properties.get(field) {
-                validate_schema_value(child, child_schema, &field_path(path, field), true, issues);
+                location.push(field.clone());
+                validate_schema_value(
+                    child,
+                    child_schema,
+                    &field_path(path, field),
+                    true,
+                    location,
+                    issues,
+                );
+                location.pop();
             }
         }
     }
@@ -595,9 +837,10 @@ pub fn validate_tool_arguments_against_schema(
         .filter(|action| !action.is_empty());
     let mut issues = Vec::new();
     let Some(arguments) = args.as_object() else {
-        issues.push(format!(
-            "expected an object, received {}",
-            json_type_name(args)
+        issues.push(ValidationIssue::new(
+            ValidationCode::Type,
+            &[],
+            format!("expected an object, received {}", json_type_name(args)),
         ));
         return Err(ToolArgumentValidationError {
             tool_name: tool_name.to_string(),
@@ -614,14 +857,22 @@ pub fn validate_tool_arguments_against_schema(
         return Err(ToolArgumentValidationError {
             tool_name: tool_name.to_string(),
             action: None,
-            issues: vec!["arguments were not valid JSON".to_string()],
+            issues: vec![ValidationIssue::new(
+                ValidationCode::MalformedJson,
+                &[],
+                "arguments were not valid JSON".to_string(),
+            )],
             malformed_parse_error: Some(parse_error.clone()),
         });
     }
 
     for field in collect_required_fields(parameters, action) {
         if !value_is_present(arguments.get(&field)) {
-            issues.push(format!("missing non-empty required field `{field}`"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Required,
+                std::slice::from_ref(&field),
+                format!("missing non-empty required field `{field}`"),
+            ));
         }
     }
 
@@ -638,7 +889,11 @@ pub fn validate_tool_arguments_against_schema(
             .map(|fields| fields.join(" + "))
             .collect::<Vec<_>>()
             .join(" or ");
-        issues.push(format!("requires one of: {rendered}"));
+        issues.push(ValidationIssue::new(
+            ValidationCode::RequiredAlternative,
+            &[],
+            format!("requires one of: {rendered}"),
+        ));
     }
 
     if let Some(action) = action
@@ -656,14 +911,30 @@ pub fn validate_tool_arguments_against_schema(
             .collect::<Vec<_>>();
         disallowed.sort();
         if !disallowed.is_empty() {
-            issues.push(format!(
-                "field(s) not allowed for action `{action}`: {}",
-                disallowed.join(", ")
+            let location = if disallowed.len() == 1 {
+                disallowed.clone()
+            } else {
+                Vec::new()
+            };
+            issues.push(ValidationIssue::new(
+                ValidationCode::ActionFields,
+                &location,
+                format!(
+                    "field(s) not allowed for action `{action}`: {}",
+                    disallowed.join(", ")
+                ),
             ));
         }
     }
 
-    validate_schema_value(args, parameter_schema, "", false, &mut issues);
+    validate_schema_value(
+        args,
+        parameter_schema,
+        "",
+        false,
+        &mut Vec::new(),
+        &mut issues,
+    );
 
     if issues.is_empty() {
         Ok(())
@@ -2618,6 +2889,157 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validation_receipts_preserve_rules_without_publishing_private_data() {
+        let error = validate_tool_arguments(
+            "agent",
+            &json!({
+                "action":"spawn", "prompt":"private-sentinel", "agent_id":"private-sentinel"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.issues[0].code, ValidationCode::Required);
+        let receipt = error.rejection_output();
+        assert_eq!(
+            receipt["validation"]["issues"][0],
+            json!({"code":"required","path":"/description"})
+        );
+        assert!(
+            receipt["error"]
+                .as_str()
+                .unwrap()
+                .contains("Correct the named fields")
+        );
+        let result = error.into_tool_result();
+        assert!(result.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap(),
+            receipt
+        );
+        assert_eq!(result.metadata.unwrap()["error_kind"], "tool_invalid_args");
+        assert!(
+            !receipt["validation"]
+                .to_string()
+                .contains("private-sentinel")
+        );
+        for (rule, value, expected) in [
+            (json!({"type":"string"}), json!(7), ValidationCode::Type),
+            (
+                json!({"const":"private-sentinel"}),
+                json!("wrong"),
+                ValidationCode::Const,
+            ),
+            (
+                json!({"enum":["private-sentinel"]}),
+                json!("wrong"),
+                ValidationCode::Enum,
+            ),
+            (
+                json!({"minLength":4}),
+                json!("x"),
+                ValidationCode::MinLength,
+            ),
+            (
+                json!({"maxLength":1}),
+                json!("long"),
+                ValidationCode::MaxLength,
+            ),
+            (json!({"minimum":2}), json!(1), ValidationCode::Minimum),
+            (json!({"maximum":1}), json!(2), ValidationCode::Maximum),
+            (
+                json!({"uniqueItems":true}),
+                json!([1, 1]),
+                ValidationCode::UniqueItems,
+            ),
+            (json!({"minItems":1}), json!([]), ValidationCode::MinItems),
+            (
+                json!({"maxItems":1}),
+                json!([1, 2]),
+                ValidationCode::MaxItems,
+            ),
+            (json!({"oneOf":[{},{}]}), json!(1), ValidationCode::Union),
+        ] {
+            let schema = json!({"function":{"parameters":{"type":"object","properties":{
+                "description":rule},"description":"private-sentinel"}}});
+            let error = validate_tool_arguments_against_schema(
+                "agent",
+                &json!({"description":value}),
+                &schema,
+            )
+            .unwrap_err();
+            assert_eq!(error.issues[0].code, expected);
+            let public = error.diagnostic();
+            assert!(validated_argument_diagnostic("agent", &public).is_some());
+            assert!(!public.to_string().contains("private-sentinel"));
+        }
+        let schema = json!({"function":{"parameters":{"type":"object", "properties":{
+            "private-sentinel":{"type":"string"}},"additionalProperties":false}}});
+        for tool in ["agent", "mcp_private"] {
+            let error = validate_tool_arguments_against_schema(
+                tool,
+                &json!({"private-sentinel":7,"another-private-key":1}),
+                &schema,
+            )
+            .unwrap_err();
+            let public = error.diagnostic();
+            assert!(!public.to_string().contains("private"));
+            assert!(
+                public["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|issue| issue["path"].is_null() || issue["path"] == "")
+            );
+        }
+    }
+
+    #[test]
+    fn validation_diagnostics_bound_locations_and_omit_excess_issues() {
+        let error = validate_tool_arguments(
+            "agent_fanout",
+            &json!({
+                "action":"start", "target_count":32, "slots":vec![json!({});32]
+            }),
+        )
+        .unwrap_err();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic["issues"].as_array().unwrap().len(), 8);
+        assert!(diagnostic["omitted"].as_u64().unwrap() > 0);
+        assert!(diagnostic.to_string().len() <= 4096);
+        assert!(
+            diagnostic["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["path"] == "/slots/*/prompt")
+        );
+        assert_eq!(
+            validated_argument_diagnostic("agent_fanout", &diagnostic),
+            Some(diagnostic)
+        );
+        for value in [
+            json!({"issues":[{"code":"type","path":"/private-sentinel"}],"omitted":0}),
+            json!({"issues":[{"code":"type","path":"/slots/0/prompt"}],"omitted":0}),
+            json!({"issues":[{"code":"private-sentinel","path":null}],"omitted":0}),
+            json!({"issues":vec![json!({"code":"required","path":null});9],"omitted":0}),
+            json!({"issues":[],"omitted":0,"error":"private-sentinel"}),
+        ] {
+            assert!(validated_argument_diagnostic("agent_fanout", &value).is_none());
+        }
+        let issue = ValidationIssue::new(
+            ValidationCode::Type,
+            &vec!["description".into(); 9],
+            "private-sentinel".into(),
+        );
+        let error = ToolArgumentValidationError {
+            tool_name: "agent".into(),
+            action: None,
+            issues: vec![issue],
+            malformed_parse_error: None,
+        };
+        assert!(error.diagnostic()["issues"][0]["path"].is_null());
+    }
+
+    #[test]
     fn built_in_schema_construction_fits_default_tokio_worker_stack() {
         // Call the uncached constructor directly: another schema test may
         // already have initialized the process-global validation index.
@@ -3226,7 +3648,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            spawn_with_runtime_id.issues,
+            spawn_with_runtime_id
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["field(s) not allowed for action `spawn`: agent_id"]
         );
 
@@ -3271,7 +3697,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            result_with_mailbox_name.issues,
+            result_with_mailbox_name
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["field(s) not allowed for action `get_result`: name"]
         );
 
@@ -4513,7 +4943,11 @@ mod tests {
 
         assert_eq!(error.action.as_deref(), Some("forget"));
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["missing non-empty required field `reason`"]
         );
         assert_eq!(
@@ -4606,7 +5040,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "requires one of: memory_id or memory_ids or selection_id",
                 "field `memory_ids` requires at least 1 item(s)",
@@ -4626,7 +5064,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "unknown field(s): legacy_focus",
                 "field `last_n` has type string, expected \"integer\"",
@@ -4652,7 +5094,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "field `slots` item 0 missing non-empty required field `prompt`",
                 "field `target_count` must be at least 1",
@@ -4737,7 +5183,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "field `questions` item 0 field `options` item 0 missing non-empty required field `label`"
             ]
