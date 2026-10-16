@@ -1210,6 +1210,133 @@ async fn repeated_gate_timeouts_do_not_exhaust_waiter_pool() {
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 #[file_serial(admission_scope)]
+async fn gate_wait_crossing_expiry_fences_replay_and_renewal() {
+    let (pool, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 0;
+    let waiter_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(waiter_pool.get())
+        .await
+        .unwrap();
+    let controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(1)).unwrap();
+    let mut waiter =
+        DatabaseWeightedAdmissionController::new(waiter_pool.clone(), limits(1)).unwrap();
+    waiter.with_admission_wait_timeout(Duration::from_secs(15));
+
+    for operation in ["new", "replay", "renew"] {
+        reset_admission_scope(&pool).await;
+        let original_key = key("clock-owner");
+        let original = controller
+            .try_reserve(&original_key, work(), Duration::from_secs(3), "original")
+            .await
+            .unwrap();
+        let old = original.reservation().clone();
+        let mut holder = pool.get().begin().await.unwrap();
+        sqlx::query(
+            "SELECT 1 FROM session_weighted_admission_gates WHERE scope_name = ? FOR UPDATE",
+        )
+        .bind(ADMISSION_SCOPE)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+        let pending = tokio::spawn({
+            let waiter = waiter.clone();
+            let old = old.clone();
+            async move {
+                match operation {
+                    "renew" => waiter
+                        .renew(&old, Duration::from_secs(30))
+                        .await
+                        .map(|_| None),
+                    "replay" => waiter
+                        .try_reserve(&old.key, work(), Duration::from_secs(30), "original")
+                        .await
+                        .map(Some),
+                    _ => waiter
+                        .try_reserve(&key("new-owner"), work(), Duration::from_secs(30), "new")
+                        .await
+                        .map(Some),
+                }
+            }
+        });
+        // Observe the real blocked locking statement before expiry, rather
+        // than guessing when the controller starts with a scheduling sleep.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.processlist
+                     WHERE db = ? AND conn_id = ? AND info LIKE '%global_resident_bytes%'
+                       AND info LIKE '%FOR UPDATE%'",
+                )
+                .bind(&settings.database)
+                .bind(connection_id)
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+                if waiting == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("controller must enter the real lock wait before expiry");
+        let database_now =
+            || sqlx::query_scalar::<_, i64>("SELECT CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)");
+        assert!(database_now().fetch_one(pool.get()).await.unwrap() < old.expires_at_unix_ms);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while database_now().fetch_one(pool.get()).await.unwrap() <= old.expires_at_unix_ms {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("database clock must cross lease expiry while gate is held");
+        holder.rollback().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("controller must finish after unlock")
+            .unwrap();
+        if operation == "renew" {
+            assert!(
+                matches!(result, Err(DistributedAdmissionError::Fenced)),
+                "a lock wait must not resurrect an expired lease"
+            );
+        } else {
+            let replacement = result.expect("expired capacity must be reclaimed").unwrap();
+            assert_ne!(replacement.reservation().reservation_id, old.reservation_id);
+            assert!(
+                replacement.reservation().expires_at_unix_ms
+                    > database_now().fetch_one(pool.get()).await.unwrap()
+            );
+            assert!(matches!(
+                controller.renew(&old, Duration::from_secs(30)).await,
+                Err(DistributedAdmissionError::Fenced)
+            ));
+            original.release().await.unwrap();
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+            )
+            .bind(ADMISSION_SCOPE)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(rows, 1, "old generation must not release replacement");
+            let slots: i64 = sqlx::query_scalar("SELECT CAST(global_provider_slots AS SIGNED) FROM session_weighted_admission_gates WHERE scope_name = ?")
+                .bind(ADMISSION_SCOPE).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(slots, 1, "replacement must be charged exactly once");
+            replacement.release().await.unwrap();
+            continue;
+        }
+        original.release().await.unwrap();
+    }
+    reset_admission_scope(&pool).await;
+    waiter_pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(admission_scope)]
 async fn expiry_frontier_is_conservative_across_shorter_renewal_and_release() {
     let pool = common::setup_pool().await;
     reset_admission_scope(&pool).await;

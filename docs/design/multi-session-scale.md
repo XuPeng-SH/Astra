@@ -255,8 +255,10 @@ independent server pools share the same durable global and owner budgets, keeps
 successful permits live until all attempts finish, and checks that release does
 not leak a reservation. The admission latency it prints includes pool and gate
 wait; it is not a full server turn or provider throughput metric. The current
-hot path also reads the gate clock and capacity hash with one locked query,
-removing a redundant round trip without weakening configuration fencing.
+hot path reads the capacity hash under the gate lock, then samples database
+time in a separate statement. A timestamp in the locking statement can precede
+its row-lock wait; it must not decide expiry, replay or renewal after that wait.
+This constant round trip is included in the existing admission deadline.
 
 The next stage may introduce sharded/lease-based capacity only after measured
 lock wait, pool wait, or reservation-scan evidence justifies it, with crash and

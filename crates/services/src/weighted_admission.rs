@@ -688,8 +688,7 @@ async fn lock_distributed_admission_gate(
                 CAST(global_context_tokens AS CHAR) AS global_context_tokens,
                 CAST(global_provider_slots AS CHAR) AS global_provider_slots,
                 CAST(global_cpu_units AS CHAR) AS global_cpu_units,
-                CAST(global_io_bytes AS CHAR) AS global_io_bytes,
-                CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
+                CAST(global_io_bytes AS CHAR) AS global_io_bytes
          FROM session_weighted_admission_gates
          WHERE scope_name = ? FOR UPDATE",
     )
@@ -700,9 +699,13 @@ async fn lock_distributed_admission_gate(
     let capacity_hash = row
         .try_get::<Option<String>, _>("capacity_hash")
         .map_err(|source| distributed_database_error("decode_gate_capacity_hash", source))?;
-    let unix_ms = row
-        .try_get::<i64, _>("database_now_unix_ms")
-        .map_err(|source| distributed_database_error("decode_gate_database_time", source))?;
+    // NOW is sampled at statement start, before a contended FOR UPDATE
+    // finishes. Read the database clock only after acquiring the gate: leases
+    // may expire while waiting, including a lease being replayed or renewed.
+    let unix_ms: i64 = sqlx::query_scalar("SELECT CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|source| distributed_database_error("read_locked_gate_database_time", source))?;
     let now = chrono::DateTime::from_timestamp_millis(unix_ms)
         .map(|timestamp| timestamp.naive_utc())
         .ok_or_else(|| {
