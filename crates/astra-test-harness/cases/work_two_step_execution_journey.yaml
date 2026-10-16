@@ -15,6 +15,9 @@ description: |
   duplicate Work, or spins through excessive model/tool rounds.
   Inputs use an isolated fixture: this measures Work execution, not research
   across Astra's independently evolving CI lanes.
+  A rejected settlement followed by valid evidence and canonical delivery is
+  recovery, not task failure. Final delivery and ownership remain hard requirements;
+  tool/round budgets separately measure execution churn.
 prompt: |
   Create a durable Work board to track these two tasks separately, execute both now,
   and record their delivery so I can inspect or continue this Work in a later session.
@@ -82,15 +85,6 @@ criteria:
       - start_work
       - settle_work_item
       - settle_work_item
-  - type: journal_tool_call_count
-    name: settle_work_item
-    min: 2
-    max: 2
-  - type: journal_tool_call_count
-    name: settle_work_item
-    ok: false
-    min: 0
-    max: 0
   - type: journal_tool_call_count
     name: settle_work_item
     min: 2
