@@ -26637,7 +26637,7 @@ mod tests {
         for (provenance, raw) in [
             (
                 astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
-                json!({"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}),
+                json!({"answers":{"0":"yes"}}),
             ),
             (
                 astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
@@ -26821,10 +26821,7 @@ mod tests {
                 } else {
                     "no"
                 };
-                (
-                    id.clone(),
-                    json!({"type":"discrete_noul", "decision":decision}),
-                )
+                (id.clone(), json!(decision))
             })
             .collect::<serde_json::Map<_, _>>();
         json!({"answers":answers}).to_string()
@@ -49367,7 +49364,7 @@ mod tests {
                     let probabilities: serde_json::Map<String, Value> = criteria.keys().map(|option| (option.clone(), json!(if option == chosen { 1.0 } else { 0.0 }))).collect();
                     json!({"type":"choice", "choice":chosen, "probabilities":probabilities, "confidence":1.0})
                 } else {
-                    json!({"type":"discrete_choice", "option":chosen})
+                    json!(chosen)
                 };
                 (id.clone(), answer)
             }).collect();
@@ -53447,8 +53444,7 @@ mod tests {
                 aliases: vec!["review".into()],
                 ..Default::default()
             }];
-            let accepted =
-                json!({"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}).to_string();
+            let accepted = json!({"answers":{"0":"yes"}}).to_string();
             for (policy, response, expected_calls, expected_skill) in [
                 (
                     SkillAutoRouteExecutionPolicy::Auto,

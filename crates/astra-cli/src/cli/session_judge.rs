@@ -259,7 +259,7 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": "completion-1", "object": "chat.completion", "offering_id": "offering-1", "model": "judge",
             "judgment_provenance": "discrete_decision",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"answers\":{\"0\":{\"type\":\"discrete_noul\",\"decision\":\"no\"}}}"}, "finish_reason": reason}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"answers\":{\"0\":\"no\"}}"}, "finish_reason": reason}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
         }))
     }

@@ -849,8 +849,11 @@ mod tests {
             .map(|id| {
                 (
                     id.clone(),
-                    serde_json::json!({"type":"discrete_noul",
-                    "decision": if id == "mutation.read_only" { "yes" } else { "no" }}),
+                    serde_json::json!(if id == "mutation.read_only" {
+                        "yes"
+                    } else {
+                        "no"
+                    }),
                 )
             })
             .collect::<serde_json::Map<_, _>>();
