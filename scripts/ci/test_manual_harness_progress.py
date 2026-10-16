@@ -58,6 +58,22 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_failed_required_combination_explains_soft_child_without_regrading(self):
+        child = {"type":"duration_between", "severity":"soft", "score":None,
+                 "passed":False, "evaluation":"reported", "diagnostic":{
+                     "kind":"count", "min":0, "max":45000, "actual":49489}}
+        parent = {"type":"all_of", "severity":"hard", "score":None,
+                  "passed":False, "evaluation":"reported", "diagnostic":{
+                      "kind":"composite", "checks":[child]}}
+        lines = list(h.check_lines([parent], "root"))
+        self.assertIn("all_of (hard): Required combination failed", lines[0])
+        self.assertIn("duration_between (soft)", lines[1])
+        self.assertIn("observed 49489", lines[1])
+        self.assertFalse(parent["passed"])
+        self.assertFalse(child["passed"])
+        result = row("incomplete", "failed")
+        self.assertTrue(any("zero counters do not prove" in line for line in h.row_checks(result)))
+
     def test_failure_summary_explains_observations_and_judges_without_regrading(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

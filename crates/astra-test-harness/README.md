@@ -616,6 +616,14 @@ Severity is assigned automatically based on criterion type (see
 `criterion_severity()` in `src/criteria.rs`). Case authors do not set
 severity manually.
 
+`all_of` and `any_of` are explicit hard contracts, including when their children
+are normally soft. Use them for required behavior such as exact tool counts or
+cache-specific contracts, not uncalibrated duration, token or round budgets.
+Keep those budgets as independent diagnostic criteria: an exceeded reference
+range is a warning, not proof of a performance regression. Performance gates
+need a comparable baseline and controlled execution conditions. Case timeouts
+remain execution bounds to stop hung runs.
+
 ### Judger scope
 
 LLM judging runs only for an explicit `judger` or `hard_judger` criterion.

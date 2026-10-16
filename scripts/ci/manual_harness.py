@@ -264,6 +264,7 @@ def check_lines(items, prefix):
         elif kind == "proof":
             reason = f"Canonical child identity/result adoption proven={diagnostic['proven']}"
         elif kind == "composite":
+            yield f"{location}: Required combination failed; child severities do not override this group's {check['severity']} requirement"
             yield from check_lines(diagnostic["checks"], f"{prefix}.{index}")
             continue
         else:
@@ -273,6 +274,8 @@ def check_lines(items, prefix):
 
 def row_checks(row):
     lines = list(check_lines(row["criteria"], "root"))
+    if row["token_usage_coverage"] is None:
+        lines.append("Provider usage coverage unavailable; terminal-reported zero counters do not prove zero usage or no tool execution.")
     for step in row["steps"]:
         lines.extend(check_lines(step["criteria"], f"step[{step['step_index']}]"))
     if not any(c["type"] in ("judger", "hard_judger") for checks in

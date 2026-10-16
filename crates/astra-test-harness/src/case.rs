@@ -1414,7 +1414,7 @@ steps:
     }
 
     #[test]
-    fn bundled_active_run_tool_result_case_makes_efficiency_bounds_hard() {
+    fn bundled_active_run_tool_result_case_requires_exact_reads_not_round_budget() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cases/active_run_tool_result_retention.yaml");
         let case = Case::from_path(&path).expect("bundled active-run case must parse");
@@ -1426,7 +1426,7 @@ steps:
                 crate::criteria::Criterion::AllOf { criteria } => Some(criteria),
                 _ => None,
             })
-            .expect("tool and round bounds must be nested in all_of");
+            .expect("exact tool count must be required");
 
         assert!(
             hard_group.iter().any(|criterion| matches!(
@@ -1436,11 +1436,11 @@ steps:
             "the scenario must fail when the model skips or invents tool work"
         );
         assert!(
-            hard_group.iter().any(|criterion| matches!(
+            case.criteria.iter().any(|criterion| matches!(
                 criterion,
                 crate::criteria::Criterion::TurnRoundsBetween { min: 2, max: 15 }
             )),
-            "the scenario must fail on an inefficient multi-round loop"
+            "round budget must remain an independent diagnostic"
         );
         let exact_read_paths = case
             .criteria
