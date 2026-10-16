@@ -35,23 +35,18 @@ steps:
     criteria:
       - type: text_contains
         needle: CURSOR-BETA
-      - type: text_contains
-        needle: cursor
   - prompt: "问题总结？请用一句话回答，不要使用工具。"
     criteria:
-      - type: text_contains
-        needle: cursor
-      - type: text_contains
-        needle: 负例测试
-      - type: text_not_contains
-        needle: LEGACY-ALPHA
-      - type: judger
+      - type: hard_judger
         question: |
           Is the answer a direct, concise summary of the immediately preceding CURSOR-BETA
           review finding (cursor inconsistency and missing negative test), without drifting to
-          the older LEGACY-ALPHA topic or inventing runtime/tool evidence? Score 1.0 only when
-          all conditions hold, 0.5 for a relevant but unnecessarily broad answer, and 0.0 for
-          stale-topic hijacking or fabricated evidence.
+          the older LEGACY-ALPHA topic or inventing runtime/tool evidence? Both findings must
+          be present. Accept equivalent wording in any language, including translations of
+          cursor and negative tests. Mentioning the old topic solely to contrast it with the
+          current finding is not topic hijacking. Reject a missing finding, actual stale-topic
+          substitution, or fabricated evidence. Judge meaning rather than literal substrings;
+          verbosity alone is not a hard failure. If the evidence is insufficient, answer unknown.
         threshold: 0.8
   - prompt: "现在明确回到整个 session：最早讨论的旧事故代号是什么？只回答代号。"
     criteria:
