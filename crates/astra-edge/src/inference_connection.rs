@@ -512,6 +512,23 @@ impl InferenceConnection {
                 }
                 self.poll().await
             }
+            EdgeServerMessage::InferenceTerminalRetired {
+                receipt,
+                delivery_generation,
+            } => {
+                self.fence_generation(delivery_generation)?;
+                self.host.retire_terminal((*receipt).clone()).await?;
+                self.pending_progress
+                    .remove(receipt.attempt.attempt_id.as_str());
+                if self
+                    .outgoing
+                    .as_ref()
+                    .is_some_and(|outgoing| outgoing.grant.attempt == receipt.attempt)
+                {
+                    self.outgoing = None;
+                }
+                self.poll().await
+            }
             EdgeServerMessage::InferenceResponseCredit {
                 attempt_id,
                 delivery_generation,
@@ -581,6 +598,32 @@ impl InferenceConnection {
                             self.outgoing = None;
                         }
                         Ok(Vec::new())
+                    }
+                    RunnerInferenceRejection::InvalidEvidence
+                    | RunnerInferenceRejection::BindingIdentityMismatch
+                        if attempt_id.is_some() =>
+                    {
+                        // A permanent rejection is not custody. Retain the exact
+                        // payload for diagnosis, but isolate it durably so neither
+                        // the next session nor the next connection reoffers it.
+                        if let Some(outgoing) = self.outgoing.as_ref().filter(|outgoing| {
+                            attempt_id.as_ref() == Some(&outgoing.grant.attempt.attempt_id)
+                        }) {
+                            self.host
+                                .quarantine_terminal(
+                                    outgoing.grant.attempt.clone(),
+                                    outgoing.payload.terminal_sha256.clone(),
+                                    reason,
+                                )
+                                .await?;
+                            tracing::warn!(
+                                attempt_id = outgoing.grant.attempt.attempt_id.as_str(),
+                                ?reason,
+                                "Runner terminal quarantined; other sessions remain available"
+                            );
+                            self.outgoing = None;
+                        }
+                        self.poll().await
                     }
                     RunnerInferenceRejection::InferenceUnsupported
                     | RunnerInferenceRejection::ProtocolVersionUnsupported
@@ -693,7 +736,28 @@ impl InferenceConnection {
                     Ok(Vec::new())
                 }
             }
-            DispatchOutcome::Acknowledged | DispatchOutcome::Unknown => {
+            DispatchOutcome::Unknown => {
+                self.pending_progress
+                    .remove(grant.attempt.attempt_id.as_str());
+                if grant.process_boot_nonce != *self.host.process_boot_nonce()
+                    && self
+                        .clock
+                        .is_some_and(|clock| grant.deadline_unix_ms <= clock.earliest_server_time())
+                {
+                    // InferenceHost owns the exclusive journal lock. This new
+                    // incarnation cannot execute the old grant, and its original
+                    // execution budget has elapsed. Absence remains unknown.
+                    return Ok(vec![EdgeClientMessage::InferenceCapacityRetired {
+                        grant: Box::new(grant),
+                        process_boot_nonce: self.host.process_boot_nonce().clone(),
+                        delivery_generation,
+                    }]);
+                }
+                Ok(Vec::new())
+            }
+            DispatchOutcome::Acknowledged
+            | DispatchOutcome::Retired
+            | DispatchOutcome::Quarantined => {
                 self.pending_progress
                     .remove(grant.attempt.attempt_id.as_str());
                 Ok(Vec::new())

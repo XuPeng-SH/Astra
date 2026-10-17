@@ -1,6 +1,19 @@
 //! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test runner_inference_db_it -- --ignored --test-threads=1
 mod common;
 
+#[cfg(unix)]
+use astra_edge::inference_connection::InferenceConnection;
+#[cfg(unix)]
+use astra_edge::inference_host::{DispatchOutcome, InferenceHost, InferenceOwner};
+#[cfg(unix)]
+use astra_inference_adapter::transport::ProviderTransport;
+#[cfg(unix)]
+use astra_server_types::edge_ws_protocol::{EdgeClientMessage, EdgeServerMessage};
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::time::Duration;
+
 use astra_services::ModelRequestContextSeed;
 use astra_services::inference_execution::runner::*;
 use astra_services::inference_execution::*;
@@ -264,6 +277,547 @@ async fn runner_delivery_preserves_host_capacity_across_claim_expiry() {
     );
 }
 
+// Invoked only by the crash-boundary test below. The real host holds the OS
+// journal lock, but receives no dispatch before the parent commits its claim.
+#[cfg(unix)]
+#[test]
+fn runner_recovery_process() {
+    let Some(root) = std::env::var_os("ASTRA_RUNNER_RECOVERY_CHILD") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let host =
+            recovery_host(&root, &std::env::var("ASTRA_RUNNER_RECOVERY_USER").unwrap()).await;
+        std::fs::write(
+            root.join("ready.tmp"),
+            serde_json::to_vec(&serde_json::json!({
+                "journal": host.journal_id(), "boot": host.process_boot_nonce(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(root.join("ready.tmp"), root.join("ready.json")).unwrap();
+        let mut byte = [0];
+        std::io::Read::read_exact(&mut std::io::stdin(), &mut byte).unwrap();
+        drop(host);
+    });
+}
+
+#[cfg(unix)]
+async fn recovery_host(root: &std::path::Path, user: &str) -> Arc<InferenceHost> {
+    InferenceHost::open(
+        root.join("journal"),
+        InferenceOwner {
+            deployment_identity: "isolated-recovery-test".into(),
+            user_id: user.into(),
+            runner_id: id("runner"),
+        },
+        root.join("models.json"),
+        root.join("secrets"),
+        ProviderTransport::build(reqwest::Client::builder().no_proxy()).unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+struct RecoveryChild(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for RecoveryChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires MatrixOne"]
+#[serial]
+async fn runner_claim_before_fence_process_exit_retires_only_expired_capacity() {
+    let mut f = Fixture::new().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = RecoveryChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "runner_recovery_process", "--nocapture"])
+            .env("ASTRA_RUNNER_RECOVERY_CHILD", root.path())
+            .env("ASTRA_RUNNER_RECOVERY_USER", &f.connection.user_id)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !root.path().join("ready.json").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "journal owner exited before the barrier"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let ready: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("ready.json")).unwrap()).unwrap();
+    let journal = id(ready["journal"].as_str().unwrap());
+    let old_boot = id(ready["boot"].as_str().unwrap());
+    enroll_runner_inference(
+        &f.pool,
+        &f.connection,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &journal,
+        &old_boot,
+    )
+    .await
+    .unwrap();
+    let mut definition = f.binding.definition.clone();
+    definition.identity.journal_id = journal.clone();
+    publish_runner_binding(
+        &f.pool,
+        &f.connection,
+        &RunnerInferenceBindingPublication {
+            protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+            operation_id: id("recovery-publication"),
+            expected_publication_revision: 0,
+            change: RunnerInferenceBindingChange::Publish {
+                definition: definition.clone(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    f.binding = resolve_runner_model_binding(&f.pool, &f.connection.user_id, &definition.identity)
+        .await
+        .unwrap();
+    f.input.offering_id = runner_offering_id(&f.connection.user_id, &definition.identity);
+    let deadline = (chrono::Utc::now().timestamp_millis() + 5_000) as u64;
+    let (invocation, grant) =
+        admit_runner_attempt(&f.pool, f.input.clone(), &f.binding, REQUEST, 0, deadline).await;
+    assert!(matches!(
+        claim_runner_delivery(&f.pool, &f.connection, &grant.attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .action,
+        RunnerDeliveryAction::Dispatch(_)
+    ));
+    // The SQL claim is committed. No dispatch message has crossed the barrier,
+    // so this real process exits before any local journal fence can be written.
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(
+        !root
+            .path()
+            .join(format!(
+                "journal/attempt-{}.json",
+                grant.attempt.attempt_id.as_str()
+            ))
+            .exists()
+    );
+    let host = recovery_host(root.path(), &f.connection.user_id).await;
+    assert_eq!(host.journal_id(), &journal);
+    assert_ne!(host.process_boot_nonce(), &old_boot);
+    enroll_runner_inference(
+        &f.pool,
+        &f.connection,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &journal,
+        host.process_boot_nonce(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        host.reconcile(&grant).await.unwrap(),
+        DispatchOutcome::Unknown
+    ));
+    assert!(
+        retire_runner_capacity(&f.pool, &f.connection, &grant, host.process_boot_nonce())
+            .await
+            .is_err(),
+        "deadline must still fence capacity"
+    );
+    request_runner_cancellation(&f.pool, &f.connection.user_id, &grant.attempt)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while chrono::Utc::now().timestamp_millis() <= deadline as i64 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut connection = InferenceConnection::new(host.clone());
+    connection.hello();
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::accepted(
+                RUNNER_INFERENCE_PROTOCOL_VERSION,
+                7,
+                chrono::Utc::now().timestamp_millis() as u64,
+            ),
+        })
+        .await
+        .unwrap();
+    let claim = claim_runner_delivery(&f.pool, &f.connection, &grant.attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    let RunnerDeliveryAction::Cancel(cancelled) = claim.action else {
+        panic!("cancel intent must retain precedence during recovery");
+    };
+    connection
+        .handle(EdgeServerMessage::InferenceCancel {
+            grant: Box::new(cancelled),
+            delivery_generation: 7,
+        })
+        .await
+        .unwrap();
+    let messages = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let messages = connection.poll().await.unwrap();
+            if messages.iter().any(|message| {
+                matches!(message, EdgeClientMessage::InferenceCapacityRetired { .. })
+            }) {
+                break messages;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let [
+        EdgeClientMessage::InferenceCapacityRetired {
+            grant: reported,
+            process_boot_nonce,
+            ..
+        },
+    ] = messages.as_slice()
+    else {
+        panic!("missing bounded recovery evidence: {messages:?}");
+    };
+    assert_eq!(**reported, grant);
+    let mut wrong = f.connection.clone();
+    wrong.user_id = "other-owner".into();
+    assert!(
+        retire_runner_capacity(&f.pool, &wrong, &grant, process_boot_nonce)
+            .await
+            .is_err()
+    );
+    wrong = f.connection.clone();
+    wrong.edge_id = "stale-socket".into();
+    assert!(
+        retire_runner_capacity(&f.pool, &wrong, &grant, process_boot_nonce)
+            .await
+            .is_err()
+    );
+    assert!(
+        retire_runner_capacity(&f.pool, &f.connection, &grant, &old_boot)
+            .await
+            .is_err()
+    );
+    let mut altered = grant.clone();
+    altered.grant_id = id("different-grant");
+    assert!(
+        retire_runner_capacity(&f.pool, &f.connection, &altered, process_boot_nonce)
+            .await
+            .is_err()
+    );
+    retire_runner_capacity(&f.pool, &f.connection, &grant, process_boot_nonce)
+        .await
+        .unwrap();
+    retire_runner_capacity(&f.pool, &f.connection, &grant, process_boot_nonce)
+        .await
+        .unwrap();
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &grant.attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        host.reconcile(&grant).await.unwrap(),
+        DispatchOutcome::Unknown
+    ));
+    let row = sqlx::query("SELECT runner_capacity_retired_by_boot, runner_no_start_evidence, runner_terminal_hash, status,
+        runner_continuation_pending FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ?")
+        .bind(&f.connection.user_id).bind(grant.attempt.attempt_id.as_str()).fetch_one(f.pool.get()).await.unwrap();
+    assert_eq!(
+        row.get::<String, _>("runner_capacity_retired_by_boot"),
+        process_boot_nonce.as_str()
+    );
+    assert_eq!(row.get::<String, _>("status"), "started");
+    assert!(
+        row.get::<Option<String>, _>("runner_no_start_evidence")
+            .is_none()
+    );
+    assert!(
+        row.get::<Option<String>, _>("runner_terminal_hash")
+            .is_none()
+    );
+    assert!(!row.get::<bool, _>("runner_continuation_pending"));
+    let invocation_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&f.connection.user_id)
+    .bind(invocation.invocation_id())
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        invocation_status, "admitted",
+        "retirement does not settle unknown cost or resume its branch"
+    );
+    f.binding = resolve_runner_model_binding(&f.pool, &f.connection.user_id, &definition.identity)
+        .await
+        .unwrap();
+    let mut independent = f.input.clone();
+    independent.scope = InferenceInvocationScope::Session {
+        session_id: grant.attempt.scope.session_id().unwrap().into(),
+        turn: 1,
+        round: 0,
+        operation_id: "explicit-independent-work".into(),
+        logical_attempt: 0,
+    };
+    independent.run_authority = None;
+    let (_, independent) = admit_runner_attempt(
+        &f.pool,
+        independent,
+        &f.binding,
+        REQUEST,
+        0,
+        (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
+    )
+    .await;
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &independent.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    request_runner_cancellation(&f.pool, &f.connection.user_id, &independent.attempt)
+        .await
+        .unwrap();
+    record_runner_start_evidence(
+        &f.pool,
+        &f.connection,
+        &independent,
+        RunnerInferenceStartEvidence::CancelledWithoutFence,
+    )
+    .await
+    .unwrap();
+    let mut grants = Vec::new();
+    for _ in 0..5 {
+        grants.push(admit_in_another_session(&f).await);
+    }
+    let barrier = Arc::new(tokio::sync::Barrier::new(5));
+    let results = futures_util::future::join_all(grants.iter().map(|grant| {
+        let barrier = barrier.clone();
+        let f = &f;
+        async move {
+            barrier.wait().await;
+            claim_runner_delivery(&f.pool, &f.connection, &grant.attempt)
+                .await
+                .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(results.iter().filter(|claim| claim.is_some()).count(), 4);
+    let active = grants
+        .iter()
+        .zip(&results)
+        .find(|(_, claim)| claim.is_some())
+        .unwrap()
+        .0;
+    let mut same_session = f.input.clone();
+    same_session.scope = active.attempt.scope.clone();
+    if let InferenceInvocationScope::Session { operation_id, .. } = &mut same_session.scope {
+        *operation_id = "next-independent".into();
+    }
+    same_session.run_authority = None;
+    let (_, next) = admit_runner_attempt(
+        &f.pool,
+        same_session,
+        &f.binding,
+        REQUEST,
+        0,
+        (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
+    )
+    .await;
+    let released = grants
+        .iter()
+        .zip(&results)
+        .find(|(candidate, claim)| claim.is_some() && candidate.attempt != active.attempt)
+        .unwrap()
+        .0;
+    request_runner_cancellation(&f.pool, &f.connection.user_id, &released.attempt)
+        .await
+        .unwrap();
+    record_runner_start_evidence(
+        &f.pool,
+        &f.connection,
+        released,
+        RunnerInferenceStartEvidence::CancelledWithoutFence,
+    )
+    .await
+    .unwrap();
+    // A host slot is now available, but this particular session is still busy.
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &next.attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let waiting = grants
+        .iter()
+        .zip(&results)
+        .find(|(_, claim)| claim.is_none())
+        .unwrap()
+        .0;
+    assert!(
+        claim_runner_delivery(&f.pool, &f.connection, &waiting.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Authentic late evidence is still accepted under the original attempt.
+    let terminal = terminal();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &grant.attempt,
+        &terminal,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    enroll_runner_inference(
+        &f.pool,
+        &f.connection,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("different-journal"),
+        &id("different-boot"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        retire_runner_capacity(&f.pool, &f.connection, &grant, &id("different-boot"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne"]
+#[serial]
+async fn runner_deleted_session_terminal_has_distinct_owner_scoped_retirement_receipt() {
+    use astra_services::auth::session::{DatabaseSessionService, SessionService};
+    let f = Fixture::new().await;
+    let (_, grant) = f.admit().await;
+    let other = admit_in_another_session(&f).await;
+    let terminal = terminal();
+    let hash =
+        astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();
+    let _lost_ack = take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &grant.attempt,
+        &terminal,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    assert!(
+        retired_runner_terminal(&f.pool, &f.connection, &grant.attempt, &hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+        .bind(&f.connection.user_id)
+        .bind(grant.attempt.scope.run_id())
+        .execute(f.pool.get())
+        .await
+        .unwrap();
+    DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(f.pool.clone())
+        .delete_session(
+            grant.attempt.scope.session_id().unwrap().into(),
+            f.connection.user_id.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        validate_runner_terminal_attempt(&f.pool, &f.connection, &grant.attempt)
+            .await
+            .is_err()
+    );
+    let receipt = retired_runner_terminal(&f.pool, &f.connection, &grant.attempt, &hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.attempt, grant.attempt);
+    assert_eq!(receipt.terminal_sha256, hash);
+    let mut wrong = f.connection.clone();
+    wrong.user_id = "other-owner".into();
+    assert!(
+        retired_runner_terminal(&f.pool, &wrong, &grant.attempt, &hash)
+            .await
+            .is_err()
+    );
+    wrong = f.connection.clone();
+    wrong.runner_id = id("other-runner");
+    assert!(
+        retired_runner_terminal(&f.pool, &wrong, &grant.attempt, &hash)
+            .await
+            .is_err()
+    );
+    let mut absent = other.attempt.clone();
+    absent.attempt_id = id("absent-attempt");
+    assert!(
+        retired_runner_terminal(&f.pool, &f.connection, &absent, &hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        take_runner_terminal_custody(
+            &f.pool,
+            &f.connection,
+            &grant.attempt,
+            &terminal,
+            RESPONSE,
+            &hash
+        )
+        .await
+        .is_err()
+    );
+    take_runner_terminal_custody(
+        &f.pool,
+        &f.connection,
+        &other.attempt,
+        &terminal,
+        RESPONSE,
+        &hash,
+    )
+    .await
+    .unwrap();
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&f.connection.user_id)
+    .bind(grant.attempt.scope.session_id())
+    .fetch_one(f.pool.get())
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0, "deleted payload must never be recreated");
+}
+
 struct Fixture {
     pool: astra_core::SharedPool,
     connection: AuthenticatedRunnerConnection,
@@ -300,11 +854,17 @@ impl Fixture {
             runner_id: id("runner"),
             edge_id: "socket-1".into(),
         };
-        enroll_runner_inference(&pool, &connection, 1, &id("journal"), &id("boot-1"))
-            .await
-            .unwrap();
+        enroll_runner_inference(
+            &pool,
+            &connection,
+            RUNNER_INFERENCE_PROTOCOL_VERSION,
+            &id("journal"),
+            &id("boot-1"),
+        )
+        .await
+        .unwrap();
         let publication: RunnerInferenceBindingPublication = serde_json::from_value(serde_json::json!({
-            "protocol_version":1,"operation_id":"publish","expected_publication_revision":0,
+            "protocol_version":RUNNER_INFERENCE_PROTOCOL_VERSION,"operation_id":"publish","expected_publication_revision":0,
             "change":{"action":"publish","definition":{
                 "identity":{"runner_id":"runner","journal_id":"journal","binding_id":"model","binding_revision":1,"profile_revision":1},
                 "display_name":"Work","model_name":"model","protocol":"openai_chat_completions","context_window":8192,"max_output_tokens":1024
@@ -813,9 +1373,15 @@ async fn runner_late_custody_settles_logically_then_acknowledges_with_terminal_r
         .unwrap();
     let old = f.connection.clone();
     f.connection.edge_id = "socket-2".into();
-    enroll_runner_inference(&f.pool, &f.connection, 1, &id("journal"), &id("boot-2"))
-        .await
-        .unwrap();
+    enroll_runner_inference(
+        &f.pool,
+        &f.connection,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("journal"),
+        &id("boot-2"),
+    )
+    .await
+    .unwrap();
     let terminal = terminal();
     let hash =
         astra_turn_types::runner_inference::runner_terminal_digest(&terminal, RESPONSE).unwrap();

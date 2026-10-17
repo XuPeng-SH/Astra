@@ -299,6 +299,15 @@ fn owner() -> InferenceOwner {
 fn transport() -> ProviderTransport {
     ProviderTransport::build(reqwest::Client::builder().no_proxy()).unwrap()
 }
+
+#[test]
+fn retirement_clock_uses_lower_bound_even_when_start_denial_is_conservative() {
+    let received = Instant::now();
+    let clock =
+        GrantClock::observed(1_000_000, received - Duration::from_secs(2), received).unwrap();
+    assert!(clock.latest_server_time() >= 1_002_000);
+    assert!(clock.earliest_server_time() < 1_000_000);
+}
 impl Fixture {
     async fn new(endpoint: &str) -> Self {
         Self::new_with_credential(endpoint, LocalCredentialRef::None).await
@@ -971,6 +980,275 @@ async fn expired_queued_grant_reconciliation_seals_only_current_incarnation_no_s
     assert!(matches!(
         fixture.host.reconcile(&replaced).await.unwrap(),
         DispatchOutcome::Unknown
+    ));
+    assert!(matches!(
+        fixture.host.cancel(&replaced).await.unwrap(),
+        DispatchOutcome::Unknown
+    ));
+    // Expiring the short start window was insufficient. Only the original
+    // execution deadline plus replacement incarnation can retire capacity.
+    replaced.deadline_unix_ms = 999_999;
+    let messages = connection
+        .handle(EdgeServerMessage::InferenceReconcile {
+            grant: Box::new(replaced.clone()),
+            delivery_generation: 7,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(messages.as_slice(), [EdgeClientMessage::InferenceCapacityRetired {
+        grant, process_boot_nonce, delivery_generation: 7,
+    }] if **grant == replaced && process_boot_nonce == fixture.host.process_boot_nonce())
+    );
+    assert!(matches!(
+        fixture.host.reconcile(&replaced).await.unwrap(),
+        DispatchOutcome::Unknown
+    ));
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("journal/attempt-expired-old-boot.json")
+            .exists()
+    );
+}
+
+async fn negotiated_connection(
+    host: Arc<InferenceHost>,
+) -> (InferenceConnection, Vec<EdgeClientMessage>) {
+    let mut connection = InferenceConnection::new(host);
+    connection.hello();
+    let messages = connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::accepted(
+                RUNNER_INFERENCE_PROTOCOL_VERSION,
+                7,
+                1_000_000,
+            ),
+        })
+        .await
+        .unwrap();
+    (connection, messages)
+}
+
+#[tokio::test]
+async fn retired_or_quarantined_terminal_does_not_block_another_session_after_reopen() {
+    for deleted in [true, false] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)
+            .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"retained-canary\"}}]}\n\ndata: [DONE]\n\n"))
+            .expect(2).mount(&server).await;
+        let fixture = Fixture::new(&server.uri()).await;
+        let first = fixture.grant("a-old-terminal", REQUEST).await;
+        let mut second = fixture.grant("b-independent-terminal", REQUEST).await;
+        second.attempt.scope = astra_turn_types::InferenceInvocationScope::Session {
+            session_id: "independent-session".into(),
+            turn: 0,
+            round: 0,
+            operation_id: "primary".into(),
+            logical_attempt: 0,
+        };
+        for grant in [&first, &second] {
+            assert!(matches!(
+                fixture
+                    .host
+                    .dispatch(grant.clone(), REQUEST.into(), fixture.clock)
+                    .await
+                    .unwrap(),
+                DispatchOutcome::Started
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if matches!(
+                        fixture.host.reconcile(grant).await.unwrap(),
+                        DispatchOutcome::Terminal(_)
+                    ) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let payload = fixture.terminal().await;
+        let (mut connection, messages) = negotiated_connection(fixture.host.clone()).await;
+        assert!(messages.iter().any(|message|
+            matches!(message, EdgeClientMessage::InferenceTerminal { transfer, .. } if transfer.attempt == first.attempt)));
+        // Transient storage failure retains the first payload and retries it.
+        connection
+            .handle(EdgeServerMessage::InferenceRejected {
+                attempt_id: Some(first.attempt.attempt_id.clone()),
+                reason: RunnerInferenceRejection::StorageUnavailable,
+            })
+            .await
+            .unwrap();
+        assert!(connection.poll().await.unwrap().iter().any(|message|
+            matches!(message, EdgeClientMessage::InferenceTerminal { transfer, .. } if transfer.attempt == first.attempt)));
+        let messages = if deleted {
+            connection
+                .handle(EdgeServerMessage::InferenceTerminalRetired {
+                    receipt: Box::new(RunnerInferenceTerminalRetirement {
+                        attempt: first.attempt.clone(),
+                        terminal_sha256: payload.terminal_sha256.clone(),
+                    }),
+                    delivery_generation: 7,
+                })
+                .await
+                .unwrap()
+        } else {
+            connection
+                .handle(EdgeServerMessage::InferenceRejected {
+                    attempt_id: Some(first.attempt.attempt_id.clone()),
+                    reason: RunnerInferenceRejection::InvalidEvidence,
+                })
+                .await
+                .unwrap()
+        };
+        assert!(messages.iter().any(|message|
+            matches!(message, EdgeClientMessage::InferenceTerminal { transfer, .. } if transfer.attempt == second.attempt)));
+        let second_payload = fixture
+            .host
+            .pending(8)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(grant, _)| grant.attempt == second.attempt)
+            .unwrap()
+            .1;
+        connection
+            .handle(EdgeServerMessage::InferenceTerminalAck {
+                ack: Box::new(RunnerInferenceTerminalAck {
+                    attempt: second.attempt.clone(),
+                    terminal_sha256: second_payload.terminal_sha256,
+                }),
+                delivery_generation: 7,
+            })
+            .await
+            .unwrap();
+        assert!(fixture.host.pending(8).await.unwrap().is_empty());
+        let record = std::fs::read_to_string(
+            fixture
+                .directory
+                .path()
+                .join("journal/attempt-a-old-terminal.json"),
+        )
+        .unwrap();
+        assert_eq!(record.contains("retained-canary"), !deleted);
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.host.active_count().await != 0 || Arc::strong_count(&fixture.host) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(fixture.host);
+        let reopened = InferenceHost::open(
+            fixture.directory.path().join("journal"),
+            owner(),
+            fixture.directory.path().join("models.json"),
+            fixture.directory.path().join("secrets"),
+            transport(),
+        )
+        .await
+        .unwrap();
+        assert!(reopened.pending(8).await.unwrap().is_empty());
+        let outcome = reopened.reconcile(&first).await.unwrap();
+        assert!(if deleted {
+            matches!(outcome, DispatchOutcome::Retired)
+        } else {
+            matches!(outcome, DispatchOutcome::Quarantined)
+        });
+        let (mut connection, messages) = negotiated_connection(reopened).await;
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, EdgeClientMessage::InferenceTerminal { .. }))
+        );
+        assert!(
+            !connection
+                .poll()
+                .await
+                .unwrap()
+                .iter()
+                .any(|message| matches!(message, EdgeClientMessage::InferenceTerminal { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_retirement_requires_exact_receipt_and_durable_commit() {
+    let fixture = Fixture::new("http://127.0.0.1:9").await;
+    let mut grant = fixture.grant("retirement-receipt", REQUEST).await;
+    grant.start_before_unix_ms = 999_999;
+    fixture
+        .host
+        .dispatch(grant.clone(), REQUEST.into(), fixture.clock)
+        .await
+        .unwrap();
+    let payload = fixture.terminal().await;
+    let receipt = RunnerInferenceTerminalRetirement {
+        attempt: grant.attempt.clone(),
+        terminal_sha256: payload.terminal_sha256,
+    };
+    let mut wrong = receipt.clone();
+    wrong.attempt.user_id = "other-user".into();
+    assert_eq!(
+        fixture.host.retire_terminal(wrong).await.unwrap_err(),
+        InferenceHostError::OwnerMismatch
+    );
+    let mut wrong = receipt.clone();
+    wrong.terminal_sha256 = RunnerInferenceDigest::new("0".repeat(64)).unwrap();
+    assert_eq!(
+        fixture.host.retire_terminal(wrong).await.unwrap_err(),
+        InferenceHostError::IdentityConflict
+    );
+    let (mut connection, _) = negotiated_connection(fixture.host.clone()).await;
+    assert_eq!(
+        connection
+            .handle(EdgeServerMessage::InferenceTerminalRetired {
+                receipt: Box::new(receipt.clone()),
+                delivery_generation: 8,
+            })
+            .await
+            .unwrap_err(),
+        InferenceHostError::WrongIncarnation
+    );
+    assert_eq!(fixture.host.pending(8).await.unwrap().len(), 1);
+    fixture
+        .host
+        .with_journal(|journal| {
+            journal.fail_next_commit();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .host
+            .retire_terminal(receipt.clone())
+            .await
+            .unwrap_err(),
+        InferenceHostError::JournalIo
+    );
+    drop(connection);
+    drop(fixture.host);
+    let reopened = InferenceHost::open(
+        fixture.directory.path().join("journal"),
+        owner(),
+        fixture.directory.path().join("models.json"),
+        fixture.directory.path().join("secrets"),
+        transport(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.pending(8).await.unwrap().len(), 1);
+    reopened.retire_terminal(receipt.clone()).await.unwrap();
+    reopened.retire_terminal(receipt).await.unwrap();
+    assert!(matches!(
+        reopened.reconcile(&grant).await.unwrap(),
+        DispatchOutcome::Retired
     ));
 }
 

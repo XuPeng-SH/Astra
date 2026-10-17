@@ -736,6 +736,18 @@ executable by requesting a new delivery generation. Only an attempt proven never
 granted may obtain its first start grant after restart. Recovery of stored results remains independent
 of boot nonce, so old results can still be acknowledged.
 
+Protocol version 2 separates execution-capacity retirement from provider outcome.
+After acquiring the same journal's exclusive OS lock, a replacement boot can
+report an exact missing old-boot grant only after its original execution deadline
+has elapsed according to the lower bound of the authenticated monotonic clock.
+Server rechecks the immutable grant, current authenticated boot/journal/socket,
+and durable deadline, then records the retirement time and reporting boot on the
+existing attempt. The attempt is never dispatched again or automatically
+continued. Unknown cost and outcome remain in the ledger and still count toward
+the unresolved-attempt admission bound; authentic late terminal evidence remains
+eligible for custody. Short claim expiry and cancellation intent do not retire
+capacity. A different journal cannot report this same-journal recovery evidence.
+
 Exactly one process holds the local journal lock. A copied installation must be
 reenrolled with a new identity; shared/cloned journals are not a supported HA
 mechanism. Old incarnations cannot accept fresh dispatch. Existing uncertain
@@ -955,9 +967,22 @@ and one per session. The Server's existing durable attempt ledger is the bounded
 waiting queue (128 unresolved attempts per Runner); waiting never extends the
 15-second start grant. Session-interleaved reconciliation prevents one session's
 backlog from filling every delivery batch. A delivery claim reserves a provider
-slot until terminal or definitive no-start evidence; claim expiry and cancellation
-intent alone cannot free a potentially executing slot. Cancellation and recovery
+slot until terminal, definitive no-start evidence, or the authenticated bounded
+incarnation retirement described above; claim expiry and cancellation intent
+alone cannot free a potentially executing slot. Cancellation and recovery
 continue even while admission capacity is exhausted.
+
+Deleting a completed session can race a lost terminal ACK. A replay rejected by
+the ledger checks the existing owner-scoped durable session deletion tombstone
+under the authenticated Runner connection. The Server sends an exact-attempt,
+terminal-hash retirement receipt, distinct from a custody ACK. Runner atomically
+replaces that payload with a retired tombstone and continues other sessions.
+Deletion during response transfer uses the same receipt path; no deleted payload
+or session is recreated. An absent attempt without a deletion tombstone is not
+retirement authority. A permanent attempt-specific evidence rejection instead
+quarantines the retained payload in the existing journal, excludes it from
+automatic replay across reconnects, and reports the condition in diagnostics.
+Transient storage/capacity rejection still retries the identical payload.
 
 Local preparation uses per-attempt ordering and shared configuration/attachment
 leases. Concurrent sessions can prepare independently, while exact cancellation

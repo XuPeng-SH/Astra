@@ -998,6 +998,7 @@ async fn handle_edge_connection(
                                 Ok(message @ (EdgeClientMessage::InferenceHello { .. }
                                     | EdgeClientMessage::InferenceBindingPublish { .. }
                                     | EdgeClientMessage::InferenceStartEvidence { .. }
+                                    | EdgeClientMessage::InferenceCapacityRetired { .. }
                                     | EdgeClientMessage::InferenceProgress { .. }
                                     | EdgeClientMessage::InferenceTerminal { .. }
                                     | EdgeClientMessage::InferenceResponseChunk { .. }

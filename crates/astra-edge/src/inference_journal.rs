@@ -7,9 +7,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use astra_turn_types::runner_inference::{
-    InferenceInvocationTerminal, RUNNER_INFERENCE_ARTIFACT_BYTES, RunnerInferenceDigest,
-    RunnerInferenceDispatchGrant, RunnerInferenceId, RunnerInferenceStartEvidence,
-    RunnerInferenceTerminalAck, runner_terminal_digest,
+    InferenceInvocationTerminal, RUNNER_INFERENCE_ARTIFACT_BYTES, RunnerInferenceAttemptIdentity,
+    RunnerInferenceDigest, RunnerInferenceDispatchGrant, RunnerInferenceId,
+    RunnerInferenceRejection, RunnerInferenceStartEvidence, RunnerInferenceTerminalAck,
+    RunnerInferenceTerminalRetirement, runner_terminal_digest,
 };
 use astra_turn_types::runner_inference::{
     RUNNER_INFERENCE_PROTOCOL_VERSION, RunnerInferenceBindingChange,
@@ -124,6 +125,15 @@ pub(crate) enum RecordState {
     },
     TerminalAwaitingAck {
         payload: RetainedTerminal,
+    },
+    TerminalQuarantined {
+        payload: RetainedTerminal,
+        reason: RunnerInferenceRejection,
+        no_start_evidence: Option<RunnerInferenceStartEvidence>,
+    },
+    Retired {
+        terminal_sha256: RunnerInferenceDigest,
+        retired_unix_ms: u64,
     },
     Acknowledged {
         terminal_sha256: RunnerInferenceDigest,
@@ -240,6 +250,7 @@ impl InferenceJournal {
                 return Err(InferenceHostError::Corrupt);
             }
             if let RecordState::TerminalAwaitingAck { payload }
+            | RecordState::TerminalQuarantined { payload, .. }
             | RecordState::NotStartedAwaitingAck { payload, .. } = &record.state
             {
                 payload.validate()?;
@@ -490,25 +501,11 @@ impl InferenceJournal {
         &mut self,
         ack: &RunnerInferenceTerminalAck,
     ) -> Result<(), InferenceHostError> {
-        let record = self
-            .records
-            .get(ack.attempt.attempt_id.as_str())
-            .ok_or(InferenceHostError::IdentityConflict)?;
-        if record.grant.attempt != ack.attempt {
-            return Err(InferenceHostError::IdentityConflict);
-        }
-        let expected = match &record.state {
-            RecordState::TerminalAwaitingAck { payload }
-            | RecordState::NotStartedAwaitingAck { payload, .. } => &payload.terminal_sha256,
-            RecordState::Acknowledged {
-                terminal_sha256, ..
-            } => terminal_sha256,
-            _ => return Err(InferenceHostError::IdentityConflict),
-        };
-        if *expected != ack.terminal_sha256 {
-            return Err(InferenceHostError::IdentityConflict);
-        }
-        if matches!(record.state, RecordState::Acknowledged { .. }) {
+        let record = self.terminal_record(&ack.attempt, &ack.terminal_sha256)?;
+        if matches!(
+            record.state,
+            RecordState::Acknowledged { .. } | RecordState::Retired { .. }
+        ) {
             return Ok(());
         }
         self.commit(JournalRecord {
@@ -517,6 +514,89 @@ impl InferenceJournal {
             state: RecordState::Acknowledged {
                 terminal_sha256: ack.terminal_sha256.clone(),
                 acknowledged_unix_ms: unix_time_ms(),
+            },
+        })
+    }
+
+    fn terminal_record(
+        &self,
+        attempt: &RunnerInferenceAttemptIdentity,
+        terminal_sha256: &RunnerInferenceDigest,
+    ) -> Result<&JournalRecord, InferenceHostError> {
+        let record = self
+            .records
+            .get(attempt.attempt_id.as_str())
+            .ok_or(InferenceHostError::IdentityConflict)?;
+        if record.grant.attempt != *attempt {
+            return Err(InferenceHostError::IdentityConflict);
+        }
+        let expected = match &record.state {
+            RecordState::TerminalAwaitingAck { payload }
+            | RecordState::TerminalQuarantined { payload, .. }
+            | RecordState::NotStartedAwaitingAck { payload, .. } => &payload.terminal_sha256,
+            RecordState::Acknowledged {
+                terminal_sha256, ..
+            }
+            | RecordState::Retired {
+                terminal_sha256, ..
+            } => terminal_sha256,
+            _ => return Err(InferenceHostError::IdentityConflict),
+        };
+        if expected != terminal_sha256 {
+            return Err(InferenceHostError::IdentityConflict);
+        }
+        Ok(record)
+    }
+
+    pub fn retire(
+        &mut self,
+        receipt: &RunnerInferenceTerminalRetirement,
+    ) -> Result<(), InferenceHostError> {
+        let record = self.terminal_record(&receipt.attempt, &receipt.terminal_sha256)?;
+        if matches!(record.state, RecordState::Retired { .. }) {
+            return Ok(());
+        }
+        self.commit(JournalRecord {
+            version: 1,
+            grant: record.grant.clone(),
+            state: RecordState::Retired {
+                terminal_sha256: receipt.terminal_sha256.clone(),
+                retired_unix_ms: unix_time_ms(),
+            },
+        })
+    }
+
+    pub fn quarantine(
+        &mut self,
+        attempt: &RunnerInferenceAttemptIdentity,
+        terminal_sha256: &RunnerInferenceDigest,
+        reason: RunnerInferenceRejection,
+    ) -> Result<(), InferenceHostError> {
+        if !matches!(
+            reason,
+            RunnerInferenceRejection::InvalidEvidence
+                | RunnerInferenceRejection::BindingIdentityMismatch
+        ) {
+            return Err(InferenceHostError::InvalidRequest);
+        }
+        let record = self.terminal_record(attempt, terminal_sha256)?;
+        let (payload, no_start_evidence) = match &record.state {
+            RecordState::TerminalAwaitingAck { payload } => (payload.clone(), None),
+            RecordState::NotStartedAwaitingAck { payload, evidence } => {
+                (payload.clone(), Some(*evidence))
+            }
+            RecordState::TerminalQuarantined { .. }
+            | RecordState::Retired { .. }
+            | RecordState::Acknowledged { .. } => return Ok(()),
+            _ => return Err(InferenceHostError::IdentityConflict),
+        };
+        self.commit(JournalRecord {
+            version: 1,
+            grant: record.grant.clone(),
+            state: RecordState::TerminalQuarantined {
+                payload,
+                reason,
+                no_start_evidence,
             },
         })
     }
@@ -555,6 +635,7 @@ impl InferenceJournal {
             .map(|record| match &record.state {
                 RecordState::ExecutionFenced => MAX_RECORD_BYTES,
                 RecordState::TerminalAwaitingAck { payload }
+                | RecordState::TerminalQuarantined { payload, .. }
                 | RecordState::NotStartedAwaitingAck { payload, .. } => payload
                     .response_json
                     .len()
@@ -599,6 +680,10 @@ impl InferenceJournal {
             .filter_map(|(attempt_id, record)| match record.state {
                 RecordState::Acknowledged {
                     acknowledged_unix_ms,
+                    ..
+                }
+                | RecordState::Retired {
+                    retired_unix_ms: acknowledged_unix_ms,
                     ..
                 } if tombstone_expired(
                     now,

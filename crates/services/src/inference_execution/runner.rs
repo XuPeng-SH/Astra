@@ -7,7 +7,7 @@ use std::{collections::HashSet, num::NonZeroU64};
 use astra_turn_types::runner_inference::{
     RunnerInferenceArtifactReference, RunnerInferenceAttemptIdentity, RunnerInferenceDigest,
     RunnerInferenceDispatchGrant, RunnerInferenceId, RunnerInferenceStartEvidence,
-    RunnerInferenceTerminalAck,
+    RunnerInferenceTerminalAck, RunnerInferenceTerminalRetirement,
 };
 
 use super::*;
@@ -186,6 +186,120 @@ pub async fn validate_runner_terminal_attempt(
         return Err(ServiceError::conflict("Runner terminal identity mismatch"));
     }
     Ok(())
+}
+
+/// Deletion authority belongs to the existing session lifecycle tombstone.
+/// An absent attempt alone is never an acknowledgement or a retirement proof.
+pub async fn retired_runner_terminal(
+    pool: &SharedPool,
+    connection: &AuthenticatedRunnerConnection,
+    identity: &RunnerInferenceAttemptIdentity,
+    terminal_sha256: &RunnerInferenceDigest,
+) -> ServiceResult<Option<RunnerInferenceTerminalRetirement>> {
+    if identity.user_id != connection.user_id || identity.binding.runner_id != connection.runner_id
+    {
+        return Err(ServiceError::conflict("Runner terminal owner mismatch"));
+    }
+    let session = identity
+        .scope
+        .session_id()
+        .ok_or_else(|| ServiceError::invalid("Runner terminal requires session scope"))?;
+    let mut tx = pool.get().begin().await.map_err(persistence)?;
+    let registry = lock_connection(&mut tx, connection).await?;
+    let journal: Option<String> = registry
+        .try_get("inference_journal_id")
+        .map_err(persistence)?;
+    let edge: Option<String> = registry.try_get("inference_edge_id").map_err(persistence)?;
+    if journal.as_deref() != Some(identity.binding.journal_id.as_str())
+        || edge.as_deref() != Some(connection.edge_id.as_str())
+    {
+        return Err(ServiceError::conflict("Runner terminal journal mismatch"));
+    }
+    let deleted = sqlx::query(
+        "SELECT 1 FROM session_deletion_tombstones WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&identity.user_id)
+    .bind(session)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(persistence)?
+    .is_some();
+    Ok(deleted.then(|| RunnerInferenceTerminalRetirement {
+        attempt: identity.clone(),
+        terminal_sha256: terminal_sha256.clone(),
+    }))
+}
+
+/// Persist bounded execution-right retirement, never a provider outcome. The
+/// reporter owns the same exclusively locked journal under a different boot,
+/// has reconciled the exact grant as missing, and has observed its full deadline
+/// elapse. Recheck that deadline and the authenticated incarnation here. A short
+/// delivery claim, cancellation, or an absent journal record alone is insufficient.
+pub async fn retire_runner_capacity(
+    pool: &SharedPool,
+    connection: &AuthenticatedRunnerConnection,
+    grant: &RunnerInferenceDispatchGrant,
+    process_boot_nonce: &RunnerInferenceId,
+) -> ServiceResult<()> {
+    let identity = &grant.attempt;
+    if identity.user_id != connection.user_id || identity.binding.runner_id != connection.runner_id
+    {
+        return Err(ServiceError::conflict("Runner retirement owner mismatch"));
+    }
+    let mut tx = pool.get().begin().await.map_err(persistence)?;
+    let session = identity
+        .scope
+        .session_id()
+        .ok_or_else(|| ServiceError::invalid("Runner retirement requires session scope"))?;
+    crate::storage::admit_session_event_write(&mut tx, session, &identity.user_id, false)
+        .await
+        .map_err(persistence)?;
+    let row = sqlx::query(
+        "SELECT runner_grant_json,
+        IF(runner_deadline_at <= NOW(6), 1, 0) AS expired
+        FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
+    )
+    .bind(&identity.user_id)
+    .bind(identity.attempt_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(persistence)?
+    .ok_or_else(|| ServiceError::not_found("Runner retirement attempt absent"))?;
+    if decode_grant(&row)? != *grant || row.try_get::<i64, _>("expired").map_err(persistence)? != 1
+    {
+        return Err(ServiceError::conflict(
+            "Runner retirement requires the exact expired grant",
+        ));
+    }
+    let registry = lock_connection(&mut tx, connection).await?;
+    let boot: Option<String> = registry
+        .try_get("inference_boot_nonce")
+        .map_err(persistence)?;
+    let journal: Option<String> = registry
+        .try_get("inference_journal_id")
+        .map_err(persistence)?;
+    let edge: Option<String> = registry.try_get("inference_edge_id").map_err(persistence)?;
+    if boot.as_deref() != Some(process_boot_nonce.as_str())
+        || process_boot_nonce == &grant.process_boot_nonce
+        || journal.as_deref() != Some(identity.binding.journal_id.as_str())
+        || edge.as_deref() != Some(connection.edge_id.as_str())
+    {
+        return Err(ServiceError::conflict(
+            "Runner retirement requires the current replacement incarnation",
+        ));
+    }
+    sqlx::query(
+        "UPDATE inference_provider_attempts SET runner_capacity_retired_at = NOW(6),
+        runner_capacity_retired_by_boot = ? WHERE user_id = ? AND attempt_id = ?
+        AND runner_capacity_retired_at IS NULL",
+    )
+    .bind(process_boot_nonce.as_str())
+    .bind(&identity.user_id)
+    .bind(identity.attempt_id.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(persistence)?;
+    tx.commit().await.map_err(persistence)
 }
 
 /// Private request/response bytes. Debug reports size only.
@@ -1184,7 +1298,8 @@ pub async fn claim_runner_delivery(
         IF(runner_grant_expires_at > NOW(6), 1, 0) AS start_valid,
         IF(runner_local_fence_at IS NOT NULL OR runner_no_start_evidence IS NOT NULL, 1, 0) AS start_known,
         IF(runner_dispatch_claim_expires_at > NOW(6), 1, 0) AS claimed,
-        IF(runner_dispatch_claim_token IS NOT NULL, 1, 0) AS previously_claimed
+        IF(runner_dispatch_claim_token IS NOT NULL, 1, 0) AS previously_claimed,
+        IF(runner_capacity_retired_at IS NOT NULL, 1, 0) AS capacity_retired
         FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
     )
     .bind(&identity.user_id)
@@ -1202,6 +1317,10 @@ pub async fn claim_runner_delivery(
         .try_get::<Option<String>, _>("runner_terminal_hash")
         .map_err(persistence)?
         .is_some()
+        || row
+            .try_get::<i64, _>("capacity_retired")
+            .map_err(persistence)?
+            == 1
         || row.try_get::<i64, _>("claimed").map_err(persistence)? == 1
     {
         return Ok(None);
@@ -1227,8 +1346,9 @@ pub async fn claim_runner_delivery(
             .map_err(persistence)?
             == 0
     {
-        // A delivery claim reserves local capacity until definitive terminal or
-        // no-start evidence. Claim timeout only permits replay of that same
+        // A delivery claim reserves local capacity until definitive terminal,
+        // no-start evidence, or authenticated bounded incarnation retirement.
+        // Claim timeout only permits replay of that same
         // grant; it must not free a possibly executing provider slot. Cancel
         // intent is likewise conservative until the Runner proves no start.
         let capacity = sqlx::query(
@@ -1240,6 +1360,7 @@ pub async fn claim_runner_delivery(
              WHERE attempt.user_id = ? AND attempt.runner_id = ?
                AND attempt.runner_journal_id = ? AND attempt.status = 'started'
                AND attempt.runner_terminal_hash IS NULL AND attempt.runner_no_start_evidence IS NULL
+               AND attempt.runner_capacity_retired_at IS NULL
                AND (attempt.runner_dispatch_claim_token IS NOT NULL
                     OR attempt.runner_local_fence_at IS NOT NULL
                     OR attempt.runner_cancel_requested_at IS NOT NULL)",
@@ -1331,6 +1452,7 @@ pub async fn list_runner_reconciliation(
             JOIN inference_invocations invocation ON invocation.user_id = attempt.user_id
                 AND invocation.invocation_id = attempt.invocation_id
             WHERE attempt.user_id = ? AND attempt.runner_id = ? AND attempt.status = 'started'
+              AND attempt.runner_capacity_retired_at IS NULL
               AND (attempt.runner_dispatch_claim_expires_at IS NULL OR attempt.runner_dispatch_claim_expires_at <= NOW(6))
         ) pending
         ORDER BY session_position, runner_grant_expires_at, attempt_id LIMIT ?",

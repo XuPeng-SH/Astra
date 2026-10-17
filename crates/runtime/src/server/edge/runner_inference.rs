@@ -151,6 +151,35 @@ fn rejection(error: &ServiceError) -> RunnerInferenceRejection {
     }
 }
 
+async fn terminal_rejection(
+    db: &SharedPool,
+    connection: &AuthenticatedRunnerConnection,
+    generation: u64,
+    transfer: &RunnerInferenceTerminalTransfer,
+    reason: RunnerInferenceRejection,
+) -> EdgeServerMessage {
+    let reason = if reason == RunnerInferenceRejection::CapacityUnavailable {
+        reason
+    } else {
+        match retired_runner_terminal(db, connection, &transfer.attempt, &transfer.terminal_sha256)
+            .await
+        {
+            Ok(Some(receipt)) => {
+                return EdgeServerMessage::InferenceTerminalRetired {
+                    receipt: Box::new(receipt),
+                    delivery_generation: generation,
+                };
+            }
+            Ok(None) => reason,
+            Err(error) => rejection(&error),
+        }
+    };
+    EdgeServerMessage::InferenceRejected {
+        attempt_id: Some(transfer.attempt.attempt_id.clone()),
+        reason,
+    }
+}
+
 async fn send(
     pool: &EdgeConnectionPool,
     connection: &AuthenticatedRunnerConnection,
@@ -193,6 +222,11 @@ pub(super) fn validate_ingress(
             publication.change.identity().runner_id.as_str() == runner
         }
         EdgeClientMessage::InferenceStartEvidence {
+            grant,
+            delivery_generation,
+            ..
+        }
+        | EdgeClientMessage::InferenceCapacityRetired {
             grant,
             delivery_generation,
             ..
@@ -405,6 +439,17 @@ async fn handle_message(
                 reason: rejection(&error),
             }),
         },
+        EdgeClientMessage::InferenceCapacityRetired {
+            grant,
+            process_boot_nonce,
+            ..
+        } => match retire_runner_capacity(db, connection, &grant, &process_boot_nonce).await {
+            Ok(()) => None,
+            Err(error) => Some(EdgeServerMessage::InferenceRejected {
+                attempt_id: Some(grant.attempt.attempt_id),
+                reason: rejection(&error),
+            }),
+        },
         EdgeClientMessage::InferenceProgress { progress, .. } => {
             let attempt_id = progress.attempt.attempt_id.clone();
             if progress_attempts
@@ -464,7 +509,12 @@ async fn handle_message(
                     .await
                     .map_err(|error| rejection(&error))
             };
-            let result = result.and_then(|()| ResponseAssembly::new(*transfer));
+            if let Err(reason) = result {
+                return Some(
+                    terminal_rejection(db, connection, generation, &transfer, reason).await,
+                );
+            }
+            let result = ResponseAssembly::new(*transfer);
             Some(match result {
                 Ok(mut assembly) => {
                     let credit = assembly.credit(generation);
@@ -540,10 +590,16 @@ async fn handle_message(
                                 delivery_generation: generation,
                             })
                         }
-                        Err(error) => Some(EdgeServerMessage::InferenceRejected {
-                            attempt_id: Some(attempt_id),
-                            reason: rejection(&error),
-                        }),
+                        Err(error) => Some(
+                            terminal_rejection(
+                                db,
+                                connection,
+                                generation,
+                                &assembly.header,
+                                rejection(&error),
+                            )
+                            .await,
+                        ),
                     }
                 }
             }
@@ -816,6 +872,21 @@ mod tests {
 
     #[test]
     fn runner_inference_ingress_fences_owner_runner_generation_and_metadata_bounds() {
+        let retirement = EdgeClientMessage::InferenceCapacityRetired {
+            grant: Box::new(RunnerInferenceDispatchGrant {
+                attempt: header(16).attempt,
+                grant_id: id("grant"),
+                process_boot_nonce: id("old-boot"),
+                start_before_unix_ms: 1,
+                deadline_unix_ms: 2,
+            }),
+            process_boot_nonce: id("new-boot"),
+            delivery_generation: 7,
+        };
+        assert!(validate_ingress(&retirement, "owner", "runner", 7));
+        assert!(!validate_ingress(&retirement, "other-owner", "runner", 7));
+        assert!(!validate_ingress(&retirement, "owner", "other-runner", 7));
+        assert!(!validate_ingress(&retirement, "owner", "runner", 8));
         let valid = EdgeClientMessage::InferenceTerminal {
             transfer: Box::new(header(16)),
             delivery_generation: 7,
@@ -867,7 +938,8 @@ mod tests {
         let worker = tokio::spawn(run(None, pool.clone(), connection, generation, receiver));
         sender
             .send(EdgeClientMessage::InferenceHello {
-                protocol_version: 1,
+                protocol_version:
+                    astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
                 journal_id: id("journal"),
                 process_boot_nonce: id("boot"),
             })

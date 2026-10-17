@@ -6980,6 +6980,8 @@ async fn ensure_core_schema_while_leased(
             runner_grant_json TEXT NULL,
             runner_grant_expires_at DATETIME(6) NULL,
             runner_deadline_at DATETIME(6) NULL,
+            runner_capacity_retired_at DATETIME(6) NULL,
+            runner_capacity_retired_by_boot VARCHAR(64) NULL,
             runner_cancel_requested_at DATETIME(6) NULL,
             runner_response_artifact_id VARCHAR(64) NULL,
             runner_response_hash CHAR(64) NULL,
@@ -7045,6 +7047,14 @@ async fn ensure_core_schema_while_leased(
         (
             "runner_cancel_requested_at",
             "ALTER TABLE inference_provider_attempts ADD COLUMN runner_cancel_requested_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_capacity_retired_at",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_capacity_retired_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_capacity_retired_by_boot",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_capacity_retired_by_boot VARCHAR(64) NULL",
         ),
         (
             "runner_response_artifact_id",

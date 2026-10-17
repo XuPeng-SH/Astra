@@ -1346,7 +1346,7 @@ mod tests {
 
     fn inference_publication(runner_id: &str) -> RunnerInferenceBindingPublication {
         serde_json::from_value(serde_json::json!({
-            "protocol_version": 1,
+            "protocol_version": astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
             "operation_id": "operation-1",
             "expected_publication_revision": 0,
             "change": {
@@ -1386,7 +1386,7 @@ mod tests {
             Err(RunnerInferenceRejection::BindingIdentityMismatch)
         );
         let mut incompatible = publication.clone();
-        incompatible.protocol_version = 2;
+        incompatible.protocol_version = 1;
         assert_eq!(
             pool.validate_runner_inference_publication("alice", "runner", alice, &incompatible),
             Err(RunnerInferenceRejection::ProtocolVersionUnsupported)

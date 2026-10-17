@@ -28,9 +28,15 @@ async fn reconnect_after_real_unregister_preserves_journal() {
     let pool = common::setup_pool().await;
     let user = format!("runner-disconnect-{}", uuid::Uuid::new_v4());
     let old = register(&pool, &user).await;
-    enroll_runner_inference(&pool, &old, 1, &id("journal"), &id("boot-1"))
-        .await
-        .unwrap();
+    enroll_runner_inference(
+        &pool,
+        &old,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("journal"),
+        &id("boot-1"),
+    )
+    .await
+    .unwrap();
     publish_runner_binding(&pool, &old, &publication("publish-1", 0, 1))
         .await
         .unwrap();
@@ -100,9 +106,15 @@ async fn reconnect_after_real_unregister_preserves_journal() {
         edge_id: "socket-2".into(),
         ..old.clone()
     };
-    enroll_runner_inference(&pool, &current, 1, &id("journal"), &id("boot-2"))
-        .await
-        .expect("ordinary disconnect must not retire the durable Runner journal");
+    enroll_runner_inference(
+        &pool,
+        &current,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("journal"),
+        &id("boot-2"),
+    )
+    .await
+    .expect("ordinary disconnect must not retire the durable Runner journal");
     let replay = publish_runner_binding(&pool, &current, &publication("publish-1", 0, 1))
         .await
         .unwrap();
@@ -130,23 +142,29 @@ async fn reconnect_after_real_unregister_preserves_journal() {
     enroll_runner_inference(
         &pool,
         &current,
-        1,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
         &id("replacement-journal"),
         &id("boot-3"),
     )
     .await
     .unwrap();
     assert!(
-        enroll_runner_inference(&pool, &current, 1, &id("journal"), &id("boot-4"))
-            .await
-            .is_err(),
+        enroll_runner_inference(
+            &pool,
+            &current,
+            RUNNER_INFERENCE_PROTOCOL_VERSION,
+            &id("journal"),
+            &id("boot-4")
+        )
+        .await
+        .is_err(),
         "explicit journal replacement must still fence the retired journal"
     );
 }
 
 fn publication(operation: &str, expected: u64, revision: u64) -> RunnerInferenceBindingPublication {
     serde_json::from_value(serde_json::json!({
-        "protocol_version": 1, "operation_id": operation,
+        "protocol_version": RUNNER_INFERENCE_PROTOCOL_VERSION, "operation_id": operation,
         "expected_publication_revision": expected,
         "change": {"action": "publish", "definition": {
             "identity": {"runner_id": "personal", "journal_id": "journal", "binding_id": "model",
@@ -193,9 +211,15 @@ async fn runner_publication_receipts_are_owner_scoped_and_cannot_restore_disable
             .is_err(),
         "tool registration is not inference enrollment"
     );
-    enroll_runner_inference(&pool, &connection, 1, &id("journal"), &id("boot-1"))
-        .await
-        .unwrap();
+    enroll_runner_inference(
+        &pool,
+        &connection,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("journal"),
+        &id("boot-1"),
+    )
+    .await
+    .unwrap();
     let receipt = publish_runner_binding(&pool, &connection, &first)
         .await
         .unwrap();
@@ -206,9 +230,15 @@ async fn runner_publication_receipts_are_owner_scoped_and_cannot_restore_disable
             .is_err()
     );
     assert!(publish_runner_binding(&pool, &other, &first).await.is_err());
-    enroll_runner_inference(&pool, &other, 1, &id("journal"), &id("other-boot"))
-        .await
-        .unwrap();
+    enroll_runner_inference(
+        &pool,
+        &other,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("journal"),
+        &id("other-boot"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         publish_runner_binding(&pool, &other, &first).await.unwrap(),
         receipt,
@@ -222,7 +252,7 @@ async fn runner_publication_receipts_are_owner_scoped_and_cannot_restore_disable
             .is_err()
     );
     let disable = RunnerInferenceBindingPublication {
-        protocol_version: 1,
+        protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
         operation_id: id("disable"),
         expected_publication_revision: 1,
         change: RunnerInferenceBindingChange::Disable {
@@ -294,9 +324,15 @@ async fn runner_reconnect_requires_executor_enrollment_but_preserves_publication
     let pool = common::setup_pool().await;
     let user = format!("runner-reconnect-{}", uuid::Uuid::new_v4());
     let old = register(&pool, &user).await;
-    enroll_runner_inference(&pool, &old, 1, &id("journal"), &id("boot-1"))
-        .await
-        .unwrap();
+    enroll_runner_inference(
+        &pool,
+        &old,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("journal"),
+        &id("boot-1"),
+    )
+    .await
+    .unwrap();
     let first = publication("publish-1", 0, 1);
     let receipt = publish_runner_binding(&pool, &old, &first).await.unwrap();
     sqlx::query("UPDATE edge_agent_registry SET edge_id = 'socket-2' WHERE user_id = ?")
@@ -341,13 +377,19 @@ async fn runner_reconnect_requires_executor_enrollment_but_preserves_publication
             .is_err()
     );
     assert!(
-        enroll_runner_inference(&pool, &current, 2, &id("journal"), &id("boot-2"))
+        enroll_runner_inference(&pool, &current, 1, &id("journal"), &id("boot-2"))
             .await
             .is_err()
     );
-    enroll_runner_inference(&pool, &current, 1, &id("journal"), &id("boot-2"))
-        .await
-        .unwrap();
+    enroll_runner_inference(
+        &pool,
+        &current,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("journal"),
+        &id("boot-2"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         publish_runner_binding(&pool, &current, &first)
             .await
@@ -367,18 +409,30 @@ async fn runner_reconnect_requires_executor_enrollment_but_preserves_publication
             .await
             .is_err()
     );
-    enroll_runner_inference(&pool, &current, 1, &id("new-journal"), &id("boot-3"))
-        .await
-        .unwrap();
+    enroll_runner_inference(
+        &pool,
+        &current,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &id("new-journal"),
+        &id("boot-3"),
+    )
+    .await
+    .unwrap();
     assert!(
         resolve_runner_model_binding(&pool, &user, first.change.identity())
             .await
             .is_err()
     );
     assert!(
-        enroll_runner_inference(&pool, &current, 1, &id("journal"), &id("boot-4"))
-            .await
-            .is_err(),
+        enroll_runner_inference(
+            &pool,
+            &current,
+            RUNNER_INFERENCE_PROTOCOL_VERSION,
+            &id("journal"),
+            &id("boot-4")
+        )
+        .await
+        .is_err(),
         "retired journal cannot restore stale inventory"
     );
 }

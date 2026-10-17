@@ -177,6 +177,15 @@ pub enum EdgeClientMessage {
         evidence: crate::runner_inference::RunnerInferenceStartEvidence,
     },
 
+    /// A new exclusive journal owner has no record for an old boot's expired
+    /// grant. Only execution capacity is retired; the outcome remains unknown.
+    #[serde(rename = "inference_capacity_retired")]
+    InferenceCapacityRetired {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        process_boot_nonce: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+    },
+
     /// Provisional normalized provider progress.  It is keyed by the full
     /// immutable attempt identity; the Server may drop or lag this message,
     /// but it must never treat it as terminal/usage/tool authority.
@@ -317,6 +326,12 @@ pub enum EdgeServerMessage {
         delivery_generation: u64,
     },
 
+    #[serde(rename = "inference_terminal_retired")]
+    InferenceTerminalRetired {
+        receipt: Box<crate::runner_inference::RunnerInferenceTerminalRetirement>,
+        delivery_generation: u64,
+    },
+
     #[serde(rename = "inference_response_credit")]
     InferenceResponseCredit {
         attempt_id: crate::runner_inference::RunnerInferenceId,
@@ -343,6 +358,7 @@ impl EdgeServerMessage {
             | Self::InferenceCancel { .. }
             | Self::InferenceReconcile { .. }
             | Self::InferenceTerminalAck { .. }
+            | Self::InferenceTerminalRetired { .. }
             | Self::InferenceResponseCredit { .. }
             | Self::InferenceRejected { .. } => true,
             Self::AuthOk { .. }
@@ -373,6 +389,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::InferenceCancel { .. } => "inference_cancel",
             EdgeServerMessage::InferenceReconcile { .. } => "inference_reconcile",
             EdgeServerMessage::InferenceTerminalAck { .. } => "inference_terminal_ack",
+            EdgeServerMessage::InferenceTerminalRetired { .. } => "inference_terminal_retired",
             EdgeServerMessage::InferenceResponseCredit { .. } => "inference_response_credit",
             EdgeServerMessage::InferenceRejected { .. } => "inference_rejected",
         }
@@ -417,14 +434,15 @@ mod tests {
     #[test]
     fn inference_negotiation_is_a_separate_strict_protocol_facet() {
         let message: EdgeClientMessage = serde_json::from_value(json!({
-            "type": "inference_hello", "protocol_version": 1,
+            "type": "inference_hello", "protocol_version": astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
             "journal_id": "journal", "process_boot_nonce": "boot"
         }))
         .unwrap();
         assert!(matches!(
             message,
             EdgeClientMessage::InferenceHello {
-                protocol_version: 1,
+                protocol_version:
+                    astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
                 ..
             }
         ));
@@ -436,18 +454,22 @@ mod tests {
             "tool",
             "args",
         ] {
-            let mut frame = json!({"type": "inference_hello", "protocol_version": 1,
+            let mut frame = json!({"type": "inference_hello", "protocol_version": astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
                 "journal_id": "journal", "process_boot_nonce": "boot"});
             frame[field] = json!("canary-secret");
             assert!(serde_json::from_value::<EdgeClientMessage>(frame).is_err());
         }
         let response = EdgeServerMessage::InferenceHelloAck {
-            negotiation: crate::runner_inference::RunnerInferenceNegotiation::accepted(1, 7, 1000),
+            negotiation: crate::runner_inference::RunnerInferenceNegotiation::accepted(
+                astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
+                7,
+                1000,
+            ),
         };
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             json!({
-                "type": "inference_hello_ack", "negotiation": {"status": "accepted", "protocol_version": 1,
+                "type": "inference_hello_ack", "negotiation": {"status": "accepted", "protocol_version": astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
                     "delivery_generation": 7, "max_artifact_bytes": 16777216, "server_unix_ms": 1000}
             })
         );

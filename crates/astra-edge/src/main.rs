@@ -1633,6 +1633,7 @@ async fn run_edge_connection(
                                 | EdgeServerMessage::InferenceCancel { .. }
                                 | EdgeServerMessage::InferenceReconcile { .. }
                                 | EdgeServerMessage::InferenceTerminalAck { .. }
+                                | EdgeServerMessage::InferenceTerminalRetired { .. }
                                 | EdgeServerMessage::InferenceResponseCredit { .. }
                                 | EdgeServerMessage::InferenceRejected { .. })) => {
                                 if let Some(worker) = &inference

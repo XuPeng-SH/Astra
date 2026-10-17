@@ -518,11 +518,17 @@ mod tests {
             runner_id: runner.clone(),
             edge_id: "completion-socket".into(),
         };
-        enroll_runner_inference(&pool, &connection, 1, &id("journal"), &id("boot"))
-            .await
-            .unwrap();
+        enroll_runner_inference(
+            &pool,
+            &connection,
+            astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION,
+            &id("journal"),
+            &id("boot"),
+        )
+        .await
+        .unwrap();
         let publication: RunnerInferenceBindingPublication = serde_json::from_value(json!({
-            "protocol_version": 1, "operation_id": "publish", "expected_publication_revision": 0,
+            "protocol_version": astra_turn_types::runner_inference::RUNNER_INFERENCE_PROTOCOL_VERSION, "operation_id": "publish", "expected_publication_revision": 0,
             "change": {"action": "publish", "definition": {
                 "identity": {"runner_id": runner, "journal_id": "journal", "binding_id": "local",
                     "binding_revision": 1, "profile_revision": 1},

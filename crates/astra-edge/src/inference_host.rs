@@ -110,6 +110,13 @@ impl GrantClock {
             .saturating_add(self.uncertainty.as_millis() as u64)
     }
 
+    /// Retirement uses the lower clock bound, unlike conservative start denial.
+    pub(crate) fn earliest_server_time(&self) -> u64 {
+        self.server_unix_ms
+            .saturating_add(self.observed.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            .saturating_sub(self.uncertainty.as_millis() as u64)
+    }
+
     fn deadline(
         &self,
         grant: &RunnerInferenceDispatchGrant,
@@ -136,6 +143,8 @@ pub enum DispatchOutcome {
     NotStarted(RunnerInferenceStartEvidence),
     Terminal(RetainedTerminal),
     Acknowledged,
+    Retired,
+    Quarantined,
     Unknown,
 }
 
@@ -988,7 +997,10 @@ impl InferenceHost {
             return Ok(outcome(record));
         }
         if grant.process_boot_nonce != self.process_boot_nonce {
-            return Err(InferenceHostError::WrongIncarnation);
+            // The replacement process cannot prove that the old grant never
+            // executed. Preserve unknown for bounded reconciliation, including
+            // when Server run cancellation takes precedence over reconciliation.
+            return Ok(DispatchOutcome::Unknown);
         }
         self.retain_no_start(
             grant,
@@ -1057,6 +1069,30 @@ impl InferenceHost {
             .await
     }
 
+    pub async fn retire_terminal(
+        &self,
+        receipt: RunnerInferenceTerminalRetirement,
+    ) -> Result<(), InferenceHostError> {
+        if receipt.attempt.user_id != self.owner.user_id
+            || receipt.attempt.binding.runner_id != self.owner.runner_id
+            || receipt.attempt.binding.journal_id != self.journal_id
+        {
+            return Err(InferenceHostError::OwnerMismatch);
+        }
+        self.with_journal(move |journal| journal.retire(&receipt))
+            .await
+    }
+
+    pub async fn quarantine_terminal(
+        &self,
+        attempt: RunnerInferenceAttemptIdentity,
+        terminal_sha256: RunnerInferenceDigest,
+        reason: RunnerInferenceRejection,
+    ) -> Result<(), InferenceHostError> {
+        self.with_journal(move |journal| journal.quarantine(&attempt, &terminal_sha256, reason))
+            .await
+    }
+
     pub async fn publication_ack(
         &self,
         receipt: RunnerInferenceBindingReceipt,
@@ -1120,6 +1156,8 @@ fn outcome(record: JournalRecord) -> DispatchOutcome {
         }
         RecordState::TerminalAwaitingAck { payload } => DispatchOutcome::Terminal(payload),
         RecordState::Acknowledged { .. } => DispatchOutcome::Acknowledged,
+        RecordState::Retired { .. } => DispatchOutcome::Retired,
+        RecordState::TerminalQuarantined { .. } => DispatchOutcome::Quarantined,
     }
 }
 

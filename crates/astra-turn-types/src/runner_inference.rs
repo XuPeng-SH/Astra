@@ -475,7 +475,7 @@ impl std::fmt::Debug for RunnerInferenceResponse {
     }
 }
 
-pub const RUNNER_INFERENCE_PROTOCOL_VERSION: u16 = 1;
+pub const RUNNER_INFERENCE_PROTOCOL_VERSION: u16 = 2;
 const MAX_INFERENCE_ID_BYTES: usize = 64;
 const MAX_MODEL_NAME_BYTES: usize = 255;
 
@@ -682,6 +682,16 @@ pub struct RunnerInferenceTerminalAck {
     pub terminal_sha256: RunnerInferenceDigest,
 }
 
+/// The authenticated Server has a durable deletion tombstone for this owned
+/// session. This retires the exact local payload; it does not acknowledge
+/// custody, settle usage, or authorize continuation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerInferenceTerminalRetirement {
+    pub attempt: RunnerInferenceAttemptIdentity,
+    pub terminal_sha256: RunnerInferenceDigest,
+}
+
 /// Immutable proof that the Server obtained one exact terminal response from
 /// a Runner.  It is intentionally transport-neutral and contains neither a
 /// credential nor response bytes: a checkpoint may retain this receipt, while
@@ -837,7 +847,7 @@ mod tests {
 
     fn publication_json() -> serde_json::Value {
         json!({
-            "protocol_version": 1,
+            "protocol_version": RUNNER_INFERENCE_PROTOCOL_VERSION,
             "operation_id": "operation-1",
             "expected_publication_revision": 0,
             "change": {
@@ -912,15 +922,15 @@ mod tests {
     #[test]
     fn enrollment_receipt_carries_exact_version_generation_limits_and_server_clock() {
         assert_eq!(
-            RunnerInferenceNegotiation::accepted(1, 42, 1000),
+            RunnerInferenceNegotiation::accepted(RUNNER_INFERENCE_PROTOCOL_VERSION, 42, 1000),
             RunnerInferenceNegotiation::Accepted {
-                protocol_version: 1,
+                protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
                 delivery_generation: 42,
                 max_artifact_bytes: RUNNER_INFERENCE_ARTIFACT_BYTES as u32,
                 server_unix_ms: 1000
             }
         );
-        for version in [0, 2, u16::MAX] {
+        for version in [0, 1, u16::MAX] {
             assert_eq!(
                 RunnerInferenceNegotiation::accepted(version, 42, 1000),
                 RunnerInferenceNegotiation::Unavailable {
