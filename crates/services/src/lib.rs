@@ -314,9 +314,9 @@ pub use pagination::{
 };
 pub use personal_skills::{
     ActivateUserSkillVersion, ActivePersonalSkillRecord, CreateUserSkillSource,
-    DatabasePersonalSkillStore, PersonalSkillError, SKILL_MD_NORMALIZE_VERSION,
-    SubmitUserSkillVersion, UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md,
-    skill_md_content_hash,
+    DatabasePersonalSkillStore, DeactivateUserSkillVersion, PersonalSkillError,
+    SKILL_MD_NORMALIZE_VERSION, SubmitUserSkillVersion, UserSkillSourceRecord,
+    UserSkillVersionRecord, normalize_skill_md, skill_md_content_hash,
 };
 pub use prompt_delta::{
     PromptDeltaCounts, PromptRequestObservability, PromptRequestPersistInput,

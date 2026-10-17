@@ -428,6 +428,7 @@ export type HarnessSkillDraft = {
   publish_visibility: string;
   content_markdown: string;
   source_summary_json: Record<string, unknown>;
+  decision_history_json: unknown[];
   status: string;
   confidence: number | null;
   created_by_node_id: string | null;

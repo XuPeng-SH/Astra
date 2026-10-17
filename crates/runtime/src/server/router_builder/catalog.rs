@@ -62,6 +62,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(user_skill_handlers::activate_user_skill_handler),
         )
         .route(
+            "/skills/user/{skill_name}/deactivate",
+            post(user_skill_handlers::deactivate_user_skill_handler),
+        )
+        .route(
             "/skills/{skill_name}/info",
             get(skills::get_skill_info_handler),
         )

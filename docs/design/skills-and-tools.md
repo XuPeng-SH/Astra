@@ -204,14 +204,22 @@ there is no originating conversation. Session creation preserves the Web
 hydration metadata; activation pins the published version through the existing
 compare-and-set endpoint before any task is sent. The ordinary Skill picker
 exposes personal sources and published revisions on demand, separately from
-per-turn name selection. It loads versions only for the selected source rather
+per-turn name selection. Its session controls can read the current active version
+and explicitly deactivate it, including a first adoption with no rollback baseline.
+Deactivation uses the same session write lock and expected-version check as
+activation, records an event and inactive projection, and frees an activation slot.
+It affects only subsequent executions; already frozen execution snapshots and
+pre-provider context-overflow rejection are preserved. It loads versions only for the selected source rather
 than fetching every Skill body. It shows bounded baseline/candidate criterion outcomes
 without presenting them as causal improvement. Generation cost is labeled
 separately from trial cost.
 
 Before generation dispatch, browser recovery stores the exact request (including
 the original idempotency key and optional validation task), scoped by authenticated
-owner, runtime, and originating session. An interrupted or lost initial response
+owner, runtime, originating session, and an immutable browser attempt ID. The URL
+retains that attempt ID before dispatch, so two tabs keep separate requests and
+cleanup changes only the addressed attempt. A direct result URL takes precedence
+over pending browser data and does not require browser storage to be readable. An interrupted or lost initial response
 is retried only with this saved request; an in-progress response never rotates
 the key. Once a response arrives, the browser replaces the pending request with
 the run reference and updates the result URL without interrupting evaluation.
@@ -219,6 +227,18 @@ Generating another candidate retains the saved source session and pinned baselin
 validation replay retains the original request identity unchanged. Starting a
 different generation while recovery is pending requires explicitly abandoning recovery; this does not cancel the server task.
 If browser storage fails before dispatch, generation does not start.
+Harness admission stores frozen authoring metadata in the same INSERT as the
+running owner, before inference. A rejected preparation write therefore leaves no
+running row that requires a second terminal write. Executor failures still settle
+through the existing Harness failure owner; process death and uncertain admission
+acknowledgements are not automatically retried as new paid executions.
+Publication first reloads the authoritative draft and requires the revision the
+user reviewed. An already approved or published revision continues from that
+state after a lost acknowledgement; approval keys include the current decision
+history length, retaining retry identity while allowing explicit reapproval after
+a later rejection of the same content revision.
+Rule and whole-draft edit buffers submit their opening revision, so another saved
+edit produces a visible revision conflict instead of a lost correction.
 The advanced Harness entry point also retains its exact request/key before dispatch
 and offers explicit recovery after reload. CLI `/skill create` and `/skill improve`
 write a private request file before sending; the printed `/skill resume <file>`

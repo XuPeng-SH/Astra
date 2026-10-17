@@ -18,7 +18,7 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react';
-import { useSearchParams } from 'next/navigation';
+import { useAuthoringReference } from '@/hooks/use-authoring-reference';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listChats } from '@/lib/api/chats';
 import {
@@ -57,6 +57,7 @@ type SkillifySourceFileInput = {
   content: string;
 };
 type RuleEditState = {
+  expected_revision: number;
   statement: string;
   rationale: string;
   content_markdown: string;
@@ -104,15 +105,16 @@ function sourceCitationLabel(count: number) {
 }
 
 export function HarnessesPage({ ownerId, runtimeKey }: { ownerId: string; runtimeKey: string }) {
-  const params = useSearchParams();
-  const storageKey = `astra:harness:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(params.get('runId') ?? '')}`;
-  return <HarnessSession key={storageKey} storageKey={storageKey} />;
+  const storagePrefix = `astra:harness:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:`;
+  const route = useAuthoringReference(storagePrefix);
+  return <HarnessSession key={route.key} storagePrefix={storagePrefix} {...route.reference} onReference={route.replaceReference} />;
 }
 
-function HarnessSession({ storageKey }: { storageKey: string }) {
-  const searchParams = useSearchParams();
-  const requestedRunId = searchParams.get('runId');
-  const requestedDraftId = searchParams.get('draftId');
+function HarnessSession({ storagePrefix, runId: requestedRunId, draftId: requestedDraftId, attemptId, onReference }: {
+  storagePrefix: string; runId: string | null; draftId: string | null; attemptId: string | null;
+  onReference: (reference: { runId?: string; attemptId?: string }) => void;
+}) {
+  const storageKey = attemptId ? `${storagePrefix}${encodeURIComponent(attemptId)}` : null;
   const mounted = useRef(true);
   const recoveryKey = useRef(storageKey);
   const [pending, setPending] = useState<SkillifyRunRequest | null>(null);
@@ -175,7 +177,7 @@ function HarnessSession({ storageKey }: { storageKey: string }) {
     mounted.current = true;
     let recovery: { pending?: SkillifyRunRequest; runId?: string } = {};
     try {
-      recovery = JSON.parse(window.localStorage.getItem(storageKey) ?? '{}');
+      if (!requestedRunId && storageKey) recovery = JSON.parse(window.localStorage.getItem(storageKey) ?? '{}');
     } catch { /* An explicit authorized result link remains usable without storage. */ }
     if (recovery.pending) {
       setPending(recovery.pending); setView('skillify'); setRecovering(false);
@@ -248,7 +250,10 @@ function HarnessSession({ storageKey }: { storageKey: string }) {
         topic: topic.trim() || null,
         target_scope: 'personal' as const,
       };
-      window.localStorage.setItem(recoveryKey.current, JSON.stringify({ pending: request }));
+      const key = `${storagePrefix}${encodeURIComponent(request.idempotency_key!)}`;
+      window.localStorage.setItem(key, JSON.stringify({ pending: request }));
+      recoveryKey.current = key;
+      onReference({ attemptId: request.idempotency_key! });
       setPending(request);
       const created = await createSkillifyRun(request);
       if (!mounted.current) return;
@@ -257,23 +262,17 @@ function HarnessSession({ storageKey }: { storageKey: string }) {
         setError('原生成任务仍在执行；稍后恢复同一任务以读取结果。');
         return;
       }
-      const reference = JSON.stringify({ runId: created.harness_run_id });
-      const nextKey = `${storageKey.slice(0, storageKey.lastIndexOf(':') + 1)}${encodeURIComponent(created.harness_run_id)}`;
-      window.localStorage.setItem(recoveryKey.current, reference);
-      window.localStorage.setItem(nextKey, reference);
-      recoveryKey.current = nextKey;
+      window.localStorage.setItem(key, JSON.stringify({ runId: created.harness_run_id }));
+      recoveryKey.current = null;
       setPending(null);
-      const url = new URL(window.location.href);
-      url.searchParams.set('runId', created.harness_run_id);
-      url.searchParams.delete('draftId');
-      window.history.replaceState(null, '', url);
+      onReference({ runId: created.harness_run_id });
       await refreshDrafts(created.harness_run_id);
     } catch (err) {
       if (mounted.current) setError(err instanceof Error ? err.message : 'Failed to start Skillify.');
     } finally {
       setBusy(false);
     }
-  }, [refreshDrafts, selected, skillName, sourceFiles, topic, pending, storageKey]);
+  }, [refreshDrafts, selected, skillName, sourceFiles, topic, pending, storagePrefix, onReference]);
 
   const decideRule = useCallback(async (
     draft: HarnessSkillDraft,
@@ -317,7 +316,7 @@ function HarnessSession({ storageKey }: { storageKey: string }) {
     setError(null);
     try {
       const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
-        expected_revision: draft.revision,
+        expected_revision: edit.expected_revision,
         decision: edit.decision,
         after_json: { statement, rationale, content_markdown: edit.content_markdown },
         reason: 'Edited rule from Skillify review UI.',
@@ -352,7 +351,7 @@ function HarnessSession({ storageKey }: { storageKey: string }) {
     }
   }, [run]);
 
-  const editDraft = useCallback(async (draft: HarnessSkillDraft, contentMarkdown: string) => {
+  const editDraft = useCallback(async (draft: HarnessSkillDraft, contentMarkdown: string, expectedRevision: number) => {
     if (!run) {
       return false;
     }
@@ -365,7 +364,7 @@ function HarnessSession({ storageKey }: { storageKey: string }) {
     setError(null);
     try {
       const updated = await decideSkillDraft(run.harness_run_id, draft.skill_draft_id, {
-        expected_revision: draft.revision,
+        expected_revision: expectedRevision,
         decision: 'edit',
         after_json: { content_markdown },
         reason: 'Edited skill content from Skillify review UI.',
@@ -458,7 +457,7 @@ function HarnessSession({ storageKey }: { storageKey: string }) {
           已保留原始生成请求。重试会恢复同一次生成，不会使用下面修改后的来源。
           <Button disabled={busy} onClick={startSkillify}>恢复原生成任务</Button>
           <Button disabled={busy} onClick={() => {
-            try { window.localStorage.removeItem(recoveryKey.current); setPending(null); }
+            try { if (recoveryKey.current) window.localStorage.removeItem(recoveryKey.current); recoveryKey.current = null; onReference({}); setPending(null); }
             catch { setError('无法清除浏览器恢复记录'); }
           }}>放弃恢复并新建任务</Button>
         </div> : null}
@@ -667,11 +666,12 @@ function SkillifyView({
   onDecideRule: (draft: HarnessSkillDraft, rule: HarnessSkillRule, decision: 'approve' | 'reject') => void;
   onEditRule: (draft: HarnessSkillDraft, rule: HarnessSkillRule, edit: RuleEditState) => Promise<boolean>;
   onDecideDraft: (draft: HarnessSkillDraft, decision: 'approve' | 'reject') => void;
-  onEditDraft: (draft: HarnessSkillDraft, contentMarkdown: string) => Promise<boolean>;
+  onEditDraft: (draft: HarnessSkillDraft, contentMarkdown: string, expectedRevision: number) => Promise<boolean>;
   onPublishDraft: (draft: HarnessSkillDraft, visibility: 'private' | 'public') => void;
 }) {
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
   const [draftMarkdown, setDraftMarkdown] = useState('');
+  const [draftRevision, setDraftRevision] = useState<number | null>(null);
   const [ruleEdits, setRuleEdits] = useState<Record<string, RuleEditState>>({});
   const activeDraftKey = activeDraft?.skill_draft_id ?? null;
   const isEditingDraft = activeDraftKey !== null && editingDraftId === activeDraftKey;
@@ -690,23 +690,27 @@ function SkillifyView({
     }
     setEditingDraftId(activeDraft.skill_draft_id);
     setDraftMarkdown(activeDraft.content_markdown);
+    setDraftRevision(activeDraft.revision);
   }, [activeDraft]);
 
   const saveDraftEdit = useCallback(async () => {
     if (!activeDraft) {
       return;
     }
-    const saved = await onEditDraft(activeDraft, draftMarkdown);
+    if (draftRevision === null) return;
+    const saved = await onEditDraft(activeDraft, draftMarkdown, draftRevision);
     if (saved) {
       setEditingDraftId(null);
       setDraftMarkdown('');
     }
-  }, [activeDraft, draftMarkdown, onEditDraft]);
+  }, [activeDraft, draftMarkdown, draftRevision, onEditDraft]);
 
   const startRuleEdit = useCallback((rule: HarnessSkillRule, decision: 'edit' | 'reject' = 'edit') => {
+    if (!activeDraft) return;
     setRuleEdits((current) => ({
       ...current,
       [rule.skill_rule_id]: {
+        expected_revision: activeDraft.revision,
         statement: rule.statement,
         rationale: rule.rationale,
         content_markdown: activeDraft?.content_markdown ?? '',
@@ -716,13 +720,9 @@ function SkillifyView({
   }, [activeDraft]);
 
   const updateRuleEdit = useCallback((ruleId: string, field: 'statement' | 'rationale' | 'content_markdown', value: string) => {
-    setRuleEdits((current) => ({
-      ...current,
-      [ruleId]: {
-        ...(current[ruleId] ?? { statement: '', rationale: '', content_markdown: '', decision: 'edit' as const }),
-        [field]: value,
-      },
-    }));
+    setRuleEdits((current) => current[ruleId] ? {
+      ...current, [ruleId]: { ...current[ruleId], [field]: value },
+    } : current);
   }, []);
 
   const cancelRuleEdit = useCallback((ruleId: string) => {

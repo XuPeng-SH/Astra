@@ -529,4 +529,191 @@ async fn activation_capacity_serializes_additions_and_preserves_runnable_replace
             .iter()
             .any(|active| active.version_id == replacement.version_id)
     );
+    store
+        .deactivate_version_with_expected(
+            &user_id,
+            &session_id,
+            &replacement.skill_name,
+            &replacement.version_id,
+        )
+        .await
+        .unwrap();
+    store
+        .activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &rejected.skill_name,
+            &rejected.version_id,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .activate_version_with_expected(
+                &user_id,
+                &session_id,
+                &replacement.skill_name,
+                &replacement.version_id,
+                None
+            )
+            .await,
+        Err(PersonalSkillError::ActivationLimitReached { .. })
+    ));
+    store
+        .deactivate_version_with_expected(
+            &user_id,
+            &session_id,
+            &rejected.skill_name,
+            &rejected.version_id,
+        )
+        .await
+        .unwrap();
+    store
+        .activate_version_with_expected(
+            &user_id,
+            &session_id,
+            &replacement.skill_name,
+            &replacement.version_id,
+            None,
+        )
+        .await
+        .unwrap();
+    let reactivated = store
+        .load_active_for_session(&user_id, &session_id)
+        .await
+        .unwrap();
+    assert_eq!(reactivated.len(), limit);
+    assert!(
+        reactivated
+            .iter()
+            .any(|active| active.version_id == replacement.version_id)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn deactivation_fences_owner_stale_and_concurrent_changes_and_records_one_transition() {
+    let pool = setup_pool().await;
+    let store = DatabasePersonalSkillStore::new(pool.clone());
+    let (owner, name) = test_ids();
+    let session = format!("session-{}", Uuid::new_v4());
+    insert_session(&pool, &session, &owner).await;
+    let first = store
+        .submit_version(&owner, &name, submit_request("first", "published"))
+        .await
+        .unwrap();
+    let second = store
+        .submit_version(&owner, &name, submit_request("second", "published"))
+        .await
+        .unwrap();
+    store
+        .activate_version_with_expected(&owner, &session, &name, &first.version_id, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .deactivate_version_with_expected("other-owner", &session, &name, &first.version_id)
+            .await,
+        Err(PersonalSkillError::SessionNotActive { .. })
+    ));
+    assert!(matches!(
+        store
+            .deactivate_version_with_expected(&owner, &session, &name, &second.version_id)
+            .await,
+        Err(PersonalSkillError::ActivationConflict { .. })
+    ));
+    let (remove, replace) = tokio::join!(
+        store.deactivate_version_with_expected(&owner, &session, &name, &first.version_id),
+        store.activate_version_with_expected(
+            &owner,
+            &session,
+            &name,
+            &second.version_id,
+            Some(&first.version_id)
+        ),
+    );
+    assert_eq!(
+        usize::from(remove.is_ok()) + usize::from(replace.is_ok()),
+        1
+    );
+    let removed = remove.is_ok();
+    let error = remove.err().or(replace.err()).unwrap();
+    assert!(
+        matches!(error, PersonalSkillError::ActivationConflict { .. }),
+        "{error}"
+    );
+    let active = store
+        .load_active_for_session(&owner, &session)
+        .await
+        .unwrap();
+    assert_eq!(active.len(), usize::from(!removed));
+    if !removed {
+        assert_eq!(active[0].version_id, second.version_id);
+    }
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let projected_count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(event_count, 2, "rejected attempts append no event");
+    assert_eq!(event_count, projected_count);
+    if !removed {
+        store
+            .deactivate_version_with_expected(&owner, &session, &name, &second.version_id)
+            .await
+            .unwrap();
+    }
+    let event: serde_json::Value = serde_json::from_str(&sqlx::query_scalar::<_, String>(
+        "SELECT CAST(metadata AS CHAR) FROM agent_events WHERE user_id = ? AND event_type = 'ui.skill.deactivate'",
+    ).bind(&owner).fetch_one(pool.get()).await.unwrap()).unwrap();
+    assert_eq!(
+        event["previous_version_id"],
+        if removed {
+            first.version_id.as_str()
+        } else {
+            second.version_id.as_str()
+        }
+    );
+    assert!(event["version_id"].is_null());
+    let mutation: String = sqlx::query_scalar("SELECT mutation FROM session_state_item_events WHERE user_id = ? AND mutation = 'deactivate'")
+        .bind(&owner).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(mutation, "deactivate");
+    assert!(
+        store
+            .load_active_for_session(&owner, &session)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for table in [
+        "session_state_items",
+        "session_state_item_events",
+        "agent_events",
+        "agent_sessions",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+    for table in ["user_skill_versions", "user_skill_sources"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE owner_user_id = ?"))
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
 }

@@ -1,14 +1,14 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { AuthoringPage } from '@/components/app/authoring-page';
 import { SkillUseAction } from '@/components/app/skill-use-action';
-import { createAuthoringIntent, listAuthoringTargets, loadAuthoringResult, decideSkillDraft, publishSkillDraft, activatePersonalSkill } from '@/lib/api/harnesses';
+import { createAuthoringIntent, listAuthoringTargets, loadAuthoringResult, decideSkillDraft, publishSkillDraft, activatePersonalSkill, deactivatePersonalSkill } from '@/lib/api/harnesses';
 import { createSession, listSessions } from '@/lib/api/sessions';
 import { runPreparedEvaluation, getEvaluationExperiment } from '@/lib/api/evaluations';
 import type { AuthoringIntentRecord } from '@/lib/api/types';
 
 const navigation = vi.hoisted(() => ({ query: 'sessionId=session', defer: false }));
 vi.mock('next/navigation', () => ({ useSearchParams: () => new URLSearchParams(navigation.query) }));
-vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn(), listAuthoringTargets: vi.fn(), loadAuthoringResult: vi.fn(), decideSkillDraft: vi.fn(), publishSkillDraft: vi.fn(), activatePersonalSkill: vi.fn() }));
+vi.mock('@/lib/api/harnesses', () => ({ createAuthoringIntent: vi.fn(), listAuthoringTargets: vi.fn(), loadAuthoringResult: vi.fn(), decideSkillDraft: vi.fn(), publishSkillDraft: vi.fn(), activatePersonalSkill: vi.fn(), deactivatePersonalSkill: vi.fn() }));
 vi.mock('@/lib/api/sessions', () => ({ createSession: vi.fn(), listSessions: vi.fn() }));
 vi.mock('@/lib/api/evaluations', () => ({ runPreparedEvaluation: vi.fn(), getEvaluationExperiment: vi.fn() }));
 
@@ -18,7 +18,7 @@ const record = {
     { source_id: 'task', event_type: 'user_query', title: 'Original task', content: 'Return a JSON verdict.' },
     { source_id: 'guidance', event_type: 'user_message', title: 'Guidance', content: 'Please hurry.' },
   ] }, output_json: { authoring: { request: { goal: 'Create a review skill', create_new: false, idempotency_key: '00000000-0000-4000-8000-000000000001' } } } },
-  skill_drafts: [{ skill_draft_id: 'draft', revision: 1, candidate_name: 'Review', description: 'Review carefully',
+  skill_drafts: [{ skill_draft_id: 'draft', revision: 1, decision_history_json: [], candidate_name: 'Review', description: 'Review carefully',
     content_markdown: '# Review\nPreserve examples.', rules: [{ skill_rule_id: 'rule', statement: 'Return JSON',
       rationale: 'The user requested a structured verdict.', citations: [{ citation_id: 'quote', source_id: 'task',
         source_locator_json: { validation: 'exact_source_match', start_byte: 0, end_byte: 22 },
@@ -39,7 +39,178 @@ beforeEach(() => {
   });
   vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000001');
   vi.mocked(listAuthoringTargets).mockResolvedValue([]);
+  vi.mocked(loadAuthoringResult).mockResolvedValue(record);
   vi.mocked(getEvaluationExperiment).mockResolvedValue({ experiment: { experiment_id: 'comparison', spec_fingerprint: 'frozen' }, trials: [] } as unknown as Awaited<ReturnType<typeof getEvaluationExperiment>>);
+});
+
+it.each(['denied', 'malformed', 'stale-pending'])('loads an explicit result with %s browser storage', async (fault) => {
+  window.history.replaceState(null, '', '/authoring?runId=frozen&attemptId=stale');
+  if (fault === 'denied') vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('Denied'); });
+  else window.localStorage.setItem('astra:authoring:v1:owner:runtime::stale', fault === 'malformed' ? '{' : JSON.stringify({ pending: { request: { goal: 'stale' } } }));
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await screen.findByText('Review carefully');
+  expect(loadAuthoringResult).toHaveBeenCalledWith('frozen');
+  expect(createAuthoringIntent).not.toHaveBeenCalled();
+  expect(screen.queryByText('重试原任务')).not.toBeInTheDocument();
+});
+
+it.each(['abandon', 'complete'])('keeps two tabs independent when one attempt is %s', async (finish) => {
+  navigation.defer = true;
+  vi.mocked(crypto.randomUUID).mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
+    .mockReturnValueOnce('00000000-0000-4000-8000-000000000002');
+  vi.mocked(createAuthoringIntent).mockRejectedValue(new Error('Response lost'));
+  const a = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  const b = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  const urls: string[] = [];
+  for (const [tab, goal] of [[a, 'Goal A'], [b, 'Goal B']] as const) {
+    window.history.replaceState(null, '', '/authoring?sessionId=session');
+    const ui = within(tab.container);
+    fireEvent.change(ui.getByLabelText('Authoring goal'), { target: { value: goal } });
+    await waitFor(() => expect(ui.getByRole('button', { name: '生成结果' })).toBeEnabled());
+    fireEvent.click(ui.getByRole('button', { name: '生成结果' }));
+    await ui.findByText('Response lost');
+    urls.push(window.location.search);
+  }
+  expect(window.localStorage.length).toBe(2);
+  const calls = vi.mocked(createAuthoringIntent).mock.calls;
+  expect(calls[0][0].idempotency_key).not.toBe(calls[1][0].idempotency_key);
+  const keyB = `astra:authoring:v1:owner:runtime:session:${calls[1][0].idempotency_key}`;
+  const savedB = window.localStorage.getItem(keyB);
+  a.unmount(); b.unmount(); navigation.defer = false;
+  window.history.replaceState(null, '', `/authoring${urls[0]}`);
+  const recoveredA = render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await waitFor(() => expect(screen.getByLabelText('Authoring goal')).toHaveValue('Goal A'));
+  if (finish === 'abandon') fireEvent.click(screen.getByRole('button', { name: '放弃恢复并修改目标' }));
+  else {
+    vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+    fireEvent.click(screen.getByRole('button', { name: '重试原任务' }));
+    await screen.findByText('Review carefully');
+    expect(vi.mocked(createAuthoringIntent).mock.calls[2]).toEqual(calls[0]);
+  }
+  expect(window.localStorage.getItem(keyB)).toBe(savedB);
+  recoveredA.unmount();
+  window.history.replaceState(null, '', `/authoring${urls[1]}`);
+  render(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
+  await waitFor(() => expect(screen.getByLabelText('Authoring goal')).toHaveValue('Goal B'));
+});
+
+it.each(['publish-response', 'refresh'])('reconciles committed publication after lost %s', async (fault) => {
+  let current = record;
+  let failReads = false;
+  vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+  vi.mocked(loadAuthoringResult).mockImplementation(async () => { if (failReads) throw new Error('Read unavailable'); return current; });
+  vi.mocked(decideSkillDraft).mockImplementation(async () => {
+    if (current.skill_drafts[0].published_version_id) throw new Error('published drafts are immutable');
+    current = { ...current, skill_drafts: [{ ...current.skill_drafts[0], status: 'ready_to_publish' }] };
+    return current.skill_drafts[0];
+  });
+  vi.mocked(publishSkillDraft).mockImplementation(async () => {
+    current = { ...current, skill_drafts: [{ ...current.skill_drafts[0], status: 'published', published_version_id: 'published' }] };
+    failReads = true;
+    if (fault === 'publish-response') throw new Error('Publication response lost');
+    return { version_id: 'published' } as Awaited<ReturnType<typeof publishSkillDraft>>;
+  });
+  await submit();
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByText(fault === 'publish-response' ? 'Publication response lost' : 'Read unavailable');
+  failReads = false;
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByRole('button', { name: '在此会话使用此版本' });
+  expect(decideSkillDraft).toHaveBeenCalledTimes(1);
+  expect(publishSkillDraft).toHaveBeenCalledTimes(1);
+  expect(activatePersonalSkill).not.toHaveBeenCalled();
+});
+
+it('reconciles lost approval without creating another audit decision', async () => {
+  let current = record;
+  vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+  vi.mocked(loadAuthoringResult).mockImplementation(async () => current);
+  vi.mocked(decideSkillDraft).mockImplementation(async () => {
+    current = { ...current, skill_drafts: [{ ...current.skill_drafts[0], status: 'ready_to_publish' }] };
+    throw new Error('Approval response lost');
+  });
+  vi.mocked(publishSkillDraft).mockImplementation(async () => {
+    current = { ...current, skill_drafts: [{ ...current.skill_drafts[0], published_version_id: 'published' }] };
+    return { version_id: 'published' } as Awaited<ReturnType<typeof publishSkillDraft>>;
+  });
+  await submit();
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByText('Approval response lost');
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByRole('button', { name: '在此会话使用此版本' });
+  expect(decideSkillDraft).toHaveBeenCalledTimes(1);
+  expect(decideSkillDraft).toHaveBeenCalledWith('frozen', 'draft', expect.objectContaining({ idempotency_key: 'authoring-approve:draft:1:0' }));
+  expect(publishSkillDraft).toHaveBeenCalledTimes(1);
+});
+
+it('distinguishes explicit reapproval after rejection while retaining an unresolved approval key', async () => {
+  let current = record;
+  const consumed = new Set<string>();
+  let failApproval = false;
+  let failPublication = true;
+  vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+  vi.mocked(loadAuthoringResult).mockImplementation(async () => current);
+  vi.mocked(decideSkillDraft).mockImplementation(async (_run, _draft, request) => {
+    if (consumed.has(request.idempotency_key!)) return current.skill_drafts[0];
+    if (failApproval) { failApproval = false; throw new Error('Approval unavailable'); }
+    consumed.add(request.idempotency_key!);
+    current = { ...current, skill_drafts: [{ ...current.skill_drafts[0], status: 'ready_to_publish',
+      decision_history_json: [...current.skill_drafts[0].decision_history_json, { decision: 'approve', idempotency_key: request.idempotency_key }],
+    }] };
+    return current.skill_drafts[0];
+  });
+  vi.mocked(publishSkillDraft).mockImplementation(async () => {
+    if (current.skill_drafts[0].status !== 'ready_to_publish') throw new Error('Draft is not approved');
+    if (failPublication) throw new Error('Publication unavailable');
+    current = { ...current, skill_drafts: [{ ...current.skill_drafts[0], published_version_id: 'published' }] };
+    return { version_id: 'published' } as Awaited<ReturnType<typeof publishSkillDraft>>;
+  });
+  await submit();
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByText('Publication unavailable');
+  // The advanced review surface can reject without changing the body revision.
+  current = { ...current, skill_drafts: [{ ...current.skill_drafts[0], status: 'rejected',
+    decision_history_json: [...current.skill_drafts[0].decision_history_json, { decision: 'reject' }],
+  }] };
+  failApproval = true;
+  failPublication = false;
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByText('Approval unavailable');
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByRole('button', { name: '在此会话使用此版本' });
+  expect(vi.mocked(decideSkillDraft).mock.calls.map((call) => call[2].idempotency_key)).toEqual([
+    'authoring-approve:draft:1:0', 'authoring-approve:draft:1:2', 'authoring-approve:draft:1:2',
+  ]);
+  expect(current.skill_drafts[0].revision).toBe(1);
+  expect(consumed.size).toBe(2);
+});
+
+it('requires review again if durable content changed before publication', async () => {
+  vi.mocked(createAuthoringIntent).mockResolvedValue(record);
+  vi.mocked(loadAuthoringResult).mockResolvedValue({ ...record, skill_drafts: [{ ...record.skill_drafts[0], revision: 2, content_markdown: 'Changed content' }] });
+  await submit();
+  fireEvent.click(screen.getByRole('button', { name: '我已审核，保存为私有 Skill' }));
+  await screen.findByText('候选已改变，请重新审核当前正文。');
+  expect(decideSkillDraft).not.toHaveBeenCalled();
+  expect(publishSkillDraft).not.toHaveBeenCalled();
+});
+
+it('allows first-adoption deactivation and refreshes a stale version before another explicit removal', async () => {
+  vi.mocked(activatePersonalSkill).mockResolvedValue({ version_id: 'first', content_hash: 'hash' });
+  vi.mocked(deactivatePersonalSkill).mockRejectedValueOnce(new Error('Concurrent replacement')).mockResolvedValue({ active_version_id: null });
+  vi.mocked(listAuthoringTargets).mockResolvedValue([{ skill_name: 'review', version_id: 'newer' }]);
+  render(<SkillUseAction run={record.harness_run} skillName="review" versionId="first" />);
+  fireEvent.click(screen.getByRole('button', { name: '在此会话使用此版本' }));
+  fireEvent.click(await screen.findByRole('button', { name: '在此会话停用此 Skill' }));
+  await screen.findByRole('alert');
+  expect(deactivatePersonalSkill).toHaveBeenLastCalledWith('review', 'session', 'first');
+  fireEvent.click(screen.getByRole('button', { name: '查看当前版本' }));
+  await screen.findByText(/当前版本：newer/);
+  expect(deactivatePersonalSkill).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole('button', { name: '在此会话停用此 Skill' }));
+  await screen.findByText(/已停用 review/);
+  expect(deactivatePersonalSkill).toHaveBeenLastCalledWith('review', 'session', 'newer');
+  expect(screen.queryByRole('button', { name: '在此会话停用此 Skill' })).not.toBeInTheDocument();
 });
 
 it('opens the standard tool result link through authorized durable reads without generating again', async () => {
@@ -189,7 +360,7 @@ it('reviews and privately publishes the exact candidate before explicitly adopti
   vi.mocked(createAuthoringIntent).mockResolvedValue(owned);
   vi.mocked(decideSkillDraft).mockResolvedValue(owned.skill_drafts[0]);
   vi.mocked(publishSkillDraft).mockResolvedValue({ version_id: 'published' } as unknown as Awaited<ReturnType<typeof publishSkillDraft>>);
-  vi.mocked(loadAuthoringResult).mockResolvedValue({ ...owned, skill_drafts: [{ ...owned.skill_drafts[0], published_version_id: 'published' }] });
+  vi.mocked(loadAuthoringResult).mockResolvedValueOnce(owned).mockResolvedValue({ ...owned, skill_drafts: [{ ...owned.skill_drafts[0], published_version_id: 'published' }] });
   vi.mocked(activatePersonalSkill).mockResolvedValue({ version_id: 'published', content_hash: 'hash' });
   await submit();
   expect(screen.getByText(/较早记录已省略/)).toBeInTheDocument();
@@ -350,6 +521,10 @@ it('keeps evaluation mounted while Next defers the canonical query update', asyn
   fireEvent.click(screen.getByRole('button', { name: '生成结果' }));
   await screen.findByText('正在验证：候选与依据已可查看');
   const options = vi.mocked(runPreparedEvaluation).mock.calls[0][1];
+  expect(options?.signal?.aborted).toBe(false);
+  // Next can deliver the earlier attempt route after the result route was written.
+  navigation.query = 'sessionId=session&attemptId=00000000-0000-4000-8000-000000000001';
+  view.rerender(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);
   expect(options?.signal?.aborted).toBe(false);
   navigation.query = window.location.search.slice(1);
   view.rerender(<AuthoringPage ownerId="owner" runtimeKey="runtime" />);

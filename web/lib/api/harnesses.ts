@@ -111,6 +111,12 @@ export function activatePersonalSkill(skillName: string, sessionId: string, vers
   });
 }
 
+export function deactivatePersonalSkill(skillName: string, sessionId: string, expectedVersionId: string) {
+  return requestJson<{ active_version_id: null }>(`/api/skills/user/${encodeURIComponent(skillName)}/deactivate`, {
+    method: 'POST', body: JSON.stringify({ session_id: sessionId, expected_active_version_id: expectedVersionId }),
+  });
+}
+
 /** Recover through authorized durable reads, never by starting authoring again. */
 export async function loadAuthoringResult(runId: string): Promise<AuthoringIntentRecord> {
   const [run, drafts] = await Promise.all([getHarnessRun(runId), listSkillDrafts(runId)]);

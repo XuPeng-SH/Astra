@@ -1829,27 +1829,6 @@ impl DatabaseHarnessService {
             "target_scope": &target_scope,
             "idempotency_key": &request.idempotency_key
         });
-        let insert_result = sqlx::query(
-            "INSERT INTO harness_runs
-             (harness_run_id, harness_id, version_id, user_id, session_id, status,
-              input_json, output_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, NULL, 'running', ?, '{\"stage\":\"model_execution\"}', NOW(6), NOW(6))",
-        )
-        .bind(&harness_run_id)
-        .bind(SKILLIFY_HARNESS_ID)
-        .bind(SKILLIFY_VERSION_ID)
-        .bind(&user_id)
-        .bind(input_json.to_string())
-        .execute(self.pool.get())
-        .await;
-        match insert_result {
-            Ok(_) => {}
-            Err(error) if request.idempotency_key.is_some() && is_duplicate_key(&error) => {
-                return self.ensure_run_owner(&user_id, &harness_run_id).await;
-            }
-            Err(error) => return Err(internal_error(error)),
-        }
-
         // Freeze identity and old content before provider I/O. Never infer an
         // improvement from the name invented by the model after generation.
         let (topic, authoring_metadata) = if let Some(context) = authoring {
@@ -1867,26 +1846,38 @@ impl DatabaseHarnessService {
                     "content_hash": baseline.content_hash, "content_markdown": baseline.content_markdown,
                 })),
             });
-            let updated = sqlx::query(
-                "UPDATE harness_runs SET output_json = ?, updated_at = NOW(6)
-                 WHERE user_id = ? AND harness_run_id = ? AND status = 'running'",
-            )
-            .bind(json!({"stage": "model_execution", "authoring": &metadata}).to_string())
-            .bind(&user_id)
-            .bind(&harness_run_id)
-            .execute(self.pool.get())
-            .await
-            .map_err(internal_error)?;
-            if updated.rows_affected() != 1 {
-                return Err(error_response(
-                    StatusCode::CONFLICT,
-                    "authoring harness run is no longer in running state",
-                ));
-            }
             (Some(topic.to_string()), Some(metadata))
         } else {
             (request.topic.clone(), None)
         };
+
+        // Persist preparation and ownership atomically. There is no fallible
+        // metadata write after admission that can strand an executor-less run.
+        let mut initial_output = json!({"stage": "model_execution"});
+        if let Some(metadata) = &authoring_metadata {
+            initial_output["authoring"] = metadata.clone();
+        }
+        let insert_result = sqlx::query(
+            "INSERT INTO harness_runs
+             (harness_run_id, harness_id, version_id, user_id, session_id, status,
+              input_json, output_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, NULL, 'running', ?, ?, NOW(6), NOW(6))",
+        )
+        .bind(&harness_run_id)
+        .bind(SKILLIFY_HARNESS_ID)
+        .bind(SKILLIFY_VERSION_ID)
+        .bind(&user_id)
+        .bind(input_json.to_string())
+        .bind(initial_output.to_string())
+        .execute(self.pool.get())
+        .await;
+        match insert_result {
+            Ok(_) => {}
+            Err(error) if request.idempotency_key.is_some() && is_duplicate_key(&error) => {
+                return self.ensure_run_owner(&user_id, &harness_run_id).await;
+            }
+            Err(error) => return Err(internal_error(error)),
+        }
 
         let source_packet_index = source_packets
             .iter()

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { activatePersonalSkill, listAuthoringTargets } from '@/lib/api/harnesses';
+import { activatePersonalSkill, deactivatePersonalSkill, listAuthoringTargets } from '@/lib/api/harnesses';
 import { createSession, listSessions } from '@/lib/api/sessions';
 import type { RuntimeSessionListCursor } from '@astra/sdk';
 import type { HarnessRun } from '@/lib/api/types';
@@ -31,6 +31,18 @@ export function SkillUseAction({ run, skillName, versionId }: { run?: HarnessRun
       setNotice(`已启用 ${skillName} · ${adopted.version_id}。下一次请求使用此版本，正在执行的请求不变。`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法启用此版本'); }
     finally { setBusy(false); }
+  }
+
+  async function deactivate() {
+    if (!activeVersion) return;
+    setBusy(true); setError(null);
+    try {
+      await deactivatePersonalSkill(skillName, sessionId, activeVersion);
+      if (!mounted.current) return;
+      setExpectedVersion(null); setActiveVersion(null);
+      setNotice(`已停用 ${skillName}。下一次请求不再使用此 Skill，正在执行的请求不变。`);
+    } catch (reason) { if (mounted.current) setError(reason instanceof Error ? reason.message : '无法停用此 Skill'); }
+    finally { if (mounted.current) setBusy(false); }
   }
 
   async function refreshVersion() {
@@ -84,6 +96,8 @@ export function SkillUseAction({ run, skillName, versionId }: { run?: HarnessRun
     {error ? <p role="alert" className="text-danger">{error} {sessionId ? <button disabled={busy} onClick={() => void refreshVersion()}>读取当前版本后重选</button> : null}</p> : null}
     <div className="flex flex-wrap gap-2">
       <Button disabled={busy || !sessionId || activeVersion === versionId} onClick={() => void activateVersion(versionId)}>在此会话使用此版本</Button>
+      {sessionId ? <Button variant="ghost" disabled={busy} onClick={() => void refreshVersion()}>查看当前版本</Button> : null}
+      {activeVersion ? <Button variant="ghost" disabled={busy} onClick={() => void deactivate()}>在此会话停用此 Skill</Button> : null}
       {oldVersion && sessions.includes(sessionId) && activeVersion === versionId ? <Button variant="ghost" disabled={busy} onClick={() => void activateVersion(oldVersion)}>切回原版本</Button> : null}
       {activeVersion && chatId ? <Button variant="ghost" href={`/chats/${encodeURIComponent(chatId)}`}>返回会话</Button> : null}
     </div>

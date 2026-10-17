@@ -749,6 +749,83 @@ async fn authoring_retry_uses_fresh_attempt_and_preserves_explicit_replay() {
 
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn authoring_preparation_database_failure_does_not_admit_an_orphan() {
+    let (admin, mut settings) = common::setup_pool_and_settings().await;
+    // Own the schema used for fault injection; never alter a shared test table.
+    settings.database = format!("skillify_fault_{}", Uuid::new_v4().simple());
+    astra_services::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let shared = astra_core::SharedPool::new(&settings).await.unwrap();
+    let executor = Arc::new(CapturingSkillifyExecutor::default());
+    *executor.pool.lock().unwrap() = Some(shared.get().clone());
+    let service =
+        DatabaseHarnessService::new(shared.clone()).with_skillify_agent_executor(executor.clone());
+    let owner = Uuid::new_v4().to_string();
+    let request = astra_services::AuthoringIntentRequest {
+        goal: "Create a review skill".into(),
+        create_new: true,
+        target_skill: None,
+        validation_task: None,
+        idempotency_key: Some("preparation-fault".into()),
+    };
+    // The former INSERT's stage-only value fits; the authoring metadata does not.
+    // Previously this failed the post-insert UPDATE and left a running orphan.
+    sqlx::query("ALTER TABLE harness_runs MODIFY COLUMN output_json VARCHAR(64) NOT NULL")
+        .execute(shared.get())
+        .await
+        .unwrap();
+    let failed = service
+        .create_authoring_intent(owner.clone(), String::new(), request.clone(), None)
+        .await;
+    assert!(
+        failed.is_err(),
+        "metadata persistence must fail under the injected bound"
+    );
+    assert!(
+        executor.request.lock().unwrap().is_none(),
+        "no paid execution before durable preparation"
+    );
+    let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harness_runs WHERE user_id = ?")
+        .bind(&owner)
+        .fetch_one(shared.get())
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted, 0,
+        "failed preparation must not require a second terminal write to recover"
+    );
+    sqlx::query("ALTER TABLE harness_runs MODIFY COLUMN output_json LONGTEXT NOT NULL")
+        .execute(shared.get())
+        .await
+        .unwrap();
+    let recovered = service
+        .create_authoring_intent(owner.clone(), String::new(), request.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(recovered.harness_run.status, "completed");
+    assert_eq!(
+        recovered.harness_run.output_json["authoring"]["operation"],
+        "create"
+    );
+    *executor.failure.lock().unwrap() = Some("replay must not redispatch".into());
+    let replay = service
+        .create_authoring_intent(owner, String::new(), request, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.harness_run.harness_run_id,
+        recovered.harness_run.harness_run_id
+    );
+    shared.close().await;
+    sqlx::query(&format!("DROP DATABASE `{}`", settings.database))
+        .execute(admin.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
 async fn authoring_pins_old_body_before_generation_and_preserves_identity_on_retry() {
     use astra_services::harness::AuthoringSkillTarget;

@@ -3,7 +3,7 @@
 use super::*;
 use astra_services::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore,
-    PersonalSkillError, SubmitUserSkillVersion,
+    DeactivateUserSkillVersion, PersonalSkillError, SubmitUserSkillVersion,
 };
 use serde::Deserialize;
 
@@ -128,4 +128,23 @@ pub(super) async fn activate_user_skill_handler(
         .await
         .map(Json)
         .map_err(map_personal_skill_error)
+}
+
+pub(super) async fn deactivate_user_skill_handler(
+    State(state): State<AppState>,
+    Path(skill_name): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DeactivateUserSkillVersion>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    require_personal_skill_store(&state)?
+        .deactivate_version_with_expected(
+            &user.user_id,
+            &request.session_id,
+            &skill_name,
+            &request.expected_active_version_id,
+        )
+        .await
+        .map_err(map_personal_skill_error)?;
+    Ok(Json(serde_json::json!({"active_version_id": null})))
 }

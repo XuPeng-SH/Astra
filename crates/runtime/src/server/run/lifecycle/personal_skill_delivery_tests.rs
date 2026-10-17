@@ -127,9 +127,31 @@ async fn adopted_skill_reaches_primary_provider_in_both_chat_entries() {
         .await;
         let session_id = session["session_id"].as_str().unwrap();
         let mut expected = Value::Null;
-        // Fresh adoption, ordinary continuation, replacement, rollback, then oversized rejection.
-        for (turn, index) in [0, 0, 1, 0, 2].into_iter().enumerate() {
-            if turn != 1 {
+        // First oversized adoption -> removal -> ordinary request, then continuation,
+        // replacement, rollback, another overflow and recovery in the same session.
+        for index in [2, 3, 0, 0, 1, 0, 2, 3] {
+            if index == 3 {
+                let snapshots: Vec<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT run_id, checkpoint_json FROM agent_runs WHERE user_id = ? AND session_id = ? ORDER BY run_id",
+                ).bind(&owner).bind(session_id).fetch_all(pool.get()).await.unwrap();
+                post_json(
+                    &app,
+                    &owner,
+                    &format!("/skills/user/{name}/deactivate"),
+                    json!({
+                        "session_id":session_id,"expected_active_version_id":expected
+                    }),
+                )
+                .await;
+                let after: Vec<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT run_id, checkpoint_json FROM agent_runs WHERE user_id = ? AND session_id = ? ORDER BY run_id",
+                ).bind(&owner).bind(session_id).fetch_all(pool.get()).await.unwrap();
+                assert_eq!(
+                    snapshots, after,
+                    "deactivation must preserve frozen executions"
+                );
+                expected = Value::Null;
+            } else if expected != versions[index]["version_id"] {
                 post_json(&app, &owner, &format!("/skills/user/{name}/activate"), json!({
                     "session_id":session_id,"version_id":versions[index]["version_id"],"expected_active_version_id":expected
                 })).await;
@@ -216,6 +238,15 @@ async fn adopted_skill_reaches_primary_provider_in_both_chat_entries() {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    if index == 3 {
+                        assert!(
+                            !text.contains("V1_START")
+                                && !text.contains("V2_START")
+                                && !text.contains("OVERSIZED_START"),
+                            "deactivated instructions must be absent from the next ordinary provider request"
+                        );
+                        continue;
+                    }
                     assert!(
                         text.contains(&bodies[index]),
                         "full adopted body absent from provider request"

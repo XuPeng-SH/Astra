@@ -12,6 +12,7 @@ import { PageHeader } from '@/components/ui/page-header';
 import { SkillEvidence, SkillContentComparison, SkillSourceCoverage, frozenSkillSources } from '@/components/app/skill-evidence';
 import { SkillUseAction } from '@/components/app/skill-use-action';
 import { Textarea } from '@/components/ui/textarea';
+import { useAuthoringReference } from '@/hooks/use-authoring-reference';
 
 function countDraftCitations(draft: AuthoringIntentRecord['skill_drafts'][number]) {
   return draft.rules.reduce((count, rule) => count + rule.citations.length, 0);
@@ -29,33 +30,22 @@ type AuthoringResult = AuthoringIntentRecord & {
   evaluation_error?: string;
 };
 
-type PendingAuthoring = { request: AuthoringIntentRequest; sessionId?: string };
+type PendingAuthoring = { attemptId: string; request: AuthoringIntentRequest; sessionId?: string };
 
 type AuthoringScope = { ownerId: string; runtimeKey: string };
 export function AuthoringPage(scope: AuthoringScope) {
   const params = useSearchParams();
   const sessionId = params.get('sessionId');
-  const runId = params.get('runId');
-  const scopeKey = JSON.stringify([scope.ownerId, scope.runtimeKey, sessionId]);
-  const [view, setView] = useState({ scopeKey, urlRunId: runId, initialRunId: runId, generation: 0 });
-  const internalRunId = useRef<string | null>(null);
-  if (view.scopeKey !== scopeKey || view.urlRunId !== runId) {
-    setView(view.scopeKey === scopeKey && internalRunId.current !== null && runId === internalRunId.current
-      ? { ...view, urlRunId: runId }
-      : { scopeKey, urlRunId: runId, initialRunId: runId, generation: view.generation + 1 });
-    internalRunId.current = null;
-  }
-  function updateResultUrl(nextRunId: string) {
-    internalRunId.current = nextRunId;
-    const url = new URL(window.location.href);
-    url.searchParams.set('runId', nextRunId);
-    window.history.replaceState(null, '', url);
-  }
-  return <AuthoringSession key={JSON.stringify([scope.ownerId, scope.runtimeKey, sessionId, view.generation])} {...scope} sessionId={sessionId} runId={view.initialRunId} onResult={updateResultUrl} />;
+  const scopeKey = `astra:authoring:v1:${encodeURIComponent(scope.ownerId)}:${encodeURIComponent(scope.runtimeKey)}:${encodeURIComponent(sessionId ?? '')}:`;
+  const route = useAuthoringReference(scopeKey);
+  return <AuthoringSession key={route.key} storagePrefix={scopeKey} sessionId={sessionId} {...route.reference} onReference={route.replaceReference} />;
 }
 
-function AuthoringSession({ ownerId, runtimeKey, sessionId, runId, onResult }: AuthoringScope & { sessionId: string | null; runId: string | null; onResult: (runId: string) => void }) {
-  const storageKey = `astra:authoring:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(sessionId ?? '')}:${encodeURIComponent(runId ?? '')}`;
+function AuthoringSession({ storagePrefix, sessionId, runId, attemptId, onReference }: {
+  storagePrefix: string; sessionId: string | null; runId: string | null; attemptId: string | null;
+  onReference: (reference: { runId?: string; attemptId?: string }) => void;
+}) {
+  const storageKey = attemptId ? `${storagePrefix}${encodeURIComponent(attemptId)}` : null;
   const recoveryKey = useRef(storageKey);
   const evaluationAbort = useRef<AbortController | null>(null);
   const mounted = useRef(true);
@@ -97,15 +87,18 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId, onResult }: A
     let active = true;
     async function recover() {
       try {
-        const raw = window.localStorage.getItem(storageKey);
-        const saved = raw ? JSON.parse(raw) as { runId?: string; pending?: PendingAuthoring } : {};
-        if (saved.pending) {
-          setPending(saved.pending); setSubmittedRequest(saved.pending.request);
-          setGoal(saved.pending.request.goal); setCreateNew(saved.pending.request.create_new ?? false);
-          setTargetVersion(saved.pending.request.target_skill?.version_id ?? '');
-          return;
+        // An explicit result is authoritative even when storage is denied or corrupt.
+        let reference = runId;
+        if (!reference && storageKey) {
+          const saved = JSON.parse(window.localStorage.getItem(storageKey) ?? '{}') as { runId?: string; pending?: PendingAuthoring };
+          if (saved.pending) {
+            setPending(saved.pending); setSubmittedRequest(saved.pending.request);
+            setGoal(saved.pending.request.goal); setCreateNew(saved.pending.request.create_new ?? false);
+            setTargetVersion(saved.pending.request.target_skill?.version_id ?? '');
+            return;
+          }
+          reference = saved.runId ?? null;
         }
-        const reference = runId ?? saved.runId;
         if (typeof reference !== 'string') return;
         setSavedRunId(reference);
         const loaded = await loadAuthoringResult(reference);
@@ -137,14 +130,11 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId, onResult }: A
     setPending(null);
     setSavedRunId(created.harness_run.harness_run_id);
     const nextRunId = created.harness_run.harness_run_id;
-    const nextKey = `astra:authoring:v1:${encodeURIComponent(ownerId)}:${encodeURIComponent(runtimeKey)}:${encodeURIComponent(sessionId ?? '')}:${encodeURIComponent(nextRunId)}`;
     try {
-      window.localStorage.setItem(recoveryKey.current, JSON.stringify({ runId: nextRunId }));
-      window.localStorage.setItem(nextKey, JSON.stringify({ runId: nextRunId }));
+      if (recoveryKey.current) window.localStorage.setItem(recoveryKey.current, JSON.stringify({ runId: nextRunId }));
     }
     catch { setError('浏览器无法保存恢复引用；请保留候选的审核链接。'); }
-    recoveryKey.current = nextKey;
-    onResult(nextRunId);
+    onReference({ runId: nextRunId });
   }
 
   async function showAndEvaluate(created: AuthoringIntentRecord) {
@@ -184,23 +174,49 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId, onResult }: A
     const draft = result?.skill_drafts.find((entry) => entry.skill_draft_id === draftId);
     if (!result || !draft) return;
     setBusy(true); setError(null);
+    const runId = result.harness_run.harness_run_id;
+    function showCurrent(loaded: AuthoringIntentRecord) {
+      if (!mounted.current) return;
+      setResult((current) => current && loaded.skill_drafts.find((entry) => entry.skill_draft_id === draftId)?.revision === draft!.revision
+        ? { ...current, ...loaded } : loaded);
+    }
     try {
-      const runId = result.harness_run.harness_run_id;
-      await decideSkillDraft(runId, draftId, { expected_revision: draft.revision, decision: 'approve', reason: 'User reviewed the exact candidate and its source evidence.' });
+      const loaded = await loadAuthoringResult(runId);
+      if (!mounted.current) return;
+      showCurrent(loaded);
+      const current = loaded.skill_drafts.find((entry) => entry.skill_draft_id === draftId);
+      if (!current || current.revision !== draft.revision) throw new Error('候选已改变，请重新审核当前正文。');
+      if (current.published_version_id) return;
+      if (current.status !== 'ready_to_publish') {
+        await decideSkillDraft(runId, draftId, { expected_revision: draft.revision, decision: 'approve',
+          idempotency_key: `authoring-approve:${draftId}:${draft.revision}:${current.decision_history_json.length}`,
+          reason: 'User reviewed the exact candidate and its source evidence.' });
+      }
       if (!mounted.current) return;
       await publishSkillDraft(runId, draftId, { expected_revision: draft.revision, visibility: 'private' });
-      const loaded = await loadAuthoringResult(runId);
-      setResult((current) => current && loaded.skill_drafts.find((entry) => entry.skill_draft_id === draftId)?.revision === draft.revision
-        ? { ...current, ...loaded } : loaded);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存已审核的 Skill'); }
-    finally { setBusy(false); }
+      showCurrent(await loadAuthoringResult(runId));
+    } catch (reason) {
+      if (!mounted.current) return;
+      // A write or its acknowledgement may have failed. Reconcile before another action.
+      try {
+        const loaded = await loadAuthoringResult(runId);
+        if (!mounted.current) return;
+        showCurrent(loaded);
+        if (loaded.skill_drafts.find((entry) => entry.skill_draft_id === draftId)?.published_version_id) return;
+      } catch { /* Keep the original failure; the next click starts with an authorized read. */ }
+      if (mounted.current) setError(reason instanceof Error ? reason.message : '无法保存已审核的 Skill');
+    }
+    finally { if (mounted.current) setBusy(false); }
   }
 
   async function generate(submission: PendingAuthoring) {
     setBusy(true); setError(null);
     try {
-      // Persist before dispatch: a missing response must never require a new key.
-      window.localStorage.setItem(recoveryKey.current, JSON.stringify({ pending: submission }));
+      // Retain this attempt and its route before dispatch. Other tabs own different keys.
+      const key = `${storagePrefix}${encodeURIComponent(submission.attemptId)}`;
+      window.localStorage.setItem(key, JSON.stringify({ pending: submission }));
+      recoveryKey.current = key;
+      onReference({ attemptId: submission.attemptId });
       setPending(submission); setSubmittedRequest(submission.request);
       const created = await createAuthoringIntent(submission.request, submission.sessionId);
       if (!mounted.current) return;
@@ -215,7 +231,7 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId, onResult }: A
     if (!submittedRequest || !taskSourceId) return;
     try {
       const expected = JSON.parse(expectedResult);
-      await generate({ request: { ...submittedRequest,
+      await generate({ attemptId: crypto.randomUUID(), request: { ...submittedRequest,
         validation_task: { source_id: taskSourceId, expected_result: expected },
       }, sessionId: (result?.harness_run.input_json.session_ids as string[] | undefined)?.[0] });
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法准备验证任务'); }
@@ -228,14 +244,17 @@ function AuthoringSession({ ownerId, runtimeKey, sessionId, runId, onResult }: A
     const sourceSession = (result?.harness_run.input_json.session_ids as string[] | undefined)?.[0] ?? sessionId ?? undefined;
     const target = targets.find((entry) => entry.version_id === targetVersion) ?? submittedRequest?.target_skill;
     setResult(null);
-    await generate({ request: { goal: trimmed, create_new: createNew, idempotency_key: crypto.randomUUID(),
+    const attemptId = crypto.randomUUID();
+    await generate({ attemptId, request: { goal: trimmed, create_new: createNew, idempotency_key: attemptId,
       ...(!createNew && target ? { target_skill: target } : {}),
     }, sessionId: sourceSession });
   }
 
   function startAnother() {
     // Explicitly abandon recovery; this does not cancel an admitted server run.
-    window.localStorage.removeItem(recoveryKey.current);
+    if (recoveryKey.current) window.localStorage.removeItem(recoveryKey.current);
+    recoveryKey.current = null;
+    onReference({});
     setPending(null); setSavedRunId(null); setSubmittedRequest(null); setResult(null); setError(null);
   }
 

@@ -140,6 +140,13 @@ pub struct ActivateUserSkillVersion {
     pub expected_active_version_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeactivateUserSkillVersion {
+    pub session_id: String,
+    pub expected_active_version_id: String,
+}
+
 #[derive(Clone)]
 pub struct DatabasePersonalSkillStore {
     pool: SharedPool,
@@ -501,7 +508,48 @@ impl DatabasePersonalSkillStore {
                 expected_active_version_id,
             )
             .await;
-        match activation {
+        Self::map_activation_result(
+            activation,
+            owner_user_id,
+            session_id,
+            skill_name,
+            version_id,
+        )?;
+        Ok(version)
+    }
+
+    pub async fn deactivate_version_with_expected(
+        &self,
+        owner_user_id: &str,
+        session_id: &str,
+        skill_name: &str,
+        expected_active_version_id: &str,
+    ) -> Result<(), PersonalSkillError> {
+        let result = DatabaseStateProjectionStore::new(self.pool.clone())
+            .deactivate_personal_skill_from_ui_with_expected(
+                owner_user_id,
+                session_id,
+                skill_name,
+                expected_active_version_id,
+            )
+            .await;
+        Self::map_activation_result(
+            result,
+            owner_user_id,
+            session_id,
+            skill_name,
+            expected_active_version_id,
+        )
+    }
+
+    fn map_activation_result(
+        result: Result<(), StateProjectionError>,
+        owner_user_id: &str,
+        session_id: &str,
+        skill_name: &str,
+        version_id: &str,
+    ) -> Result<(), PersonalSkillError> {
+        match result {
             Ok(()) => {}
             Err(StateProjectionError::SessionNotActive { .. }) => {
                 return Err(PersonalSkillError::SessionNotActive {
@@ -544,7 +592,7 @@ impl DatabasePersonalSkillStore {
                 });
             }
         }
-        Ok(version)
+        Ok(())
     }
 
     pub async fn load_active_for_session(
