@@ -63,6 +63,11 @@ source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
 and tree's root self totals share the same root `Turn`/`TurnError` accounting;
 neither round replays nor child terminals add to those buckets. Tree still
 rolls separately attributed child completions into its inclusive root total.
+Tree's `tool_calls` likewise sums known root terminal execution counts and
+attributed child completions. An explicit terminal zero is authoritative;
+round mirrors and child terminals do not add to the root's own count. Missing
+scalars contribute no known executions. Digest's outcome counts may also include
+rejected or reused requests, so they need not equal tree's execution count.
 Diff's `prompt` and `completion` are fresh input and output; its `total` is
 their sum, excluding prompt-cache buckets. Known terminal totals do not
 reconstruct missing usage or upgrade a historical last-round snapshot into

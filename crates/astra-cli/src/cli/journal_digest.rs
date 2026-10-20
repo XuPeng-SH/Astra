@@ -770,7 +770,7 @@ fn observed_runtime_round_usage(
     })
 }
 
-fn is_root_terminal(event: &session_journal::JournalEvent) -> bool {
+pub(super) fn is_root_terminal(event: &session_journal::JournalEvent) -> bool {
     matches!(
         event.event_type,
         JournalEventType::Turn | JournalEventType::TurnError
