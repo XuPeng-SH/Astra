@@ -3614,7 +3614,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         };
 
         assert_eq!(
@@ -3645,7 +3644,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         };
 
         assert_eq!(

@@ -2016,7 +2016,6 @@ mod tests {
                 compression_triggered: false,
             }),
             timing: None,
-            explanations: vec!["stable".to_string()],
         });
         session_workspace::write_workspace(&ws).unwrap();
 
@@ -2221,7 +2220,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         });
         let artifacts = LoadedSelfSurfaceArtifacts {
             session_id: session_id.to_string(),

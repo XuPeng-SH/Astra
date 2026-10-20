@@ -2318,7 +2318,7 @@ mod tests {
             .clone()
             .expect("first pending trace should be set");
         assert_eq!(first_pending.0, 1);
-        assert_eq!(first_pending.1["history"]["total_turns_available"], 0);
+        assert_eq!(first_pending.1["history"]["total_tokens"], 0);
         assert_eq!(
             first_pending.1["history"]["turns_retained"]
                 .as_array()

@@ -1450,7 +1450,7 @@ pub struct ToolExecutor {
         std::sync::Mutex<Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>>,
     /// Optional canonical observability session for introspection.
     /// Provides access to per-turn context assembly traces, timing data,
-    /// drift detection, and decision explanations.
+    /// and drift detection.
     pub observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,

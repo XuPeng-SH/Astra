@@ -2711,6 +2711,18 @@ mod tests {
             turns[1].content_preview,
             "user: second · assistant: calling tool · tool: tool output · assistant: final answer"
         );
+        let collector =
+            astra_turn_core::turn_trace_collector::TurnTraceCollector::new("input", "session");
+        collector.set_history_retained(&turns);
+        let history = collector.finalize().history.unwrap();
+        assert_eq!(
+            history.total_tokens,
+            turns.iter().map(|turn| turn.tokens).sum::<u32>()
+        );
+        assert_eq!(
+            history.turns_retained[1].content_preview,
+            turns[1].content_preview
+        );
     }
 
     #[test]

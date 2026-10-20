@@ -4181,7 +4181,7 @@ mod routing_tests {
         assert_eq!(breakdown.limit, 0, "do not fabricate a prompt budget");
         assert!(breakdown.categories.is_empty());
         assert!(breakdown.session_summary.is_some());
-        assert_eq!(breakdown.history.retained, 1);
+        assert_eq!(breakdown.history.turns.len(), 1);
         assert_eq!(breakdown.history.turns[0].preview, "first request");
         assert!(breakdown.has_observable_data());
     }

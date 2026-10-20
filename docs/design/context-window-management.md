@@ -136,8 +136,9 @@ each call/result pair and references the retained result by call ID; it never
 merges executions or upgrades their outcome. Ambiguous IDs, structured/array
 payloads and already-compacted output are not candidates. A reference must save
 both bytes and estimated tokens. Budget truncation does not infer tool semantics
-from names or output prose. The compression trace reports this as
-`DuplicateToolOutputElimination`; it is not a semantic read-equivalence claim.
+from names or output prose. The mechanical pipeline records this as `duplicate_tool_output_elimination`
+in its existing outcome and compaction event. Savings are estimates; this is
+not a semantic read-equivalence claim.
 
 A compaction should produce:
 
@@ -177,3 +178,17 @@ rounds. Runtime focus guidance contains a bounded rule, not copied current/prior
 requests or a second `active_goal` representation. This keeps constraints intact
 without multiplying large inputs after the budget pass; telemetry owns turn and
 round identity independently of the prompt's focus instruction.
+
+## Context snapshot evidence
+
+`ContextAssemblyTrace.history` describes observed CLI admission input before
+Server-side request assembly. `null` means unobserved; an object with an empty
+`turns_retained` list and `total_tokens: 0` means observed empty input. Group
+ordinals are local input ordinals, not canonical session-turn identities.
+`total_tokens` is an estimate of that observed slice.
+
+This snapshot supplies no pre/post compaction ratio, affected-turn list or
+pipeline-stage history. Runtime compaction events, step facts and audit remain
+their owners. A positive compression-trigger flag is evidence of a trigger,
+not a reconstruction of the rewrite. Session marker lists identify turns with
+recorded markers; they do not count all compactions or prove absence.
