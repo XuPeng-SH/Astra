@@ -98,6 +98,62 @@ fn local_setup_reuses_scopes_and_preserves_secrets_on_failures() {
         .status
         .success()
     );
+    // A permissive diagnostic must not claim success for a file chat rejects.
+    let malformed = serde_json::json!({
+        "command":env!("CARGO_BIN_EXE_mock_mcp_server"), "args":[7, secret]
+    })
+    .to_string();
+    assert!(
+        run(root, &["mcp", "add-json", "malformed", &malformed])
+            .status
+            .success()
+    );
+    for action in ["ping", "test", "get"] {
+        let rejected = run(root, &["mcp", action, "malformed"]);
+        assert!(!rejected.status.success(), "{action}: {}", text(&rejected));
+        assert!(
+            text(&rejected).contains("Failed to parse"),
+            "{}",
+            text(&rejected)
+        );
+        assert!(!text(&rejected).contains(secret), "{}", text(&rejected));
+    }
+    assert!(run(root, &["mcp", "remove", "malformed"]).status.success());
+
+    // A disabled project entry must not execute or fall back to the user entry.
+    let disabled = serde_json::json!({
+        "command":env!("CARGO_BIN_EXE_mock_mcp_server"), "disabled":true
+    })
+    .to_string();
+    assert!(
+        run(
+            root,
+            &["mcp", "add-json", "scoped-check", &server, "-s", "user"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run(root, &["mcp", "add-json", "scoped-check", &disabled])
+            .status
+            .success()
+    );
+    let effective = run(root, &["mcp", "get", "scoped-check"]);
+    assert!(effective.status.success() && text(&effective).contains("Scope: user"));
+    for action in ["ping", "test"] {
+        let rejected = run(root, &["mcp", action, "scoped-check", "-s", "project"]);
+        assert!(!rejected.status.success(), "{action}: {}", text(&rejected));
+        assert!(
+            text(&rejected).contains("No enabled MCP server"),
+            "{}",
+            text(&rejected)
+        );
+    }
+    assert!(
+        run(root, &["mcp", "ping", "scoped-check", "-s", "user"])
+            .status
+            .success()
+    );
     let user_path = root.join("user/mcp.json");
     let prior: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&user_path).unwrap()).unwrap();

@@ -188,7 +188,8 @@ user configuration instead. Both files use a top-level `mcpServers` object:
 without the `mcpServers` wrapper. It supports `stdio` (the default, using
 `command`, `args`, and optional `env`), `sse`, `streamable_http`, and `ws`
 (using `url`, optional `headers`, and optional `auth_token`). Use the exact
-`streamable_http` spelling in configuration; `http` is not a chat-loader alias.
+`streamable_http` spelling in configuration; `http`, `streamable-http`, and
+`websocket` are not accepted aliases.
 `add` writes a stdio entry. Both commands default to project scope and reject
 an existing name in that file; remove the existing entry or edit the file to
 replace it. Adding configuration does not install an executable or test access.
@@ -214,8 +215,11 @@ connection or tool availability. In an active chat, `/mcp` shows connected
 servers and tools. The standalone `astra mcp test NAME -s project|user` and
 `astra mcp ping NAME -s project|user` explicitly connect to the selected server;
 for stdio this launches its configured command. Each diagnostic performs one
-top-level connection attempt using the existing transport deadlines; chat
-connection recovery retains its own retry policy.
+top-level connection attempt using the existing transport deadlines. Both
+commands use the chat loader for the selected file and reject disabled or
+invalid definitions; they do not fall back to other scopes or skill manifests.
+A malformed typed field can invalidate the whole file, just as at chat startup.
+Chat connection recovery retains its own retry policy.
 
 The CLI agent receives stable guidance to discover these existing commands and
 use only its selected local executor. Configuration JSON and raw connection

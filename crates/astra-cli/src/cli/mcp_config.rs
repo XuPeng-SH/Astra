@@ -445,120 +445,34 @@ fn render_mcp_get(
     Ok(output)
 }
 
-fn find_server_entry<'a>(
-    config: &'a serde_json::Value,
+/// Diagnose exactly the enabled configuration chat would load from this file.
+fn diagnostic_mcp_config(
     name: &str,
-) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
-    config
-        .get("mcpServers")
-        .and_then(|v| v.as_object())
-        .and_then(|m| m.get(name))
-        .and_then(|v| v.as_object())
-}
-
-fn json_entry_to_mcp_config(
-    name: &str,
-    entry: &serde_json::Map<String, serde_json::Value>,
+    path: &std::path::Path,
 ) -> Result<astra_mcp::McpServerConfig, String> {
-    let server_type = entry
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("stdio");
-
-    let transport = match server_type {
-        "sse" => {
-            let url = entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("SSE server '{name}' missing `url`"))?;
-            astra_mcp::Transport::Sse {
-                url: url.to_string(),
-                auth_token: entry
-                    .get("auth_token")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                headers: string_map_from_json_object(entry.get("headers")),
-            }
-        }
-        "http" | "streamable_http" | "streamable-http" => {
-            let url = entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("HTTP MCP server '{name}' missing `url`"))?;
-            astra_mcp::Transport::StreamableHttp {
-                url: url.to_string(),
-                auth_token: entry
-                    .get("auth_token")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                headers: string_map_from_json_object(entry.get("headers")),
-            }
-        }
-        "ws" | "websocket" => {
-            let url = entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("WS server '{name}' missing `url`"))?;
-            astra_mcp::Transport::Ws {
-                url: url.to_string(),
-                auth_token: entry
-                    .get("auth_token")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                headers: string_map_from_json_object(entry.get("headers")),
-            }
-        }
-        "stdio" | "" => {
-            let command = entry
-                .get("command")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("Stdio server '{name}' missing `command`"))?;
-            let mut command_vec = vec![command.to_string()];
-            if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
-                command_vec.extend(args.iter().filter_map(|v| v.as_str()).map(String::from));
-            }
-            astra_mcp::Transport::Stdio {
-                command: command_vec,
-                args: Vec::new(),
-                env: string_map_from_json_object(entry.get("env")),
-            }
-        }
-        _ => return Err(format!("Unsupported MCP server type for '{name}'")),
-    };
-
-    Ok(astra_mcp::McpServerConfig {
-        name: name.to_string(),
-        transport,
-        description: String::new(),
-        enabled: true,
+    let discovery =
+        crate::manifest_loader::discover_mcp_server_configs_from_paths(Some(path), &[], None);
+    if let Some(server) = discovery
+        .servers
+        .into_iter()
+        .find(|server| server.config.name == name)
+    {
+        let mut config = server.config;
         // A user-requested diagnostic performs one top-level connection attempt.
-        retry: astra_mcp::RetryConfig {
-            max_retries: 0,
-            ..Default::default()
-        },
-    })
-}
-
-fn string_map_from_json_object(
-    value: Option<&serde_json::Value>,
-) -> std::collections::HashMap<String, String> {
-    value
-        .and_then(|v| v.as_object())
-        .map(|object| {
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+        config.retry.max_retries = 0;
+        return Ok(config);
+    }
+    let mut errors = discovery.diagnostics;
+    errors.push(format!(
+        "No enabled MCP server found with name '{name}' in {}",
+        path.display()
+    ));
+    Err(errors.join("\n"))
 }
 
 async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
     let path = mcp_json_path_for_scope(scope)?;
-    let config = read_mcp_config(&path)?;
-    let entry = find_server_entry(&config, name)
-        .ok_or_else(|| format!("Server '{name}' not found in {}", path.display()))?;
-    let mcp_config = json_entry_to_mcp_config(name, entry)?;
+    let mcp_config = diagnostic_mcp_config(name, &path)?;
 
     eprintln!("  {} Connecting to {}...", theme::icon_ok(), name.magenta());
 
@@ -615,10 +529,7 @@ async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
 
 async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
     let path = mcp_json_path_for_scope(scope)?;
-    let config = read_mcp_config(&path)?;
-    let entry = find_server_entry(&config, name)
-        .ok_or_else(|| format!("Server '{name}' not found in {}", path.display()))?;
-    let mcp_config = json_entry_to_mcp_config(name, entry)?;
+    let mcp_config = diagnostic_mcp_config(name, &path)?;
 
     let mut manager = astra_mcp::McpClientManager::new();
     manager
@@ -652,11 +563,7 @@ mod mcp_cli_tests {
     };
 
     #[test]
-    fn diagnostic_checks_use_one_attempt_and_hide_transport_values() {
-        let entry = serde_json::json!({"command": "fixture-mcp"});
-        let config =
-            super::json_entry_to_mcp_config("fixture", entry.as_object().unwrap()).unwrap();
-        assert_eq!(config.retry.max_retries, 0);
+    fn diagnostic_errors_hide_transport_values() {
         let sentinel = "https://example.invalid/mcp?credential=private-fixture";
         for error in [
             astra_mcp::McpError::InvalidConfig(sentinel.into()),
@@ -1001,48 +908,81 @@ mod mcp_cli_tests {
     }
 
     #[test]
-    fn mcp_list_empty_config() {
-        let dir = tempfile::TempDir::new().unwrap();
+    fn diagnostics_preserve_canonical_fields_and_use_one_attempt() {
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        make_config(&path, serde_json::json!({}));
-
-        let config = read_mcp_config(&path).unwrap();
-        let servers = config["mcpServers"].as_object().unwrap();
-        assert!(servers.is_empty());
-    }
-
-    #[test]
-    fn mcp_list_multiple_server_types() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
+        let secret = "synthetic-private-value";
         make_config(
             &path,
             serde_json::json!({
-                "stdio-srv": {"command": "npx", "args": ["@mcp/server"]},
-                "sse-srv": {"type": "sse", "url": "http://localhost:3000"},
-                "http-srv": {"type": "streamable_http", "url": "http://localhost:4000"}
+                "stdio": {"command":"fixture-command", "args":["--token", secret], "env":{"TOKEN":secret}},
+                "sse": {"type":"sse", "url":secret, "headers":{"Authorization":secret}, "auth_token":secret},
+                "streamable_http": {"type":"streamable_http", "url":secret, "headers":{"Authorization":secret}, "auth_token":secret},
+                "ws": {"type":"ws", "url":secret, "headers":{"Authorization":secret}, "auth_token":secret}
             }),
         );
-
-        let config = read_mcp_config(&path).unwrap();
-        let servers = config["mcpServers"].as_object().unwrap();
-        assert_eq!(servers.len(), 3);
-
-        // stdio type inference
-        let stdio = &servers["stdio-srv"];
-        assert_eq!(
-            stdio
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stdio"),
-            "stdio"
+        for name in ["stdio", "sse", "streamable_http", "ws"] {
+            let config = super::diagnostic_mcp_config(name, &path).unwrap();
+            assert_eq!(config.name, name);
+            assert!(config.enabled);
+            assert_eq!(config.retry.max_retries, 0);
+            let defaults = astra_mcp::RetryConfig::default();
+            assert_eq!(config.retry.initial_delay_ms, defaults.initial_delay_ms);
+            assert_eq!(config.retry.max_delay_ms, defaults.max_delay_ms);
+            let transport = serde_json::to_value(config.transport).unwrap();
+            let expected = if name == "stdio" {
+                serde_json::json!({"type":"stdio", "command":["fixture-command", "--token", secret], "args":[], "env":{"TOKEN":secret}})
+            } else {
+                serde_json::json!({"type":name, "url":secret, "headers":{"Authorization":secret}, "auth_token":secret})
+            };
+            assert_eq!(transport, expected);
+        }
+        let discovery =
+            crate::manifest_loader::discover_mcp_server_configs_from_paths(Some(&path), &[], None);
+        assert!(
+            discovery
+                .servers
+                .iter()
+                .all(|server| server.config.retry.max_retries
+                    == astra_mcp::RetryConfig::default().max_retries)
         );
+    }
 
-        // sse type
-        assert_eq!(servers["sse-srv"]["type"], "sse");
-
-        // http type
-        assert_eq!(servers["http-srv"]["type"], "streamable_http");
+    #[test]
+    fn diagnostics_reject_configuration_chat_cannot_enable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let secret = "synthetic-private-value";
+        assert!(super::diagnostic_mcp_config("fixture", &path).is_err());
+        for entry in [
+            serde_json::json!({"command":secret, "args":[7, secret]}),
+            serde_json::json!({"command":secret, "env":{"TOKEN":7}}),
+            serde_json::json!({"type":"streamable_http", "url":secret, "headers":{"Authorization":7}}),
+            serde_json::json!({"command":secret, "disabled":true}),
+            serde_json::json!({"type":"http", "url":secret}),
+            serde_json::json!({"type":"streamable-http", "url":secret}),
+            serde_json::json!({"type":"websocket", "url":secret}),
+            serde_json::json!({"type":secret}),
+            serde_json::json!({"type":7, "command":secret}),
+            serde_json::json!({"type":"sse", "auth_token":secret}),
+            serde_json::json!({}),
+        ] {
+            make_config(&path, serde_json::json!({"fixture":entry}));
+            let error = super::diagnostic_mcp_config("fixture", &path).unwrap_err();
+            assert!(error.contains("No enabled MCP server"), "{error}");
+            assert!(!error.contains(secret), "{error}");
+        }
+        // A malformed sibling invalidates the same file for chat and diagnostics.
+        make_config(
+            &path,
+            serde_json::json!({
+                "fixture":{"command":"fixture-command"},
+                "broken":{"command":secret,"args":[7]}
+            }),
+        );
+        let error = super::diagnostic_mcp_config("fixture", &path).unwrap_err();
+        assert!(error.contains("Failed to parse"), "{error}");
+        assert!(!error.contains(secret), "{error}");
     }
 
     #[test]
