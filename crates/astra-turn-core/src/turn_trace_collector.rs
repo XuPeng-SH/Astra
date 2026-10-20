@@ -360,26 +360,32 @@ mod tests {
         use crate::context_assembly_trace::TurnRetention;
         let first = super::TurnTraceCollector::new("turn-1", "session-a");
         let second = super::TurnTraceCollector::new("turn-1", "session-b");
+        assert!(first.finalize().history.is_none());
+        let turns = [
+            TurnRetention {
+                turn_index: 0,
+                role: "user".into(),
+                tokens: u32::MAX,
+                has_tool_calls: false,
+                content_preview: "session-a".into(),
+            },
+            TurnRetention {
+                turn_index: 1,
+                role: "assistant".into(),
+                tokens: 1,
+                has_tool_calls: false,
+                content_preview: "answer-a".into(),
+            },
+        ];
+        first.set_history_retained(&turns);
+        let history = first.finalize().history.unwrap();
+        assert_eq!(history.turns_retained.len(), 2);
+        assert_eq!(history.total_tokens, u32::MAX);
         let writer = first.clone_arc();
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 for _ in 0..32 {
-                    writer.set_history_retained(&[
-                        TurnRetention {
-                            turn_index: 0,
-                            role: "user".into(),
-                            tokens: u32::MAX,
-                            has_tool_calls: false,
-                            content_preview: "session-a".into(),
-                        },
-                        TurnRetention {
-                            turn_index: 1,
-                            role: "assistant".into(),
-                            tokens: 1,
-                            has_tool_calls: false,
-                            content_preview: "answer-a".into(),
-                        },
-                    ]);
+                    writer.set_history_retained(&turns);
                     writer.set_history_retained(&[]);
                 }
             });

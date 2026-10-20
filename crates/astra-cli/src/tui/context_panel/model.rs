@@ -434,8 +434,6 @@ pub(crate) struct TurnDetail {
     pub role: String,
     pub tokens: u32,
     pub has_tool_calls: bool,
-    /// `None` when this turn was retained; `Some(method)` when
-    /// compressed with that method.
     /// Short content preview taken from the turn body (first
     /// non-blank line). Empty when the caller didn't attach
     /// transcript text.
