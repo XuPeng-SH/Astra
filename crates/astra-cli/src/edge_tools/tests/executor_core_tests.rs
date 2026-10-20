@@ -1037,7 +1037,6 @@ async fn execute_reflect_uses_local_surface_with_session() {
             },
         ),
         timing: None,
-        explanations: vec![],
     });
     session_workspace::write_workspace(&ws).unwrap();
 

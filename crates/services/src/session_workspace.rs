@@ -67,20 +67,9 @@ pub struct ContextTraceMemorySignal {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextTraceHistorySignal {
-    #[serde(default)]
-    pub total_turns_available: u32,
-    #[serde(default)]
-    pub retained_turns: usize,
-    #[serde(default)]
-    pub compressed_turns: usize,
-    #[serde(default)]
-    pub dropped_turns: usize,
-    #[serde(default)]
-    pub compression_ratio: f64,
-    #[serde(default)]
-    pub tokens_before: u32,
-    #[serde(default)]
-    pub tokens_after: u32,
+    /// Observed CLI admission input groups, not canonical session turns.
+    pub retained_groups: usize,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,8 +117,6 @@ pub struct ContextTraceSignal {
     pub budget: Option<ContextTraceBudgetSignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<ContextTraceTimingSignal>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub explanations: Vec<String>,
 }
 
 impl ContextTraceSignal {
@@ -174,18 +161,11 @@ impl ContextTraceSignal {
                 ));
             }
         }
-        if let Some(history) = self.history.as_ref()
-            && history.compressed_turns > 0
-        {
-            if history.compression_ratio > 0.0 {
-                parts.push(format!(
-                    "history: {} compressed (ratio {ratio:.2})",
-                    history.compressed_turns,
-                    ratio = history.compression_ratio
-                ));
-            } else {
-                parts.push(format!("history: {} compressed", history.compressed_turns));
-            }
+        if let Some(history) = self.history.as_ref() {
+            parts.push(format!(
+                "admission history: {} groups (~{} tokens)",
+                history.retained_groups, history.total_tokens
+            ));
         }
         if let Some(budget) = self.budget.as_ref()
             && (budget.max_tokens > 0 || budget.total_used > 0)
@@ -198,14 +178,7 @@ impl ContextTraceSignal {
         {
             parts.push(format!("time: {}ms", timing.total_ms));
         }
-        if let Some(explanation) = self.explanations.first() {
-            let preview: String = explanation.chars().take(96).collect();
-            if explanation.chars().count() > 96 {
-                parts.push(format!("note: {preview}..."));
-            } else {
-                parts.push(format!("note: {preview}"));
-            }
-        }
+
         parts.join(" | ")
     }
 }
@@ -1668,13 +1641,8 @@ mod tests {
                 latency_ms: 9,
             }),
             history: Some(ContextTraceHistorySignal {
-                total_turns_available: 10,
-                retained_turns: 5,
-                compressed_turns: 3,
-                dropped_turns: 2,
-                compression_ratio: 0.58,
-                tokens_before: 900,
-                tokens_after: 522,
+                retained_groups: 5,
+                total_tokens: 522,
             }),
             budget: Some(ContextTraceBudgetSignal {
                 max_tokens: 20_000,
@@ -1690,7 +1658,6 @@ mod tests {
                 tool_execution_ms: 330,
                 total_ms: 1600,
             }),
-            explanations: vec!["Kept LSP because symbol-aware navigation was required.".into()],
         });
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
@@ -1728,7 +1695,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         });
 
         write_workspace(&ws).unwrap();
@@ -1826,7 +1792,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         };
 
         assert!(trace.preview().contains("tools[latest_round]: lsp"));

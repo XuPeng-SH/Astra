@@ -4923,7 +4923,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["trace-a".into()],
     };
     let trace_b = ContextTraceSignal {
         turn_id: "turn-b".into(),
@@ -4938,7 +4937,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["trace-b".into()],
     };
 
     event_service
@@ -5208,7 +5206,6 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
             history: None,
             budget: None,
             timing: None,
-            explanations: vec![format!("trace-{idx}")],
         };
         event_service
             .create_event(
@@ -5288,7 +5285,6 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["restored from old remote workspace artifact".into()],
     });
 
     let mut newer_workspace = WorkspaceMetadata::with_context(
@@ -5313,7 +5309,6 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["restored from newest remote workspace artifact".into()],
     });
 
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
@@ -5700,7 +5695,6 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
         history: None,
         budget: None,
         timing: None,
-        explanations: vec!["missing row".into()],
     };
 
     let rejected = event_service

@@ -2389,7 +2389,6 @@ mod tests {
                 },
             ),
             timing: None,
-            explanations: vec!["budget stable".to_string()],
         });
         session_workspace::write_workspace(&ws).unwrap();
 
@@ -2590,7 +2589,6 @@ mod tests {
                 },
             ),
             timing: None,
-            explanations: vec!["pressure rising".to_string()],
         });
         session_workspace::write_workspace(&ws).unwrap();
 

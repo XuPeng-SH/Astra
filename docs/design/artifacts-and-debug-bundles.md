@@ -95,7 +95,7 @@ Requirements:
 - redaction boundary;
 - exclusion from default learning pipeline.
 
-CLI context dumps use `astra.context_dump/v2`. They retain the recorded prompt
+CLI context dumps use `astra.context_dump/v3`. They retain the recorded prompt
 trace, conversation, usage and compaction facts; the empty local built-in skill
 selection field is retired. Actual skill injection remains in the trace.
 
@@ -167,3 +167,13 @@ Each class has independent redaction and retention policy.
 - Expired bundle is inaccessible except allowed audit metadata.
 - Export does not include classes that were not enabled.
 - Deletion propagates to artifact references and learning exclusions.
+
+The v3 context dump uses the same typed `ContextAssemblyTrace` payload in live
+and journal `trace` fields. An absent capture produces `trace: null`; the latest malformed
+or unsupported journal trace fails the dump explicitly. It does not fall back
+to an older trace or convert retired compression-detail shapes. Visible chat
+history is separate display evidence, not an exact provider-request replay.
+
+The v3 trace also retires the generic explanation array: it had no production
+producer. Canonical memory/tool exclusions, provider decisions and durable
+execution evidence remain available through their existing owners.

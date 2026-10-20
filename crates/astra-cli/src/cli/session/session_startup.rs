@@ -1344,7 +1344,6 @@ mod tests {
                 },
             ),
             timing: None,
-            explanations: Vec::new(),
         });
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
@@ -1409,7 +1408,6 @@ mod tests {
                     history: None,
                     budget: None,
                     timing: None,
-                    explanations: Vec::new(),
                 });
             astra_services::session_workspace::write_workspace(&workspace).unwrap();
             let mut state = SessionState::default();
