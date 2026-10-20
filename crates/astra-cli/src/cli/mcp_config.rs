@@ -7,6 +7,65 @@ use crate::cli::cli_config::cli_args::McpCmd;
 use crossterm::style::Stylize;
 use std::io::Write;
 
+/// Stable CLI capability guidance; syntax and validation stay with `astra mcp --help`.
+pub(crate) const MCP_SETUP_GUIDANCE: &str = "Astra supports project/user mcp.json configuration. For MCP setup, use `astra mcp --help` and `astra mcp list --effective` through the explicitly selected local executor; preserve its permissions. `add-json` accepts one server entry extracted from mcpServers; choose project or user scope. Do not print or repeat credentials; use protected local files for secret-bearing configuration rather than inline shell arguments. Configuration does not install software or prove connectivity and takes effect at the next chat startup. `test`/`ping` launch configured processes or contact networks: run only when authorized, in the intended scope; a scoped check does not prove the effective winner. If local execution is unavailable, give these instructions without accessing the Server filesystem.";
+
+/// Transport errors can contain credential-bearing URLs or provider payloads.
+/// Keep command output actionable without copying those values to the terminal.
+fn connection_failure(name: &str, error: &astra_mcp::McpError) -> String {
+    let cause = match error {
+        astra_mcp::McpError::InvalidConfig(_) => "invalid transport configuration",
+        astra_mcp::McpError::Spawn(_) => "could not start the configured process",
+        astra_mcp::McpError::Initialize(_) => "MCP initialization failed",
+        _ => "MCP service failed",
+    };
+    format!(
+        "MCP check failed for '{name}': {cause}. Check the selected configuration, executable, authentication and connectivity; connection details omitted."
+    )
+}
+
+/// Serialize cooperating writers across atomic replacement of the config file.
+/// The sibling lock is stable and must never be removed while writers may exist.
+fn lock_mcp_config(path: &std::path::Path) -> Result<std::fs::File, String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Cannot create MCP config directory: {e}"))?;
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    let lock_path = std::path::PathBuf::from(name);
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err("MCP config lock must be a regular file, not a symlink".into());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Cannot inspect MCP config lock: {e}")),
+        Ok(_) => {}
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|e| format!("Cannot open MCP config lock: {e}"))?;
+    if !file
+        .metadata()
+        .map_err(|e| format!("Cannot inspect MCP config lock: {e}"))?
+        .is_file()
+    {
+        return Err("MCP config lock must be a regular file".into());
+    }
+    file.lock()
+        .map_err(|e| format!("Cannot acquire MCP config lock: {e}"))?;
+    Ok(file)
+}
+
 fn validate_mcp_config_shape(
     config: serde_json::Value,
     source: &str,
@@ -27,7 +86,15 @@ fn validate_mcp_config_shape(
 pub(crate) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
     let project_path = crate::manifest_loader::project_mcp_json_path()
         .ok_or_else(|| "Cannot determine project directory for MCP config".to_string())?;
-    let mut config = read_mcp_config(&project_path)?;
+    load_mcp_configs_at_path(sources, &project_path)
+}
+
+fn load_mcp_configs_at_path(
+    sources: &[String],
+    project_path: &std::path::Path,
+) -> Result<(), String> {
+    let _guard = lock_mcp_config(project_path)?;
+    let mut config = read_mcp_config(project_path)?;
 
     for (index, source) in sources.iter().enumerate() {
         let json_str = if std::path::Path::new(source).is_file() {
@@ -56,7 +123,7 @@ pub(crate) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
         }
     }
 
-    write_mcp_config(&project_path, &config)?;
+    write_mcp_config(project_path, &config)?;
     Ok(())
 }
 
@@ -224,7 +291,8 @@ fn mcp_add_at_path(
     args: &[String],
     path: &std::path::Path,
 ) -> Result<(), String> {
-    let mut config = read_mcp_config(&path)?;
+    let config_lock = lock_mcp_config(path)?;
+    let mut config = read_mcp_config(path)?;
 
     // Check for duplicate
     if let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) {
@@ -248,7 +316,8 @@ fn mcp_add_at_path(
         .ok_or("mcpServers value must be a JSON object")?
         .insert(name.to_string(), entry);
 
-    write_mcp_config(&path, &config)?;
+    write_mcp_config(path, &config)?;
+    drop(config_lock);
     stdout_println!(
         "  {} Added '{}' to {}",
         theme::icon_ok(),
@@ -259,14 +328,19 @@ fn mcp_add_at_path(
 }
 
 fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
+    let path = mcp_json_path_for_scope(scope)?;
+    mcp_add_json_at_path(name, json, &path)
+}
+
+fn mcp_add_json_at_path(name: &str, json: &str, path: &std::path::Path) -> Result<(), String> {
     let entry: serde_json::Value =
         serde_json::from_str(json).map_err(|e| json_parse_error("MCP server JSON", &e))?;
     if !entry.is_object() {
         return Err("JSON config must be an object".to_string());
     }
 
-    let path = mcp_json_path_for_scope(scope)?;
-    let mut config = read_mcp_config(&path)?;
+    let config_lock = lock_mcp_config(path)?;
+    let mut config = read_mcp_config(path)?;
 
     if let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) {
         if servers.contains_key(name) {
@@ -285,7 +359,8 @@ fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
         .ok_or("mcpServers value must be a JSON object")?
         .insert(name.to_string(), entry);
 
-    write_mcp_config(&path, &config)?;
+    write_mcp_config(path, &config)?;
+    drop(config_lock);
     stdout_println!(
         "  {} Added '{}' to {}",
         theme::icon_ok(),
@@ -297,10 +372,15 @@ fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
 
 fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
     let path = mcp_json_path_for_scope(scope)?;
+    mcp_remove_at_path(name, &path)
+}
+
+fn mcp_remove_at_path(name: &str, path: &std::path::Path) -> Result<(), String> {
+    let config_lock = lock_mcp_config(path)?;
     if !path.is_file() {
         return Err(format!("No config file at {}", path.display()));
     }
-    let mut config = read_mcp_config(&path)?;
+    let mut config = read_mcp_config(path)?;
 
     let removed = config
         .get_mut("mcpServers")
@@ -312,7 +392,8 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
         return Err(format!("Server '{name}' not found in {}", path.display()));
     }
 
-    write_mcp_config(&path, &config)?;
+    write_mcp_config(path, &config)?;
+    drop(config_lock);
     stdout_println!(
         "  {} Removed '{}' from {}",
         theme::icon_ok(),
@@ -450,7 +531,11 @@ fn json_entry_to_mcp_config(
         transport,
         description: String::new(),
         enabled: true,
-        retry: Default::default(),
+        // A user-requested diagnostic performs one top-level connection attempt.
+        retry: astra_mcp::RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
     })
 }
 
@@ -481,7 +566,7 @@ async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
     let tool_count = manager
         .connect(mcp_config)
         .await
-        .map_err(|e| format!("Failed to connect to '{name}': {e}"))?;
+        .map_err(|e| connection_failure(name, &e))?;
 
     let conn = manager
         .get(name)
@@ -539,7 +624,7 @@ async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
     manager
         .connect(mcp_config)
         .await
-        .map_err(|e| format!("Failed to connect to '{name}': {e}"))?;
+        .map_err(|e| connection_failure(name, &e))?;
 
     match manager.ping(name).await {
         Ok(latency) => {
@@ -554,7 +639,7 @@ async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
         }
         Err(error) => {
             manager.disconnect(name);
-            Err(format!("Ping failed for '{name}': {error}"))
+            Err(connection_failure(name, &error))
         }
     }
 }
@@ -565,6 +650,87 @@ mod mcp_cli_tests {
         mcp_add_at_path, mcp_json_path_for_scope, read_mcp_config, render_mcp_get, render_mcp_list,
         write_mcp_config,
     };
+
+    #[test]
+    fn diagnostic_checks_use_one_attempt_and_hide_transport_values() {
+        let entry = serde_json::json!({"command": "fixture-mcp"});
+        let config =
+            super::json_entry_to_mcp_config("fixture", entry.as_object().unwrap()).unwrap();
+        assert_eq!(config.retry.max_retries, 0);
+        let sentinel = "https://example.invalid/mcp?credential=private-fixture";
+        for error in [
+            astra_mcp::McpError::InvalidConfig(sentinel.into()),
+            astra_mcp::McpError::Spawn(sentinel.into()),
+            astra_mcp::McpError::Initialize(sentinel.into()),
+            astra_mcp::McpError::ConnectionLost("fixture".into(), sentinel.into()),
+        ] {
+            let displayed = super::connection_failure("fixture", &error);
+            assert!(
+                displayed.contains("fixture")
+                    && displayed.contains("Check the selected configuration")
+            );
+            assert!(!displayed.contains(sentinel) && !displayed.contains("private-fixture"));
+        }
+    }
+
+    #[test]
+    fn concurrent_additions_preserve_every_committed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    mcp_add_at_path(&format!("fixture-{index}"), "fixture-command", &[], path)
+                        .unwrap();
+                });
+            }
+        });
+        let config = read_mcp_config(&path).unwrap();
+        assert_eq!(config["mcpServers"].as_object().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn config_locks_are_per_destination_and_release_after_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.json");
+        let second = dir.path().join("second.json");
+        let held = super::lock_mcp_config(&first).unwrap();
+        mcp_add_at_path("second", "fixture-command", &[], &second).unwrap();
+        drop(held);
+        std::fs::write(&first, "invalid json").unwrap();
+        assert!(mcp_add_at_path("bad", "fixture-command", &[], &first).is_err());
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "invalid json");
+        make_config(&first, serde_json::json!({}));
+        mcp_add_at_path("first", "fixture-command", &[], &first).unwrap();
+        let before = std::fs::read(&first).unwrap();
+        assert!(mcp_add_at_path("first", "duplicate", &[], &first).is_err());
+        assert_eq!(std::fs::read(&first).unwrap(), before);
+        mcp_add_at_path("next", "fixture-command", &[], &first).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_lock_entries_do_not_mutate_config_or_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let lock = dir.path().join("mcp.json.lock");
+        make_config(&path, serde_json::json!({}));
+        let before = std::fs::read(&path).unwrap();
+        let target = dir.path().join("sentinel");
+        std::fs::write(&target, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, &lock).unwrap();
+        assert!(mcp_add_at_path("fixture", "fixture-command", &[], &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "unchanged");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(mcp_add_at_path("fixture", "fixture-command", &[], &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     fn make_config(path: &std::path::Path, servers: serde_json::Value) {
         if let Some(parent) = path.parent() {
@@ -631,72 +797,47 @@ mod mcp_cli_tests {
 
     #[test]
     fn mcp_add_and_remove_roundtrip() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-
-        // Start empty
-        make_config(&path, serde_json::json!({}));
-
-        // Add a server
-        let mut config = read_mcp_config(&path).unwrap();
-        let entry = serde_json::json!({"command": "npx", "args": ["@mcp/server"]});
-        config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .insert("test-server".to_string(), entry);
-        write_mcp_config(&path, &config).unwrap();
-
-        // Verify it's there
-        let config = read_mcp_config(&path).unwrap();
-        assert!(config["mcpServers"]["test-server"]["command"] == "npx");
-
-        // Remove it
-        let mut config = read_mcp_config(&path).unwrap();
-        let removed = config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .remove("test-server")
-            .is_some();
-        assert!(removed);
-        write_mcp_config(&path, &config).unwrap();
-
-        // Verify it's gone
-        let config = read_mcp_config(&path).unwrap();
+        super::mcp_add_at_path("fixture", "fixture-command", &["argument".into()], &path).unwrap();
+        assert_eq!(
+            read_mcp_config(&path).unwrap()["mcpServers"]["fixture"]["command"],
+            "fixture-command"
+        );
+        super::mcp_remove_at_path("fixture", &path).unwrap();
         assert!(
-            !config["mcpServers"]
+            read_mcp_config(&path).unwrap()["mcpServers"]
                 .as_object()
                 .unwrap()
-                .contains_key("test-server")
+                .is_empty()
         );
     }
 
     #[test]
     fn mcp_add_json_valid() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        make_config(&path, serde_json::json!({}));
-
-        let entry: serde_json::Value =
-            serde_json::from_str(r#"{"url":"http://localhost:3000","type":"sse"}"#).unwrap();
-        let mut config = read_mcp_config(&path).unwrap();
-        config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .insert("sse-server".to_string(), entry);
-        write_mcp_config(&path, &config).unwrap();
-
-        let config = read_mcp_config(&path).unwrap();
-        assert_eq!(config["mcpServers"]["sse-server"]["type"], "sse");
+        super::mcp_add_json_at_path(
+            "sse-server",
+            r#"{"type":"sse","url":"https://example.invalid/mcp"}"#,
+            &path,
+        )
+        .unwrap();
         assert_eq!(
-            config["mcpServers"]["sse-server"]["url"],
-            "http://localhost:3000"
+            read_mcp_config(&path).unwrap()["mcpServers"]["sse-server"]["type"],
+            "sse"
         );
     }
 
     #[test]
     fn mcp_add_json_invalid_json() {
-        let err: Result<serde_json::Value, _> = serde_json::from_str("not json");
-        assert!(err.is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        make_config(&path, serde_json::json!({}));
+        let before = std::fs::read(&path).unwrap();
+        assert!(super::mcp_add_json_at_path("fixture", "not json", &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        super::mcp_add_json_at_path("fixture", r#"{"command":"fixture"}"#, &path).unwrap();
     }
 
     #[test]
@@ -713,17 +854,13 @@ mod mcp_cli_tests {
 
     #[test]
     fn mcp_remove_nonexistent_server() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
         make_config(&path, serde_json::json!({}));
-
-        let mut config = read_mcp_config(&path).unwrap();
-        let removed = config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .remove("ghost")
-            .is_some();
-        assert!(!removed);
+        let before = std::fs::read(&path).unwrap();
+        assert!(super::mcp_remove_at_path("missing", &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        mcp_add_at_path("fixture", "fixture-command", &[], &path).unwrap();
     }
 
     #[test]
@@ -927,29 +1064,43 @@ mod mcp_cli_tests {
 
     #[test]
     fn load_mcp_configs_from_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_file = dir.path().join("custom-mcp.json");
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.json");
+        let path = dir.path().join("mcp.json");
         std::fs::write(
-            &config_file,
-            r#"{"mcpServers":{"test-server":{"command":"echo","args":["hello"]}}}"#,
+            &source,
+            r#"{"mcpServers":{"fixture":{"command":"fixture-command"}}}"#,
         )
         .unwrap();
-
-        let json_str = std::fs::read_to_string(&config_file).unwrap();
-        let parsed = super::parse_mcp_config_source(&json_str, "test file").unwrap();
-        let servers = parsed
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .unwrap();
-        assert!(servers.contains_key("test-server"));
-        assert_eq!(servers["test-server"]["command"], "echo");
-        assert_eq!(servers["test-server"]["args"][0], "hello");
+        super::load_mcp_configs_at_path(&[source.to_string_lossy().into_owned()], &path).unwrap();
+        assert_eq!(
+            read_mcp_config(&path).unwrap()["mcpServers"]["fixture"]["command"],
+            "fixture-command"
+        );
     }
 
     #[test]
     fn load_mcp_configs_rejects_missing_mcp_servers_key() {
-        let json_str = r#"{"servers":{"foo":{}}}"#;
-        let error = super::parse_mcp_config_source(json_str, "test source").unwrap_err();
-        assert!(error.contains("must contain a \"mcpServers\" object"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        make_config(&path, serde_json::json!({"keep":{"command":"keep"}}));
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            super::load_mcp_configs_at_path(&[r#"{"servers":{"fixture":{}}}"#.into()], &path)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        super::load_mcp_configs_at_path(
+            &[r#"{"mcpServers":{"fixture":{"command":"fixture-command"}}}"#.into()],
+            &path,
+        )
+        .unwrap();
+        assert_eq!(
+            read_mcp_config(&path).unwrap()["mcpServers"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
