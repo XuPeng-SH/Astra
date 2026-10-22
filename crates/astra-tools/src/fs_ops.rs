@@ -228,22 +228,8 @@ fn validate_str_replace_anchor(edit_label: &str, old_str: &str) -> Result<(), St
     Ok(())
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    path.components()
-        .fold(PathBuf::new(), |mut acc, component| {
-            match component {
-                std::path::Component::ParentDir => {
-                    acc.pop();
-                }
-                std::path::Component::CurDir => {}
-                other => acc.push(other),
-            }
-            acc
-        })
-}
-
 fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
-    let mut variants = vec![normalize_path(path)];
+    let mut variants = vec![astra_sandbox::normalize_path(path)];
     if let Ok(canonical) = path.canonicalize()
         && !variants.iter().any(|existing| existing == &canonical)
     {
@@ -256,17 +242,6 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
         variants.push(canonical_parent);
     }
     variants
-}
-
-fn is_within_workspace_root(path: &Path, workspace_root: &Path) -> bool {
-    let path_variants = unique_path_variants(path);
-    let root_variants = unique_path_variants(workspace_root);
-
-    path_variants.iter().any(|candidate| {
-        root_variants
-            .iter()
-            .any(|root| candidate == root || candidate.starts_with(root))
-    })
 }
 
 pub(crate) fn relative_to_workspace_root(workspace_root: &Path, path: &Path) -> Option<PathBuf> {
@@ -314,62 +289,18 @@ pub fn resolve_path_sandboxed(
     relative: &str,
     allowed_paths: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let input_is_absolute = Path::new(relative).is_absolute();
-    let path = if input_is_absolute {
-        PathBuf::from(relative)
-    } else {
-        workspace_root.join(relative)
-    };
-
-    let normalized = normalize_path(&path);
-
-    let final_path = if normalized.exists() {
-        normalized
-            .canonicalize()
-            .map_err(|e| format!("Cannot resolve path: {e}"))?
-    } else {
-        // Canonicalize parent directory to resolve symlinks in the path
-        // prefix even when the leaf doesn't exist yet. Without this, a
-        // symlink in the workspace pointing outside (e.g. → /etc) would
-        // bypass the sandbox check for not-yet-created files.
-        match normalized.parent() {
-            Some(parent) if parent.exists() => {
-                let canonical_parent = parent
-                    .canonicalize()
-                    .map_err(|e| format!("Cannot resolve parent path: {e}"))?;
-                match normalized.file_name() {
-                    Some(name) => canonical_parent.join(name),
-                    None => normalized,
-                }
-            }
-            _ => normalized,
+    let mut policy = astra_sandbox::SandboxPolicy::for_project(workspace_root);
+    policy.allowed_paths = allowed_paths.to_vec();
+    astra_sandbox::validate_path(&policy, relative).map_err(|error| {
+        if error.is_boundary_violation() {
+            format!(
+                "SANDBOX_DENIED: Path '{relative}' is outside workspace root '{}'",
+                workspace_root.display()
+            )
+        } else {
+            error.to_string()
         }
-    };
-
-    // Check workspace root first.
-    if is_within_workspace_root(&final_path, workspace_root) {
-        return Ok(final_path);
-    }
-
-    // The allowlist (e.g. `/tmp`) only applies to inputs the caller
-    // explicitly typed as absolute. A relative input that escapes the
-    // workspace via `..` and happens to land inside an allowed prefix is
-    // still a sandbox escape — the caller did not opt into the allowed
-    // root, the path traversal did. Without this guard, a workspace
-    // located under $TMPDIR can be escaped via `read_file("../foo")`.
-    if input_is_absolute {
-        for allowed in allowed_paths {
-            if is_within_workspace_root(&final_path, allowed) {
-                return Ok(final_path);
-            }
-        }
-    }
-
-    Err(format!(
-        "SANDBOX_DENIED: Path '{}' is outside workspace root '{}'",
-        relative,
-        workspace_root.display()
-    ))
+    })
 }
 
 fn path_resolution_failed(
@@ -3901,7 +3832,7 @@ mod tests {
     fn str_replace_resolves_non_secret_credential_reference() {
         let tmp = TempDir::new().unwrap();
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
-        let path = tmp.path().join("config.env");
+        let path = tmp.path().join("config.conf");
         std::fs::write(&path, raw).unwrap();
         let (redacted, count) =
             astra_text_utils::credential_redaction::redact_credentials_in_text(raw);
@@ -3911,7 +3842,7 @@ mod tests {
         let result = str_replace(
             tmp.path(),
             &serde_json::json!({
-                "path": "config.env",
+                "path": "config.conf",
                 "old_str": "[REDACTED:AWS_ACCESS_KEY:invalid]",
                 "new_str": "[configured-access-key]"
             }),
@@ -3926,7 +3857,7 @@ mod tests {
         let result = str_replace(
             tmp.path(),
             &serde_json::json!({
-                "path": "config.env",
+                "path": "config.conf",
                 "old_str": marker,
                 "new_str": "[configured-access-key]"
             }),
@@ -4017,7 +3948,7 @@ mod tests {
     fn str_replace_resolved_marker_equal_to_new_text_is_a_noop() {
         let tmp = TempDir::new().unwrap();
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
-        let path = tmp.path().join("config.env");
+        let path = tmp.path().join("config.conf");
         std::fs::write(&path, raw).unwrap();
         let (redacted, count) =
             astra_text_utils::credential_redaction::redact_credentials_in_text(raw);
@@ -4030,7 +3961,7 @@ mod tests {
         let result = str_replace(
             tmp.path(),
             &serde_json::json!({
-                "path": "config.env",
+                "path": "config.conf",
                 "old_str": marker,
                 "new_str": "AKIAIOSFODNN7EXAMPLE"
             }),
@@ -5104,9 +5035,23 @@ mod tests {
     }
 
     #[test]
+    fn canonical_path_policy_blocks_credential_files_before_reading() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("config.env"), "SYNTHETIC_CREDENTIAL_FILE").unwrap();
+        let result = read_file(root.path(), &serde_json::json!({"path":"config.env"}));
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("blocked as a sensitive credential path")
+        );
+        assert!(!result.output.contains("SYNTHETIC_CREDENTIAL_FILE"));
+    }
+
+    #[test]
     fn path_traversal_blocked() {
         let tmp = TempDir::new().unwrap();
-        let args = serde_json::json!({"path": "../../../etc/passwd"});
+        let args = serde_json::json!({"path": "../outside-marker"});
         let result = read_file(tmp.path(), &args);
         assert!(result.is_error);
         assert!(result.output.contains("SANDBOX_DENIED"));
@@ -5261,7 +5206,7 @@ mod tests {
         );
         let resolved = result.unwrap();
         assert!(
-            is_within_workspace_root(&resolved, Path::new("/tmp")),
+            resolved.starts_with(Path::new("/tmp").canonicalize().unwrap()),
             "resolved temp path must stay within the configured temp root: {:?}",
             resolved
         );

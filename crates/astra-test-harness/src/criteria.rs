@@ -6466,6 +6466,8 @@ mod tests {
 
     fn outcome_with_tools(tools: &[&str]) -> RunOutcome {
         RunOutcome {
+            error_code: None,
+            server_admission_not_dispatched: false,
             model: "m".into(),
             exit_code: 0,
             text: "ok".into(),

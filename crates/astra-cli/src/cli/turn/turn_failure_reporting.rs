@@ -290,7 +290,10 @@ pub(crate) fn report_turn_failure(
         &failure.partial,
     );
     {
-        let error_kind = astra_core::ClassifiedError::from(failure.error.clone()).kind;
+        let error_kind = failure
+            .partial
+            .failure_kind
+            .unwrap_or_else(|| astra_core::ClassifiedError::from(failure.error.clone()).kind);
         err_event.metadata = Some(serde_json::json!({
             "error_kind": error_kind.as_str(),
             "retryable": error_kind.is_retryable(),

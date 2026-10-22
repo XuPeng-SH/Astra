@@ -1439,12 +1439,30 @@ fn validate_workspace_coordination_host()
 // text-only turn or a surface with only read-only tools needs no writer host.
 async fn validate_local_workspace_host_for_tool_surface(
     executor: &ToolExecutor,
-) -> Result<(), String> {
+) -> Result<(), astra_core::ClassifiedError> {
     if executor
         .current_surface_requires_workspace_coordination()
         .await
     {
-        validate_workspace_coordination_host().map_err(|error| error.to_string())?;
+        validate_workspace_coordination_host().map_err(|error| {
+            use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+            match error {
+                WorkspaceLeaseFailure::CoordinationHostUnsupported => {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ToolUnavailable,
+                        error.to_string(),
+                    )
+                    .with_details_json(
+                        serde_json::json!({
+                            "code": astra_tools::TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED,
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    )
+                }
+                other => astra_core::ClassifiedError::from(other.to_string()),
+            }
+        })?;
     }
     Ok(())
 }
@@ -1457,7 +1475,7 @@ async fn chat_turn_post_payload_after_prepare(
         ChatTurnPrepLineGuard,
         Option<crate::cli::stream::stream_json::StreamJsonExchange>,
     ),
-    String,
+    astra_core::ClassifiedError,
 > {
     let ChatTurnPostPayloadRequest {
         server_admission_dispatched,
@@ -1578,7 +1596,7 @@ async fn chat_turn_post_payload_after_prepare(
 
 pub(crate) async fn fetch_chat_turn_sse(
     ctx: ChatTurnSseFetchRequest<'_>,
-) -> Result<TurnResult, String> {
+) -> Result<TurnResult, astra_core::ClassifiedError> {
     let ChatTurnSseFetchRequest {
         server_admission_dispatched,
         completion_checks,
@@ -1731,7 +1749,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             status.as_u16(),
             body.as_str(),
             compact_or_raw,
-        ));
+        )
+        .into());
     }
 
     // Paired with `Acquire` load in `PlanAssembleLineSpinner`: publish "HTTP response ready"

@@ -82,6 +82,24 @@ pub(crate) async fn settle_failed_turn(
     dispatch: &mut TurnDispatch<'_, '_>,
     failure: &mut crate::TurnFailure,
 ) {
+    if failure.partial.server_admission_not_dispatched {
+        if !dispatch.line.trim().is_empty() {
+            dispatch
+                .ui
+                .restore_input(dispatch.line, state.session_id.as_deref());
+        }
+        dispatch.ui.show_error(&format!(
+            "[{}] {}",
+            failure
+                .partial
+                .error_code
+                .as_deref()
+                .unwrap_or("local_error"),
+            failure.error
+        ));
+        clear_recovery_scoped_turn_restrictions(state);
+        return;
+    }
     if failure.partial.admission_rejected {
         report_admission_rejection(state, dispatch.line, failure, dispatch.ui);
         clear_recovery_scoped_turn_restrictions(state);
@@ -111,6 +129,55 @@ mod tests {
     use super::{TurnDispatch, settle_failed_turn, settle_successful_turn};
     use crate::cli::session::session_state::SessionState;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn local_rejection_restores_draft_without_journal_or_usage() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let mut state = SessionState::default();
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut dispatch = TurnDispatch {
+            ctx: &ctx,
+            line: "write a file",
+            effective_line: "write a file",
+            user_intent: "write a file",
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
+            token: "synthetic-token",
+            session_id: "",
+            admitted_server_turn: None,
+            semantic_query_override: None,
+            turn_start: std::time::Instant::now(),
+            ui: &mut ui,
+            turn_usage_sink: Some(&usage),
+        };
+        let mut failure = crate::TurnFailure {
+            error: "administrator must repair the root-owned temporary directory".into(),
+            partial: crate::PartialTurnData {
+                server_admission_not_dispatched: true,
+                failure_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+                error_code: Some("workspace_host_unsupported".into()),
+                ..Default::default()
+            },
+        };
+        settle_failed_turn(&mut state, &mut dispatch, &mut failure).await;
+        assert_eq!(ui.restored_inputs, vec!["write a file"]);
+        assert!(state.journal.is_none());
+        assert!(usage.lock().unwrap().is_none());
+        assert!(
+            ui.errors
+                .iter()
+                .any(|message| message.contains("workspace_host_unsupported")
+                    && message.contains("administrator"))
+        );
+    }
 
     #[tokio::test]
     async fn settle_successful_turn_clears_last_turn_interrupted() {

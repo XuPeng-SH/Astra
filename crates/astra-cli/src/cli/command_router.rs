@@ -2841,15 +2841,16 @@ async fn execute_cli_command_impl(
                         print_one_shot_completion_warning(&sr, exit_code, args.json);
                         return Ok(exit_code);
                     }
+                    let failure_exit = hard_failure_exit_code(&e);
                     if args.json {
-                        let error = e.error.clone();
                         write_headless_stdout_line(
                             &serde_json::to_string_pretty(&hard_failure_json_output(e))
                                 .map_err(|error| error.to_string())?,
                         )?;
-                        return Err(error);
+                        return Ok(failure_exit);
                     }
-                    return Err(e.error);
+                    eprintln!("{}", hard_failure_diagnostic(&e));
+                    return Ok(failure_exit);
                 }
             };
             if wall_deadline_reached || user_interrupted {
@@ -3793,7 +3794,27 @@ fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Valu
 /// Project observed failure facts without committing a successful turn or
 /// inferring a durable terminal from a transport error. Run identity comes
 /// only from the physical stream's validated root binding.
+fn hard_failure_diagnostic(failure: &crate::TurnFailure) -> String {
+    match failure.partial.error_code.as_deref() {
+        Some(code) if failure.partial.server_admission_not_dispatched => {
+            format!("[{code}] {}", failure.error)
+        }
+        _ => failure.error.clone(),
+    }
+}
+
+fn hard_failure_exit_code(failure: &crate::TurnFailure) -> ExitCode {
+    if failure.partial.server_admission_not_dispatched
+        && failure.partial.failure_kind == Some(astra_core::ErrorKind::ToolUnavailable)
+    {
+        ExitCode::ToolFailure
+    } else {
+        ExitCode::ApiError
+    }
+}
+
 fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
+    let exit_code = hard_failure_exit_code(&failure);
     let partial = failure.partial;
     let classes = partial
         .tool_outcomes
@@ -3826,7 +3847,13 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
         tool_record_coverage_partial: true,
         ..Default::default()
     };
-    let mut output = final_json_output(&result, ExitCode::ApiError);
+    let mut output = final_json_output(&result, exit_code);
+    if partial.server_admission_not_dispatched {
+        output["server_admission_not_dispatched"] = serde_json::json!(true);
+        if let Some(kind) = partial.failure_kind {
+            output["error_kind"] = serde_json::json!(kind.as_str());
+        }
+    }
     output["tool_result_class_counts"] = classes;
     output["error"] = serde_json::json!(failure.error);
     output["error_code"] = serde_json::json!(partial.error_code);
@@ -4083,8 +4110,8 @@ pub(crate) async fn run_print_mode(
             return Ok(ExitCode::Success);
         }
         Err(e) => {
+            let failure_exit = hard_failure_exit_code(&e);
             if output_format == "json" || stream_json_emitter.is_some() {
-                let error = e.error.clone();
                 let mut output = hard_failure_json_output(e);
                 if let Some(emitter) = stream_json_emitter.as_ref() {
                     let result_session_id = output["session_id"].as_str().map(str::to_string);
@@ -4099,9 +4126,10 @@ pub(crate) async fn run_print_mode(
                             .map_err(|error| error.to_string())?,
                     )?;
                 }
-                return Err(error);
+                return Ok(failure_exit);
             }
-            return Err(e.error);
+            eprintln!("{}", hard_failure_diagnostic(&e));
+            return Ok(failure_exit);
         }
     };
 
@@ -4353,6 +4381,33 @@ mod exit_code_tests {
         stream_result_from_incremental_snapshot,
     };
     use crate::cli::stream::streaming_types::VerdictEvent;
+
+    #[test]
+    fn local_host_failure_json_and_process_exit_share_classification() {
+        let failure = crate::TurnFailure {
+            error: "Local workspace execution requires an administrator to repair /tmp".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+                error_code: Some(astra_tools::TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED.into()),
+                error_metadata: Some(serde_json::json!({"retryable":false})),
+                server_admission_not_dispatched: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            super::hard_failure_exit_code(&failure),
+            ExitCode::ToolFailure
+        );
+        let output = super::hard_failure_json_output(failure);
+        assert_eq!(output["exit_code"], 1);
+        assert_eq!(output["error_kind"], "tool_unavailable");
+        assert_eq!(output["error_code"], "workspace_host_unsupported");
+        assert_eq!(output["server_admission_not_dispatched"], true);
+        assert_eq!(output["success"], false);
+        assert!(output["run_id"].is_null());
+        assert_eq!(output["prompt_tokens"], 0);
+        assert_eq!(output["tool_calls_count"], 0);
+    }
 
     fn empty_stream_result() -> StreamResult {
         StreamResult::default()

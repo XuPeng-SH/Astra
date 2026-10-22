@@ -2613,6 +2613,23 @@ async fn unsupported_workspace_host_rejects_public_turn_before_admission_http() 
     );
     assert_eq!(requests[0].method.as_str(), "GET");
     assert_eq!(requests[0].url.path(), "/models");
+    assert_eq!(
+        failure.partial.error_code.as_deref(),
+        Some("workspace_host_unsupported")
+    );
+    assert!(failure.partial.server_admission_not_dispatched);
+    assert_eq!(
+        failure.partial.failure_kind,
+        Some(astra_core::ErrorKind::ToolUnavailable)
+    );
+    assert_eq!(
+        failure.partial.error_metadata.as_ref().unwrap()["retryable"],
+        false
+    );
+    assert!(!failure.partial.admission_rejected);
+    assert_eq!(failure.partial.prompt_tokens, 0);
+    assert_eq!(failure.partial.completion_tokens, 0);
+    assert_eq!(failure.partial.tool_calls_count, 0);
     assert!(failure.partial.run_id.is_none());
     assert!(failure.partial.tool_call_records.is_empty());
 }

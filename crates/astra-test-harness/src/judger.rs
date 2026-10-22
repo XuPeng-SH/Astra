@@ -2020,6 +2020,8 @@ print({response:?})
 
     fn dummy_outcome() -> RunOutcome {
         RunOutcome {
+            error_code: None,
+            server_admission_not_dispatched: false,
             model: "m".into(),
             exit_code: 0,
             text: "agent output".into(),
@@ -2153,6 +2155,8 @@ print({response:?})
 
     fn outcome_with_stderr(stderr: &str) -> RunOutcome {
         RunOutcome {
+            error_code: None,
+            server_admission_not_dispatched: false,
             model: "m".into(),
             exit_code: 0,
             text: "agent text".into(),

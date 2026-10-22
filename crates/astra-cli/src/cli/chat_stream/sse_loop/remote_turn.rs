@@ -383,7 +383,7 @@ pub(super) async fn consume_remote_turn(
         host.last_error_metadata.as_ref(),
         host.last_physical_run_id.as_deref(),
     );
-    if rejected {
+    if rejected || (result.is_err() && !*host.server_admission_dispatched) {
         state.turn_event_buffer = None;
         state.step_recorder.discard_uncommitted();
         state.interruption = None;

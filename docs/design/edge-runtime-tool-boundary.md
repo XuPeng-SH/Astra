@@ -266,6 +266,13 @@ Side-effecting tools require stronger checks than read-only tools.
 | External mutation | explicit API authority and approval policy. |
 | Credential access | deny by default unless dedicated secret provider authorizes scoped access. |
 
+Filesystem path authorization is owned by `astra-sandbox`. In Standard and Strict
+isolation, relative inputs must stay within the selected workspace after resolving
+symlinks and parent components, including nonexistent tails. Additional directory
+grants apply to explicit absolute inputs; they cannot authorize relative traversal.
+CLI and shared filesystem tools use this same resolver. Explicit Permissive mode
+retains its broader authority and bypass-immune credential exclusions.
+
 ### Workspace observation coordination
 
 Local shell and typed workspace writers must serialize each executor-owned
@@ -278,6 +285,12 @@ Text-only and read-only surfaces do not require it. Unsupported hosts fail with
 an actionable local setup error before model execution; admission also rechecks
 the same trust boundary. Tool-level refusals use the non-retryable
 `workspace_host_unsupported` kind, distinct from a missing workspace binding.
+A CLI preflight refusal preserves `error_kind=tool_unavailable`,
+`error_code=workspace_host_unsupported`, non-retryable metadata, exit status `1`,
+and `server_admission_not_dispatched=true` in terminal JSON. It creates no Run,
+execution journal entry, accounting reconciliation, or usage publication. Human
+output retains the stable code and administrator guidance.
+
 Rebinding a workspace or changing cache roots cannot repair a host whose
 coordination directory is not trusted; use a supported host or have its
 administrator provision the required root-owned sticky directory.

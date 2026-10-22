@@ -189,27 +189,6 @@ impl ToolExecutor {
         let p = expanded_home_path
             .as_deref()
             .unwrap_or_else(|| Path::new(path));
-        let resolved = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.project_root.join(p)
-        };
-
-        // Symlink loop / depth guard: canonicalize to detect circular symlinks.
-        // Skip for non-existent paths (let the caller produce a clear NotFound).
-        if resolved.exists() {
-            match resolved.canonicalize() {
-                Ok(_) => {}                                              // reachable — no loop
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race — let caller handle
-                Err(e) => {
-                    return Err(format!(
-                        "Error: cannot resolve '{}' (possible symlink loop or broken link): {e}",
-                        path
-                    )
-                    .into());
-                }
-            }
-        }
 
         {
             let sp_guard = self
@@ -231,7 +210,11 @@ impl ToolExecutor {
                 });
             }
         }
-        Ok(resolved)
+        Ok(if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.project_root.join(p)
+        })
     }
 
     /// String API adapter for current filesystem callers that still consume
@@ -2460,6 +2443,85 @@ mod tests {
         for i in 1..=num_lines {
             writeln!(f, "line {i}: {}", "x".repeat(80)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn public_file_tools_reject_relative_escape_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let marker = outside.join("marker.txt");
+        std::fs::write(&marker, "SYNTHETIC_BOUNDARY_MARKER").unwrap();
+        let executor = test_executor_in(&root);
+        for (name, args) in [
+            ("read_file", json!({"path":"../outside/marker.txt"})),
+            (
+                "write_file",
+                json!({"path":"../outside/marker.txt", "delete":true}),
+            ),
+            (
+                "write_file",
+                json!({"path":"../outside/new/deep.txt", "content":"changed"}),
+            ),
+            (
+                "str_replace",
+                json!({"path":"../outside/marker.txt", "old_str":"SYNTHETIC_BOUNDARY_MARKER", "new_str":"changed"}),
+            ),
+        ] {
+            let result = executor.execute_with_metadata(name, &args).await;
+            assert!(result.is_error, "{name}: {result:?}");
+            let output = result.output;
+            assert!(
+                output.contains("outside the project directory"),
+                "{name}: {output}"
+            );
+            assert!(
+                !output.contains("SYNTHETIC_BOUNDARY_MARKER"),
+                "{name}: {output}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "SYNTHETIC_BOUNDARY_MARKER"
+            );
+            assert!(!outside.join("new").exists());
+        }
+    }
+
+    #[test]
+    fn read_file_relative_escape_is_not_authorized_by_temp_prefix() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let marker = "SYNTHETIC_OUTSIDE_BOUNDARY_MARKER";
+        let target = outside.join("marker.txt");
+        std::fs::write(&target, marker).unwrap();
+        std::fs::write(project.join("inside.txt"), "inside control").unwrap();
+        let executor = test_executor_in(&project);
+        assert!(
+            executor
+                .read_file(&json!({"path":"inside.txt"}))
+                .contains("inside control")
+        );
+        assert!(
+            executor
+                .read_file(&json!({"path":target.to_str().unwrap()}))
+                .contains(marker),
+            "explicit absolute temp access is the passing control"
+        );
+        let result = executor.read_file_with_metadata(&json!({"path":"../outside/marker.txt"}));
+        assert!(
+            !result.output.contains(marker),
+            "relative path disclosed the sibling fixture: {result:?}"
+        );
+        assert!(result.is_error);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["error_kind"],
+            "sandbox_denied"
+        );
     }
 
     // ── file_outline: integration via read_file ──────────────────────────────

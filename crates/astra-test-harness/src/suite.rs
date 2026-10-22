@@ -44,13 +44,17 @@ fn attach_durable_judger_evidence(outcome: &mut RunOutcome, session: &SessionCap
 /// must never become an implicit deletion target.
 fn created_session_ids_for_cleanup(attempts: &[AttemptRecord]) -> Vec<String> {
     let mut ids = BTreeSet::new();
-    for id in attempts.iter().filter_map(|attempt| {
-        attempt
-            .outcome
-            .session_id
-            .as_deref()
-            .filter(|id| is_valid_server_session_id(id))
-    }) {
+    for id in attempts
+        .iter()
+        .filter(|attempt| !attempt.outcome.is_pre_execution_failure())
+        .filter_map(|attempt| {
+            attempt
+                .outcome
+                .session_id
+                .as_deref()
+                .filter(|id| is_valid_server_session_id(id))
+        })
+    {
         ids.insert(id.to_string());
     }
     ids.into_iter().collect()
@@ -819,7 +823,7 @@ impl<'a> SuiteRunner<'a> {
                 // than left as the deterministic placeholder (which would
                 // otherwise make every hard_judger step fail regardless of
                 // the model's actual result).
-                if !self.no_judger {
+                if !step_outcome.is_pre_execution_failure() && !self.no_judger {
                     for (criterion_index, criterion) in step.criteria.iter().enumerate() {
                         if matches!(
                             criterion,
@@ -830,7 +834,7 @@ impl<'a> SuiteRunner<'a> {
                             step_criteria_results[criterion_index] = result;
                         }
                     }
-                } else {
+                } else if !step_outcome.is_pre_execution_failure() {
                     for (criterion_index, criterion) in step.criteria.iter().enumerate() {
                         match criterion {
                             Criterion::Judger { .. } => {
@@ -848,8 +852,9 @@ impl<'a> SuiteRunner<'a> {
                     }
                 }
                 let mut step_lifecycle_ok = true;
-                if step_outcome.exit_code != 0
-                    && !accepts_negative_terminal(&step.criteria, &step_outcome, None)
+                if step_outcome.is_pre_execution_failure()
+                    || (step_outcome.exit_code != 0
+                        && !accepts_negative_terminal(&step.criteria, &step_outcome, None))
                 {
                     step_lifecycle_ok = false;
                     lifecycle_errors.push(format!(
@@ -999,7 +1004,8 @@ impl<'a> SuiteRunner<'a> {
             }
         }
 
-        if case.steps.is_empty() {
+        let local_rejection = outcome.is_pre_execution_failure();
+        if case.steps.is_empty() && !local_rejection {
             match outcome.session_id.as_deref() {
                 Some(session_id) if !is_valid_server_session_id(session_id) => {
                     lifecycle_errors.push(format!(
@@ -1044,7 +1050,8 @@ impl<'a> SuiteRunner<'a> {
             crate::criteria::unconditional_memoria_settled_subsystem(&criteria)
         };
 
-        let cleanup_enabled = self.runner_cfg.cleanup_created_sessions
+        let cleanup_enabled = !local_rejection
+            && self.runner_cfg.cleanup_created_sessions
             && case
                 .extra_cli_args
                 .iter()
@@ -1080,7 +1087,8 @@ impl<'a> SuiteRunner<'a> {
         } else {
             None
         };
-        if session.is_none()
+        if !local_rejection
+            && session.is_none()
             && (self.session_mode.should_load(case)
                 || case.cleanup_memory_records
                 || requires_session_capture(&criteria))
@@ -1104,6 +1112,9 @@ impl<'a> SuiteRunner<'a> {
             _ => missing_invocation_id = Some("root terminal outcome has no run_id".to_string()),
         }
         for (idx, step) in step_results.iter().enumerate() {
+            if step.outcome.is_pre_execution_failure() {
+                continue;
+            }
             match step.outcome.run_id.as_deref() {
                 Some(run_id) if !run_id.trim().is_empty() => {
                     invocation_run_ids.push(run_id.to_string())
@@ -1117,7 +1128,7 @@ impl<'a> SuiteRunner<'a> {
         invocation_run_ids.sort_unstable();
         invocation_run_ids.dedup();
 
-        if requires_durable_run_binding(&criteria) {
+        if !local_rejection && requires_durable_run_binding(&criteria) {
             let binding_error = if let Some(error) = missing_invocation_id.clone() {
                 Some(format!(
                     "hard durable evidence requires every invocation identity: {error}"
@@ -1205,9 +1216,26 @@ impl<'a> SuiteRunner<'a> {
                 crate::judger::semantic_child_evidence(&case.prompt, &outcome, adoption)
             });
 
+        let local_failure = attempts
+            .iter()
+            .map(|attempt| &attempt.outcome)
+            .chain(step_results.iter().map(|step| &step.outcome))
+            .find(|invocation| invocation.is_pre_execution_failure());
+
         // Always run the judger (unless --no-judger) — the quality
         // score is useful for diagnostics even when Hard criteria fail.
-        if !self.no_judger {
+        if local_failure.is_some() {
+            for (i, criterion) in criteria.iter().enumerate() {
+                if matches!(
+                    criterion,
+                    Criterion::Judger { .. } | Criterion::HardJudger { .. }
+                ) {
+                    det[i].passed = false;
+                    det[i].detail =
+                        "judger not run: local execution prerequisites unavailable".into();
+                }
+            }
+        } else if !self.no_judger {
             for (i, c) in criteria.iter().enumerate() {
                 if !matches!(c, Criterion::Judger { .. } | Criterion::HardJudger { .. }) {
                     continue;
@@ -1261,7 +1289,8 @@ impl<'a> SuiteRunner<'a> {
             .filter(|c| c.severity == crate::criteria::CriterionSeverity::Hard)
             .all(|c| c.passed);
         let all_passed = det.iter().all(|c| c.passed) && steps_passed;
-        let product_passed = lifecycle_errors.is_empty() && hard_passed && steps_passed;
+        let product_passed =
+            local_failure.is_none() && lifecycle_errors.is_empty() && hard_passed && steps_passed;
 
         // Classify failure.
         let mut classification_criteria = det.clone();
@@ -1274,7 +1303,8 @@ impl<'a> SuiteRunner<'a> {
         let product_failure_class = if setup_failed {
             Some(crate::classify::FailureClass::PlatformSetupFailed)
         } else if !product_passed {
-            let terminal = if attempts.len() > 1 { root } else { &outcome };
+            let terminal =
+                local_failure.unwrap_or(if attempts.len() > 1 { root } else { &outcome });
             Some(classify(terminal, &classification_criteria))
         } else {
             None
@@ -1286,7 +1316,8 @@ impl<'a> SuiteRunner<'a> {
         };
 
         // Digest on FAIL.
-        let (digest, digest_error) = if !product_passed
+        let (digest, digest_error) = if !local_rejection
+            && !product_passed
             && let Some(collector) = self.digest_collector
             && let Some(sid) = outcome.session_id.as_deref()
         {
@@ -1773,6 +1804,109 @@ mod tests {
             cleanup_memory_records: false,
             requires_memoria: false,
         }
+    }
+
+    struct NoExternalWork;
+    impl SessionLoader for NoExternalWork {
+        fn load(&self, _: &str) -> Option<SessionCapture> {
+            panic!("local rejection must not load a journal");
+        }
+    }
+    #[async_trait]
+    impl Judger for NoExternalWork {
+        async fn judge(
+            &self,
+            _: &Criterion,
+            _: &RunOutcome,
+            _: Option<&crate::judger::SemanticJudgerEvidence>,
+        ) -> Result<JudgerResult, astra_core::ClassifiedError> {
+            panic!("local rejection must not invoke a provider");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_rejection_never_loads_selected_session_or_calls_judger() {
+        let case = case_with(
+            "local-host",
+            vec![
+                Criterion::SessionSubsystemHealthy {
+                    settled_subsystem: None,
+                },
+                Criterion::Judger {
+                    question: "Was the task completed?".into(),
+                    threshold: 0.7,
+                    model: None,
+                },
+            ],
+        );
+        let executor = FakeExecutor::new();
+        executor.seed(
+            &case.name,
+            "m",
+            RunOutcome {
+                model: "m".into(),
+                exit_code: 1,
+                session_id: Some("550e8400-e29b-41d4-a716-446655440000".into()),
+                final_state: Some("failed".into()),
+                error_kind: Some("tool_unavailable".into()),
+                error_code: Some("workspace_host_unsupported".into()),
+                server_admission_not_dispatched: true,
+                ..Default::default()
+            },
+        );
+        let external = NoExternalWork;
+        let mut runner = semantic_runner(&executor, &external, &external);
+        runner.runner_cfg.cleanup_created_sessions = true;
+        let report = runner.run_one(&case, "m", 0).await;
+        assert!(!report.is_passed());
+        assert_eq!(report.failure_class, Some(FailureClass::ToolUnavailable));
+        assert!(!report.outcome.stderr.contains("no run_id"));
+        assert_eq!(executor.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn follow_up_local_rejection_skips_judging_and_preserves_admitted_root() {
+        let judger = Criterion::Judger {
+            question: "Was the task completed?".into(),
+            threshold: 0.7,
+            model: None,
+        };
+        let mut case = case_with("follow-up-host", vec![judger.clone()]);
+        case.steps = vec![
+            crate::case::CaseStep {
+                prompt: "write a file".into(),
+                criteria: vec![judger],
+                timeout_seconds: None,
+            },
+            crate::case::CaseStep {
+                prompt: "must not continue".into(),
+                criteria: vec![],
+                timeout_seconds: None,
+            },
+        ];
+        let executor = FakeExecutor::new();
+        let root = outcome_ok("m", "root answer", &[]);
+        let rejected = RunOutcome {
+            model: "m".into(),
+            exit_code: 1,
+            session_id: root.session_id.clone(),
+            final_state: Some("failed".into()),
+            error_kind: Some("tool_unavailable".into()),
+            error_code: Some("workspace_host_unsupported".into()),
+            server_admission_not_dispatched: true,
+            ..Default::default()
+        };
+        executor.seed(&case.name, "m", root.clone());
+        executor.seed(&format!("{}__step0", case.name), "m", rejected);
+        let runner = semantic_runner(&executor, &NoExternalWork, &NoopSessionLoader);
+        let report = runner.run_one(&case, "m", 0).await;
+        assert!(!report.is_passed());
+        assert_eq!(report.failure_class, Some(FailureClass::ToolUnavailable));
+        assert_eq!(report.outcome.run_id, root.run_id);
+        assert_eq!(report.outcome.text, root.text);
+        assert_eq!(report.steps.len(), 1);
+        assert!(report.steps[0].outcome.run_id.is_none());
+        assert_eq!(executor.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2334,6 +2468,8 @@ mod tests {
 
     fn outcome_ok(model: &str, text: &str, tools: &[&str]) -> RunOutcome {
         RunOutcome {
+            error_code: None,
+            server_admission_not_dispatched: false,
             model: model.into(),
             exit_code: 0,
             text: text.into(),

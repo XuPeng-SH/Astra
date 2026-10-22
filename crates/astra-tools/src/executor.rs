@@ -1262,7 +1262,7 @@ mod tests {
         let result = exec
             .execute(
                 "write_file",
-                &serde_json::json!({"path": "../../etc/passwd", "delete": true}),
+                &serde_json::json!({"path": "../outside-marker", "delete": true}),
             )
             .await;
         assert!(

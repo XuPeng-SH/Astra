@@ -81,6 +81,11 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     if outcome.exit_code < 0 {
         return FailureClass::Unknown;
     }
+    if outcome.is_pre_execution_failure()
+        && outcome.error_kind.as_deref() == Some("tool_unavailable")
+    {
+        return FailureClass::ToolUnavailable;
+    }
     // Exit 124 only proves that the outer deadline fired. If typed execution
     // evidence already proves model/tool progress, calling it an infrastructure
     // outage hides the product's pacing failure and tells reviewers to paper it

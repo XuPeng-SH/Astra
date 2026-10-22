@@ -1097,7 +1097,19 @@ impl CliServerAdmissionHost<'_> {
         refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
-        let mut turn_result = turn_result?;
+        let mut turn_result = turn_result.inspect_err(|error| {
+            if let Some(details) = error
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<Value>(details).ok())
+            {
+                self.last_error_code = details
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.last_error_metadata = Some(details);
+            }
+        })?;
 
         // Capture observed coordination before ingest can reject an incomplete
         // remote terminal. The existing success/failure journal commit owns
