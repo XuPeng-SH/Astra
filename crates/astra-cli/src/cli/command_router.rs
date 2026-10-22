@@ -2842,6 +2842,10 @@ async fn execute_cli_command_impl(
                         return Ok(exit_code);
                     }
                     let failure_exit = hard_failure_exit_code(&e);
+                    eprintln!(
+                        "{}",
+                        crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
+                    );
                     if args.json {
                         write_headless_stdout_line(
                             &serde_json::to_string_pretty(&hard_failure_json_output(e))
@@ -2849,7 +2853,6 @@ async fn execute_cli_command_impl(
                         )?;
                         return Ok(failure_exit);
                     }
-                    eprintln!("{}", hard_failure_diagnostic(&e));
                     return Ok(failure_exit);
                 }
             };
@@ -3791,18 +3794,6 @@ fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Valu
     final_json_output_with_context(sr, exit_code, trace_id, request_id)
 }
 
-/// Project observed failure facts without committing a successful turn or
-/// inferring a durable terminal from a transport error. Run identity comes
-/// only from the physical stream's validated root binding.
-fn hard_failure_diagnostic(failure: &crate::TurnFailure) -> String {
-    match failure.partial.error_code.as_deref() {
-        Some(code) if failure.partial.server_admission_not_dispatched => {
-            format!("[{code}] {}", failure.error)
-        }
-        _ => failure.error.clone(),
-    }
-}
-
 fn hard_failure_exit_code(failure: &crate::TurnFailure) -> ExitCode {
     if failure.partial.server_admission_not_dispatched
         && failure.partial.failure_kind == Some(astra_core::ErrorKind::ToolUnavailable)
@@ -3813,6 +3804,9 @@ fn hard_failure_exit_code(failure: &crate::TurnFailure) -> ExitCode {
     }
 }
 
+/// Project observed failure facts without committing a successful turn or
+/// inferring a durable terminal from a transport error. Run identity comes
+/// only from the physical stream's validated root binding.
 fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     let exit_code = hard_failure_exit_code(&failure);
     let partial = failure.partial;
@@ -4111,6 +4105,10 @@ pub(crate) async fn run_print_mode(
         }
         Err(e) => {
             let failure_exit = hard_failure_exit_code(&e);
+            eprintln!(
+                "{}",
+                crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
+            );
             if output_format == "json" || stream_json_emitter.is_some() {
                 let mut output = hard_failure_json_output(e);
                 if let Some(emitter) = stream_json_emitter.as_ref() {
@@ -4128,7 +4126,6 @@ pub(crate) async fn run_print_mode(
                 }
                 return Ok(failure_exit);
             }
-            eprintln!("{}", hard_failure_diagnostic(&e));
             return Ok(failure_exit);
         }
     };

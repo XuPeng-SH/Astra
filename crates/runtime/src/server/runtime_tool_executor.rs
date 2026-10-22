@@ -14030,11 +14030,40 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn read_file_blocks_path_traversal() {
-        let (exec, _dir) = test_executor();
-        let result = exec
-            .execute("read_file", &json!({"path": "../../etc/passwd"}))
-            .await;
+        let (exec, dir) = test_executor();
+        let outside = tempfile::tempdir_in(dir.path().parent().unwrap()).unwrap();
+        let marker = outside.path().join("marker.txt");
+        std::fs::write(&marker, "SYNTHETIC_OUTSIDE_MARKER").unwrap();
+        let relative = format!(
+            "../{}/marker.txt",
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
+        let result = exec.execute("read_file", &json!({"path": relative})).await;
         assert!(result.contains("SANDBOX_DENIED"));
+        assert!(!result.contains("SYNTHETIC_OUTSIDE_MARKER"));
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "SYNTHETIC_OUTSIDE_MARKER"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_blocks_sensitive_workspace_file() {
+        let (exec, dir) = test_executor();
+        let marker = dir.path().join("config.env");
+        std::fs::write(&marker, "SYNTHETIC_CREDENTIAL_MARKER").unwrap();
+        let result = exec
+            .execute("read_file", &json!({"path": "config.env"}))
+            .await;
+        assert!(
+            result.contains("blocked as a sensitive credential path"),
+            "{result}"
+        );
+        assert!(!result.contains("SYNTHETIC_CREDENTIAL_MARKER"));
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "SYNTHETIC_CREDENTIAL_MARKER"
+        );
     }
 
     #[tokio::test]

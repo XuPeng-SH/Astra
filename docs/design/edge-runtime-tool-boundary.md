@@ -289,7 +289,10 @@ A CLI preflight refusal preserves `error_kind=tool_unavailable`,
 `error_code=workspace_host_unsupported`, non-retryable metadata, exit status `1`,
 and `server_admission_not_dispatched=true` in terminal JSON. It creates no Run,
 execution journal entry, accounting reconciliation, or usage publication. Human
-output retains the stable code and administrator guidance.
+output retains the stable code and administrator guidance on stderr even when
+stdout uses JSON or stream-json. Interactive refusal uses the existing
+not-started settlement: the draft, recovery guidance and tool restrictions remain
+available for a later attempt.
 
 Rebinding a workspace or changing cache roots cannot repair a host whose
 coordination directory is not trusted; use a supported host or have its

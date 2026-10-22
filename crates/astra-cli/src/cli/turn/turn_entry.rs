@@ -245,6 +245,18 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
         return TurnAttempt::NotStarted(Box::new(failure));
     }
     prepare_turn_adaptation(state, input.api, input.token, input.message).await;
+    let attempt = execute_stream_turn(TurnExecutionRequest { state, input }).await;
+    let not_started = match &attempt {
+        TurnAttempt::NotStarted(_) => true,
+        TurnAttempt::Interrupted(result) => result
+            .as_ref()
+            .as_ref()
+            .is_err_and(|failure| failure.partial.server_admission_not_dispatched),
+        TurnAttempt::Completed(_) => false,
+    };
+    if not_started {
+        return attempt;
+    }
     if state
         .resume_guidance
         .as_ref()
@@ -259,7 +271,7 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     {
         state.diagnostics_context = None;
     }
-    execute_stream_turn(TurnExecutionRequest { state, input }).await
+    attempt
 }
 
 /// Establish the canonical identity transaction before an interactive turn
@@ -883,6 +895,145 @@ mod tests {
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::stream::streaming_types::UsageAttribution;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unsupported_host_preserves_recovery_through_turn_execution_and_settlement() {
+        use crate::cli::chat_stream::WORKSPACE_HOST_VALIDATION_FOR_TEST;
+        use crate::cli::turn::turn_settlement::TurnDispatch;
+        use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::test_utils::isolate_credentials();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::test_utils::mock_model_catalog_json(&["test-model"])),
+            )
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut state = SessionState {
+            session_id: Some(session_id.clone()),
+            model: Some("test-model".into()),
+            turn: 7,
+            history: vec![("original task".into(), "unfinished".into())],
+            resume_guidance: Some("verify unfinished work".into()),
+            diagnostics_context: Some("existing diagnostic".into()),
+            resume_restricted_tools: vec!["bash".into()],
+            pending_bg_notifications: vec!["child completed".into()],
+            session_lessons_loaded: true,
+            perm_manager: crate::cli::permission_manager::PermissionManager::new(true),
+            tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry().clone(),
+            active_conversation: Some(
+                astra_turn_core::active_conversation::ActiveConversation::empty(
+                    &crate::cli::cli_config::cli_utils::cli_user_id(),
+                    &session_id,
+                )
+                .unwrap(),
+            ),
+            ..SessionState::default()
+        };
+        let required = vec![
+            "verify unfinished work".into(),
+            "existing diagnostic".into(),
+        ];
+        let input = super::TurnExecutionInput {
+            api: &api,
+            profile: None,
+            token: "synthetic-token",
+            message: "continue",
+            user_intent: "continue",
+            input_runtime_required_texts: &required,
+            input_runtime_volatile_texts: &[],
+            session_id: &session_id,
+            admitted_server_turn: None,
+            semantic_query_override: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let attempt = WORKSPACE_HOST_VALIDATION_FOR_TEST
+            .scope(
+                Err(WorkspaceLeaseFailure::CoordinationHostUnsupported),
+                super::run_chat_turn(super::TurnExecutionRequest {
+                    state: &mut state,
+                    input,
+                }),
+            )
+            .await;
+        let super::TurnAttempt::NotStarted(failure) = &attempt else {
+            panic!("unsupported host must remain an unstarted attempt");
+        };
+        assert_eq!(
+            failure.partial.error_code.as_deref(),
+            Some("workspace_host_unsupported")
+        );
+        assert!(failure.partial.run_id.is_none());
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut ui = crate::tests::TestUi::default();
+        let context = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let mut dispatch = TurnDispatch {
+            ctx: &context,
+            line: "continue",
+            effective_line: "continue",
+            user_intent: "continue",
+            input_runtime_required_texts: &required,
+            input_runtime_volatile_texts: &[],
+            token: "synthetic-token",
+            session_id: &session_id,
+            admitted_server_turn: None,
+            semantic_query_override: None,
+            turn_start: std::time::Instant::now(),
+            ui: &mut ui,
+            turn_usage_sink: Some(&usage),
+        };
+        let settled = super::settle_turn_attempt(&mut state, &mut dispatch, attempt, |_| {
+            Box::pin(async { panic!("unsupported host must not retry") })
+        })
+        .await
+        .unwrap();
+        assert_eq!(settled, TurnSettlementOutcome::NotStarted);
+        assert_eq!(state.turn, 7);
+        assert_eq!(
+            state.history,
+            [("original task".into(), "unfinished".into())]
+        );
+        assert_eq!(
+            state.resume_guidance.as_deref(),
+            Some("verify unfinished work")
+        );
+        assert_eq!(
+            state.diagnostics_context.as_deref(),
+            Some("existing diagnostic")
+        );
+        assert_eq!(state.resume_restricted_tools, ["bash"]);
+        assert_eq!(state.pending_bg_notifications, ["child completed"]);
+        assert!(state.journal.is_none());
+        assert!(usage.lock().unwrap().is_none());
+        assert_eq!(ui.restored_inputs, ["continue"]);
+        assert_eq!(ui.errors.len(), 1);
+        assert!(ui.errors[0].contains("workspace_host_unsupported"));
+        assert!(ui.errors[0].contains("administrator"));
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "GET" && request.url.path() == "/models"),
+            "no execution or refresh request is allowed"
+        );
+    }
 
     #[tokio::test]
     async fn conversation_input_cannot_execute_local_shell_syntax() {

@@ -181,7 +181,11 @@ pub fn canonicalize_parent_and_append(path: &Path) -> Result<PathBuf, SandboxPat
         Err(error) => return Err(failure(error)),
     }
 
-    let mut result = PathBuf::new();
+    let mut result = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        Path::new(".").canonicalize().map_err(failure)?
+    };
     for component in path.components() {
         match component {
             std::path::Component::CurDir => continue,
@@ -219,6 +223,34 @@ mod tests {
 
     fn strict_policy(root: &str) -> SandboxPolicy {
         SandboxPolicy::strict(root)
+    }
+
+    #[test]
+    fn relative_workspace_resolves_missing_targets_from_the_current_directory() {
+        let root = Path::new(".").canonicalize().unwrap();
+        let name = format!("astra-missing-{}", uuid::Uuid::new_v4());
+        let policy = SandboxPolicy::for_project(".");
+        assert_eq!(validate_path(&policy, ".").unwrap(), root);
+        for input in [name.clone(), format!("{name}/new/deep.txt")] {
+            assert!(!root.join(&input).exists());
+            let expected = root.join(&input);
+            assert_eq!(validate_path(&policy, &input).unwrap(), expected);
+            assert_eq!(
+                validate_path(&SandboxPolicy::for_project(&root), &input).unwrap(),
+                expected
+            );
+        }
+        let outside = format!("../{name}/new.txt");
+        assert_eq!(
+            canonicalize_parent_and_append(Path::new(&outside)).unwrap(),
+            root.parent().unwrap_or(&root).join(&name).join("new.txt")
+        );
+        if root.parent().is_some() {
+            assert!(matches!(
+                validate_path(&policy, &outside),
+                Err(SandboxPathError::BoundaryEscape { .. })
+            ));
+        }
     }
 
     #[test]

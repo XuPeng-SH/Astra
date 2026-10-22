@@ -114,7 +114,12 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
     if was_user_cancel {
         TurnAttempt::Interrupted(Box::new(result))
     } else {
-        TurnAttempt::Completed(Box::new(result))
+        match result {
+            Err(failure) if failure.partial.server_admission_not_dispatched => {
+                TurnAttempt::NotStarted(Box::new(failure))
+            }
+            result => TurnAttempt::Completed(Box::new(result)),
+        }
     }
 }
 

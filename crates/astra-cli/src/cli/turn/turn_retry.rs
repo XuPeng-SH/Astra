@@ -1,6 +1,7 @@
 //! Retry orchestration for recoverable turn failures.
 
 use super::turn_auth_retry::prepare_auth_refresh_retry;
+use super::turn_failure_reporting::turn_failure_diagnostic;
 use super::turn_settlement::{
     TurnDispatch, settle_failed_turn, settle_interrupted_turn, settle_successful_turn,
 };
@@ -35,22 +36,7 @@ pub(crate) async fn settle_turn_attempt(
             settle_not_started_turn(state, dispatch, &failure);
             Ok(TurnSettlementOutcome::NotStarted)
         }
-        TurnAttempt::Interrupted(result) => {
-            settle_interrupted_turn(state, dispatch, *result).await;
-            Ok(TurnSettlementOutcome::Interrupted)
-        }
-        TurnAttempt::Completed(result) => match *result {
-            Ok(result) => {
-                settle_successful_turn(state, dispatch, result).await;
-                Ok(TurnSettlementOutcome::Succeeded)
-            }
-            Err(mut failure) => {
-                // Once execution was attempted, retain and settle its facts.
-                // Only producer-owned local preflight may authorize a retry.
-                settle_failed_turn(state, dispatch, &mut failure).await;
-                Ok(TurnSettlementOutcome::Failed)
-            }
-        },
+        attempt => Ok(settle_attempt_without_retry(state, dispatch, attempt).await),
     }
 }
 
@@ -122,10 +108,10 @@ async fn try_retry_after_auth_refresh(
         },
     })
     .await;
-    Some(settle_retry_attempt(state, dispatch, retry).await)
+    Some(settle_attempt_without_retry(state, dispatch, retry).await)
 }
 
-async fn settle_retry_attempt(
+async fn settle_attempt_without_retry(
     state: &mut SessionState,
     dispatch: &mut TurnDispatch<'_, '_>,
     retry: TurnAttempt,
@@ -136,6 +122,14 @@ async fn settle_retry_attempt(
             TurnSettlementOutcome::NotStarted
         }
         TurnAttempt::Interrupted(result) => {
+            if let Err(failure) = result.as_ref()
+                && failure.partial.server_admission_not_dispatched
+            {
+                // Stop never authorizes an auth retry, and an unsent request
+                // has no cancelled execution to journal or charge.
+                settle_not_started_turn(state, dispatch, failure);
+                return TurnSettlementOutcome::NotStarted;
+            }
             settle_interrupted_turn(state, dispatch, *result).await;
             TurnSettlementOutcome::Interrupted
         }
@@ -157,7 +151,7 @@ fn settle_not_started_turn(
     dispatch: &mut TurnDispatch<'_, '_>,
     failure: &crate::TurnFailure,
 ) {
-    dispatch.ui.show_error(&failure.error);
+    dispatch.ui.show_error(&turn_failure_diagnostic(failure));
     if !dispatch.line.trim().is_empty() {
         let _ = dispatch
             .ui
@@ -353,7 +347,14 @@ mod tests {
             admission: None,
             explain_analyze_terminal_degraded: None,
         };
-        for retry in [false, true] {
+        for (retry, local, cancelled) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
             let mut state = SessionState {
                 session_id: Some("same-session".into()),
                 turn: 7,
@@ -380,12 +381,29 @@ mod tests {
                 ui: &mut ui,
                 turn_usage_sink: Some(&usage),
             };
-            let attempt = TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
-                error: "model selection rejected".into(),
-                partial: Default::default(),
-            }));
+            let failure = if local {
+                crate::TurnFailure {
+                    error: "administrator must repair the coordination host".into(),
+                    partial: crate::PartialTurnData {
+                        server_admission_not_dispatched: true,
+                        error_code: Some("workspace_host_unsupported".into()),
+                        failure_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+                        ..Default::default()
+                    },
+                }
+            } else {
+                crate::TurnFailure {
+                    error: "model selection rejected".into(),
+                    partial: Default::default(),
+                }
+            };
+            let attempt = if cancelled {
+                TurnAttempt::Interrupted(Box::new(Err(failure)))
+            } else {
+                TurnAttempt::NotStarted(Box::new(failure))
+            };
             let outcome = if retry {
-                super::settle_retry_attempt(&mut state, &mut dispatch, attempt).await
+                super::settle_attempt_without_retry(&mut state, &mut dispatch, attempt).await
             } else {
                 settle_turn_attempt(&mut state, &mut dispatch, attempt, |_| {
                     Box::pin(async { panic!("preflight rejection cannot execute a turn") })
@@ -405,7 +423,14 @@ mod tests {
             assert_eq!(state.pending_bg_notifications, ["child complete"]);
             assert_eq!(state.resume_restricted_tools, ["bash"]);
             assert_eq!(ui.restored_inputs, ["/model literal task"]);
-            assert_eq!(ui.errors, ["model selection rejected"]);
+            assert_eq!(
+                ui.errors,
+                [if local {
+                    "[workspace_host_unsupported] administrator must repair the coordination host"
+                } else {
+                    "model selection rejected"
+                }]
+            );
             assert!(usage.lock().unwrap().is_none());
         }
     }

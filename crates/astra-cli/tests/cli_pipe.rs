@@ -532,7 +532,7 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        for mode in ["chat-json", "print-json", "stream-json"] {
+        for mode in ["chat-json", "print-json", "stream-json", "chat-text"] {
             let home = tempfile::tempdir().unwrap();
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
             command.args([
@@ -544,16 +544,18 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 "mock-model",
                 "--no-instructions",
             ]);
-            if mode == "chat-json" {
+            if mode == "chat-json" || mode == "chat-text" {
                 command.args([
                     "chat",
                     "--no-resume",
                     "--permission-mode",
                     "auto",
-                    "--json",
                     "-m",
                     "exercise hard failure",
                 ]);
+                if mode == "chat-json" {
+                    command.arg("--json");
+                }
             } else {
                 command.args([
                     "--print",
@@ -601,6 +603,22 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 Some(3),
                 "{mode}, admitted={admitted}: {}",
                 String::from_utf8_lossy(&output.stderr)
+            );
+            if mode == "chat-text" {
+                assert_no_completed_turn(home.path().join(".astra/sessions"), SESSION);
+                continue;
+            }
+            let diagnostic = if !admitted && mode == "stream-json" {
+                "without a bridge run_id"
+            } else {
+                "402"
+            };
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .matches(diagnostic)
+                    .count(),
+                1,
+                "{mode}: product failure must be printed once"
             );
             let result: Value = if mode == "stream-json" {
                 let records = stdout
