@@ -754,6 +754,23 @@ Server persists route, admitted invocation, and first provider-attempt identity 
 
 Retries reuse the logical invocation but create a new provider attempt. The invocation ID is sent upstream as an idempotency key only when the final provider explicitly supports that contract. If delivery may have occurred and the provider cannot answer idempotently, the result is `DeliveryUnknown`; Astra does not blindly retry or claim zero usage.
 
+### Primary request admission boundary
+
+Primary streaming inference prepares and validates the transport payload before
+admission. The canonical transition WAL, logical invocation, first physical
+attempt, and accepted request-context fact commit in one transaction through the
+inference service. The transport sends the same immutable serialized bytes;
+request preparation alone grants no permission to contact a provider.
+
+The existing attempt observer consumes that acknowledged first admission after
+checking exact wire identity and local execution fences. It does not admit the
+first attempt a second time. A subsequent physical retry still obtains fresh
+durable scope and invocation authority. A lost admission acknowledgement is
+resolved as pre-delivery through the existing bounded settlement owner before a
+replacement logical identity can dispatch. Cancellation, owner loss, and the
+original execution deadline continue to fence delivery.
+
+
 ## Control plane and data plane
 
 ```text

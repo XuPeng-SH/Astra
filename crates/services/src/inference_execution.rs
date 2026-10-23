@@ -6503,69 +6503,74 @@ async fn close_open_attempts_owned_by_settlement_debt<'e, E>(
     invocation_id: &str,
     terminal: &DurableInferenceTerminal,
     provider_attempt_id: Option<&str>,
+    pre_delivery: bool,
 ) -> Result<u64, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
-    if let Some(attempt_id) = provider_attempt_id {
-        return sqlx::query(
-            "UPDATE inference_provider_attempts
-             SET status = ?, terminal_fingerprint = ?,
-                 usage_status = ?,
-                 input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
-                 cache_creation_tokens = ?, provider_response_id = ?,
-                 error_kind = ?, error_message = ?, terminal_at = NOW(6)
-             WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?
-               AND status = 'started'",
+    // An exact-attempt debt owns that physical terminal. A validated logical
+    // pre-delivery debt proves no request was authorized, including the first
+    // physical row in a combined admission whose ACK was lost. Only a debt
+    // without either proof must conservatively recover as delivery-unknown.
+    let fallback = if provider_attempt_id.is_none() && !pre_delivery {
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::DeliveryUnknown,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("settlement_recovery".to_string()),
+            error_message: Some(
+                "provider attempt terminal write was not observed before logical settlement"
+                    .to_string(),
+            ),
+        };
+        Some(
+            DurableInferenceTerminal::from_terminal(
+                &terminal,
+                terminal_fingerprint(&terminal)
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+            )
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
         )
-        .bind(&terminal.status)
-        .bind(&terminal.terminal_fingerprint)
-        .bind(&terminal.usage_status)
-        .bind(terminal.input_tokens)
-        .bind(terminal.output_tokens)
-        .bind(terminal.cache_read_tokens)
-        .bind(terminal.cache_creation_tokens)
-        .bind(&terminal.provider_response_id)
-        .bind(&terminal.error_kind)
-        .bind(&terminal.error_message)
-        .bind(user_id)
-        .bind(invocation_id)
-        .bind(attempt_id)
+    } else {
+        None
+    };
+    let terminal = fallback.as_ref().unwrap_or(terminal);
+    let mut update =
+        sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE inference_provider_attempts SET status = ");
+    update
+        .push_bind(&terminal.status)
+        .push(", terminal_fingerprint = ")
+        .push_bind(&terminal.terminal_fingerprint)
+        .push(", usage_status = ")
+        .push_bind(&terminal.usage_status)
+        .push(", input_tokens = ")
+        .push_bind(terminal.input_tokens)
+        .push(", output_tokens = ")
+        .push_bind(terminal.output_tokens)
+        .push(", cache_read_tokens = ")
+        .push_bind(terminal.cache_read_tokens)
+        .push(", cache_creation_tokens = ")
+        .push_bind(terminal.cache_creation_tokens)
+        .push(", provider_response_id = ")
+        .push_bind(&terminal.provider_response_id)
+        .push(", error_kind = ")
+        .push_bind(&terminal.error_kind)
+        .push(", error_message = ")
+        .push_bind(&terminal.error_message)
+        .push(", terminal_at = NOW(6) WHERE user_id = ")
+        .push_bind(user_id)
+        .push(" AND invocation_id = ")
+        .push_bind(invocation_id)
+        .push(" AND status = 'started'");
+    if let Some(attempt_id) = provider_attempt_id {
+        update.push(" AND attempt_id = ").push_bind(attempt_id);
+    }
+    update
+        .build()
         .execute(executor)
         .await
-        .map(|result| result.rows_affected());
-    }
-
-    let fallback = InferenceInvocationTerminal {
-        status: InferenceTerminalStatus::DeliveryUnknown,
-        usage: InferenceUsage::default(),
-        usage_status: InferenceUsageStatus::Unavailable,
-        provider_response_id: None,
-        error_kind: Some("settlement_recovery".to_string()),
-        error_message: Some(
-            "provider attempt terminal write was not observed before logical settlement"
-                .to_string(),
-        ),
-    };
-    let fingerprint = terminal_fingerprint(&fallback)
-        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-    sqlx::query(
-        "UPDATE inference_provider_attempts
-         SET status = 'delivery_unknown', terminal_fingerprint = ?,
-             usage_status = 'unavailable',
-             input_tokens = 0, output_tokens = 0, cache_read_tokens = 0,
-             cache_creation_tokens = 0, provider_response_id = NULL,
-             error_kind = ?, error_message = ?, terminal_at = NOW(6)
-         WHERE user_id = ? AND invocation_id = ? AND status = 'started'",
-    )
-    .bind(fingerprint)
-    .bind(fallback.error_kind)
-    .bind(fallback.error_message)
-    .bind(user_id)
-    .bind(invocation_id)
-    .execute(executor)
-    .await
-    .map(|result| result.rows_affected())
+        .map(|result| result.rows_affected())
 }
 
 /// Resolve the race where another reconciler terminalizes the invocation
@@ -6736,6 +6741,7 @@ async fn reconcile_inference_settlement_debt_on_connection(
             invocation_id,
             &terminal,
             provider_attempt_id.as_deref(),
+            provider_delivery_state == ProviderDeliveryState::PreDelivery.as_str(),
         )
         .await?;
         if recovered_attempts > 0 {
@@ -6804,47 +6810,70 @@ async fn reconcile_inference_settlement_debt_on_connection(
             .await?;
             return Ok(0);
         }
-        if let Some(attempt_id) = provider_attempt_id.as_deref()
-            && exact_attempt.is_some()
-            && let Err(error) = insert_recovered_model_request_terminal(
+        let recovery_attempts = if let Some(attempt_id) = provider_attempt_id.as_ref() {
+            if exact_attempt.is_some() {
+                vec![attempt_id.clone()]
+            } else {
+                Vec::new()
+            }
+        } else if provider_delivery_state == ProviderDeliveryState::PreDelivery.as_str() {
+            // A combined admission can leave accepted request evidence even
+            // when its caller never received an ACK. Recover those exact
+            // physical facts before completing the logical cancellation.
+            sqlx::query_scalar::<_, String>(
+                "SELECT attempt_id FROM inference_provider_attempts
+                 WHERE user_id = ? AND invocation_id = ? AND terminal_fingerprint = ?
+                 ORDER BY attempt_index",
+            )
+            .bind(user_id)
+            .bind(invocation_id)
+            .bind(&fingerprint)
+            .fetch_all(&mut *connection)
+            .await?
+        } else {
+            Vec::new()
+        };
+        for attempt_id in recovery_attempts {
+            if let Err(error) = insert_recovered_model_request_terminal(
                 &mut *connection,
                 user_id,
                 invocation_id,
-                attempt_id,
+                &attempt_id,
                 &terminal,
             )
             .await
-        {
-            let quarantine_reason = match &error {
-                sqlx::Error::Protocol(message)
-                    if message.contains("has no accepted request-context event") =>
-                {
-                    Some("exact provider attempt is missing accepted request-context evidence")
-                }
-                sqlx::Error::Protocol(_) => {
-                    Some("exact provider attempt has malformed request-context evidence")
-                }
-                _ => None,
-            };
-            let Some(quarantine_reason) = quarantine_reason else {
-                return Err(error);
-            };
-            quarantine_inference_settlement_debt(
-                &mut *connection,
-                user_id,
-                invocation_id,
-                &fingerprint,
-                quarantine_reason,
-            )
-            .await?;
-            tracing::error!(
-                %user_id,
-                %invocation_id,
-                %attempt_id,
-                %error,
-                "quarantined exact settlement debt with incomplete accounting evidence"
-            );
-            return Ok(0);
+            {
+                let quarantine_reason = match &error {
+                    sqlx::Error::Protocol(message)
+                        if message.contains("has no accepted request-context event") =>
+                    {
+                        Some("exact provider attempt is missing accepted request-context evidence")
+                    }
+                    sqlx::Error::Protocol(_) => {
+                        Some("exact provider attempt has malformed request-context evidence")
+                    }
+                    _ => None,
+                };
+                let Some(quarantine_reason) = quarantine_reason else {
+                    return Err(error);
+                };
+                quarantine_inference_settlement_debt(
+                    &mut *connection,
+                    user_id,
+                    invocation_id,
+                    &fingerprint,
+                    quarantine_reason,
+                )
+                .await?;
+                tracing::error!(
+                    %user_id,
+                    %invocation_id,
+                    %attempt_id,
+                    %error,
+                    "quarantined exact settlement debt with incomplete accounting evidence"
+                );
+                return Ok(0);
+            }
         }
         if terminal.status == InferenceTerminalStatus::Succeeded.as_str()
             && !matching_successful_provider_attempt(
@@ -8378,6 +8407,58 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resumed_attempts, 1);
+
+        // A committed combined admission may lose its ACK before transport.
+        // Existing pre-delivery recovery must close the physical row as well
+        // as its invocation; a replacement cannot revive either identity.
+        let combined = plan("combined_ack_lost");
+        let combined_attempt = attempt(&combined);
+        admit_inference_invocation_with_first_provider_attempt(&pool, &combined, &combined_attempt)
+            .await
+            .unwrap();
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &combined, &terminal)
+                .await
+                .unwrap(),
+            (InferenceInvocationAdmissionResolution::Settled, None)
+        );
+        assert_eq!(
+            reconcile_inference_settlement(&pool, &combined, &terminal)
+                .await
+                .unwrap(),
+            InferenceSettlementReconcileOutcome::Settled
+        );
+        let statuses: (String, String) = sqlx::query_as(
+            "SELECT i.status, p.status FROM inference_invocations i
+             JOIN inference_provider_attempts p ON p.user_id = i.user_id AND p.invocation_id = i.invocation_id
+             WHERE i.user_id = ? AND i.invocation_id = ? AND p.attempt_id = ?",
+        ).bind(&user_id).bind(combined.invocation_id()).bind(combined_attempt.attempt_id())
+            .fetch_one(pool.get()).await.unwrap();
+        assert_eq!(statuses, ("cancelled".into(), "cancelled".into()));
+        assert_eq!(
+            reconcile_inference_settlement(&pool, &combined, &terminal)
+                .await
+                .unwrap(),
+            InferenceSettlementReconcileOutcome::Settled
+        );
+        let context_terminals: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_request_context_events
+             WHERE user_id = ? AND invocation_id = ? AND attempt_id = ? AND event_stage = 'terminal'",
+        ).bind(&user_id).bind(combined.invocation_id()).bind(combined_attempt.attempt_id())
+            .fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            context_terminals, 1,
+            "lost ACK recovery and replay close accepted request evidence exactly once"
+        );
+        assert!(
+            admit_inference_invocation_with_first_provider_attempt(
+                &pool,
+                &combined,
+                &combined_attempt
+            )
+            .await
+            .is_err()
+        );
         for table in [
             "inference_invocation_settlement_debts",
             "inference_provider_attempts",

@@ -64,8 +64,8 @@ use crate::turn::agentic_loop::host::{
 };
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute, RuntimeToolChoice,
-    call_llm_and_collect_with_stream_callback, provider_supports_no_tool_choice,
-    sleep_ms_or_llm_cancel,
+    call_prepared_llm_and_collect_with_stream_callback, prepare_streaming_call,
+    provider_supports_no_tool_choice, sleep_ms_or_llm_cancel,
 };
 use crate::turn::llm::summary_client::{DurableSummaryAttemptAllocator, RuntimeSummaryClient};
 use crate::turn::model_cooldown::rate_limit_cooldown;
@@ -21134,8 +21134,143 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 (astra_turn_types::InferencePurpose::SubAgent, None) => "agent_turn".to_string(),
                 _ => "agent_turn".to_string(),
             };
+            // The final helper already projected and, for append-only
+            // providers, durably staged the execution deadline.  Keep this
+            // exact vector immutable through provider dispatch; only the
+            // timeout is sampled at the dispatch boundary.
+            let attempt_llm_messages_owned = llm_messages.clone();
+            let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
+            let (provider_canonical_transitions, provider_canonical_planned_head) = if state
+                .owns_provider_canonical_transition_wal()
+                && matches!(
+                    cache_cap.volatile_placement,
+                    astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                ) {
+                if durable_canonical_cursor > state.messages.len() {
+                    let error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "provider canonical transition cursor exceeds canonical history",
+                    );
+                    self.complete_request_preparation_phase_with_context(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
+                    );
+                    return Err(error);
+                }
+                let appended = state.messages[durable_canonical_cursor..].to_vec();
+                {
+                    if !crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
+                        attempt_llm_messages,
+                        &state.messages,
+                        durable_canonical_cursor,
+                    ) {
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "provider request does not preserve its staged canonical append suffix",
+                        );
+                        self.complete_request_preparation_phase_with_context(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
+                        );
+                            return Err(error);
+                    }
+                    let Some(durable_base) = state.provider_canonical_wal_base.clone() else {
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "provider canonical transition has no admitted durable base",
+                        );
+                        self.complete_request_preparation_phase_with_context(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
+                        );
+                            return Err(error);
+                    };
+                    let predecessor_messages = &state.messages[..durable_canonical_cursor];
+                    let replacement_authorization = state
+                        .provider_canonical_replacement_authorization(
+                            &durable_base,
+                            predecessor_messages,
+                        );
+                    let plan = match plan_provider_canonical_wal_transition(
+                        &durable_base,
+                        state.provider_canonical_wal_head.as_ref(),
+                        predecessor_messages,
+                        appended,
+                        replacement_authorization.as_ref(),
+                        ProviderCanonicalWalLimits::PRODUCTION,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(source) => {
+                            let error = astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::ContractViolation,
+                                format!(
+                                    "failed to plan a bounded provider canonical transition: {source}"
+                                ),
+                            );
+                            self.complete_request_preparation_phase_with_context(
+                                state,
+                                request_attempt_started_at,
+                                attempt_in_round,
+                                &mut request_preparation_recorded_attempts,
+                                TurnPhaseOutcome::Failed,
+                                attempt_context_metrics.clone(),
+                            );
+                                    return Err(error);
+                        }
+                    };
+                    (vec![plan.transition], Some(plan.head))
+                }
+            } else {
+                (Vec::new(), None)
+            };
+            let provider_canonical_transition_id = provider_canonical_transitions
+                .first()
+                .map(|transition| transition.transition_id.clone());
+            let provider_canonical_replacement = provider_canonical_transitions
+                .first()
+                .filter(|transition| {
+                    transition.recovery_mode
+                        == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+                })
+                .cloned();
+            let execution_route = llm_cfg.execution_route();
+            let prepared_call = match prepare_streaming_call(
+                LlmCall {
+                    purpose: state.inference_purpose,
+                    messages: attempt_llm_messages,
+                    tools: &final_tools,
+                    cache_capability: Some(cache_cap),
+                    route: execution_route.borrowed(),
+                    max_output_tokens: Some(effective_max_output),
+                    temperature: None,
+                    thinking: &primary_thinking,
+                },
+                if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.complete_request_preparation_phase_with_context(
+                        state, request_attempt_started_at, attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed, attempt_context_metrics.clone(),
+                    );
+                    return Err(error);
+                }
+            };
             let durable_invocation = match durable_ledger
-                .admit_with_request_context(
+                .admit_prepared_request(
                     astra_turn_types::InferenceInvocationScope::Run {
                         session_id: self.session_id.clone(),
                         run_id,
@@ -21152,6 +21287,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         .unwrap_or(&llm_cfg.model_name),
                     &llm_cfg.provider,
                     request_context,
+                    crate::turn::llm::durable::FirstProviderRequest {
+                        wire: prepared_call.identity(),
+                        canonical_transitions: &provider_canonical_transitions,
+                    },
                 )
                 .await
             {
@@ -21218,135 +21357,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(error);
                 }
             };
-            // The final helper already projected and, for append-only
-            // providers, durably staged the execution deadline.  Keep this
-            // exact vector immutable through provider dispatch; only the
-            // timeout is sampled at the dispatch boundary.
-            let attempt_llm_messages_owned = llm_messages.clone();
-            let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
-            let (provider_canonical_transitions, provider_canonical_planned_head) = if state
-                .owns_provider_canonical_transition_wal()
-                && matches!(
-                    cache_cap.volatile_placement,
-                    astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
-                ) {
-                if durable_canonical_cursor > state.messages.len() {
-                    let error = astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        "provider canonical transition cursor exceeds canonical history",
-                    );
-                    self.complete_request_preparation_phase_with_context(
-                        state,
-                        request_attempt_started_at,
-                        attempt_in_round,
-                        &mut request_preparation_recorded_attempts,
-                        TurnPhaseOutcome::Failed,
-                        attempt_context_metrics.clone(),
-                    );
-                    durable_invocation.finish_error(&error).await?;
-                    return Err(error);
-                }
-                let appended = state.messages[durable_canonical_cursor..].to_vec();
-                {
-                    if !crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
-                        attempt_llm_messages,
-                        &state.messages,
-                        durable_canonical_cursor,
-                    ) {
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            "provider request does not preserve its staged canonical append suffix",
-                        );
-                        self.complete_request_preparation_phase_with_context(
-                            state,
-                            request_attempt_started_at,
-                            attempt_in_round,
-                            &mut request_preparation_recorded_attempts,
-                            TurnPhaseOutcome::Failed,
-                            attempt_context_metrics.clone(),
-                        );
-                        durable_invocation.finish_error(&error).await?;
-                        return Err(error);
-                    }
-                    let Some(durable_base) = state.provider_canonical_wal_base.clone() else {
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            "provider canonical transition has no admitted durable base",
-                        );
-                        self.complete_request_preparation_phase_with_context(
-                            state,
-                            request_attempt_started_at,
-                            attempt_in_round,
-                            &mut request_preparation_recorded_attempts,
-                            TurnPhaseOutcome::Failed,
-                            attempt_context_metrics.clone(),
-                        );
-                        durable_invocation.finish_error(&error).await?;
-                        return Err(error);
-                    };
-                    let predecessor_messages = &state.messages[..durable_canonical_cursor];
-                    let replacement_authorization = state
-                        .provider_canonical_replacement_authorization(
-                            &durable_base,
-                            predecessor_messages,
-                        );
-                    let plan = match plan_provider_canonical_wal_transition(
-                        &durable_base,
-                        state.provider_canonical_wal_head.as_ref(),
-                        predecessor_messages,
-                        appended,
-                        replacement_authorization.as_ref(),
-                        ProviderCanonicalWalLimits::PRODUCTION,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(source) => {
-                            let error = astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::ContractViolation,
-                                format!(
-                                    "failed to plan a bounded provider canonical transition: {source}"
-                                ),
-                            );
-                            self.complete_request_preparation_phase_with_context(
-                                state,
-                                request_attempt_started_at,
-                                attempt_in_round,
-                                &mut request_preparation_recorded_attempts,
-                                TurnPhaseOutcome::Failed,
-                                attempt_context_metrics.clone(),
-                            );
-                            durable_invocation.finish_error(&error).await?;
-                            return Err(error);
-                        }
-                    };
-                    (vec![plan.transition], Some(plan.head))
-                }
-            } else {
-                (Vec::new(), None)
-            };
-            let provider_canonical_transition_id = provider_canonical_transitions
-                .first()
-                .map(|transition| transition.transition_id.clone());
-            let provider_canonical_replacement = provider_canonical_transitions
-                .first()
-                .filter(|transition| {
-                    transition.recovery_mode
-                        == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
-                })
-                .cloned();
-            if let Err(error) = durable_invocation
-                .bind_provider_canonical_transitions(provider_canonical_transitions)
-            {
-                self.complete_request_preparation_phase_with_context(
-                    state,
-                    request_attempt_started_at,
-                    attempt_in_round,
-                    &mut request_preparation_recorded_attempts,
-                    TurnPhaseOutcome::Failed,
-                    attempt_context_metrics.clone(),
-                );
-                durable_invocation.finish_error(&error).await?;
-                return Err(error);
-            }
             // Attempt-keyed prompt truth is created only after durable
             // admission chooses the authoritative logical identity. The
             // cancelled N recovery fact must never own the request artifact
@@ -21617,24 +21627,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             }
                         }
                     };
-                    let execution_route = llm_cfg.execution_route();
-                    let call = LlmCall {
-                        purpose: state.inference_purpose,
-                        messages: attempt_llm_messages,
-                        tools: &final_tools,
-                        cache_capability: Some(cache_cap),
-                        route: execution_route.borrowed(),
-                        max_output_tokens: Some(effective_max_output),
-                        temperature: None,
-                        thinking: &primary_thinking,
-                    };
                     let llm_cancel = llm_cancel_for_state(state);
-                    call_llm_and_collect_with_stream_callback(
-                        call,
+                    call_prepared_llm_and_collect_with_stream_callback(
+                        prepared_call,
                         llm_cancel,
                         Some(&mut on_stream_update),
                         Some(&explain_provider_attempt_observer),
-                        if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
                         dispatch_budget.client_timeout,
                     ).await.map_err(|error| dispatch_budget.classify_deadline(error))
                 };
