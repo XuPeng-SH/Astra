@@ -8,6 +8,7 @@ mod test_support;
 
 use harness::*;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::prelude::*;
 
@@ -87,6 +88,17 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 )],
             )
             .await;
+        // Raw history can contain an imported row without a canonical head.
+        // It stays visible to history readers, never an alternate prompt source.
+        let imported = "Imported transcript is not canonical model context.";
+        let mut hash = Sha256::new();
+        hash.update(b"assistant\0");
+        hash.update(imported.as_bytes());
+        hash.update([0]);
+        sqlx::query(
+            "INSERT INTO session_transcript_items (session_id, item_seq, user_id, role, content, source_event_id, content_hash, created_at) VALUES (?, 1, ?, 'assistant', ?, 'imported-history', ?, NOW(6))",
+        ).bind(&b.ctx.session_id).bind(&b.ctx.user_id).bind(imported)
+            .bind(format!("{:x}", hash.finalize())).execute(&b.ctx.pool).await.unwrap();
         *capture.0.lock().unwrap() = Some(Vec::new());
         let request = axum::http::Request::builder()
             .method("POST")
@@ -128,6 +140,18 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .await
         );
         let statements = capture.0.lock().unwrap().take().unwrap();
+        assert!(
+            !statements
+                .iter()
+                .any(|sql| sql.contains("FROM conversation_log")),
+            "ordinary chat must use its admitted canonical history, without legacy CSL probes"
+        );
+        assert!(
+            !statements
+                .iter()
+                .any(|sql| sql.contains("run_display_projections")),
+            "ordinary chat must not maintain a separate display store"
+        );
         let diagnostic_rows: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
         )
@@ -171,6 +195,12 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         );
         let requests = b.ctx.native_provider_requests().await;
         assert_eq!(requests.len(), readonly_rounds + 1);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.body.to_string().contains(imported)),
+            "raw transcript without canonical Context must not be injected into provider requests"
+        );
         if readonly_rounds > 0 {
             assert!(
                 requests.last().unwrap().body["messages"]

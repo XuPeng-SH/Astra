@@ -1898,7 +1898,6 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
         for table in [
             "tool_invocation_ledger",
             "agent_session_execution_slots",
-            "run_display_projections",
             "run_checkpoints",
             "agent_run_events",
             "agent_runs",
@@ -2319,7 +2318,6 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
         for table in [
             "tool_invocation_ledger",
             "agent_session_execution_slots",
-            "run_display_projections",
             "run_checkpoints",
             "agent_run_events",
             "agent_runs",

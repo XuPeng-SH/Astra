@@ -147,8 +147,6 @@ pub(crate) struct PostLoopPersistContext {
     pub(crate) hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     pub(crate) observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     pub(crate) metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    pub(crate) csl_manager:
-        Option<tokio::sync::Mutex<astra_turn_core::conversation_log::manager::CslManager>>,
 }
 
 impl PostLoopPersistContext {
@@ -177,13 +175,12 @@ impl PostLoopPersistContext {
     ///
     /// Callers must pass the exact result of
     /// [`Self::persist_canonical_transcript_in_transaction`]. This keeps the order
-    /// `canonical journal -> context-head CAS -> CSL/projections` explicit.
+    /// `canonical journal -> context-head CAS -> derived consumers` explicit.
     pub(crate) async fn run_after_core(
         &self,
         state: &AgenticLoopState,
         loop_success: bool,
         canonical_result: Result<(), String>,
-        canonical_context_persisted: bool,
     ) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Err(error) = canonical_result {
@@ -193,17 +190,10 @@ impl PostLoopPersistContext {
             // failed creates a second, contradictory source of truth. Retain
             // the classified terminal failure and append-only provider/tool
             // evidence, but fail closed before derived state escapes.
-            return Err(format!("core+trace transaction failed: {error}"));
+            return Err(format!("canonical transaction failed: {error}"));
         }
 
         crate::turn::agentic_loop::finalization::persist_completed_context_trace(state).await;
-
-        // 1. Persist CSL via CslManager only after core+trace persistence
-        // succeeds. If CSL fails later, restore can fall back to transcript
-        // messages; if core+trace failed, advancing CSL would create history
-        // without canonical durable events behind it.
-        self.persist_csl_if_canonical_ready(state, canonical_context_persisted, &mut errors)
-            .await;
 
         // The remaining consumers all read the immutable completed loop state
         // and write independent sinks. The writes are awaited together;
@@ -283,41 +273,6 @@ impl PostLoopPersistContext {
             Ok(())
         } else {
             Err(errors.join("; "))
-        }
-    }
-
-    async fn persist_csl_if_canonical_ready(
-        &self,
-        state: &AgenticLoopState,
-        canonical_ready: bool,
-        errors: &mut Vec<String>,
-    ) {
-        let Some(ref mgr) = self.csl_manager else {
-            return;
-        };
-        if !canonical_ready {
-            tracing::warn!(
-                session_id = %self.session_id,
-                run_id = %self.run_id,
-                "skipping CSL persist because canonical journal or context-head persistence failed"
-            );
-            return;
-        }
-
-        let mut mgr = mgr.lock().await;
-        let session_state = extract_session_state_compact(state);
-        let messages = messages_for_csl_persist(state);
-        if let Err(e) = mgr
-            .persist_turn(state.session_turn, &messages, &session_state)
-            .await
-        {
-            let msg = format!("CSL persist failed: {}", e);
-            tracing::warn!(
-                session_id = %self.session_id,
-                error = %e,
-                "CSL persist failed"
-            );
-            errors.push(msg);
         }
     }
 
@@ -990,64 +945,6 @@ async fn persist_server_loop_canonical_append_inner(
     })
 }
 
-pub(crate) fn extract_session_state_compact(
-    state: &AgenticLoopState,
-) -> astra_turn_core::conversation_log::SessionStateCompact {
-    astra_turn_core::conversation_log::SessionStateCompact {
-        source_cursor: None,
-        // CSL is conversation materialization, not execution policy. Persisting
-        // transient restrictions, approvals, interruptions, budgets, or
-        // compaction pressure here makes old materialized state hard-steer later
-        // turns. Deferred activation is different: it records which full
-        // schemas the retained prompt has already materialized and remains
-        // subject to the current surface and runtime bindings on restore.
-        blocked_tools: Vec::new(),
-        recent_tools: state.recent_tools.clone(),
-        // Carrier calls are authorized solely by the digest-bearing evidence
-        // below. A name-only shadow set must never revive an obsolete schema
-        // decision into a later provider surface.
-        // Only paired tool_search results carrying a digest may later
-        // authorize the stable deferred carrier. Name-only state is retained
-        // separately for transitional prompt continuity, never for dispatch.
-        deferred_tool_activations:
-            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-                &state.messages,
-                state.deferred_tool_activations.clone(),
-            ),
-        approval_overrides: None,
-        budget_remaining_tokens: 0,
-        budget_remaining_rounds: 0,
-        consecutive_ctx_errors: 0,
-        interruption: None,
-        delegation: None,
-        compaction_tracker: None,
-    }
-}
-
-pub(crate) fn restore_session_state_compact(
-    ss: astra_turn_core::conversation_log::SessionStateCompact,
-    loop_state: &mut AgenticLoopState,
-) {
-    if !ss.recent_tools.is_empty() {
-        loop_state.recent_tools = ss.recent_tools;
-    }
-    // Checkpoints and CSL are independent recovery projections. A compacted
-    // transcript can legitimately predate a deferred-tool selection that the
-    // step checkpoint already restored, so CSL must only contribute durable
-    // activation facts; it must never erase a newer one.
-    loop_state.deferred_tool_activations =
-        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-            &[],
-            std::mem::take(&mut loop_state.deferred_tool_activations)
-                .into_iter()
-                .chain(ss.deferred_tool_activations),
-        );
-    // Intentionally ignore all actual runtime-control fields in
-    // SessionStateCompact. Older CSL records may contain them, but restoring
-    // them here would leak stale pauses, approvals, budget pressure, and
-    // compaction failures into a new user turn.
-}
-
 pub(crate) fn restore_step_checkpoint_runtime_state(
     restored: astra_pipeline::step_restore::RestoredSession,
     current_date: &str,
@@ -1142,45 +1039,6 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     Ok(())
 }
 
-pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
-    let mut messages = state.messages.clone();
-    if astra_core::history_work::instrumentation_enabled() {
-        let (bytes, rows) = json_history_payload_work(&messages);
-        astra_core::history_work::record_operation(
-            astra_core::history_work::HistoryWorkSite::ServerCslPersistClone,
-            bytes,
-            rows,
-            0,
-        );
-    }
-    let final_text = state.final_text.trim();
-    if !final_text.is_empty() {
-        let already_has_final = messages
-            .last()
-            .and_then(|message| {
-                if let Some(id) = state.final_text_model_item_id.as_deref() {
-                    return Some(astra_turn_types::model_item_id(message) == Some(id));
-                }
-                let role = message.get("role")?.as_str()?;
-                let content = message.get("content")?.as_str()?;
-                Some(role == "assistant" && content.trim() == final_text)
-            })
-            .unwrap_or(false);
-        if !already_has_final {
-            let mut message = json!({
-                "role": "assistant",
-                "content": final_text,
-            });
-            astra_turn_types::mark_model_message(
-                &mut message,
-                state.final_text_model_item_id.as_deref(),
-            );
-            messages.push(message);
-        }
-    }
-    messages
-}
-
 /// Count cloned heap payload without allocating a second serialized history.
 fn json_value_payload_bytes(value: &Value) -> u64 {
     match value {
@@ -1203,15 +1061,6 @@ fn json_map_payload_bytes(values: &Map<String, Value>) -> u64 {
             .saturating_add(key.len().try_into().unwrap_or(u64::MAX))
             .saturating_add(json_value_payload_bytes(value))
     })
-}
-
-fn json_history_payload_work(messages: &[Value]) -> (u64, u64) {
-    (
-        messages.iter().fold(0_u64, |bytes, message| {
-            bytes.saturating_add(json_value_payload_bytes(message))
-        }),
-        messages.len().try_into().unwrap_or(u64::MAX),
-    )
 }
 
 fn server_observer_request_retained_bytes(request: &TurnObserverRequest) -> u64 {
@@ -2574,9 +2423,6 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_turn_core::conversation_log::CslStore;
-    use astra_turn_core::conversation_log::file_store::FileCslStore;
-    use astra_turn_core::conversation_log::manager::{CslManager, CslManagerConfig};
     use sqlx::Row;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -2654,7 +2500,6 @@ mod tests {
             }],
             last_event_idx: 7,
             latest_event_type: Some("run_finished".to_string()),
-            projection_hash: "projection-hash".to_string(),
         }
     }
 
@@ -2807,10 +2652,7 @@ mod tests {
         }
     }
 
-    fn test_post_loop_persist_context(
-        session_id: &str,
-        csl_manager: Option<CslManager>,
-    ) -> PostLoopPersistContext {
+    fn test_post_loop_persist_context(session_id: &str) -> PostLoopPersistContext {
         PostLoopPersistContext {
             matrixone: MatrixOneSettings::default(),
             shared_pool: None,
@@ -2825,13 +2667,12 @@ mod tests {
             hook_db_writer: None,
             observer_worker: None,
             metrics_registry: None,
-            csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         }
     }
 
     #[test]
     fn root_atomic_terminal_append_includes_recoverable_assistant_transcript() {
-        let persist = test_post_loop_persist_context("root-terminal-transcript", None);
+        let persist = test_post_loop_persist_context("root-terminal-transcript");
         let append = persist.atomic_terminal_canonical_append(7);
         assert!(append.include_terminal_assistant);
         assert_eq!(append.expected_owner_generation, Some(7));
@@ -2920,7 +2761,7 @@ mod tests {
         let user = format!("post-loop-user-{}", Uuid::new_v4());
         let session = format!("post-loop-session-{}", Uuid::new_v4());
         crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
-        let mut persist = test_post_loop_persist_context(&session, None);
+        let mut persist = test_post_loop_persist_context(&session);
         persist.user_id = user.clone();
         persist.shared_pool = Some(pool.clone());
         persist.hook_db_writer = Some(Arc::new(
@@ -2930,10 +2771,7 @@ mod tests {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "Ordinary answer".into();
         state.telemetry.all_selected_skills.push("review".into());
-        persist
-            .run_after_core(&state, true, Ok(()), true)
-            .await
-            .unwrap();
+        persist.run_after_core(&state, true, Ok(())).await.unwrap();
         let selected: Vec<String> = sqlx::query_scalar(
             "SELECT skill_name FROM skill_selection_events WHERE user_id = ? AND session_id = ?",
         )
@@ -3183,15 +3021,12 @@ mod tests {
         // between our assertions and background persistence.
         state.telemetry.all_selected_skills.clear();
         persist
-            .run_after_core(&state, true, Ok(()), true)
+            .run_after_core(&state, true, Ok(()))
             .await
             .expect("ordinary post-loop must not access the closed database");
         state.telemetry.all_selected_skills.push("review".into());
         assert!(
-            persist
-                .run_after_core(&state, true, Ok(()), true)
-                .await
-                .is_err(),
+            persist.run_after_core(&state, true, Ok(())).await.is_err(),
             "positive control: a real skill write must still require the database"
         );
     }
@@ -3607,7 +3442,7 @@ mod tests {
     #[tokio::test]
     async fn canonical_failure_does_not_publish_derived_hook_state() {
         let writer = Arc::new(CaptureHookDbWriter::default());
-        let mut persist = test_post_loop_persist_context("canonical-failure-session", None);
+        let mut persist = test_post_loop_persist_context("canonical-failure-session");
         persist.hook_db_writer = Some(writer.clone());
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.telemetry.all_selected_skills.push("review".into());
@@ -3617,7 +3452,6 @@ mod tests {
                 &state,
                 false,
                 Err("canonical transaction unavailable".to_string()),
-                false,
             )
             .await
             .expect_err("derived state must fail closed without canonical facts");
@@ -3868,7 +3702,7 @@ mod tests {
             "content": ["hi", {"text": "nested"}],
         })];
 
-        assert_eq!(json_history_payload_work(&messages), (27, 1));
+        assert_eq!(json_value_payload_bytes(&messages[0]), 27);
     }
 
     #[test]
@@ -3916,104 +3750,6 @@ mod tests {
             "observer turn_count is a session/user-turn sequence, not the \
              number of LLM/tool-loop rounds consumed inside this turn",
         );
-    }
-
-    #[test]
-    fn messages_for_csl_persist_keeps_raw_canonical_history() {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        let mut objective = json!({"role": "user", "content": "old review"});
-        astra_turn_types::mark_user_turn_semantics(
-            &mut objective,
-            astra_turn_types::UserTurnSemantics::new(
-                astra_turn_types::ObjectiveRelation::Replace,
-                None,
-            ),
-        );
-        state.messages = vec![
-            objective,
-            json!({"role": "system", "content": "arbitrary compaction boundary", "_compact_boundary": true}),
-            json!({"role": "user", "content": "不要review啊！"}),
-            json!({"role": "assistant", "reasoning_content": "trace"}),
-            astra_turn_types::runtime_owned_message(
-                "system",
-                "arbitrary runtime projection",
-                astra_turn_types::RuntimeMessageDelivery::Projection,
-            ),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
-        ];
-        state.final_text = "ok".to_string();
-
-        let messages = messages_for_csl_persist(&state);
-
-        assert_eq!(messages.len(), 7);
-        assert_eq!(messages[0]["content"], "old review");
-        assert_eq!(
-            astra_turn_types::user_turn_semantics(&messages[0])
-                .expect("valid semantics")
-                .map(|semantics| semantics.objective_relation),
-            Some(astra_turn_types::ObjectiveRelation::Replace)
-        );
-        assert_eq!(messages[1]["_compact_boundary"], true);
-        assert_eq!(messages[2]["content"], "不要review啊！");
-        assert_eq!(messages[3]["reasoning_content"], "trace");
-        assert!(astra_turn_types::is_runtime_owned_message(&messages[4]));
-        assert_eq!(messages[5]["role"], "tool");
-        assert_eq!(messages[6]["content"], "ok");
-    }
-
-    #[tokio::test]
-    async fn csl_persist_is_skipped_when_canonical_backbone_is_incomplete() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store: Arc<dyn CslStore> = Arc::new(FileCslStore::new(dir.path()));
-        let session_id = "post-loop-csl-gated-on-core";
-        let manager = CslManager::new(
-            Arc::clone(&store),
-            session_id.to_string(),
-            CslManagerConfig::default(),
-        )
-        .expect("csl manager");
-        let ctx = test_post_loop_persist_context(session_id, Some(manager));
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.session_turn = 3;
-        state.messages = vec![json!({"role": "user", "content": "question"})];
-        state.final_text = "answer".to_string();
-        let mut errors = Vec::new();
-
-        ctx.persist_csl_if_canonical_ready(&state, false, &mut errors)
-            .await;
-
-        assert!(errors.is_empty());
-        let entries = store.load_after(session_id, 0).await.expect("load csl");
-        assert!(
-            entries.is_empty(),
-            "CSL must not advance when core+trace persistence failed: {entries:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn csl_persist_runs_after_canonical_backbone_is_ready() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store: Arc<dyn CslStore> = Arc::new(FileCslStore::new(dir.path()));
-        let session_id = "post-loop-csl-after-core";
-        let manager = CslManager::new(
-            Arc::clone(&store),
-            session_id.to_string(),
-            CslManagerConfig::default(),
-        )
-        .expect("csl manager");
-        let ctx = test_post_loop_persist_context(session_id, Some(manager));
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.session_turn = 3;
-        state.messages = vec![json!({"role": "user", "content": "question"})];
-        state.final_text = "answer".to_string();
-        let mut errors = Vec::new();
-
-        ctx.persist_csl_if_canonical_ready(&state, true, &mut errors)
-            .await;
-
-        assert!(errors.is_empty());
-        let entries = store.load_after(session_id, 0).await.expect("load csl");
-        assert_eq!(entries.len(), 1, "successful core+trace must allow CSL");
     }
 
     #[test]
@@ -4557,7 +4293,6 @@ mod tests {
             hook_db_writer: None,
             observer_worker: None,
             metrics_registry: None,
-            csl_manager: None,
         };
         let terminal_assistant_source_event_id = persist
             .persist_canonical_transcript_in_transaction(&state, true)
@@ -4634,7 +4369,7 @@ mod tests {
         ));
         let authority = engine.start_run(&run, &user, &session).await.unwrap();
         let state = crate::turn::agentic_loop::host::make_test_loop_state();
-        let mut persist = test_post_loop_persist_context(&session, None);
+        let mut persist = test_post_loop_persist_context(&session);
         persist.shared_pool = Some(pool.clone());
         persist.user_id = user.clone();
         persist.run_id = run.clone();
@@ -4738,7 +4473,7 @@ mod tests {
             .unwrap();
             cleanup_core_persist_fixture_for_owner(db, session, owner).await;
         }
-        for table in ["agent_run_events", "run_display_projections", "agent_runs"] {
+        for table in ["agent_run_events", "agent_runs"] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND run_id = ?"
             )))
@@ -5213,7 +4948,6 @@ mod tests {
             hook_db_writer: None,
             observer_worker: None,
             metrics_registry: None,
-            csl_manager: None,
         };
         let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
         persist_root_turn_input(
@@ -5622,94 +5356,38 @@ mod tests {
             terminal_events.clone()
         };
         assert!(commit.terminal_assistant_source_event_id.is_some());
-        let commit_hash = sqlx::query_scalar::<_, String>(
-            "SELECT projection_hash FROM run_display_projections
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .fetch_one(&db)
-        .await
-        .expect("read committed terminal projection hash");
-        let projection_row = sqlx::query(
-            "SELECT status, waiting_for, projection_event_idx, latest_event_type,
-                    latest_checkpoint_id, latest_checkpoint_kind, latest_checkpoint_version,
-                    total_prompt_tokens, total_completion_tokens, total_tool_calls,
-                    projection_hash
-             FROM run_display_projections WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .fetch_one(&db)
-        .await
-        .expect("terminal settlement must commit its display projection");
+        let canonical_store = DatabaseRunStateStore::new(pool.clone());
+        let canonical = canonical_store
+            .load_run(&user_id, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canonical.status, terminal_status);
+        assert!(canonical.waiting_for.is_none());
+        assert!(canonical.last_event_idx > 0);
         assert_eq!(
-            projection_row.try_get::<String, _>("status").unwrap(),
-            terminal_status
-        );
-        assert!(
-            projection_row
-                .try_get::<Option<String>, _>("waiting_for")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            projection_row
-                .try_get::<i64, _>("projection_event_idx")
-                .unwrap()
-                > 0
-        );
-        assert_eq!(
-            projection_row
-                .try_get::<Option<String>, _>("latest_event_type")
-                .unwrap()
+            canonical
+                .events
+                .last()
+                .map(astra_services::extract_event_type)
                 .as_deref(),
             Some("run_settlement_finished")
         );
         assert_eq!(
-            projection_row
-                .try_get::<i64, _>("total_prompt_tokens")
-                .unwrap(),
-            37
+            (
+                canonical.total_prompt_tokens,
+                canonical.total_completion_tokens,
+                canonical.total_tool_calls
+            ),
+            (37, 17, 6)
         );
-        assert_eq!(
-            projection_row
-                .try_get::<i64, _>("total_completion_tokens")
-                .unwrap(),
-            17
-        );
-        assert_eq!(
-            projection_row
-                .try_get::<i64, _>("total_tool_calls")
-                .unwrap(),
-            6
-        );
-        assert_eq!(
-            projection_row
-                .try_get::<String, _>("projection_hash")
-                .unwrap(),
-            commit_hash
-        );
-        assert!(
-            projection_row
-                .try_get::<Option<String>, _>("latest_checkpoint_id")
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            projection_row
-                .try_get::<Option<String>, _>("latest_checkpoint_kind")
-                .unwrap()
-                .as_deref(),
-            Some("resume")
-        );
-        assert_eq!(
-            projection_row
-                .try_get::<Option<String>, _>("latest_checkpoint_version")
-                .unwrap()
-                .as_deref(),
-            Some("checkpoint_v1")
-        );
+        let checkpoint = canonical_store
+            .load_latest_checkpoint(&user_id, &run_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.checkpoint_kind, "resume");
+        assert_eq!(checkpoint.checkpoint_version, "checkpoint_v1");
 
         // Exercise the same authoritative resolver used after a lost COMMIT
         // acknowledgement, including its receipt and canonical-evidence checks.

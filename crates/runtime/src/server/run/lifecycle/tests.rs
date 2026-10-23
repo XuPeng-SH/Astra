@@ -567,13 +567,9 @@ fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
     assert!(must_mutate.verification_required);
 }
 
-use crate::server::run::lifecycle::persistence::{
-    extract_session_state_compact, messages_for_csl_persist,
-};
 use astra_services::runs::{
-    DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-    DurableRunRecord, InMemoryRunStateStore, RunStateStore, RuntimeMcpBindingRequest,
-    RuntimeSkillBindingRequest,
+    DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunRecord, InMemoryRunStateStore,
+    RunStateStore, RuntimeMcpBindingRequest, RuntimeSkillBindingRequest,
 };
 use astra_services::session_journal::{JournalEventType, ToolCallDisposition, ToolCallRecord};
 use astra_services::workspace_records::{
@@ -1586,10 +1582,6 @@ async fn exercise_primary_continuation_entry(
         ));
     let mut created = Vec::new();
     if compact_history {
-        use astra_turn_core::conversation_log::{
-            SessionStateCompact,
-            manager::{CslManager, CslManagerConfig},
-        };
         let mut history = vec![
             json!({"role":"user","content":"Read the current continuation live runtime overview."}),
         ];
@@ -1599,38 +1591,56 @@ async fn exercise_primary_continuation_entry(
             history.push(json!({"role":"tool","tool_call_id":call_id,"content":if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(500)) } else { format!("Recent observation {index}") }}));
         }
         history.push(json!({"role":"assistant","content":"Earlier observations archived; current overview remains to be collected."}));
-        let cursor = astra_turn_types::SessionCursorV1 {
-            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
-            owner_id: owner.into(),
-            session_id: session.into(),
-            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+        let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            owner,
+            session,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            owner,
+            "continuation-history-fixture",
+            astra_turn_types::ActorKindV1::Server,
+            astra_turn_types::SessionSurfaceV1::Server,
+            None,
+            astra_turn_types::AuthorityEpochsV1::default(),
+        );
+        let reservation = match coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                None,
+                &actor,
+                Duration::from_secs(60),
+                "continuation-history-writer",
+                "continuation-history-turn",
+                None,
+            )
+            .await
+            .expect("admit canonical fixture history")
+        {
+            astra_services::AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => {
+                reservation
+            }
+            other => panic!("unexpected canonical history admission: {other:?}"),
+        };
+        let delta = astra_turn_types::CanonicalTurnDeltaV1 {
+            schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
             completed_turn: 1,
             journal_event_seq: 1,
             conversation_seq: 1,
-            canonical_root_hash: astra_turn_types::canonical_conversation_root(&history),
-            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
             compaction_generation: 0,
             config_version_id: None,
+            mode: astra_turn_types::CanonicalDeltaModeV1::Append,
+            logical_segments: pack_canonical_turn_segments(history),
         };
-        let mut manager = CslManager::new(
-            service
-                .build_csl_store(owner)
-                .expect("durable history store"),
-            session.into(),
-            CslManagerConfig::default(),
-        )
-        .unwrap();
-        manager
-            .persist_turn(
-                1,
-                &history,
-                &SessionStateCompact {
-                    source_cursor: Some(cursor),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("persist complete prior history");
+        assert!(matches!(
+            coordinator
+                .commit_turn_and_release_writer(&reservation, delta, "continuation-history-commit",)
+                .await
+                .expect("persist canonical prior history"),
+            astra_turn_types::CoordinatorMutationV1::Applied { .. }
+        ));
     }
     for turn in 0..2 {
         let boundary = observations.lock().await.len();
@@ -3157,333 +3167,6 @@ fn test_agent_spawned(
             fanout_slot: None,
         },
     )
-}
-
-#[test]
-fn restore_session_state_compact_ignores_runtime_control_state() {
-    let svc = test_service();
-    let request = test_request("resume");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.max_turn_input_tokens = 123_456;
-    state.remaining_turns = 9;
-    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
-        name: "web_fetch".into(),
-        schema_digest: "sha256:checkpoint".into(),
-        descriptor: None,
-    }];
-
-    restore_session_state_compact(
-        astra_turn_core::conversation_log::SessionStateCompact {
-            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
-                name: "github".into(),
-                schema_digest: "sha256:csl".into(),
-                descriptor: None,
-            }],
-            approval_overrides: Some(json!({"approval": "stale"})),
-            budget_remaining_tokens: 42_000,
-            budget_remaining_rounds: 3,
-            consecutive_ctx_errors: 3,
-            interruption: Some(json!({
-                "kind": "budget_exhausted",
-                "resume_action": "continue_immediately"
-            })),
-            compaction_tracker: Some(json!({
-                "attempt_count": 4,
-                "cumulative_tokens_freed": 18_000,
-                "last_tokens_freed": 2_000,
-                "last_was_insufficient": true,
-                "consecutive_futile_attempts": 2,
-            })),
-            ..Default::default()
-        },
-        &mut state,
-    );
-
-    assert!(state.approval_overrides.is_none());
-    assert!(state.interruption.is_none());
-    assert_eq!(state.max_turn_input_tokens, 123_456);
-    assert_eq!(state.remaining_turns, 9);
-    assert_eq!(state.consecutive_context_window_errors, 0);
-    assert_eq!(state.compaction_effectiveness.attempt_count, 0);
-    assert_eq!(
-        state.deferred_tool_activations.len(),
-        2,
-        "CSL and checkpoint selections merge only as schema-addressed evidence"
-    );
-}
-
-#[test]
-fn csl_restore_does_not_wire_name_only_activation_into_the_executor() {
-    let svc = test_service();
-    let request = test_request("resume");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    // This is the recovery order used by a resumed root run: the heavy
-    // checkpoint is restored first and CSL follows as a transcript projection.
-    restore_session_state_compact(
-        astra_turn_core::conversation_log::SessionStateCompact::default(),
-        &mut state,
-    );
-
-    let workspace = tempfile::tempdir().expect("workspace");
-    super::wire_executor_into_state(
-        crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
-            workspace.path().to_path_buf(),
-            "test-user".to_string(),
-            "session-1".to_string(),
-            None,
-            None,
-        ),
-        &mut state,
-    );
-
-    assert!(state.runtime_tool_executor.is_some());
-}
-
-#[test]
-fn csl_session_state_does_not_persist_runtime_control_state() {
-    let svc = test_service();
-    let request = test_request("resume");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.restricted_tools.insert("write_file".to_string());
-    state.max_turn_input_tokens = 50_000;
-    state.remaining_turns = 2;
-    state.consecutive_context_window_errors = 5;
-    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-        astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
-        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-        astra_turn_core::interruption::InterruptionStateSummary {
-            has_checkpoint: true,
-            tool_calls_completed: 1,
-            turns_completed: 1,
-            remaining_turns: 0,
-            error_detail: Some("stale interruption".to_string()),
-            stall_signal: None,
-            resume_restricted_tools: vec![],
-        },
-    ));
-    state.compaction_effectiveness.attempt_count = 7;
-    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
-        name: "github".into(),
-        schema_digest: "sha256:github".into(),
-        descriptor: None,
-    }];
-
-    let compact = extract_session_state_compact(&state);
-
-    assert!(
-        compact.blocked_tools.is_empty(),
-        "conversation-log state must not persist transient runtime restrictions"
-    );
-    assert!(compact.approval_overrides.is_none());
-    assert!(compact.interruption.is_none());
-    assert_eq!(compact.budget_remaining_tokens, 0);
-    assert_eq!(compact.budget_remaining_rounds, 0);
-    assert_eq!(compact.consecutive_ctx_errors, 0);
-    assert!(compact.compaction_tracker.is_none());
-    assert_eq!(
-        compact.deferred_tool_activations,
-        state.deferred_tool_activations
-    );
-}
-
-#[test]
-fn csl_session_state_preserves_typed_activation_without_executor_side_state() {
-    let svc = test_service();
-    let request = test_request("resume");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
-        name: "stale-state-copy".into(),
-        schema_digest: "sha256:stale".into(),
-        descriptor: None,
-    }];
-    let workspace = tempfile::tempdir().expect("workspace");
-    let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
-        workspace.path().to_path_buf(),
-        "test-user".to_string(),
-        "session-1".to_string(),
-        None,
-        None,
-    );
-    state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
-
-    let compact = extract_session_state_compact(&state);
-
-    assert_eq!(
-        compact.deferred_tool_activations,
-        state.deferred_tool_activations
-    );
-}
-
-#[test]
-fn csl_session_state_restore_ignores_legacy_blocked_tools() {
-    let svc = test_service();
-    let request = test_request("resume");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-
-    restore_session_state_compact(
-        astra_turn_core::conversation_log::SessionStateCompact {
-            blocked_tools: vec!["legacy_stale_tool".into()],
-            recent_tools: vec!["read_file".into()],
-            ..Default::default()
-        },
-        &mut state,
-    );
-
-    assert!(
-        state.restricted_tools.is_empty(),
-        "legacy CSL blocked_tools must not restore as hard runtime restrictions"
-    );
-    assert_eq!(state.recent_tools, vec!["read_file"]);
-}
-
-#[test]
-fn csl_restore_turn_start_excludes_current_user_message() {
-    let svc = test_service();
-    let request = test_request("3");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-2",
-        None,
-        None,
-        None,
-    );
-    let restored = vec![
-        json!({"role": "user", "content": "1"}),
-        json!({"role": "assistant", "content": "ack 1"}),
-    ];
-
-    let turn_start =
-        AgenticRunLifecycleService::restore_csl_messages_into_loop_state(restored, &mut state);
-
-    assert_eq!(
-        turn_start, 2,
-        "CSL deltas must start before this turn's user message"
-    );
-    assert_eq!(state.messages.len(), 3);
-    assert_eq!(state.messages[0]["content"], "1");
-    assert_eq!(state.messages[1]["content"], "ack 1");
-    assert_eq!(state.messages[2]["content"], "3");
-}
-
-#[tokio::test]
-async fn csl_persist_after_restore_keeps_current_user_message() {
-    use astra_turn_core::conversation_log::file_store::FileCslStore;
-    use astra_turn_core::conversation_log::manager::{CslManager, CslManagerConfig};
-    use astra_turn_core::conversation_log::{CslStore, SessionStateCompact};
-
-    let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn CslStore> = Arc::new(FileCslStore::new(dir.path()));
-    let session_id = "server-csl-current-user";
-    let mut first = CslManager::new(
-        Arc::clone(&store),
-        session_id.to_string(),
-        CslManagerConfig::default(),
-    )
-    .unwrap();
-    first
-        .persist_turn(
-            1,
-            &[
-                json!({"role": "user", "content": "1"}),
-                json!({"role": "assistant", "content": "ack 1"}),
-            ],
-            &SessionStateCompact::default(),
-        )
-        .await
-        .unwrap();
-
-    let svc = test_service();
-    let request = test_request("3");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-2",
-        None,
-        None,
-        None,
-    );
-    state.final_text = "ack 3".to_string();
-
-    let mut resumed = CslManager::new(
-        Arc::clone(&store),
-        session_id.to_string(),
-        CslManagerConfig::default(),
-    )
-    .unwrap();
-    let materialized = resumed.load().await.unwrap().unwrap();
-    let turn_start = AgenticRunLifecycleService::restore_csl_messages_into_loop_state(
-        materialized.messages,
-        &mut state,
-    );
-    resumed.mark_turn_start(turn_start);
-
-    let messages = messages_for_csl_persist(&state);
-    resumed
-        .persist_turn(2, &messages, &extract_session_state_compact(&state))
-        .await
-        .unwrap();
-
-    let mut reloaded = CslManager::new(
-        Arc::clone(&store),
-        session_id.to_string(),
-        CslManagerConfig::default(),
-    )
-    .unwrap();
-    let final_state = reloaded.load().await.unwrap().unwrap();
-    let contents = final_state
-        .messages
-        .iter()
-        .map(|message| message["content"].as_str().unwrap_or_default())
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        contents,
-        vec!["1", "ack 1", "3", "ack 3"],
-        "restored web runs must persist the current user message into CSL"
-    );
 }
 
 #[test]
@@ -10470,14 +10153,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .await
     }
 
-    async fn load_run_projection(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.inner.load_run_projection(user_id, run_id).await
-    }
-
     async fn find_latest_root_run(
         &self,
         user_id: &str,
@@ -10487,17 +10162,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.counters.lock().unwrap().explain_lookup_calls += 1;
         self.inner
             .find_latest_root_run(user_id, session_id, current_root)
-            .await
-    }
-
-    async fn rebuild_run_projection(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.inner
-            .rebuild_run_projection(user_id, expected_session_id, run_id)
             .await
     }
 
@@ -12115,117 +11779,6 @@ async fn durable_descendant_cancellation_pages_past_500_descendants_and_unrelate
     }
 }
 
-#[test]
-fn resume_hydration_requires_existing_session_with_prior_prompt_history() {
-    assert!(
-        !should_restore_prior_prompt_history(false, false),
-        "new sessions must not enter resume hydration"
-    );
-    assert!(
-        !should_restore_prior_prompt_history(false, true),
-        "prior history is irrelevant when the request does not target an existing session"
-    );
-    assert!(
-        !should_restore_prior_prompt_history(true, false),
-        "a pre-created web session id without prompt history is not a resume"
-    );
-    assert!(
-        should_restore_prior_prompt_history(true, true),
-        "resume is only valid when an existing session has prompt-facing history"
-    );
-}
-
-#[test]
-fn canonical_continuation_skips_redundant_hybrid_resume_hydration() {
-    assert!(should_hydrate_degraded_session_resume(true, false));
-    assert!(
-        !should_hydrate_degraded_session_resume(true, true),
-        "canonical history and warm runtime state already own ordinary continuation"
-    );
-    assert!(!should_hydrate_degraded_session_resume(false, false));
-}
-
-#[tokio::test]
-async fn server_resume_hydration_failure_is_not_prompt_facing() {
-    let service = test_service();
-
-    let hint = service
-        .session_resume_hydration_hint_for_session("user-1", "session-1", "run-1", true)
-        .await;
-
-    assert_eq!(hint, None);
-}
-
-#[test]
-fn server_resume_hydration_uses_transcript_when_primary_restore_is_not_viable() {
-    let primary = vec![json!({"role": "user", "content": "继续"})];
-    let transcript = vec![
-        json!({"role": "user", "content": "review branch changes"}),
-        json!({"role": "assistant", "content": "The review found resume continuity issues."}),
-    ];
-
-    let hint = AgenticRunLifecycleService::session_resume_hydration_hint_from_sources(
-        &primary,
-        &transcript,
-    )
-    .expect("transcript metadata should be valid")
-    .expect("transcript fallback should provide viable resume context");
-
-    assert!(hint.contains("latest_user_input: review branch changes"));
-    assert!(hint.contains("last_assistant_state: The review found resume continuity issues."));
-}
-
-#[test]
-fn server_resume_hydration_prefers_primary_restore_when_viable() {
-    let primary = vec![
-        json!({"role": "user", "content": "primary goal"}),
-        json!({"role": "assistant", "content": "primary state"}),
-    ];
-    let transcript = vec![
-        json!({"role": "user", "content": "transcript goal"}),
-        json!({"role": "assistant", "content": "transcript state"}),
-    ];
-
-    let hint = AgenticRunLifecycleService::session_resume_hydration_hint_from_sources(
-        &primary,
-        &transcript,
-    )
-    .expect("primary metadata should be valid")
-    .expect("primary restore should provide viable resume context");
-
-    assert!(hint.contains("latest_user_input: primary goal"));
-    assert!(hint.contains("last_assistant_state: primary state"));
-    assert!(!hint.contains("transcript goal"));
-    assert!(!hint.contains("transcript state"));
-}
-
-#[test]
-fn server_resume_hydration_does_not_hide_corrupt_primary_metadata_with_a_fallback() {
-    let primary = vec![
-        json!({
-            "role": "user",
-            "content": "primary goal",
-            (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
-                "schema_version": "invalid",
-                "objective_relation": "replace"
-            }
-        }),
-        json!({"role": "assistant", "content": "primary state"}),
-    ];
-    let transcript = vec![
-        json!({"role": "user", "content": "fallback goal"}),
-        json!({"role": "assistant", "content": "fallback state"}),
-    ];
-
-    assert!(matches!(
-        AgenticRunLifecycleService::session_resume_hydration_hint_from_sources(
-            &primary,
-            &transcript,
-        ),
-        Err(astra_turn_types::UserTurnSemanticsError::Malformed(_))
-    ));
-}
-
 fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycleService {
     let engine = RunEngine::new(store);
     AgenticRunLifecycleService::new(
@@ -12410,27 +11963,28 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
                 1,
                 "a lost claim must release only its own resident capacity"
             );
-            let prior = service
-                .restore_transcript_prompt_messages(&user, &session, &run, "atomic-start-test")
-                .await;
             assert!(
-                prior.is_empty(),
-                "the accepted input is not prior-turn history"
+                participant
+                    .0
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .prior_messages
+                    .is_empty(),
+                "the accepted input is not prior canonical history"
             );
-            let visible = service
-                .restore_transcript_prompt_messages(
-                    &user,
-                    &session,
-                    "next-run",
-                    "atomic-start-test",
-                )
-                .await;
-            assert_eq!(visible[0]["content"], request.message);
+            let visible: Vec<String> = sqlx::query_scalar(
+                "SELECT content FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND run_id = ? AND role = 'user'",
+            ).bind(&user).bind(&session).bind(&run).fetch_all(pool.get()).await.unwrap();
+            assert_eq!(
+                visible,
+                vec![request.message.clone()],
+                "opening must durably retain the original submitted input"
+            );
         }
         for table in [
             "agent_runs",
             "agent_run_events",
-            "run_display_projections",
             "session_transcript_items",
             "agent_events",
         ] {
@@ -12442,7 +11996,11 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             .fetch_one(pool.get())
             .await
             .unwrap();
-            assert_eq!(count, i64::from(!reject), "{table}: reject={reject}");
+            assert_eq!(
+                count,
+                i64::from(!reject && table != "agent_events"),
+                "{table}: reject={reject}"
+            );
         }
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? AND active_writer_json IS NOT NULL AND active_reservation_json IS NOT NULL")
             .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
@@ -12455,7 +12013,10 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
         .fetch_one(pool.get())
         .await
         .unwrap();
-        assert_eq!(count, i64::from(!reject));
+        assert_eq!(
+            count, 0,
+            "ordinary opening does not create diagnostic events"
+        );
         if let Some(admission) = participant.0.admission.as_ref() {
             let _ = admission.coordinator.release_writer(&admission.lease).await;
             admission.release_started.store(true, Ordering::Release);
@@ -12467,7 +12028,6 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             ("agent_session_execution_slots", "user_id"),
             ("session_transcript_items", "user_id"),
             ("agent_events", "user_id"),
-            ("run_display_projections", "user_id"),
             ("agent_run_events", "user_id"),
             ("agent_runs", "user_id"),
             ("agent_sessions", "user_id"),
@@ -12482,159 +12042,6 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             .unwrap();
         }
     }
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-async fn transcript_prompt_hydration_preserves_lineage_budget_and_owner_on_matrixone() {
-    let pool = setup_lifecycle_run_db_it().await;
-    let suffix = Uuid::new_v4();
-    let user_id = format!("transcript-owner-{suffix}");
-    let session_id = format!("transcript-session-{suffix}");
-    let root_run_id = format!("transcript-root-{suffix}");
-    let child_run_id = format!("transcript-child-{suffix}");
-    crate::server::run::insert_active_run_session_fixture(&pool, &user_id, &session_id).await;
-    for (run_id, parent, depth, status) in [
-        (&root_run_id, None, 0, "cancelled"),
-        (&child_run_id, Some(root_run_id.as_str()), 1, "completed"),
-    ] {
-        sqlx::query(
-            "INSERT INTO agent_runs
-             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(run_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(parent)
-        .bind(&root_run_id)
-        .bind(parent.map_or_else(|| run_id.to_string(), |parent| format!("{parent}/{run_id}")))
-        .bind(depth)
-        .bind(status)
-        .execute(pool.get())
-        .await
-        .expect("insert exact-owner run lineage");
-    }
-    let mut items = (1..=90)
-        .map(|seq| {
-            (
-                seq,
-                Some(root_run_id.as_str()),
-                "user",
-                format!("root-{seq:02}"),
-            )
-        })
-        .collect::<Vec<_>>();
-    items.push((
-        905,
-        Some(child_run_id.as_str()),
-        "assistant",
-        "child-output-must-not-be-prompt-history".into(),
-    ));
-    items.push((91, None, "system", "session-note".into()));
-    items.extend(
-        (0..astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS).map(|offset| {
-            (
-                1_000 + offset,
-                Some(root_run_id.as_str()),
-                "tool",
-                format!("tool-tail-{offset}"),
-            )
-        }),
-    );
-    let mut insert = sqlx::QueryBuilder::new(
-        "INSERT INTO session_transcript_items
-         (session_id, item_seq, user_id, run_id, role, content, content_hash, created_at) ",
-    );
-    insert.push_values(&items, |mut row, (seq, run_id, role, content)| {
-        row.push_bind(&session_id)
-            .push_bind(seq)
-            .push_bind(&user_id)
-            .push_bind(run_id)
-            .push_bind(role)
-            .push_bind(content)
-            .push_bind(format!("fixture:{seq}"))
-            .push("NOW(6)");
-    });
-    insert
-        .build()
-        .execute(pool.get())
-        .await
-        .expect("insert bounded transcript fixture");
-
-    // Verify the storage quota before the prompt sanitizer applies its own
-    // final history bound; neither bound is a substitute for the other.
-    let rows = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
-        .bind(&session_id)
-        .bind(&user_id)
-        .bind("fresh-reader")
-        .bind(astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
-        .fetch_all(pool.get())
-        .await
-        .expect("load provider-safe durable transcript rows");
-    let service = db_backed_test_service(&pool, "transcript-reader");
-    let messages = service
-        .restore_transcript_prompt_messages(&user_id, &session_id, "fresh-reader", "test")
-        .await;
-    let foreign = service
-        .restore_transcript_prompt_messages(
-            &format!("foreign-{suffix}"),
-            &session_id,
-            &root_run_id,
-            "test",
-        )
-        .await;
-    for table in ["session_transcript_items", "agent_runs"] {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        )))
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("cleanup exact-owner transcript fixture");
-    }
-    crate::server::run::cleanup_run_session_fixture(&pool, &user_id, &session_id).await;
-
-    assert_eq!(
-        rows.len(),
-        astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize
-    );
-    assert_eq!(rows.first().unwrap().get::<String, _>("content"), "root-12");
-    assert_eq!(
-        rows.last().unwrap().get::<String, _>("content"),
-        "session-note"
-    );
-    assert!(rows.iter().all(|row| {
-        let content = row.get::<String, _>("content");
-        content != "child-output-must-not-be-prompt-history" && !content.starts_with("tool-tail-")
-    }));
-    assert_eq!(
-        messages.len(),
-        40,
-        "the actual prompt sanitizer bounds hydrated history"
-    );
-    assert_eq!(messages.first().unwrap()["content"], "root-53");
-    assert_eq!(messages.last().unwrap()["content"], "session-note");
-    assert!(messages.iter().any(|message| {
-        message["role"] == "system"
-            && message["content"]
-                .as_str()
-                .is_some_and(|content| content.contains("cancelled before completion"))
-    }));
-    assert!(
-        messages.iter().all(|message| {
-            message["content"].as_str() != Some("child-output-must-not-be-prompt-history")
-                && !message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.starts_with("tool-tail-"))
-        }),
-        "child output and bare tool rows are not main prompt history"
-    );
-    assert!(
-        foreign.is_empty(),
-        "another owner cannot hydrate this session's transcript"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13067,7 +12474,6 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
 async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
         "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND run_id = ?",
-        "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
@@ -28531,6 +27937,37 @@ async fn cancel_run_remains_bounded_when_attached_stream_is_backpressured() {
         .expect("load durable run")
         .expect("durable run");
     assert_eq!(durable.status, STATUS_RUNNING);
+}
+
+#[tokio::test]
+async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellation() {
+    let cancel = Arc::new(CancellationToken::new());
+    let user_cancel = Arc::new(AtomicBool::new(false));
+    let provider: Arc<dyn RunControlProvider> = Arc::new(StaticRunControlProvider::new(None));
+    let watcher = start_active_run_control_watcher(
+        Some(provider),
+        "user-1".into(),
+        "session-1".into(),
+        "run-1".into(),
+        None,
+        user_cancel.clone(),
+        Arc::new(AtomicBool::new(false)),
+        cancel.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
+    )
+    .unwrap();
+    // Let the task install its lifetime guard before simulating a task failure.
+    tokio::task::yield_now().await;
+    watcher.join.abort();
+    tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+        .await
+        .expect("a waiting executor must wake when its control observer dies");
+    assert!(
+        !user_cancel.load(Ordering::Acquire),
+        "observer failure is runtime-owned"
+    );
+    assert!(watcher.alive.has_changed().is_err());
 }
 
 #[tokio::test(start_paused = true)]

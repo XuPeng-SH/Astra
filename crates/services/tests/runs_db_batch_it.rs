@@ -690,10 +690,7 @@ async fn append_events_batch_isolates_idempotency_and_replay_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
+
     let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
         .execute(_pool.get())
@@ -821,7 +818,6 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
     assert_eq!(index, baseline_index + 3);
     for table in [
         "agent_run_events",
-        "run_display_projections",
         "agent_runs",
         "agent_session_execution_slots",
         "agent_session_lifecycle_fences",
@@ -1007,10 +1003,7 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
+
     let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
         .execute(_pool.get())
@@ -1097,7 +1090,6 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
     for run_id in [run_id.as_str(), malformed_run_id.as_str()] {
         for statement in [
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
-            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
         ] {
             let _ = sqlx::query(statement)
@@ -1376,7 +1368,6 @@ async fn concurrent_run_inserts_share_one_session_slot() {
     assert_eq!(fence_count, 1, "the first admission must create one fence");
 
     for table in [
-        "run_display_projections",
         "agent_run_events",
         "agent_session_execution_slots",
         "agent_runs",
@@ -1485,10 +1476,6 @@ async fn session_deletion_competes_safely_with_run_admission() {
         ),
         (
             "agent_run_events",
-            "user_id = ? AND session_id = ? AND run_id = ?",
-        ),
-        (
-            "run_display_projections",
             "user_id = ? AND session_id = ? AND run_id = ?",
         ),
     ] {
@@ -2218,7 +2205,6 @@ async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atom
     }
     for table in [
         "agent_run_events",
-        "run_display_projections",
         "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",

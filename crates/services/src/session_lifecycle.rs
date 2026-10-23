@@ -462,10 +462,6 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM run_checkpoints WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "run_display_projections",
-        sql: "DELETE FROM run_display_projections WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "agent_runs",
         sql: "DELETE FROM agent_runs WHERE session_id = ? AND user_id = ?",
     },

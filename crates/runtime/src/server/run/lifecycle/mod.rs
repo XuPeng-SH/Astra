@@ -61,10 +61,6 @@ use astra_services::runs::{
     durable_run_status_blocks_session, durable_run_status_is_terminal, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
-use astra_services::session_restore::{
-    PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL, PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL,
-    SessionRestoreService,
-};
 use astra_services::skills::SkillService;
 use astra_services::work::{
     DatabaseWorkRepository, InternalSessionId, WorkBranchId, WorkBranchSubjectChange,
@@ -73,7 +69,6 @@ use astra_services::work::{
     WorkSubjectRef,
 };
 use astra_services::{AdmittedModelExecution, EdgeContext};
-use astra_services::{DatabaseContextManifestStore, RetrievalStage};
 use astra_services::{ModelService, SessionContextCoordinator as _};
 use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
@@ -1778,20 +1773,6 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
 }
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn should_restore_prior_prompt_history(
-    request_targets_existing_session: bool,
-    session_has_prior_prompt_history: bool,
-) -> bool {
-    request_targets_existing_session && session_has_prior_prompt_history
-}
-
-fn should_hydrate_degraded_session_resume(
-    restore_prior_prompt_history: bool,
-    canonical_head_available: bool,
-) -> bool {
-    restore_prior_prompt_history && !canonical_head_available
-}
 
 /// Wire a freshly-constructed [`runtime_tool_executor::RuntimeToolExecutor`]
 /// into the agentic loop state and set the tool-executor handle.
@@ -4125,8 +4106,7 @@ pub(crate) use persistence::{
     append_session_transcript_items_admitted_in_tx,
     build_run_turn_complete_event_with_interruption, materialize_server_run_transcript_evidence,
     persist_server_loop_canonical_append, persist_server_loop_canonical_terminal_settlement,
-    restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
-    trace_context_from_subrun_context,
+    restore_step_checkpoint_runtime_state, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
 
@@ -4906,7 +4886,6 @@ struct OwnedBackgroundExecution {
     work_runtime_binding: Option<ValidatedWorkRuntimeBinding>,
     tool_runtime_workspace: Option<PathBuf>,
     cloud_workspace_record: Option<RuntimeWorkspaceRecord>,
-    csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
     cancel_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
     llm_cancel_token: Arc<CancellationToken>,
@@ -5425,6 +5404,9 @@ fn start_active_run_control_watcher(
     let (watcher_lifetime, alive) = tokio::sync::watch::channel(());
     let join = tokio::spawn(async move {
         let _watcher_lifetime = watcher_lifetime;
+        // A panic or task abort must wake an executor waiting on input/control.
+        // This cancels only local execution; it never fabricates User intent.
+        let cancel_on_failure = cancel_token.as_ref().clone().drop_guard();
         let mut poll = tokio::time::interval_at(
             tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
             ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
@@ -5485,6 +5467,7 @@ fn start_active_run_control_watcher(
                 }
             }
         }
+        cancel_on_failure.disarm();
     });
     Some(ActiveRunControlWatcher {
         alive,
@@ -7593,328 +7576,6 @@ impl AgenticRunLifecycleService {
                 .lock()
                 .await
                 .insert(run_id.to_owned(), progress_rx);
-        }
-    }
-
-    fn build_csl_store(
-        &self,
-        user_id: &str,
-    ) -> Option<Arc<dyn astra_turn_core::conversation_log::CslStore>> {
-        let pool = self.shared_pool.as_ref()?;
-        let store = match astra_turn_core::conversation_log::db_store::DbCslStore::new(
-            self.matrixone.clone(),
-            user_id,
-        ) {
-            Ok(store) => store.with_pool(pool.clone()),
-            Err(error) => {
-                tracing::warn!(user_id, error = %error, "CSL store creation failed");
-                return None;
-            }
-        };
-        Some(Arc::new(store))
-    }
-
-    async fn restore_csl_history(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        loop_state: &mut AgenticLoopState,
-    ) -> Option<astra_turn_core::conversation_log::manager::CslManager> {
-        let store = self.build_csl_store(user_id)?;
-        let mut mgr = match astra_turn_core::conversation_log::manager::CslManager::new(
-            store,
-            session_id.to_string(),
-            Default::default(),
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "CSL manager creation failed");
-                return None;
-            }
-        };
-        mgr.set_trace_id(run_id.to_string());
-
-        let restored_messages;
-        let mut resume_cursor = None;
-        let mut restored_session_state = None;
-
-        let mut csl_reusable = true;
-        match mgr.load().await {
-            Ok(Some(mat)) => {
-                let session_state = mat.session_state;
-                resume_cursor = session_state.source_cursor.clone();
-                if resume_cursor.is_none() {
-                    tracing::warn!(
-                        session_id,
-                        run_id,
-                        "CSL projection has no versioned source cursor; refusing resume"
-                    );
-                    if let Err(error) = mgr.reset().await {
-                        tracing::warn!(session_id, run_id, %error, "failed to reset cursorless CSL projection");
-                    }
-                    return Some(mgr);
-                }
-                restored_messages = mat.messages;
-                restored_session_state = Some(session_state);
-            }
-            Ok(None) => {
-                restored_messages = Vec::new();
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_id,
-                    error = %e,
-                    "CSL load failed; starting with empty history"
-                );
-                self.record_runtime_retrieval_degrade(
-                    user_id,
-                    session_id,
-                    run_id,
-                    RetrievalStage::Structured,
-                    "timeout",
-                )
-                .await;
-                restored_messages = Vec::new();
-                csl_reusable = matches!(
-                    e,
-                    astra_turn_core::conversation_log::CslStoreError::Serde(_)
-                        | astra_turn_core::conversation_log::CslStoreError::Materialize(_)
-                        | astra_turn_core::conversation_log::CslStoreError::CausalProjection(_)
-                );
-                if csl_reusable && let Err(reset_error) = mgr.reset().await {
-                    tracing::warn!(
-                        session_id,
-                        run_id,
-                        error = %reset_error,
-                        "CSL reset failed after corrupted log; transcript fallback will not persist CSL this turn"
-                    );
-                    csl_reusable = false;
-                }
-            }
-        }
-
-        let restored_messages = if restored_messages.is_empty() {
-            restored_messages
-        } else {
-            let Some(cursor) = resume_cursor else {
-                tracing::error!(
-                    session_id,
-                    run_id,
-                    "resume material has no versioned cursor"
-                );
-                return Some(mgr);
-            };
-            if cursor.owner_id != user_id
-                || cursor.session_id != session_id
-                || cursor.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
-            {
-                tracing::error!(
-                    session_id,
-                    run_id,
-                    cursor_owner = %cursor.owner_id,
-                    cursor_session = %cursor.session_id,
-                    "server loop rejected resume material outside the requested owner/session"
-                );
-                if let Err(error) = mgr.reset().await {
-                    tracing::warn!(
-                        session_id,
-                        run_id,
-                        %error,
-                        "failed to reset rejected causal projection"
-                    );
-                }
-                return Some(mgr);
-            }
-            let candidate = astra_turn_types::ResumeCandidateV1 {
-                source: astra_turn_types::ResumeSourceV1::CslProjection,
-                cursor,
-                conversation_messages: restored_messages,
-                materialized_conversation_root_hash: None,
-                degraded_reasons: Vec::new(),
-                repair_actions: Vec::new(),
-                projections: astra_turn_types::ResumeProjectionSetV1::default(),
-            };
-            match astra_turn_types::select_resume_bundle(None, [candidate]) {
-                Ok(bundle) => {
-                    if let Some(session_state) = restored_session_state.take() {
-                        restore_session_state_compact(session_state, loop_state);
-                    }
-                    bundle.conversation_messages
-                }
-                Err(error) => {
-                    tracing::error!(
-                        session_id,
-                        run_id,
-                        %error,
-                        "server loop rejected inconsistent resume material"
-                    );
-                    Vec::new()
-                }
-            }
-        };
-        let turn_start_message_count =
-            Self::restore_csl_messages_into_loop_state(restored_messages, loop_state);
-        if !csl_reusable {
-            return None;
-        }
-        mgr.mark_turn_start(turn_start_message_count);
-        Some(mgr)
-    }
-
-    async fn restore_transcript_prompt_messages(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        reason: &'static str,
-    ) -> Vec<Value> {
-        let Some(pool) = self.shared_pool.as_ref() else {
-            return Vec::new();
-        };
-        let rows = match sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(run_id)
-            .bind(astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
-            .fetch_all(pool.get())
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(
-                    session_id,
-                    run_id,
-                    reason,
-                    error = %error,
-                    "transcript prompt-history restore failed"
-                );
-                return Vec::new();
-            }
-        };
-
-        let mut messages = Vec::with_capacity(rows.len());
-        for (index, row) in rows.iter().enumerate() {
-            let role = match row.try_get::<String, _>("role") {
-                Ok(role) => role,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id,
-                        run_id,
-                        reason,
-                        error = %error,
-                        "transcript prompt-history restore skipped row with invalid role"
-                    );
-                    continue;
-                }
-            };
-            if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool") {
-                continue;
-            }
-            let content = match row.try_get::<String, _>("content") {
-                Ok(content) => content,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id,
-                        run_id,
-                        reason,
-                        error = %error,
-                        "transcript prompt-history restore skipped row with invalid content"
-                    );
-                    continue;
-                }
-            };
-            let run_id = row.try_get::<Option<String>, _>("run_id").ok().flatten();
-            let next_run_id = rows
-                .get(index + 1)
-                .and_then(|next| next.try_get::<Option<String>, _>("run_id").ok().flatten());
-            let run_status = row
-                .try_get::<Option<String>, _>("run_status")
-                .ok()
-                .flatten();
-            let has_prompt_content = !content.trim().is_empty();
-            if astra_services::session_restore::prompt_history_role_is_provider_safe(
-                &role,
-                has_prompt_content,
-            ) {
-                messages.push(json!({
-                    "role": role,
-                    "content": content,
-                }));
-            }
-            if let Some(boundary) =
-                astra_services::session_restore::prompt_history_boundary_after_message(
-                    &role,
-                    has_prompt_content,
-                    run_id.as_deref(),
-                    next_run_id.as_deref(),
-                    run_status.as_deref(),
-                )
-            {
-                messages.push(json!({
-                    "role": "system",
-                    "content": boundary,
-                }));
-            }
-        }
-
-        let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages);
-        if !messages.is_empty() {
-            tracing::warn!(
-                session_id,
-                run_id,
-                reason,
-                message_count = messages.len(),
-                "restored prompt history from transcript because CSL was unavailable"
-            );
-        }
-        messages
-    }
-
-    fn restore_csl_messages_into_loop_state(
-        mut restored_messages: Vec<Value>,
-        loop_state: &mut AgenticLoopState,
-    ) -> usize {
-        let turn_start_message_count = restored_messages.len();
-        if !restored_messages.is_empty() {
-            restored_messages.append(&mut loop_state.messages);
-            loop_state.messages = restored_messages;
-        }
-        turn_start_message_count
-    }
-
-    async fn record_runtime_retrieval_degrade(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        stage: RetrievalStage,
-        reason: &str,
-    ) {
-        let Some(pool) = &self.shared_pool else {
-            return;
-        };
-        let store = DatabaseContextManifestStore::new(pool.clone());
-        if let Err(error) = store
-            .record_retrieval_degrade_event(
-                user_id,
-                session_id,
-                Some(run_id),
-                stage.clone(),
-                reason,
-                0,
-            )
-            .await
-        {
-            tracing::warn!(
-                target: "astra_runtime::retrieval",
-                session_id,
-                run_id,
-                stage = ?stage,
-                reason,
-                error = %error,
-                "failed to persist retrieval degrade event"
-            );
         }
     }
 
@@ -12665,230 +12326,6 @@ impl AgenticRunLifecycleService {
         );
     }
 
-    async fn session_resume_hydration_hint_for_session(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        resume_requested: bool,
-    ) -> Option<String> {
-        if !resume_requested {
-            return None;
-        }
-
-        let Some(shared) = &self.shared_pool else {
-            tracing::warn!(
-                target: "astra_runtime::resume_hydration",
-                user_id,
-                session_id,
-                "resume hydration skipped: shared MatrixOne pool is not configured"
-            );
-            return None;
-        };
-
-        let restore =
-            astra_services::session_restore::HybridRestoreService::new(shared.get().clone());
-        match restore.restore_session(user_id, session_id).await {
-            Ok(Some(restored)) => {
-                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
-                    user_id,
-                    session_id,
-                    &restored.conversation_messages,
-                    &[],
-                ) {
-                    return Some(hint);
-                }
-                let transcript_messages = self
-                    .restore_transcript_prompt_messages(
-                        user_id,
-                        session_id,
-                        run_id,
-                        "hybrid_restore_unusable",
-                    )
-                    .await;
-                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
-                    user_id,
-                    session_id,
-                    &restored.conversation_messages,
-                    &transcript_messages,
-                ) {
-                    return Some(hint);
-                }
-                tracing::warn!(
-                    target: "astra_runtime::resume_hydration",
-                    user_id,
-                    session_id,
-                    "resume hydration degraded: restored session has no prompt-facing transcript"
-                );
-                Some(
-                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-                        "resume restored session metadata but no prompt-facing transcript/history",
-                    ),
-                )
-            }
-            Ok(None) => {
-                let transcript_messages = self
-                    .restore_transcript_prompt_messages(
-                        user_id,
-                        session_id,
-                        run_id,
-                        "hybrid_restore_empty",
-                    )
-                    .await;
-                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
-                    user_id,
-                    session_id,
-                    &[],
-                    &transcript_messages,
-                ) {
-                    return Some(hint);
-                }
-                tracing::warn!(
-                    target: "astra_runtime::resume_hydration",
-                    user_id,
-                    session_id,
-                    "resume hydration skipped: session restore returned no resumable state"
-                );
-                Some(
-                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-                        "session restore returned no resumable state",
-                    ),
-                )
-            }
-            Err(error) => {
-                let transcript_messages = self
-                    .restore_transcript_prompt_messages(
-                        user_id,
-                        session_id,
-                        run_id,
-                        "hybrid_restore_failed",
-                    )
-                    .await;
-                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
-                    user_id,
-                    session_id,
-                    &[],
-                    &transcript_messages,
-                ) {
-                    return Some(hint);
-                }
-                tracing::warn!(
-                    target: "astra_runtime::resume_hydration",
-                    user_id,
-                    session_id,
-                    error = %error,
-                    "resume hydration skipped: session restore failed"
-                );
-                Some(
-                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-                        "session restore failed and transcript fallback was unavailable",
-                    ),
-                )
-            }
-        }
-    }
-
-    async fn session_has_prior_prompt_history(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-    ) -> bool {
-        let Some(shared) = &self.shared_pool else {
-            return false;
-        };
-        let pool = shared.get();
-
-        match sqlx::query(
-            "SELECT 1 AS present
-             FROM conversation_log
-             WHERE user_id = ? AND session_id = ?
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_optional(pool)
-        .await
-        {
-            Ok(Some(_)) => return true,
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::resume_hydration",
-                    user_id,
-                    session_id,
-                    error = %error,
-                    "failed to check canonical conversation history before resume hydration"
-                );
-            }
-        }
-
-        match sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(run_id)
-            .fetch_optional(pool)
-            .await
-        {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::resume_hydration",
-                    user_id,
-                    session_id,
-                    error = %error,
-                    "failed to check transcript history before resume hydration"
-                );
-                false
-            }
-        }
-    }
-
-    fn session_resume_hydration_hint_from_sources(
-        primary_messages: &[Value],
-        transcript_messages: &[Value],
-    ) -> Result<Option<String>, astra_turn_types::UserTurnSemanticsError> {
-        if let Some(hint) =
-            astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-                primary_messages,
-            )?
-        {
-            return Ok(Some(hint));
-        }
-        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-            transcript_messages,
-        )
-    }
-
-    fn session_resume_hydration_hint_or_invalid_failure(
-        user_id: &str,
-        session_id: &str,
-        primary_messages: &[Value],
-        transcript_messages: &[Value],
-    ) -> Option<String> {
-        match Self::session_resume_hydration_hint_from_sources(
-            primary_messages,
-            transcript_messages,
-        ) {
-            Ok(hint) => hint,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::resume_hydration",
-                    user_id,
-                    session_id,
-                    error = %error,
-                    "resume hydration degraded: restored typed turn metadata is invalid"
-                );
-                Some(
-                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-                        "restored resume source contains invalid typed turn metadata",
-                    ),
-                )
-            }
-        }
-    }
-
     /// Build the initial [`AgenticLoopState`] from a chat request.
     ///
     /// `workspace_override` — when the server provisions a workspace (web-agent
@@ -15040,7 +14477,6 @@ impl AgenticRunLifecycleService {
             work_runtime_binding,
             tool_runtime_workspace,
             cloud_workspace_record,
-            csl_manager,
             cancel_flag,
             pause_flag,
             llm_cancel_token,
@@ -15120,7 +14556,6 @@ impl AgenticRunLifecycleService {
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             metrics_registry: self.metrics_registry.clone(),
-            csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
 
         // Background task tracking (same pattern as the create_run spawn above).
@@ -16512,12 +15947,7 @@ impl AgenticRunLifecycleService {
                     // after the SSE terminal boundary so slow hooks never hold
                     // the user's stream open.
                     if let Err(e) = persist_ctx
-                        .run_after_core(
-                            &state,
-                            loop_success,
-                            canonical_result,
-                            canonical_context_cursor.is_some(),
-                        )
+                        .run_after_core(&state, loop_success, canonical_result)
                         .await
                     {
                         tracing::error!(
@@ -17118,80 +16548,34 @@ impl AgenticRunLifecycleService {
                 Some(turn) => turn,
                 None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
             };
-            // Legacy CSL resume cursors derive their completed turn from this
-            // field, so establish it before history restoration.
+            // Advisory warm-start state is scoped to the admitted canonical turn.
             state.session_turn = session_turn;
-            let history_restore = async {
-                // ── Runtime warm-start from step checkpoint ────────────────
-                let restore_prior_prompt_history = should_restore_prior_prompt_history(
-                    request.session_id.is_some(),
-                    if canonical_has_prior_prompt_history {
-                        true
-                    } else {
-                        self.session_has_prior_prompt_history(&user_id, &session_id, &run_id)
-                            .await
-                    },
-                );
-
-                if restore_prior_prompt_history {
-                    if let Ok(Some(restored)) =
-                        astra_pipeline::step_restore::restore_session(&user_id, &session_id)
-                    {
-                        restore_step_checkpoint_runtime_state(
-                            restored,
-                            &fresh_session_current_date,
-                            &mut state,
-                        )
-                        .map_err(|error| {
-                            error_response_coded(
-                                StatusCode::CONFLICT,
-                                &error.message,
-                                "execution_reconstruction_required",
-                            )
-                        })?;
-                    }
-                }
-
-                // ── CSL: Load conversation history from the log ─────────────
-                let csl_manager = if restore_prior_prompt_history
-                    && canonical_turn
-                        .as_ref()
-                        .is_none_or(|admission| !admission.had_canonical_head)
+            // Canonical admission owns history, including an explicitly empty
+            // head. Legacy CSL/raw projections cannot reinterpret that result.
+            // Warm-start only advisory state for an admitted continuation;
+            // same-Run checkpoint reconstruction remains fenced separately.
+            if request.session_id.is_some() && canonical_has_prior_prompt_history {
+                if let Ok(Some(restored)) =
+                    astra_pipeline::step_restore::restore_session(&user_id, &session_id)
                 {
-                    self.restore_csl_history(&user_id, &session_id, &run_id, &mut state)
-                        .await
-                } else {
-                    None
-                };
-
-                let needs_session_resume_hydration = should_hydrate_degraded_session_resume(
-                    restore_prior_prompt_history,
-                    canonical_has_prior_prompt_history,
-                );
-                let session_resume_hint = self
-                    .session_resume_hydration_hint_for_session(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        needs_session_resume_hydration,
+                    restore_step_checkpoint_runtime_state(
+                        restored,
+                        &fresh_session_current_date,
+                        &mut state,
                     )
-                    .await;
-                Ok::<_, (StatusCode, Json<astra_core::ErrorResponse>)>((
-                    csl_manager,
-                    session_resume_hint,
-                ))
-            };
-            let plan_resume = async {
-                self.plan_resume_snapshot_for_request(&request, &user_id, &session_id)
-                    .await
-            };
-            let (history_restore, plan_resume_snapshot) =
-                tokio::join!(history_restore, plan_resume);
-            let (csl_manager, session_resume_hint) = history_restore?;
-            let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
-                session_resume_hint,
-                plan_resume_snapshot.prompt_hint,
-            );
+                    .map_err(|error| {
+                        error_response_coded(
+                            StatusCode::CONFLICT,
+                            &error.message,
+                            "execution_reconstruction_required",
+                        )
+                    })?;
+                }
+            }
+            let plan_resume_snapshot = self
+                .plan_resume_snapshot_for_request(&request, &user_id, &session_id)
+                .await;
+            let plan_resume_hint = plan_resume_snapshot.prompt_hint;
             let plan_authoring_active = plan_resume_snapshot.authoring_active;
             let mut host = self.build_host(
                 &user_id,
@@ -17563,7 +16947,6 @@ impl AgenticRunLifecycleService {
                 work_runtime_binding,
                 tool_runtime_workspace,
                 cloud_workspace_record: cloud_workspace_record.take(),
-                csl_manager,
                 cancel_flag,
                 pause_flag,
                 llm_cancel_token: llm_cancel_token.clone(),
@@ -17816,16 +17199,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         recent_limit: u32,
     ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
         let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
-        let projection = self
-            .run_engine
-            .load_run_projection(&user_id, &run_id)
-            .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to load run projection: {error}"),
-                )
-            })?;
         let latest_checkpoint = self
             .run_engine
             .load_latest_checkpoint(&user_id, &run_id, None)
@@ -17836,110 +17209,35 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     format!("Failed to load run checkpoint: {error}"),
                 )
             })?;
+        // Status, counters, binding and the bounded event window share the
+        // captured canonical Run. Checkpoint metadata is advisory and may advance
+        // between reads; it never grants checkpoint or execution authority.
         let recent_events = Self::durable_recent_events(&run, recent_limit);
         let binding = Self::durable_run_execution_binding_snapshot(&run);
-
-        if let Some(projection) = projection {
-            Ok(RunProjectionRecord {
-                run_id: projection.run_id,
-                session_id: projection.session_id,
-                status: projection.status,
-                waiting_for: projection.waiting_for,
-                error_message: projection.error_message,
-                workspace: binding.workspace.clone(),
-                executor: binding.executor.clone(),
-                transport: binding.transport.clone(),
-                run_event_high_watermark: run.last_event_idx,
-                projection_event_idx: projection.projection_event_idx,
-                projection_updated_at: projection.updated_at,
-                projection_hash: projection.projection_hash,
-                latest_event_type: projection.latest_event_type,
-                total_prompt_tokens: projection.total_prompt_tokens,
-                total_completion_tokens: projection.total_completion_tokens,
-                total_tool_calls: projection.total_tool_calls,
-                latest_checkpoint: latest_checkpoint.map(|checkpoint| {
-                    RunProjectionCheckpointRecord {
-                        checkpoint_id: checkpoint.checkpoint_id,
-                        checkpoint_kind: checkpoint.checkpoint_kind,
-                        checkpoint_version: checkpoint.checkpoint_version,
-                        node_seq: checkpoint.node_seq,
-                        created_at: checkpoint.created_at,
-                    }
-                }),
-                has_durable_projection: true,
-                recent_events,
-            })
-        } else {
-            let latest_event_type = run.events.last().map(astra_services::extract_event_type);
-            Ok(RunProjectionRecord {
-                run_id: run.run_id.clone(),
-                session_id: run.session_id.clone(),
-                status: run.status.clone(),
-                waiting_for: run.waiting_for.clone(),
-                error_message: run.error_message.clone(),
-                workspace: binding.workspace,
-                executor: binding.executor,
-                transport: binding.transport,
-                run_event_high_watermark: run.last_event_idx,
-                projection_event_idx: run.last_event_idx,
-                projection_updated_at: run.updated_at.clone(),
-                projection_hash: format!(
-                    "{:x}",
-                    Sha256::digest(
-                        serde_json::json!({
-                            "run_id": run.run_id,
-                            "status": run.status,
-                            "waiting_for": run.waiting_for,
-                            "last_event_idx": run.last_event_idx,
-                            "total_prompt_tokens": run.total_prompt_tokens,
-                            "total_completion_tokens": run.total_completion_tokens,
-                            "total_tool_calls": run.total_tool_calls,
-                            "latest_event_type": latest_event_type.clone(),
-                        })
-                        .to_string()
-                        .as_bytes()
-                    )
-                ),
-                latest_event_type,
-                total_prompt_tokens: run.total_prompt_tokens,
-                total_completion_tokens: run.total_completion_tokens,
-                total_tool_calls: run.total_tool_calls,
-                latest_checkpoint: latest_checkpoint.map(|checkpoint| {
-                    RunProjectionCheckpointRecord {
-                        checkpoint_id: checkpoint.checkpoint_id,
-                        checkpoint_kind: checkpoint.checkpoint_kind,
-                        checkpoint_version: checkpoint.checkpoint_version,
-                        node_seq: checkpoint.node_seq,
-                        created_at: checkpoint.created_at,
-                    }
-                }),
-                has_durable_projection: false,
-                recent_events,
-            })
-        }
-    }
-
-    async fn repair_run_projection(
-        &self,
-        run_id: String,
-        user_id: String,
-        recent_limit: u32,
-    ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
-        let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
-        let rebuilt = self
-            .run_engine
-            .rebuild_run_projection(&user_id, &run.session_id, &run_id)
-            .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to rebuild run projection: {error}"),
-                )
-            })?;
-        if rebuilt.is_none() {
-            return Err(error_response(StatusCode::NOT_FOUND, "Run not found"));
-        }
-        self.get_run_projection(run_id, user_id, recent_limit).await
+        let latest_event_type = run.events.last().map(astra_services::extract_event_type);
+        Ok(RunProjectionRecord {
+            run_id: run.run_id,
+            session_id: run.session_id,
+            status: run.status,
+            waiting_for: run.waiting_for,
+            error_message: run.error_message,
+            workspace: binding.workspace,
+            executor: binding.executor,
+            transport: binding.transport,
+            run_event_high_watermark: run.last_event_idx,
+            latest_event_type,
+            total_prompt_tokens: run.total_prompt_tokens,
+            total_completion_tokens: run.total_completion_tokens,
+            total_tool_calls: run.total_tool_calls,
+            latest_checkpoint: latest_checkpoint.map(|checkpoint| RunProjectionCheckpointRecord {
+                checkpoint_id: checkpoint.checkpoint_id,
+                checkpoint_kind: checkpoint.checkpoint_kind,
+                checkpoint_version: checkpoint.checkpoint_version,
+                node_seq: checkpoint.node_seq,
+                created_at: checkpoint.created_at,
+            }),
+            recent_events,
+        })
     }
 
     async fn stream_run(

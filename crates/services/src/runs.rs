@@ -176,18 +176,6 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
-    async fn repair_run_projection(
-        &self,
-        _run_id: String,
-        _user_id: String,
-        _recent_limit: u32,
-    ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "Run projection repair not supported",
-        ))
-    }
-
     async fn stream_run(
         &self,
         run_id: String,
@@ -1420,15 +1408,11 @@ pub struct RunProjectionRecord {
     pub executor: Option<serde_json::Value>,
     pub transport: Option<String>,
     pub run_event_high_watermark: i64,
-    pub projection_event_idx: i64,
-    pub projection_updated_at: String,
-    pub projection_hash: String,
     pub latest_event_type: Option<String>,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_tool_calls: u32,
     pub latest_checkpoint: Option<RunProjectionCheckpointRecord>,
-    pub has_durable_projection: bool,
     pub recent_events: Vec<serde_json::Value>,
 }
 
@@ -3635,26 +3619,6 @@ impl From<&DurableRunCheckpointRecord> for RunCheckpointReceipt {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DurableRunDisplayProjectionRecord {
-    pub run_id: String,
-    pub user_id: String,
-    pub session_id: String,
-    pub status: String,
-    pub waiting_for: Option<String>,
-    pub error_message: Option<String>,
-    pub projection_event_idx: i64,
-    pub latest_event_type: Option<String>,
-    pub latest_checkpoint_id: Option<String>,
-    pub latest_checkpoint_kind: Option<String>,
-    pub latest_checkpoint_version: Option<String>,
-    pub total_prompt_tokens: u64,
-    pub total_completion_tokens: u64,
-    pub total_tool_calls: u32,
-    pub projection_hash: String,
-    pub updated_at: String,
-}
-
 const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
@@ -3692,11 +3656,6 @@ const RUN_LIST_CURSOR_SELECT_SQL: &str =
 const RUN_LIST_CURSOR_PREDICATE_SQL: &str =
     " AND (updated_at < ? OR (updated_at = ? AND run_id < ?))";
 const RUN_LIST_ORDER_SQL: &str = " ORDER BY updated_at DESC, run_id DESC";
-
-const RUN_DISPLAY_PROJECTION_COLUMNS: &str = "run_id, user_id, session_id, status, waiting_for, \
-     error_message, projection_event_idx, latest_event_type, latest_checkpoint_id, \
-     latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens, \
-     total_completion_tokens, total_tool_calls, projection_hash, updated_at";
 
 /// Abstraction for durable run persistence.
 ///
@@ -5170,7 +5129,6 @@ pub struct AtomicRunTerminalSettlementCommit {
     pub event_receipts: Vec<AtomicRunTerminalEventReceipt>,
     pub last_event_idx: i64,
     pub latest_event_type: Option<String>,
-    pub projection_hash: String,
 }
 
 /// Additional canonical facts committed by the Run creation transaction.
@@ -6332,19 +6290,6 @@ pub trait RunStateStore: Send + Sync {
         events: &[serde_json::Value],
     ) -> Result<bool, String>;
 
-    /// Repair the derived display projection when an owner proves a terminal
-    /// transaction committed after its store response was abandoned. Normal
-    /// transitions perform this refresh in their store call; the default is
-    /// a no-op for stores without a separate projection.
-    async fn repair_terminal_projection_after_receipt(
-        &self,
-        _user_id: &str,
-        _expected_session_id: &str,
-        _run_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
     /// Append immutable facts and their model-selection identity without rewriting
     /// lifecycle state, but only
     /// while the exact execution generation and one of the expected statuses
@@ -6410,24 +6355,6 @@ pub trait RunStateStore: Send + Sync {
         run_id: &str,
         checkpoint_kind: Option<&str>,
     ) -> Result<Option<DurableRunCheckpointRecord>, String>;
-
-    /// Load the current typed display projection for a durable run.
-    async fn load_run_projection(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String>;
-
-    /// Rebuild the typed display projection from durable run facts.
-    ///
-    /// This is an explicit repair path for projection writes that failed after
-    /// the authoritative run status/event/checkpoint facts already committed.
-    async fn rebuild_run_projection(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String>;
 
     /// Append multiple events in a single batch. This is the canonical write
     /// path. Single-event callers should use `append_event` which delegates here.
@@ -6798,8 +6725,6 @@ pub struct InMemoryRunStateStore {
     execution_owner_lease_ttl: Duration,
     checkpoints:
         tokio::sync::RwLock<std::collections::HashMap<String, Vec<DurableRunCheckpointRecord>>>,
-    projections:
-        tokio::sync::RwLock<std::collections::HashMap<String, DurableRunDisplayProjectionRecord>>,
     #[cfg(test)]
     load_run_calls: std::sync::atomic::AtomicUsize,
 }
@@ -6927,7 +6852,6 @@ impl InMemoryRunStateStore {
                     {
                         return Ok(StatusTransitionCommit::default());
                     }
-                    let latest_event_type = new_events.last().map(extract_event_type);
                     apply_in_memory_status_transition(
                         &mut slots,
                         run,
@@ -6940,7 +6864,7 @@ impl InMemoryRunStateStore {
                         run.events.extend(new_events);
                         run.last_event_idx = run.events.len() as i64 - 1;
                     }
-                    Some((run.clone(), latest_event_type, recovery_event))
+                    Some((run.clone(), recovery_event))
                 } else {
                     None
                 }
@@ -6948,8 +6872,7 @@ impl InMemoryRunStateStore {
                 None
             }
         };
-        if let Some((run, latest_event_type, recovery_event)) = updated {
-            self.sync_projection(&run, latest_event_type, None).await;
+        if let Some((run, recovery_event)) = updated {
             let recovery = recovery_event.map(|event| {
                 let mut metadata = run;
                 metadata.events.clear();
@@ -6981,7 +6904,6 @@ impl InMemoryRunStateStore {
             execution_owner_pod_id: None,
             execution_owner_lease_ttl: Duration::from_secs(45),
             checkpoints: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            projections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             #[cfg(test)]
             load_run_calls: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -7027,57 +6949,6 @@ impl InMemoryRunStateStore {
     fn load_run_call_count(&self) -> usize {
         self.load_run_calls
             .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    async fn sync_projection(
-        &self,
-        run: &DurableRunRecord,
-        latest_event_type: Option<String>,
-        latest_checkpoint: Option<&DurableRunCheckpointRecord>,
-    ) {
-        let mut projections = self.projections.write().await;
-        let existing = projections.get(&run.run_id).cloned();
-        let projection = build_run_display_projection(
-            run,
-            latest_event_type.or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|entry| entry.latest_event_type.clone())
-            }),
-            latest_checkpoint.map(checkpoint_summary_tuple).or_else(|| {
-                existing.as_ref().and_then(|entry| {
-                    Some((
-                        entry.latest_checkpoint_id.clone()?,
-                        entry.latest_checkpoint_kind.clone()?,
-                        entry.latest_checkpoint_version.clone()?,
-                    ))
-                })
-            }),
-        );
-        projections.insert(run.run_id.clone(), projection);
-    }
-
-    async fn sync_projection_event_metadata(
-        &self,
-        run: &DurableRunRecord,
-        event_index: i64,
-        event_type: &str,
-    ) {
-        let mut projections = self.projections.write().await;
-        let Some(projection) = projections
-            .get_mut(&run.run_id)
-            .filter(|projection| projection.user_id == run.user_id)
-        else {
-            return;
-        };
-        if projection.projection_event_idx > event_index {
-            return;
-        }
-        projection.projection_event_idx = event_index;
-        projection.latest_event_type = Some(event_type.to_string());
-        projection.projection_hash =
-            event_metadata_projection_patch_hash(&run.run_id, event_index, Some(event_type));
-        projection.updated_at = chrono::Utc::now().to_rfc3339();
     }
 
     async fn insert_run_record(
@@ -7134,12 +7005,6 @@ impl InMemoryRunStateStore {
             record.waiting_for.as_deref(),
         )?;
         runs.insert(run_id.clone(), record);
-        let Some(inserted) = runs.get(run_id.as_str()).cloned() else {
-            return Err(format!(
-                "inserted run disappeared before projection sync: {run_id}"
-            ));
-        };
-
         // Evict oldest completed/failed runs when over capacity.
         let mut evicted_ids = Vec::new();
         if runs.len() > Self::MAX_RUNS {
@@ -7162,20 +7027,13 @@ impl InMemoryRunStateStore {
         drop(slots);
         if !evicted_ids.is_empty() {
             {
-                let mut projections = self.projections.write().await;
-                for id in &evicted_ids {
-                    projections.remove(id);
-                }
-            }
-            {
                 let mut checkpoints = self.checkpoints.write().await;
                 for id in &evicted_ids {
                     checkpoints.remove(id);
                 }
             }
         }
-        self.sync_projection(&inserted, Some("run_started".to_string()), None)
-            .await;
+
         Ok(DurableRunStartClaim::Started { authority })
     }
 }
@@ -8059,136 +7917,6 @@ fn is_checkpoint_version(version: &str) -> bool {
         .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
 }
 
-fn checkpoint_summary_tuple(checkpoint: &DurableRunCheckpointRecord) -> (String, String, String) {
-    (
-        checkpoint.checkpoint_id.clone(),
-        checkpoint.checkpoint_kind.clone(),
-        checkpoint.checkpoint_version.clone(),
-    )
-}
-
-fn build_run_display_projection(
-    run: &DurableRunRecord,
-    latest_event_type: Option<String>,
-    latest_checkpoint: Option<(String, String, String)>,
-) -> DurableRunDisplayProjectionRecord {
-    let payload = serde_json::json!({
-        "run_id": run.run_id,
-        "status": run.status,
-        "waiting_for": run.waiting_for,
-        "error_message": run.error_message,
-        "projection_event_idx": run.last_event_idx,
-        "latest_event_type": latest_event_type.clone(),
-        "latest_checkpoint_id": latest_checkpoint.as_ref().map(|value| value.0.as_str()),
-        "latest_checkpoint_kind": latest_checkpoint.as_ref().map(|value| value.1.as_str()),
-        "latest_checkpoint_version": latest_checkpoint.as_ref().map(|value| value.2.as_str()),
-        "total_prompt_tokens": run.total_prompt_tokens,
-        "total_completion_tokens": run.total_completion_tokens,
-        "total_tool_calls": run.total_tool_calls,
-    });
-    DurableRunDisplayProjectionRecord {
-        run_id: run.run_id.clone(),
-        user_id: run.user_id.clone(),
-        session_id: run.session_id.clone(),
-        status: run.status.clone(),
-        waiting_for: run.waiting_for.clone(),
-        error_message: run.error_message.clone(),
-        projection_event_idx: run.last_event_idx,
-        latest_event_type,
-        latest_checkpoint_id: latest_checkpoint.as_ref().map(|value| value.0.clone()),
-        latest_checkpoint_kind: latest_checkpoint.as_ref().map(|value| value.1.clone()),
-        latest_checkpoint_version: latest_checkpoint.as_ref().map(|value| value.2.clone()),
-        total_prompt_tokens: run.total_prompt_tokens,
-        total_completion_tokens: run.total_completion_tokens,
-        total_tool_calls: run.total_tool_calls,
-        projection_hash: sha256_hex(payload.to_string().as_bytes()),
-        updated_at: run.updated_at.clone(),
-    }
-}
-
-fn run_display_projection_payload_matches(
-    left: &DurableRunDisplayProjectionRecord,
-    right: &DurableRunDisplayProjectionRecord,
-) -> bool {
-    left.run_id == right.run_id
-        && left.user_id == right.user_id
-        && left.session_id == right.session_id
-        && left.status == right.status
-        && left.waiting_for == right.waiting_for
-        && left.error_message == right.error_message
-        && left.projection_event_idx == right.projection_event_idx
-        && left.latest_event_type == right.latest_event_type
-        && left.latest_checkpoint_id == right.latest_checkpoint_id
-        && left.latest_checkpoint_kind == right.latest_checkpoint_kind
-        && left.latest_checkpoint_version == right.latest_checkpoint_version
-        && left.total_prompt_tokens == right.total_prompt_tokens
-        && left.total_completion_tokens == right.total_completion_tokens
-        && left.total_tool_calls == right.total_tool_calls
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunDisplayProjectionRelation {
-    ProjectionBehindAuthority,
-    Canonical,
-    HashCanonicalization,
-    PayloadConflict,
-    AuthorityBehindProjection,
-}
-
-fn classify_run_display_projection_relation(
-    existing: &DurableRunDisplayProjectionRecord,
-    authoritative: &DurableRunDisplayProjectionRecord,
-) -> RunDisplayProjectionRelation {
-    match existing
-        .projection_event_idx
-        .cmp(&authoritative.projection_event_idx)
-    {
-        std::cmp::Ordering::Less => RunDisplayProjectionRelation::ProjectionBehindAuthority,
-        std::cmp::Ordering::Greater => RunDisplayProjectionRelation::AuthorityBehindProjection,
-        std::cmp::Ordering::Equal
-            if !run_display_projection_payload_matches(existing, authoritative) =>
-        {
-            RunDisplayProjectionRelation::PayloadConflict
-        }
-        std::cmp::Ordering::Equal if existing.projection_hash != authoritative.projection_hash => {
-            RunDisplayProjectionRelation::HashCanonicalization
-        }
-        std::cmp::Ordering::Equal => RunDisplayProjectionRelation::Canonical,
-    }
-}
-
-fn usage_projection_patch_hash(
-    run_id: &str,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    tool_calls: u32,
-) -> String {
-    let payload = serde_json::json!({
-        "run_id": run_id,
-        "usage_patch": {
-            "total_prompt_tokens": prompt_tokens,
-            "total_completion_tokens": completion_tokens,
-            "total_tool_calls": tool_calls,
-        },
-    });
-    sha256_hex(payload.to_string().as_bytes())
-}
-
-fn event_metadata_projection_patch_hash(
-    run_id: &str,
-    projection_event_idx: i64,
-    latest_event_type: Option<&str>,
-) -> String {
-    let payload = serde_json::json!({
-        "run_id": run_id,
-        "event_metadata_patch": {
-            "projection_event_idx": projection_event_idx,
-            "latest_event_type": latest_event_type,
-        },
-    });
-    sha256_hex(payload.to_string().as_bytes())
-}
-
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn request_permission_mode(
@@ -8346,7 +8074,7 @@ impl RunStateStore for InMemoryRunStateStore {
             request.run_id,
             request.expected_run_generation,
         );
-        let updated = {
+        {
             let mut cancellation_requests = self.cancellation_requests.write().await;
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
@@ -8398,10 +8126,8 @@ impl RunStateStore for InMemoryRunStateStore {
             run.owner_lease_expires_at = None;
             run.events.extend(new_events);
             run.last_event_idx = run.events.len() as i64 - 1;
-            run.clone()
-        };
-        self.sync_projection(&updated, Some("run_finished".to_string()), None)
-            .await;
+        }
+
         Ok(true)
     }
 
@@ -8569,25 +8295,6 @@ impl RunStateStore for InMemoryRunStateStore {
         run.last_event_idx = event_index;
         run.updated_at = chrono::Utc::now().to_rfc3339();
 
-        // Keep the in-memory projection in the same run critical section. A
-        // reader can observe the old projection before this operation, or the
-        // new run+projection after it, but no settlement mutation can interleave.
-        let mut projections = self.projections.write().await;
-        let latest_checkpoint = projections.get(&run.run_id).and_then(|entry| {
-            Some((
-                entry.latest_checkpoint_id.clone()?,
-                entry.latest_checkpoint_kind.clone()?,
-                entry.latest_checkpoint_version.clone()?,
-            ))
-        });
-        let projection = build_run_display_projection(run, Some("user_intent".to_string()), None);
-        let projection = DurableRunDisplayProjectionRecord {
-            latest_checkpoint_id: latest_checkpoint.as_ref().map(|value| value.0.clone()),
-            latest_checkpoint_kind: latest_checkpoint.as_ref().map(|value| value.1.clone()),
-            latest_checkpoint_version: latest_checkpoint.as_ref().map(|value| value.2.clone()),
-            ..projection
-        };
-        projections.insert(run.run_id.clone(), projection);
         Ok(AtomicRunGuidanceAdmission::Committed { event_index })
     }
 
@@ -8758,25 +8465,6 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         run.last_event_idx = next_event_index - 1;
         run.updated_at = chrono::Utc::now().to_rfc3339();
-        let mut projections = self.projections.write().await;
-        let projection = projections
-            .entry(run.run_id.clone())
-            .or_insert_with(|| build_run_display_projection(run, None, None));
-        if projection.projection_event_idx <= run.last_event_idx {
-            projection.projection_event_idx = run.last_event_idx;
-            let event_type = if request.purpose.disposition() == UserIntentStatus::Returned {
-                "user_intent_returned"
-            } else {
-                "user_intent_applied"
-            };
-            projection.latest_event_type = Some(event_type.to_string());
-            projection.projection_hash = event_metadata_projection_patch_hash(
-                &run.run_id,
-                run.last_event_idx,
-                Some(event_type),
-            );
-            projection.updated_at = run.updated_at.clone();
-        }
         Ok(
             if request.purpose.disposition() == UserIntentStatus::Returned {
                 AtomicRunUserIntentApply::Returned { event_indices }
@@ -9126,7 +8814,7 @@ impl RunStateStore for InMemoryRunStateStore {
     ) -> Result<AtomicRunToolRequestCommitOutcome, String> {
         validate_action_admission_request(request.action)?;
         validate_atomic_tool_request_event(request)?;
-        let updated = {
+        let receipt = {
             let action_fence = self.action_fence_for(request.action.user_id, request.action.run_id);
             let _action_fence = action_fence.lock_owned().await;
             let cancellation_requests = self.cancellation_requests.read().await;
@@ -9258,15 +8946,10 @@ impl RunStateStore for InMemoryRunStateStore {
             run.events.push(request.tool_request_event.clone());
             run.last_event_idx = tool_request_event_index;
             run.updated_at = chrono::Utc::now().to_rfc3339();
-            (run.clone(), receipt)
+            receipt
         };
-        self.sync_projection_event_metadata(
-            &updated.0,
-            updated.1.tool_request_event_index,
-            "tool_request",
-        )
-        .await;
-        Ok(AtomicRunToolRequestCommitOutcome::Committed(updated.1))
+
+        Ok(AtomicRunToolRequestCommitOutcome::Committed(receipt))
     }
 
     async fn register_guarded_interaction_batch(
@@ -9281,7 +8964,7 @@ impl RunStateStore for InMemoryRunStateStore {
         {
             return Err(ToolInteractionAdmissionError::Unproven.to_string());
         }
-        let updated = {
+        {
             let action_fence = self.action_fence_for(request.user_id, request.run_id);
             let _action_fence = action_fence.lock_owned().await;
             let cancellation_requested = self
@@ -9418,10 +9101,8 @@ impl RunStateStore for InMemoryRunStateStore {
                 run.events.extend(new_events);
                 run.updated_at = chrono::Utc::now().to_rfc3339();
             }
-            run.clone()
-        };
-        self.sync_projection(&updated, Some(kind.required_event_type().to_string()), None)
-            .await;
+        }
+
         Ok(AtomicRunInteractionBatchRegistration::Registered)
     }
 
@@ -9444,7 +9125,6 @@ impl RunStateStore for InMemoryRunStateStore {
             return Ok(GuardedRunStatusTransition::StatusConflict);
         }
         let terminal_origin = cancelled_terminal_origin(status, std::slice::from_ref(&event))?;
-        let latest_event_type = extract_event_type(&event);
         let terminal_error_code = terminal_error_code_from_transition(
             status,
             error_message,
@@ -9505,7 +9185,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     || !expected_statuses.contains(&run.status.as_str())
                     || !cancellation_markers_admit_transition(terminal_origin, lineage_markers)
                 {
-                    None
+                    false
                 } else {
                     apply_in_memory_status_transition(
                         &mut slots,
@@ -9517,15 +9197,13 @@ impl RunStateStore for InMemoryRunStateStore {
                     )?;
                     run.events.push(event);
                     run.last_event_idx = run.events.len() as i64 - 1;
-                    Some(run.clone())
+                    true
                 }
             } else {
-                None
+                false
             }
         };
-        if let Some(run) = updated {
-            self.sync_projection(&run, Some(latest_event_type), None)
-                .await;
+        if updated {
             Ok(GuardedRunStatusTransition::Updated)
         } else {
             Ok(GuardedRunStatusTransition::StatusConflict)
@@ -9635,10 +9313,6 @@ impl RunStateStore for InMemoryRunStateStore {
                 run.updated_at = chrono::Utc::now().to_rfc3339();
             }
         };
-        // This primitive deliberately preserves every lifecycle projection
-        // field. A full projection sync here can race a resume/completion
-        // transition and overwrite its newer status or waiting reason with
-        // the pre-append snapshot.
         Ok(true)
     }
 
@@ -9650,7 +9324,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let action_fence = self.action_fence_for(request.user_id, request.run_id);
         let _action_fence = action_fence.lock_owned().await;
         let cancellation_requests = self.cancellation_requests.read().await;
-        let updated = {
+        {
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             let lineage_markers = in_memory_lineage_cancellation_markers(
@@ -9702,10 +9376,8 @@ impl RunStateStore for InMemoryRunStateStore {
             run.last_event_idx = run.events.len() as i64 - 1;
             run.owner_pod_id = None;
             run.owner_lease_expires_at = None;
-            run.clone()
-        };
-        self.sync_projection(&updated, Some("run_finished".to_string()), None)
-            .await;
+        }
+
         Ok(AtomicExecutionOwnerCancellation::Committed)
     }
 
@@ -9731,25 +9403,20 @@ impl RunStateStore for InMemoryRunStateStore {
                     || run.session_id != expected_session_id
                     || run.run_generation != expected_owner_generation
                 {
-                    None
+                    false
                 } else {
                     run.total_prompt_tokens = run.total_prompt_tokens.max(prompt_tokens);
                     run.total_completion_tokens =
                         run.total_completion_tokens.max(completion_tokens);
                     run.total_tool_calls = run.total_tool_calls.max(tool_calls);
                     run.updated_at = chrono::Utc::now().to_rfc3339();
-                    Some(run.clone())
+                    true
                 }
             } else {
-                None
+                false
             }
         };
-        if let Some(run) = updated {
-            self.sync_projection(&run, None, None).await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(updated)
     }
 
     async fn save_checkpoint(
@@ -9780,7 +9447,7 @@ impl RunStateStore for InMemoryRunStateStore {
             }
         };
         let mut checkpoints = self.checkpoints.write().await;
-        let (run, checkpoint) = {
+        let checkpoint = {
             let Some(run) = runs.get_mut(run_id) else {
                 return Ok(None);
             };
@@ -9824,7 +9491,7 @@ impl RunStateStore for InMemoryRunStateStore {
             run.checkpoint_json = Some(checkpoint_json.to_string());
             run.checkpoint_version = Some(checkpoint_version.clone());
             run.updated_at = chrono::Utc::now().to_rfc3339();
-            let checkpoint = DurableRunCheckpointRecord {
+            DurableRunCheckpointRecord {
                 checkpoint_id: previous
                     .map(|entry| entry.checkpoint_id.clone())
                     .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
@@ -9839,8 +9506,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 created_at: previous
                     .map(|entry| entry.created_at.clone())
                     .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-            };
-            (run.clone(), checkpoint)
+            }
         };
         let entries = checkpoints.entry(run_id.to_string()).or_default();
         if let Some(existing) = entries
@@ -9857,7 +9523,7 @@ impl RunStateStore for InMemoryRunStateStore {
         drop(runs);
         drop(cancellation_requests);
         drop(action_guard);
-        self.sync_projection(&run, None, Some(&checkpoint)).await;
+
         Ok(Some(RunCheckpointReceipt::from(&checkpoint)))
     }
 
@@ -9893,44 +9559,6 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(matches.into_iter().next())
     }
 
-    async fn load_run_projection(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        let projections = self.projections.read().await;
-        Ok(projections
-            .get(run_id)
-            .filter(|projection| projection.user_id == user_id)
-            .cloned())
-    }
-
-    async fn rebuild_run_projection(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        let Some(run) = self.load_run(user_id, run_id).await? else {
-            return Ok(None);
-        };
-        if run.session_id != expected_session_id {
-            return Ok(None);
-        }
-        let latest_event_type = run.events.last().map(extract_event_type);
-        let latest_checkpoint = self.load_latest_checkpoint(user_id, run_id, None).await?;
-        let projection = build_run_display_projection(
-            &run,
-            latest_event_type,
-            latest_checkpoint.as_ref().map(checkpoint_summary_tuple),
-        );
-        self.projections
-            .write()
-            .await
-            .insert(run_id.to_string(), projection.clone());
-        Ok(Some(projection))
-    }
-
     async fn append_events_batch(
         &self,
         user_id: &str,
@@ -9941,7 +9569,7 @@ impl RunStateStore for InMemoryRunStateStore {
         if events.is_empty() {
             return Ok(());
         }
-        let updated = {
+        {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
             let mut runs = self.runs.write().await;
@@ -9955,17 +9583,11 @@ impl RunStateStore for InMemoryRunStateStore {
             if events.is_empty() {
                 return Ok(());
             }
-            let latest_event_type = extract_event_type(events.last().unwrap());
             let start_idx = run.events.len() as i64;
             let event_count = events.len() as i64;
             run.events.extend(events);
             run.last_event_idx = start_idx + event_count - 1;
             run.updated_at = chrono::Utc::now().to_rfc3339();
-            Some((run.clone(), latest_event_type))
-        };
-        if let Some((run, latest_event_type)) = updated {
-            self.sync_projection(&run, Some(latest_event_type), None)
-                .await;
         }
         Ok(())
     }
@@ -10006,13 +9628,10 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         enum Mutation {
             Resolved {
-                run: DurableRunRecord,
-                resumed: bool,
                 event: serde_json::Value,
                 disposition: InteractionResolutionDisposition,
             },
             Queued {
-                run: DurableRunRecord,
                 event: serde_json::Value,
             },
         }
@@ -10154,12 +9773,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.events.extend(events.clone());
                     run.last_event_idx = first_event_idx + events.len() as i64 - 1;
                     run.updated_at = chrono::Utc::now().to_rfc3339();
-                    Mutation::Resolved {
-                        run: run.clone(),
-                        resumed: false,
-                        event,
-                        disposition,
-                    }
+                    Mutation::Resolved { event, disposition }
                 } else {
                     if let Some(existing) = queued {
                         return Ok(DurableRunInteractionResolveOutcome::Queued(existing));
@@ -10168,10 +9782,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.events.push(event.clone());
                     run.last_event_idx = run.last_event_idx.saturating_add(1);
                     run.updated_at = chrono::Utc::now().to_rfc3339();
-                    Mutation::Queued {
-                        run: run.clone(),
-                        event,
-                    }
+                    Mutation::Queued { event }
                 }
             } else {
                 let disposition = interaction_resolution_disposition(
@@ -10203,37 +9814,18 @@ impl RunStateStore for InMemoryRunStateStore {
                 run.last_event_idx = first_event_idx + events.len() as i64 - 1;
                 run.updated_at = chrono::Utc::now().to_rfc3339();
                 Mutation::Resolved {
-                    run: run.clone(),
-                    resumed: resume_wait,
                     event: terminal_event,
                     disposition,
                 }
             }
         };
-        let (run, resumed, terminal_event, disposition) = match updated {
-            Mutation::Resolved {
-                run,
-                resumed,
-                event,
-                disposition,
-            } => (run, resumed, event, disposition),
-            Mutation::Queued { run, event } => {
-                let queued_event_type = extract_event_type(&event);
-                self.sync_projection(&run, Some(queued_event_type), None)
-                    .await;
+        let (terminal_event, disposition) = match updated {
+            Mutation::Resolved { event, disposition } => (event, disposition),
+            Mutation::Queued { event } => {
                 return Ok(DurableRunInteractionResolveOutcome::Queued(event));
             }
         };
-        self.sync_projection(
-            &run,
-            Some(if resumed {
-                "run_resumed".to_string()
-            } else {
-                kind.resolved_event_type().to_string()
-            }),
-            None,
-        )
-        .await;
+
         debug_assert_eq!(
             interaction_resolution_receipt(&terminal_event)
                 .and_then(|receipt| receipt.get("disposition"))
@@ -10254,16 +9846,12 @@ impl RunStateStore for InMemoryRunStateStore {
         &self,
         request: AtomicRunInteractionWaitRequest<'_>,
     ) -> Result<DurableRunInteractionWaitOutcome, String> {
-        enum WaitMutation {
-            Waiting(DurableRunRecord),
-            Resolved(DurableRunRecord, serde_json::Value),
-        }
         let user_id = request.user_id;
         let expected_session_id = request.expected_session_id;
         let run_id = request.run_id;
         let request_id = request.request_id;
         let kind = request.kind;
-        let updated = {
+        let outcome = {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
             let cancellation_requested = self
@@ -10339,7 +9927,7 @@ impl RunStateStore for InMemoryRunStateStore {
                         kind.waiting_for()
                     )
                 })?;
-                let (events, terminal_event, resumed) = if let Some(disposition) = disposition {
+                let (events, terminal_event) = if let Some(disposition) = disposition {
                     let response = interaction_response_with_receipt(
                         response,
                         &disposition,
@@ -10348,7 +9936,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     );
                     let events = interaction_resolution_events(kind, request_id, response, false);
                     let terminal_event = events[0].clone();
-                    (events, terminal_event, false)
+                    (events, terminal_event)
                 } else if request.expected_control_epoch
                     != registration_authority.expected_control_epoch
                     || request.expected_owner_generation
@@ -10379,7 +9967,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     let resolved = interaction_resolution_events(kind, request_id, response, true);
                     let terminal_event = resolved[0].clone();
                     events.extend(resolved);
-                    (events, terminal_event, true)
+                    (events, terminal_event)
                 } else {
                     return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
                 };
@@ -10387,8 +9975,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 run.events.extend(events.clone());
                 run.last_event_idx = first_event_idx + events.len() as i64 - 1;
                 run.updated_at = chrono::Utc::now().to_rfc3339();
-                let _ = resumed;
-                WaitMutation::Resolved(run.clone(), terminal_event)
+                DurableRunInteractionWaitOutcome::AlreadyResolved(terminal_event)
             } else {
                 if run.run_generation != request.expected_owner_generation {
                     return Ok(DurableRunInteractionWaitOutcome::OwnerGenerationMismatch {
@@ -10450,30 +10037,10 @@ impl RunStateStore for InMemoryRunStateStore {
                 run.events.push(event);
                 run.last_event_idx = run.last_event_idx.saturating_add(1);
                 run.updated_at = chrono::Utc::now().to_rfc3339();
-                WaitMutation::Waiting(run.clone())
+                DurableRunInteractionWaitOutcome::Waiting
             }
         };
-        match updated {
-            WaitMutation::Waiting(run) => {
-                self.sync_projection(&run, Some("interaction_wait_started".to_string()), None)
-                    .await;
-                Ok(DurableRunInteractionWaitOutcome::Waiting)
-            }
-            WaitMutation::Resolved(run, event) => {
-                let latest = if interaction_resolution_receipt(&event)
-                    .and_then(|receipt| receipt.get("disposition"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("resumed")
-                {
-                    "run_resumed"
-                } else {
-                    kind.resolved_event_type()
-                };
-                self.sync_projection(&run, Some(latest.to_string()), None)
-                    .await;
-                Ok(DurableRunInteractionWaitOutcome::AlreadyResolved(event))
-            }
-        }
+        Ok(outcome)
     }
 
     async fn list_user_runs_cursor(
@@ -11506,137 +11073,6 @@ fn compare_recovery_candidate_order(
 
 impl DatabaseRunStateStore {
     #[allow(clippy::too_many_arguments)]
-    async fn upsert_terminal_display_projection_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        run: &DurableRunRecord,
-        request: AtomicRunTerminalSettlementRequest<'_>,
-        next_last_event_idx: i64,
-        latest_event_type: Option<&str>,
-    ) -> Result<String, String> {
-        let latest_checkpoint = sqlx::query(
-            "SELECT checkpoint_id, checkpoint_kind, checkpoint_version
-             FROM run_checkpoints
-             WHERE user_id = ? AND run_id = ?
-             ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1",
-        )
-        .bind(&run.user_id)
-        .bind(&run.run_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "load_atomic_terminal_projection_checkpoint",
-                &run.run_id,
-                source,
-            )
-            .to_string()
-        })?
-        .map(|row| {
-            Ok::<_, String>((
-                row.try_get("checkpoint_id")
-                    .map_err(|source| {
-                        db_error(
-                            "decode_atomic_terminal_projection_checkpoint_id",
-                            &run.run_id,
-                            source,
-                        )
-                    })
-                    .map_err(|error| error.to_string())?,
-                row.try_get("checkpoint_kind")
-                    .map_err(|source| {
-                        db_error(
-                            "decode_atomic_terminal_projection_checkpoint_kind",
-                            &run.run_id,
-                            source,
-                        )
-                    })
-                    .map_err(|error| error.to_string())?,
-                row.try_get("checkpoint_version")
-                    .map_err(|source| {
-                        db_error(
-                            "decode_atomic_terminal_projection_checkpoint_version",
-                            &run.run_id,
-                            source,
-                        )
-                    })
-                    .map_err(|error| error.to_string())?,
-            ))
-        })
-        .transpose()?;
-        let projection = build_run_display_projection(
-            &DurableRunRecord {
-                status: request.status.to_string(),
-                waiting_for: request.waiting_for.map(str::to_string),
-                error_message: request.error_message.map(str::to_string),
-                last_event_idx: next_last_event_idx,
-                total_prompt_tokens: request.prompt_tokens,
-                total_completion_tokens: request.completion_tokens,
-                total_tool_calls: request.tool_calls,
-                ..run.clone()
-            },
-            latest_event_type.map(str::to_string),
-            latest_checkpoint,
-        );
-        let upsert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO run_display_projections
-             (run_id, user_id, session_id, status, waiting_for, error_message,
-              projection_event_idx, latest_event_type, latest_checkpoint_id,
-              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
-              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
-             ON DUPLICATE KEY UPDATE
-               status = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(status), status),
-               waiting_for = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(waiting_for), waiting_for),
-               error_message = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(error_message), error_message),
-               latest_event_type = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_event_type), latest_event_type),
-               latest_checkpoint_id = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_id), latest_checkpoint_id),
-               latest_checkpoint_kind = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_kind), latest_checkpoint_kind),
-               latest_checkpoint_version = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_version), latest_checkpoint_version),
-               total_prompt_tokens = IF(VALUES(total_prompt_tokens) > total_prompt_tokens, VALUES(total_prompt_tokens), total_prompt_tokens),
-               total_completion_tokens = IF(VALUES(total_completion_tokens) > total_completion_tokens, VALUES(total_completion_tokens), total_completion_tokens),
-               total_tool_calls = IF(VALUES(total_tool_calls) > total_tool_calls, VALUES(total_tool_calls), total_tool_calls),
-               projection_hash = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(projection_hash), projection_hash),
-               updated_at = IF(VALUES(projection_event_idx) >= projection_event_idx, NOW(6), updated_at),
-               projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
-            [
-                projection.waiting_for.is_some(),
-                projection.error_message.is_some(),
-                projection.latest_event_type.is_some(),
-                projection.latest_checkpoint_id.is_some(),
-                projection.latest_checkpoint_kind.is_some(),
-                projection.latest_checkpoint_version.is_some(),
-            ],
-        );
-        sqlx::query(upsert_sql)
-            .bind(&projection.run_id)
-            .bind(&projection.user_id)
-            .bind(&projection.session_id)
-            .bind(&projection.status)
-            .bind(&projection.waiting_for)
-            .bind(&projection.error_message)
-            .bind(projection.projection_event_idx)
-            .bind(&projection.latest_event_type)
-            .bind(&projection.latest_checkpoint_id)
-            .bind(&projection.latest_checkpoint_kind)
-            .bind(&projection.latest_checkpoint_version)
-            .bind(projection.total_prompt_tokens as i64)
-            .bind(projection.total_completion_tokens as i64)
-            .bind(projection.total_tool_calls as i64)
-            .bind(&projection.projection_hash)
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| {
-                db_error(
-                    "upsert_atomic_terminal_run_projection",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-        Ok(projection.projection_hash)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn transition_run_status(
         &self,
         user_id: &str,
@@ -12041,8 +11477,6 @@ impl DatabaseRunStateStore {
             );
         }
 
-        self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
-            .await;
         Ok(StatusTransitionCommit {
             applied: true,
             recovery,
@@ -12619,9 +12053,8 @@ impl DatabaseRunStateStore {
     ///
     /// The caller is responsible for committing or rolling back `tx`. `None`
     /// is a resolved ownership/status conflict and leaves the transaction open
-    /// so the caller can roll back its canonical writes. The terminal display
-    /// projection is committed from the locked run and staged event receipts;
-    /// replay, conflict, and failure paths retain the full repair.
+    /// so the caller can roll back its canonical writes. Committed Run facts
+    /// and immutable event receipts own replay and uncertain-commit resolution.
     pub async fn settle_terminal_in_existing_transaction(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -13038,15 +12471,6 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|error| error.to_string())?;
         }
-        let projection_hash = Self::upsert_terminal_display_projection_tx(
-            tx,
-            &run,
-            request,
-            next_last_event_idx,
-            event_rows.last().map(|event| event.event_type.as_str()),
-        )
-        .await?;
-
         Ok(Some(AtomicRunTerminalSettlementCommit {
             committed_events: events_to_commit,
             event_receipts: event_rows
@@ -13062,7 +12486,6 @@ impl DatabaseRunStateStore {
                 .collect(),
             last_event_idx: next_last_event_idx,
             latest_event_type: event_rows.last().map(|event| event.event_type.clone()),
-            projection_hash,
         }))
     }
 
@@ -13098,22 +12521,6 @@ impl DatabaseRunStateStore {
             }
             AtomicRunTerminalFactMatch::Exact => {}
         }
-        let projection_hash = sqlx::query_scalar::<_, String>(
-            "SELECT projection_hash FROM run_display_projections
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| {
-            db_error(
-                "resolve_atomic_terminal_projection_hash",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
         let (receipts, committed_events) = if let Some(expected) = expected_receipts {
             if expected.last().map(|receipt| receipt.event_idx) != Some(run.last_event_idx)
                 && !expected.is_empty()
@@ -13328,7 +12735,6 @@ impl DatabaseRunStateStore {
                 committed_events,
                 event_receipts: receipts,
                 last_event_idx: run.last_event_idx,
-                projection_hash: projection_hash.unwrap_or_default(),
             },
         ))
     }
@@ -13511,20 +12917,6 @@ impl DatabaseRunStateStore {
                 ))
             })
             .collect()
-    }
-
-    /// Repair the derived display projection after an authoritative atomic
-    /// terminal settlement. A projection failure is surfaced to the caller but
-    /// can never roll back or reclassify the already-committed run terminal.
-    pub async fn repair_projection_after_atomic_terminal_settlement(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<(), String> {
-        self.sync_projection_for_user(user_id, expected_session_id, run_id)
-            .await
-            .map_err(|error| error.to_string())
     }
 
     fn lease_ttl_micros(&self) -> i64 {
@@ -14084,263 +13476,6 @@ impl DatabaseRunStateStore {
             .await
     }
 
-    async fn load_run_projection_metadata_for_user(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> DbStoreResult<Option<DurableRunDisplayProjectionRecord>> {
-        let sql = format!(
-            "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS} FROM run_display_projections WHERE user_id = ? AND run_id = ?"
-        );
-        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(user_id)
-            .bind(run_id)
-            .fetch_optional(self.pool.get())
-            .await
-            .map_err(|source| db_error("load_run_projection_for_user", run_id, source))?;
-        row.map(run_projection_record_from_row).transpose()
-    }
-
-    async fn patch_run_projection_usage_for_user(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
-    ) -> DbStoreResult<u64> {
-        let projection_hash =
-            usage_projection_patch_hash(run_id, prompt_tokens, completion_tokens, tool_calls);
-        let result = sqlx::query(
-            "UPDATE run_display_projections
-             SET projection_hash = IF(
-                   CAST(? AS SIGNED) >= total_prompt_tokens
-                   AND CAST(? AS SIGNED) >= total_completion_tokens
-                   AND CAST(? AS SIGNED) >= total_tool_calls,
-                   ?, projection_hash),
-                 updated_at = IF(
-                   CAST(? AS SIGNED) > total_prompt_tokens
-                   OR CAST(? AS SIGNED) > total_completion_tokens
-                   OR CAST(? AS SIGNED) > total_tool_calls,
-                   NOW(6), updated_at),
-                 total_prompt_tokens = IF(CAST(? AS SIGNED) > total_prompt_tokens, CAST(? AS SIGNED), total_prompt_tokens),
-                 total_completion_tokens = IF(CAST(? AS SIGNED) > total_completion_tokens, CAST(? AS SIGNED), total_completion_tokens),
-                 total_tool_calls = IF(CAST(? AS SIGNED) > total_tool_calls, CAST(? AS SIGNED), total_tool_calls)
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(prompt_tokens as i64)
-        .bind(completion_tokens as i64)
-        .bind(tool_calls as i64)
-        .bind(&projection_hash)
-        .bind(prompt_tokens as i64)
-        .bind(completion_tokens as i64)
-        .bind(tool_calls as i64)
-        .bind(prompt_tokens as i64)
-        .bind(prompt_tokens as i64)
-        .bind(completion_tokens as i64)
-        .bind(completion_tokens as i64)
-        .bind(tool_calls as i64)
-        .bind(tool_calls as i64)
-        .bind(user_id)
-        .bind(expected_session_id)
-        .bind(run_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("patch_run_projection_usage", run_id, source))?;
-        Ok(result.rows_affected())
-    }
-
-    async fn patch_run_projection_event_metadata_for_user(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        projection_event_idx: i64,
-        latest_event_type: &str,
-    ) {
-        match Self::patch_run_projection_event_metadata(
-            self.pool.get(),
-            user_id,
-            expected_session_id,
-            run_id,
-            projection_event_idx,
-            latest_event_type,
-        )
-        .await
-        {
-            Ok(rows_affected) if rows_affected > 0 => {}
-            Ok(_) => {
-                self.inspect_or_repair_run_projection_event_metadata_miss(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    projection_event_idx,
-                    latest_event_type,
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    projection_event_idx,
-                    latest_event_type,
-                    error = %error,
-                    "action admission committed but display projection event metadata patch failed"
-                );
-            }
-        }
-    }
-
-    async fn inspect_or_repair_run_projection_event_metadata_miss(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        projection_event_idx: i64,
-        latest_event_type: &str,
-    ) {
-        match self
-            .load_run_projection_metadata_for_user(user_id, run_id)
-            .await
-        {
-            Ok(None) => {
-                if let Err(error) = self
-                    .sync_projection_for_user(user_id, expected_session_id, run_id)
-                    .await
-                {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        projection_event_idx,
-                        latest_event_type,
-                        error = %error,
-                        "event commit succeeded but missing display projection repair failed"
-                    );
-                }
-            }
-            Ok(Some(existing)) => {
-                tracing::debug!(
-                    user_id,
-                    run_id,
-                    projection_event_idx,
-                    current_projection_event_idx = existing.projection_event_idx,
-                    latest_event_type,
-                    "ignored stale run display projection event metadata patch"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    projection_event_idx,
-                    latest_event_type,
-                    error = %error,
-                    "event commit succeeded but display projection state check failed"
-                );
-            }
-        }
-    }
-
-    async fn patch_run_projection_event_metadata<'e, E>(
-        executor: E,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        projection_event_idx: i64,
-        latest_event_type: &str,
-    ) -> Result<u64, sqlx::Error>
-    where
-        E: Executor<'e, Database = MySql>,
-    {
-        let projection_hash = event_metadata_projection_patch_hash(
-            run_id,
-            projection_event_idx,
-            Some(latest_event_type),
-        );
-        sqlx::query(
-            "UPDATE run_display_projections
-             SET projection_event_idx = ?,
-                 latest_event_type = ?,
-                 projection_hash = ?,
-                 updated_at = NOW(6)
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND projection_event_idx < ?",
-        )
-        .bind(projection_event_idx)
-        .bind(latest_event_type)
-        .bind(&projection_hash)
-        .bind(user_id)
-        .bind(expected_session_id)
-        .bind(run_id)
-        .bind(projection_event_idx)
-        .execute(executor)
-        .await
-        .map(|result| result.rows_affected())
-    }
-
-    async fn upsert_event_metadata_projection_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        run: &DurableRunRecord,
-        event_index: i64,
-        event_type: &str,
-    ) -> Result<(), String> {
-        let prompt_tokens = i64::try_from(run.total_prompt_tokens).map_err(|_| {
-            format!(
-                "guidance projection prompt token total exceeds i64 for run {}",
-                run.run_id
-            )
-        })?;
-        let completion_tokens = i64::try_from(run.total_completion_tokens).map_err(|_| {
-            format!(
-                "guidance projection completion token total exceeds i64 for run {}",
-                run.run_id
-            )
-        })?;
-        let tool_calls = i64::from(run.total_tool_calls);
-        let projection_hash =
-            event_metadata_projection_patch_hash(&run.run_id, event_index, Some(event_type));
-        let upsert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO run_display_projections
-             (run_id, user_id, session_id, status, waiting_for, error_message,
-              projection_event_idx, latest_event_type, latest_checkpoint_id,
-              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
-              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NOW(6))
-             ON DUPLICATE KEY UPDATE
-               status = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(status), status),
-               waiting_for = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(waiting_for), waiting_for),
-               error_message = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(error_message), error_message),
-               latest_event_type = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(latest_event_type), latest_event_type),
-               total_prompt_tokens = IF(VALUES(total_prompt_tokens) > total_prompt_tokens, VALUES(total_prompt_tokens), total_prompt_tokens),
-               total_completion_tokens = IF(VALUES(total_completion_tokens) > total_completion_tokens, VALUES(total_completion_tokens), total_completion_tokens),
-               total_tool_calls = IF(VALUES(total_tool_calls) > total_tool_calls, VALUES(total_tool_calls), total_tool_calls),
-               projection_hash = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_hash), projection_hash),
-               updated_at = IF(VALUES(projection_event_idx) > projection_event_idx, NOW(6), updated_at),
-               projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
-            [run.waiting_for.is_some(), run.error_message.is_some()],
-        );
-        sqlx::query(upsert_sql)
-            .bind(&run.run_id)
-            .bind(&run.user_id)
-            .bind(&run.session_id)
-            .bind(&run.status)
-            .bind(&run.waiting_for)
-            .bind(&run.error_message)
-            .bind(event_index)
-            .bind(event_type)
-            .bind(prompt_tokens)
-            .bind(completion_tokens)
-            .bind(tool_calls)
-            .bind(&projection_hash)
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| {
-                db_error("upsert_event_metadata_projection", &run.run_id, source).to_string()
-            })?;
-        Ok(())
-    }
-
     async fn insert_run_event_rows_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         run_id: &str,
@@ -14425,218 +13560,6 @@ impl DatabaseRunStateStore {
             }
         }
         Ok(true)
-    }
-
-    async fn repair_run_projection_after_status_for_user(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) {
-        if let Err(error) = self
-            .sync_projection_for_user(user_id, expected_session_id, run_id)
-            .await
-        {
-            tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "run transition committed but authoritative display projection refresh failed"
-            );
-        }
-    }
-
-    /// Rebuild the display projection from one canonical, locked cut of the
-    /// authoritative run, event, and checkpoint tables.
-    ///
-    /// Full projection refreshes never trust a caller snapshot. Taking the
-    /// session -> lifecycle-fence -> slot -> run lock before the projection row
-    /// serializes delayed post-commit callbacks with the transition that made
-    /// their snapshot stale. This also keeps the lock order compatible with
-    /// transactions that update the run and projection together.
-    async fn sync_projection_for_user(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> DbStoreResult<()> {
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| db_error("acquire_sync_run_projection", run_id, source))?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| db_error("begin_sync_run_projection", run_id, source))?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
-            .await?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error("rollback_sync_run_projection_missing", run_id, source)
-            })?;
-            connection.release();
-            return Ok(());
-        };
-        let latest_event_type = sqlx::query_scalar::<_, String>(
-            "SELECT event_type FROM agent_run_events
-             WHERE user_id = ? AND run_id = ?
-             ORDER BY event_idx DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| db_error("load_projection_latest_event_tx", run_id, source))?;
-        let latest_checkpoint = sqlx::query(
-            "SELECT checkpoint_id, checkpoint_kind, checkpoint_version
-             FROM run_checkpoints
-             WHERE user_id = ? AND run_id = ?
-             ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| db_error("load_projection_latest_checkpoint_tx", run_id, source))?
-        .map(|row| {
-            Ok::<_, DatabaseRunStateStoreError>((
-                row.try_get("checkpoint_id").map_err(|source| {
-                    db_error("decode_projection_checkpoint_id", run_id, source)
-                })?,
-                row.try_get("checkpoint_kind").map_err(|source| {
-                    db_error("decode_projection_checkpoint_kind", run_id, source)
-                })?,
-                row.try_get("checkpoint_version").map_err(|source| {
-                    db_error("decode_projection_checkpoint_version", run_id, source)
-                })?,
-            ))
-        })
-        .transpose()?;
-        let projection = build_run_display_projection(&run, latest_event_type, latest_checkpoint);
-        let existing = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS}
-             FROM run_display_projections
-             WHERE user_id = ? AND run_id = ? FOR UPDATE"
-        )))
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| db_error("lock_run_projection", run_id, source))?
-        .map(run_projection_record_from_row)
-        .transpose()?;
-        if let Some(existing) = existing.as_ref()
-            && existing.session_id != projection.session_id
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error("rollback_cross_session_run_projection", run_id, source)
-            })?;
-            connection.release();
-            return Err(db_error(
-                "sync_run_projection_cross_session_conflict",
-                run_id,
-                sqlx::Error::Protocol(format!(
-                    "display projection is bound to immutable session {}, authoritative run is bound to {}",
-                    existing.session_id, projection.session_id
-                )),
-            ));
-        }
-        if let Some(existing) = existing.as_ref() {
-            match classify_run_display_projection_relation(existing, &projection) {
-                RunDisplayProjectionRelation::AuthorityBehindProjection => {
-                    tx.rollback().await.map_err(|source| {
-                        db_error("rollback_stale_run_projection", run_id, source)
-                    })?;
-                    connection.release();
-                    return Err(db_error(
-                        "sync_run_projection_stale_authority",
-                        run_id,
-                        sqlx::Error::Protocol(format!(
-                            "authoritative event index {} trails display projection index {}",
-                            projection.projection_event_idx, existing.projection_event_idx
-                        )),
-                    ));
-                }
-                RunDisplayProjectionRelation::PayloadConflict => {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        projection_event_idx = projection.projection_event_idx,
-                        existing_projection_hash = %existing.projection_hash,
-                        authoritative_projection_hash = %projection.projection_hash,
-                        stage = "projection_same_frontier_authority_repair",
-                        "repairing conflicting same-frontier display projection from canonical durable facts"
-                    );
-                }
-                RunDisplayProjectionRelation::HashCanonicalization => {
-                    tracing::debug!(
-                        user_id,
-                        run_id,
-                        projection_event_idx = projection.projection_event_idx,
-                        existing_projection_hash = %existing.projection_hash,
-                        authoritative_projection_hash = %projection.projection_hash,
-                        stage = "projection_same_frontier_hash_canonicalization",
-                        "canonicalizing same-frontier display projection patch hash"
-                    );
-                }
-                RunDisplayProjectionRelation::ProjectionBehindAuthority
-                | RunDisplayProjectionRelation::Canonical => {}
-            }
-        }
-        let upsert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO run_display_projections
-             (run_id, user_id, session_id, status, waiting_for, error_message,
-              projection_event_idx, latest_event_type, latest_checkpoint_id,
-              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
-              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
-             ON DUPLICATE KEY UPDATE
-               status = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(status), status),
-               waiting_for = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(waiting_for), waiting_for),
-               error_message = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(error_message), error_message),
-               latest_event_type = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_event_type), latest_event_type),
-               latest_checkpoint_id = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_id), latest_checkpoint_id),
-               latest_checkpoint_kind = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_kind), latest_checkpoint_kind),
-               latest_checkpoint_version = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_version), latest_checkpoint_version),
-               total_prompt_tokens = IF(VALUES(total_prompt_tokens) > total_prompt_tokens, VALUES(total_prompt_tokens), total_prompt_tokens),
-               total_completion_tokens = IF(VALUES(total_completion_tokens) > total_completion_tokens, VALUES(total_completion_tokens), total_completion_tokens),
-               total_tool_calls = IF(VALUES(total_tool_calls) > total_tool_calls, VALUES(total_tool_calls), total_tool_calls),
-               projection_hash = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(projection_hash), projection_hash),
-               updated_at = IF(VALUES(projection_event_idx) >= projection_event_idx, NOW(6), updated_at),
-               projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
-            [
-                projection.waiting_for.is_some(),
-                projection.error_message.is_some(),
-                projection.latest_event_type.is_some(),
-                projection.latest_checkpoint_id.is_some(),
-                projection.latest_checkpoint_kind.is_some(),
-                projection.latest_checkpoint_version.is_some(),
-            ],
-        );
-        sqlx::query(upsert_sql)
-            .bind(&projection.run_id)
-            .bind(&projection.user_id)
-            .bind(&projection.session_id)
-            .bind(&projection.status)
-            .bind(&projection.waiting_for)
-            .bind(&projection.error_message)
-            .bind(projection.projection_event_idx)
-            .bind(&projection.latest_event_type)
-            .bind(&projection.latest_checkpoint_id)
-            .bind(&projection.latest_checkpoint_kind)
-            .bind(&projection.latest_checkpoint_version)
-            .bind(projection.total_prompt_tokens as i64)
-            .bind(projection.total_completion_tokens as i64)
-            .bind(projection.total_tool_calls as i64)
-            .bind(&projection.projection_hash)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| db_error("upsert_authoritative_run_projection", run_id, source))?;
-        tx.commit()
-            .await
-            .map_err(|source| db_error("commit_sync_run_projection", run_id, source))?;
-        connection.release();
-        Ok(())
     }
 
     /// Append one immutable event batch under the canonical
@@ -14807,17 +13730,7 @@ impl DatabaseRunStateStore {
                 db_error("rollback_idempotent_run_event_batch", run_id, source)
             })?;
             connection.release();
-            if let Err(error) = self
-                .sync_projection_for_user(user_id, expected_session_id, run_id)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    error = %error,
-                    "exact run event replay succeeded but projection repair failed"
-                );
-            }
+
             return Ok(());
         }
         let start_idx = run.last_event_idx + 1;
@@ -14859,11 +13772,6 @@ impl DatabaseRunStateStore {
             ));
         }
         Self::insert_run_event_rows_tx(&mut tx, run_id, &rows, "insert_run_events_batch").await?;
-        let latest_event_type = rows
-            .last()
-            .expect("committed event batch")
-            .event_type
-            .clone();
         #[cfg(test)]
         let inject_missing_commit = self
             .generic_append_commit_ack_loss_missing_once
@@ -14907,48 +13815,7 @@ impl DatabaseRunStateStore {
             }
         };
         if commit_error.is_none() {
-            // The projection is a recoverable read model, so it must not
-            // participate in the authoritative event transaction. Reuse the
-            // now-synchronized physical connection after COMMIT instead: this
-            // removes the second checkout without extending the run-row lock
-            // or making projection availability gate event durability.
-            match Self::patch_run_projection_event_metadata(
-                connection.connection_mut(),
-                user_id,
-                expected_session_id,
-                run_id,
-                last_event_idx,
-                &latest_event_type,
-            )
-            .await
-            {
-                Ok(rows_affected) if rows_affected > 0 => connection.release(),
-                Ok(_) => {
-                    connection.release();
-                    self.inspect_or_repair_run_projection_event_metadata_miss(
-                        user_id,
-                        expected_session_id,
-                        run_id,
-                        last_event_idx,
-                        &latest_event_type,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        projection_event_idx = last_event_idx,
-                        latest_event_type,
-                        error = %error,
-                        "event commit succeeded but display projection event metadata patch failed"
-                    );
-                    // The failed exchange may have left unread protocol data.
-                    // Drop closes this connection instead of returning it to
-                    // the shared pool; the authoritative commit already won.
-                    drop(connection);
-                }
-            }
+            connection.release();
             return Ok(());
         }
         if connection_reusable {
@@ -14980,14 +13847,7 @@ impl DatabaseRunStateStore {
                 sqlx::Error::Protocol(commit_error),
             ));
         }
-        self.patch_run_projection_event_metadata_for_user(
-            user_id,
-            expected_session_id,
-            run_id,
-            last_event_idx,
-            &latest_event_type,
-        )
-        .await;
+
         Ok(())
     }
 }
@@ -16600,60 +15460,6 @@ impl DatabaseRunStateStore {
             )
             .await?;
         }
-        let projection = build_run_display_projection(
-            &record,
-            (if collaborator_events_on_new_run {
-                collaborator_event_rows.last()
-            } else {
-                None
-            })
-            .or_else(|| initial_event_rows.last())
-            .map(|event| event.event_type.clone()),
-            None,
-        );
-        let insert_projection_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO run_display_projections
-             (run_id, user_id, session_id, status, waiting_for, error_message,
-              projection_event_idx, latest_event_type, latest_checkpoint_id,
-              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
-              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NOW(6))",
-            [
-                projection.waiting_for.is_some(),
-                projection.error_message.is_some(),
-                projection.latest_event_type.is_some(),
-            ],
-        );
-        sqlx::query(insert_projection_sql)
-            .bind(&projection.run_id)
-            .bind(&projection.user_id)
-            .bind(&projection.session_id)
-            .bind(&projection.status)
-            .bind(&projection.waiting_for)
-            .bind(&projection.error_message)
-            .bind(projection.projection_event_idx)
-            .bind(&projection.latest_event_type)
-            .bind(i64::try_from(projection.total_prompt_tokens).map_err(|_| {
-                format!(
-                    "initial projection prompt tokens overflow for {}",
-                    record.run_id
-                )
-            })?)
-            .bind(
-                i64::try_from(projection.total_completion_tokens).map_err(|_| {
-                    format!(
-                        "initial projection completion tokens overflow for {}",
-                        record.run_id
-                    )
-                })?,
-            )
-            .bind(i64::from(projection.total_tool_calls))
-            .bind(&projection.projection_hash)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error("insert_initial_run_projection", &record.run_id, source).to_string()
-            })?;
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -17528,24 +16334,7 @@ impl DatabaseRunStateStore {
             )
             .await.map_err(|error| error.to_string())?;
 
-            // Keep the user-visible projection in the authoritative commit.
-            // This replaces a second post-commit transaction that could wait
-            // indefinitely after the terminal fact was already durable.
-            let mut projection_run = run.clone();
-            projection_run.status = STATUS_CANCELLED.to_string();
-            projection_run.waiting_for = None;
-            projection_run.error_code = None;
-            projection_run.error_message = None;
-            projection_run.owner_pod_id = None;
-            projection_run.owner_lease_expires_at = None;
-            projection_run.last_event_idx = next_last_event_idx;
-            Self::upsert_event_metadata_projection_tx(
-                &mut tx,
-                &projection_run,
-                next_last_event_idx,
-                "run_finished",
-            )
-            .await?;
+
             Ok(StagedExecutionOwnerCancellation::Commit { terminal_event })
         }
         .await;
@@ -18186,17 +16975,6 @@ impl RunStateStore for DatabaseRunStateStore {
         .await
     }
 
-    async fn repair_terminal_projection_after_receipt(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<(), String> {
-        self.sync_projection_for_user(user_id, expected_session_id, run_id)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     async fn request_permission_mode(
         &self,
         user_id: &str,
@@ -18820,21 +17598,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 "terminalize_orphaned_run_cancellation_insert_terminal_events",
             )
             .await.map_err(|error| error.to_string())?;
-            let mut projection_run = run.clone();
-            projection_run.status = STATUS_CANCELLED.to_string();
-            projection_run.waiting_for = None;
-            projection_run.error_code = None;
-            projection_run.error_message = None;
-            projection_run.owner_pod_id = None;
-            projection_run.owner_lease_expires_at = None;
-            projection_run.last_event_idx = event_idx;
-            Self::upsert_event_metadata_projection_tx(
-                &mut tx,
-                &projection_run,
-                event_idx,
-                "run_finished",
-            )
-            .await?;
+
             let commit_error = match tx.commit().await {
                 Ok(()) => {
                     #[cfg(test)]
@@ -19643,8 +18407,6 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await
         .map_err(|error| error.to_string())?;
-        Self::upsert_event_metadata_projection_tx(&mut tx, &run, event_index, "user_intent")
-            .await?;
 
         let commit_error = match tx.commit().await {
             Ok(()) => {
@@ -20193,17 +18955,6 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await
         .map_err(|error| error.to_string())?;
-        Self::upsert_event_metadata_projection_tx(
-            &mut tx,
-            &run,
-            last_event_index,
-            if request.purpose.disposition() == UserIntentStatus::Returned {
-                "user_intent_returned"
-            } else {
-                "user_intent_applied"
-            },
-        )
-        .await?;
 
         let expected_applied = expected
             .iter()
@@ -20785,8 +19536,6 @@ impl RunStateStore for DatabaseRunStateStore {
         })?;
         connection.release();
 
-        self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
-            .await;
         Ok(GuardedRunStatusTransition::Updated)
     }
 
@@ -21173,42 +19922,7 @@ impl RunStateStore for DatabaseRunStateStore {
         .map_err(|source| {
             db_error("update_run_usage_if_current_owner", run_id, source).to_string()
         })?;
-        if result.rows_affected() > 0 {
-            match self
-                .patch_run_projection_usage_for_user(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                )
-                .await
-            {
-                Ok(0) => {
-                    if let Err(error) = self
-                        .sync_projection_for_user(user_id, expected_session_id, run_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            user_id,
-                            run_id,
-                            error = %error,
-                            "run usage committed but projection repair failed"
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        error = %error,
-                        "run usage committed but projection patch failed"
-                    );
-                }
-            }
-        }
+
         Ok(result.rows_affected() > 0)
     }
 
@@ -21381,9 +20095,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("commit_save_checkpoint", run_id, source).to_string())?;
         connection.release();
-        self.sync_projection_for_user(user_id, expected_session_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?;
+
         Ok(Some(RunCheckpointReceipt {
             checkpoint_id,
             user_id: user_id.to_owned(),
@@ -21427,31 +20139,6 @@ impl RunStateStore for DatabaseRunStateStore {
         row.map(|row| decode_run_checkpoint_record_from_row(&row))
             .transpose()
             .map_err(|e| e.to_string())
-    }
-
-    async fn load_run_projection(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.load_run_projection_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn rebuild_run_projection(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        if self.load_run(user_id, run_id).await?.is_none() {
-            return Ok(None);
-        }
-        self.sync_projection_for_user(user_id, expected_session_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.load_run_projection(user_id, run_id).await
     }
 
     // `append_event` not overridden — trait default delegates to
@@ -21859,25 +20546,11 @@ impl RunStateStore for DatabaseRunStateStore {
             ) {
                 return Ok(recovered_outcome);
             }
-            self.patch_run_projection_event_metadata_for_user(
-                request.action.user_id,
-                request.action.expected_session_id,
-                request.action.run_id,
-                tool_request_event_index,
-                "tool_request",
-            )
-            .await;
+
             return Ok(recovered_outcome);
         }
         connection.release();
-        self.patch_run_projection_event_metadata_for_user(
-            request.action.user_id,
-            request.action.expected_session_id,
-            request.action.run_id,
-            tool_request_event_index,
-            "tool_request",
-        )
-        .await;
+
         Ok(AtomicRunToolRequestCommitOutcome::Committed(receipt))
     }
 
@@ -22415,14 +21088,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 "recovered guarded interaction registration commit acknowledgement"
             );
         }
-        self.patch_run_projection_event_metadata_for_user(
-            request.user_id,
-            request.expected_session_id,
-            request.run_id,
-            next_last_event_idx,
-            kind.required_event_type(),
-        )
-        .await;
+
         Ok(AtomicRunInteractionBatchRegistration::Registered)
     }
 
@@ -22715,14 +21381,7 @@ impl RunStateStore for DatabaseRunStateStore {
                                 .to_string()
                         })?;
                         connection.release();
-                        self.patch_run_projection_event_metadata_for_user(
-                            user_id,
-                            expected_session_id,
-                            run_id,
-                            event_idx,
-                            kind.resolved_event_type(),
-                        )
-                        .await;
+
                         return Ok(DurableRunInteractionWaitOutcome::AlreadyResolved(event));
                     }
                 }
@@ -23068,14 +21727,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         ));
                     }
                 }
-                self.patch_run_projection_event_metadata_for_user(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    last_event_idx,
-                    "run_resumed",
-                )
-                .await;
+
                 return Ok(DurableRunInteractionWaitOutcome::AlreadyResolved(
                     terminal_event,
                 ));
@@ -23280,8 +21932,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 // latest same-kind frontier are classified from one locked cut.
                 continue;
             }
-            self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
-                .await;
+
             break Ok(DurableRunInteractionWaitOutcome::Waiting);
         }
     }
@@ -23715,24 +22366,10 @@ impl RunStateStore for DatabaseRunStateStore {
                     if !queued_interaction_response_matches(&recovered, &response_data) {
                         return Ok(DurableRunInteractionResolveOutcome::Conflict(recovered));
                     }
-                    self.patch_run_projection_event_metadata_for_user(
-                        user_id,
-                        expected_session_id,
-                        run_id,
-                        event_idx,
-                        queued_response_event_type,
-                    )
-                    .await;
+
                     return Ok(DurableRunInteractionResolveOutcome::Queued(recovered));
                 }
-                self.patch_run_projection_event_metadata_for_user(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    event_idx,
-                    queued_response_event_type,
-                )
-                .await;
+
                 return Ok(DurableRunInteractionResolveOutcome::Queued(event));
             }
 
@@ -23870,17 +22507,6 @@ impl RunStateStore for DatabaseRunStateStore {
                     .map_err(|error| format!("{commit_error}; {error}"))?
                 {
                     InteractionCommitRecovery::ThisAttemptExact(existing) => {
-                        if let Err(error) = self
-                            .sync_projection_for_user(user_id, expected_session_id, run_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                user_id,
-                                run_id,
-                                error = %error,
-                                "interaction ACK recovered but display projection refresh failed"
-                            );
-                        }
                         return Ok(interaction_outcome_from_durable_receipt(existing, false));
                     }
                     InteractionCommitRecovery::EquivalentConcurrentWinner(existing) => {
@@ -23892,17 +22518,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     InteractionCommitRecovery::NotCommitted => return Err(commit_error),
                 }
             }
-            if let Err(error) = self
-                .sync_projection_for_user(user_id, expected_session_id, run_id)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    error = %error,
-                    "interaction resolved but display projection refresh failed"
-                );
-            }
+
             return Ok(interaction_outcome_from_durable_receipt(
                 events[0].clone(),
                 true,
@@ -25879,59 +24495,6 @@ fn decode_durable_work_item_run_binding(
             "durable WorkItem run binding must contain all fields or none",
         )),
     }
-}
-
-fn run_projection_record_from_row(
-    row: sqlx::mysql::MySqlRow,
-) -> DbStoreResult<DurableRunDisplayProjectionRecord> {
-    decode_run_display_projection_record_from_row(&row)
-}
-
-fn decode_run_display_projection_record_from_row(
-    row: &impl RunStateDbRow,
-) -> DbStoreResult<DurableRunDisplayProjectionRecord> {
-    let operation = "decode_run_projection_row";
-    let table = "run_display_projections";
-    let run_id = run_row_string(row, operation, table, "run_id")?;
-    Ok(DurableRunDisplayProjectionRecord {
-        run_id,
-        user_id: run_row_string(row, operation, table, "user_id")?,
-        session_id: run_row_string(row, operation, table, "session_id")?,
-        status: run_row_string(row, operation, table, "status")?,
-        waiting_for: run_row_optional_string(row, operation, table, "waiting_for")?,
-        error_message: run_row_optional_string(row, operation, table, "error_message")?,
-        projection_event_idx: run_row_at_least_i64(
-            row,
-            operation,
-            table,
-            "projection_event_idx",
-            -1,
-        )?,
-        latest_event_type: run_row_optional_string(row, operation, table, "latest_event_type")?,
-        latest_checkpoint_id: run_row_optional_string(
-            row,
-            operation,
-            table,
-            "latest_checkpoint_id",
-        )?,
-        latest_checkpoint_kind: run_row_optional_string(
-            row,
-            operation,
-            table,
-            "latest_checkpoint_kind",
-        )?,
-        latest_checkpoint_version: run_row_optional_string(
-            row,
-            operation,
-            table,
-            "latest_checkpoint_version",
-        )?,
-        total_prompt_tokens: run_row_u64(row, operation, table, "total_prompt_tokens")?,
-        total_completion_tokens: run_row_u64(row, operation, table, "total_completion_tokens")?,
-        total_tool_calls: run_row_u32(row, operation, table, "total_tool_calls")?,
-        projection_hash: run_row_string(row, operation, table, "projection_hash")?,
-        updated_at: run_row_datetime_string(row, operation, table, "updated_at")?,
-    })
 }
 
 fn decode_run_checkpoint_record_from_row(
@@ -29318,32 +27881,20 @@ mod tests {
                 accepted
             );
         }
-        // A blocked projection write must retain the existing action fence.
-        let projection_guard = store.projections.write().await;
-        let mut update = Box::pin(store.update_run_usage_if_current_owner(
-            RunUsageOwnerUpdateRequest {
-                user_id: "u1",
-                expected_session_id: "s1",
-                run_id: "owned-usage",
-                expected_owner_generation: 0,
-                prompt_tokens: 22,
-                completion_tokens: 13,
-                tool_calls: 5,
-            },
-        ));
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(update.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
         assert!(
             store
-                .action_fence_for("u1", "owned-usage")
-                .try_lock()
-                .is_err()
+                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id: "owned-usage",
+                    expected_owner_generation: 0,
+                    prompt_tokens: 22,
+                    completion_tokens: 13,
+                    tool_calls: 5,
+                })
+                .await
+                .unwrap()
         );
-        drop(projection_guard);
-        assert!(update.await.unwrap());
         let run = store.load_run("u1", "owned-usage").await.unwrap().unwrap();
         assert_eq!(
             (
@@ -29353,11 +27904,7 @@ mod tests {
             ),
             (22, 13, 5)
         );
-        let projection = store
-            .load_run_projection("u1", "owned-usage")
-            .await
-            .unwrap()
-            .unwrap();
+        let projection = store.load_run("u1", "owned-usage").await.unwrap().unwrap();
         assert_eq!(
             (
                 projection.total_prompt_tokens,
@@ -30103,94 +28650,6 @@ mod tests {
     }
 
     #[test]
-    fn same_frontier_local_patch_hash_is_not_projection_payload_conflict() {
-        let mut run = durable_run_record("projection-local-patches");
-        run.last_event_idx = 7;
-        run.total_prompt_tokens = 21;
-        run.total_completion_tokens = 13;
-        run.total_tool_calls = 5;
-        let authoritative =
-            build_run_display_projection(&run, Some("tool_call_end".to_string()), None);
-
-        // Event metadata and usage are deliberately patched independently on
-        // the hot path. The last patch owns a bounded patch hash, while the
-        // materialized payload already agrees with the canonical full view.
-        let mut locally_patched = authoritative.clone();
-        locally_patched.projection_hash = event_metadata_projection_patch_hash(
-            &run.run_id,
-            run.last_event_idx,
-            Some("tool_call_end"),
-        );
-        locally_patched.projection_hash = usage_projection_patch_hash(
-            &run.run_id,
-            run.total_prompt_tokens,
-            run.total_completion_tokens,
-            run.total_tool_calls,
-        );
-
-        assert_ne!(
-            locally_patched.projection_hash,
-            authoritative.projection_hash
-        );
-        assert!(run_display_projection_payload_matches(
-            &locally_patched,
-            &authoritative
-        ));
-        assert_eq!(
-            classify_run_display_projection_relation(&locally_patched, &authoritative),
-            RunDisplayProjectionRelation::HashCanonicalization,
-            "a legal patch hash is canonicalized without conflict recovery"
-        );
-        assert_eq!(locally_patched.status, authoritative.status);
-        assert_eq!(
-            locally_patched.latest_event_type,
-            authoritative.latest_event_type
-        );
-        assert_eq!(
-            locally_patched.total_prompt_tokens,
-            authoritative.total_prompt_tokens
-        );
-        assert_eq!(
-            locally_patched.total_completion_tokens,
-            authoritative.total_completion_tokens
-        );
-        assert_eq!(
-            locally_patched.total_tool_calls,
-            authoritative.total_tool_calls
-        );
-    }
-
-    #[test]
-    fn same_frontier_stale_payload_remains_a_projection_conflict() {
-        let mut run = durable_run_record("projection-stale-payload");
-        run.last_event_idx = 3;
-        run.total_prompt_tokens = 34;
-        run.total_completion_tokens = 8;
-        run.total_tool_calls = 2;
-        let authoritative =
-            build_run_display_projection(&run, Some("tool_call_end".to_string()), None);
-        let mut stale = authoritative.clone();
-        stale.status = STATUS_WAITING.to_string();
-        stale.waiting_for = Some("tool_approval".to_string());
-        stale.total_prompt_tokens = 0;
-        stale.projection_hash = usage_projection_patch_hash(&run.run_id, 0, 0, 0);
-
-        assert_eq!(
-            classify_run_display_projection_relation(&stale, &authoritative),
-            RunDisplayProjectionRelation::PayloadConflict,
-            "same-frontier stale payload must still enter authoritative repair"
-        );
-
-        let mut projection_ahead = stale;
-        projection_ahead.projection_event_idx = authoritative.projection_event_idx + 1;
-        assert_eq!(
-            classify_run_display_projection_relation(&projection_ahead, &authoritative),
-            RunDisplayProjectionRelation::AuthorityBehindProjection,
-            "an authority snapshot behind the projection frontier must stay fail-closed"
-        );
-    }
-
-    #[test]
     fn atomic_terminal_authoritative_facts_distinguish_active_exact_and_mismatch() {
         let events = [json!({
             "event_type": "run_finished",
@@ -30593,7 +29052,6 @@ mod tests {
                 "checkpoint_version" => "checkpoint_v2",
                 "idempotency_key" => "checkpoint:run-1:resume:batch-1",
                 "checkpoint_json" => r#"{"version":"checkpoint_v2"}"#,
-                "projection_hash" => "hash-1",
                 "payload_json" => self.payload_json,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
@@ -30631,10 +29089,6 @@ mod tests {
                 "work_branch_id" => Some("branch-1".to_string()),
                 "work_item_id" => Some("root".to_string()),
                 "work_item_attempt_id" => Some("attempt-1".to_string()),
-                "latest_event_type" => Some("text_delta".to_string()),
-                "latest_checkpoint_id" => Some("checkpoint-1".to_string()),
-                "latest_checkpoint_kind" => Some("resume".to_string()),
-                "latest_checkpoint_version" => Some("checkpoint_v2".to_string()),
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -30656,7 +29110,6 @@ mod tests {
                 "total_completion_tokens" => 25,
                 "total_tool_calls" => 6,
                 "node_seq" => 4,
-                "projection_event_idx" => 4,
                 "total" => 11,
                 "event_idx" => 9,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -30838,7 +29291,6 @@ mod tests {
         run_id: &str,
     ) {
         for sql in [
-            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
@@ -31980,14 +30432,14 @@ mod tests {
             "run_finished"
         );
         let projection = store
-            .load_run_projection(&user_b, &run_b)
+            .load_run(&user_b, &run_b)
             .await
             .expect("load unrelated cancellation projection")
             .expect("unrelated cancellation projection exists");
         assert_eq!(projection.status, STATUS_CANCELLED);
-        assert_eq!(projection.projection_event_idx, cancelled.last_event_idx);
+        assert_eq!(projection.last_event_idx, cancelled.last_event_idx);
         assert_eq!(
-            projection.latest_event_type.as_deref(),
+            projection.events.last().map(extract_event_type).as_deref(),
             Some("run_finished")
         );
         assert_eq!(
@@ -32327,22 +30779,8 @@ mod tests {
             .await
             .expect("load exactly claimed run")
             .expect("claimed run exists");
-        let projection = store
-            .load_run_projection(&user_id, &run_id)
-            .await
-            .expect("load projection without repair")
-            .expect("creation committed its display projection");
-        let expected = build_run_display_projection(
-            &durable,
-            durable.events.last().map(extract_event_type),
-            None,
-        );
-        assert_eq!(projection.session_id, session_id);
-        assert_eq!(
-            projection.projection_event_idx,
-            expected.projection_event_idx
-        );
-        assert_eq!(projection.projection_hash, expected.projection_hash);
+        assert_eq!(durable.session_id, session_id);
+        assert_eq!(durable.last_event_idx, durable.events.len() as i64 - 1);
 
         sqlx::query(
             "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
@@ -32681,75 +31119,6 @@ mod tests {
             decode_run_checkpoint_record_from_row(&FakeRunStateRow::with_i64("node_seq", -1)),
             "node_seq",
         );
-    }
-
-    #[test]
-    fn run_projection_row_decode_preserves_values_and_fails_loudly() {
-        let projection =
-            decode_run_display_projection_record_from_row(&FakeRunStateRow::complete())
-                .expect("projection row decodes");
-        assert_eq!(projection.run_id, "run-1");
-        assert_eq!(projection.user_id, "user-1");
-        assert_eq!(projection.session_id, "session-1");
-        assert_eq!(projection.status, STATUS_RUNNING);
-        assert_eq!(projection.projection_event_idx, 4);
-        assert_eq!(projection.latest_event_type.as_deref(), Some("text_delta"));
-        assert_eq!(projection.total_prompt_tokens, 100);
-        assert_eq!(projection.total_completion_tokens, 25);
-        assert_eq!(projection.total_tool_calls, 6);
-        assert_eq!(projection.projection_hash, "hash-1");
-        assert_eq!(projection.updated_at, "2026-06-26 12:01:00");
-
-        for column in [
-            "run_id",
-            "user_id",
-            "session_id",
-            "status",
-            "waiting_for",
-            "error_message",
-            "projection_event_idx",
-            "latest_event_type",
-            "latest_checkpoint_id",
-            "latest_checkpoint_kind",
-            "latest_checkpoint_version",
-            "total_prompt_tokens",
-            "total_completion_tokens",
-            "total_tool_calls",
-            "projection_hash",
-            "updated_at",
-        ] {
-            assert_run_db_error_mentions(
-                decode_run_display_projection_record_from_row(&FakeRunStateRow::fail_on(column)),
-                column,
-            );
-        }
-
-        assert_run_db_error_mentions(
-            decode_run_display_projection_record_from_row(&FakeRunStateRow::with_i64(
-                "projection_event_idx",
-                -2,
-            )),
-            "projection_event_idx",
-        );
-        assert_eq!(
-            decode_run_display_projection_record_from_row(&FakeRunStateRow::with_i64(
-                "projection_event_idx",
-                -1,
-            ))
-            .unwrap()
-            .projection_event_idx,
-            -1
-        );
-    }
-
-    #[test]
-    fn usage_projection_patch_hash_changes_with_usage_totals() {
-        let base = usage_projection_patch_hash("run-1", 10, 4, 2);
-        assert_eq!(base, usage_projection_patch_hash("run-1", 10, 4, 2));
-        assert_ne!(base, usage_projection_patch_hash("run-1", 11, 4, 2));
-        assert_ne!(base, usage_projection_patch_hash("run-1", 10, 5, 2));
-        assert_ne!(base, usage_projection_patch_hash("run-1", 10, 4, 3));
-        assert_ne!(base, usage_projection_patch_hash("run-2", 10, 4, 2));
     }
 
     #[test]
@@ -34382,7 +32751,6 @@ mod tests {
 
         // Cleanup is limited to this test's unique owner and session.
         for sql in [
-            "DELETE FROM run_display_projections WHERE user_id = ? AND session_id = ?",
             "DELETE FROM agent_run_events WHERE user_id = ? AND session_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?",
             "DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?",
@@ -35647,53 +34015,6 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_run_create_projection_conflict_rolls_back_run_and_initial_events_on_matrixone()
-     {
-        let (store, pool) = setup_database_run_state_store_it().await;
-        let nonce = Uuid::new_v4();
-        let user_id = format!("create-projection-u-{nonce}");
-        let session_id = format!("create-projection-s-{nonce}");
-        let run_id = format!("create-projection-r-{nonce}");
-        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-        sqlx::query(
-            "INSERT INTO run_display_projections
-             (run_id, user_id, session_id, status, projection_hash)
-             VALUES (?, ?, ?, 'completed', ?)",
-        )
-        .bind(&run_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind("conflicting-projection")
-        .execute(pool.get())
-        .await
-        .expect("seed conflicting projection identity");
-
-        let mut run = durable_run_record(&run_id);
-        run.user_id = user_id.clone();
-        run.session_id = session_id.clone();
-        assert!(store.insert_run(run).await.is_err());
-        assert!(store.load_run(&user_id, &run_id).await.unwrap().is_none());
-        let event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .fetch_one(pool.get())
-        .await
-        .expect("count rolled-back initial events");
-        assert_eq!(event_count, 0);
-
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup projection conflict session");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_collaborator_stage_ack_loss_recovers_atomic_child_and_anchor_receipts() {
         use crate::tool_invocation_ledger::{
             DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
@@ -36010,21 +34331,6 @@ mod tests {
         assert_eq!(durable.events.len(), 2);
         assert_eq!(durable.events[0]["index"], 0);
         assert_eq!(durable.events[1]["index"], 1);
-        let projection = store
-            .load_run_projection(&user_id, &run_id)
-            .await
-            .expect("load ACK-loss projection")
-            .expect("ACK-loss projection committed with run");
-        assert_eq!(projection.projection_event_idx, 1);
-        assert_eq!(
-            projection.latest_event_type.as_deref(),
-            Some("user_message")
-        );
-        assert_eq!(
-            projection.projection_hash,
-            build_run_display_projection(&durable, Some("user_message".into()), None)
-                .projection_hash
-        );
         assert_eq!(
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT run_id FROM agent_session_execution_slots
@@ -36311,12 +34617,15 @@ mod tests {
         assert_eq!(receipt["data"]["run_id"], run_id);
         assert_eq!(receipt["data"]["session_id"], session_id);
         let projection = store
-            .load_run_projection(&user_id, &run_id)
+            .load_run(&user_id, &run_id)
             .await
             .expect("load receipt projection")
             .expect("receipt projection committed with run");
-        assert_eq!(projection.projection_event_idx, 0);
-        assert_eq!(projection.latest_event_type.as_deref(), Some("run_created"));
+        assert_eq!(projection.last_event_idx, 0);
+        assert_eq!(
+            projection.events.last().map(extract_event_type).as_deref(),
+            Some("run_created")
+        );
         assert!(
             receipt["data"]["receipt_id"]
                 .as_str()
@@ -38199,123 +36508,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_local_projection_patches_canonicalize_without_payload_conflict_on_matrixone()
-    {
-        let (store, pool) = setup_database_run_state_store_it().await;
-        let user_id = format!("projection-patches-u-{}", Uuid::new_v4());
-        let session_id = format!("projection-patches-s-{}", Uuid::new_v4());
-        let run_id = format!("projection-patches-r-{}", Uuid::new_v4());
-        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-        let mut run = durable_run_record(&run_id);
-        run.user_id = user_id.clone();
-        run.session_id = session_id.clone();
-        let offering_id = Uuid::new_v4().to_string();
-        run.model_offering_id = Some(offering_id.clone());
-        run.resolved_model_name = Some("projection-model".into());
-        run.runtime_profile = Some("projection-profile".into());
-        store.insert_run(run).await.expect("insert projection run");
-
-        store
-            .append_event(
-                &user_id,
-                &session_id,
-                &run_id,
-                make_event("tool_call_end", json!({"ok": true})),
-            )
-            .await
-            .expect("append event metadata projection patch");
-        assert!(
-            store
-                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
-                    user_id: &user_id,
-                    expected_session_id: &session_id,
-                    run_id: &run_id,
-                    prompt_tokens: 21,
-                    completion_tokens: 13,
-                    tool_calls: 5,
-                    expected_owner_generation: 0
-                })
-                .await
-                .expect("publish usage projection patch")
-        );
-
-        let authoritative = store
-            .load_run(&user_id, &run_id)
-            .await
-            .expect("load authoritative run")
-            .expect("authoritative run exists");
-        assert_eq!(
-            authoritative.model_offering_id.as_deref(),
-            Some(offering_id.as_str())
-        );
-        assert_eq!(
-            authoritative.resolved_model_name.as_deref(),
-            Some("projection-model")
-        );
-        assert_eq!(
-            authoritative.runtime_profile.as_deref(),
-            Some("projection-profile")
-        );
-        let locally_patched = store
-            .load_run_projection(&user_id, &run_id)
-            .await
-            .expect("load locally patched projection")
-            .expect("locally patched projection exists");
-        let expected = build_run_display_projection(
-            &authoritative,
-            authoritative.events.last().map(extract_event_type),
-            None,
-        );
-        assert_eq!(
-            classify_run_display_projection_relation(&locally_patched, &expected),
-            RunDisplayProjectionRelation::HashCanonicalization
-        );
-        assert!(run_display_projection_payload_matches(
-            &locally_patched,
-            &expected
-        ));
-
-        store
-            .sync_projection_for_user(&user_id, &session_id, &run_id)
-            .await
-            .expect("canonicalize full projection hash");
-        let canonical = store
-            .load_run_projection(&user_id, &run_id)
-            .await
-            .expect("load canonical projection")
-            .expect("canonical projection exists");
-        assert_eq!(
-            classify_run_display_projection_relation(&canonical, &expected),
-            RunDisplayProjectionRelation::Canonical
-        );
-        assert!(run_display_projection_payload_matches(
-            &canonical, &expected
-        ));
-        assert_eq!(
-            canonical.latest_event_type.as_deref(),
-            Some("tool_call_end")
-        );
-        assert_eq!(canonical.total_prompt_tokens, 21);
-        assert_eq!(canonical.total_completion_tokens, 13);
-        assert_eq!(canonical.total_tool_calls, 5);
-
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup projection patch slot");
-        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup projection patch session");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_concurrent_sibling_callbacks_preserve_authoritative_frontier_projection_on_matrixone()
-     {
+    async fn database_concurrent_sibling_callbacks_preserve_canonical_frontier_on_matrixone() {
         let (store, pool) = setup_database_run_state_store_it().await;
         let user_id = format!("projection-frontier-u-{}", Uuid::new_v4());
         let session_id = format!("projection-frontier-s-{}", Uuid::new_v4());
@@ -38460,77 +36653,12 @@ mod tests {
         assert_eq!(authoritative.total_prompt_tokens, 21);
         assert_eq!(authoritative.total_completion_tokens, 13);
         assert_eq!(authoritative.total_tool_calls, 5);
-        let canonical_before_conflict = store
-            .load_run_projection(&user_id, &run_id)
+        let checkpoint = store
+            .load_latest_checkpoint(&user_id, &run_id, None)
             .await
-            .expect("load canonical projection before conflict")
-            .expect("canonical projection exists before conflict");
-
-        // Model a delayed same-frontier writer from an already-committed
-        // sibling callback. The repair path must discard this payload and
-        // rebuild from the locked durable frontier, not accept last-writer.
-        sqlx::query(
-            "UPDATE run_display_projections
-             SET status = 'waiting', waiting_for = 'tool_approval',
-                 error_message = 'stale sibling', latest_event_type = 'approval_resolved',
-                 latest_checkpoint_id = NULL, latest_checkpoint_kind = NULL,
-                 latest_checkpoint_version = NULL, total_prompt_tokens = 0,
-                 total_completion_tokens = 0, total_tool_calls = 0,
-                 projection_hash = ?
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind("0".repeat(64))
-        .bind(&user_id)
-        .bind(&run_id)
-        .execute(pool.get())
-        .await
-        .expect("inject same-frontier projection conflict");
-        let injected = store
-            .load_run_projection(&user_id, &run_id)
-            .await
-            .expect("load injected projection conflict")
-            .expect("injected projection exists");
-        assert_eq!(
-            classify_run_display_projection_relation(&injected, &canonical_before_conflict),
-            RunDisplayProjectionRelation::PayloadConflict
-        );
-        store
-            .sync_projection_for_user(&user_id, &session_id, &run_id)
-            .await
-            .expect("repair same-frontier conflict from authority");
-        store
-            .patch_run_projection_event_metadata_for_user(
-                &user_id,
-                &session_id,
-                &run_id,
-                authoritative.last_event_idx - 1,
-                "stale_sibling_callback",
-            )
-            .await;
-
-        let projection = store
-            .load_run_projection(&user_id, &run_id)
-            .await
-            .expect("load final projection")
-            .expect("final projection exists");
-        assert_eq!(projection.status, authoritative.status);
-        assert_eq!(projection.waiting_for, authoritative.waiting_for);
-        assert_eq!(projection.error_message, authoritative.error_message);
-        assert_eq!(
-            projection.projection_event_idx,
-            authoritative.last_event_idx
-        );
-        assert_eq!(
-            projection.latest_event_type,
-            authoritative.events.last().map(extract_event_type)
-        );
-        assert_eq!(projection.total_prompt_tokens, 21);
-        assert_eq!(projection.total_completion_tokens, 13);
-        assert_eq!(projection.total_tool_calls, 5);
-        assert_eq!(
-            projection.latest_checkpoint_version.as_deref(),
-            Some("checkpoint_v2")
-        );
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.checkpoint_version, "checkpoint_v2");
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
@@ -38800,35 +36928,13 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*)
-                 FROM run_display_projections projection
-                 INNER JOIN agent_runs run
-                   ON run.user_id = projection.user_id
-                  AND run.session_id = projection.session_id
-                  AND run.run_id = projection.run_id
-                 WHERE projection.run_id LIKE ? AND projection.projection_event_idx = 4",
+                "SELECT COUNT(*) FROM agent_runs WHERE run_id LIKE ? AND last_event_idx = 4",
             )
             .bind(&run_like)
             .fetch_one(pool.get())
             .await
-            .expect("count monotonic stress projections"),
+            .unwrap(),
             EXPECTED_RUNS
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*)
-                 FROM run_display_projections projection
-                 LEFT JOIN agent_runs run
-                   ON run.user_id = projection.user_id
-                  AND run.session_id = projection.session_id
-                  AND run.run_id = projection.run_id
-                 WHERE projection.run_id LIKE ? AND run.run_id IS NULL",
-            )
-            .bind(&run_like)
-            .fetch_one(pool.get())
-            .await
-            .expect("detect cross-owner stress projections"),
-            0
         );
 
         for (user_id, _, run_id) in &fixtures {
@@ -39161,12 +37267,15 @@ mod tests {
             1
         );
         let projection = store
-            .load_run_projection(&user_id, &run_id)
+            .load_run(&user_id, &run_id)
             .await
             .unwrap()
             .expect("guidance projection committed atomically");
-        assert_eq!(projection.projection_event_idx, 1);
-        assert_eq!(projection.latest_event_type.as_deref(), Some("user_intent"));
+        assert_eq!(projection.last_event_idx, 1);
+        assert_eq!(
+            projection.events.last().map(extract_event_type).as_deref(),
+            Some("user_intent")
+        );
 
         let request = AtomicRunGuidanceAdmissionRequest {
             user_id: &user_id,
@@ -43433,65 +41542,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_action_projection_patch_cannot_overwrite_equal_index_pause() {
-        let store = InMemoryRunStateStore::new();
-        store
-            .insert_run(durable_run_record("action-projection-race"))
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .begin_action(action_admission_request("action-projection-race"))
-                .await
-                .unwrap(),
-            AtomicRunActionAdmission::Started { event_index: 0 }
-        );
-        let stale_running = store
-            .load_run("u1", "action-projection-race")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            store
-                .update_run_status_with_events_if_current(
-                    "u1",
-                    "s1",
-                    "action-projection-race",
-                    &[STATUS_RUNNING],
-                    None,
-                    STATUS_PAUSED,
-                    None,
-                    None,
-                    &[]
-                )
-                .await
-                .unwrap()
-        );
-
-        // Model a delayed post-commit admission projection racing after the
-        // equal-index pause projection. It may refresh event metadata only.
-        store
-            .sync_projection_event_metadata(
-                &stale_running,
-                stale_running.last_event_idx,
-                ACTION_ADMISSION_GRANTED_EVENT_TYPE,
-            )
-            .await;
-        let projection = store
-            .load_run_projection("u1", "action-projection-race")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(projection.status, STATUS_PAUSED);
-        assert_eq!(projection.waiting_for, None);
-        assert_eq!(projection.projection_event_idx, 0);
-        assert_eq!(
-            projection.latest_event_type.as_deref(),
-            Some(ACTION_ADMISSION_GRANTED_EVENT_TYPE)
-        );
-    }
-
-    #[tokio::test]
     async fn interaction_lookup_returns_the_exact_durable_event_index() {
         let store = InMemoryRunStateStore::new();
         store
@@ -45217,12 +43267,15 @@ mod tests {
                 .all(|event| extract_event_type(event) != "approval_required")
         );
         let projection = store
-            .load_run_projection("u1", "approval-guidance-race")
+            .load_run("u1", "approval-guidance-race")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(projection.latest_event_type.as_deref(), Some("user_intent"));
-        assert_eq!(projection.projection_event_idx, 0);
+        assert_eq!(
+            projection.events.last().map(extract_event_type).as_deref(),
+            Some("user_intent")
+        );
+        assert_eq!(projection.last_event_idx, 0);
     }
 
     fn recovered_interaction_event(expected: &RunEventInsertRow) -> RecoveredInteractionEvent {
@@ -45628,12 +43681,15 @@ mod tests {
         assert_eq!(loaded.events[0]["event_type"], "run_paused");
 
         let projection = store
-            .load_run_projection("u1", "transition-commit")
+            .load_run("u1", "transition-commit")
             .await
             .unwrap()
             .expect("transition should refresh projection");
         assert_eq!(projection.status, STATUS_PAUSED);
-        assert_eq!(projection.latest_event_type.as_deref(), Some("run_paused"));
+        assert_eq!(
+            projection.events.last().map(extract_event_type).as_deref(),
+            Some("run_paused")
+        );
     }
 
     #[tokio::test]
@@ -46565,13 +44621,13 @@ mod tests {
         assert_eq!(loaded.events[1]["event_type"], "run_finished");
 
         let projection = store
-            .load_run_projection("u1", "transition-batch")
+            .load_run("u1", "transition-batch")
             .await
             .unwrap()
             .expect("transition should refresh projection");
         assert_eq!(projection.status, STATUS_FAILED);
         assert_eq!(
-            projection.latest_event_type.as_deref(),
+            projection.events.last().map(extract_event_type).as_deref(),
             Some("run_finished")
         );
     }
@@ -46894,12 +44950,6 @@ mod tests {
             .insert_run(record)
             .await
             .expect("insert eventless run");
-        sqlx::query("DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?")
-            .bind(&user_id)
-            .bind(&run_id)
-            .execute(pool.get())
-            .await
-            .expect("remove derived projection before append repair");
 
         let events = vec![
             make_event("step_started", json!({"round": 0})),
@@ -46920,13 +44970,13 @@ mod tests {
         assert_eq!(loaded.events.len(), 4);
 
         let projection = store
-            .load_run_projection_metadata_for_user(&user_id, &run_id)
+            .load_run(&user_id, &run_id)
             .await
             .expect("load projection")
             .expect("projection exists");
-        assert_eq!(projection.projection_event_idx, 3);
+        assert_eq!(projection.last_event_idx, 3);
         assert_eq!(
-            projection.latest_event_type.as_deref(),
+            projection.events.last().map(extract_event_type).as_deref(),
             Some("step_completed")
         );
 
@@ -46935,7 +44985,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_status_event_batch_transition_and_projection_repair_hold_on_matrixone() {
+    async fn database_status_event_batch_transition_preserves_canonical_facts_on_matrixone() {
         let (store, pool) = setup_database_run_state_store_it().await;
         let user_id = format!("runs-it-user-{}", Uuid::new_v4());
         let run_id = format!("runs-it-run-{}", Uuid::new_v4());
@@ -47036,21 +45086,27 @@ mod tests {
             .await
             .expect("update usage");
         let usage_projection = store
-            .load_run_projection(&user_id, &run_id)
+            .load_run(&user_id, &run_id)
             .await
             .expect("load projection after usage patch")
             .expect("projection should exist after usage patch");
         assert_eq!(usage_projection.status, STATUS_FAILED);
         assert_eq!(usage_projection.error_message.as_deref(), Some("boom"));
-        assert_eq!(usage_projection.projection_event_idx, 2);
+        assert_eq!(usage_projection.last_event_idx, 2);
         assert_eq!(
-            usage_projection.latest_event_type.as_deref(),
+            usage_projection
+                .events
+                .last()
+                .map(extract_event_type)
+                .as_deref(),
             Some("run_finished")
         );
-        assert_eq!(
-            usage_projection.latest_checkpoint_version.as_deref(),
-            Some("checkpoint_v2")
-        );
+        let checkpoint = store
+            .load_latest_checkpoint(&user_id, &run_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.checkpoint_version, "checkpoint_v2");
         assert_eq!(usage_projection.total_prompt_tokens, 10);
         assert_eq!(usage_projection.total_completion_tokens, 4);
         assert_eq!(usage_projection.total_tool_calls, 2);
@@ -47068,127 +45124,7 @@ mod tests {
         assert_eq!(loaded.events[1]["event_type"], "run_error");
         assert_eq!(loaded.events[2]["event_type"], "run_finished");
 
-        sqlx::query(
-            "UPDATE run_display_projections
-             SET status = 'running',
-                 error_message = NULL,
-                 projection_event_idx = -1,
-                 latest_event_type = 'stale_event',
-                 latest_checkpoint_kind = NULL,
-                 latest_checkpoint_version = NULL
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .execute(pool.get())
-        .await
-        .expect("corrupt projection");
-
-        let repaired = store
-            .rebuild_run_projection(&user_id, &session_id, &run_id)
-            .await
-            .expect("repair projection")
-            .expect("projection repaired");
-        assert_eq!(repaired.status, STATUS_FAILED);
-        assert_eq!(repaired.error_message.as_deref(), Some("boom"));
-        assert_eq!(repaired.projection_event_idx, 2);
-        assert_eq!(repaired.latest_event_type.as_deref(), Some("run_finished"));
-        assert_eq!(
-            repaired.latest_checkpoint_version.as_deref(),
-            Some("checkpoint_v2")
-        );
-
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-    }
-
-    #[tokio::test]
-    async fn rebuild_run_projection_repairs_stale_projection_from_facts() {
-        let store = InMemoryRunStateStore::new();
-        store
-            .insert_run(durable_run_record("projection-repair"))
-            .await
-            .unwrap();
-        let saved_checkpoint = store
-            .save_checkpoint(RunCheckpointWriteRequest { user_id: "u1", expected_session_id: "s1", run_id: "projection-repair", checkpoint_json: r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"repair"}"#, authority: CheckpointWriteAuthority::ControlPlane })
-            .await
-            .unwrap().is_some();
-        assert!(saved_checkpoint);
-
-        let events = vec![
-            make_event("run_error", json!({"error": "boom"})),
-            make_event("run_finished", json!({"status": "failed"})),
-        ];
-        store
-            .update_run_status_with_events_if_current(
-                "u1",
-                "s1",
-                "projection-repair",
-                &[STATUS_RUNNING],
-                None,
-                STATUS_FAILED,
-                None,
-                Some("boom"),
-                &events,
-            )
-            .await
-            .unwrap();
-        store
-            .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
-                user_id: "u1",
-                expected_session_id: "s1",
-                run_id: "projection-repair",
-                prompt_tokens: 10,
-                completion_tokens: 4,
-                tool_calls: 2,
-                expected_owner_generation: 0,
-            })
-            .await
-            .unwrap();
-
-        let mut stale = store
-            .load_run_projection("u1", "projection-repair")
-            .await
-            .unwrap()
-            .expect("projection should exist before corruption");
-        stale.status = STATUS_RUNNING.to_string();
-        stale.error_message = None;
-        stale.projection_event_idx = -1;
-        stale.latest_event_type = Some("stale_event".to_string());
-        stale.latest_checkpoint_kind = None;
-        stale.latest_checkpoint_version = None;
-        stale.total_prompt_tokens = 0;
-        stale.total_completion_tokens = 0;
-        stale.total_tool_calls = 0;
-        store
-            .projections
-            .write()
-            .await
-            .insert("projection-repair".to_string(), stale);
-
-        let repaired = store
-            .rebuild_run_projection("u1", "s1", "projection-repair")
-            .await
-            .unwrap()
-            .expect("repair should rebuild projection");
-        assert_eq!(repaired.status, STATUS_FAILED);
-        assert_eq!(repaired.error_message.as_deref(), Some("boom"));
-        assert_eq!(repaired.projection_event_idx, 1);
-        assert_eq!(repaired.latest_event_type.as_deref(), Some("run_finished"));
-        assert_eq!(repaired.latest_checkpoint_kind.as_deref(), Some("resume"));
-        assert_eq!(
-            repaired.latest_checkpoint_version.as_deref(),
-            Some("checkpoint_v2")
-        );
-        assert_eq!(repaired.total_prompt_tokens, 10);
-        assert_eq!(repaired.total_completion_tokens, 4);
-        assert_eq!(repaired.total_tool_calls, 2);
-
-        let loaded = store
-            .load_run_projection("u1", "projection-repair")
-            .await
-            .unwrap()
-            .expect("repaired projection should be stored");
-        assert_eq!(loaded.projection_hash, repaired.projection_hash);
     }
 
     #[tokio::test]
@@ -47199,13 +45135,7 @@ mod tests {
         store.insert_run(run).await.unwrap();
 
         assert!(store.load_run("u2", "owner-bound").await.unwrap().is_none());
-        assert!(
-            store
-                .load_run_projection("u2", "owner-bound")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(store.load_run("u2", "owner-bound").await.unwrap().is_none());
         assert!(
             store
                 .load_latest_checkpoint("u2", "owner-bound", None)

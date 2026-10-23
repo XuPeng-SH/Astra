@@ -10238,15 +10238,11 @@ mod tests {
             executor: None,
             transport: None,
             run_event_high_watermark: 4,
-            projection_event_idx: 4,
-            projection_updated_at: "2026-09-17T00:00:00Z".to_string(),
-            projection_hash: "hash".to_string(),
             latest_event_type: Some("ask_user_prompted".to_string()),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
             latest_checkpoint: None,
-            has_durable_projection: true,
             recent_events: vec![serde_json::json!({
                 "event_type": "ask_user_prompted",
                 "data": {

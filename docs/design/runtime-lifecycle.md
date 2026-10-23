@@ -920,10 +920,13 @@ admission. Cancellation and completion use the same slot as task startup.
 
 The source-only turn core/tool event writers, activity writer, and reflection
 state/lesson writer assembly are retired. Canonical loop append and atomic
-terminal settlement own raw conversation history and the terminal display projection in one authoritative transaction; a terminal
-projection must preserve the latest committed checkpoint metadata. The
-resolution path rereads the committed projection hash after a lost commit
-acknowledgement instead of synthesizing one.
+terminal settlement own raw conversation history and canonical Run facts in one
+transaction. GET `/chat/runs/{run_id}/projection` renders the existing public
+snapshot from canonical Run/events and checkpoint metadata. There is no stored
+display projection, mirror hash or POST projection-repair API. A checkpoint
+summary may advance between display reads; only the exact checkpoint owner can
+admit resume. Lost-ACK terminal resolution retains exact generation, outcome,
+usage, event/batch identities and raw/Context evidence, with no display dependency.
 
 Terminal evidence admission reads exact run metadata and its cancellation
 marker under the session/execution/run locks once. Settlement consumes those
@@ -937,7 +940,7 @@ admission remain mandatory; losing model output on a process crash may require
 a user to resend or continue.
 
 The completed stream follows the durable terminal, canonical conversation
-commit and exact writer release. After remaining projections and hooks, the
+commit and exact writer release. After remaining derived consumers and hooks, the
 owning task drops its resident context and interaction senders, then releases
 distributed capacity. Agent cleanup does not query or retire per-model WAL
 payloads because agent execution no longer produces them. Existing permit-drop
@@ -984,3 +987,20 @@ never authorizes a receipt. Abort guards retain supervised provenance while
 an owner is handed to a worker, and output pumps use the existing bounded
 drain on error as well as timeout. Operation timeouts and sandbox authority
 are unchanged.
+
+
+Server conversation continuation uses the canonical Context admitted for that
+Run. An absent head is an empty conversation; neither CSL nor raw transcript
+projections are alternate prompt-recovery authorities. The Server no longer
+loads, repairs, or persists a second CSL conversation projection. Advisory step
+checkpoint state may warm a continuation with canonical history, but cannot
+reconstruct same-Run execution custody. Explicit Run resume retains its exact
+checkpoint and generation validation.
+
+
+The production history-work baseline records the canonical Run event watermark,
+completion, owner/model correlation and actual provider usage. It no longer
+measures a duplicate display frontier or projection lag. Its report contract is
+`astra.history_work.production_baseline.v5`; process captures use
+`astra.history_work.production_process_capture.v4`. Older report shapes are
+rejected rather than interpreted as current evidence.
