@@ -173,6 +173,23 @@ same fenced transition and atomic batch registration as production.
 
 ## Run
 
+Database-backed fresh root admission commits the Run identity, Session execution
+slot, canonical Context writer/turn reservation, and accepted user input
+(audit, transcript and event counter) in one transaction. The existing Run
+creation owner stages these writes; Context keeps its existing validation and
+mutation algorithms. The existing opening event's unique row identity and hash
+bind commit-acknowledgement recovery to that transaction. Observing an existing Run
+never creates a writer or borrows its distributed capacity permit.
+
+Immutable history and weighted-capacity preparation happen before the Run
+transaction so concurrent starts cannot exhaust the pool while holding Session
+locks. Each attempt uses its own capacity identity and releases only its own
+permit on a lost claim or rollback. Context validates the prepared cursor and
+authority under the winning transaction. No workspace, provider or tool operation
+occurs inside that transaction. Execution starts only within the original
+committed owner lease window. Prior-history restoration excludes the current Run's already
+persisted input, which becomes history for subsequent Runs.
+
 The shared loop exit owns terminal rendering, SessionFacts, memory input
 publication and the final checkpoint. Execution/tool phases return outcomes;
 they do not independently finalize the same turn. A retained input wait keeps

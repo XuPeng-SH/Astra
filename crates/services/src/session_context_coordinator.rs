@@ -745,15 +745,33 @@ impl PreparedSessionContextCommit {
     }
 }
 
+pub struct TurnReservationRequest<'a> {
+    pub lease: &'a ConversationWriterLeaseV1,
+    pub expected_cursor: Option<&'a SessionCursorV1>,
+    pub ttl: Duration,
+    pub idempotency_key: &'a str,
+    pub expected_execution_binding_generation: Option<u64>,
+}
+
+pub struct WriterTurnReservationRequest<'a> {
+    pub key: &'a SessionKeyV1,
+    pub expected_cursor: Option<&'a SessionCursorV1>,
+    pub actor: &'a ActorContextV1,
+    pub ttl: Duration,
+    pub writer_idempotency_key: &'a str,
+    pub reservation_idempotency_key: &'a str,
+    pub expected_execution_binding_generation: Option<u64>,
+}
+
 // A standalone rejected authority operation commits its rejection audit. In a
 // terminal transaction the same rejection must roll back the entire settlement.
-enum StagedTurnCommit {
-    Mutation(CoordinatorMutationV1),
+enum StagedCoordinatorMutation<T> {
+    Mutation(T),
     Rejected(SessionContextCoordinatorError),
 }
 
-impl StagedTurnCommit {
-    fn into_result(self) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
+impl<T> StagedCoordinatorMutation<T> {
+    fn into_result(self) -> Result<T, SessionContextCoordinatorError> {
         match self {
             Self::Mutation(mutation) => Ok(mutation),
             Self::Rejected(error) => Err(error),
@@ -800,7 +818,7 @@ impl DatabaseSessionContextCoordinator {
         &self,
         tx: &mut Transaction<'_, MySql>,
         prepared: &PreparedSessionContextCommit,
-        admission: &crate::runs::AtomicRunTerminalSettlementAdmission,
+        admission: &crate::runs::RunMutationAdmission,
     ) -> Result<SessionCursorV1, SessionContextCoordinatorError> {
         if !admission.owns_session(
             &prepared.reservation.key.owner_user_id,
@@ -826,7 +844,8 @@ impl DatabaseSessionContextCoordinator {
         &self,
         tx: &mut Transaction<'_, MySql>,
         prepared: &PreparedSessionContextCommit,
-    ) -> Result<StagedTurnCommit, SessionContextCoordinatorError> {
+    ) -> Result<StagedCoordinatorMutation<CoordinatorMutationV1>, SessionContextCoordinatorError>
+    {
         let reservation = &prepared.reservation;
         let delta = &prepared.delta;
         let idempotency_key = prepared.idempotency_key.as_str();
@@ -855,7 +874,7 @@ impl DatabaseSessionContextCoordinator {
                 release_committed_writer_in_tx(tx, &mut state, reservation).await?;
             }
 
-            return Ok(StagedTurnCommit::Mutation(
+            return Ok(StagedCoordinatorMutation::Mutation(
                 CoordinatorMutationV1::AlreadyApplied {
                     cursor: last.cursor.clone(),
                 },
@@ -891,7 +910,7 @@ impl DatabaseSessionContextCoordinator {
                     release_committed_writer_in_tx(tx, &mut state, reservation).await?;
                 }
 
-                return Ok(StagedTurnCommit::Mutation(
+                return Ok(StagedCoordinatorMutation::Mutation(
                     CoordinatorMutationV1::AlreadyApplied {
                         cursor: receipt.cursor,
                     },
@@ -911,7 +930,7 @@ impl DatabaseSessionContextCoordinator {
             )
             .await?;
 
-            return Ok(StagedTurnCommit::Rejected(error));
+            return Ok(StagedCoordinatorMutation::Rejected(error));
         }
         if state.head.as_ref().map(|head| &head.cursor) != reservation.expected_cursor.as_ref() {
             let current_cursor = state.head.as_ref().map(|head| head.cursor.clone());
@@ -929,7 +948,7 @@ impl DatabaseSessionContextCoordinator {
             )
             .await?;
 
-            return Ok(StagedTurnCommit::Mutation(
+            return Ok(StagedCoordinatorMutation::Mutation(
                 CoordinatorMutationV1::Conflict {
                     current_cursor,
                     safe_options: vec![
@@ -992,9 +1011,9 @@ impl DatabaseSessionContextCoordinator {
             update_database_state(tx, &state).await?;
         }
 
-        Ok(StagedTurnCommit::Mutation(CoordinatorMutationV1::Applied {
-            cursor,
-        }))
+        Ok(StagedCoordinatorMutation::Mutation(
+            CoordinatorMutationV1::Applied { cursor },
+        ))
     }
 
     pub fn new(pool: SharedPool) -> Self {
@@ -3285,9 +3304,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         idempotency_key: &str,
         expected_execution_binding_generation: Option<u64>,
     ) -> Result<ReserveTurnOutcome, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_RESERVATION_TTL)?;
-        validate_idempotency_key(idempotency_key)?;
-        validate_optional_cursor(&lease.key, expected_cursor)?;
+        validate_turn_reservation_inputs(lease, expected_cursor, ttl, idempotency_key)?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_reserve_turn", source))?;
@@ -3296,209 +3313,21 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .await
             .map_err(|source| database_error("begin_reserve_turn", source))?;
         admit_session_lifecycle_write(&mut tx, &lease.key).await?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, &lease.key).await?;
-        validate_execution_binding_generation_in_tx(
-            &mut tx,
-            &lease.key,
-            expected_execution_binding_generation,
-        )
-        .await?;
-        let request_hash = reservation_request_hash(lease, expected_cursor);
-        if let Some(receipt) = load_database_receipt::<ReservationReceiptV1>(
-            &mut tx,
-            &lease.key,
-            "reserve",
-            idempotency_key,
-            &request_hash,
-        )
-        .await?
-        {
-            record_database_authority_event(
+        let staged = self
+            .stage_reserve_turn(
                 &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "idempotent_replay",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: Some(&receipt.reservation.reservation_id),
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reservation_replay", source))?;
-            connection.release();
-            return Ok(ReserveTurnOutcome::AlreadyReserved(receipt.reservation));
-        }
-        if let Some(active) = state.active_reservation.clone()
-            && active.idempotency_key == idempotency_key
-        {
-            validate_reservation_request(&active, lease, &expected_cursor.cloned())?;
-            validate_active_lease(&state, lease, now)?;
-            if fence_expired_reservation_authority(&mut state, lease, now) {
-                // The preceding acquire_writer replay can have refreshed the
-                // writer. Fence that refresh in this transaction when its
-                // paired reservation has already expired.
-                update_database_state(&mut tx, &state).await?;
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "reserve_turn",
-                        outcome: "expired_authority_fenced",
-                        actor: Some(&lease.actor),
-                        lease_id: Some(&lease.lease_id),
-                        reservation_id: Some(&active.reservation_id),
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit()
-                    .await
-                    .map_err(|source| database_error("commit_reservation_expiry_fence", source))?;
-                connection.release();
-                return Err(SessionContextCoordinatorError::Expired);
-            }
-            let expires_at = refreshed_live_expiry(
-                now,
-                ttl,
-                active.expires_at_unix_ms,
-                Some(lease.expires_at_unix_ms),
-            )?;
-            let refreshed = state
-                .active_reservation
-                .as_mut()
-                .expect("matched active reservation");
-            refreshed.expires_at_unix_ms = expires_at;
-            let refreshed = refreshed.clone();
-            update_database_state(&mut tx, &state).await?;
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "idempotent_refreshed",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: Some(&refreshed.reservation_id),
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reservation_retry", source))?;
-            connection.release();
-            return Ok(ReserveTurnOutcome::AlreadyReserved(refreshed));
-        }
-        if let Err(error) = validate_active_lease(&state, lease, now) {
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: authority_error_outcome(&error),
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reserve_turn_audit", source))?;
-            connection.release();
-            return Err(error);
-        }
-        if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
-            let outcome = ReserveTurnOutcome::Conflict {
-                current_head: state.head.clone(),
-            };
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "cursor_conflict",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reservation_conflict", source))?;
-            connection.release();
-            return Ok(outcome);
-        }
-        if state
-            .active_reservation
-            .as_ref()
-            .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-        {
-            let outcome = ReserveTurnOutcome::Conflict {
-                current_head: state.head.clone(),
-            };
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "reservation_conflict",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_active_reservation_conflict", source))?;
-            connection.release();
-            return Ok(outcome);
-        }
-        if let Some(previous) = &state.active_reservation {
-            archive_database_reservation(&mut tx, previous).await?;
-        }
-        let reservation = TurnReservationV1 {
-            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-            reservation_id: Uuid::new_v4().to_string(),
-            key: lease.key.clone(),
-            lease_id: lease.lease_id.clone(),
-            writer_epoch: lease.writer_epoch,
-            expected_cursor: expected_cursor.cloned(),
-            reserved_turn: expected_cursor
-                .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
-            created_at_unix_ms: now,
-            expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
-            idempotency_key: idempotency_key.to_owned(),
-        };
-        state.active_reservation = Some(reservation.clone());
-        update_database_state(&mut tx, &state).await?;
-        record_database_authority_event(
-            &mut tx,
-            &state,
-            AuthorityAuditFact {
-                operation: "reserve_turn",
-                outcome: "reserved",
-                actor: Some(&lease.actor),
-                lease_id: Some(&lease.lease_id),
-                reservation_id: Some(&reservation.reservation_id),
+                lease,
                 expected_cursor,
-            },
-        )
-        .await?;
+                ttl,
+                idempotency_key,
+                expected_execution_binding_generation,
+            )
+            .await?;
         tx.commit()
             .await
             .map_err(|source| database_error("commit_reserve_turn", source))?;
         connection.release();
-        Ok(ReserveTurnOutcome::Reserved(reservation))
+        staged.into_result()
     }
 
     async fn acquire_writer_and_reserve_turn(
@@ -3511,262 +3340,41 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         reservation_idempotency_key: &str,
         expected_execution_binding_generation: Option<u64>,
     ) -> Result<AcquireWriterAndReserveTurnOutcome, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_LEASE_TTL.min(MAX_RESERVATION_TTL))?;
-        validate_idempotency_key(writer_idempotency_key)?;
-        validate_idempotency_key(reservation_idempotency_key)?;
-        actor
-            .validate_for(key)
-            .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
-        validate_optional_cursor(key, expected_cursor)?;
-
+        validate_writer_turn_inputs(
+            key,
+            expected_cursor,
+            actor,
+            ttl,
+            writer_idempotency_key,
+            reservation_idempotency_key,
+        )?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
-            .map_err(|source| database_error("acquire_and_reserve_turn", source))?;
+            .map_err(|source| database_error("acquire_acquire_writer_and_reserve_turn", source))?;
         let mut tx = connection
             .begin()
             .await
-            .map_err(|source| database_error("begin_acquire_and_reserve_turn", source))?;
-        ensure_database_state(&mut tx, key, actor.authority_epochs).await?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, key).await?;
-        validate_execution_binding_generation_in_tx(
-            &mut tx,
-            key,
-            expected_execution_binding_generation,
-        )
-        .await?;
-        let expected_cursor_owned = expected_cursor.cloned();
-
-        let (lease, acquire_outcome) = if let Some(active) = state.active_writer.clone()
-            && active.idempotency_key == writer_idempotency_key
-        {
-            validate_lease_request(&active, key, &expected_cursor_owned, actor)?;
-            let expires_at = refreshed_live_expiry(now, ttl, active.expires_at_unix_ms, None)?;
-            let refreshed = state
-                .active_writer
-                .as_mut()
-                .expect("matched active writer lease");
-            refreshed.expires_at_unix_ms = expires_at;
-            (refreshed.clone(), "idempotent_refreshed")
-        } else {
-            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
-                let current_head = state.head.clone();
-                let active_lease_expires_at_unix_ms = state
-                    .active_writer
-                    .as_ref()
-                    .filter(|lease| lease.expires_at_unix_ms > now)
-                    .map(|lease| lease.expires_at_unix_ms);
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "acquire_writer",
-                        outcome: "cursor_conflict",
-                        actor: Some(actor),
-                        lease_id: None,
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_conflict", source)
-                })?;
-                connection.release();
-                return Ok(AcquireWriterAndReserveTurnOutcome::WriterConflict {
-                    current_head,
-                    active_lease_expires_at_unix_ms,
-                });
-            }
-            if state
-                .active_writer
-                .as_ref()
-                .is_some_and(|lease| lease.expires_at_unix_ms > now)
-            {
-                let current_head = state.head.clone();
-                let active_lease_expires_at_unix_ms = state
-                    .active_writer
-                    .as_ref()
-                    .map(|lease| lease.expires_at_unix_ms);
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "acquire_writer",
-                        outcome: "writer_conflict",
-                        actor: Some(actor),
-                        lease_id: None,
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_conflict", source)
-                })?;
-                connection.release();
-                return Ok(AcquireWriterAndReserveTurnOutcome::WriterConflict {
-                    current_head,
-                    active_lease_expires_at_unix_ms,
-                });
-            }
-            if actor.authority_epochs != state.authority_epochs {
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "acquire_writer",
-                        outcome: "stale_fenced",
-                        actor: Some(actor),
-                        lease_id: None,
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_fenced", source)
-                })?;
-                connection.release();
-                return Err(SessionContextCoordinatorError::Fenced);
-            }
-            archive_database_state_receipts(&mut tx, &state).await?;
-            state.active_reservation = None;
-            state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
-                SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
-            })?;
-            let lease = ConversationWriterLeaseV1 {
-                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                key: key.clone(),
-                lease_id: Uuid::new_v4().to_string(),
-                writer_epoch: state.writer_epoch,
-                actor: actor.clone(),
-                expected_cursor: expected_cursor_owned.clone(),
-                acquired_at_unix_ms: now,
-                expires_at_unix_ms: checked_expiry(now, ttl)?,
-                idempotency_key: writer_idempotency_key.to_owned(),
-            };
-            state.active_writer = Some(lease.clone());
-            (lease, "acquired")
-        };
-
-        let (reservation, reserve_outcome) = if let Some(active) = state.active_reservation.clone()
-            && active.idempotency_key == reservation_idempotency_key
-        {
-            validate_reservation_request(&active, &lease, &expected_cursor_owned)?;
-            validate_active_lease(&state, &lease, now)?;
-            if fence_expired_reservation_authority(&mut state, &lease, now) {
-                update_database_state(&mut tx, &state).await?;
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "reserve_turn",
-                        outcome: "expired_authority_fenced",
-                        actor: Some(&lease.actor),
-                        lease_id: Some(&lease.lease_id),
-                        reservation_id: Some(&active.reservation_id),
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_expiry_fence", source)
-                })?;
-                connection.release();
-                return Err(SessionContextCoordinatorError::Expired);
-            }
-            let expires_at = refreshed_live_expiry(
-                now,
-                ttl,
-                active.expires_at_unix_ms,
-                Some(lease.expires_at_unix_ms),
-            )?;
-            let refreshed = state
-                .active_reservation
-                .as_mut()
-                .expect("matched active turn reservation");
-            refreshed.expires_at_unix_ms = expires_at;
-            (refreshed.clone(), "idempotent_refreshed")
-        } else {
-            validate_active_lease(&state, &lease, now)?;
-            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor
-                || state
-                    .active_reservation
-                    .as_ref()
-                    .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-            {
-                let current_head = state.head.clone();
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "reserve_turn",
-                        outcome: "reservation_conflict",
-                        actor: Some(&lease.actor),
-                        lease_id: Some(&lease.lease_id),
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_conflict", source)
-                })?;
-                connection.release();
-                return Ok(AcquireWriterAndReserveTurnOutcome::ReservationConflict {
-                    lease,
-                    current_head,
-                });
-            }
-            if let Some(previous) = &state.active_reservation {
-                archive_database_reservation(&mut tx, previous).await?;
-            }
-            let reservation = TurnReservationV1 {
-                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                reservation_id: Uuid::new_v4().to_string(),
-                key: lease.key.clone(),
-                lease_id: lease.lease_id.clone(),
-                writer_epoch: lease.writer_epoch,
-                expected_cursor: expected_cursor_owned,
-                reserved_turn: expected_cursor
-                    .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
-                created_at_unix_ms: now,
-                expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
-                idempotency_key: reservation_idempotency_key.to_owned(),
-            };
-            state.active_reservation = Some(reservation.clone());
-            (reservation, "reserved")
-        };
-
-        update_database_state(&mut tx, &state).await?;
-        record_database_authority_events(
-            &mut tx,
-            &state,
-            &[
-                AuthorityAuditFact {
-                    operation: "acquire_writer",
-                    outcome: acquire_outcome,
-                    actor: Some(actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
+            .map_err(|source| database_error("begin_acquire_writer_and_reserve_turn", source))?;
+        admit_session_lifecycle_write(&mut tx, key).await?;
+        let staged = self
+            .stage_acquire_writer_and_reserve_turn(
+                &mut tx,
+                WriterTurnReservationRequest {
+                    key,
                     expected_cursor,
+                    actor,
+                    ttl,
+                    writer_idempotency_key,
+                    reservation_idempotency_key,
+                    expected_execution_binding_generation,
                 },
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: reserve_outcome,
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: Some(&reservation.reservation_id),
-                    expected_cursor,
-                },
-            ],
-        )
-        .await?;
+            )
+            .await?;
         tx.commit()
             .await
-            .map_err(|source| database_error("commit_acquire_and_reserve_turn", source))?;
+            .map_err(|source| database_error("commit_acquire_writer_and_reserve_turn", source))?;
         connection.release();
-        Ok(AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation })
+        staged.into_result()
     }
 
     async fn commit_turn(
@@ -4558,12 +4166,559 @@ struct WriterTransferReceiptV1 {
     lease: ConversationWriterLeaseV1,
 }
 
+fn validate_turn_reservation_inputs(
+    lease: &ConversationWriterLeaseV1,
+    expected_cursor: Option<&SessionCursorV1>,
+    ttl: Duration,
+    idempotency_key: &str,
+) -> Result<(), SessionContextCoordinatorError> {
+    validate_ttl(ttl, MAX_RESERVATION_TTL)?;
+    validate_idempotency_key(idempotency_key)?;
+    validate_optional_cursor(&lease.key, expected_cursor)
+}
+
+fn validate_writer_turn_inputs(
+    key: &SessionKeyV1,
+    expected_cursor: Option<&SessionCursorV1>,
+    actor: &ActorContextV1,
+    ttl: Duration,
+    writer_key: &str,
+    reservation_key: &str,
+) -> Result<(), SessionContextCoordinatorError> {
+    validate_ttl(ttl, MAX_LEASE_TTL.min(MAX_RESERVATION_TTL))?;
+    validate_idempotency_key(writer_key)?;
+    validate_idempotency_key(reservation_key)?;
+    actor
+        .validate_for(key)
+        .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
+    validate_optional_cursor(key, expected_cursor)
+}
+
+impl DatabaseSessionContextCoordinator {
+    pub async fn reserve_turn_in_run_transaction(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        admission: &crate::runs::RunMutationAdmission,
+        request: TurnReservationRequest<'_>,
+    ) -> Result<ReserveTurnOutcome, SessionContextCoordinatorError> {
+        let TurnReservationRequest {
+            lease,
+            expected_cursor,
+            ttl,
+            idempotency_key,
+            expected_execution_binding_generation,
+        } = request;
+        validate_turn_reservation_inputs(lease, expected_cursor, ttl, idempotency_key)?;
+        if !admission.owns_session(&lease.key.owner_user_id, &lease.key.session_id) {
+            return Err(SessionContextCoordinatorError::Unauthorized);
+        }
+        self.stage_reserve_turn(
+            tx,
+            lease,
+            expected_cursor,
+            ttl,
+            idempotency_key,
+            expected_execution_binding_generation,
+        )
+        .await?
+        .into_result()
+    }
+
+    async fn stage_reserve_turn(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        lease: &ConversationWriterLeaseV1,
+        expected_cursor: Option<&SessionCursorV1>,
+        ttl: Duration,
+        idempotency_key: &str,
+        expected_execution_binding_generation: Option<u64>,
+    ) -> Result<StagedCoordinatorMutation<ReserveTurnOutcome>, SessionContextCoordinatorError> {
+        let (mut state, now) = lock_database_state_at_now(tx, &lease.key).await?;
+        validate_execution_binding_generation_in_tx(
+            tx,
+            &lease.key,
+            expected_execution_binding_generation,
+        )
+        .await?;
+        let request_hash = reservation_request_hash(lease, expected_cursor);
+        if let Some(receipt) = load_database_receipt::<ReservationReceiptV1>(
+            tx,
+            &lease.key,
+            "reserve",
+            idempotency_key,
+            &request_hash,
+        )
+        .await?
+        {
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "idempotent_replay",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: Some(&receipt.reservation.reservation_id),
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(
+                ReserveTurnOutcome::AlreadyReserved(receipt.reservation),
+            ));
+        }
+        if let Some(active) = state.active_reservation.clone()
+            && active.idempotency_key == idempotency_key
+        {
+            validate_reservation_request(&active, lease, &expected_cursor.cloned())?;
+            validate_active_lease(&state, lease, now)?;
+            if fence_expired_reservation_authority(&mut state, lease, now) {
+                // The preceding acquire_writer replay can have refreshed the
+                // writer. Fence that refresh in this transaction when its
+                // paired reservation has already expired.
+                update_database_state(tx, &state).await?;
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "reserve_turn",
+                        outcome: "expired_authority_fenced",
+                        actor: Some(&lease.actor),
+                        lease_id: Some(&lease.lease_id),
+                        reservation_id: Some(&active.reservation_id),
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Rejected(
+                    SessionContextCoordinatorError::Expired,
+                ));
+            }
+            let expires_at = refreshed_live_expiry(
+                now,
+                ttl,
+                active.expires_at_unix_ms,
+                Some(lease.expires_at_unix_ms),
+            )?;
+            let refreshed = state
+                .active_reservation
+                .as_mut()
+                .expect("matched active reservation");
+            refreshed.expires_at_unix_ms = expires_at;
+            let refreshed = refreshed.clone();
+            update_database_state(tx, &state).await?;
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "idempotent_refreshed",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: Some(&refreshed.reservation_id),
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(
+                ReserveTurnOutcome::AlreadyReserved(refreshed),
+            ));
+        }
+        if let Err(error) = validate_active_lease(&state, lease, now) {
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: authority_error_outcome(&error),
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Rejected(error));
+        }
+        if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
+            let outcome = ReserveTurnOutcome::Conflict {
+                current_head: state.head.clone(),
+            };
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "cursor_conflict",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(outcome));
+        }
+        if state
+            .active_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+        {
+            let outcome = ReserveTurnOutcome::Conflict {
+                current_head: state.head.clone(),
+            };
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "reservation_conflict",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(outcome));
+        }
+        if let Some(previous) = &state.active_reservation {
+            archive_database_reservation(tx, previous).await?;
+        }
+        let reservation = TurnReservationV1 {
+            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+            reservation_id: Uuid::new_v4().to_string(),
+            key: lease.key.clone(),
+            lease_id: lease.lease_id.clone(),
+            writer_epoch: lease.writer_epoch,
+            expected_cursor: expected_cursor.cloned(),
+            reserved_turn: expected_cursor
+                .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
+            created_at_unix_ms: now,
+            expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
+            idempotency_key: idempotency_key.to_owned(),
+        };
+        state.active_reservation = Some(reservation.clone());
+        update_database_state(tx, &state).await?;
+        record_database_authority_event(
+            tx,
+            &state,
+            AuthorityAuditFact {
+                operation: "reserve_turn",
+                outcome: "reserved",
+                actor: Some(&lease.actor),
+                lease_id: Some(&lease.lease_id),
+                reservation_id: Some(&reservation.reservation_id),
+                expected_cursor,
+            },
+        )
+        .await?;
+        Ok(StagedCoordinatorMutation::Mutation(
+            ReserveTurnOutcome::Reserved(reservation),
+        ))
+    }
+
+    pub async fn acquire_writer_and_reserve_turn_in_run_transaction(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        admission: &crate::runs::RunMutationAdmission,
+        request: WriterTurnReservationRequest<'_>,
+    ) -> Result<AcquireWriterAndReserveTurnOutcome, SessionContextCoordinatorError> {
+        let WriterTurnReservationRequest {
+            key,
+            expected_cursor,
+            actor,
+            ttl,
+            writer_idempotency_key,
+            reservation_idempotency_key,
+            expected_execution_binding_generation,
+        } = request;
+        validate_writer_turn_inputs(
+            key,
+            expected_cursor,
+            actor,
+            ttl,
+            writer_idempotency_key,
+            reservation_idempotency_key,
+        )?;
+        if !admission.owns_session(&key.owner_user_id, &key.session_id) {
+            return Err(SessionContextCoordinatorError::Unauthorized);
+        }
+        self.stage_acquire_writer_and_reserve_turn(
+            tx,
+            WriterTurnReservationRequest {
+                key,
+                expected_cursor,
+                actor,
+                ttl,
+                writer_idempotency_key,
+                reservation_idempotency_key,
+                expected_execution_binding_generation,
+            },
+        )
+        .await?
+        .into_result()
+    }
+
+    async fn stage_acquire_writer_and_reserve_turn(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        request: WriterTurnReservationRequest<'_>,
+    ) -> Result<
+        StagedCoordinatorMutation<AcquireWriterAndReserveTurnOutcome>,
+        SessionContextCoordinatorError,
+    > {
+        let WriterTurnReservationRequest {
+            key,
+            expected_cursor,
+            actor,
+            ttl,
+            writer_idempotency_key,
+            reservation_idempotency_key,
+            expected_execution_binding_generation,
+        } = request;
+        ensure_database_state_admitted(tx, key, actor.authority_epochs).await?;
+        let (mut state, now) = lock_database_state_at_now(tx, key).await?;
+        validate_execution_binding_generation_in_tx(tx, key, expected_execution_binding_generation)
+            .await?;
+        let expected_cursor_owned = expected_cursor.cloned();
+
+        let (lease, acquire_outcome) = if let Some(active) = state.active_writer.clone()
+            && active.idempotency_key == writer_idempotency_key
+        {
+            validate_lease_request(&active, key, &expected_cursor_owned, actor)?;
+            let expires_at = refreshed_live_expiry(now, ttl, active.expires_at_unix_ms, None)?;
+            let refreshed = state
+                .active_writer
+                .as_mut()
+                .expect("matched active writer lease");
+            refreshed.expires_at_unix_ms = expires_at;
+            (refreshed.clone(), "idempotent_refreshed")
+        } else {
+            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
+                let current_head = state.head.clone();
+                let active_lease_expires_at_unix_ms = state
+                    .active_writer
+                    .as_ref()
+                    .filter(|lease| lease.expires_at_unix_ms > now)
+                    .map(|lease| lease.expires_at_unix_ms);
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "acquire_writer",
+                        outcome: "cursor_conflict",
+                        actor: Some(actor),
+                        lease_id: None,
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Mutation(
+                    AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        current_head,
+                        active_lease_expires_at_unix_ms,
+                    },
+                ));
+            }
+            if state
+                .active_writer
+                .as_ref()
+                .is_some_and(|lease| lease.expires_at_unix_ms > now)
+            {
+                let current_head = state.head.clone();
+                let active_lease_expires_at_unix_ms = state
+                    .active_writer
+                    .as_ref()
+                    .map(|lease| lease.expires_at_unix_ms);
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "acquire_writer",
+                        outcome: "writer_conflict",
+                        actor: Some(actor),
+                        lease_id: None,
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Mutation(
+                    AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        current_head,
+                        active_lease_expires_at_unix_ms,
+                    },
+                ));
+            }
+            if actor.authority_epochs != state.authority_epochs {
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "acquire_writer",
+                        outcome: "stale_fenced",
+                        actor: Some(actor),
+                        lease_id: None,
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Rejected(
+                    SessionContextCoordinatorError::Fenced,
+                ));
+            }
+            archive_database_state_receipts(tx, &state).await?;
+            state.active_reservation = None;
+            state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
+                SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
+            })?;
+            let lease = ConversationWriterLeaseV1 {
+                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                key: key.clone(),
+                lease_id: Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                actor: actor.clone(),
+                expected_cursor: expected_cursor_owned.clone(),
+                acquired_at_unix_ms: now,
+                expires_at_unix_ms: checked_expiry(now, ttl)?,
+                idempotency_key: writer_idempotency_key.to_owned(),
+            };
+            state.active_writer = Some(lease.clone());
+            (lease, "acquired")
+        };
+
+        let (reservation, reserve_outcome) = if let Some(active) = state.active_reservation.clone()
+            && active.idempotency_key == reservation_idempotency_key
+        {
+            validate_reservation_request(&active, &lease, &expected_cursor_owned)?;
+            validate_active_lease(&state, &lease, now)?;
+            if fence_expired_reservation_authority(&mut state, &lease, now) {
+                update_database_state(tx, &state).await?;
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "reserve_turn",
+                        outcome: "expired_authority_fenced",
+                        actor: Some(&lease.actor),
+                        lease_id: Some(&lease.lease_id),
+                        reservation_id: Some(&active.reservation_id),
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Rejected(
+                    SessionContextCoordinatorError::Expired,
+                ));
+            }
+            let expires_at = refreshed_live_expiry(
+                now,
+                ttl,
+                active.expires_at_unix_ms,
+                Some(lease.expires_at_unix_ms),
+            )?;
+            let refreshed = state
+                .active_reservation
+                .as_mut()
+                .expect("matched active turn reservation");
+            refreshed.expires_at_unix_ms = expires_at;
+            (refreshed.clone(), "idempotent_refreshed")
+        } else {
+            validate_active_lease(&state, &lease, now)?;
+            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor
+                || state
+                    .active_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+            {
+                let current_head = state.head.clone();
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "reserve_turn",
+                        outcome: "reservation_conflict",
+                        actor: Some(&lease.actor),
+                        lease_id: Some(&lease.lease_id),
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Mutation(
+                    AcquireWriterAndReserveTurnOutcome::ReservationConflict {
+                        lease,
+                        current_head,
+                    },
+                ));
+            }
+            if let Some(previous) = &state.active_reservation {
+                archive_database_reservation(tx, previous).await?;
+            }
+            let reservation = TurnReservationV1 {
+                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                reservation_id: Uuid::new_v4().to_string(),
+                key: lease.key.clone(),
+                lease_id: lease.lease_id.clone(),
+                writer_epoch: lease.writer_epoch,
+                expected_cursor: expected_cursor_owned,
+                reserved_turn: expected_cursor
+                    .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
+                created_at_unix_ms: now,
+                expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
+                idempotency_key: reservation_idempotency_key.to_owned(),
+            };
+            state.active_reservation = Some(reservation.clone());
+            (reservation, "reserved")
+        };
+
+        update_database_state(tx, &state).await?;
+        record_database_authority_events(
+            tx,
+            &state,
+            &[
+                AuthorityAuditFact {
+                    operation: "acquire_writer",
+                    outcome: acquire_outcome,
+                    actor: Some(actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: reserve_outcome,
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: Some(&reservation.reservation_id),
+                    expected_cursor,
+                },
+            ],
+        )
+        .await?;
+        Ok(StagedCoordinatorMutation::Mutation(
+            AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation },
+        ))
+    }
+}
+
 async fn ensure_database_state(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
     epochs: AuthorityEpochsV1,
 ) -> Result<(), SessionContextCoordinatorError> {
     admit_session_lifecycle_write(tx, key).await?;
+    ensure_database_state_admitted(tx, key, epochs).await
+}
+
+async fn ensure_database_state_admitted(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    epochs: AuthorityEpochsV1,
+) -> Result<(), SessionContextCoordinatorError> {
     sqlx::query(
         "INSERT IGNORE INTO session_context_heads
          (isolation_domain, owner_user_id, session_id, branch_id,
