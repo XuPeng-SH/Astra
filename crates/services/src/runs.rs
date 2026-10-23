@@ -5255,6 +5255,12 @@ pub struct AtomicRunTerminalSettlementAdmission {
     cancellation_requested: bool,
 }
 
+impl AtomicRunTerminalSettlementAdmission {
+    pub(crate) fn owns_session(&self, user_id: &str, session_id: &str) -> bool {
+        self.run.user_id == user_id && self.run.session_id == session_id
+    }
+}
+
 /// Authoritative read result for an atomic terminal settlement.
 ///
 /// `NotCommitted` is reserved for the original active generation, which may

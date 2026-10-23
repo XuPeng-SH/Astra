@@ -13,7 +13,6 @@ use super::lifecycle::{
 /// observability session, and persist to journal. Called from every exit path
 /// in the agentic loop so `/context breakdown` always reflects the latest turn.
 pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
-    update_session_facts_from_turn(state);
     let Some(collector) = state.telemetry.turn_trace_collector.take() else {
         return;
     };
@@ -509,9 +508,31 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
     }
 
+    // One loop exit owns turn facts and settlement. Round trace callbacks are
+    // observations: they must not append the same cumulative tool facts again.
+    // Waiting/delegated/rejected control does not settle an unfinished turn.
+    if !host.is_pre_admission_rejection()
+        && !matches!(
+            &result,
+            Ok(AgenticLoopOutcome::Waiting(_)
+                | AgenticLoopOutcome::Delegated
+                | AgenticLoopOutcome::ControlRejected(_))
+        )
+    {
+        update_session_facts_from_turn(state);
+        // Cancellation before any output has no assistant answer to render.
+        // Fatal errors retain their existing partial/checkpoint error path.
+        if result.is_ok()
+            && (matches!(&result, Ok(AgenticLoopOutcome::Completed))
+                || !state.final_text.is_empty())
+        {
+            finalize_and_render(host, state).await;
+        }
+    }
+
     host.on_turn_terminal(state, &result).await;
 
-    // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
+    // One SessionEnd owner covers normal completion and error returns alike.
     if !input_wait_continuation {
         super::super::harness_adapter::harness_at!(
             &state.harness,
@@ -607,6 +628,10 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    // All terminal routes retain the producer-owned child obligation here.
+    if !state.final_output_ready_notified {
+        super::execution_phase::fence_direct_child_finalization(host, state).await;
+    }
     // The answer itself belongs to the interactive critical path. Everything
     // below this boundary is durable/derived settlement and must never keep a
     // displayed answer looking live just because a database, workspace, or
@@ -644,15 +669,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     reset_per_turn_advisory_state(state);
     update_working_memory_for_turn_settlement(state);
-
-    // ── Harness: SessionEnd (observe only, fire at most once) ──
-    // Fire after terminal text/interruption normalization so snapshots expose
-    // the real final state instead of a pre-finalization empty/completed shell.
-    super::super::harness_adapter::harness_at!(
-        &state.harness,
-        astra_harness::HookPoint::SessionEnd,
-        state
-    );
 
     try_write_heavy_checkpoint(state);
 }
@@ -2398,8 +2414,8 @@ mod tests {
         // Before finalization, facts should be empty
         assert!(state.session_facts.active_files.is_empty());
 
-        // Run finalization (which calls update_session_facts_from_turn)
-        finalize_turn_trace(&mut state).await;
+        // Turn settlement updates facts independently of optional round traces.
+        update_session_facts_from_turn(&mut state);
 
         // After finalization, facts should be populated
         assert_eq!(state.session_facts.turn, 7);
@@ -2910,10 +2926,9 @@ mod tests {
         }];
         state.total_prompt = 15000;
 
-        // finalize_turn_trace will attempt L1 write to $HOME/.astra/... which may
-        // fail in test (no writable session dir). That's fine — it's non-fatal.
-        // We verify the facts update and L1 content generation instead.
-        finalize_turn_trace(&mut state).await;
+        // Error facts belong to turn settlement, independently of tracing or
+        // optional memory extraction.
+        update_session_facts_from_turn(&mut state);
 
         // Error tracked in facts
         assert_eq!(state.session_facts.error_state.total_errors, 1);

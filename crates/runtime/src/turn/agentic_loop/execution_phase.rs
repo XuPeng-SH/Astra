@@ -11,8 +11,7 @@ use super::host::{
     DIRECT_CHILD_RESULT_SCHEMA, HostTurnResult, RejectedToolCall, RunControlProvider,
     ToolCallAdmission, TurnPhaseKind, TurnPhaseOutcome, UserIntentState,
     WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase,
-    context_manifest_identity_from_result, finalize_and_render, finalize_turn_trace,
-    try_write_heavy_checkpoint,
+    context_manifest_identity_from_result, finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -5008,7 +5007,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 }
                 try_write_heavy_checkpoint(state);
                 state.step_recorder.end_turn(false);
-                finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect {
@@ -5769,7 +5767,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 );
                 observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
-                finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
 
@@ -6004,7 +6001,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
-                finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
 
@@ -6090,7 +6086,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         );
                         state.step_recorder.end_turn(false);
                         try_write_heavy_checkpoint(state);
-                        finalize_and_render(host, state).await;
                         return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
                     }
                 };
@@ -6180,7 +6175,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                     state.step_recorder.end_turn(false);
                     try_write_heavy_checkpoint(state);
-                    finalize_and_render(host, state).await;
                     return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
                 }
                 authorized
@@ -6238,7 +6232,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                     state.step_recorder.end_turn(false);
                     try_write_heavy_checkpoint(state);
-                    finalize_and_render(host, state).await;
                     return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
                 }
                 CompletionActionBoundary::NoWindow | CompletionActionBoundary::Settled => {}
@@ -6303,7 +6296,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
-                finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
 
@@ -6332,7 +6324,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
             observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
 
-            finalize_and_render(host, state).await;
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
         }
         AgenticIngestIterationControl::ContinueIterating => {
@@ -8131,7 +8122,6 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         );
         observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
         state.step_recorder.end_turn(false);
-        finalize_and_render(host, state).await;
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
 
@@ -10288,7 +10278,14 @@ mod tests {
             ),
             budget
         );
-        assert_eq!(host.final_policy_snapshots.last(), Some(&policy_before));
+        assert_eq!(
+            serde_json::to_value(&state.stall.runtime_policy_evaluation).unwrap(),
+            policy_before
+        );
+        assert!(
+            host.final_policy_snapshots.is_empty(),
+            "phase returns an outcome; shared loop exit renders it"
+        );
         assert!(!state.stall.tool_call_records.is_empty());
         assert!(state.messages.iter().any(|message| {
             message
@@ -10371,7 +10368,10 @@ mod tests {
             host.executed_messages.len() == 1,
             "only the original provider request; no follow-up request"
         );
-        assert_eq!(host.rendered_final_text.last(), Some(&state.final_text));
+        assert!(
+            host.rendered_final_text.is_empty(),
+            "phase returns an outcome; shared loop exit renders it"
+        );
     }
 
     fn ordinary_admitted(

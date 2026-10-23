@@ -162,6 +162,13 @@ Retention is a product contract:
   admission. Replay reuses the immutable identity; collisions retain their
   receipt without projecting conflicting text. Structured intents without a
   prompt retain transcript-only capture. Resume does not admit a second input.
+- Root execution commits canonical Context (segments, manifest, head, operation
+  receipt and owned writer release) with Run terminal, semantic usage, audit
+  and transcript in one transaction. Context rejection leaves the Run active;
+  Run rejection rolls back Context too. The generation-scoped settlement
+  receipt binds the exact Context request and resulting cursor, so retry and
+  lost COMMIT acknowledgement resolve the same atomic fact rather than a
+  second Context write. Standalone coordinator callers use the same mutation.
 - Context display publication follows canonical terminal settlement in the
   existing tracked cleanup task. Workspace projections no longer block model
   completion; `context_trace_signal` uses the bounded ingestion worker and its

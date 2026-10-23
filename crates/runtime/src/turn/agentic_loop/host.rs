@@ -5164,17 +5164,6 @@ pub(crate) use super::finalization::{
     finalize_turn_trace, run_agentic_loop_with_host, try_write_heavy_checkpoint,
 };
 
-/// Every shared-loop finalization route (including exhausted slices and
-/// harness exits) must retain the producer-owned child obligation.
-pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
-    host: &mut H,
-    state: &mut AgenticLoopState,
-) {
-    if !state.final_output_ready_notified {
-        super::execution_phase::fence_direct_child_finalization(host, state).await;
-    }
-    super::finalization::finalize_and_render(host, state).await;
-}
 pub(crate) use super::lifecycle::{
     PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
@@ -5257,7 +5246,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Pause { reason, .. } => {
@@ -5267,7 +5256,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessPaused,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Continue => {}
@@ -5317,7 +5306,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
             try_write_heavy_checkpoint(state);
             if !outcome.should_continue() {
-                finalize_and_render(host, state).await;
                 return Ok(AgenticLoopOutcome::Completed);
             }
             state.loop_entry = LoopEntry::IterationBoundary {
@@ -5340,14 +5328,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             turn_start_time,
         } = match prepare_turn_iteration(host, state, turn_index).await? {
             PreparedTurnIteration::Ready(prep) => prep,
-            PreparedTurnIteration::Finished(outcome) => {
-                if matches!(outcome, AgenticLoopOutcome::Completed)
-                    && (!state.final_text.is_empty() || state.interruption.is_some())
-                {
-                    finalize_and_render(host, state).await;
-                }
-                return Ok(outcome);
-            }
+            PreparedTurnIteration::Finished(outcome) => return Ok(outcome),
         };
 
         let TurnExecutionPhase {
@@ -5375,15 +5356,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     .wait_for_input(RuntimeInputWait::Completion)?;
                 continue;
             }
-            TurnExecutionControl::Return(outcome) => {
-                if !matches!(
-                    &outcome,
-                    AgenticLoopOutcome::Delegated | AgenticLoopOutcome::ControlRejected(_)
-                ) {
-                    finalize_and_render(host, state).await;
-                }
-                return Ok(outcome);
-            }
+            TurnExecutionControl::Return(outcome) => return Ok(outcome),
         };
 
         // ── Harness: PostLlmResponse — Block/Pause halts session ──
@@ -5400,7 +5373,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Pause { reason, .. } => {
@@ -5410,7 +5383,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessPaused,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Continue => {}
@@ -5535,7 +5508,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                         &reason,
                     );
-                    finalize_and_render(host, state).await;
+
                     return Ok(AgenticLoopOutcome::Completed);
                 }
                 astra_harness::HookVerdict::Pause { reason, .. } => {
@@ -5545,7 +5518,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         astra_turn_core::interruption::InterruptionKind::HarnessPaused,
                         &reason,
                     );
-                    finalize_and_render(host, state).await;
+
                     return Ok(AgenticLoopOutcome::Completed);
                 }
                 astra_harness::HookVerdict::Continue => {}
@@ -5562,7 +5535,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Pause {
@@ -5605,8 +5578,8 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         state.loop_entry.advance()?;
     }
-    // Loop exhausted max_turns without explicit break — write final state.
-    finalize_and_render(host, state).await;
+    // Exhausting the slice settles at the shared loop exit, like explicit returns.
+
     Ok(AgenticLoopOutcome::Completed)
 }
 
@@ -8450,6 +8423,15 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        assert_eq!(host.final_output_ready, vec!["done"]);
+        assert_eq!(
+            state.session_facts.recent_tool_calls.len(),
+            1,
+            "one executed tool must contribute one fact at the shared loop exit"
+        );
+        assert_eq!(state.session_facts.recent_tool_calls[0].name, "bash");
+        assert!(state.session_facts.recent_tool_calls[0].ok);
 
         let mut terminal_counts = std::collections::BTreeMap::new();
         for event in state.step_recorder.events() {
