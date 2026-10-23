@@ -739,8 +739,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                         .iter()
                         .filter(|manifest| manifest.user_invocable)
                         .count();
-                    ctx.bottom_pane.composer.set_text("$");
-                    ctx.bottom_pane.sync_popups();
+                    ctx.bottom_pane.start_composer_draft("$");
                     ctx.show_response(format!(
                         "Opened skills · {skill_count} available · type to filter"
                     ));
@@ -1647,7 +1646,7 @@ pub(crate) fn handle_display_view_result(result: ViewResult, bottom_pane: &mut B
             ));
         }
         ViewResult::InsertCommand(command) => {
-            bottom_pane.composer.set_text(&format!("{command} "));
+            bottom_pane.start_composer_draft(&format!("{command} "));
         }
         _ => {}
     }

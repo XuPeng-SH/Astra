@@ -55,7 +55,7 @@ impl TextArea {
         self.text.clear();
         self.cursor_pos = 0;
         self.preferred_col = None;
-        self.paste_burst.reset();
+        self.paste_burst.reset_preserving_enter_guard();
         self.invalidate_wrap();
     }
 
@@ -63,8 +63,17 @@ impl TextArea {
         self.text = text.to_string();
         self.cursor_pos = self.text.len();
         self.preferred_col = None;
-        self.paste_burst.reset();
+        self.paste_burst.reset_preserving_enter_guard();
         self.invalidate_wrap();
+    }
+
+    pub fn take_text(&mut self) -> String {
+        if let Some(pending) = self.paste_burst.flush(Instant::now()) {
+            self.insert_str(&pending);
+        }
+        let text = std::mem::take(&mut self.text);
+        self.set_text("");
+        text
     }
 
     /// Current cursor byte offset within `text()`.
@@ -105,6 +114,16 @@ impl TextArea {
         self.paste_burst.force_due_buffer_for_test(text, now);
     }
 
+    /// Consume a guarded Enter before a popup can treat it as submission.
+    pub fn insert_newline_if_pasting(&mut self) -> bool {
+        if self.paste_burst.enter_should_insert_newline(Instant::now()) {
+            self.insert_char('\n');
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> TextAreaAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -116,9 +135,7 @@ impl TextArea {
                 TextAreaAction::Changed
             }
             KeyCode::Enter => {
-                let now = Instant::now();
-                if self.paste_burst.enter_should_insert_newline(now) {
-                    self.insert_char('\n');
+                if self.insert_newline_if_pasting() {
                     TextAreaAction::Changed
                 } else {
                     TextAreaAction::Submit

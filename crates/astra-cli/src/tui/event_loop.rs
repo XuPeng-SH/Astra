@@ -7263,7 +7263,7 @@ enum LocalShellSubmission {
 }
 
 fn classify_local_shell_submission(text: &str) -> LocalShellSubmission {
-    let Some(command) = text.trim_start().strip_prefix('!') else {
+    let Some(command) = crate::cli::turn::turn_entry::shell_input_body(text) else {
         return LocalShellSubmission::NotShell;
     };
     let command = command.trim();
@@ -11828,7 +11828,7 @@ pub(crate) async fn run_tui_session(
                                                 // Keep the continuation explicit and editable. The
                                                 // actual Work turn is submitted only after the user
                                                 // writes a message and presses Enter.
-                                                bottom_pane.composer.set_text(&format!(
+                                                bottom_pane.start_composer_draft(&format!(
                                                     "/work continue {} ",
                                                     work_id
                                                 ));
@@ -23163,6 +23163,98 @@ mod tests {
                 SubmissionProjection::Conversation(expected)
             );
         }
+    }
+
+    #[test]
+    fn returned_literal_waits_for_a_fresh_gesture_after_command_drafts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for draft in [
+            "/help",
+            "/model chosen",
+            "/he",
+            "/unknown",
+            "/plan inspect",
+            "!echo held",
+        ] {
+            for followup in [false, true] {
+                let key = if followup {
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)
+                } else {
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                };
+                let mut pane = explicit_followup_pane();
+                pane.set_slash_items(vec![slash_menu::SlashItem::simple("/help", "help")]);
+                pane.try_accept_user_intent(
+                    "returned-literal",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    "/tmp/project inspect this",
+                )
+                .unwrap();
+                for ch in draft.chars() {
+                    pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                }
+                assert!(pane.return_user_intent(
+                    "returned-literal",
+                    astra_turn_types::UserIntentStatus::Returned,
+                    "/tmp/project inspect this",
+                ));
+                assert!(!pane.return_user_intent(
+                    "returned-literal",
+                    astra_turn_types::UserIntentStatus::Returned,
+                    "/tmp/project inspect this",
+                ));
+                assert_eq!(pane.composer.text(), draft);
+                let first = pane.handle_key(key);
+                let submitted = match first {
+                    BottomPaneAction::SubmitInput(text) if !followup => text,
+                    BottomPaneAction::QueueFollowUp(text) if followup => text,
+                    other => panic!("expected draft submission, got {other:?}"),
+                };
+                assert_eq!(submitted, if draft == "/he" { "/help" } else { draft });
+                assert_eq!(pane.queued_next_turn_submission_count(), 0);
+                assert_eq!(pane.composer.text(), "//tmp/project inspect this");
+                assert!(!pane.slash_menu_is_open());
+                let second = pane.handle_key(key);
+                let restored = match second {
+                    BottomPaneAction::SubmitInput(text) if !followup => text,
+                    BottomPaneAction::QueueFollowUp(text) if followup => text,
+                    other => panic!("expected separately submitted return, got {other:?}"),
+                };
+                assert_eq!(
+                    submission_projection(&restored),
+                    SubmissionProjection::Conversation("/tmp/project inspect this")
+                );
+                assert!(pane.composer.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn restored_mixed_inputs_preserve_order_and_dispatch_boundaries() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut pane = explicit_followup_pane();
+        pane.composer.set_text("existing");
+        restore_queued_input(
+            interactive_queue([
+                "//one".into(),
+                "/help".into(),
+                "///two".into(),
+                "!echo held".into(),
+            ]),
+            &mut pane,
+        );
+        for expected in ["existing\n\n/one", "/help", "//two", "!echo held"] {
+            let BottomPaneAction::SubmitInput(raw) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("each restored draft requires its own Enter");
+            };
+            assert_eq!(slash_dispatch::parse_submission(&raw).text(), expected);
+        }
+        assert!(pane.composer.is_empty());
+        assert_eq!(pane.queued_next_turn_submission_count(), 0);
     }
 
     #[test]

@@ -107,7 +107,11 @@ impl ChatComposer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.textarea.is_empty()
+        self.textarea.is_empty() && !self.paste_burst_active()
+    }
+
+    pub(crate) fn paste_burst_active(&self) -> bool {
+        self.textarea.paste_burst_active()
     }
 
     /// True when the user is browsing history (Up/Down navigation).
@@ -144,6 +148,16 @@ impl ChatComposer {
             self.last_submit_at = Some(Instant::now());
         }
         expanded
+    }
+
+    /// Move editable content without creating history or submission feedback.
+    pub(crate) fn take_draft(&mut self) -> String {
+        let raw = self.textarea.take_text();
+        let text = self.expand_pastes(&raw);
+        self.history_index = None;
+        self.draft = None;
+        self.pasted_blobs.clear();
+        text
     }
 
     pub fn clear_draft(&mut self) {
@@ -344,6 +358,10 @@ impl ChatComposer {
 
     fn prefix_display_width(&self) -> u16 {
         self.prompt_prefix.width() as u16
+    }
+
+    pub(crate) fn insert_newline_if_pasting(&mut self) -> bool {
+        self.textarea.insert_newline_if_pasting()
     }
 
     pub fn flush_paste_burst(&mut self) -> bool {

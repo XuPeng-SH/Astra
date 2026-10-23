@@ -603,3 +603,178 @@ fn snapshot_active_bottom_surface_narrow_42() {
         snapshot_text(&pane, Rect::new(0, 0, 42, 5))
     );
 }
+
+#[test]
+fn restored_drafts_survive_menu_edits_and_explicit_clearing() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for edit in [KeyCode::Tab, KeyCode::Char('1'), KeyCode::Esc] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+            "/help", "help",
+        )]);
+        pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        pane.restore_into_composer("//returned");
+        assert!(
+            pane.notice_lines(100)
+                .iter()
+                .any(|line| line.to_string().contains("Unsent drafts (1)"))
+        );
+        pane.handle_key(KeyEvent::new(edit, KeyModifiers::NONE));
+        assert_eq!(pane.restored_drafts.len(), 1);
+        assert!(
+            pane.slash_menu.is_none(),
+            "dismissed menus must stay dismissed"
+        );
+        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(pane.composer.text(), "//returned");
+        assert!(pane.restored_drafts.is_empty());
+        let BottomPaneAction::SubmitInput(raw) =
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("restored input must still need Enter");
+        };
+        assert_eq!(raw, "//returned");
+    }
+}
+
+#[test]
+fn restoring_multiline_conversation_closes_skill_completion() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer, skill_popup::SkillItem};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.set_skill_items(vec![SkillItem {
+        name: "inspect".into(),
+        description: "inspect".into(),
+        source: "test".into(),
+    }]);
+    for ch in "$inspect".chars() {
+        pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert!(pane.skill_popup.is_some());
+    pane.restore_into_composer("//returned");
+    assert!(pane.skill_popup.is_none());
+    let BottomPaneAction::SubmitInput(raw) =
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("completion must not swallow multiline input");
+    };
+    assert_eq!(raw, "$inspect\n\n/returned");
+}
+
+#[test]
+fn restoration_waits_for_buffered_paste_without_losing_its_bytes() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.composer.force_pending_paste_burst_for_test(
+        "draft being pasted",
+        Instant::now() - std::time::Duration::from_secs(1),
+    );
+    pane.restore_into_composer("//returned");
+    assert!(
+        !pane.composer.is_empty(),
+        "buffered paste prevents replay and empty-input quit"
+    );
+    assert!(
+        pane.composer.text().is_empty(),
+        "restoration must not reset a pending burst"
+    );
+    pane.pre_draw_tick(Instant::now());
+    assert!(
+        matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BottomPaneAction::Consumed
+        ),
+        "a late pasted newline must not submit recovery"
+    );
+    assert!(pane.composer.text().ends_with('\n'));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let BottomPaneAction::SubmitInput(raw) =
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("a later deliberate Enter must submit");
+    };
+    assert_eq!(raw.trim_end(), "draft being pasted\n\n/returned");
+}
+
+#[test]
+fn starting_another_draft_preserves_paste_payloads_and_pending_bytes() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for placeholder in [false, true] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        let original = if placeholder {
+            "large pasted line\n".repeat(100)
+        } else {
+            "pending paste".into()
+        };
+        if placeholder {
+            pane.handle_paste(&original);
+            assert!(
+                !pane.composer.text().contains(&original),
+                "fixture uses a compact placeholder"
+            );
+        } else {
+            pane.composer
+                .force_pending_paste_burst_for_test(&original, Instant::now());
+        }
+        pane.start_composer_draft("/help");
+        assert_eq!(pane.composer.text(), "/help");
+        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(pane.composer.text(), original);
+        if !placeholder {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let BottomPaneAction::SubmitInput(raw) =
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("cleared command must reveal an editable draft");
+        };
+        assert_eq!(raw, original);
+    }
+}
+
+#[test]
+fn clearing_a_paste_keeps_a_trailing_newline_from_submitting_recovery() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for returned in ["//returned", "/help"] {
+        for clear in [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            let mut pane = BottomPane::new();
+            pane.composer = ChatComposer::new_ephemeral();
+            pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+                "/help", "help",
+            )]);
+            pane.composer
+                .force_pending_paste_burst_for_test("unfinished paste", Instant::now());
+            pane.restore_into_composer(returned);
+            pane.handle_key(clear);
+            assert_eq!(pane.composer.text(), returned);
+            assert_eq!(pane.slash_menu_is_open(), returned == "/help");
+            assert!(
+                matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    BottomPaneAction::Consumed
+                ),
+                "cancelled paste still needs protection against its trailing newline"
+            );
+            assert_eq!(pane.composer.text(), format!("{returned}\n"));
+            assert!(!pane.slash_menu_is_open());
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let BottomPaneAction::SubmitInput(raw) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("a later fresh gesture must submit recovery");
+            };
+            assert_eq!(raw.trim_end(), returned);
+        }
+    }
+}

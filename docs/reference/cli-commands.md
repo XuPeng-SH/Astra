@@ -310,7 +310,11 @@ In the interactive composer, a leading `/` selects a slash action. To send liter
 slash text, escape it with another slash: `//tmp/project inspect this` sends
 `/tmp/project inspect this`, and `//stop` sends `/stop` as conversation text.
 The escape also applies to queued messages and guidance for an active run.
-Literal text stays literal when rejected input returns to an existing draft.
+Returned conversation can merge with an existing conversation draft. Commands
+and shell drafts stay separate: “Unsent drafts” shows retained input, which
+moves into the composer after the current draft is sent or cleared. Each draft
+requires a new submission gesture; restoration never sends it automatically.
+These editable drafts remain local to the running client.
 Ctrl+R also restores the latest conversation with its slash escape, so editing
 and resending `/exit` text keeps it a message. The transcript shows the original
 conversation text, without the composer escape.
