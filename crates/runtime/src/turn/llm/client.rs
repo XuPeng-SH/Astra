@@ -4845,6 +4845,7 @@ pub(crate) async fn call_llm_and_collect(
 
 /// Execute one logical provider boundary with explicit tool authority and optional budget.
 /// An explicit budget is a new logical invocation, never a hidden transport retry.
+#[cfg(test)]
 pub(crate) async fn call_llm_and_collect_with_stream_callback(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
@@ -4918,14 +4919,39 @@ fn discrete_judgment_provenance(
     .then_some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
 }
 
-async fn call_llm_and_collect_with_total_budget(
-    call: LlmCall<'_>,
-    cancel: LlmCancel<'_>,
-    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
-    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+/// A fully projected streaming request. Durable admission and transport share
+/// these exact serialized bytes; preparing a request grants no execution authority.
+pub(crate) struct PreparedStreamingCall<'a> {
+    purpose: astra_turn_types::InferencePurpose,
+    route: LlmExecutionRoute<'a>,
+    request: PreparedProviderRequest,
+    wire_output_limit: Option<usize>,
+    authorized_tool_names: HashSet<String>,
+    url: String,
+    judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     tool_choice: RuntimeToolChoice,
-    total_budget: std::time::Duration,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    preparation_elapsed: std::time::Duration,
+}
+
+impl PreparedStreamingCall<'_> {
+    pub(crate) fn purpose(&self) -> astra_turn_types::InferencePurpose {
+        self.purpose
+    }
+
+    pub(crate) fn route(&self) -> &LlmExecutionRoute<'_> {
+        &self.route
+    }
+
+    pub(crate) fn identity(&self) -> &ProviderWireRequestIdentity {
+        self.request.identity()
+    }
+}
+
+pub(crate) fn prepare_streaming_call(
+    call: LlmCall<'_>,
+    tool_choice: RuntimeToolChoice,
+) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
+    let preparation_started = Instant::now();
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
@@ -4934,19 +4960,13 @@ async fn call_llm_and_collect_with_total_budget(
     }
     call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
-    let logical_total_budget = total_budget;
-    let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
-    let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
-    let LlmCall {
-        purpose,
-        messages,
-        tools,
-        cache_capability,
-        route,
-        max_output_tokens,
-        temperature,
-        thinking,
-    } = call;
+    let messages = call.messages;
+    let tools = call.tools;
+    let cache_capability = call.cache_capability;
+    let route = &call.route;
+    let max_output_tokens = call.max_output_tokens;
+    let temperature = call.temperature;
+    let thinking = call.thinking;
     let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
         route.request_body_overrides,
         route.fixed_temperature,
@@ -4959,41 +4979,13 @@ async fn call_llm_and_collect_with_total_budget(
     } else {
         temperature
     };
-    let LlmExecutionRoute {
-        fixed_temperature: _,
-        supported_reasoning_efforts: _,
-        thinking_protocol,
-        model_name,
-        wire_model_name,
-        api_key,
-        base_url,
-        provider,
-        header_overrides,
-        request_body_overrides,
-        completions_url_override,
-        request_timeout,
-    } = route;
-    let cooldown = rate_limit_cooldown();
-    // `model_key` indexes rate-limit state on the local row name.
-    let model_key = model_name;
-    // `upstream_name` is what goes in the outbound request body + URL.
-    let upstream_name = wire_model_name.unwrap_or(model_name);
+    let provider = route.provider;
+    let model_name = route.model_name;
+    let upstream_name = route.wire_model_name.unwrap_or(model_name);
+    let base_url = route.base_url;
+    let request_body_overrides = route.request_body_overrides;
+    let thinking_protocol = route.thinking_protocol;
     validate_request_body_overrides(request_body_overrides)?;
-
-    let started = Instant::now();
-    let controlled_attempt_observer =
-        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
-            inner,
-            started,
-            work_budget: total_budget,
-            logical_budget: logical_total_budget,
-            cancel,
-        });
-    let attempt_observer = controlled_attempt_observer
-        .as_ref()
-        .map(|observer| observer as &dyn ProviderAttemptObserver);
-    let client = global_llm_client();
-
     // Project system messages according to the declared transport/cache shape.
     // A current-user-only capability consolidates them at the head; protocols
     // that admit a runtime system suffix preserve that boundary.
@@ -5057,14 +5049,115 @@ async fn call_llm_and_collect_with_total_budget(
 
     let url = llm_request_url(
         base_url,
-        completions_url_override,
+        route.completions_url_override,
         provider,
         upstream_name,
         true,
     );
+    Ok(PreparedStreamingCall {
+        purpose: call.purpose,
+        route: call.route,
+        request: prepared_request,
+        wire_output_limit,
+        authorized_tool_names,
+        url,
+        judgment_provenance,
+        tool_choice,
+        preparation_elapsed: preparation_started.elapsed(),
+    })
+}
+
+#[cfg(test)]
+async fn call_llm_and_collect_with_total_budget(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let prepared = prepare_streaming_call(call, tool_choice)?;
+    call_prepared_llm_with_total_budget(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        total_budget,
+    )
+    .await
+}
+
+pub(crate) async fn call_prepared_llm_and_collect_with_stream_callback(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: Option<std::time::Duration>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let total_budget = total_budget.unwrap_or_else(|| match prepared.tool_choice {
+        RuntimeToolChoice::Auto => llm_total_budget(),
+        RuntimeToolChoice::None => auxiliary_execution_budget(prepared.purpose, llm_total_budget()),
+    });
+    call_prepared_llm_with_total_budget(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        total_budget,
+    )
+    .await
+}
+
+async fn call_prepared_llm_with_total_budget(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let PreparedStreamingCall {
+        purpose,
+        route,
+        request: prepared_request,
+        wire_output_limit,
+        authorized_tool_names,
+        url,
+        judgment_provenance,
+        preparation_elapsed,
+        ..
+    } = prepared;
+    let LlmExecutionRoute {
+        model_name,
+        api_key,
+        base_url: _,
+        provider,
+        header_overrides,
+        request_timeout,
+        completions_url_override,
+        ..
+    } = route;
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
-
+    let model_key = model_name;
+    let cooldown = rate_limit_cooldown();
+    let logical_total_budget = total_budget;
+    let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
+    let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
+    // Count request projection against provider work, while a retained pause
+    // or database admission wait keeps its existing separate deadline owner.
+    let started = Instant::now() - preparation_elapsed;
+    let controlled_attempt_observer =
+        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
+            inner,
+            started,
+            work_budget: total_budget,
+            logical_budget: logical_total_budget,
+            cancel,
+        });
+    let attempt_observer = controlled_attempt_observer
+        .as_ref()
+        .map(|observer| observer as &dyn ProviderAttemptObserver);
+    let client = global_llm_client();
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
     let mut last_model_gateway_error = None;
