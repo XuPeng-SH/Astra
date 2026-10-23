@@ -34,7 +34,6 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use sqlx::mysql::MySqlRow;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
@@ -568,19 +567,6 @@ pub async fn cleanup_edge_registry(pool: &sqlx::MySqlPool, user_id: &str, edge_a
 /// materialized checkout before an Edge can start a turn, so bootstrap seeds
 /// the same durable identity that a real Edge WebSocket handshake publishes.
 pub const MATRIX_E2E_EDGE_WORKSPACE_ROOT: &str = "/tmp/astra-system-matrix-edge";
-
-pub fn row_get_str(r: &MySqlRow, col: &str) -> String {
-    r.try_get::<String, _>(col)
-        .unwrap_or_else(|_| panic!("missing string column {col}"))
-}
-
-pub fn row_get_opt_str(r: &MySqlRow, col: &str) -> Option<String> {
-    r.try_get::<Option<String>, _>(col).ok().flatten()
-}
-
-pub fn row_get_opt_i64(r: &MySqlRow, col: &str) -> Option<i64> {
-    r.try_get::<Option<i64>, _>(col).ok().flatten()
-}
 
 /// Poll until `agent_events` has at least one row per `event_type` for this session, or `timeout`.
 /// Avoids fixed `sleep` after server-owned `/chat/stream` SSE (faster on hot DB, less flaky on cold).

@@ -368,3 +368,11 @@ schema markers still fail the current-contract check. Runtime display reads
 use the captured Run/event watermark and independently read checkpoint metadata;
 a newer checkpoint summary during that read is accepted display inconsistency,
 never execution or resume authority.
+
+Server opening and terminal commits do not synthesize legacy `agent_events`
+`user_query`/`llm_response` roots, including in Explain mode. Explain captures
+optional runtime diagnostics; it does not create another conversation ledger.
+Conversation history and resume use canonical Context and raw transcript, and
+execution/usage use Run. Audit turn views over explicitly ingested client roots
+can therefore be empty for Server-only sessions; they do not certify whether a
+conversation or execution occurred.

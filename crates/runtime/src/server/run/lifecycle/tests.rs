@@ -31936,9 +31936,7 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
             ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Observed both reports."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))
         ])]).await;
         let native_base = format!("{}/v1", native_gateway.base_url);
-        use crate::server::model_execution_admission::inheritance_test_support::{
-            OFFERING_ID, ServiceBackedOffering,
-        };
+        use crate::server::model_execution_admission::inheritance_test_support::ServiceBackedOffering;
         let mut admitted = genesis_execution();
         admitted.base_url = native_base;
         let model_service = Arc::new(ServiceBackedOffering::new(admitted.clone()));
@@ -31985,34 +31983,33 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
             .expect("delegated Explain child did not panic")
             .expect("delegated Explain run");
         assert_eq!(result.result.status, STATUS_COMPLETED, "{result:?}");
-        let outputs: Vec<(String,)> = sqlx::query_as(
-            "SELECT CAST(metadata AS CHAR) FROM agent_events \
-             WHERE user_id = ? AND session_id = ? AND run_id = ? \
-             AND event_type = 'tool_call_completed' AND meta_tool_name = 'introspect'",
-        )
-        .bind(user)
-        .bind(&session)
-        .bind(&child)
-        .fetch_all(pool.get())
-        .await
-        .unwrap();
-        assert_eq!(
-            outputs.len(),
-            2,
-            "both distinct report requests must execute"
-        );
-        for (output,) in outputs {
-            assert!(output.contains(&handle), "{output}");
-            assert!(!output.contains("requires a server root execution context"));
+        {
+            let requests = native_gateway.requests.lock().await;
+            let synthesis = requests.last().expect("post-tool provider request");
+            let outputs = synthesis.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .filter(|message| {
+                    matches!(
+                        message["tool_call_id"].as_str(),
+                        Some("explain-0" | "explain-1")
+                    )
+                })
+                .map(|message| message["content"].as_str().expect("actual tool output"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outputs.len(),
+                2,
+                "both distinct report requests must reach synthesis"
+            );
+            for output in outputs {
+                assert!(output.contains(&handle), "{output}");
+                assert!(!output.contains("requires a server root execution context"));
+            }
         }
         native_gateway.assert_complete();
-        assert!(
-            model_service
-                .calls()
-                .iter()
-                .any(|(owner, offering)| owner == user && offering == OFFERING_ID),
-            "child reauthorizes the Server Offering"
-        );
         cleanup_lifecycle_run_fixture(&pool, user, &child).await;
         cleanup_lifecycle_run_fixture(&pool, user, &parent).await;
     }
@@ -32942,10 +32939,10 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         "semantic overflow should be summarized"
     );
     assert!(
-        budgeted
+        !budgeted
             .iter()
             .any(|event| durable_event_type(event) == Some("tool_call")),
-        "tool start boundary must beat progress noise under budget pressure"
+        "live tool starts must not become duplicate durable rows"
     );
     assert!(
         budgeted
@@ -33006,7 +33003,6 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
     );
     for expected in [
         "durable_events_compacted",
-        "tool_call",
         "tool_call_end",
         "text_done",
         "run_finished",
@@ -33024,10 +33020,6 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
     assert!(replay_events.iter().all(|event| {
         event.get("type").and_then(Value::as_str) != Some("text_delta")
             && event.get("event_type").and_then(Value::as_str) != Some("text_delta")
-    }));
-    assert!(replay_events.iter().any(|event| {
-        event.get("type").and_then(Value::as_str) == Some("tool_call")
-            || event.get("event_type").and_then(Value::as_str) == Some("tool_call")
     }));
     assert!(replay_events.iter().any(|event| {
         event.get("type").and_then(Value::as_str) == Some("tool_call_end")

@@ -145,6 +145,13 @@ and machine-event drain after the CLI process exits; a descendant holding a
 pipe open cannot turn an incomplete capture into a passing result or leave the
 harness waiting without a bound.
 
+Execution preflight failures retain only categorical `final_state` and
+`interruption_kind` alongside the existing safe stage and error identifiers.
+These facts require a strictly parsed CLI terminal matching the process exit;
+unknown interruption labels, protocol failures and older sidecars produce null
+fields. An interrupted preflight remains a failed gate, with zero cases run.
+The report never includes provider text, interruption reasons or raw envelopes.
+
 Live agent cases require exit 0 by default. A negative test can explicitly
 expect a nonzero terminal code using `exit_code`, together with the expected
 `final_state`, `interruption_kind`, and evidence assertions. Passing means the

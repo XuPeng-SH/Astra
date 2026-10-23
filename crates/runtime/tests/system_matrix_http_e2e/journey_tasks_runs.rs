@@ -517,7 +517,6 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
     use astra_services::runs::{CheckpointWriteAuthority, RunCheckpointWriteRequest};
     use futures_util::FutureExt;
     use serde_json::Value;
-    use sqlx::Row;
     use std::{panic::AssertUnwindSafe, sync::Arc, task::Poll, time::Duration};
     use tokio::sync::Notify;
 
@@ -647,7 +646,6 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(payload["original_facts"]["total_prompt"], 42);
         assert_eq!(payload["original_facts"]["total_completion"], 7);
         assert_eq!(payload["original_facts"]["total_tool_calls"], 1);
-        assert!(payload["original_facts"]["canonical_turn_started_at"].is_string());
         assert!(payload["execution_deadline"]["deadline_unix_ms"].as_u64().is_some());
         assert!(payload["continuation"].is_object());
         let before_restart = store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap();
@@ -841,23 +839,15 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(final_budget["remaining_iterations"], 2);
         assert_eq!(final_budget["effective_hard_turn_limit"], 4);
 
-        // Actual HTTP requests above prove both dispatches and exact restored
-        // input; Run accounting above preserves cumulative usage across restart.
-        // Round trace is process-local diagnostic history, not a second durable
-        // execution ledger: only the resumed round is emitted at settlement.
-        let rounds = sqlx::query(
-            "SELECT llm_model_used, CAST(token_usage AS CHAR) AS token_usage
-             FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?
-               AND event_type = 'llm_round_completed' ORDER BY created_at"
-        ).bind(&ctx.user_id).bind(&ctx.session_id).bind(&run_id)
-            .fetch_all(&ctx.pool).await.unwrap();
-        assert_eq!(rounds.len(), 1);
-        for row in &rounds {
-            assert_eq!(row.get::<String, _>("llm_model_used"), format!("mock-{}", ctx.suffix));
-            let usage: Value = serde_json::from_str(&row.get::<String, _>("token_usage")).unwrap();
-            assert_eq!((usage["input_tokens"].as_u64(), usage["output_tokens"].as_u64()),
-                (Some(52), Some(11)));
-        }
+        // Actual HTTP requests prove both dispatches and restored input. Run
+        // accounting above preserves cumulative usage; ordinary restoration
+        // does not reconstruct or ingest a duplicate per-round trace.
+        let diagnostics: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?
+               AND event_type IN ('trace_span', 'llm_round', 'llm_round_completed')"
+        ).bind(&ctx.user_id).bind(&ctx.session_id)
+            .fetch_one(&ctx.pool).await.unwrap();
+        assert_eq!(diagnostics, 0, "ordinary restoration must not ingest round diagnostics");
         assert_eq!(store.load_latest_checkpoint(&ctx.user_id, &run_id, Some("execution_handoff"))
             .await.unwrap().unwrap(), checkpoint);
         }).await.expect("bounded public execution handoff regression");

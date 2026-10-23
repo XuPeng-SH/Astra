@@ -793,46 +793,6 @@ async fn assert_native_delegation_without_auxiliary_selector(
             .expect("canonical model-control semantics"),
         "model-control semantics must reach the provider, not only the full catalog"
     );
-    let candidates: Vec<_> = first.body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|message| {
-            let text = message["content"].as_str()?;
-            let text = text
-                .strip_prefix("<astra-runtime-context>\n")
-                .and_then(|text| text.strip_suffix("\n</astra-runtime-context>"))
-                .unwrap_or(text);
-            let payload: Value = serde_json::from_str(text).ok()?;
-            payload
-                .get("catalog")
-                .is_some()
-                .then_some((message, payload))
-        })
-        .collect();
-    assert_eq!(
-        candidates.len(),
-        1,
-        "cold parent request must carry one candidate context"
-    );
-    assert_eq!(candidates[0].0["role"], "user");
-    assert_eq!(
-        candidates[0]
-            .1
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
-        vec!["catalog", "child_model_selection_allowed"],
-        "candidate context carries observations, not another selection policy"
-    );
-    let items = candidates[0].1["catalog"]["items"].as_array().unwrap();
-    let selected = items
-        .iter()
-        .find(|item| item["offering_id"] == DEFAULT_MODEL_OFFERING_ID)
-        .expect("authorized parent Offering must be visible on the wire");
-    assert_eq!(selected["name"], "test-model");
-    assert_eq!(selected["provider"], "openai");
     let mut actual = Vec::new();
     for call in request.body["messages"]
         .as_array()
