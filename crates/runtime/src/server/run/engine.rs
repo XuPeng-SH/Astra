@@ -50,17 +50,17 @@ use astra_services::runs::{
     AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
     AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest, AtomicRunUserIntentApply,
     AtomicRunUserIntentApplyRequest, DurableCancellationOrigin, DurableRunCheckpointRecord,
-    DurableRunDisplayProjectionRecord, DurableRunEventDelta, DurableRunInteractionAttachmentGuard,
-    DurableRunInteractionKind, DurableRunInteractionProjection,
-    DurableRunInteractionResolveOutcome, DurableRunListPage, DurableRunObservation,
-    DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
-    DurableRunUserIntentControlDelta, DurableRunWorkScope, DurableWorkItemRunBinding,
-    DurableWorkRunBinding, GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
-    RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
-    RunExecutionBoundaryAuthorization, RunExecutionBoundaryAuthorizationRequest, RunListCursor,
-    RunStateStore, RunStatusCasRequest, RunUsageOwnerUpdateRequest, RuntimeProfileRequest,
-    SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy, USER_INTENT_CONTROL_DELTA_PAGE_SIZE,
-    durable_run_status_is_terminal, durable_run_status_kind,
+    DurableRunEventDelta, DurableRunInteractionAttachmentGuard, DurableRunInteractionKind,
+    DurableRunInteractionProjection, DurableRunInteractionResolveOutcome, DurableRunListPage,
+    DurableRunObservation, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
+    DurableRunStatusSnapshot, DurableRunUserIntentControlDelta, DurableRunWorkScope,
+    DurableWorkItemRunBinding, DurableWorkRunBinding, GuardedRunStatusTransition,
+    GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode,
+    ResolvedModelSelection, RunExecutionBoundaryAuthorization,
+    RunExecutionBoundaryAuthorizationRequest, RunListCursor, RunStateStore, RunStatusCasRequest,
+    RunUsageOwnerUpdateRequest, RuntimeProfileRequest, SkillAutoRouteExecutionPolicy,
+    TurnIntentExecutionPolicy, USER_INTENT_CONTROL_DELTA_PAGE_SIZE, durable_run_status_is_terminal,
+    durable_run_status_kind,
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::thinking_config::ThinkingConfig;
@@ -164,7 +164,7 @@ pub enum TerminalTransitionOutcome {
 
 /// What a bounded owner transition and its optional durable receipt proved.
 enum OwnerTerminalAttempt {
-    Committed { needs_projection_repair: bool },
+    Committed,
     Superseded(Box<DurableRunRecord>),
     NotCommitted,
 }
@@ -2751,9 +2751,7 @@ impl RunEngine {
         let Some(local_deadline) = local_deadline else {
             return transition.await.map(|committed| {
                 if committed {
-                    OwnerTerminalAttempt::Committed {
-                        needs_projection_repair: false,
-                    }
+                    OwnerTerminalAttempt::Committed
                 } else {
                     OwnerTerminalAttempt::NotCommitted
                 }
@@ -2762,9 +2760,7 @@ impl RunEngine {
         match tokio::time::timeout_at(local_deadline, transition).await {
             Ok(result) => result.map(|committed| {
                 if committed {
-                    OwnerTerminalAttempt::Committed {
-                        needs_projection_repair: false,
-                    }
+                    OwnerTerminalAttempt::Committed
                 } else {
                     OwnerTerminalAttempt::NotCommitted
                 }
@@ -2785,9 +2781,7 @@ impl RunEngine {
                 )
                 .await
                 {
-                    Ok(Ok(TerminalReceipt::Committed)) => Ok(OwnerTerminalAttempt::Committed {
-                        needs_projection_repair: true,
-                    }),
+                    Ok(Ok(TerminalReceipt::Committed)) => Ok(OwnerTerminalAttempt::Committed),
                     Ok(Ok(TerminalReceipt::Superseded(durable))) => {
                         Ok(OwnerTerminalAttempt::Superseded(durable))
                     }
@@ -2884,10 +2878,8 @@ impl RunEngine {
                     .map(RunOwnerLeaseTerminalOperation::deadline),
             )
             .await?;
-        let needs_projection_repair = match terminal_attempt {
-            OwnerTerminalAttempt::Committed {
-                needs_projection_repair,
-            } => Some(needs_projection_repair),
+        let committed = match terminal_attempt {
+            OwnerTerminalAttempt::Committed => true,
             OwnerTerminalAttempt::Superseded(durable) => {
                 if durable.run_generation == expected_owner_generation
                     && durable_run_status_is_terminal(&durable.status)
@@ -2897,16 +2889,13 @@ impl RunEngine {
                 }
                 return Ok(TerminalTransitionOutcome::Superseded(durable));
             }
-            OwnerTerminalAttempt::NotCommitted => None,
+            OwnerTerminalAttempt::NotCommitted => false,
         };
-        if let Some(needs_projection_repair) = needs_projection_repair {
+        if committed {
             if let Some(operation) = terminal_operation.take() {
                 operation.retire();
             }
-            if needs_projection_repair {
-                self.repair_terminal_projection_bounded(user_id, expected_session_id, run_id)
-                    .await;
-            }
+
             let durable = self
                 .load_run(user_id, run_id)
                 .await?
@@ -2967,10 +2956,8 @@ impl RunEngine {
                         .map(RunOwnerLeaseTerminalOperation::deadline),
                 )
                 .await?;
-            let needs_projection_repair = match cancellation_attempt {
-                OwnerTerminalAttempt::Committed {
-                    needs_projection_repair,
-                } => Some(needs_projection_repair),
+            let committed = match cancellation_attempt {
+                OwnerTerminalAttempt::Committed => true,
                 OwnerTerminalAttempt::Superseded(durable) => {
                     if durable.run_generation == expected_owner_generation
                         && durable_run_status_is_terminal(&durable.status)
@@ -2980,16 +2967,13 @@ impl RunEngine {
                     }
                     return Ok(TerminalTransitionOutcome::Superseded(durable));
                 }
-                OwnerTerminalAttempt::NotCommitted => None,
+                OwnerTerminalAttempt::NotCommitted => false,
             };
-            if let Some(needs_projection_repair) = needs_projection_repair {
+            if committed {
                 if let Some(operation) = terminal_operation.take() {
                     operation.retire();
                 }
-                if needs_projection_repair {
-                    self.repair_terminal_projection_bounded(user_id, expected_session_id, run_id)
-                        .await;
-                }
+
                 let cancelled = self.load_run(user_id, run_id).await?.ok_or_else(|| {
                     format!("run {run_id} disappeared after cancellation settlement")
                 })?;
@@ -3066,40 +3050,6 @@ impl RunEngine {
             );
         }
         Ok(TerminalReceipt::Committed)
-    }
-
-    async fn repair_terminal_projection_bounded(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) {
-        // The timed-out store future may have been dropped after COMMIT but
-        // before its display refresh. This rare-path repair is best effort
-        // and must run only after the confirmed owner heartbeat is retired.
-        match tokio::time::timeout(
-            TERMINAL_RECEIPT_MAX_WAIT,
-            self.store.repair_terminal_projection_after_receipt(
-                user_id,
-                expected_session_id,
-                run_id,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "terminal receipt confirmed but display projection repair failed"
-            ),
-            Err(_) => tracing::warn!(
-                user_id,
-                run_id,
-                "terminal receipt confirmed but display projection repair timed out"
-            ),
-        }
     }
 
     /// Persist the semantic run aggregate only for the exact execution
@@ -3190,27 +3140,6 @@ impl RunEngine {
             })
             .await
             .map(|outcome| outcome.map(|outcome| outcome.run))
-    }
-
-    /// Load the current durable display projection for a run.
-    pub async fn load_run_projection(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.store.load_run_projection(user_id, run_id).await
-    }
-
-    /// Rebuild the durable display projection from authoritative run facts.
-    pub async fn rebuild_run_projection(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.store
-            .rebuild_run_projection(user_id, expected_session_id, run_id)
-            .await
     }
 
     /// Append an event to the durable event log.
@@ -5917,7 +5846,6 @@ mod tests {
             matches!(outcome, Ok(TerminalTransitionOutcome::Committed(_))),
             "{outcome:?}"
         );
-        assert_eq!(store.projection_repairs.load(Ordering::SeqCst), 1);
         tokio::task::yield_now().await;
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
@@ -5985,7 +5913,6 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
-        assert_eq!(store.projection_repairs.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -6860,7 +6787,6 @@ mod tests {
         control_delta_index_corruption: Option<(usize, Option<serde_json::Value>)>,
         recovery_claim_failures: AtomicUsize,
         attempts: AtomicUsize,
-        projection_repairs: AtomicUsize,
         waiting_queries: AtomicUsize,
         recovery_claims: AtomicUsize,
         lease_renewal_interval: Option<Duration>,
@@ -6909,7 +6835,6 @@ mod tests {
                 control_delta_index_corruption: None,
                 recovery_claim_failures: AtomicUsize::new(0),
                 attempts: AtomicUsize::new(0),
-                projection_repairs: AtomicUsize::new(0),
                 waiting_queries: AtomicUsize::new(0),
                 recovery_claims: AtomicUsize::new(0),
                 lease_renewal_interval: None,
@@ -7019,16 +6944,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunStateStore for FlakyBatchTransitionStore {
-        async fn repair_terminal_projection_after_receipt(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-        ) -> Result<(), String> {
-            self.projection_repairs.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
         async fn reconcile_execution_handoff(
             &self,
             claim: &astra_services::runs::RecoveryClaim,
@@ -7383,25 +7298,6 @@ mod tests {
         ) -> Result<Option<DurableRunCheckpointRecord>, String> {
             self.inner
                 .load_latest_checkpoint(user_id, run_id, checkpoint_kind)
-                .await
-        }
-
-        async fn load_run_projection(
-            &self,
-            user_id: &str,
-            run_id: &str,
-        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            self.inner.load_run_projection(user_id, run_id).await
-        }
-
-        async fn rebuild_run_projection(
-            &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            self.inner
-                .rebuild_run_projection(user_id, expected_session_id, run_id)
                 .await
         }
 
@@ -9352,7 +9248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_projection_tracks_latest_event_usage_and_checkpoint() {
+    async fn canonical_run_tracks_latest_event_usage_and_checkpoint() {
         let engine = test_engine();
         let authority = engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
@@ -9401,36 +9297,31 @@ mod tests {
         );
 
         let projection = engine
-            .load_run_projection("user-1", "run-1")
+            .load_run("user-1", "run-1")
             .await
             .unwrap()
             .expect("projection should exist");
         assert_eq!(projection.status, "waiting");
         assert_eq!(projection.waiting_for.as_deref(), Some("user_input"));
-        assert_eq!(projection.projection_event_idx, 1);
+        assert_eq!(projection.last_event_idx, 1);
         assert_eq!(
-            projection.latest_event_type.as_deref(),
+            projection
+                .events
+                .last()
+                .map(astra_services::runs::extract_event_type)
+                .as_deref(),
             Some("tool_call_start")
         );
-        assert_eq!(projection.latest_checkpoint_kind.as_deref(), Some("resume"));
-        assert_eq!(
-            projection.latest_checkpoint_version.as_deref(),
-            Some("checkpoint_v2")
-        );
+        let checkpoint = engine
+            .load_latest_checkpoint("user-1", "run-1", None)
+            .await
+            .unwrap()
+            .expect("canonical checkpoint");
+        assert_eq!(checkpoint.checkpoint_kind, "resume");
+        assert_eq!(checkpoint.checkpoint_version, "checkpoint_v2");
         assert_eq!(projection.total_prompt_tokens, 11);
         assert_eq!(projection.total_completion_tokens, 7);
         assert_eq!(projection.total_tool_calls, 3);
-        assert!(
-            !projection.projection_hash.is_empty(),
-            "projection hash should be stable and non-empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_run_projection_missing_run_returns_none() {
-        let engine = test_engine();
-        let projection = engine.load_run_projection("user-1", "nope").await.unwrap();
-        assert!(projection.is_none());
     }
 
     #[tokio::test]

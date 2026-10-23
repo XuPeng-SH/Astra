@@ -71,8 +71,7 @@ use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJourn
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
     LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
-    run_local_tool_policy_preflight, spawn_resource_tool_call_recording, unknown_local_tool_result,
-    validate_local_tool_arguments,
+    run_local_tool_policy_preflight, unknown_local_tool_result, validate_local_tool_arguments,
 };
 use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
@@ -815,9 +814,6 @@ pub struct RuntimeToolExecutor {
     pub(crate) journal_turn_index: AtomicU32,
     /// Aggregate output bytes this turn.
     aggregate_output_bytes: AtomicUsize,
-    /// Optional resource governor for usage tracking (Phase 5).
-    resource_governor:
-        Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
 
     // ── Persistence ───────────────────────────────────────────────────────────
     /// Owner-checked remote artifact store shared by workspace snapshots and
@@ -1019,7 +1015,6 @@ impl RuntimeToolExecutor {
             provider_interaction_gate: None,
             progress_callback: None,
             auxiliary_event_writer: None,
-            resource_governor: None,
             tool_execution_service: ToolExecutionService::builder().build(),
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
@@ -5811,7 +5806,6 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
             drop(workspace_authority);
             return result.into();
         }
-        spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
         self.execute_local_with_metadata(request, cancel_token)
             .await
     }

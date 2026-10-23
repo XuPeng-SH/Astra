@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v106";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v107";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4043,32 +4043,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(pool, "run_display_projections",
-        "CREATE TABLE IF NOT EXISTS run_display_projections (
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL,
-            waiting_for VARCHAR(64) NULL,
-            error_message TEXT NULL,
-            projection_event_idx BIGINT NOT NULL DEFAULT -1,
-            latest_event_type VARCHAR(64) NULL,
-            latest_checkpoint_id VARCHAR(64) NULL,
-            latest_checkpoint_kind VARCHAR(32) NULL,
-            latest_checkpoint_version VARCHAR(32) NULL,
-            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
-            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
-            total_tool_calls BIGINT NOT NULL DEFAULT 0,
-            projection_hash VARCHAR(64) NOT NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, run_id),
-            INDEX idx_run_display_projections_owner_session_updated (user_id, session_id, updated_at),
-            INDEX idx_run_display_projections_user_updated (user_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // `tool_exactly_once_results` is retired and is not a runtime authority.
     // Startup deliberately leaves any historical table untouched: removing
     // side-effect evidence is an explicit administrative lifecycle action,
@@ -6177,18 +6151,7 @@ async fn verify_core_schema_shape(
         "idx_run_checkpoints_session_kind_created",
         &["user_id", "session_id", "checkpoint_kind", "created_at"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "run_display_projections",
-        "PRIMARY",
-        &["user_id", "run_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "run_display_projections",
-        "idx_run_display_projections_owner_session_updated",
-        &["user_id", "session_id", "updated_at"],
-    )?;
+
     fail_if_required_columns_missing_or_nullable(
         pool,
         database,

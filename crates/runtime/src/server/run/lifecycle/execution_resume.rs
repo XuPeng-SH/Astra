@@ -723,7 +723,6 @@ impl AgenticRunLifecycleService {
             work_runtime_binding: None,
             tool_runtime_workspace: Some(workspace),
             cloud_workspace_record: None,
-            csl_manager: None,
             cancel_flag: cancel.clone(),
             pause_flag: pause.clone(),
             llm_cancel_token: token.clone(),

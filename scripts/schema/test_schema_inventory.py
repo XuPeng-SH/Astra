@@ -366,7 +366,6 @@ fn char_literal() { let slash = '/'; }
             "agent_sessions",
             "agent_runs",
             "run_checkpoints",
-            "run_display_projections",
             "conversation_log",
             "session_transcript_items",
             "tool_invocation_ledger",
@@ -410,14 +409,6 @@ fn char_literal() { let slash = '/'; }
         )
         self.assertIn(
             "do not merge into agent_runs",
-            self.tables["run_display_projections"]["merge_guidance"],
-        )
-        self.assertIn(
-            "rebuildable from agent_runs",
-            self.tables["run_display_projections"]["rebuildability"],
-        )
-        self.assertIn(
-            "do not merge into agent_runs",
             self.tables["run_checkpoints"]["merge_guidance"],
         )
 
@@ -425,7 +416,7 @@ fn char_literal() { let slash = '/'; }
         sessions = self.tables["agent_sessions"]
         runs = self.tables["agent_runs"]
         checkpoints = self.tables["run_checkpoints"]
-        projections = self.tables["run_display_projections"]
+        self.assertNotIn("run_display_projections", self.tables)
 
         self.assertIn("parent lifecycle row", sessions["retention_policy"])
         self.assertIn("cleanup boundary", sessions["merge_guidance"])
@@ -435,15 +426,12 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("pause/cancel", runs["retention_policy"])
         self.assertIn("owner lease generation", runs["rebuildability"])
         self.assertIn("events own replay", runs["merge_guidance"])
-        self.assertIn("projections own repairable display state", runs["merge_guidance"])
+        self.assertIn("display snapshots are derived on read", runs["merge_guidance"])
 
         self.assertIn("no independent age-based TTL", checkpoints["retention_policy"])
         self.assertIn("checkpoint_json", checkpoints["rebuildability"])
         self.assertIn("typed, idempotent, multi-version", checkpoints["merge_guidance"])
 
-        self.assertIn("derived run display projection", projections["state_class"])
-        self.assertIn("clear and rebuild", projections["retention_policy"])
-        self.assertIn("repairable display state", projections["merge_guidance"])
 
     def test_state_task_workspace_tables_have_semantic_metadata(self) -> None:
         second_batch = {

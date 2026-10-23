@@ -175,7 +175,6 @@ pub(crate) struct CanonicalHeadObservabilityResponse {
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct SessionProjectionObservabilityResponse {
     pub observability_available: bool,
-    pub active_run_projection_lag_events: i64,
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
@@ -623,13 +622,8 @@ pub(crate) async fn get_session_state_handler(
     let state_summary = load_state_summary(pool, &session.user_id, &session.session_id).await?;
     let artifact_previews =
         load_artifact_previews(&state, &session.user_id, &session.session_id).await?;
-    let projection_observability = load_session_projection_observability(
-        pool,
-        &session.user_id,
-        &session.session_id,
-        active_run.as_ref(),
-    )
-    .await?;
+    let projection_observability =
+        load_session_projection_observability(pool, &session.user_id, &session.session_id).await?;
     let active_run = active_run.map(|mut run| {
         run.replay_required = run_event_replay_required;
         run.replay_start_event_idx = if run_event_replay_required {
@@ -1024,28 +1018,7 @@ async fn load_session_projection_observability(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
-    active_run: Option<&ActiveRunProjection>,
 ) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
-    let active_run_projection_lag_events = if let Some(active_run) = active_run {
-        let row = sqlx::query(
-            "SELECT projection_event_idx
-             FROM run_display_projections
-             WHERE run_id = ? AND user_id = ?",
-        )
-        .bind(&active_run.run_id)
-        .bind(user_id)
-        .fetch_optional(pool.get())
-        .await
-        .map_err(internal_error)?;
-        let projection_event_idx = row
-            .map(|row| session_row_i64(&row, "projection_event_idx"))
-            .transpose()
-            .map_err(internal_error)?
-            .unwrap_or(-1);
-        (active_run.run_event_high_watermark - projection_event_idx).max(0)
-    } else {
-        0
-    };
     let prompt_request_count =
         astra_services::count_prompt_requests_for_session(pool, user_id, session_id)
             .await
@@ -1145,7 +1118,6 @@ async fn load_session_projection_observability(
         .map(|record| record.event.compaction);
     Ok(SessionProjectionObservabilityResponse {
         observability_available: true,
-        active_run_projection_lag_events,
         prompt_request_count,
         latest_prompt_request,
         canonical_heads,
@@ -4005,7 +3977,6 @@ mod tests {
             match column {
                 "item_seq" => Ok(7),
                 "last_monotonic_id" => Ok(42),
-                "projection_event_idx" => Ok(8),
                 "total" => Ok(4),
                 "total_estimated_tokens" => Ok(123),
                 "high_watermark" => Ok(11),

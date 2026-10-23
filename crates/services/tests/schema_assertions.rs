@@ -72,6 +72,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         );
     }
     for retired in [
+        "run_display_projections",
         "session_delegations",
         "tool_result_projection_decisions",
         "tool_result_projection_receipts",
@@ -720,12 +721,6 @@ async fn schema_rationalization_runtime_contract() {
             "harness_snapshots must not keep ownerless index {removed_index}"
         );
     }
-
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "run_display_projections").await,
-        ["user_id", "run_id"],
-        "run_display_projections primary key must carry the owner boundary"
-    );
 }
 
 #[tokio::test]
@@ -1777,28 +1772,7 @@ async fn phase1_run_durability_schema_contract() {
             "agent_runs must not keep ownerless run-tree/retry index {removed_index}"
         );
     }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "run_display_projections",
-            "idx_run_display_projections_owner_session_updated"
-        )
-        .await,
-        ["user_id", "session_id", "updated_at"],
-        "run display projection session scans must stay owner-bound"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "run_display_projections",
-            "idx_run_display_projections_session_updated"
-        )
-        .await
-        .is_empty(),
-        "run_display_projections must not keep ownerless session recency index idx_run_display_projections_session_updated"
-    );
+
     assert_eq!(
         index_columns(
             &pool,

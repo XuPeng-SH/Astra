@@ -19,8 +19,9 @@ Data and storage owns platform state layering, MatrixOne usage, retention, archi
 Delegation topology, status, retry lineage, usage, and terminal evidence are owned
 by `agent_runs` and `agent_run_events`. Run admission and owner-fenced transitions
 persist these canonical facts; there is no separate delegation table or
-delegation-state mirror. The run display projection and bounded terminal-receipt
-repair remain derived from canonical run facts.
+delegation-state mirror. Run display is rendered on read from canonical Run, events and checkpoints.
+There is no display table, background mirror repair, or display hash in a
+terminal receipt. Lost-ACK reconciliation validates the actual canonical facts.
 
 Session state projections remain owned by personal-skill activation and
 user-anchor memory. The unused general state-item upsert API and generic mutation
@@ -140,8 +141,11 @@ Item content hashes, per-item canonical commitment fields, contiguous committed
 projection heads, and authoritative terminal replay verification remain
 required. Accepted event replay can repair missing display material and enrich
 reasoning; it cannot reconstruct arbitrary original item sequences/timestamps
-or synthesize a committed head from the newest item. The bounded root-only
-transcript restore fallback remains available when canonical history is absent.
+or synthesize a committed head from the newest item. Server Run prompt history
+comes only from the admitted canonical Context, including an empty head. It does
+not probe CSL or raw transcript rows to reconstruct missing Context. Imported or
+legacy-only transcripts remain readable as history; they do not silently become
+model context. Explicit Run resume continues through its checkpoint custody owner.
 
 ## Retention
 
@@ -231,8 +235,8 @@ Retention is a product contract:
   matches to input ordinals; Rust does not normalize persisted identities.
   Conflicting immutable payloads abort the entire batch, including across
   windows. Unkeyed events remain distinct. This reduces preflight round trips,
-  not retained event rows or payload bytes; commit reconciliation and display
-  projection repair retain their existing owners.
+  not retained event rows or payload bytes; exact commit reconciliation retains
+  its existing canonical owner.
 - Run mutations retain the deletion-fence → session → execution-slot → run
   lock order. A caller's exact-owner/session/run locking read also establishes
   existence; it does not need a separate existence query in that transaction.
@@ -355,3 +359,12 @@ Run/Context commits and tool-side-effect admission retain their durable owners.
 Process failure can discard in-flight model output and diagnostics. An absent
 usage observation remains unknown and cannot authorize a side effect or establish
 a billing fact. Standalone accounting uses its existing ledger boundary.
+
+
+Schema contract `2026-10-24-v107` retires `run_display_projections`. Fresh schema
+creation and Session deletion do not reference it. Bootstrap never drops an
+existing table, upgrades a populated schema, or backfills a replacement. Older
+schema markers still fail the current-contract check. Runtime display reads
+use the captured Run/event watermark and independently read checkpoint metadata;
+a newer checkpoint summary during that read is accepted display inconsistency,
+never execution or resume authority.

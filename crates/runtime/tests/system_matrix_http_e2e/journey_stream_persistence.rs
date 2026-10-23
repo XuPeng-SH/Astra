@@ -978,8 +978,6 @@ async fn assert_concurrent_fanout_durability(
     );
 }
 
-/// Poll until `agent_events` has at least `min_count` rows for the session.
-
 /// Starting another in-process app must not interpret an already-live Matrix
 /// fixture as interrupted state. The second bootstrap crosses the same stale
 /// cleanup path used after developer interrupts, then the first app proves its
