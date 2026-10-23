@@ -4152,8 +4152,8 @@ fn build_server_skill_executor(
     execution_lease_lost: Option<Arc<AtomicBool>>,
     memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
-    #[cfg(any(test, feature = "e2e-hooks"))] test_inference_ledger: Option<
-        &crate::turn::llm::durable::TestInferenceLedgerPersistence,
+    #[cfg(any(test, feature = "e2e-hooks"))] provider_observations: Option<
+        &crate::server::provider_test_support::ProviderObservationsFixture,
     >,
     #[cfg(feature = "harness")] harness_sink: Option<
         &std::sync::Arc<dyn astra_harness::SnapshotSink>,
@@ -4189,7 +4189,7 @@ fn build_server_skill_executor(
     .with_execution_lease_lost(execution_lease_lost);
     #[cfg(any(test, feature = "e2e-hooks"))]
     {
-        subrun_executor.test_inference_ledger = test_inference_ledger.cloned();
+        subrun_executor.provider_observations = provider_observations.cloned();
     }
     subrun_executor = subrun_executor.with_interaction_mode(interaction_mode);
     if let (Some(parent_owner_generation), Some(parent_owner_pod_id), Some(invocation_ledger)) = (
@@ -6180,7 +6180,8 @@ pub struct AgenticRunLifecycleService {
     invocation_ledger: Option<crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger>,
     invocation_composition_error: Option<Arc<str>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
-    test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
+    provider_observations:
+        Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
     /// Bounded process-local fork-prefix store shared by root loops and their
@@ -6332,7 +6333,7 @@ impl AgenticRunLifecycleService {
             invocation_ledger,
             invocation_composition_error,
             #[cfg(any(test, feature = "e2e-hooks"))]
-            test_inference_ledger: None,
+            provider_observations: None,
             delegation_engine: None,
             fork_prefix_store: Arc::new(
                 astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new(),
@@ -6841,7 +6842,7 @@ impl AgenticRunLifecycleService {
         })
     }
 
-    async fn finish_canonical_turn_cleanup(admission: &CanonicalTurnAdmission, committed: bool) {
+    async fn finish_canonical_turn_cleanup(admission: &CanonicalTurnAdmission) {
         if let Err(error) = admission.distributed_permit.release().await {
             tracing::warn!(
                 target: "astra_runtime::canonical_wal",
@@ -6850,27 +6851,6 @@ impl AgenticRunLifecycleService {
                 turn = admission.reservation.reserved_turn,
                 %error,
                 "distributed admission release is pending; the permit will retry on drop"
-            );
-        }
-        if committed
-            && let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
-                &admission.inference_pool,
-                &admission.lease.key.owner_user_id,
-                &admission.lease.key.session_id,
-                admission.reservation.reserved_turn,
-            )
-            .await
-        {
-            // The canonical commit is authoritative. Payload retirement
-            // is lagging work; the next session boundary retries all
-            // absorbed turns instead of broadening this commit contract.
-            tracing::warn!(
-                target: "astra_runtime::canonical_wal",
-                user_id = %admission.lease.key.owner_user_id,
-                session_id = %admission.lease.key.session_id,
-                turn = admission.reservation.reserved_turn,
-                %error,
-                "provider WAL payload retirement is pending"
             );
         }
     }
@@ -7095,11 +7075,11 @@ impl AgenticRunLifecycleService {
     /// fixtures. Provider calls still use canonical admission and settlement;
     /// this does not inject a model judgment or grant delegation authority.
     #[cfg(feature = "e2e-hooks")]
-    pub fn with_e2e_inference_ledger(
+    pub fn with_provider_observations(
         mut self,
-        fixture: &crate::server::provider_test_support::InferenceLedgerFixture,
+        fixture: &crate::server::provider_test_support::ProviderObservationsFixture,
     ) -> Self {
-        self.test_inference_ledger = Some(fixture.persistence.clone());
+        self.provider_observations = Some(fixture.clone());
         self
     }
 
@@ -7442,7 +7422,7 @@ impl AgenticRunLifecycleService {
         }
         #[cfg(any(test, feature = "e2e-hooks"))]
         {
-            executor.test_inference_ledger = self.test_inference_ledger.clone();
+            executor.provider_observations = self.provider_observations.clone();
         }
         let executor = Arc::new(executor);
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
@@ -13155,8 +13135,8 @@ impl AgenticRunLifecycleService {
         }
 
         #[cfg(any(test, feature = "e2e-hooks"))]
-        if let Some(ledger) = self.test_inference_ledger.as_ref() {
-            builder = builder.with_test_inference_ledger(ledger.clone());
+        if let Some(ledger) = self.provider_observations.as_ref() {
+            builder = builder.with_provider_observations(ledger.clone());
         }
 
         builder = builder.with_memoria_client(
@@ -13603,7 +13583,7 @@ impl AgenticRunLifecycleService {
             memory_extraction_service.as_ref(),
             interaction_sink,
             #[cfg(any(test, feature = "e2e-hooks"))]
-            self.test_inference_ledger.as_ref(),
+            self.provider_observations.as_ref(),
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -17158,11 +17138,7 @@ impl AgenticRunLifecycleService {
                 // context and its interaction sender clones. This run task
                 // retains cleanup custody without keeping the stream open.
                 if let Some(admission) = canonical_turn.as_ref() {
-                    Self::finish_canonical_turn_cleanup(
-                        admission,
-                        canonical_context_cursor.is_some(),
-                    )
-                    .await;
+                    Self::finish_canonical_turn_cleanup(admission).await;
                 }
             },
             "agentic_loop_owned_execution",
@@ -20176,7 +20152,8 @@ pub struct ServerSpawnAgentExecutor {
     workspace_provider: Option<ServerWorkspaceProvisioner>,
     workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
-    test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
+    provider_observations:
+        Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_service: Option<Arc<dyn ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -20451,7 +20428,7 @@ impl ServerSpawnAgentExecutor {
     ) -> Self {
         Self {
             #[cfg(any(test, feature = "e2e-hooks"))]
-            test_inference_ledger: None,
+            provider_observations: None,
             workspace_provider: None,
             workspace_record_store: None,
             model_service: None,
@@ -21126,7 +21103,7 @@ impl ServerSpawnAgentExecutor {
         }
         #[cfg(any(test, feature = "e2e-hooks"))]
         {
-            executor.test_inference_ledger = self.test_inference_ledger.clone();
+            executor.provider_observations = self.provider_observations.clone();
         }
         executor = executor.with_inherited_permissions(inherited_permissions);
         if let Some(pool) = self.shared_pool.clone() {
@@ -23621,7 +23598,8 @@ pub struct ServerSubRunExecutor {
     workspace_provider: Option<ServerWorkspaceProvisioner>,
     workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
-    test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
+    provider_observations:
+        Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     provider_scope_bound: bool,
     model_service: Option<Arc<dyn ModelService>>,
@@ -23723,7 +23701,7 @@ impl ServerSubRunExecutor {
             workspace_provider: None,
             workspace_record_store: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
-            test_inference_ledger: None,
+            provider_observations: None,
             model_service: None,
             model_catalog_reader: None,
             provider_scope_bound: false,
@@ -26348,8 +26326,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
         }
         #[cfg(any(test, feature = "e2e-hooks"))]
-        if let Some(ledger) = self.test_inference_ledger.as_ref() {
-            builder = builder.with_test_inference_ledger(ledger.clone());
+        if let Some(ledger) = self.provider_observations.as_ref() {
+            builder = builder.with_provider_observations(ledger.clone());
         }
         // NOTE on grandchild inheritance: delegated children don't get
         // a prefix_store wired here because this sub-run executor

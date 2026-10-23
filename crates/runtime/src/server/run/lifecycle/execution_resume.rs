@@ -549,7 +549,7 @@ impl AgenticRunLifecycleService {
                 cursor.compaction_generation,
             );
         }
-        host.restore_handoff_wal(&mut state, &handoff, &canonical.prior_messages)
+        host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await
             .map_err(|error| invalid_resume(error.message))?;
         host.bind_execution_handoff(

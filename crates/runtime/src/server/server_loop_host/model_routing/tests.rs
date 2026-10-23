@@ -67,7 +67,7 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
             model.completions_url_override = Some(url.clone());
         }
         let baseline = catalog.models.read().unwrap()["strong"].clone();
-        let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -76,7 +76,7 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
         )
         .with_admitted_model_execution(Some(baseline))
         .with_model_service(Some(catalog.clone()))
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_test_judgment_clients([
             Box::new(classification_client)
                 as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,

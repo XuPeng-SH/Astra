@@ -110,8 +110,10 @@ capacity, and the schema guard checks all three columns.
 Model thinking observations use only the configuration-bound snapshot; obsolete
 capability and error mirror columns are absent.
 The retired tool-result projection decision/receipt tables and special event
-field are absent. Current provider-wire and accepted-to-terminal recovery
-contracts remain unchanged.
+field are absent. Agent provider observations are request-local; they create no
+inference invocation/attempt rows, accepted/terminal context pairs, canonical
+provider WAL or settlement debts. Standalone completion and background accounting
+retain their inference ledger. Durable tool custody remains independent.
 The retired session-level physical-workspace claim, unexecuted workflow-trigger
 and plan-step attempt tables are not part of this contract. The unused cloud
 configuration-body mirror is also absent; configuration version changes retain
@@ -323,13 +325,15 @@ The durable run retry counter is retired from the fresh schema and Rust record.
 Verification retries retain their `retry_of` and `retry_scope` lineage; recovery
 generations and provider-attempt retry accounting remain separate authorities.
 
-## Empty provider canonical recovery
+## Agent request observations
 
-The canonical transition loader classifies owner-scoped recovery work in one
-statement snapshot. An existing writable Session with no admitted primary
-invocation, no current WAL/head, and no absorbed WAL/head can return an empty
-chain without a reconstruction transaction. Missing/deleting Sessions and
-committed lifecycle fences fail closed. Nonempty state retains the existing
-retirement, expired-owner recovery and fenced reconstruction boundaries.
-The classification grants no inference authority; later provider admission
-still validates its owner, generation, lease, control and canonical frontier.
+Ordinary agent model requests and their auxiliary summaries reuse Run execution
+authority. Wire identity, dispatch, terminal and usage observations live in the
+request and feed existing trace projections. A model attempt is not a second
+persistent task. Root startup and cleanup do not load or retire provider-attempt
+WALs. Explicit handoff checkpoints carry the complete verified continuation;
+Run/Context commits and tool-side-effect admission retain their durable owners.
+
+Process failure can discard in-flight model output and diagnostics. An absent
+usage observation remains unknown and cannot authorize a side effect or establish
+a billing fact. Standalone accounting uses its existing ledger boundary.
