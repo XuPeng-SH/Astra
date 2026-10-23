@@ -91,6 +91,8 @@ rules remain authoritative. Local controls retain their dispatcher semantics.
 A typed client wake rechecks owner/Session attachment and input gates before
 consuming one FIFO entry. Input remains in the FIFO until consumption; terminal
 paste protection and popup handling apply to user gestures independently.
+A guarded paste-tail Enter on an empty composer is consumed without creating a
+new draft; explicit newlines and nonempty drafts retain their handoff gates.
 This queue has process-local custody, not durable Server acceptance or recovery
 across client restart; it does not add a runtime delivery class or scheduler.
 

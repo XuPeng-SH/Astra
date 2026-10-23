@@ -311,7 +311,8 @@ slash text, escape it with another slash: `//tmp/project inspect this` sends
 `/tmp/project inspect this`, and `//stop` sends `/stop` as conversation text.
 The escape also applies to queued messages and guidance for an active run.
 Returned conversation can merge with an existing conversation draft. Commands
-and shell drafts stay separate: “Unsent drafts” shows retained input, which
+and shell drafts, including multiline pasted content, stay separate. Intentional
+whitespace-only drafts also remain editable. “Unsent drafts” shows retained input, which
 moves into the composer after the current draft is sent or cleared. Each draft
 requires a new submission gesture; restoration never sends it automatically.
 Navigation also preserves the draft suspended while browsing history, including

@@ -16001,13 +16001,17 @@ mod tests {
         ));
         let mut queue = pane.take_queued_next_turn_submissions();
         queue.push_back(NextTurnSubmission::Interactive("second".into()));
-        // A physical trailing newline stays in editing even while the FIFO is ready.
+        // A stale paste tail is consumed without creating a new draft.
         assert!(matches!(
             pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             BottomPaneAction::Consumed
         ));
-        assert_eq!(pane.composer.text(), "\n");
-        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(pane.composer.is_empty());
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BottomPaneAction::Consumed
+        ));
+        assert!(pane.composer.is_empty());
         assert_eq!(
             replay_one_for_test(&mut queue, &mut pane, &mut chat),
             Some(NextTurnSubmission::Interactive("pasted request".into()))
@@ -16026,8 +16030,19 @@ mod tests {
     fn queued_wake_rechecks_attachment_input_and_loading_before_consumption() {
         use bottom_pane::info_view::InfoView;
         for case in [
-            "ready", "modal", "login", "active", "catalog", "read", "draft", "paste", "session",
-            "epoch", "cancel",
+            "ready",
+            "modal",
+            "login",
+            "active",
+            "catalog",
+            "read",
+            "draft",
+            "paste",
+            "session",
+            "epoch",
+            "cancel",
+            "newline",
+            "whitespace",
         ] {
             let mut state = crate::cli::session::session_state::SessionState::default();
             state.set_session_id("source");
@@ -16056,6 +16071,13 @@ mod tests {
                 "catalog" => gate.model_catalog_loading = true,
                 "read" => gate.background_reads_in_flight = true,
                 "draft" => pane.handle_paste("new draft"),
+                "newline" => {
+                    pane.handle_key(crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Enter,
+                        crossterm::event::KeyModifiers::SHIFT,
+                    ));
+                }
+                "whitespace" => pane.handle_paste(" "),
                 "paste" => pane
                     .composer
                     .force_pending_paste_burst_for_test("new paste", std::time::Instant::now()),
@@ -16096,6 +16118,16 @@ mod tests {
                         // The still-active detector is not forced to flush by this synthetic tick.
                         assert!(!pane.composer.is_empty());
                     } else {
+                        if matches!(case, "newline" | "whitespace") {
+                            assert_eq!(
+                                pane.composer.text(),
+                                if case == "newline" { "\n" } else { " " }
+                            );
+                            pane.handle_key(crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Char('c'),
+                                crossterm::event::KeyModifiers::CONTROL,
+                            ));
+                        }
                         assert!(pane.composer.text().contains("accepted"));
                     }
                 }
@@ -23397,7 +23429,6 @@ mod tests {
             ("", "/stop\n\n//tmp/624"),
             ("continue", "continue\n\n/stop\n\n//tmp/624"),
             ("//existing", "/existing\n\n/stop\n\n//tmp/624"),
-            (" ", "/stop\n\n//tmp/624"),
         ] {
             let mut pane = explicit_followup_pane();
             pane.composer.set_text(draft);

@@ -672,9 +672,10 @@ impl BottomPane {
     }
 
     fn restore_next_draft(&mut self) -> bool {
-        use super::slash_dispatch::{conversation_for_composer, parse_submission};
+        use super::slash_dispatch::parse_submission;
         let conversation = |text: &str| {
-            !parse_submission(text).is_command()
+            !text.trim().is_empty()
+                && !parse_submission(text).is_command()
                 && crate::cli::turn::turn_entry::shell_input_body(text).is_none()
         };
         if self.restored_drafts.is_empty() || self.composer.paste_burst_active() {
@@ -682,27 +683,29 @@ impl BottomPane {
         }
         let mut raw = self.composer.text();
         let mut changed = false;
-        if raw.trim().is_empty() {
+        let compatible = if raw.is_empty() {
             raw = self.restored_drafts.pop_front().expect("nonempty drafts");
             changed = true;
-        }
-        if conversation(&raw) {
-            let mut merged = parse_submission(&raw).text().to_owned();
+            conversation(&raw)
+        } else {
+            conversation(&self.composer.expanded_raw_text())
+        };
+        if compatible {
+            // Keep the first fragment's composer encoding and paste placeholders.
+            // Only later fragments lose their leading literal escape; they no
+            // longer occupy a command boundary in the combined conversation.
             while self
                 .restored_drafts
                 .front()
                 .is_some_and(|text| conversation(text))
             {
                 let next = self.restored_drafts.pop_front().expect("checked front");
-                merged.truncate(merged.trim_end().len());
-                merged.push_str("\n\n");
-                merged.push_str(parse_submission(&next).text());
+                raw.push_str("\n\n");
+                raw.push_str(parse_submission(&next).text());
                 changed = true;
             }
-            if changed {
-                self.replace_composer_text(&conversation_for_composer(&merged));
-            }
-        } else if changed {
+        }
+        if changed {
             self.replace_composer_text(&raw);
         }
         changed
@@ -1859,7 +1862,7 @@ impl BottomPane {
         // approval can interpret Enter. The textarea consumes it atomically.
         if key.code == KeyCode::Enter
             && key.modifiers.is_empty()
-            && self.composer.insert_newline_if_pasting()
+            && self.composer.consume_guarded_enter()
         {
             self.sync_popups();
             return BottomPaneAction::Consumed;

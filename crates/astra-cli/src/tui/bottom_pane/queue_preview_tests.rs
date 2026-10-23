@@ -836,19 +836,7 @@ fn picker_navigation_transfers_suspended_history_drafts_and_pastes() {
             else {
                 panic!("fresh gesture submits retained editing");
             };
-            assert_eq!(
-                raw,
-                expected
-                    .iter()
-                    .map(|s| s.trim_end())
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-                    + if expected.last().is_some_and(|s| s.ends_with('\n')) {
-                        "\n"
-                    } else {
-                        ""
-                    }
-            );
+            assert_eq!(raw, expected.join("\n\n"));
         }
     }
 }
@@ -870,4 +858,131 @@ fn history_suspension_transfers_pending_paste_bytes_before_up() {
         pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
         vec!["original pending bytes"]
     );
+}
+
+#[test]
+fn pasted_drafts_keep_dispatch_boundaries_and_exact_payloads_on_restoration() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crate::tui::slash_dispatch::parse_submission;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for (prefix, payload, separate) in [
+        ("", "!printf 'one'\nprintf 'two'\nprintf 'three'\r\n ", true),
+        (" \t", "!!printf 'one'\nprintf 'two'\nprintf 'three'", true),
+        ("", "/unknown\nargument\nlast\t", true),
+        ("", "/plan inspect\nargument\nlast\r\n", true),
+        ("", "!\n\n", true),
+        ("", "//stop\nconversation\nlast\r\n ", false),
+        ("", "///tmp/path\nconversation\nlast\t", false),
+        ("/", "/stop\nconversation\nlast\r\n", false),
+        (
+            "explain ",
+            "!printf 'one'\nprintf 'two'\nprintf 'three'",
+            false,
+        ),
+    ] {
+        for followup in [false, true] {
+            let mut pane = BottomPane::new();
+            pane.composer = ChatComposer::new_ephemeral();
+            pane.composer.set_text(prefix);
+            pane.handle_paste(payload);
+            let display = pane.composer.text();
+            assert!(display.contains("[Pasted #"));
+            let original = format!("{prefix}{payload}");
+            assert_eq!(pane.composer.expanded_raw_text(), original);
+            let blobs = pane.composer.pasted_blob_count();
+            pane.restore_into_composer("//returned");
+            assert_eq!(pane.composer.pasted_blob_count(), blobs);
+            if separate {
+                assert_eq!(pane.composer.text(), display);
+                assert_eq!(pane.restored_drafts.len(), 1);
+            }
+            let key = if followup {
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            } else {
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            };
+            let action = pane.handle_key(key);
+            let raw = match (action, followup) {
+                (BottomPaneAction::SubmitInput(raw), false)
+                | (BottomPaneAction::QueueFollowUp(raw), true) => raw,
+                other => panic!("expected deliberate submission: {other:?}"),
+            };
+            if separate {
+                assert_eq!(raw, original);
+                assert_eq!(pane.composer.text(), "//returned");
+                let second = pane.handle_key(key);
+                assert!(matches!(second,
+                    BottomPaneAction::SubmitInput(ref raw) | BottomPaneAction::QueueFollowUp(ref raw)
+                    if parse_submission(raw).text() == "/returned"
+                ));
+            } else {
+                assert_eq!(raw, format!("{original}\n\n/returned"));
+                assert_eq!(
+                    parse_submission(&raw).text(),
+                    format!("{}\n\n/returned", parse_submission(&original).text())
+                );
+            }
+            assert!(pane.composer.is_empty());
+            assert!(pane.restored_drafts.is_empty());
+        }
+    }
+}
+
+#[test]
+fn restoration_preserves_multiple_paste_blobs_and_suspended_history() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.handle_paste("previous message");
+    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let suspended = "suspended paste\n".repeat(100);
+    pane.handle_paste(&suspended);
+    pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    pane.composer.set_text("");
+    let first = "//first\r\nsecond\r\nlast \t";
+    let second = "another\nlarge\npaste\r\n";
+    pane.handle_paste(first);
+    pane.handle_paste(second);
+    let expected = format!("{first}{second}");
+    let display = pane.composer.text();
+    let cursor = pane.composer.cursor_byte();
+    for _ in 0..2 {
+        assert_eq!(pane.composer.expanded_raw_text(), expected);
+    }
+    assert_eq!(pane.composer.text(), display);
+    assert_eq!(pane.composer.cursor_byte(), cursor);
+    assert!(pane.composer.is_browsing_history());
+    assert_eq!(pane.composer.pasted_blob_count(), 3);
+    pane.restore_into_composer("//returned");
+    assert_eq!(pane.composer.pasted_blob_count(), 3);
+    pane.start_composer_draft("/help");
+    assert_eq!(
+        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        vec![format!("{expected}\n\n/returned"), suspended.clone()]
+    );
+    pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let BottomPaneAction::SubmitInput(raw) =
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("retained input still needs a new gesture");
+    };
+    assert_eq!(raw, format!("{expected}\n\n/returned\n\n{suspended}"));
+}
+
+#[test]
+fn recovery_waits_behind_intentional_whitespace_drafts() {
+    use super::chat_composer::ChatComposer;
+    for draft in [" ", "\n", "\r\n \t"] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        pane.composer.set_text(draft);
+        pane.restore_into_composer("//returned");
+        assert_eq!(pane.composer.text(), draft);
+        assert_eq!(
+            pane.restored_drafts.front().map(String::as_str),
+            Some("//returned")
+        );
+        assert!(!pane.composer.is_empty());
+    }
 }

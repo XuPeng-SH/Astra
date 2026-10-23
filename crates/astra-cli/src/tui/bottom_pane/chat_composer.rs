@@ -106,6 +106,12 @@ impl ChatComposer {
         self.textarea.text().to_string()
     }
 
+    /// Command-aware input with presentation-only paste placeholders expanded.
+    /// Reading it never consumes pending paste or editing/history state.
+    pub(crate) fn expanded_raw_text(&self) -> std::borrow::Cow<'_, str> {
+        self.expand_pastes(self.textarea.text())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.textarea.is_empty() && !self.paste_burst_active()
     }
@@ -123,7 +129,7 @@ impl ChatComposer {
 
     pub fn clear_and_submit(&mut self) -> String {
         let raw = self.textarea.text().to_string();
-        let expanded = self.expand_pastes(&raw);
+        let expanded = self.expand_pastes(&raw).into_owned();
         // Submission is a semantic boundary, not just a key event. Keep
         // whitespace-only drafts out of the event loop and preserve them so
         // an accidental Enter cannot erase what the user typed.
@@ -154,7 +160,7 @@ impl ChatComposer {
     /// state. An unchanged recalled entry remains available in history.
     pub(crate) fn take_recoverable_drafts(&mut self) -> Vec<String> {
         let raw = self.textarea.take_text();
-        let visible = self.expand_pastes(&raw);
+        let visible = self.expand_pastes(&raw).into_owned();
         let mut drafts = Vec::with_capacity(2);
         let unchanged_recall = self
             .history_index
@@ -163,7 +169,7 @@ impl ChatComposer {
             drafts.push(visible);
         }
         if let Some(raw) = self.draft.take() {
-            let suspended = self.expand_pastes(&raw);
+            let suspended = self.expand_pastes(&raw).into_owned();
             if !suspended.trim().is_empty() && !drafts.contains(&suspended) {
                 drafts.push(suspended);
             }
@@ -215,15 +221,15 @@ impl ChatComposer {
     }
 
     /// Replace every placeholder in `text` with its stored blob.
-    fn expand_pastes(&self, text: &str) -> String {
+    fn expand_pastes<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         if self.pasted_blobs.is_empty() {
-            return text.to_string();
+            return std::borrow::Cow::Borrowed(text);
         }
         let mut out = text.to_string();
         for (placeholder, blob) in &self.pasted_blobs {
             out = out.replace(placeholder, blob);
         }
-        out
+        std::borrow::Cow::Owned(out)
     }
 
     #[cfg(test)]
@@ -373,8 +379,8 @@ impl ChatComposer {
         self.prompt_prefix.width() as u16
     }
 
-    pub(crate) fn insert_newline_if_pasting(&mut self) -> bool {
-        self.textarea.insert_newline_if_pasting()
+    pub(crate) fn consume_guarded_enter(&mut self) -> bool {
+        self.textarea.consume_guarded_enter()
     }
 
     pub fn flush_paste_burst(&mut self) -> bool {
