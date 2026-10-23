@@ -1,4 +1,3 @@
-use crate::{EventCreateRequestData, EventService};
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_services::SessionArtifactStore;
@@ -29,7 +28,6 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         first_budget_pressure: &mut state.telemetry.first_budget_pressure,
         pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
         observability_session: state.telemetry.observability_session.clone(),
-        persistence: state.telemetry.context_trace_persistence.clone(),
     })
     .await;
 }
@@ -46,7 +44,6 @@ pub struct TurnTraceFinalizationInput<'a> {
     pub pending_context_assembly_trace: &'a mut Option<(u32, serde_json::Value)>,
     pub observability_session:
         Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
-    pub persistence: Option<super::host::ContextTracePersistenceContext>,
 }
 
 /// Settle measured context evidence without execution-loop state.
@@ -92,10 +89,16 @@ pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) 
         // the first one made long tool turns look artificially small.
         *input.pending_context_assembly_trace = Some((session_turn, trace.to_json_value()));
     }
+}
+
+/// Publish derived context displays only after canonical terminal settlement.
+/// The existing run cleanup task owns completion and shutdown draining.
+pub(crate) async fn persist_completed_context_trace(state: &AgenticLoopState) {
     persist_latest_context_trace_signal(
-        input.session_id,
-        input.persistence,
-        input.observability_session,
+        state.current_session_id.as_deref(),
+        state.telemetry.context_trace_persistence.clone(),
+        state.telemetry.observability_session.clone(),
+        state.telemetry.trace_ingestion.as_ref(),
     )
     .await;
 }
@@ -104,6 +107,7 @@ async fn persist_latest_context_trace_signal(
     session_id: Option<&str>,
     persistence: Option<super::host::ContextTracePersistenceContext>,
     session: Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
+    ingestion: Option<&astra_services::event_ingestion::IngestionSender>,
 ) {
     let (session_id, persistence, session) = match (session_id, persistence, session) {
         (Some(session_id), Some(persistence), Some(session)) if !session_id.is_empty() => {
@@ -168,33 +172,24 @@ async fn persist_latest_context_trace_signal(
     } else {
         signal.turn_id.clone()
     };
-    if let Err((status, response)) = persistence
-        .event_service
-        .create_event(
-            persistence.user_id.clone(),
-            EventCreateRequestData {
-                ingestion_source: astra_services::events::EventIngestionSource::Client,
-                event_id: None,
-                session_id: session_id.clone(),
-                event_type: "context_trace_signal".to_string(),
-                content,
-                agent_id: Some(persistence.agent_id),
-                agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                parent_event_id: None,
-                parent_event_ids: Some(Vec::new()),
-                causal_chain_id: Some(format!("{session_id}:context-trace:{turn_id}")),
-                metadata: Some(metadata),
-            },
-        )
-        .await
-    {
-        astra_core::agent_warn!(
-            "context-trace",
-            "Failed to persist context trace signal for {}: {} {}",
-            session_id,
-            status,
-            response.0.detail
-        );
+    if let Some(ingestion) = ingestion {
+        ingestion.enqueue(astra_services::event_ingestion::IngestionEvent {
+            event_id: uuid::Uuid::now_v7().to_string(),
+            session_id: session_id.clone(),
+            user_id: persistence.user_id,
+            event_type: "context_trace_signal".into(),
+            content: Some(content),
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: Some(metadata),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: Some(format!("{session_id}:context-trace:{turn_id}")),
+            history_work_queue_reservation: None,
+            ingestion_enqueued_at: None,
+        });
     }
 }
 
@@ -2111,6 +2106,60 @@ mod tests {
         assert_eq!(trace.token_budget.total_used, 25_000);
         assert_eq!(trace.token_budget.max_tokens, 100_000);
         assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn context_display_is_queued_only_after_completed_core() {
+        let mut state = make_state();
+        let session_id = format!("async-context-{}", uuid::Uuid::new_v4());
+        state.current_session_id = Some(session_id.clone());
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(20_000);
+        let hub = crate::observability::ObservabilityHub::new();
+        state.telemetry.observability_session = Some(hub.start_session("owner", &session_id));
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-1",
+                session_id.clone(),
+            ));
+        state.telemetry.context_trace_persistence =
+            Some(super::super::host::ContextTracePersistenceContext {
+                user_id: "owner".into(),
+                artifact_store: astra_services::DatabaseSessionArtifactStore::new(
+                    astra_core::MatrixOneSettings::default(),
+                ),
+            });
+        let (sender, mut receiver) = astra_services::event_ingestion::IngestionSender::for_tests(4);
+        state.telemetry.trace_ingestion = Some(sender);
+        finalize_turn_trace(&mut state).await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "finalization must not publish before canonical core commits"
+        );
+        assert_eq!(
+            state
+                .telemetry
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .context_traces
+                .len(),
+            1
+        );
+        persist_completed_context_trace(&state).await;
+        let event = receiver
+            .try_recv()
+            .expect("completed context projection is queued");
+        assert_eq!(event.user_id, "owner");
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.event_type, "context_trace_signal");
+        assert!(event.metadata.unwrap().get("budget").is_some());
+        assert!(
+            receiver.try_recv().is_err(),
+            "one projection per completed turn"
+        );
     }
 
     #[tokio::test]

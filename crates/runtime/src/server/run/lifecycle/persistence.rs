@@ -196,51 +196,6 @@ impl PostLoopPersistContext {
         }
     }
 
-    /// Persist the immutable root turn before execution starts.
-    ///
-    /// Terminal projection remains a single post-loop transaction, but an
-    /// accepted turn must not disappear from audit merely because execution
-    /// is cancelled, the client disconnects, or terminal persistence fails.
-    /// This is one idempotent write per root run; it is never called per token
-    /// or per tool event.
-    pub(crate) async fn persist_turn_start(&self, state: &AgenticLoopState) -> Result<(), String> {
-        let Some(pool) = self.shared_pool.as_ref() else {
-            return Ok(());
-        };
-        let trace = server_trace_context(
-            &self.user_id,
-            &self.session_id,
-            &self.run_id,
-            state.session_turn,
-        );
-        let turn_started_at = *state.canonical_turn_started_at.get_or_init(|| {
-            state
-                .turn_event_buffer
-                .as_ref()
-                .map(astra_services::session_journal::TurnEventBuffer::turn_started_at)
-                .unwrap_or_else(chrono::Utc::now)
-        });
-        let Some(event) = server_loop_user_query_event(
-            &self.user_id,
-            &self.session_id,
-            &self.run_id,
-            None,
-            None,
-            self.agent_id.as_deref(),
-            None,
-            &trace,
-            &self.user_message,
-            turn_started_at,
-        ) else {
-            return Ok(());
-        };
-        DatabaseTraceEventWriter::new(self.matrixone.clone())
-            .with_pool(pool.clone())
-            .write(event)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     /// Persist projections and observers after the canonical core transaction.
     ///
     /// Callers must pass the exact result of
@@ -263,6 +218,8 @@ impl PostLoopPersistContext {
             // evidence, but fail closed before derived state escapes.
             return Err(format!("core+trace transaction failed: {error}"));
         }
+
+        crate::turn::agentic_loop::finalization::persist_completed_context_trace(state).await;
 
         // 1. Persist CSL via CslManager only after core+trace persistence
         // succeeds. If CSL fails later, restore can fall back to transcript
@@ -1773,7 +1730,7 @@ fn capture_turn_trace_time_bounds(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn server_loop_user_query_event(
+pub(super) fn server_loop_user_query_event(
     user_id: &str,
     session_id: &str,
     run_id: &str,
@@ -2134,6 +2091,63 @@ async fn persist_server_loop_transcript_items_in_tx(
         .map_err(|error| error.to_string())
 }
 
+/// Commit the accepted input's audit fact and user-visible transcript together.
+/// Both projections share the same session admission and insertion receipt.
+pub(crate) async fn persist_root_turn_input(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    item: TranscriptPersistItem,
+    audit: Option<TraceEvent>,
+) -> Result<(), String> {
+    let has_audit = audit.is_some();
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut tx = connection
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
+    admit_session_event_write(&mut tx, session_id, user_id, false)
+        .await
+        .map_err(|error| error.to_string())?;
+    let outcome = DatabaseTraceEventWriter::write_many_in_admitted_tx(
+        &mut tx,
+        user_id,
+        session_id,
+        audit.into_iter().collect(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let accepted = !has_audit || outcome.accepts_projection(&item.source_event_id);
+    if accepted {
+        append_session_transcript_items_admitted_in_tx(&mut tx, user_id, session_id, &[item])
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some((delta, last_event_id)) = outcome
+        .session_event_deltas
+        .get(&(user_id.to_owned(), session_id.to_owned()))
+    {
+        crate::data_layer::storage::bump_agent_session_event_count(
+            &mut *tx,
+            session_id,
+            user_id,
+            *delta,
+            last_event_id.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().await.map_err(|error| error.to_string())?;
+    connection.release();
+    if !accepted {
+        return Err("root input event identity collided; transcript was not projected".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) async fn persist_session_transcript_items(
     pool: &SharedPool,
     user_id: &str,
@@ -3701,6 +3715,153 @@ mod tests {
         astra_core::SharedPool::new(settings)
             .await
             .expect("SharedPool::new")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn root_input_is_atomic_replay_safe_and_collision_fenced() {
+        let pool = setup_pool().await;
+        let db = pool.get();
+        let user = format!("input-owner-{}", Uuid::new_v4());
+        let session = format!("input-session-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO agent_sessions (session_id,user_id,title,status,event_count) VALUES (?,?,'input','active',0)")
+            .bind(&session).bind(&user).execute(db).await.unwrap();
+        let make_event = |run: &str, message: &str| {
+            let trace = server_trace_context(&user, &session, run, 1);
+            server_loop_user_query_event(
+                &user,
+                &session,
+                run,
+                None,
+                None,
+                None,
+                None,
+                &trace,
+                message,
+                chrono::Utc::now(),
+            )
+            .unwrap()
+        };
+        let input = make_event("input-run", "ordinary conversation");
+        persist_test_root_turn_input(&pool, input.clone())
+            .await
+            .unwrap();
+        persist_test_root_turn_input(&pool, input.clone())
+            .await
+            .unwrap();
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 1);
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_event_id,content FROM session_transcript_items WHERE user_id=? AND session_id=?")
+            .bind(&user).bind(&session).fetch_all(db).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![(input.event_id.clone(), "ordinary conversation".into())]
+        );
+        let mut collision = input.clone();
+        collision.content = Some("conflicting input".into());
+        assert!(
+            persist_test_root_turn_input(&pool, collision)
+                .await
+                .is_err()
+        );
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observation_identity_collisions WHERE user_id=? AND identity_id=?")
+            .bind(&user).bind(&input.event_id).fetch_one(db).await.unwrap();
+        assert_eq!(
+            receipts, 1,
+            "collision evidence must commit without conflicting text"
+        );
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 1);
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM session_transcript_items WHERE user_id=? AND session_id=?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        assert_eq!(content, "ordinary conversation");
+
+        // Exhaust the transcript sequence after a successful input. A later
+        // projection failure must also roll back its newly inserted audit fact.
+        sqlx::query(
+            "UPDATE session_transcript_items SET item_seq=? WHERE user_id=? AND session_id=?",
+        )
+        .bind(i64::MAX)
+        .bind(&user)
+        .bind(&session)
+        .execute(db)
+        .await
+        .unwrap();
+        let next = make_event("next-input-run", "another ordinary input");
+        assert!(
+            persist_test_root_turn_input(&pool, next.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 1);
+        sqlx::query(
+            "UPDATE session_transcript_items SET item_seq=1 WHERE user_id=? AND session_id=?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .execute(db)
+        .await
+        .unwrap();
+        persist_test_root_turn_input(&pool, next).await.unwrap();
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 2);
+        let mut foreign = make_event("foreign-run", "wrong owner");
+        foreign.user_id = format!("foreign-{}", Uuid::new_v4());
+        assert!(persist_test_root_turn_input(&pool, foreign).await.is_err());
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 2);
+        sqlx::query("UPDATE agent_sessions SET status='deleting' WHERE user_id=? AND session_id=?")
+            .bind(&user)
+            .bind(&session)
+            .execute(db)
+            .await
+            .unwrap();
+        let rejected = make_event("deleted-input-run", "late input");
+        assert!(
+            persist_test_root_turn_input(&pool, rejected.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(assert_session_event_count(db, &user, &session).await, 2);
+        cleanup_core_persist_fixture_for_owner(db, &session, &user).await;
+        assert!(persist_test_root_turn_input(&pool, rejected).await.is_err());
+        let sessions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_sessions WHERE user_id=? AND session_id=?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "input capture must never recreate a missing session"
+        );
+        sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id=?")
+            .bind(&user)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    async fn persist_test_root_turn_input(
+        pool: &SharedPool,
+        event: TraceEvent,
+    ) -> Result<(), String> {
+        let item = TranscriptPersistItem {
+            run_id: event.run_id.clone(),
+            role: "user",
+            content: event.content.clone().unwrap_or_default(),
+            payload: None,
+            source_event_id: event.event_id.clone(),
+        };
+        let user = event.user_id.clone();
+        let session = event.session_id.clone();
+        persist_root_turn_input(pool, &user, &session, item, Some(event)).await
     }
 
     #[derive(Default)]
@@ -6908,8 +7069,24 @@ mod tests {
             metrics_registry: None,
             csl_manager: None,
         };
-        persist
-            .persist_turn_start(&state)
+        let started_at = *state
+            .canonical_turn_started_at
+            .get_or_init(chrono::Utc::now);
+        let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
+        let input = server_loop_user_query_event(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            None,
+            persist.agent_id.as_deref(),
+            None,
+            &trace,
+            &persist.user_message,
+            started_at,
+        )
+        .expect("nonempty input");
+        persist_test_root_turn_input(&pool, input)
             .await
             .expect("persist admission-time root event");
         tokio::time::sleep(Duration::from_millis(25)).await;

@@ -49,7 +49,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use astra_services::DatabaseEventService;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord, TraceSpanBuilder};
 use async_trait::async_trait;
@@ -2016,9 +2015,7 @@ pub struct TelemetryState {
 #[derive(Clone, Debug)]
 pub struct ContextTracePersistenceContext {
     pub user_id: String,
-    pub event_service: DatabaseEventService,
     pub artifact_store: astra_services::DatabaseSessionArtifactStore,
-    pub agent_id: String,
 }
 
 /// Stall and verdict tracking state for the agentic loop.
