@@ -248,45 +248,6 @@ async fn persist_context_trace_to_workspace_if_present(
     }
 }
 
-fn persist_remote_composite_snapshot_index_blocking(
-    persistence: Option<&super::host::ContextTracePersistenceContext>,
-    session_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-    source: &str,
-) {
-    let Some(persistence) = persistence.cloned() else {
-        return;
-    };
-    let session_id = session_id.to_string();
-    let session_id_for_log = session_id.clone();
-    let index = index.clone();
-    let future = async move {
-        astra_services::session_restore::persist_remote_composite_snapshot_index(
-            &session_id,
-            &persistence.user_id,
-            &index,
-            &persistence.artifact_store,
-        )
-        .await
-        .map(|_| ())
-    };
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map(|runtime| runtime.block_on(future))
-            .map_err(|error| error.to_string())
-            .and_then(|result| result),
-    };
-    if let Err(error) = result {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Failed to {source} for {session_id_for_log}: {error}"
-        );
-    }
-}
-
 /// Best-effort heavy checkpoint write.
 ///
 /// Several early-exit paths in the agentic loop (for example text-only
@@ -395,13 +356,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     }
 
     let turn = session_turn_number(state);
-    if let Some((cp, snapshot)) = commit_session_continuity_checkpoint(
-        user_id,
-        sid,
-        turn,
-        cp,
-        state.telemetry.context_trace_persistence.as_ref(),
-    ) {
+    if let Some((cp, snapshot)) = commit_session_continuity_checkpoint(user_id, sid, turn, cp) {
         state.last_composite_snapshot = Some(snapshot);
         state.stall.last_heavy_checkpoint = Some(cp);
     }
@@ -415,7 +370,6 @@ pub fn commit_session_continuity_checkpoint(
     session_id: &str,
     turn: u32,
     cp: StepCheckpoint,
-    persistence: Option<&super::host::ContextTracePersistenceContext>,
 ) -> Option<(
     StepCheckpoint,
     astra_core::composite_snapshot::CompositeSnapshot,
@@ -425,7 +379,7 @@ pub fn commit_session_continuity_checkpoint(
             .label(format!("checkpoint-t{turn}"))
             .workspace_state(session_id.to_owned())
             .build();
-    let (_ckpt_num, snapshot, index) =
+    let (_ckpt_num, snapshot, _index) =
         match step_checkpoint::commit_composite_checkpoint(user_id, session_id, &cp, snapshot) {
             Ok(committed) => committed,
             Err(error) => {
@@ -438,12 +392,6 @@ pub fn commit_session_continuity_checkpoint(
                 return None;
             }
         };
-    persist_remote_composite_snapshot_index_blocking(
-        persistence,
-        session_id,
-        &index,
-        "persist remote composite snapshot index",
-    );
 
     Some((cp, snapshot))
 }

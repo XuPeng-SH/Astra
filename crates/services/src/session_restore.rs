@@ -15,16 +15,13 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 
-use crate::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
-
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
-pub const COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID: &str = "projection:composite-snapshot-index";
 const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
     SELECT number, turn, title, summary, total_tokens \
     FROM ( \
@@ -1357,42 +1354,6 @@ fn local_checkpoint_count(
     })
 }
 
-fn composite_snapshot_index_to_remote_artifact_record(
-    session_id: &str,
-    user_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
-    Ok(SessionArtifactJsonRecord {
-        artifact_id: COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID.to_string(),
-        session_id: session_id.to_string(),
-        user_id: user_id.to_string(),
-        artifact_kind: COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND.to_string(),
-        source: Some("composite_snapshot_index".to_string()),
-        turn: index.snapshots.last().map(|snapshot| snapshot.turn),
-        round: None,
-        content: serde_json::to_value(index)?,
-        metadata: Some(json!({
-            "snapshot_count": index.snapshots.len(),
-            "latest_version": index.current_version(),
-        })),
-        references: Vec::new(),
-    })
-}
-
-pub async fn persist_remote_composite_snapshot_index(
-    session_id: &str,
-    user_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-    store: &impl SessionArtifactJsonStore,
-) -> Result<StoredSessionArtifact, String> {
-    let record = composite_snapshot_index_to_remote_artifact_record(session_id, user_id, index)
-        .map_err(|error| error.to_string())?;
-    store
-        .merge_composite_snapshot_index_projection(record)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 fn recent_tools_from_context_trace(
     trace: Option<&super::session_workspace::ContextTraceSignal>,
 ) -> Vec<String> {
@@ -1916,6 +1877,7 @@ mod tests {
     use super::*;
     use crate::session_journal::JournalDirGuard;
     use crate::session_workspace;
+    use serde_json::json;
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
@@ -3651,20 +3613,6 @@ mod tests {
             vec!["rg".to_string(), "bash".to_string()],
             "resume recent_tools must contain canonical non-empty tool names only"
         );
-    }
-
-    #[test]
-    fn composite_snapshot_index_uses_one_stable_remote_projection_id() {
-        let index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-        let first =
-            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
-                .expect("serialize first index");
-        let second =
-            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
-                .expect("serialize replayed index");
-
-        assert_eq!(first.artifact_id, COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID);
-        assert_eq!(second.artifact_id, first.artifact_id);
     }
 
     #[test]
