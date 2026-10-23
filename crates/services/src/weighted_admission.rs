@@ -365,10 +365,7 @@ impl DatabaseWeightedAdmissionController {
                 .map_err(|source| distributed_database_error("rollback_escalation", source))?;
             return Ok(ReservationAttempt::ConfigurationNeeded);
         }
-        for gate in &mut gates {
-            reconcile_expired_reservations(&mut tx, gate, now).await?;
-            ensure_materialized_admission_usage(&mut tx, gate).await?;
-        }
+        repair_admission_usage(&mut tx, &mut gates, now).await?;
         if all_partitions {
             ensure_partition_allocations(&mut tx, &mut gates, self.limits, requested_hash).await?;
         } else if gates
@@ -1028,9 +1025,9 @@ async fn ensure_partition_allocations(
             gate.allocated = AdmissionWork::from_components(values).ok_or_else(|| {
                 DistributedAdmissionError::Invalid("partition allocation overflow".into())
             })?;
-            store_partition_allocation(tx, gate, requested).await?;
             gate.capacity_hash = Some(requested.to_owned());
         }
+        store_partition_allocations(tx, &gates.iter().collect::<Vec<_>>()).await?;
     }
     if sum_admission_work(gates.iter().map(|gate| gate.allocated))? != limits.global
         || gates
@@ -1056,17 +1053,82 @@ fn sum_admission_work(
         })
 }
 
-async fn store_partition_allocation(
+/// Publish the already-validated allocation plan in one statement. Callers
+/// hold every affected gate in canonical order throughout the transaction.
+async fn store_partition_allocations(
     tx: &mut CancellationSafeTransaction,
-    gate: &LockedDistributedAdmissionGate,
-    hash: &str,
+    gates: &[&LockedDistributedAdmissionGate],
 ) -> Result<(), DistributedAdmissionError> {
-    admission_io!(tx, sqlx::query(
-        "UPDATE session_weighted_admission_gates SET capacity_hash = ?, allocated_resident_bytes = ?, allocated_context_tokens = ?, allocated_provider_slots = ?, allocated_cpu_units = ?, allocated_io_bytes = ?, updated_at = NOW(6) WHERE scope_name = ?"
-    ).bind(hash).bind(gate.allocated.resident_bytes.to_string()).bind(gate.allocated.context_tokens.to_string())
-        .bind(u64::from(gate.allocated.provider_slots).to_string()).bind(gate.allocated.cpu_units.to_string()).bind(gate.allocated.io_bytes.to_string()).bind(&gate.scope).execute(&mut **tx))
-        .map_err(|source| distributed_database_error("store_partition_allocation", source))?;
+    if gates.is_empty() {
+        return Ok(());
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "UPDATE session_weighted_admission_gates SET capacity_hash = CASE scope_name",
+    );
+    for gate in gates {
+        query
+            .push(" WHEN ")
+            .push_bind(gate.scope.clone())
+            .push(" THEN ")
+            .push_bind(gate.capacity_hash.clone().expect("configured partition"));
+    }
+    query.push(" ELSE capacity_hash END");
+    push_gate_work_assignments(&mut query, gates, "allocated", |gate| gate.allocated);
+    push_gate_update_scopes(&mut query, gates);
+    admission_io!(tx, query.build().execute(&mut **tx))
+        .map_err(|source| distributed_database_error("store_partition_allocations", source))?;
     Ok(())
+}
+
+fn push_gate_work_assignments(
+    query: &mut sqlx::QueryBuilder<sqlx::MySql>,
+    gates: &[&LockedDistributedAdmissionGate],
+    prefix: &'static str,
+    work: fn(&LockedDistributedAdmissionGate) -> AdmissionWork,
+) {
+    for (index, name) in [
+        "resident_bytes",
+        "context_tokens",
+        "provider_slots",
+        "cpu_units",
+        "io_bytes",
+    ]
+    .iter()
+    .enumerate()
+    {
+        query
+            .push(", ")
+            .push(prefix)
+            .push("_")
+            .push(*name)
+            .push(" = CASE scope_name");
+        for gate in gates {
+            query
+                .push(" WHEN ")
+                .push_bind(gate.scope.clone())
+                .push(" THEN CAST(")
+                .push_bind(work(gate).components()[index].to_string())
+                .push(" AS DECIMAL(20, 0))");
+        }
+        query
+            .push(" ELSE ")
+            .push(prefix)
+            .push("_")
+            .push(*name)
+            .push(" END");
+    }
+}
+
+fn push_gate_update_scopes(
+    query: &mut sqlx::QueryBuilder<sqlx::MySql>,
+    gates: &[&LockedDistributedAdmissionGate],
+) {
+    query.push(", updated_at = NOW(6) WHERE scope_name IN (");
+    let mut scopes = query.separated(", ");
+    for gate in gates {
+        scopes.push_bind(gate.scope.clone());
+    }
+    scopes.push_unseparated(")");
 }
 
 async fn transfer_partition_credit(
@@ -1119,22 +1181,25 @@ async fn transfer_partition_credit(
             ));
         }
     }
-    let mut changed_rows = 0usize;
-    for (gate, values) in gates.iter_mut().zip(allocations) {
+    let mut changed = Vec::new();
+    for (index, (gate, values)) in gates.iter_mut().zip(allocations).enumerate() {
         let allocated = AdmissionWork::from_components(values).ok_or_else(|| {
             DistributedAdmissionError::Invalid("partition allocation overflow".into())
         })?;
         if gate.allocated != allocated {
-            changed_rows += 1;
+            changed.push(index);
             gate.allocated = allocated;
-            store_partition_allocation(
-                tx,
-                gate,
-                gate.capacity_hash.as_deref().expect("configured partition"),
-            )
-            .await?;
         }
     }
+    let changed_rows = changed.len();
+    store_partition_allocations(
+        tx,
+        &changed
+            .iter()
+            .map(|index| &gates[*index])
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     tracing::debug!(target: "astra_services::weighted_admission", changed_rows, "admission credit transfer prepared");
     Ok(true)
 }
@@ -1280,55 +1345,42 @@ async fn store_expiry_frontier(
     Ok(())
 }
 
-async fn reconcile_expired_reservations(
+/// Repair only dirty or expired partitions under their existing gate locks.
+/// Initializing sixteen empty partitions is the same bounded aggregate repair
+/// as initializing one; it does not need sixteen independent SQL protocols.
+async fn repair_admission_usage(
     tx: &mut CancellationSafeTransaction,
-    gate: &mut LockedDistributedAdmissionGate,
+    gates: &mut [LockedDistributedAdmissionGate],
     now: chrono::NaiveDateTime,
 ) -> Result<(), DistributedAdmissionError> {
-    if gate.usage_initialized && gate.earliest_expiry_at.is_none_or(|at| at > now) {
-        return Ok(());
-    }
-    let deleted = admission_io!(
-        tx,
-        sqlx::query(
-            "DELETE FROM session_weighted_admission_reservations
-         WHERE scope_name = ? AND expires_at <= NOW(6)",
-        )
-        .bind(&gate.scope)
-        .execute(&mut **tx)
-    )
-    .map_err(|source| distributed_database_error("cleanup_expired", source))?;
-    if deleted.rows_affected() != 0 {
-        // The same transaction publishes rebuilt counters and frontier before
-        // any successful commit, so no intermediate dirty UPDATE is needed.
-        gate.usage_initialized = false;
-    } else if gate.usage_initialized {
-        gate.earliest_expiry_at = admission_io!(tx, sqlx::query_scalar(
-            "SELECT MIN(expires_at) FROM session_weighted_admission_reservations WHERE scope_name = ?",
-        ).bind(&gate.scope).fetch_one(&mut **tx))
-            .map_err(|source| distributed_database_error("refresh_expiry_frontier", source))?;
-        store_expiry_frontier(tx, &gate.scope, gate.earliest_expiry_at).await?;
-    }
-    Ok(())
-}
-
-/// Rebuild O(1) global and per-owner totals from reservation rows. This is a
-/// repair path, used on fresh initialization or after an out-of-band delete;
-/// normal reserve/release paths update the totals incrementally.
-async fn ensure_materialized_admission_usage(
-    tx: &mut CancellationSafeTransaction,
-    gate: &mut LockedDistributedAdmissionGate,
-) -> Result<(), DistributedAdmissionError> {
-    if gate.usage_initialized {
+    let mut selected: Vec<_> = gates
+        .iter_mut()
+        .filter(|gate| {
+            !gate.usage_initialized || gate.earliest_expiry_at.is_some_and(|at| at <= now)
+        })
+        .collect();
+    if selected.is_empty() {
         return Ok(());
     }
 
-    // MatrixOne sums BIGINT inputs as int64. Widen before SUM, not after it:
-    // multiple valid reservation rows can exceed i64::MAX while fitting u64.
-    let row = admission_io!(
-        tx,
-        sqlx::query(
-            "SELECT
+    let mut expire = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "DELETE FROM session_weighted_admission_reservations WHERE scope_name IN (",
+    );
+    {
+        let mut scopes = expire.separated(", ");
+        for gate in &selected {
+            scopes.push_bind(gate.scope.clone());
+        }
+        scopes.push_unseparated(") AND expires_at <= NOW(6)");
+    }
+    let deleted = admission_io!(tx, expire.build().execute(&mut **tx))
+        .map_err(|source| distributed_database_error("cleanup_expired", source))?;
+    let rebuild =
+        deleted.rows_affected() != 0 || selected.iter().any(|gate| !gate.usage_initialized);
+
+    // Widen each BIGINT before SUM: valid reservations can sum beyond i64.
+    let mut aggregate = sqlx::QueryBuilder::<sqlx::MySql>::new(if rebuild {
+        "SELECT scope_name,
                  MIN(expires_at) AS earliest_expiry_at,
                  CAST(COALESCE(SUM(CAST(resident_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS used_resident_bytes,
                  CAST(COALESCE(SUM(CAST(context_tokens AS DECIMAL(38, 0))), 0) AS CHAR) AS used_context_tokens,
@@ -1340,38 +1392,72 @@ async fn ensure_materialized_admission_usage(
                        OR provider_slots > 4294967295 OR cpu_units < 0 OR io_bytes < 0
                      THEN 1 ELSE 0 END), 0) AS SIGNED) AS invalid_rows
              FROM session_weighted_admission_reservations
-             WHERE scope_name = ?",
-        )
-        .bind(&gate.scope)
-        .fetch_one(&mut **tx)
-    )
-    .map_err(|source| distributed_database_error("rebuild_active_usage", source))?;
-    let invalid_rows: i64 = row
-        .try_get("invalid_rows")
-        .map_err(|source| distributed_database_error("decode_usage_invalid_rows", source))?;
-    if invalid_rows > 0 {
-        return Err(DistributedAdmissionError::Invalid(format!(
-            "distributed admission contains {invalid_rows} invalid stored reservation rows"
-        )));
+             WHERE scope_name IN ("
+    } else {
+        "SELECT scope_name, MIN(expires_at) AS earliest_expiry_at FROM session_weighted_admission_reservations WHERE scope_name IN ("
+    });
+    {
+        let mut scopes = aggregate.separated(", ");
+        for gate in &selected {
+            scopes.push_bind(gate.scope.clone());
+        }
+        scopes.push_unseparated(") GROUP BY scope_name");
     }
-    let global = decode_aggregate_admission_work(&row, "used_")?;
-    let earliest_expiry_at: Option<chrono::NaiveDateTime> = row
-        .try_get("earliest_expiry_at")
-        .map_err(|source| distributed_database_error("decode_usage_expiry_frontier", source))?;
+    let rows = admission_io!(tx, aggregate.build().fetch_all(&mut **tx))
+        .map_err(|source| distributed_database_error("rebuild_active_usage", source))?;
+    let mut totals = HashMap::with_capacity(rows.len());
+    for row in rows {
+        if rebuild {
+            let invalid: i64 = row.try_get("invalid_rows").map_err(|source| {
+                distributed_database_error("decode_usage_invalid_rows", source)
+            })?;
+            if invalid > 0 {
+                return Err(DistributedAdmissionError::Invalid(format!(
+                    "distributed admission contains {invalid} invalid stored reservation rows"
+                )));
+            }
+        }
+        let scope: String = row
+            .try_get("scope_name")
+            .map_err(|source| distributed_database_error("decode_usage_scope", source))?;
+        let usage = rebuild
+            .then(|| decode_aggregate_admission_work(&row, "used_"))
+            .transpose()?;
+        let expiry: Option<chrono::NaiveDateTime> = row
+            .try_get("earliest_expiry_at")
+            .map_err(|source| distributed_database_error("decode_usage_expiry_frontier", source))?;
+        totals.insert(scope, (usage, expiry));
+    }
+    for gate in &mut selected {
+        let (usage, expiry) = totals.remove(&gate.scope).unwrap_or_default();
+        if rebuild {
+            gate.used = usage.unwrap_or_default();
+        }
+        gate.earliest_expiry_at = expiry;
+        gate.usage_initialized = true;
+    }
 
-    admission_io!(
-        tx,
-        sqlx::query(
-            "DELETE FROM session_weighted_admission_owner_usage
-             WHERE scope_name = ?",
-        )
-        .bind(&gate.scope)
-        .execute(&mut **tx)
-    )
-    .map_err(|source| distributed_database_error("clear_owner_usage", source))?;
-    admission_io!(
-        tx,
-        sqlx::query(
+    if !totals.is_empty() {
+        return Err(DistributedAdmissionError::Invalid(
+            "admission aggregate returned an unexpected partition".into(),
+        ));
+    }
+    // A conservatively early frontier may outlive a renewed/released row.
+    // With no expired rows and clean counters, only its frontier needs repair.
+    if rebuild {
+        let mut clear = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "DELETE FROM session_weighted_admission_owner_usage WHERE scope_name IN (",
+        );
+        {
+            let mut scopes = clear.separated(", ");
+            for gate in &selected {
+                scopes.push_bind(gate.scope.clone());
+            }
+            scopes.push_unseparated(")");
+        }
+        admission_io!(tx, clear.build().execute(&mut **tx))
+            .map_err(|source| distributed_database_error("clear_owner_usage", source))?;
+        let mut owners = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "INSERT INTO session_weighted_admission_owner_usage
              (scope_name, isolation_domain, owner_user_id, resident_bytes,
               context_tokens, provider_slots, cpu_units, io_bytes)
@@ -1382,41 +1468,36 @@ async fn ensure_materialized_admission_usage(
                     COALESCE(SUM(CAST(cpu_units AS DECIMAL(38, 0))), 0),
                     COALESCE(SUM(CAST(io_bytes AS DECIMAL(38, 0))), 0)
              FROM session_weighted_admission_reservations
-             WHERE scope_name = ?
-             GROUP BY scope_name, isolation_domain, owner_user_id",
-        )
-        .bind(&gate.scope)
-        .execute(&mut **tx)
-    )
-    .map_err(|source| distributed_database_error("rebuild_owner_usage", source))?;
-
-    admission_io!(
-        tx,
-        sqlx::query(
-            "UPDATE session_weighted_admission_gates
-             SET usage_initialized = 1,
-                 earliest_expiry_at = ?,
-                 used_resident_bytes = ?,
-                 used_context_tokens = ?,
-                 used_provider_slots = ?,
-                 used_cpu_units = ?,
-                 used_io_bytes = ?,
-                 updated_at = NOW(6)
-             WHERE scope_name = ?",
-        )
-        .bind(earliest_expiry_at)
-        .bind(global.resident_bytes.to_string())
-        .bind(global.context_tokens.to_string())
-        .bind(u64::from(global.provider_slots).to_string())
-        .bind(global.cpu_units.to_string())
-        .bind(global.io_bytes.to_string())
-        .bind(&gate.scope)
-        .execute(&mut **tx)
-    )
-    .map_err(|source| distributed_database_error("publish_materialized_usage", source))?;
-    gate.usage_initialized = true;
-    gate.used = global;
-    gate.earliest_expiry_at = earliest_expiry_at;
+             WHERE scope_name IN (",
+        );
+        {
+            let mut scopes = owners.separated(", ");
+            for gate in &selected {
+                scopes.push_bind(gate.scope.clone());
+            }
+            scopes.push_unseparated(") GROUP BY scope_name, isolation_domain, owner_user_id");
+        }
+        admission_io!(tx, owners.build().execute(&mut **tx))
+            .map_err(|source| distributed_database_error("rebuild_owner_usage", source))?;
+    }
+    let selected: Vec<_> = selected.into_iter().map(|gate| &*gate).collect();
+    let mut publish = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "UPDATE session_weighted_admission_gates SET usage_initialized = 1, earliest_expiry_at = CASE scope_name",
+    );
+    for gate in &selected {
+        publish
+            .push(" WHEN ")
+            .push_bind(gate.scope.clone())
+            .push(" THEN ")
+            .push_bind(gate.earliest_expiry_at);
+    }
+    publish.push(" ELSE earliest_expiry_at END");
+    if rebuild {
+        push_gate_work_assignments(&mut publish, &selected, "used", |gate| gate.used);
+    }
+    push_gate_update_scopes(&mut publish, &selected);
+    admission_io!(tx, publish.build().execute(&mut **tx))
+        .map_err(|source| distributed_database_error("publish_materialized_usage", source))?;
     Ok(())
 }
 
