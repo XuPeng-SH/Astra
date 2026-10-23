@@ -173,6 +173,12 @@ same fenced transition and atomic batch registration as production.
 
 ## Run
 
+The shared loop exit owns terminal rendering, SessionFacts, memory input
+publication and the final checkpoint. Execution/tool phases return outcomes;
+they do not independently finalize the same turn. A retained input wait keeps
+its unfinished execution and is not a terminal settlement. SessionEnd is emitted
+once at that shared boundary, after cancellation and final text normalization.
+
 A run is a durable execution attempt inside a session. It owns status, owner lease, checkpoint lineage, current stage, and terminal outcome.
 
 Common statuses:

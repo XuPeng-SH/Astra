@@ -23,6 +23,9 @@ use astra_services::runs::{
     AtomicRunTerminalSettlementResolution, DatabaseRunStateStore, RunStateStore,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
+use astra_services::session_context_coordinator::{
+    DatabaseSessionContextCoordinator, PreparedSessionContextCommit,
+};
 use astra_services::skills::SkillService;
 use astra_services::{CancellationSafePoolConnection, EdgeContext};
 use astra_services::{
@@ -497,6 +500,7 @@ impl PostLoopPersistContext {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
         events: &[Value],
+        context_commit: Option<&PreparedSessionContextCommit>,
     ) -> Result<Option<CanonicalTerminalSettlementCommit>, String> {
         let Some(pool) = self.shared_pool.as_ref() else {
             return Ok(None);
@@ -519,6 +523,7 @@ impl PostLoopPersistContext {
                 prompt_tokens: state.provider_input_tokens(),
                 completion_tokens: state.total_completion,
                 tool_calls: state.total_tool_calls,
+                context_commit,
             },
             terminal_operation,
         )
@@ -613,10 +618,12 @@ pub(crate) struct CanonicalTerminalSettlement<'a> {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) tool_calls: u32,
+    pub(crate) context_commit: Option<&'a PreparedSessionContextCommit>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct CanonicalTerminalSettlementCommit {
+    pub(crate) canonical_context_cursor: Option<SessionCursorV1>,
     pub(crate) terminal_events: Vec<Value>,
     pub(crate) terminal_assistant_source_event_id: Option<String>,
 }
@@ -905,11 +912,13 @@ fn finish_authoritatively_resolved_terminal(
     append: &CanonicalLoopAppend<'_>,
     state: &AgenticLoopState,
     terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
+    context_commit: Option<&PreparedSessionContextCommit>,
 ) -> CanonicalTerminalSettlementCommit {
     if let Some(operation) = terminal_operation {
         operation.retire();
     }
     CanonicalTerminalSettlementCommit {
+        canonical_context_cursor: context_commit.map(PreparedSessionContextCommit::cursor),
         terminal_events: terminal.committed_events,
         terminal_assistant_source_event_id: append
             .include_terminal_assistant
@@ -950,6 +959,25 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     settlement: CanonicalTerminalSettlement<'_>,
     terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
+    let mut bound_events = settlement.events.to_vec();
+    if let Some(context) = settlement.context_commit {
+        let event = bound_events
+            .iter_mut()
+            .find(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("run_settlement_finished")
+            })
+            .ok_or_else(|| {
+                "canonical context settlement requires its terminal receipt".to_string()
+            })?;
+        event
+            .as_object_mut()
+            .ok_or_else(|| "invalid terminal receipt".to_string())?
+            .insert("canonical_context".into(), context.terminal_binding());
+    }
+    let settlement = CanonicalTerminalSettlement {
+        events: &bound_events,
+        ..settlement
+    };
     // Once an exact-generation terminal transaction may have reached COMMIT,
     // dropping its future at the lease deadline would bypass the existing
     // lost-acknowledgement resolution and report a committed run as failed.
@@ -1094,6 +1122,7 @@ async fn persist_server_loop_canonical_append_inner(
                     &append,
                     state,
                     terminal_operation.take(),
+                    settlement.context_commit,
                 ));
             }
             return Err(format!(
@@ -1232,6 +1261,24 @@ async fn persist_server_loop_canonical_append_inner(
         .map_err(|error| format!("bump canonical session event count: {error}"))?;
     }
 
+    let canonical_context_cursor = if let Some(context) = settlement.and_then(|s| s.context_commit)
+    {
+        Some(
+            DatabaseSessionContextCoordinator::new(pool.clone())
+                .commit_turn_in_terminal_transaction(
+                    &mut tx,
+                    context,
+                    terminal_admission
+                        .as_ref()
+                        .expect("context commit owns terminal admission"),
+                )
+                .await
+                .map_err(|error| format!("canonical context settlement failed: {error}"))?,
+        )
+    } else {
+        None
+    };
+
     let terminal_commit = if let Some(settlement) = settlement {
         let store = DatabaseRunStateStore::new(pool.clone());
         match store
@@ -1256,6 +1303,7 @@ async fn persist_server_loop_canonical_append_inner(
                         &append,
                         state,
                         terminal_operation.take(),
+                        settlement.context_commit,
                     )),
                     None => Err(format!(
                         "canonical terminal settlement lost durable execution authority at generation {}",
@@ -1341,6 +1389,7 @@ async fn persist_server_loop_canonical_append_inner(
     .filter(|item| capture_outcome.accepts_projection(&item.source_event_id))
     .map(|item| item.source_event_id);
     Ok(CanonicalTerminalSettlementCommit {
+        canonical_context_cursor,
         terminal_events: terminal_commit
             .map(|(_, terminal)| terminal.committed_events)
             .unwrap_or_default(),
@@ -3562,7 +3611,9 @@ mod tests {
 
     impl tracing::field::Visit for PersistenceQueries {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "db.statement" {
+            // SQLx emits transaction BEGIN through summary, with an empty
+            // db.statement. Ordinary statements retain their full SQL field.
+            if field.name() == "db.statement" || (field.name() == "summary" && value == "BEGIN") {
                 self.0.lock().unwrap().push(value.to_owned());
             }
         }
@@ -6412,6 +6463,7 @@ mod tests {
                 None,
                 None,
                 &terminal_events,
+                None,
             )
             .await
             .expect_err("a rejected terminal response must abort settlement");
@@ -6687,6 +6739,7 @@ mod tests {
                 prompt_tokens: 11,
                 completion_tokens: 7,
                 tool_calls: 3,
+                context_commit: None,
             },
             None,
         )
@@ -6844,6 +6897,7 @@ mod tests {
                 prompt_tokens: 31,
                 completion_tokens: 13,
                 tool_calls: 5,
+                context_commit: None,
             },
             None,
         )
@@ -7140,6 +7194,54 @@ mod tests {
             model_name: Some("test-model"),
             include_terminal_assistant: true,
         };
+        use astra_services::SessionContextCoordinator;
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let key =
+            astra_turn_types::SessionKeyV1::owner_session("server", &user_id, &session_id, "main");
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            &user_id,
+            "terminal-context-it",
+            astra_turn_types::ActorKindV1::Server,
+            astra_turn_types::SessionSurfaceV1::Server,
+            None,
+            astra_turn_types::AuthorityEpochsV1::default(),
+        );
+        let reservation = match coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                None,
+                &actor,
+                Duration::from_secs(120),
+                "context-writer",
+                "context-turn",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            astra_services::AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => {
+                reservation
+            }
+            other => panic!("unexpected context admission: {other:?}"),
+        };
+        let delta = astra_turn_types::CanonicalTurnDeltaV1 {
+            schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: reservation.reserved_turn,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            compaction_generation: 0,
+            config_version_id: None,
+            mode: astra_turn_types::CanonicalDeltaModeV1::Append,
+            logical_segments: vec![vec![
+                json!({"role":"user", "content":persist.user_message}),
+                json!({"role":"assistant", "content":state.final_text}),
+            ]],
+        };
+        let context_commit =
+            PreparedSessionContextCommit::new(&reservation, delta.clone(), "context-commit", true)
+                .unwrap();
+        terminal_events.last_mut().unwrap()["canonical_context"] =
+            context_commit.terminal_binding();
         let settlement = CanonicalTerminalSettlement {
             expected_statuses: &[initial_status],
             expected_owner_generation: authority.owner_generation,
@@ -7150,6 +7252,7 @@ mod tests {
             prompt_tokens: 37,
             completion_tokens: 17,
             tool_calls: 6,
+            context_commit: Some(&context_commit),
         };
         if let Some(event_type) = collision {
             // First capture exact evidence through the ordinary append boundary,
@@ -7242,6 +7345,83 @@ mod tests {
             .await
             .unwrap();
         }
+        if collision.is_none() {
+            let mut invalid_delta = delta.clone();
+            invalid_delta.completed_turn += 1;
+            let invalid_context = PreparedSessionContextCommit::new(
+                &reservation,
+                invalid_delta,
+                "context-commit",
+                true,
+            )
+            .unwrap();
+            let error = persist_server_loop_canonical_terminal_settlement(
+                &pool,
+                append(),
+                &state,
+                CanonicalTerminalSettlement {
+                    context_commit: Some(&invalid_context),
+                    ..settlement
+                },
+                None,
+            )
+            .await
+            .expect_err("context rejection must roll back the entire terminal");
+            assert!(
+                error.contains("canonical context settlement failed"),
+                "{error}"
+            );
+            assert!(coordinator.load_head(&key).await.unwrap().is_none());
+            assert!(
+                coordinator
+                    .load_active_writer(&key)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&run_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(status, initial_status);
+            let terminal_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'llm_response'")
+                .bind(&user_id).bind(&session_id).fetch_one(&db).await.unwrap();
+            assert_eq!(terminal_rows, 0);
+
+            // Context was successfully staged here; rejecting the Run terminal
+            // must undo its immutable objects, head, writer release and receipt.
+            let error = persist_server_loop_canonical_terminal_settlement(
+                &pool,
+                append(),
+                &state,
+                CanonicalTerminalSettlement {
+                    expected_statuses: &["incompatible"],
+                    ..settlement
+                },
+                None,
+            )
+            .await
+            .expect_err("terminal rejection must roll back staged Context");
+            assert!(
+                error.contains("authoritative atomic terminal resolution conflict"),
+                "{error}"
+            );
+            assert!(coordinator.load_head(&key).await.unwrap().is_none());
+            assert!(
+                coordinator
+                    .load_active_writer(&key)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let immutable_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ? AND session_id = ?")
+                .bind(&user_id).bind(&session_id).fetch_one(&db).await.unwrap();
+            assert_eq!(immutable_rows, 0);
+        }
         let queries = PersistenceQueries::default();
         let subscriber = tracing_subscriber::registry().with(queries.clone());
         let started = std::time::Instant::now();
@@ -7255,12 +7435,51 @@ mod tests {
         .with_subscriber(subscriber)
         .await
         .expect("commit canonical terminal settlement");
+        let expected_cursor = context_commit.cursor();
+        assert_eq!(
+            commit.canonical_context_cursor,
+            Some(expected_cursor.clone())
+        );
+        assert_eq!(
+            coordinator.load_head(&key).await.unwrap().unwrap().cursor,
+            expected_cursor
+        );
+        assert!(
+            coordinator
+                .load_active_writer(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            coordinator
+                .materialize(&coordinator.load_head(&key).await.unwrap().unwrap())
+                .await
+                .unwrap()
+                .messages,
+            delta
+                .logical_segments
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+
         {
             let statements = queries.0.lock().unwrap();
             assert!(
                 !statements.is_empty(),
                 "SQL capture must observe the real writer"
             );
+            assert_eq!(
+                statements
+                    .iter()
+                    .filter(|sql| sql.as_str() == "BEGIN")
+                    .count(),
+                1,
+                "Run and Context must share one transaction"
+            );
+
             assert!(
                 !statements
                     .iter()
@@ -7446,6 +7665,34 @@ mod tests {
         assert_eq!(
             replay.terminal_assistant_source_event_id,
             commit.terminal_assistant_source_event_id
+        );
+
+        // A matching Run terminal and trace is insufficient when its canonical
+        // history request differs. The immutable terminal receipt binds both.
+        let mut changed_delta = delta.clone();
+        changed_delta.logical_segments[0][1]["content"] = json!("different canonical history");
+        let changed_context =
+            PreparedSessionContextCommit::new(&reservation, changed_delta, "context-commit", true)
+                .unwrap();
+        let error = persist_server_loop_canonical_terminal_settlement(
+            &pool,
+            append(),
+            &state,
+            CanonicalTerminalSettlement {
+                context_commit: Some(&changed_context),
+                ..settlement
+            },
+            None,
+        )
+        .await
+        .expect_err("a different context must not resolve as the committed Run");
+        assert!(
+            error.contains("authoritative atomic terminal resolution conflict"),
+            "{error}"
+        );
+        assert_eq!(
+            coordinator.load_head(&key).await.unwrap().unwrap().cursor,
+            expected_cursor
         );
 
         // Freezing time must not accept changed content under the same identity.

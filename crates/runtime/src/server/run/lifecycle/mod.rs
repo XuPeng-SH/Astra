@@ -6679,6 +6679,68 @@ impl AgenticRunLifecycleService {
         Ok(())
     }
 
+    fn prepare_canonical_turn_commit(
+        admission: Option<&CanonicalTurnAdmission>,
+        messages: &[Value],
+        rewrite_proof: Option<&CanonicalRewriteProof>,
+        allow_empty_delta: bool,
+        run_id: &str,
+    ) -> Result<
+        Option<astra_services::session_context_coordinator::PreparedSessionContextCommit>,
+        String,
+    > {
+        let Some(admission) = admission else {
+            return Ok(None);
+        };
+        let Some((mode, logical_segments)) = canonical_commit_delta(
+            &admission.prior_messages,
+            admission.had_canonical_head,
+            messages,
+            rewrite_proof,
+            allow_empty_delta,
+        )?
+        else {
+            return Ok(None);
+        };
+        let base = admission.reservation.expected_cursor.as_ref();
+        let replaces_history = mode == astra_turn_types::CanonicalDeltaModeV1::Replace;
+        let delta = astra_turn_types::CanonicalTurnDeltaV1 {
+            schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: admission.reservation.reserved_turn,
+            journal_event_seq: base.map_or(1, |cursor| cursor.journal_event_seq.saturating_add(1)),
+            conversation_seq: base.map_or(1, |cursor| cursor.conversation_seq.saturating_add(1)),
+            compaction_generation: if replaces_history {
+                let proof = rewrite_proof.ok_or_else(|| {
+                    "canonical replacement is missing its typed rewrite proof".to_string()
+                })?;
+                let cursor = base.ok_or_else(|| {
+                    "canonical replacement is missing its admitted base cursor".to_string()
+                })?;
+                if proof.base_manifest_root() != cursor.canonical_root_hash {
+                    return Err(
+                        "canonical rewrite proof does not match the admitted base root".into(),
+                    );
+                }
+                proof.replacement_generation().ok_or_else(|| {
+                    "canonical rewrite proof has no resulting compaction generation".to_string()
+                })?
+            } else {
+                base.map_or(0, |cursor| cursor.compaction_generation)
+            },
+            config_version_id: base.and_then(|cursor| cursor.config_version_id.clone()),
+            mode,
+            logical_segments,
+        };
+        astra_services::session_context_coordinator::PreparedSessionContextCommit::new(
+            &admission.reservation,
+            delta,
+            &format!("server-run:{run_id}:commit"),
+            admission.release_writer_on_finish,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string())
+    }
+
     async fn commit_canonical_turn(
         admission: Option<&CanonicalTurnAdmission>,
         messages: &[Value],
@@ -6691,59 +6753,21 @@ impl AgenticRunLifecycleService {
         };
         admission.renewal_cancel.cancel();
         let result = async {
-            let Some((mode, logical_segments)) = canonical_commit_delta(
-                &admission.prior_messages,
-                admission.had_canonical_head,
+            let Some(prepared) = Self::prepare_canonical_turn_commit(
+                Some(admission),
                 messages,
                 rewrite_proof,
                 allow_empty_delta,
+                run_id,
             )?
             else {
                 return Ok(None);
             };
-            let base = admission.reservation.expected_cursor.as_ref();
-            let replaces_history = mode == astra_turn_types::CanonicalDeltaModeV1::Replace;
-            let delta = astra_turn_types::CanonicalTurnDeltaV1 {
-                schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-                completed_turn: admission.reservation.reserved_turn,
-                journal_event_seq: base
-                    .map_or(1, |cursor| cursor.journal_event_seq.saturating_add(1)),
-                conversation_seq: base
-                    .map_or(1, |cursor| cursor.conversation_seq.saturating_add(1)),
-                compaction_generation: if replaces_history {
-                    let proof = rewrite_proof.ok_or_else(|| {
-                        "canonical replacement is missing its typed rewrite proof".to_string()
-                    })?;
-                    let cursor = base.ok_or_else(|| {
-                        "canonical replacement is missing its admitted base cursor".to_string()
-                    })?;
-                    if proof.base_manifest_root() != cursor.canonical_root_hash {
-                        return Err(
-                            "canonical rewrite proof does not match the admitted base root".into(),
-                        );
-                    }
-                    proof.replacement_generation().ok_or_else(|| {
-                        "canonical rewrite proof has no resulting compaction generation".to_string()
-                    })?
-                } else {
-                    base.map_or(0, |cursor| cursor.compaction_generation)
-                },
-                config_version_id: base.and_then(|cursor| cursor.config_version_id.clone()),
-                mode,
-                logical_segments,
-            };
-            let idempotency_key = format!("server-run:{run_id}:commit");
-            let commit = if admission.release_writer_on_finish {
-                admission
-                    .coordinator
-                    .commit_turn_and_release_writer(&admission.reservation, delta, &idempotency_key)
-                    .await
-            } else {
-                admission
-                    .coordinator
-                    .commit_turn(&admission.reservation, delta, &idempotency_key)
-                    .await
-            };
+            let commit = astra_services::DatabaseSessionContextCoordinator::new(
+                admission.inference_pool.clone(),
+            )
+            .commit_prepared_turn(&prepared)
+            .await;
             match commit.map_err(|error| error.to_string())? {
                 astra_turn_types::CoordinatorMutationV1::Applied { cursor }
                 | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { cursor } => {
@@ -16384,19 +16408,49 @@ impl AgenticRunLifecycleService {
                             &[STATUS_RUNNING, STATUS_WAITING]
                         };
                     let mut terminal_persistence_failure = None;
-                    match persist_ctx
-                        .persist_atomic_terminal_settlement(
-                            &state,
-                            terminal_expected_statuses,
-                            execution_owner_generation,
-                            persisted_status.as_str(),
-                            None,
-                            error_msg.as_deref(),
-                            events_for_transition,
-                        )
-                        .await
-                    {
+                    let context_commit = Self::prepare_canonical_turn_commit(
+                        canonical_turn.as_ref(),
+                        &state.messages,
+                        state.canonical_rewrite_proof(),
+                        allow_empty_delta
+                            || bg_cancel_flag.load(Ordering::Acquire)
+                            || bg_llm_cancel_token.is_cancelled(),
+                        &bg_run_id,
+                    );
+                    let terminal_result = match context_commit {
+                        Ok(context_commit) => {
+                            if let Some(admission) = canonical_turn.as_ref() {
+                                admission.renewal_cancel.cancel();
+                            }
+                            persist_ctx
+                                .persist_atomic_terminal_settlement(
+                                    &state,
+                                    terminal_expected_statuses,
+                                    execution_owner_generation,
+                                    persisted_status.as_str(),
+                                    None,
+                                    error_msg.as_deref(),
+                                    events_for_transition,
+                                    context_commit.as_ref(),
+                                )
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match terminal_result {
                         Ok(Some(commit)) => {
+                            canonical_context_cursor = commit.canonical_context_cursor;
+                            if let Some(admission) = canonical_turn.as_ref() {
+                                if admission.release_writer_on_finish
+                                    && canonical_context_cursor.is_none()
+                                {
+                                    let _ = admission
+                                        .coordinator
+                                        .release_writer(&admission.lease)
+                                        .await;
+                                }
+                                admission.release_started.store(true, Ordering::Release);
+                            }
                             terminal_assistant_source_event_id =
                                 commit.terminal_assistant_source_event_id;
                             core_trace_result = Ok(());
@@ -16674,7 +16728,10 @@ impl AgenticRunLifecycleService {
                     streamed_final_events.insert(0, publication);
                 }
 
-                if owner_terminal_committed && core_trace_result.is_ok() {
+                if owner_terminal_committed
+                    && core_trace_result.is_ok()
+                    && !atomic_terminal_committed
+                {
                     match Self::commit_canonical_turn(
                         canonical_turn.as_ref(),
                         &state.messages,
@@ -26865,6 +26922,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 prompt_tokens,
                 completion_tokens: loop_state.total_completion,
                 tool_calls: loop_state.total_tool_calls,
+                context_commit: None,
             })
         } else {
             None

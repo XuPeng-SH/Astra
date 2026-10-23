@@ -678,6 +678,89 @@ pub struct DatabaseSessionContextCoordinator {
     pool: SharedPool,
 }
 
+/// Immutable, validated input to one canonical Context commit. Preparing it
+/// performs no I/O and grants no authority. Its cursor and request identity can
+/// be bound to the Run terminal receipt before either is written.
+#[derive(Debug)]
+pub struct PreparedSessionContextCommit {
+    reservation: TurnReservationV1,
+    delta: CanonicalTurnDeltaV1,
+    idempotency_key: String,
+    release_writer: bool,
+    request_hash: String,
+    segments: Vec<ConversationSegmentV1>,
+    node: ContextManifestNodeV1,
+}
+
+impl PreparedSessionContextCommit {
+    pub fn new(
+        reservation: &TurnReservationV1,
+        delta: CanonicalTurnDeltaV1,
+        idempotency_key: &str,
+        release_writer: bool,
+    ) -> Result<Self, SessionContextCoordinatorError> {
+        delta
+            .validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_idempotency_key(idempotency_key)?;
+        let segments = delta
+            .logical_segments
+            .iter()
+            .cloned()
+            .map(|messages| ConversationSegmentV1::new(&reservation.key, messages))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let node = manifest_node_for_delta(
+            &reservation.key,
+            reservation
+                .expected_cursor
+                .as_ref()
+                .map(|cursor| cursor.canonical_root_hash.clone()),
+            &delta,
+            &segments,
+        )
+        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        Ok(Self {
+            request_hash: commit_request_hash(reservation, &delta),
+            reservation: reservation.clone(),
+            delta,
+            idempotency_key: idempotency_key.to_owned(),
+            release_writer,
+            segments,
+            node,
+        })
+    }
+
+    pub fn cursor(&self) -> SessionCursorV1 {
+        self.node.cursor()
+    }
+
+    pub fn terminal_binding(&self) -> Value {
+        serde_json::json!({
+            "request_hash": self.request_hash,
+            "idempotency_key": self.idempotency_key,
+            "release_writer": self.release_writer,
+            "cursor": self.cursor(),
+        })
+    }
+}
+
+// A standalone rejected authority operation commits its rejection audit. In a
+// terminal transaction the same rejection must roll back the entire settlement.
+enum StagedTurnCommit {
+    Mutation(CoordinatorMutationV1),
+    Rejected(SessionContextCoordinatorError),
+}
+
+impl StagedTurnCommit {
+    fn into_result(self) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
+        match self {
+            Self::Mutation(mutation) => Ok(mutation),
+            Self::Rejected(error) => Err(error),
+        }
+    }
+}
+
 impl DatabaseSessionContextCoordinator {
     async fn commit_turn_inner(
         &self,
@@ -686,18 +769,15 @@ impl DatabaseSessionContextCoordinator {
         idempotency_key: &str,
         release_writer: bool,
     ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
-        delta
-            .validate()
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        validate_idempotency_key(idempotency_key)?;
-        let request_hash = commit_request_hash(reservation, &delta);
-        let mut segments = Vec::with_capacity(delta.logical_segments.len());
-        for messages in delta.logical_segments.iter().cloned() {
-            segments.push(
-                ConversationSegmentV1::new(&reservation.key, messages)
-                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?,
-            );
-        }
+        let prepared =
+            PreparedSessionContextCommit::new(reservation, delta, idempotency_key, release_writer)?;
+        self.commit_prepared_turn(&prepared).await
+    }
+
+    pub async fn commit_prepared_turn(
+        &self,
+        prepared: &PreparedSessionContextCommit,
+    ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_commit_turn", source))?;
@@ -705,14 +785,61 @@ impl DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_commit_turn", source))?;
-        admit_session_lifecycle_write(&mut tx, &reservation.key).await?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
+        admit_session_lifecycle_write(&mut tx, &prepared.reservation.key).await?;
+        let outcome = self.stage_turn_commit(&mut tx, prepared).await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_turn", source))?;
+        connection.release();
+        outcome.into_result()
+    }
+
+    /// Stage canonical Context under the same session/execution/run locks as
+    /// the terminal. The caller owns COMMIT; any rejection aborts that terminal.
+    pub async fn commit_turn_in_terminal_transaction(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        prepared: &PreparedSessionContextCommit,
+        admission: &crate::runs::AtomicRunTerminalSettlementAdmission,
+    ) -> Result<SessionCursorV1, SessionContextCoordinatorError> {
+        if !admission.owns_session(
+            &prepared.reservation.key.owner_user_id,
+            &prepared.reservation.key.session_id,
+        ) {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "terminal admission does not own the canonical context".into(),
+            ));
+        }
+        match self.stage_turn_commit(tx, prepared).await?.into_result()? {
+            CoordinatorMutationV1::Applied { cursor }
+            | CoordinatorMutationV1::AlreadyApplied { cursor } => Ok(cursor),
+            CoordinatorMutationV1::Conflict { .. } => Err(SessionContextCoordinatorError::Invalid(
+                "canonical session head changed before terminal commit".into(),
+            )),
+            CoordinatorMutationV1::NeedsRepair { reason, .. } => {
+                Err(SessionContextCoordinatorError::NeedsRepair(reason))
+            }
+        }
+    }
+
+    async fn stage_turn_commit(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        prepared: &PreparedSessionContextCommit,
+    ) -> Result<StagedTurnCommit, SessionContextCoordinatorError> {
+        let reservation = &prepared.reservation;
+        let delta = &prepared.delta;
+        let idempotency_key = prepared.idempotency_key.as_str();
+        let request_hash = &prepared.request_hash;
+        let segments = &prepared.segments;
+        let release_writer = prepared.release_writer;
+        let (mut state, now) = lock_database_state_at_now(tx, &reservation.key).await?;
         if let Some(last) = state.last_commit.clone()
             && last.idempotency_key == idempotency_key
         {
-            validate_commit_request(&last, reservation, &delta)?;
+            validate_commit_request(&last, reservation, delta)?;
             record_database_authority_event(
-                &mut tx,
+                tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "commit_turn",
@@ -725,31 +852,30 @@ impl DatabaseSessionContextCoordinator {
             )
             .await?;
             if release_writer {
-                release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?;
+                release_committed_writer_in_tx(tx, &mut state, reservation).await?;
             }
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_retry", source))?;
-            connection.release();
-            return Ok(CoordinatorMutationV1::AlreadyApplied {
-                cursor: last.cursor.clone(),
-            });
+
+            return Ok(StagedTurnCommit::Mutation(
+                CoordinatorMutationV1::AlreadyApplied {
+                    cursor: last.cursor.clone(),
+                },
+            ));
         }
         if let Err(error) = validate_active_reservation(&state, reservation, now) {
             // Archived receipts are only relevant when this is not the current
             // active reservation. The successful hot path already proves that
             // the commit has not been applied, so avoid an extra database read.
             if let Some(receipt) = load_database_receipt::<CommitReceiptV1>(
-                &mut tx,
+                tx,
                 &reservation.key,
                 "commit",
                 idempotency_key,
-                &request_hash,
+                request_hash,
             )
             .await?
             {
                 record_database_authority_event(
-                    &mut tx,
+                    tx,
                     &state,
                     AuthorityAuditFact {
                         operation: "commit_turn",
@@ -762,18 +888,17 @@ impl DatabaseSessionContextCoordinator {
                 )
                 .await?;
                 if release_writer {
-                    release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?;
+                    release_committed_writer_in_tx(tx, &mut state, reservation).await?;
                 }
-                tx.commit()
-                    .await
-                    .map_err(|source| database_error("commit_turn_replay", source))?;
-                connection.release();
-                return Ok(CoordinatorMutationV1::AlreadyApplied {
-                    cursor: receipt.cursor,
-                });
+
+                return Ok(StagedTurnCommit::Mutation(
+                    CoordinatorMutationV1::AlreadyApplied {
+                        cursor: receipt.cursor,
+                    },
+                ));
             }
             record_database_authority_event(
-                &mut tx,
+                tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "commit_turn",
@@ -785,16 +910,13 @@ impl DatabaseSessionContextCoordinator {
                 },
             )
             .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_rejection_audit", source))?;
-            connection.release();
-            return Err(error);
+
+            return Ok(StagedTurnCommit::Rejected(error));
         }
         if state.head.as_ref().map(|head| &head.cursor) != reservation.expected_cursor.as_ref() {
             let current_cursor = state.head.as_ref().map(|head| head.cursor.clone());
             record_database_authority_event(
-                &mut tx,
+                tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "commit_turn",
@@ -806,45 +928,39 @@ impl DatabaseSessionContextCoordinator {
                 },
             )
             .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_conflict", source))?;
-            connection.release();
-            return Ok(CoordinatorMutationV1::Conflict {
-                current_cursor,
-                safe_options: vec![
-                    CoordinatorConflictOptionV1::Refresh,
-                    CoordinatorConflictOptionV1::Fork,
-                ],
-            });
+
+            return Ok(StagedTurnCommit::Mutation(
+                CoordinatorMutationV1::Conflict {
+                    current_cursor,
+                    safe_options: vec![
+                        CoordinatorConflictOptionV1::Refresh,
+                        CoordinatorConflictOptionV1::Fork,
+                    ],
+                },
+            ));
         }
-        validate_delta_advance(state.head.as_ref(), reservation, &delta)?;
-        // Build and persist immutable canonical objects from the head held by
-        // this transaction. This removes the duplicate pre-BEGIN head read
-        // while retaining the same row-lock fence.
-        let node =
-            manifest_node_for_delta(&reservation.key, state.head.as_ref(), &delta, &segments)
-                .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_delta_advance(state.head.as_ref(), reservation, delta)?;
+        let node = &prepared.node;
         let (total_canonical_bytes, total_message_count) =
-            next_head_totals(state.head.as_ref(), &segments, delta.mode)?;
+            next_head_totals(state.head.as_ref(), segments, delta.mode)?;
         self.persist_database_immutables_in_tx(
-            &mut tx,
+            tx,
             &reservation.key,
-            &segments,
-            &node,
+            segments,
+            node,
             total_canonical_bytes,
             total_message_count,
         )
         .await?;
         if let Some(previous) = &state.last_commit {
-            archive_database_commit(&mut tx, previous).await?;
+            archive_database_commit(tx, previous).await?;
         }
         let cursor = node.cursor();
         state.head = Some(SessionContextHeadV1 {
             schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
             key: reservation.key.clone(),
             cursor: cursor.clone(),
-            latest_manifest_root: node.manifest_root,
+            latest_manifest_root: node.manifest_root.clone(),
             total_canonical_bytes,
             total_message_count,
             writer_epoch: reservation.writer_epoch,
@@ -853,14 +969,14 @@ impl DatabaseSessionContextCoordinator {
             idempotency_key: idempotency_key.to_owned(),
             reservation_id: reservation.reservation_id.clone(),
             reservation: reservation.clone(),
-            delta_hash: turn_delta_hash(&delta),
+            delta_hash: turn_delta_hash(delta),
             cursor: cursor.clone(),
         });
         state.active_reservation = None;
         // Capture the commit audit before clearing its writer: the audit
         // owner and commit-before-release order must remain unchanged.
         record_database_authority_event(
-            &mut tx,
+            tx,
             &state,
             AuthorityAuditFact {
                 operation: "commit_turn",
@@ -872,16 +988,13 @@ impl DatabaseSessionContextCoordinator {
             },
         )
         .await?;
-        if !release_writer
-            || !release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?
-        {
-            update_database_state(&mut tx, &state).await?;
+        if !release_writer || !release_committed_writer_in_tx(tx, &mut state, reservation).await? {
+            update_database_state(tx, &state).await?;
         }
-        tx.commit()
-            .await
-            .map_err(|source| database_error("commit_turn", source))?;
-        connection.release();
-        Ok(CoordinatorMutationV1::Applied { cursor })
+
+        Ok(StagedTurnCommit::Mutation(CoordinatorMutationV1::Applied {
+            cursor,
+        }))
     }
 
     pub fn new(pool: SharedPool) -> Self {
@@ -5835,11 +5948,10 @@ fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, SessionContextCo
 
 fn manifest_node_for_delta(
     key: &SessionKeyV1,
-    head: Option<&SessionContextHeadV1>,
+    parent: Option<String>,
     delta: &CanonicalTurnDeltaV1,
     segments: &[ConversationSegmentV1],
 ) -> Result<ContextManifestNodeV1, SessionCoordinationValidationError> {
-    let parent = head.map(|head| head.latest_manifest_root.clone());
     let references = segments
         .iter()
         .map(ConversationSegmentV1::reference)

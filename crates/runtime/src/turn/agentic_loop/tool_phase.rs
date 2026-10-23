@@ -32,8 +32,8 @@ use super::execution_phase::{
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, BudgetWrapupOrigin,
     CONSECUTIVE_ERROR_BUDGET, ForegroundFanoutPagination, ToolLedgerAttemptBatch,
-    extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
-    publish_introspect_snapshot, record_edge_tool_observability, try_write_heavy_checkpoint,
+    extract_file_path_from_tool, finalize_turn_trace, publish_introspect_snapshot,
+    record_edge_tool_observability, try_write_heavy_checkpoint,
 };
 use astra_turn_core::tool_call_shape::{tool_call_arguments_value, tool_call_name};
 
@@ -1869,7 +1869,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             );
             observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
             state.step_recorder.end_turn(false);
-            finalize_and_render(host, state).await;
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
 
@@ -2452,13 +2451,11 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         if let Some(error) = verification_error {
             super::execution_phase::finish_unavailable_verification(state, error);
             state.step_recorder.end_turn(false);
-            finalize_and_render(host, state).await;
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
         if let Some(error) = policy_history_error {
             super::execution_phase::finish_unavailable_policy(state, error);
             state.step_recorder.end_turn(false);
-            finalize_and_render(host, state).await;
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
 
@@ -2614,7 +2611,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 "closing repeated unchanged work-unit observations with a runtime acknowledgement"
             );
             state.step_recorder.end_turn(false);
-            finalize_and_render(host, state).await;
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
 
@@ -2650,7 +2646,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                     "terminating turn after provider-declared successful tool result"
                 );
                 state.step_recorder.end_turn(false);
-                finalize_and_render(host, state).await;
                 return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
             }
         }
@@ -2678,7 +2673,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 "terminating turn after deferred provider-declared successful tool result"
             );
             state.step_recorder.end_turn(false);
-            finalize_and_render(host, state).await;
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
 
@@ -2879,7 +2873,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             Err(error) => {
                 super::execution_phase::finish_unavailable_policy(state, error);
                 state.step_recorder.end_turn(false);
-                finalize_and_render(host, state).await;
                 return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
             }
         };
