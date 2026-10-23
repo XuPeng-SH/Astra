@@ -782,15 +782,6 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
-    /// Whether this host already owns post-loop session-memory settlement.
-    ///
-    /// Server runs schedule extraction and its lifecycle evidence after the
-    /// durable terminal response. Other hosts still use the shared turn
-    /// finalization boundary as their extraction owner.
-    fn owns_post_loop_memory_settlement(&self) -> bool {
-        false
-    }
-
     /// Publish a meaningful lifecycle stage as it begins. `started_at` comes
     /// from the owner that measures the corresponding terminal receipt, so a
     /// live graph and its completed interval share one clock boundary.
@@ -3904,32 +3895,11 @@ pub struct AgenticLoopState {
     pub session_facts: astra_turn_types::session_facts::SessionFacts,
 
     // ── Session-memory extraction (LLM-backed L1) ──
-    /// Coordinator for background session-memory extraction. When `Some`,
-    /// `finalize_and_render` calls `svc.maybe_spawn(req)` after each
-    /// turn; the service owns LLM selector resolution, selector
-    /// cooldown, in-flight dedup, the event stream, the UX broker,
-    /// AND the per-session debounce state. When `None` (tests, sub-runs
-    /// that opt out), no extraction happens and no events are emitted.
-    /// Cloned from the host service at state-build time.
-    ///
-    /// Per-session debounce state (`initialized`, `tokens_at_last_extraction`,
-    /// …) deliberately lives *inside* the service — not here — because
-    /// `AgenticLoopState` is rebuilt every turn and would lose the
-    /// debounce across turns, making the "growth delta" branch of the
-    /// gate structurally unreachable.
+    /// Shared service for explicit session finalization and sub-run wiring.
+    /// Ordinary turn completion does not schedule extraction or duplicate its
+    /// inputs. The service owns selector resolution, debounce and worker custody.
     pub memory_extraction_service:
         Option<std::sync::Arc<crate::session_memory::MemoryExtractionService>>,
-
-    /// Debounce state for the LLM-backed session-memory extractor that
-    /// writes `session-memory.md` in the background (fire-and-forget).
-    /// Persists across turns so `should_extract` can compare growth deltas.
-    /// Reset to `Default::default()` only when a new session starts.
-    ///
-    /// Wrapped in `Arc<Mutex<>>` so the background extraction task can
-    /// flip `mark_extracted` itself *after* the write completes.
-    pub session_memory_state: std::sync::Arc<
-        std::sync::Mutex<astra_turn_core::cloud_session_memory_extract::SessionMemoryState>,
-    >,
 
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
@@ -4183,7 +4153,6 @@ impl AgenticLoopState {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
-            session_memory_state: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
             session_turn: 0,
@@ -6465,7 +6434,6 @@ pub(crate) mod tests {
         cancel_child_agents_delay: Option<std::time::Duration>,
         terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
         stop_after_success_completion: Option<RuntimeSuccessfulToolCompletion>,
-        owns_post_loop_memory_settlement: bool,
 
         committed_work_synthesis: Result<bool, String>,
         committed_work_synthesis_sequence: std::collections::VecDeque<Result<bool, String>>,
@@ -6532,7 +6500,6 @@ pub(crate) mod tests {
                 cancel_child_agents_delay: None,
                 terminal_control_outcome: None,
                 stop_after_success_completion: None,
-                owns_post_loop_memory_settlement: false,
 
                 committed_work_synthesis: Ok(false),
                 committed_work_synthesis_sequence: std::collections::VecDeque::new(),
@@ -6549,11 +6516,6 @@ pub(crate) mod tests {
 
         pub(crate) fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
-            self
-        }
-
-        pub(crate) fn with_post_loop_memory_settlement_owner(mut self) -> Self {
-            self.owns_post_loop_memory_settlement = true;
             self
         }
 
@@ -6635,10 +6597,6 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
-        fn owns_post_loop_memory_settlement(&self) -> bool {
-            self.owns_post_loop_memory_settlement
-        }
-
         fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
             self.history_artifact_enabled
         }

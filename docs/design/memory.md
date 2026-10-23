@@ -50,7 +50,9 @@ The design does not require one physical backend. Vector, fulltext, graph, tabul
 
 ## Credential authority and admission
 
-Per-turn extraction and remote session-end maintenance are Server-owned. CLI
+Extraction and remote session-end maintenance are Server-owned and run at
+explicit Session close/finalize boundaries. Ordinary turns do not refresh
+long-term memory; prompt recall and explicit memory tools remain available. CLI
 exit hands off through `POST /sessions/{session_id}/memory/finalize` using the
 selected profile's fresh access token; it preserves the resumable Session and
 never falls back to a client-side purge if the handoff fails. Explicit session
@@ -105,14 +107,19 @@ validates every row against the attested Memoria owner. UC and personal Memoria
 namespaces need not equal `/auth/me.user_id`; an absent, malformed or mismatched
 attestation fails closed. No owner or grant cache is shared between operations.
 
-Fresh schema contract `2026-10-16-v103` includes `agent_session_memory_work`,
-the durable journal for the existing extraction and governance algorithms. Normal turn finalization performs a one-second bounded
-handoff of authenticated canonical extraction input before terminal completion;
-expensive inference and Memoria work remain background operations. A missed
-handoff is recovered from immutable canonical context using the existing Session
-context coordinator. Server's post-loop settlement remains its sole extraction
-dispatch point; deferring dispatch does not skip the bounded pre-terminal input
-publication. Destructive stages verify the canonical completed-turn
+Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`,
+the durable journal for extraction and governance. Ordinary turn completion
+stores conversation input only through the canonical Context coordinator: it
+does not clone the transcript into a memory job, run extraction, or create a
+second post-loop settlement worker. Close/finalize enqueues one durable task;
+the existing recovery driver materializes the latest committed Context head
+and freezes input only when that task executes. This intentionally trades
+per-turn long-term-memory freshness for fewer writes and model calls. Runtime-only
+per-turn facts are not checkpointed separately for memory; extraction derives
+content from the committed conversation and turn coordinate. No in-process
+snapshot or per-turn handoff is required for recovery.
+
+Destructive stages verify the canonical completed-turn
 watermark and wait for execution settlement. If freshness cannot be verified or
 materialization fails, working memory is retained.
 
@@ -164,8 +171,7 @@ database capacity limits; this is not a claim of unlimited horizontal throughput
 CLI exit targets its idle generation; a follow-up turn invalidates that old
 maintenance request. Explicit close settles all already-admitted extraction and
 rejects writes after the closed generation is consolidated. The close transaction
-creates the journal even when the first turn's bounded handoff never published a
-row, allowing restart recovery to discover canonical input. A previously completed
+creates its journal without requiring a per-turn snapshot, allowing restart recovery to discover canonical input. A previously completed
 CLI-exit generation cannot complete an explicit close while the existing Session
 execution slot is occupied or canonical writer/reservation authority remains live.
 Terminal Run persistence releases the slot before canonical context commit; slot

@@ -1,12 +1,11 @@
-//! Run admission control, quota gating, and post-loop memory cleanup permits.
+//! Run admission control, quota gating, and durable event metrics.
 //!
 //! This module handles:
 //! - Run admission timeouts and capacity errors
 //! - Per-user run quota enforcement
-//! - Post-loop memory cleanup concurrency control
-//! - Metrics registration for admission and cleanup subsystems
+//! - Metrics registration for admission and durable events
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
@@ -30,22 +29,9 @@ pub(super) const METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL: &str = "astra_durable_run_
 pub(super) const METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL: &str = "astra_durable_run_event_bytes_total";
 pub(super) const METRIC_DURABLE_RUN_EVENT_ROW_BUDGET: &str = "astra_durable_run_event_row_budget";
 pub(super) const METRIC_DURABLE_RUN_EVENT_BYTE_BUDGET: &str = "astra_durable_run_event_byte_budget";
-pub(super) const METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL: &str =
-    "astra_post_loop_memory_cleanup_dispatches_total";
-pub(super) const METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL: &str =
-    "astra_post_loop_memory_cleanup_workers_total";
-pub(super) const METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL: &str =
-    "astra_session_memory_post_loop_drains_total";
-pub(super) const DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY: usize = 4;
-/// The extraction worker has one bounded end-to-end deadline, including
-/// provider selection and durable snapshot I/O. Post-loop settlement runs
-/// outside the response stream, but must still outlive that contract instead
-/// of calling an in-flight memory operation failed or settled prematurely.
-pub(super) const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 45_000;
 /// Phase-0 observed behavior: run admission is count-based and every run
 /// consumes one unit regardless of prompt size.
 pub(super) const CURRENT_RUN_ADMISSION_WEIGHT_UNITS: u64 = 1;
-static POST_LOOP_MEMORY_CLEANUP_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 pub(super) fn run_admission_timeout() -> Duration {
     Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
@@ -88,14 +74,6 @@ impl From<RunAdmissionError> for PreSpawnFailureCode {
             RunAdmissionError::Cancelled => Self::PreSpawnFailure,
         }
     }
-}
-
-pub(super) fn post_loop_memory_cleanup_permits() -> Arc<tokio::sync::Semaphore> {
-    Arc::clone(POST_LOOP_MEMORY_CLEANUP_PERMITS.get_or_init(|| {
-        Arc::new(tokio::sync::Semaphore::new(
-            DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
-        ))
-    }))
 }
 
 pub(super) fn pre_spawn_failure_terminal_events(
@@ -332,23 +310,6 @@ mod model_gateway_error_tests {
     }
 }
 
-pub(super) fn register_post_loop_memory_cleanup_metrics(
-    registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
-) {
-    registry.register_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL,
-        "Post-loop memory cleanup dispatches by mode and low-cardinality outcome.",
-    );
-    registry.register_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL,
-        "Post-loop memory cleanup workers by low-cardinality outcome.",
-    );
-    registry.register_counter(
-        METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL,
-        "Post-loop session-memory extraction drains by low-cardinality outcome.",
-    );
-}
-
 pub(super) fn refresh_durable_run_event_budget_metrics(
     registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
 ) {
@@ -407,52 +368,6 @@ pub(super) fn record_durable_run_event_batch_metrics(
             .sum::<usize>()
             .try_into()
             .unwrap_or(u64::MAX),
-    );
-}
-
-pub(super) fn record_post_loop_memory_cleanup_dispatch_metrics(
-    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    mode: &'static str,
-    outcome: &'static str,
-) {
-    let Some(registry) = registry else {
-        return;
-    };
-    register_post_loop_memory_cleanup_metrics(registry);
-    registry.increment_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL,
-        &[("mode", mode), ("outcome", outcome)],
-        1,
-    );
-}
-
-pub(super) fn record_post_loop_memory_cleanup_worker_metrics(
-    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    outcome: &'static str,
-) {
-    let Some(registry) = registry else {
-        return;
-    };
-    register_post_loop_memory_cleanup_metrics(registry);
-    registry.increment_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL,
-        &[("outcome", outcome)],
-        1,
-    );
-}
-
-pub(super) fn record_session_memory_post_loop_drain_metrics(
-    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    outcome: &'static str,
-) {
-    let Some(registry) = registry else {
-        return;
-    };
-    register_post_loop_memory_cleanup_metrics(registry);
-    registry.increment_counter(
-        METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL,
-        &[("outcome", outcome)],
-        1,
     );
 }
 

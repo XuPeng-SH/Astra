@@ -80,6 +80,9 @@ worker lease and bounded retry timing. Canonical Session status, execution
 settlement and context heads remain authoritative; the journal does not grant
 memory access or create another context lifecycle. Session deletion removes
 its queued inputs through the existing deletion catalog.
+Ordinary turns create no memory-journal row or input snapshot. Explicit Session
+close/finalize enqueues maintenance; its worker materializes the latest canonical
+Context through the existing coordinator before freezing extraction input.
 
 Completed extraction drops its input transcript; publication coordinates and
 facts survive independently. Only fully successful governance retires replay

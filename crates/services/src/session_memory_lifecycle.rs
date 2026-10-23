@@ -1,5 +1,6 @@
 //! Durable session-memory work owned by the canonical session lifecycle.
-//! Request publication precedes turn completion. Short checkpoints and bounded
+//! Explicit Session close/finalize reconstructs input from canonical Context.
+//! Short checkpoints and bounded
 //! destructive cleanup take the existing session write fence, shared by all pods
 //! and turn admission; a lease selects a worker, never grants user authority.
 

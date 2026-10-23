@@ -649,11 +649,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     finalize_turn_trace(state).await;
 
-    // Publish the bounded durable handoff before terminal completion. Server
-    // runs admit extraction only at their detached post-loop boundary; other
-    // surfaces let the same service dispatch background extraction here.
-    maybe_run_memory_extraction(state, host.owns_post_loop_memory_settlement()).await;
-
     // Desired-state convergence authority is deliberately live-only. A
     // terminal turn (successful, interrupted, or cancelled) must not leave a
     // no-op writer snapshot consumable by a later run on the same long-lived
@@ -956,75 +951,6 @@ fn update_session_facts_from_turn(state: &mut super::host::AgenticLoopState) {
         .session_facts
         .set_blocked_tools(state.restricted_tools.iter().cloned().collect());
     let _ = had_error;
-}
-
-/// Bridge between turn finalization and
-/// [`crate::session_memory::MemoryExtractionService`]. Returns
-/// after a bounded durable input handoff. The service owns per-session
-/// debounce and background extraction; Server defers dispatch to its sole
-/// post-loop settlement owner without skipping the durable publication.
-async fn maybe_run_memory_extraction(state: &mut AgenticLoopState, defer_dispatch: bool) {
-    let Some(svc) = state.memory_extraction_service.clone() else {
-        return;
-    };
-    let Some(session_id) = state.current_session_id.clone() else {
-        return;
-    };
-    let Some(_user_id) = state.context_manifest_user_id.clone() else {
-        tracing::warn!(
-            session_id = %session_id,
-            "Skipping session-memory extraction: missing durable user_id"
-        );
-        return;
-    };
-    let turn_number = session_turn_number(state);
-
-    let had_error = state.error_recovery.consecutive_same_error > 0;
-
-    // Total context size the model actually sees — uncached prompt +
-    // cache reads + cache creation. Using `total_prompt` alone here
-    // was a semantic bug: on prompt-cache-heavy sessions 90% of the
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::MemoryExtractionHistoryClone,
-        &state.messages,
-    );
-    let req = crate::session_memory::ExtractionRequest {
-        inference_scope: astra_turn_types::InferenceInvocationScope::Session {
-            session_id,
-            turn: turn_number,
-            round: state.current_round_index,
-            operation_id: "memory_extraction".to_string(),
-            logical_attempt: 0,
-        },
-        messages: state.messages.clone(),
-        session_facts: state.session_facts.clone(),
-        had_error,
-        reanchors_current_objective: state
-            .turn_intent
-            .as_ref()
-            .is_some_and(|intent| intent.reanchors_current_objective()),
-    };
-
-    match tokio::time::timeout(std::time::Duration::from_secs(1), svc.prepare_request(&req)).await {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "session memory durable handoff failed");
-            return;
-        }
-        Err(_) => {
-            tracing::warn!("session memory durable handoff timed out");
-            return;
-        }
-    }
-    if defer_dispatch {
-        return;
-    }
-    match svc.maybe_spawn(req) {
-        crate::session_memory::SpawnDecision::Spawned => {}
-        crate::session_memory::SpawnDecision::Queued => {}
-        crate::session_memory::SpawnDecision::Skipped => {}
-    }
 }
 
 #[cfg(test)]
@@ -2428,17 +2354,8 @@ mod tests {
         assert_eq!(state.session_facts.recent_tool_calls.len(), 2);
     }
 
-    // ── finalize_and_render integrates MemoryExtractionService ─────────
-    //
-    // Verifies the post-wiring finalization path:
-    //   * actually calls `svc.maybe_spawn` when a service is attached
-    //   * writes `session-memory.md` on the rule-based fallback path
-    //   * emits a `session_memory_extraction` event
-    //   * is a no-op when no service is attached (test/dispatcher paths)
-
-    /// Capturing no-op Memoria client for finalize-side integration tests.
-    /// Records every `store` so assertions can verify the runner persisted
-    /// L1 content without hitting a real Memoria HTTP endpoint.
+    // Turn completion must not schedule optional extraction or duplicate its
+    // canonical input, even with an extraction service attached.
     #[derive(Default)]
     struct CapturingMemoriaForFinalize {
         stored: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
@@ -2519,7 +2436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_does_not_classify_short_user_text() {
+    async fn finalize_and_render_does_not_extract_memory_on_turn_completion() {
         let sid = format!(
             "finalize-skips-{}",
             std::time::SystemTime::now()
@@ -2548,48 +2465,14 @@ mod tests {
             .await;
         assert_eq!(pending, 0);
         assert!(
-            !memoria.stored.lock().unwrap().is_empty(),
-            "structured freshness, not message length, admits extraction"
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_and_render_defers_memory_to_post_loop_owner() {
-        let sid = format!(
-            "finalize-defers-memory-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let mut host = MockHost::new(Vec::new()).with_post_loop_memory_settlement_owner();
-        let mut state = make_state();
-        state.current_session_id = Some(sid);
-        state.context_manifest_user_id = Some("test-user".into());
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "server turn"}));
-        let (_rx, memoria) = attach_memory_extraction_service(&mut state);
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        let pending = state
-            .memory_extraction_service
-            .as_ref()
-            .expect("memory extraction service")
-            .wait_for_pending(std::time::Duration::from_millis(20))
-            .await;
-        assert_eq!(pending, 0);
-        assert!(
             memoria.stored.lock().unwrap().is_empty(),
-            "the post-loop settlement owner must admit extraction at its own boundary"
+            "turn completion must not dispatch optional session-finalization work"
         );
     }
 
     #[tokio::test]
     #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-    async fn post_loop_owner_preserves_durable_handoff_before_dispatch() {
+    async fn turn_completion_does_not_duplicate_canonical_input_in_memory_journal() {
         let settings = astra_core::MatrixOneSettings::from_env();
         crate::isolated_database::require_isolated_database(&settings.database);
         astra_services::storage::ensure_core_schema(&settings, "mysql")
@@ -2620,31 +2503,22 @@ mod tests {
             .unwrap_or_else(|_| panic!("fixture owns its service"));
         state.memory_extraction_service =
             Some(std::sync::Arc::new(svc.with_durable_store(pool.clone())));
-        let mut host = MockHost::new(Vec::new()).with_post_loop_memory_settlement_owner();
+        let mut host = MockHost::new(Vec::new());
 
         finalize_and_render(&mut host, &mut state).await;
 
-        let sqlx::types::Json(work): sqlx::types::Json<
-            astra_services::session_memory_lifecycle::SessionMemoryWork,
-        > = sqlx::query_scalar(
-            "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
         )
         .bind(&user)
         .bind(&session)
         .fetch_one(pool.get())
         .await
         .unwrap();
-        let request = work
-            .pending_request
-            .expect("terminal finalization must persist its input");
-        assert_eq!(request["session_facts"]["turn"], 1);
-        assert_eq!(request["messages"], serde_json::json!(state.messages));
-        assert!(work.latest_fingerprint.is_some());
-        assert!(
-            !work.extraction_requested,
-            "post-loop owner must admit dispatch later"
+        assert_eq!(
+            count, 0,
+            "the Context owner already holds this turn's input"
         );
-        assert!(work.active_request.is_none());
         assert_eq!(
             state
                 .memory_extraction_service
@@ -2889,13 +2763,6 @@ mod tests {
         );
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     }
-
-    // I11 test removed in rebase: the branch wired a now-deleted
-    // `memory_extraction_runner` module directly from
-    // `finalize_and_render`. Main's refactor routes session-memory
-    // extraction through a dedicated service that fires on its own
-    // schedule, not synchronously from finalize. Re-add equivalent
-    // coverage when the new service surfaces a synchronous hook.
 
     #[tokio::test]
     async fn error_triggered_l1_sets_error_state_and_builds_l1() {
