@@ -3322,12 +3322,11 @@ pub async fn run_stream_context_trace_persistence() {
         &body[..body.len().min(300)]
     );
 
-    // Wait for events to be persisted (user_query + llm_response + context_trace_signal = 3).
-    wait_for_agent_events_count(
+    super::harness::wait_for_agent_event_types(
         pool,
         user_id,
         &session_id,
-        3,
+        &["user_query", "llm_response", "context_trace_signal"],
         std::time::Duration::from_secs(15),
     )
     .await;
@@ -3598,6 +3597,15 @@ pub async fn run_stream_multi_turn_persistence() {
         count_after_turn2 >= count_after_turn1 + 3,
         "turn 2 should add >= 3 events: after_turn1={count_after_turn1}, after_turn2={count_after_turn2}"
     );
+
+    super::harness::wait_for_agent_event_type_counts(
+        pool,
+        user_id,
+        &session_id,
+        &[("context_trace_signal", 2)],
+        std::time::Duration::from_secs(15),
+    )
+    .await;
 
     // ── Verify event types across both turns ──
     let uq_count: i64 = sqlx::query_scalar(

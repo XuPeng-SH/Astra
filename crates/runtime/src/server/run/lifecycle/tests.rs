@@ -12925,8 +12925,9 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         crate::server::run::insert_active_run_session_fixture(&pool, user_id, session_id).await;
     }
 
-    let service =
+    let mut service =
         db_backed_test_service(&pool, &format!("capacity-it-owner-pod-{}", Uuid::new_v4()));
+    service.provider_observations = Some(Default::default());
     assert!(
         service.admission_limits.global.provider_slots >= 3
             && service.admission_limits.per_owner.provider_slots >= 2,
@@ -13047,44 +13048,29 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         llm.requests.load(Ordering::SeqCst) >= 3,
         "the blocked run and both independent runs must cross the provider boundary"
     );
-    // The lifecycle may issue bounded diagnostic/introspection calls in
-    // addition to the primary turn. Count the canonical primary admissions
-    // from the durable ledger so those diagnostics cannot look like duplicate
-    // user turns while this test still proves one primary admission per run.
-    let primary_fast_requests = sqlx::query(
-        "SELECT run_id, COUNT(*) AS admission_count
-         FROM model_request_context_events
-         WHERE event_stage = 'accepted'
-           AND purpose = 'primary_agent'
-           AND run_id IN (?, ?)
-         GROUP BY run_id",
-    )
-    .bind(&fast_a_run_id)
-    .bind(&fast_b_run_id)
-    .fetch_all(pool.get())
-    .await
-    .expect("count durable primary provider admissions for independent runs")
-    .into_iter()
-    .map(|row| {
-        (
-            row.try_get::<String, _>("run_id")
-                .expect("durable admission row must include run id"),
-            row.try_get::<i64, _>("admission_count")
-                .expect("durable admission row must include count"),
-        )
-    })
-    .collect::<HashMap<_, _>>();
+    // Count canonical primary requests at the real transport boundary; auxiliary
+    // diagnostics must not look like duplicate user turns. Model requests reuse
+    // Run authority and no longer create a separate durable admission record.
+    let mut primary_fast_requests = HashMap::<String, usize>::new();
+    for (scope, _) in service.provider_observations.as_ref().unwrap().requests() {
+        if scope.operation_id() == "agent_turn"
+            && let Some(run_id) = scope.run_id()
+            && [fast_a_run_id.as_str(), fast_b_run_id.as_str()].contains(&run_id)
+        {
+            *primary_fast_requests.entry(run_id.to_owned()).or_default() += 1;
+        }
+    }
     for run_id in [&fast_a_run_id, &fast_b_run_id] {
         assert_eq!(
             primary_fast_requests.get(run_id).copied(),
             Some(1),
-            "independent run {run_id} must have exactly one durable primary provider admission"
+            "independent run {run_id} must have exactly one primary provider request"
         );
     }
     assert_eq!(
         primary_fast_requests.len(),
         2,
-        "only the two independent runs should have durable primary admissions in this query"
+        "only the two independent runs should have primary provider requests in this view"
     );
     for events in [&fast_a_events, &fast_b_events] {
         assert!(
@@ -13262,31 +13248,23 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         llm.requests.load(Ordering::SeqCst) >= 5,
         "the cancelled run and every accepted terminal run must cross the provider boundary"
     );
-    let primary_terminal_requests = sqlx::query(
-        "SELECT run_id, COUNT(*) AS admission_count
-         FROM model_request_context_events
-         WHERE event_stage = 'accepted'
-           AND purpose = 'primary_agent'
-           AND run_id IN (?, ?, ?, ?)
-         GROUP BY run_id",
-    )
-    .bind(&fast_a_run_id)
-    .bind(&fast_b_run_id)
-    .bind(&resumed_original_run_id)
-    .bind(&after_cancel_run_id)
-    .fetch_all(pool.get())
-    .await
-    .expect("count durable primary provider admissions for reused sessions")
-    .into_iter()
-    .map(|row| {
-        (
-            row.try_get::<String, _>("run_id")
-                .expect("durable admission row must include run id"),
-            row.try_get::<i64, _>("admission_count")
-                .expect("durable admission row must include count"),
-        )
-    })
-    .collect::<HashMap<_, _>>();
+    let mut primary_terminal_requests = HashMap::<String, usize>::new();
+    for (scope, _) in service.provider_observations.as_ref().unwrap().requests() {
+        if scope.operation_id() == "agent_turn"
+            && let Some(run_id) = scope.run_id()
+            && [
+                fast_a_run_id.as_str(),
+                fast_b_run_id.as_str(),
+                resumed_original_run_id.as_str(),
+                after_cancel_run_id.as_str(),
+            ]
+            .contains(&run_id)
+        {
+            *primary_terminal_requests
+                .entry(run_id.to_owned())
+                .or_default() += 1;
+        }
+    }
     for run_id in [
         &fast_a_run_id,
         &fast_b_run_id,
@@ -13296,13 +13274,13 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         assert_eq!(
             primary_terminal_requests.get(run_id).copied(),
             Some(1),
-            "accepted terminal run {run_id} must have exactly one durable primary provider admission"
+            "accepted terminal run {run_id} must have exactly one primary provider request"
         );
     }
     assert_eq!(
         primary_terminal_requests.len(),
         4,
-        "only accepted terminal runs should have durable primary admissions in this query"
+        "only accepted terminal runs should have primary provider requests in this view"
     );
 
     for (user_id, run_id) in [

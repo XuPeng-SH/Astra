@@ -8901,14 +8901,6 @@ mod tests {
             );
             let mut capture = crate::execution_capture::tests::capture();
             capture.run_tree.runs[1].runtime.model_name = Some(model.clone());
-            capture
-                .reflection
-                .model_requests
-                .terminal
-                .as_mut()
-                .unwrap()
-                .groups[0]
-                .model = model.clone();
             let mut stream = crate::runner::StreamCapture::default();
             stream.identity_verified = true;
             stream.execution = Some(capture.clone());

@@ -1108,80 +1108,38 @@ pub async fn run_product_matrix_full_journey(
         tool_turn_sse.contains("\"type\":\"tool_request\""),
         "tool-backed chat should emit tool_request: {tool_turn_sse}"
     );
-    wait_for_agent_event_types(
-        pool,
-        &user_id,
-        &session_id,
-        &["context_trace_signal"],
-        std::time::Duration::from_secs(30),
-    )
-    .await;
-
-    let trace_row = {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if let Some(row) = sqlx::query(
-                "SELECT \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.turn_id')) AS turn_id, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) AS selected_tool, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.surface_scope')) AS surface_scope, \
-                     CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.tools_available')) AS SIGNED) AS tools_available \
-                 FROM agent_events \
-                 WHERE session_id = ? \
-                   AND user_id = ? \
-                   AND event_type = 'context_trace_signal' \
-                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) IS NOT NULL \
-                 ORDER BY created_at DESC \
-                 LIMIT 1",
-            )
-            .bind(&session_id)
-            .bind(&user_id)
-            .fetch_optional(pool)
-            .await
-            .expect("latest tool-backed context_trace_signal event")
-            {
-                break row;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "timeout waiting for tool-backed context_trace_signal for session_id={session_id}"
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    };
+    // Check the selected and consumed tool at the provider boundary. The
+    // latest context display is a projection of the final request and need
+    // not retain an earlier request's tool catalog or its ordering.
+    let requests = ctx.native_provider_requests().await;
+    let tool_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "user" && message["content"] == "read README through a tool"
+                })
+            })
+        })
+        .collect();
     assert!(
-        trace_row
-            .try_get::<Option<String>, _>("turn_id")
-            .ok()
-            .flatten()
-            .is_some_and(|turn_id| turn_id.starts_with("turn-")),
-        "context trace event should carry turn_id"
-    );
-    assert_eq!(
-        trace_row
-            .try_get::<Option<String>, _>("selected_tool")
-            .ok()
-            .flatten()
-            .as_deref(),
-        Some("read_file"),
-        "context trace event should persist selected tool"
+        tool_requests.iter().any(
+            |request| request.body["tools"].as_array().is_some_and(|tools| tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "read_file"))
+        )
     );
     assert!(
-        trace_row
-            .try_get::<Option<String>, _>("surface_scope")
-            .ok()
-            .flatten()
-            .is_some_and(|surface_scope| !surface_scope.is_empty()),
-        "context trace event should persist tool surface scope"
-    );
-    assert!(
-        trace_row
-            .try_get::<Option<i64>, _>("tools_available")
-            .ok()
-            .flatten()
-            .is_some_and(|tools_available| tools_available >= 1),
-        "context trace event should persist available tool count"
+        tool_requests
+            .iter()
+            .any(|request| request.body["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("from tool-backed matrix e2e"))
+                })))
     );
 
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
