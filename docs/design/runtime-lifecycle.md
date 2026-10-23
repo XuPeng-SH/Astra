@@ -190,8 +190,9 @@ occurs inside that transaction. Execution starts only within the original
 committed owner lease window. Prior-history restoration excludes the current Run's already
 persisted input, which becomes history for subsequent Runs.
 
-The shared loop exit owns terminal rendering, SessionFacts, memory input
-publication and the final checkpoint. Execution/tool phases return outcomes;
+The shared loop exit owns terminal rendering, SessionFacts and the final
+checkpoint. Canonical Context retains conversation input; memory extraction
+is owned by explicit Session close/finalize, without a second per-turn handoff. Execution/tool phases return outcomes;
 they do not independently finalize the same turn. A retained input wait keeps
 its unfinished execution and is not a terminal settlement. SessionEnd is emitted
 once at that shared boundary, after cancellation and final text normalization.
