@@ -1028,7 +1028,8 @@ fn should_queue_work_start_submission(
     // Commands that launch a turn are conversational despite a slash prefix.
     // Other slash commands are local controls and should stay responsive so
     // the user can inspect or explicitly switch Sessions while Work starts.
-    !trimmed.starts_with('/') || submission_starts_conversation(trimmed)
+    !slash_dispatch::parse_submission(trimmed).is_command()
+        || submission_starts_conversation(trimmed)
 }
 
 /// Returns whether a pristine Work start still owns the sessionless identity.
@@ -1068,8 +1069,7 @@ fn release_work_start_submissions(
         }
     }
 
-    let restored = pending.drain(..).collect::<Vec<_>>().join("\n\n");
-    bottom_pane.restore_into_composer(&restored);
+    bottom_pane.restore_inputs_into_composer(pending.drain(..));
     false
 }
 
@@ -1091,7 +1091,7 @@ fn restore_work_start_submissions_after_scope_change(
     if restored.is_empty() {
         return 0;
     }
-    bottom_pane.restore_into_composer(&restored.join("\n\n"));
+    bottom_pane.restore_inputs_into_composer(&restored);
     restored.len()
 }
 
@@ -2771,7 +2771,7 @@ fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut
         }
     }
     if !interactive.is_empty() {
-        bottom_pane.restore_into_composer(&interactive.join("\n\n"));
+        bottom_pane.restore_inputs_into_composer(interactive);
     }
 }
 
@@ -2791,7 +2791,7 @@ fn active_submission_belongs_to_next_turn(
     output_has_settled: bool,
     foreground_lifecycle_transferred: bool,
 ) -> bool {
-    text.trim_start().starts_with('/')
+    slash_dispatch::parse_submission(text).is_command()
         || submission_belongs_to_next_turn(output_has_settled, foreground_lifecycle_transferred)
 }
 
@@ -2896,7 +2896,7 @@ fn should_start_queued_followups(
 fn model_facing_followup_backlog(queued: &VecDeque<NextTurnSubmission>) -> bool {
     queued.iter().any(|entry| {
         matches!(entry, NextTurnSubmission::Conversation { .. })
-            || !entry.text().trim_start().starts_with('/')
+            || !slash_dispatch::parse_submission(entry.text()).is_command()
     })
 }
 
@@ -3070,7 +3070,9 @@ fn admit_idle_followup(
 fn submission_starts_conversation(text: &str) -> bool {
     let trimmed = text.trim_start();
     slash_plan_goal(trimmed).is_some()
-        || (!trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('!'))
+        || (!trimmed.is_empty()
+            && !slash_dispatch::parse_submission(trimmed).is_command()
+            && !trimmed.starts_with('!'))
 }
 
 /// Handle the explicit composer action before guidance admission. Local
@@ -7145,12 +7147,15 @@ enum SubmissionProjection<'a> {
 }
 
 fn submission_projection(text: &str) -> SubmissionProjection<'_> {
-    if let Some(goal) = slash_plan_goal(text) {
-        SubmissionProjection::Conversation(goal)
-    } else if text.trim_start().starts_with('/') {
-        SubmissionProjection::LocalAction(text)
-    } else {
-        SubmissionProjection::Conversation(text)
+    match slash_dispatch::parse_submission(text) {
+        slash_dispatch::SubmissionInput::Command(text) => match slash_plan_goal(text) {
+            Some(goal) => SubmissionProjection::Conversation(goal),
+            None => SubmissionProjection::LocalAction(text),
+        },
+        slash_dispatch::SubmissionInput::Conversation(text)
+        | slash_dispatch::SubmissionInput::Literal(text) => {
+            SubmissionProjection::Conversation(text)
+        }
     }
 }
 
@@ -8400,7 +8405,7 @@ pub(crate) async fn run_tui_session(
                     }
                     let auto_submit = work_start_succeeded && work_is_current && stale.is_empty();
                     if !stale.is_empty() {
-                        bottom_pane.restore_into_composer(&stale.join("\n\n"));
+                        bottom_pane.restore_inputs_into_composer(stale);
                         chat_widget.commit_system(history_cell::system::SystemCell::info(
                             "A message queued for the previous Work Session was kept in the composer after the Session changed. Review it before sending.",
                         ));
@@ -8412,8 +8417,7 @@ pub(crate) async fn run_tui_session(
                             &mut queued_followup_submissions,
                         )
                     } else {
-                        let restored = pending.drain(..).collect::<Vec<_>>().join("\n\n");
-                        bottom_pane.restore_into_composer(&restored);
+                        bottom_pane.restore_inputs_into_composer(pending.drain(..));
                         false
                     };
                     if scheduled {
@@ -8454,9 +8458,7 @@ pub(crate) async fn run_tui_session(
                         .map(|submission| submission.text)
                         .collect::<Vec<_>>();
                     if !pending.is_empty() {
-                        bottom_pane.restore_into_composer(
-                            &pending.into_iter().collect::<Vec<_>>().join("\n\n"),
-                        );
+                        bottom_pane.restore_inputs_into_composer(pending);
                     }
                     chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
                         "Work start stopped before the Server replied: {error}. Your message is kept in the composer; retry `/work start <goal>` when ready.",
@@ -9009,7 +9011,7 @@ pub(crate) async fn run_tui_session(
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 }
 
-                                if continuation.is_none() && text.trim_start().starts_with('/')
+                                if continuation.is_none() && slash_dispatch::parse_submission(&text).is_command()
                                     && inline_chat_submit.is_none()
                                 {
                                     // Snapshot the session identity before a
@@ -9286,9 +9288,17 @@ pub(crate) async fn run_tui_session(
                                     }
                                     frame_requester.schedule_frame();
                                 } else {
+                                    let parsed = slash_dispatch::parse_submission(&text);
                                     let literal_submission = continuation.is_some()
-                                        || inline_chat_submit.is_some();
-                                    let submit_text = inline_chat_submit.unwrap_or(text);
+                                        || inline_chat_submit.is_some()
+                                        || parsed.is_literal();
+                                    let submit_text = if let Some(goal) = inline_chat_submit {
+                                        goal
+                                    } else if continuation.is_some() {
+                                        text
+                                    } else {
+                                        parsed.text().to_owned()
+                                    };
                                     if !runtime_notification_submission
                                         && crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(
                                             &state,
@@ -10127,7 +10137,7 @@ pub(crate) async fn run_tui_session(
                                                                             intent_id.clone(),
                                                                             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
                                                                             astra_turn_types::UserIntentStatus::AcceptedLocal,
-                                                                            queued_text.clone(),
+                                                                            slash_dispatch::parse_submission(&queued_text).text().to_owned(),
                                                                         ) {
                                                                             // Empty input is not a guidance intent. It can be
                                                                             // produced by an internal wake-up submission and must
@@ -10177,7 +10187,7 @@ pub(crate) async fn run_tui_session(
                                                                                     remote_run_id: &submission_run_id,
                                                                                     run_control: &submission_run_control,
                                                                                     intent_id: &submission_intent_id,
-                                                                                    text: &submission_text,
+                                                                                    text: slash_dispatch::parse_submission(&submission_text).text(),
                                                                                     background_work_snapshot: Some(&active_work_snapshot),
                                                                                     work_unit_observations: &active_work_observations,
                                                                                 },
@@ -11188,7 +11198,7 @@ pub(crate) async fn run_tui_session(
                                         &mut queued_followup_submissions,
                                         locally_owned_user_intents
                                             .iter()
-                                            .map(|intent| intent.text.clone()),
+                                            .map(|intent| slash_dispatch::conversation_for_composer(&intent.text).into_owned()),
                                         &mut post_output_submissions,
                                         should_start_followups,
                                     ) {
@@ -22843,6 +22853,186 @@ mod tests {
                 ..
             }) if text == "Opened session reflection"
         ));
+    }
+
+    #[tokio::test]
+    async fn escaped_slash_auth_rejection_restores_a_message_not_a_command() {
+        for raw in ["//stop", "//plan inspect", "///tmp/path"] {
+            let effective = slash_dispatch::parse_submission(raw).text();
+            let queue: RestoreInputQueue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut ui = ui_adapter::TuiUiAdapter::new(tx, queue.clone(), "escaped-submit", None);
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            let outcome = crate::cli::turn::turn_entry::handle_chat_input_with_ui(
+                crate::cli::turn::turn_entry::ChatInput::Conversation(effective.to_string()),
+                None,
+                crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+                &mut state,
+                crate::cli::turn::turn_entry::TurnContext {
+                    api: &api,
+                    profile: None,
+                    post_commit_tx: None,
+                    admission: None,
+                    explain_analyze_terminal_degraded: None,
+                },
+                &mut ui,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                crate::cli::turn::turn_entry::InteractiveTurnOutcome::NotStarted
+            ));
+            let request = take_restore_input_request(&queue).expect("rejected input retained");
+            for (draft, prefix) in [
+                ("", ""),
+                ("continue", "continue\n\n"),
+                ("//existing", "/existing\n\n"),
+            ] {
+                let mut pane = explicit_followup_pane();
+                pane.composer.set_text(draft);
+                assert!(apply_restore_input_request(
+                    &request,
+                    None,
+                    Some("escaped-submit"),
+                    &mut pane,
+                    &mut std::collections::HashSet::new(),
+                ));
+                let expected = format!("{prefix}{effective}");
+                assert_eq!(
+                    submission_projection(&pane.composer.text()),
+                    SubmissionProjection::Conversation(&expected)
+                );
+            }
+            assert_eq!(state.turn, 0);
+        }
+    }
+
+    #[test]
+    fn escaped_slash_submissions_remain_literal_across_projection_and_queueing() {
+        for (raw, effective) in [
+            ("//tmp/project inspect this", "/tmp/project inspect this"),
+            ("//plan inspect this", "/plan inspect this"),
+            ("//stop", "/stop"),
+            ("//", "/"),
+            ("//login", "/login"),
+            ("///tmp/project", "//tmp/project"),
+            ("  //tmp/path", "/tmp/path"),
+        ] {
+            assert_eq!(
+                submission_projection(raw),
+                SubmissionProjection::Conversation(effective),
+                "{raw}"
+            );
+            assert!(submission_starts_conversation(raw), "{raw}");
+            assert!(should_flush_submission_immediately(raw), "{raw}");
+            assert!(slash_dispatch::immediate_control(raw).is_none(), "{raw}");
+            assert!(!slash_dispatch::is_model_picker_request(raw), "{raw}");
+            assert!(!active_submission_belongs_to_next_turn(raw, false, false));
+            assert!(should_queue_work_start_submission(
+                raw,
+                false,
+                true,
+                None,
+                Some(7),
+                7
+            ));
+            let guidance = LocalRunControl::guidance_input(
+                slash_dispatch::parse_submission(raw).text(),
+                None,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(guidance["content"], effective);
+            let mut pane = explicit_followup_pane();
+            pane.try_accept_user_intent(
+                "escaped-guidance",
+                astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                astra_turn_types::UserIntentStatus::AcceptedLocal,
+                effective,
+            )
+            .unwrap();
+            let local = pane.take_client_recoverable_user_intents();
+            let mut followups = VecDeque::new();
+            let mut post = VecDeque::new();
+            settle_followup_submissions(
+                &mut followups,
+                local.iter().map(|intent| {
+                    slash_dispatch::conversation_for_composer(&intent.text).into_owned()
+                }),
+                &mut post,
+                true,
+            );
+            assert_eq!(
+                submission_projection(followups[0].text()),
+                SubmissionProjection::Conversation(effective)
+            );
+            for (index, (draft, prefix)) in [
+                ("", ""),
+                ("continue", "continue\n\n"),
+                ("//existing", "/existing\n\n"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                pane.composer.set_text(draft);
+                let intent_id = format!("returned-guidance-{index}");
+                pane.try_accept_user_intent(
+                    &intent_id,
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    effective,
+                )
+                .unwrap();
+                assert!(pane.return_user_intent(
+                    &intent_id,
+                    astra_turn_types::UserIntentStatus::Returned,
+                    effective
+                ));
+                let expected = format!("{prefix}{effective}");
+                assert_eq!(
+                    submission_projection(&pane.composer.text()),
+                    SubmissionProjection::Conversation(&expected)
+                );
+            }
+            let queued = VecDeque::from([NextTurnSubmission::Interactive(raw.to_string())]);
+            assert!(model_facing_followup_backlog(&queued));
+            assert_eq!(queued.front().unwrap().text(), raw, "queue keeps raw input");
+            let mut widget = chat_widget::ChatWidget::new(String::new());
+            commit_submission_projection(&mut widget, raw);
+            let event = widget.history()[0].to_persist().unwrap();
+            assert!(matches!(event,
+                crate::tui::turn_event::TurnEvent::User { text, .. } if text == effective
+            ));
+        }
+        for command in ["/stop", "/login", "/hlep", "/he"] {
+            assert!(matches!(
+                submission_projection(command),
+                SubmissionProjection::LocalAction(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn restored_fragments_decode_once_before_encoding_the_merged_boundary() {
+        for (draft, expected) in [
+            ("", "/stop\n\n//tmp/624"),
+            ("continue", "continue\n\n/stop\n\n//tmp/624"),
+            ("//existing", "/existing\n\n/stop\n\n//tmp/624"),
+            (" ", "/stop\n\n//tmp/624"),
+        ] {
+            let mut pane = explicit_followup_pane();
+            pane.composer.set_text(draft);
+            restore_queued_input(
+                interactive_queue(["//stop".into(), "///tmp/624".into()]),
+                &mut pane,
+            );
+            assert_eq!(
+                submission_projection(&pane.composer.text()),
+                SubmissionProjection::Conversation(expected)
+            );
+        }
     }
 
     #[test]

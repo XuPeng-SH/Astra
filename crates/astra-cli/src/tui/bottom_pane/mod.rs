@@ -642,7 +642,9 @@ impl BottomPane {
         };
         self.pending_user_intents.remove(index);
         self.applied_user_intent_ids.insert(intent_id.to_string());
-        self.restore_into_composer(runtime_content);
+        self.restore_into_composer(&super::slash_dispatch::conversation_for_composer(
+            runtime_content,
+        ));
         true
     }
 
@@ -650,15 +652,46 @@ impl BottomPane {
     /// preserving any draft the user is currently editing by appending
     /// beneath it. Never silently drop user input.
     pub fn restore_into_composer(&mut self, text: &str) {
-        if text.trim().is_empty() {
-            return;
+        self.restore_inputs_into_composer(std::iter::once(text));
+    }
+
+    /// Merge raw composer fragments before encoding the leading command
+    /// boundary. Joining escaped fragments first would leave interior escapes
+    /// in the model's message. Typed continuations use their captured target.
+    pub(crate) fn restore_inputs_into_composer(
+        &mut self,
+        inputs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        use super::slash_dispatch::{conversation_for_composer, parse_submission};
+        let existing = self.composer.text();
+        let parsed = parse_submission(&existing);
+        let mut literal = parsed.is_literal();
+        let mut merged = parsed.text().to_owned();
+        let mut changed = false;
+        let mut has_content = !merged.trim().is_empty();
+        for input in inputs {
+            let text = input.as_ref();
+            if text.trim().is_empty() {
+                continue;
+            }
+            let parsed = parse_submission(text);
+            if !has_content {
+                literal = parsed.is_literal();
+                has_content = true;
+            }
+            if !merged.is_empty() {
+                merged.truncate(merged.trim_end().len());
+                merged.push_str("\n\n");
+            }
+            merged.push_str(parsed.text());
+            changed = true;
         }
-        if self.composer.is_empty() {
-            self.composer.set_text(text);
-        } else {
-            let existing = self.composer.text();
-            self.composer
-                .set_text(&format!("{}\n\n{}", existing.trim_end(), text));
+        if changed {
+            if literal {
+                self.composer.set_text(&conversation_for_composer(&merged));
+            } else {
+                self.composer.set_text(&merged);
+            }
         }
     }
 
