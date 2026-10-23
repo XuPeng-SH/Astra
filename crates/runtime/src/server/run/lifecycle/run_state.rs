@@ -408,6 +408,7 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                 durable_event_type(event),
                 Some(
                     "text_done"
+                        | "tool_call_end"
                         | "runtime.control.handoff.requested"
                         | "runtime.control.handoff.rejected"
                         | "run_error"
@@ -422,6 +423,12 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
             )
         })
         .cloned()
+        .map(|mut event| {
+            if let Some(object) = event.as_object_mut() {
+                object.remove(TOOL_TERMINAL_LIVE_EMITTED_FIELD);
+            }
+            event
+        })
         .collect()
 }
 
@@ -432,16 +439,15 @@ pub fn streaming_final_event_for_replay(event: &Value) -> bool {
     )
 }
 
-/// Internal settlement fence written only on the retained copy after the
-/// ordered fanout has durably committed the tool terminal. The persisted/wire
-/// copy is clean, so this field never becomes public protocol.
-pub(crate) const TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD: &str =
-    "_astra_tool_terminal_durably_fanned_out";
+/// Process-local delivery watermark on retained copies only. It suppresses
+/// duplicate attached-stream delivery, never authorizes execution or proves
+/// durable effect settlement. Persisted and wire copies must be clean.
+pub(crate) const TOOL_TERMINAL_LIVE_EMITTED_FIELD: &str = "_astra_tool_terminal_live_emitted";
 
-pub fn tool_terminal_requires_settlement_repair(event: &Value) -> bool {
+pub fn tool_terminal_requires_live_repair(event: &Value) -> bool {
     durable_event_type(event) == Some("tool_call_end")
         && event
-            .get(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD)
+            .get(TOOL_TERMINAL_LIVE_EMITTED_FIELD)
             .and_then(Value::as_bool)
             != Some(true)
 }
@@ -451,15 +457,17 @@ pub fn tool_terminal_requires_settlement_repair(event: &Value) -> bool {
 ///
 /// Tool progress is delivered incrementally and may be coalesced when an
 /// observer falls behind. A tool terminal is different from ordinary
-/// progress: settlement repairs it unless the ordered fanout durably committed
-/// it. Replaying a successfully delivered terminal on the same
+/// progress: convergence repairs it unless the ordered fanout emitted it.
+/// Replaying an already emitted terminal on the same
 /// attached stream is not idempotence; it is a duplicate public event.
 pub fn streaming_convergence_event_for_replay(event: &Value) -> bool {
-    streaming_final_event_for_replay(event) || tool_terminal_requires_settlement_repair(event)
+    streaming_final_event_for_replay(event) || tool_terminal_requires_live_repair(event)
 }
 
 pub fn streaming_event_for_persistence(event: &Value) -> bool {
-    streaming_final_event_for_replay(event) || live_delta_event_for_persistence(event)
+    streaming_final_event_for_replay(event)
+        || durable_event_type(event) == Some("tool_call_end")
+        || live_delta_event_for_persistence(event)
 }
 
 fn durable_agent_communication(event: &Value) -> bool {
@@ -714,33 +722,23 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
             | "agent_waiting"
             | "agent_cancelled"
             | "agent_interrupted"
-            | "tool_call"
-            | "tool_call_start"
-            | "tool_routing_decision"
-            | "tool_transport_started"
-            | "tool_transport_completed"
-            | "tool_transport_failed"
-            | "tool_call_end"
     )
 }
 
 pub fn push_active_run_live_event(run: &mut RunState, event: Value) {
-    // The process-local replay cache mirrors durable reconnect boundaries.
-    // Transient activity (for example per-round agent progress) is delivered
-    // directly to current observers and must not accumulate here.
-    if !live_delta_event_for_persistence(&event) {
+    // Keep bounded tool outcomes for same-process reconnects. Cross-process
+    // observers obtain those outcomes with the terminal batch; transient tool
+    // progress goes directly to current observers without database writes.
+    fn retained(event: &Value) -> bool {
+        live_delta_event_for_persistence(event)
+            || durable_event_type(event) == Some("tool_call_end")
+    }
+    if !retained(&event) {
         return;
     }
     run.events.push(event);
-    while run
-        .events
-        .iter()
-        .filter(|event| live_delta_event_for_persistence(event))
-        .count()
-        > MAX_ACTIVE_RUN_LIVE_EVENTS
-    {
-        let Some(oldest_live_event) = run.events.iter().position(live_delta_event_for_persistence)
-        else {
+    while run.events.iter().filter(|event| retained(event)).count() > MAX_ACTIVE_RUN_LIVE_EVENTS {
+        let Some(oldest_live_event) = run.events.iter().position(retained) else {
             break;
         };
         run.events.remove(oldest_live_event);

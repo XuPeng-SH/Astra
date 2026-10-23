@@ -1593,16 +1593,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / context",
         product_owner="session handoff lifecycle and recovery",
     ),
-    "session_transcript_projection_heads": TableMetadata(
-        semantic_owner="astra_services::context::transcript_projection",
-        state_class="durable transcript projection sequence head",
-        primary_query="transcript projection head by user_id/session_id, completed_turn, journal_event_seq, conversation_seq, and canonical_root_hash",
-        retention_policy="retain the current projection checkpoint while transcript replay and compaction need it; replace during projection repair and remove with session cleanup",
-        rebuildability="advance only through contiguous canonical cursor promotion with complete materialized evidence; MAX(item_seq) cannot certify commitment",
-        merge_guidance="keep separate from session_context_heads, transcript items, manifests, and events; this is transcript projection state keyed by projection sequence, not canonical history",
-        migration_owner="astra_services::storage / context",
-        product_owner="transcript materialization, compaction, and projection recovery",
-    ),
     "mcp_servers": TableMetadata(
         semantic_owner="astra_services::mcp_registry",
         state_class="durable MCP server registry fact",

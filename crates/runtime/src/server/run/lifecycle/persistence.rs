@@ -1279,6 +1279,21 @@ async fn persist_server_loop_canonical_append_inner(
         None
     };
 
+    // Context and the original transcript belong to the same commit. The
+    // cursor was just issued by the coordinator under this Run's Session fence;
+    // a second projection head must not certify it after the terminal is visible.
+    if let Some(cursor) = canonical_context_cursor.as_ref() {
+        bind_run_transcript_to_cursor_in_tx(
+            &mut tx,
+            append.user_id,
+            append.session_id,
+            append.run_id,
+            cursor,
+        )
+        .await
+        .map_err(|error| format!("canonical transcript settlement failed: {error}"))?;
+    }
+
     let terminal_commit = if let Some(settlement) = settlement {
         let store = DatabaseRunStateStore::new(pool.clone());
         match store
@@ -2689,8 +2704,7 @@ pub(crate) async fn materialize_server_run_transcript_evidence(
     }
     if let Some(cursor) = canonical_cursor
         && let Err(error) =
-            commit_run_transcript_projection_in_tx(&mut tx, user_id, session_id, run_id, cursor)
-                .await
+            bind_run_transcript_to_cursor_in_tx(&mut tx, user_id, session_id, run_id, cursor).await
     {
         return Err(rollback_materialized_transcript_transaction(
             tx,
@@ -2707,40 +2721,10 @@ fn transcript_cursor_i64(field: &'static str, value: u64) -> Result<i64, sqlx::E
         .map_err(|_| sqlx::Error::Protocol(format!("{field} exceeds MatrixOne BIGINT")))
 }
 
-fn projection_cursor_from_row(
-    row: &sqlx::mysql::MySqlRow,
-    user_id: &str,
-    session_id: &str,
-) -> Result<SessionCursorV1, sqlx::Error> {
-    let completed_turn = row.try_get::<i64, _>("completed_turn")?;
-    let completed_turn = u32::try_from(completed_turn).map_err(|_| {
-        sqlx::Error::Protocol("transcript projection completed_turn is invalid".to_string())
-    })?;
-    let non_negative = |field: &'static str| -> Result<u64, sqlx::Error> {
-        u64::try_from(row.try_get::<i64, _>(field)?)
-            .map_err(|_| sqlx::Error::Protocol(format!("transcript projection {field} is invalid")))
-    };
-    Ok(SessionCursorV1 {
-        schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
-        owner_id: user_id.to_string(),
-        session_id: session_id.to_string(),
-        branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
-        completed_turn,
-        journal_event_seq: non_negative("journal_event_seq")?,
-        conversation_seq: non_negative("conversation_seq")?,
-        canonical_root_hash: row.try_get("canonical_root_hash")?,
-        projection_schema: u32::try_from(non_negative("projection_schema")?).map_err(|_| {
-            sqlx::Error::Protocol("transcript projection projection_schema is invalid".to_string())
-        })?,
-        compaction_generation: non_negative("compaction_generation")?,
-        config_version_id: row.try_get("config_version_id")?,
-    })
-}
-
-/// Promote all transcript material for one run and its causal cursor in one
-/// transaction. The projection head advances only one canonical turn at a
-/// time, so a missed/crashed projection cannot be hidden by a later turn.
-async fn commit_run_transcript_projection_in_tx(
+/// Bind original raw history to the Context cursor issued in this transaction.
+/// The caller owns the Session fence and the canonical commit; this helper does
+/// not derive conversation truth from trace, a display row, or a second head.
+async fn bind_run_transcript_to_cursor_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
@@ -2765,71 +2749,8 @@ async fn commit_run_transcript_projection_in_tx(
             "canonical transcript cursor is structurally invalid".to_string(),
         ));
     }
-    let stored = sqlx::query(
-        "SELECT completed_turn, journal_event_seq, conversation_seq,
-                canonical_root_hash, projection_schema, compaction_generation,
-                config_version_id
-         FROM session_transcript_projection_heads
-         WHERE user_id = ? AND session_id = ?
-         FOR UPDATE",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .map(|row| projection_cursor_from_row(&row, user_id, session_id))
-    .transpose()?;
-    match stored.as_ref() {
-        Some(stored) if stored == cursor => {}
-        Some(stored) if stored.completed_turn.checked_add(1) == Some(cursor.completed_turn) => {}
-        None if cursor.completed_turn == 1 => {}
-        Some(stored) => {
-            return Err(sqlx::Error::Protocol(format!(
-                "transcript projection cannot advance from canonical turn {} to {}",
-                stored.completed_turn, cursor.completed_turn
-            )));
-        }
-        None => {
-            return Err(sqlx::Error::Protocol(format!(
-                "transcript projection is missing the prefix before canonical turn {}",
-                cursor.completed_turn
-            )));
-        }
-    }
-
     let completed_turn = i64::from(cursor.completed_turn);
     let conversation_seq = transcript_cursor_i64("conversation_seq", cursor.conversation_seq)?;
-    let transcript_rows = sqlx::query(
-        "SELECT canonical_completed_turn, canonical_conversation_seq, canonical_root_hash
-         FROM session_transcript_items
-         WHERE user_id = ? AND session_id = ? AND run_id = ?
-         FOR UPDATE",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(run_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    if transcript_rows.is_empty() {
-        return Err(sqlx::Error::Protocol(
-            "run transcript has no material to commit".to_string(),
-        ));
-    }
-    for row in transcript_rows {
-        let stored_turn = row.try_get::<Option<i64>, _>("canonical_completed_turn")?;
-        let stored_sequence = row.try_get::<Option<i64>, _>("canonical_conversation_seq")?;
-        let stored_root = row.try_get::<Option<String>, _>("canonical_root_hash")?;
-        let is_uncommitted =
-            stored_turn.is_none() && stored_sequence.is_none() && stored_root.is_none();
-        let is_exact = stored_turn == Some(completed_turn)
-            && stored_sequence == Some(conversation_seq)
-            && stored_root.as_deref() == Some(cursor.canonical_root_hash.as_str());
-        if !is_uncommitted && !is_exact {
-            return Err(sqlx::Error::Protocol(
-                "run transcript conflicts with its canonical projection".to_string(),
-            ));
-        }
-    }
     sqlx::query(
         "UPDATE session_transcript_items
          SET canonical_completed_turn = ?, canonical_conversation_seq = ?,
@@ -2846,39 +2767,6 @@ async fn commit_run_transcript_projection_in_tx(
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(
-        "INSERT INTO session_transcript_projection_heads
-         (user_id, session_id, completed_turn, journal_event_seq,
-          conversation_seq, canonical_root_hash, projection_schema,
-          compaction_generation, config_version_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
-         ON DUPLICATE KEY UPDATE
-           completed_turn = VALUES(completed_turn),
-           journal_event_seq = VALUES(journal_event_seq),
-           conversation_seq = VALUES(conversation_seq),
-           canonical_root_hash = VALUES(canonical_root_hash),
-           projection_schema = VALUES(projection_schema),
-           compaction_generation = VALUES(compaction_generation),
-           config_version_id = VALUES(config_version_id),
-           updated_at = NOW(6)",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(completed_turn)
-    .bind(transcript_cursor_i64(
-        "journal_event_seq",
-        cursor.journal_event_seq,
-    )?)
-    .bind(conversation_seq)
-    .bind(&cursor.canonical_root_hash)
-    .bind(i64::from(cursor.projection_schema))
-    .bind(transcript_cursor_i64(
-        "compaction_generation",
-        cursor.compaction_generation,
-    )?)
-    .bind(&cursor.config_version_id)
-    .execute(&mut **tx)
-    .await?;
     Ok(())
 }
 
@@ -5894,14 +5782,6 @@ mod tests {
         session_id: &str,
         user_id: &str,
     ) {
-        sqlx::query(
-            "DELETE FROM session_transcript_projection_heads WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .execute(db)
-        .await
-        .expect("cleanup transcript fixture projection head");
         sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
@@ -5929,14 +5809,6 @@ mod tests {
         session_id: &str,
         user_id: &str,
     ) {
-        sqlx::query(
-            "DELETE FROM session_transcript_projection_heads WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .execute(db)
-        .await
-        .expect("cleanup core persist projection head");
         sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
             .bind(user_id)
@@ -8654,7 +8526,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn committed_transcript_projection_is_contiguous_atomic_and_idempotent() {
+    async fn raw_transcript_cursor_binding_is_owner_scoped_and_idempotent() {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let user_id = Uuid::new_v4().to_string();
@@ -8711,66 +8583,34 @@ mod tests {
             .expect("cursor-only materialization and exact retry");
         }
 
-        let run_three = Uuid::new_v4().to_string();
-        persist_session_transcript_items(
-            &pool,
-            &user_id,
-            &session_id,
-            &[TranscriptPersistItem {
-                run_id: Some(run_three.clone()),
-                role: "user",
-                content: "turn three without two".to_string(),
-                payload: None,
-                source_event_id: Uuid::new_v4().to_string(),
-            }],
-        )
-        .await
-        .expect("insert gap transcript");
-        let cursor_three = SessionCursorV1 {
-            completed_turn: 3,
-            journal_event_seq: 3,
-            conversation_seq: 3,
-            canonical_root_hash: "c".repeat(64),
+        let committed: (Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT canonical_completed_turn, canonical_conversation_seq, canonical_root_hash FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        ).bind(&user_id).bind(&session_id).bind(&run_one).fetch_one(&db).await.unwrap();
+        assert_eq!(
+            committed,
+            (
+                Some(1),
+                Some(1),
+                Some(cursor_one.canonical_root_hash.clone())
+            )
+        );
+        let wrong_cursor = SessionCursorV1 {
+            owner_id: "another-owner".into(),
             ..cursor_one.clone()
         };
-        let mut gap_tx = db.begin().await.expect("begin gap projection");
-        let gap = commit_run_transcript_projection_in_tx(
-            &mut gap_tx,
-            &user_id,
-            &session_id,
-            &run_three,
-            &cursor_three,
-        )
-        .await
-        .expect_err("projection gap must fail closed");
-        gap_tx.rollback().await.expect("rollback projection gap");
-        assert!(matches!(gap, sqlx::Error::Protocol(_)));
-
-        let head_turn = sqlx::query(
-            "SELECT completed_turn FROM session_transcript_projection_heads
-             WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .fetch_one(&db)
-        .await
-        .expect("projection head")
-        .try_get::<i64, _>("completed_turn")
-        .expect("decode projection head");
-        assert_eq!(head_turn, 1);
-        let uncommitted = sqlx::query(
-            "SELECT canonical_completed_turn FROM session_transcript_items
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&run_three)
-        .fetch_one(&db)
-        .await
-        .expect("gap item")
-        .try_get::<Option<i64>, _>("canonical_completed_turn")
-        .expect("decode gap item");
-        assert_eq!(uncommitted, None);
+        let mut tx = db.begin().await.unwrap();
+        assert!(
+            bind_run_transcript_to_cursor_in_tx(
+                &mut tx,
+                &user_id,
+                &session_id,
+                &run_one,
+                &wrong_cursor
+            )
+            .await
+            .is_err()
+        );
+        tx.rollback().await.unwrap();
         sqlx::query(
             "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
         )

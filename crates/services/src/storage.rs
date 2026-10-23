@@ -4196,26 +4196,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "session_transcript_projection_heads",
-        "CREATE TABLE IF NOT EXISTS session_transcript_projection_heads (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            completed_turn BIGINT NOT NULL,
-            journal_event_seq BIGINT NOT NULL,
-            conversation_seq BIGINT NOT NULL,
-            canonical_root_hash VARCHAR(64) NOT NULL,
-            projection_schema BIGINT NOT NULL,
-            compaction_generation BIGINT NOT NULL,
-            config_version_id VARCHAR(128) NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "prompt_request_records",
         "CREATE TABLE IF NOT EXISTS prompt_request_records (
             request_id VARCHAR(64) NOT NULL,

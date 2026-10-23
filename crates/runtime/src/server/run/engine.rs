@@ -546,6 +546,12 @@ pub struct RunStartContext {
     pub turn_intent_policy: TurnIntentExecutionPolicy,
     pub skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    /// A binding known before Run creation belongs to its atomic opening batch.
+    /// Provisioned capacity establishes this pair later, after claiming the Run.
+    pub(crate) initial_execution_contract: Option<(
+        crate::server::tool_transport::ExecutionBindingSnapshot,
+        astra_turn_types::StopHookObligations,
+    )>,
     /// Exact runtime child instance, distinct from its reusable agent profile.
     /// Only an internal child admission may establish this recovery identity.
     pub(crate) child_runtime_id: Option<String>,
@@ -603,6 +609,7 @@ impl Default for RunStartContext {
             turn_intent_policy: TurnIntentExecutionPolicy::default(),
             skill_auto_route_policy: SkillAutoRouteExecutionPolicy::default(),
             execution_metadata: None,
+            initial_execution_contract: None,
             child_runtime_id: None,
             collaborator_stage: None,
             execution_restrictions: None,
@@ -2135,6 +2142,18 @@ impl RunEngine {
             .map(runtime_profile_label)
             .map(str::to_string);
         let run_started_data = run_started_event_data(&context);
+        let mut events = vec![serde_json::json!({
+            "event_type": "run_started",
+            "data": run_started_data,
+        })];
+        if let Some((snapshot, completion_checks)) = context.initial_execution_contract.as_ref() {
+            events.extend(super::binding_resolution::binding_snapshot_events(
+                run_id,
+                session_id,
+                snapshot,
+                completion_checks,
+            ));
+        }
         let record = DurableRunRecord {
             terminal_receipt_json: None,
             run_id: run_id.to_string(),
@@ -2170,10 +2189,7 @@ impl RunEngine {
             runtime_profile,
             start_request_fingerprint: context.start_request_fingerprint,
             work_binding: context.work_binding,
-            events: vec![serde_json::json!({
-                "event_type": "run_started",
-                "data": run_started_data
-            })],
+            events,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -7736,6 +7752,56 @@ mod tests {
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
         assert_eq!(run.events[0]["data"]["skill_auto_route_policy"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn opening_batch_contains_the_known_execution_contract_once() {
+        let engine = test_engine();
+        let binding = crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+            crate::server::tool_transport::WorkspaceBinding::none(),
+            crate::server::tool_transport::ExecutorBinding::server_control_plane(),
+        );
+        let checks = astra_turn_types::StopHookObligations {
+            declarations: Default::default(),
+            phase: astra_turn_types::CompletionCheckPhase::Stop,
+        };
+        let context = RunStartContext {
+            initial_execution_contract: Some((binding.clone(), checks.clone())),
+            ..Default::default()
+        };
+        engine
+            .start_run_with_context("known-binding", "user-1", "sess-1", context.clone())
+            .await
+            .unwrap();
+        let run = engine
+            .load_run("user-1", "known-binding")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.events.len(),
+            3,
+            "one Run opening plus the exact workspace/executor pair"
+        );
+        assert_eq!(
+            super::super::binding_resolution::durable_run_execution_contract(&run).unwrap(),
+            (binding, checks)
+        );
+        let claim = engine
+            .claim_run_with_context("known-binding", "user-1", "sess-1", Some("sess-1"), context)
+            .await
+            .unwrap();
+        assert!(matches!(claim, DurableRunStartClaim::Existing { .. }));
+        assert_eq!(
+            engine
+                .load_run("user-1", "known-binding")
+                .await
+                .unwrap()
+                .unwrap()
+                .events,
+            run.events,
+            "an exact retry must not append a second binding pair"
+        );
     }
 
     #[tokio::test]

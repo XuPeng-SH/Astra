@@ -559,11 +559,15 @@ impl AgenticRunLifecycleService {
         );
         configure_runtime_controllers(
             &self.matrixone,
-            self.shared_pool.as_ref(),
+            self.shared_pool
+                .as_ref()
+                .filter(|_| astra_services::runs::run_requested_explain_analyze(run)),
             &mut state,
             &run.user_id,
             &run.session_id,
-            self.trace_ingestion.clone(),
+            self.trace_ingestion
+                .clone()
+                .filter(|_| astra_services::runs::run_requested_explain_analyze(run)),
         )
         .await;
         let mut executor = self.build_root_runtime_tool_executor(

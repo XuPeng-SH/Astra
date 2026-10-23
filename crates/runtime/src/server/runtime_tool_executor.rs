@@ -10116,9 +10116,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_freezes_control_attribution_without_provider_policy() {
-        use astra_services::runs::WorkInvocationAttribution;
-
+    async fn tool_search_executes_without_creating_a_durable_effect_receipt() {
         let (mut executor, _dir) = test_executor();
         executor.enable_durable_invocations();
         let identity = astra_turn_types::ToolInvocationIdentity::new(
@@ -10146,24 +10144,12 @@ pub(crate) mod tests {
             )
             .await;
         assert!(!result.is_error, "{result:?}");
-        let record = executor
-            .invocation_ledger
-            .as_ref()
-            .unwrap()
-            .get(&identity)
-            .await
-            .unwrap()
-            .unwrap();
-        let decision =
-            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(
-                &record.decision,
-            )
-            .unwrap();
-        assert_eq!(
-            decision.work_attribution,
-            WorkInvocationAttribution::Control
+        assert!(
+            executor
+                .durable_invocation_record_for_test(&identity)
+                .await
+                .is_none()
         );
-        assert!(decision.provider_policy.is_none());
     }
 
     #[test]
