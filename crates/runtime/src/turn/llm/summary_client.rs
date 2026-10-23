@@ -458,6 +458,7 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            admitted_at: std::time::Instant::now(),
             price_snapshot: None,
             offering_id: "summary-offering".to_string(),
             source_identity: None,

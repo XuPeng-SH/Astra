@@ -1797,6 +1797,10 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         let mut admitted_tool_call_control = super::host::AdmittedToolCallControl::Continue;
         let mut delegation_model_admissions = std::collections::HashMap::new();
         if !admitted_logical_calls.is_empty() {
+            state
+                .messaging
+                .ensure_mailbox_for_tools(&admitted_logical_calls)
+                .await?;
             let delivered = host
                 .handle_admitted_tool_invocations(state, &admitted_tool_calls)
                 .await;

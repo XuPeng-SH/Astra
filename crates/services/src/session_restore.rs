@@ -1702,12 +1702,15 @@ impl SessionRestoreService for HybridRestoreService {
             None => return Ok(Vec::new()),
         };
 
-        let rows = sqlx::query(
+        let mut select = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
          COALESCE(event_summary.turn_count, 0) AS turn_count, \
          latest_model.llm_model_used AS latest_model \
-         FROM agent_sessions s \
-         LEFT JOIN ( \
+         FROM ",
+        );
+        crate::auth::session::push_session_activity_source(&mut select, user_id);
+        select.push(
+            " LEFT JOIN ( \
            SELECT user_id, session_id, COALESCE(MAX(CASE WHEN parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count \
            FROM agent_events \
            GROUP BY user_id, session_id \
@@ -1725,13 +1728,14 @@ impl SessionRestoreService for HybridRestoreService {
            WHERE rn = 1 \
          ) latest_model \
            ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
-         WHERE s.user_id = ? AND s.status IN ('active', 'paused') \
-         ORDER BY s.updated_at DESC LIMIT 20",
-        )
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("list_resumable: {e}"))?;
+         WHERE s.status IN ('active', 'paused') \
+         ORDER BY s.activity_at DESC, s.session_id DESC LIMIT 20",
+        );
+        let rows = select
+            .build()
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("list_resumable: {e}"))?;
 
         let mut sessions = Vec::new();
         for row in &rows {

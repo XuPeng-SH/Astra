@@ -158,24 +158,41 @@ Retention is a product contract:
 
 - Event ids should be stable and collision-resistant.
 - Ingestion should be idempotent.
-- Session event counters commit in the same transaction as their inserted event
-  rows, including terminal settlement and trace repair. Replay contributes no
-  insertion delta; a lost commit acknowledgement must not trigger a separate
-  counter update.
-- Fresh root admission commits the Run identity and execution slot, Context
-  writer/turn reservation, `user_query` audit, transcript, and inserted-only
-  event counter in one transaction. The original Run opening-event receipt
-  proves the batch after a lost acknowledgement. A collision rolls back the
-  entire admission. Standalone capture retains its collision receipt without
-  projecting conflicting text. Structured intents without a prompt retain
-  transcript-only capture. Resume does not admit a second input.
+- Diagnostic event counters commit with their inserted diagnostic rows. Exact
+  replay contributes no insertion delta. They count captured diagnostics, not
+  conversation turns or user-visible messages.
+- Fresh root admission commits Run identity, execution slot, Context writer/turn
+  reservation and original input transcript in one transaction. The Run opening
+  receipt proves the batch after a lost acknowledgement. Raw identity conflicts
+  roll back admission. Resume does not admit a second original input.
+- Raw conversation history stores original input, applied user guidance and the
+  actual terminal assistant answer with its model-item identity. It does not
+  copy tool starts/results: Run events, canonical Context and effect receipts
+  retain their existing responsibilities. Paused output does not occupy the
+  final-answer identity. Compaction cannot replace the original user input.
+- Raw append validates database identity equality in bounded batches. Exact
+  owner, nullable Run, role, content and immutable payload must match; the full
+  stored content hash must also verify. Assistant reasoning/status are separate
+  presentation enrichment. Unknown JSON fields remain immutable identity.
+  Conflicts in any chunk roll back the entire transaction, including earlier
+  siblings. Exact replay allocates no new sequence and preserves enrichment.
 - Root execution commits canonical Context (segments, manifest, head, operation
-  receipt and owned writer release) with Run terminal, semantic usage, audit
-  and transcript in one transaction. Context rejection leaves the Run active;
-  Run rejection rolls back Context too. The generation-scoped settlement
-  receipt binds the exact Context request and resulting cursor, so retry and
-  lost COMMIT acknowledgement resolve the same atomic fact rather than a
-  second Context write. Standalone coordinator callers use the same mutation.
+  receipt and writer release), raw transcript, Run terminal and semantic usage
+  together. Context rejection leaves the Run active; Run rejection rolls back
+  Context too. Lost acknowledgement resolves the exact generation-scoped Run
+  receipt and reads matching raw identities and Context commitments. Recovery
+  cannot repair absent history or accept conflicting facts.
+- Session list/GET/resumable recency is the later of explicit Session metadata
+  activity and the current server/default-branch reachable manifest's immutable
+  creation time. It does not use mutable Context controller timestamps or Run
+  history aggregation. Seek cursors and ordering use the same full-precision
+  timestamp, with Session ID breaking ties. Missing/fork-inherited Context
+  falls back to Session metadata; no read repairs or activity writes occur.
+- Optional `agent_events` diagnostics neither authorize nor gate conversation
+  admission, settlement or replay. Ordinary root/resumed execution and children
+  do not write diagnostic copies during execution or terminal cleanup. Explicit
+  root Explain uses the existing bounded ingestion owner; legacy diagnostic
+  turn lists can be sparse and are not a conversation authority.
 - Context display publication follows canonical terminal settlement in the
   existing tracked cleanup task. Workspace projections no longer block model
   completion; `context_trace_signal` uses the bounded ingestion worker and its
@@ -185,8 +202,6 @@ Retention is a product contract:
   exact affected-row count plus distinct, bounded identities avoids rereading
   newly inserted rows. Partial insertion, duplicate identities, replay and
   possible truncation retain owner-scoped hash/write-marker classification.
-- Terminal capture batches core conversation events and LLM/tool trace events
-  through the same writer, sharing session admission and insertion readback.
 - The existing asynchronous ingestion worker combines eligible session heads
   into count- and charged-byte-bounded transactions. The aggregate event bound
   or earliest absolute flush deadline triggers dispatch; owner round-robin and

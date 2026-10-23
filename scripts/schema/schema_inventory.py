@@ -1426,7 +1426,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "conversation_manifest_nodes": TableMetadata(
         semantic_owner="astra_services::context::manifest",
         state_class="durable immutable context manifest graph authority",
-        primary_query="manifest root and parent lineage by owner session/branch, conversation_seq, compaction_generation, and reachable state",
+        primary_query="manifest root and parent lineage by owner session/branch, conversation_seq, compaction_generation, and reachable state; current committed manifest creation time supplies Session read recency",
         retention_policy="retain reachable manifests and their lineage while session context can be restored; garbage-collect unreachable nodes only after pins and heads no longer reference them",
         rebuildability="not rebuildable from session_context_heads alone because parent lineage, root hashes, and reachability are manifest authority",
         merge_guidance="keep separate from session_context_heads, manifest segments, events, and receipts; the manifest graph is immutable context authority, not a current projection or operation acknowledgment",
@@ -1516,7 +1516,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "session_context_heads": TableMetadata(
         semantic_owner="astra_services::context::heads",
         state_class="mixed current context projection plus live coordination/fencing authority",
-        primary_query="current context head by owner session/branch, latest_manifest_root, canonical_root_hash, completed_turn, and sequence counters",
+        primary_query="current context head by owner session/branch, latest_manifest_root, canonical_root_hash, completed_turn, and sequence counters; selected manifest joins provide Session read recency without controller timestamps",
         retention_policy="retain the current head while the session/branch is live; replace transactionally and delete with the owning session after manifest/event cleanup",
         rebuildability="manifest/sequence projection and root are repairable from manifests, authority events, and receipts; while active writer/reservation leases, expiry, writer_epoch, or authority epochs are live, the entire row is not safely rebuildable",
         merge_guidance="keep separate from manifest/events/receipts: heads are a current projection, manifests own canonical lineage, events own authority history, and receipts own idempotency outcomes; active writer, reservation, and fencing coordination remain distinct from repairable projection state",

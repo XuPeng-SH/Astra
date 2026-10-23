@@ -290,43 +290,6 @@ pub trait UserIntentProvider: Send + Sync {
         Err("atomic action admission is not supported by this run-control provider".to_string())
     }
 
-    /// Durably close admission for new current-run intents before the final
-    /// model-boundary poll. Implementations with a remote durable queue must
-    /// serialize this fence with intent append operations.
-    async fn fence_user_intent_submissions(
-        &self,
-        _user_id: &str,
-        _expected_session_id: &str,
-        _run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        match authority {
-            UserIntentAdmissionAuthority::ProcessLocal => Ok(()),
-            UserIntentAdmissionAuthority::DurableOwnerGeneration(_) => Err(
-                "durable user-intent admission fencing is not supported by this provider"
-                    .to_string(),
-            ),
-        }
-    }
-
-    /// Reopen current-run intent admission when settlement discovered guidance
-    /// and the same run will continue through another model boundary.
-    async fn reopen_user_intent_submissions(
-        &self,
-        _user_id: &str,
-        _expected_session_id: &str,
-        _run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        match authority {
-            UserIntentAdmissionAuthority::ProcessLocal => Ok(()),
-            UserIntentAdmissionAuthority::DurableOwnerGeneration(_) => Err(
-                "durable user-intent admission reopening is not supported by this provider"
-                    .to_string(),
-            ),
-        }
-    }
-
     /// Poll `user_intent` events appended to a durable run after the
     /// provided exclusive cursor.
     async fn poll_user_intents(

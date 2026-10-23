@@ -324,6 +324,13 @@ independent Session in the same directory. The canonical binding generation
 fences delayed work for its own Session. The executor-owned workspace lease is
 the only physical-operation serialization boundary.
 
+Idle controller changes and recovery-point capture inspect actual Session
+execution occupancy under the same Session/slot fence as Run admission. An
+occupied slot, active child, paused Run awaiting input, or terminal executor
+with a live owner lease blocks that boundary even when no Controller writer
+lease exists. Recovery capture reports active execution and publishes no point
+until that execution has settled.
+
 ## Unhappy paths
 
 | Failure | Required behavior |

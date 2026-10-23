@@ -4736,6 +4736,7 @@ mod tests {
         persistence: Arc<dyn InferenceLedgerPersistence>,
     ) -> DurableInferenceLedger {
         let execution = astra_services::AdmittedModelExecution {
+            admitted_at: std::time::Instant::now(),
             price_snapshot: None,
             offering_id: "offering-test".to_string(),
             source_identity: None,

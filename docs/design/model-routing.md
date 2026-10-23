@@ -527,3 +527,7 @@ embedding the complete authorized model catalog in the prompt. Catalog
 observation is explicit through `model_catalog`; selecting an actual named
 child model uses the existing authorized selector at that admission boundary.
 Unused catalog services do not become dependencies of ordinary model rounds.
+
+Model execution material carries the original trusted admission time. Moving or
+cloning that material into another host does not restart its validity window;
+an expired catalog admission must refresh before the next model request.

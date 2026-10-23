@@ -3385,7 +3385,6 @@ pub enum AtomicRunGuidanceAdmission {
     Inactive {
         status: String,
     },
-    SettlementFenced,
     ConsumerNotLive {
         run: Box<DurableRunRecord>,
         /// Only a process-local store may safely perform the legacy orphan
@@ -3393,78 +3392,6 @@ pub enum AtomicRunGuidanceAdmission {
         /// transaction that could pause a newly recovered owner generation.
         process_local_recovery_safe: bool,
     },
-    Missing,
-}
-
-/// Desired state of the durable current-run guidance admission gate.
-///
-/// Each transition is a journal fact, not a mutable boolean. Reading the
-/// latest fact by `(user_id, run_id, event_type, event_idx)` gives a bounded
-/// control-plane view even when the run has a large provider/tool history.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RunUserIntentAdmissionTransition {
-    Fence,
-    Reopen,
-}
-
-impl RunUserIntentAdmissionTransition {
-    fn event_type(self) -> &'static str {
-        match self {
-            Self::Fence => "user_intent_settlement_fenced",
-            Self::Reopen => "user_intent_admission_reopened",
-        }
-    }
-
-    fn desired_fenced(self) -> bool {
-        matches!(self, Self::Fence)
-    }
-}
-
-/// Immutable authority for one settlement-gate transition.
-///
-/// `expected_owner_generation` is a process-held capability captured when the
-/// executor claimed the run. A database implementation must compare it with
-/// the locked row and must not reconstruct it from current durable state.
-#[derive(Clone, Copy, Debug)]
-pub struct AtomicRunUserIntentAdmissionTransitionRequest<'a> {
-    pub user_id: &'a str,
-    pub run_id: &'a str,
-    pub expected_session_id: &'a str,
-    pub expected_owner_generation: u64,
-    pub transition: RunUserIntentAdmissionTransition,
-}
-
-/// Typed result of one linearized settlement-gate transition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AtomicRunUserIntentAdmissionTransition {
-    Changed {
-        event_index: i64,
-    },
-    /// The fence fact is durably present after an ambiguous commit ACK. This
-    /// proves settlement custody only; it is never authority to continue the
-    /// executor or enter another provider boundary.
-    DurableFactRecovered {
-        event_index: i64,
-    },
-    /// A reopen fact is present and the exact caller still held live execution
-    /// authority when the store revalidated it under the run lock.
-    LiveReopenAuthorized {
-        event_index: Option<i64>,
-    },
-    AlreadyInState {
-        event_index: Option<i64>,
-    },
-    Inactive {
-        status: String,
-    },
-    OwnerGenerationMismatch {
-        actual_owner_generation: u64,
-    },
-    OwnerMismatch {
-        actual_owner_pod_id: Option<String>,
-    },
-    OwnerLeaseExpired,
-    IdentityConflict,
     Missing,
 }
 
@@ -3556,7 +3483,6 @@ pub enum AtomicRunUserIntentApply {
     AlreadyApplied { event_indices: Vec<i64> },
     Returned { event_indices: Vec<i64> },
     RunTerminalReturned,
-    SettlementFenced,
     Inactive { status: String },
     OwnerGenerationMismatch { actual_owner_generation: u64 },
     OwnerMismatch { actual_owner_pod_id: Option<String> },
@@ -5269,13 +5195,60 @@ pub trait RunStartTransactionParticipant: Send + Sync {
 /// be consumed in its admitting transaction, before that transaction changes
 /// run metadata or appends run events. It is not a cache or execution grant.
 pub struct RunMutationAdmission {
-    run: DurableRunRecord,
-    cancellation_requested: bool,
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    generation: u64,
+    operation: RunMutationOperation,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunMutationOperation {
+    Opening,
+    Observed,
+    Terminal,
 }
 
 impl RunMutationAdmission {
+    fn from_record(run: &DurableRunRecord, operation: RunMutationOperation) -> Self {
+        Self {
+            user_id: run.user_id.clone(),
+            session_id: run.session_id.clone(),
+            run_id: run.run_id.clone(),
+            generation: run.run_generation,
+            operation,
+        }
+    }
+
     pub(crate) fn owns_session(&self, user_id: &str, session_id: &str) -> bool {
-        self.run.user_id == user_id && self.run.session_id == session_id
+        self.user_id == user_id && self.session_id == session_id
+    }
+
+    pub(crate) fn authorizes_context_terminal(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.operation == RunMutationOperation::Terminal
+            && self.owns_session(user_id, session_id)
+            && self.run_id == run_id
+            && self.generation == generation
+    }
+}
+
+/// Locked metadata for operations which actually need the current row. A
+/// successful conditional terminal write needs only the smaller private proof.
+pub struct LockedRunMutation {
+    run: DurableRunRecord,
+    cancellation_requested: bool,
+    admission: RunMutationAdmission,
+}
+
+impl LockedRunMutation {
+    pub fn admission(&self) -> &RunMutationAdmission {
+        &self.admission
     }
 }
 
@@ -6176,22 +6149,6 @@ pub trait RunStateStore: Send + Sync {
         _request: AtomicRunGuidanceAdmissionRequest<'_>,
     ) -> Result<AtomicRunGuidanceAdmission, String> {
         Err("atomic run guidance admission is not implemented for this run store".to_string())
-    }
-
-    /// Atomically change the durable current-run guidance admission gate.
-    ///
-    /// Shared stores must lock the exact run, validate the caller's execution
-    /// capability, append the journal fact, and advance its projection in one
-    /// transaction. The default fails closed so callers cannot fall back to a
-    /// snapshot followed by a generic event append.
-    async fn transition_user_intent_admission(
-        &self,
-        _request: AtomicRunUserIntentAdmissionTransitionRequest<'_>,
-    ) -> Result<AtomicRunUserIntentAdmissionTransition, String> {
-        Err(
-            "atomic user-intent admission transition is not implemented for this run store"
-                .to_string(),
-        )
     }
 
     /// Atomically append exact `user_intent_applied` facts without hydrating
@@ -7548,120 +7505,6 @@ fn run_events_have_same_immutable_payload(
     logical_run_event(left) == logical_run_event(right)
 }
 
-fn user_intent_admission_transition_event(
-    run_id: &str,
-    transition: RunUserIntentAdmissionTransition,
-    after_event_index: i64,
-) -> serde_json::Value {
-    let event_type = transition.event_type();
-    serde_json::json!({
-        "event_type": event_type,
-        "idempotency_key": format!("{event_type}:{run_id}:{after_event_index}"),
-        "data": {"after_event_index": after_event_index},
-    })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct UserIntentAdmissionGate {
-    event_index: i64,
-    transition: RunUserIntentAdmissionTransition,
-    after_event_index: Option<i64>,
-}
-
-impl UserIntentAdmissionGate {
-    fn blocks_pending_sources(self, source_event_indices: &[i64]) -> Result<bool, String> {
-        if !self.transition.desired_fenced() {
-            return Ok(false);
-        }
-        let cutoff = self.after_event_index.ok_or_else(|| {
-            format!(
-                "user-intent admission fence at event {} has no valid cutoff",
-                self.event_index
-            )
-        })?;
-        Ok(source_event_indices
-            .iter()
-            .any(|source_event_index| *source_event_index > cutoff))
-    }
-}
-
-fn latest_user_intent_admission_transition(
-    events: &[serde_json::Value],
-) -> Option<UserIntentAdmissionGate> {
-    events
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(position, event)| {
-            let transition = match extract_event_type(event).as_str() {
-                "user_intent_settlement_fenced" => RunUserIntentAdmissionTransition::Fence,
-                "user_intent_admission_reopened" => RunUserIntentAdmissionTransition::Reopen,
-                _ => return None,
-            };
-            let event_index = event
-                .get("index")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(position as i64);
-            Some(UserIntentAdmissionGate {
-                event_index,
-                transition,
-                after_event_index: event
-                    .pointer("/data/after_event_index")
-                    .and_then(serde_json::Value::as_i64),
-            })
-        })
-}
-
-fn decode_user_intent_admission_gate_row(
-    row: &sqlx::mysql::MySqlRow,
-    run_id: &str,
-    operation: &'static str,
-) -> Result<UserIntentAdmissionGate, String> {
-    let event_type: String = row
-        .try_get("event_type")
-        .map_err(|source| db_error(operation, run_id, source).to_string())?;
-    let event_index: i64 = row
-        .try_get("event_idx")
-        .map_err(|source| db_error(operation, run_id, source).to_string())?;
-    let payload_json: String = row
-        .try_get("payload_json")
-        .map_err(|source| db_error(operation, run_id, source).to_string())?;
-    let event_hash: String = row
-        .try_get("event_hash")
-        .map_err(|source| db_error(operation, run_id, source).to_string())?;
-    if event_hash != sha256_hex(payload_json.as_bytes()) {
-        return Err(format!(
-            "{operation} found corrupt user-intent admission gate at event {event_index} for run {run_id}"
-        ));
-    }
-    let event: serde_json::Value = serde_json::from_str(&payload_json).map_err(|source| {
-        format!(
-            "{operation} could not decode user-intent admission gate at event {event_index} for run {run_id}: {source}"
-        )
-    })?;
-    let transition = match event_type.as_str() {
-        "user_intent_settlement_fenced" => RunUserIntentAdmissionTransition::Fence,
-        "user_intent_admission_reopened" => RunUserIntentAdmissionTransition::Reopen,
-        _ => {
-            return Err(format!(
-                "{operation} loaded unexpected admission gate type {event_type} for run {run_id}"
-            ));
-        }
-    };
-    if extract_event_type(&event) != event_type {
-        return Err(format!(
-            "{operation} found mismatched admission gate identity at event {event_index} for run {run_id}"
-        ));
-    }
-    Ok(UserIntentAdmissionGate {
-        event_index,
-        transition,
-        after_event_index: event
-            .pointer("/data/after_event_index")
-            .and_then(serde_json::Value::as_i64),
-    })
-}
-
 /// Canonical user-facing content for accepted durable user intent payloads.
 /// Runtime prompt injection delegates to this function so the authoritative
 /// store and consumer cannot derive different immutable applied facts.
@@ -8703,9 +8546,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 status: run.status.clone(),
             });
         }
-        if run_guidance_admission_is_fenced(&run.events) {
-            return Ok(AtomicRunGuidanceAdmission::SettlementFenced);
-        }
+
         let durable_lease_live = run.owner_pod_id.is_some()
             && in_memory_action_owner_lease_is_active(run).unwrap_or(false);
         if !request.process_local_execution_live && !durable_lease_live {
@@ -8748,87 +8589,6 @@ impl RunStateStore for InMemoryRunStateStore {
         };
         projections.insert(run.run_id.clone(), projection);
         Ok(AtomicRunGuidanceAdmission::Committed { event_index })
-    }
-
-    async fn transition_user_intent_admission(
-        &self,
-        request: AtomicRunUserIntentAdmissionTransitionRequest<'_>,
-    ) -> Result<AtomicRunUserIntentAdmissionTransition, String> {
-        validate_expected_run_session_id(request.expected_session_id)?;
-        let action_fence = self.action_fence_for(request.user_id, request.run_id);
-        let _action_fence = action_fence.lock_owned().await;
-        let mut runs = self.runs.write().await;
-        let Some(run) = runs.get_mut(request.run_id).filter(|run| {
-            run.user_id == request.user_id && run.session_id == request.expected_session_id
-        }) else {
-            return Ok(AtomicRunUserIntentAdmissionTransition::Missing);
-        };
-
-        if !matches!(
-            durable_run_status_kind(&run.status),
-            DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
-        ) {
-            return Ok(AtomicRunUserIntentAdmissionTransition::Inactive {
-                status: run.status.clone(),
-            });
-        }
-        if run.run_generation != request.expected_owner_generation {
-            return Ok(
-                AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                    actual_owner_generation: run.run_generation,
-                },
-            );
-        }
-        let latest = latest_user_intent_admission_transition(&run.events);
-        let currently_fenced = latest
-            .as_ref()
-            .is_some_and(|gate| gate.transition.desired_fenced());
-        if currently_fenced == request.transition.desired_fenced() {
-            let event_index = latest.map(|gate| gate.event_index);
-            return Ok(match request.transition {
-                RunUserIntentAdmissionTransition::Fence => {
-                    AtomicRunUserIntentAdmissionTransition::AlreadyInState { event_index }
-                }
-                RunUserIntentAdmissionTransition::Reopen => {
-                    AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized { event_index }
-                }
-            });
-        }
-
-        let after_event_index = run.last_event_idx;
-        let mut event = user_intent_admission_transition_event(
-            request.run_id,
-            request.transition,
-            after_event_index,
-        );
-        let event_count = i64::try_from(run.events.len())
-            .map_err(|_| format!("run {} event count exceeds i64", request.run_id))?;
-        let event_index = after_event_index
-            .checked_add(1)
-            .ok_or_else(|| format!("run {} event index overflow", request.run_id))?
-            .max(event_count);
-        if let Some(object) = event.as_object_mut() {
-            object.insert("index".to_string(), serde_json::json!(event_index));
-        }
-        run.events.push(event);
-        run.last_event_idx = event_index;
-        run.updated_at = chrono::Utc::now().to_rfc3339();
-
-        let mut projections = self.projections.write().await;
-        let projection = projections
-            .entry(run.run_id.clone())
-            .or_insert_with(|| build_run_display_projection(run, None, None));
-        if projection.projection_event_idx <= event_index {
-            projection.projection_event_idx = event_index;
-            projection.latest_event_type = Some(request.transition.event_type().to_string());
-            projection.projection_hash = event_metadata_projection_patch_hash(
-                &run.run_id,
-                event_index,
-                Some(request.transition.event_type()),
-            );
-            projection.updated_at = run.updated_at.clone();
-        }
-        Ok(AtomicRunUserIntentAdmissionTransition::Changed { event_index })
     }
 
     async fn apply_run_user_intents(
@@ -8886,11 +8646,11 @@ impl RunStateStore for InMemoryRunStateStore {
                 source,
                 UserIntentStatus::Returned,
             )?;
-            expected.push((*source_index, applied, returned));
+            expected.push((applied, returned));
         }
         if (request.purpose.dispatch_owner().is_some()
             || request.purpose.disposition() == UserIntentStatus::Returned)
-            && expected.iter().any(|(_, applied, _)| {
+            && expected.iter().any(|(applied, _)| {
                 applied.pointer("/data/delivery")
                     != Some(&serde_json::json!(UserIntentDelivery::GuideCurrentRun))
             })
@@ -8899,7 +8659,7 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         let unique_intent_count = expected
             .iter()
-            .filter_map(|(_, applied, _)| extract_optional_string(applied, "idempotency_key"))
+            .filter_map(|(applied, _)| extract_optional_string(applied, "idempotency_key"))
             .collect::<std::collections::HashSet<_>>()
             .len();
         if unique_intent_count != expected.len() {
@@ -8909,8 +8669,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let mut already_applied = Vec::new();
         let mut returned_count = 0_usize;
         let mut pending = Vec::new();
-        let mut pending_source_indices = Vec::new();
-        for (source_index, applied, returned) in &expected {
+        for (applied, returned) in &expected {
             let applied_key = extract_optional_string(applied, "idempotency_key")
                 .expect("validated applied event has an idempotency key");
             let returned_key = extract_optional_string(returned, "idempotency_key")
@@ -8952,7 +8711,6 @@ impl RunStateStore for InMemoryRunStateStore {
                         applied.clone()
                     },
                 );
-                pending_source_indices.push(*source_index);
             }
         }
 
@@ -8982,15 +8740,6 @@ impl RunStateStore for InMemoryRunStateStore {
         if request.invocation_identity.is_some() {
             return Err(ToolInteractionAdmissionError::Unsupported.to_string());
         }
-        let latest_fence = latest_user_intent_admission_transition(&run.events);
-        if let Some(latest_fence) = latest_fence {
-            match latest_fence.blocks_pending_sources(&pending_source_indices) {
-                Ok(true) => return Ok(AtomicRunUserIntentApply::SettlementFenced),
-                Ok(false) => {}
-                Err(_) => return Ok(AtomicRunUserIntentApply::IdentityConflict),
-            }
-        }
-
         let mut next_event_index = run
             .last_event_idx
             .checked_add(1)
@@ -11566,10 +11315,6 @@ pub struct DatabaseRunStateStore {
     #[cfg(test)]
     guidance_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
-    user_intent_control_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(test)]
-    user_intent_control_commit_recovery_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
-    #[cfg(test)]
     user_intent_apply_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     execution_boundary_authorization_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -11639,13 +11384,6 @@ const USER_INTENT_CONTROL_DELTA_SELECT_SQL: &str = "SELECT payload_json, event_i
         ORDER BY event_idx ASC LIMIT ?)
      ) AS bounded_user_intent_control
      ORDER BY event_idx ASC LIMIT ?";
-
-const GUIDANCE_LATEST_FENCE_SELECT_SQL: &str =
-    "SELECT event_type, event_idx, event_hash, payload_json FROM agent_run_events
-     WHERE user_id = ? AND run_id = ?
-       AND event_type IN ('user_intent_settlement_fenced',
-                          'user_intent_admission_reopened')
-     ORDER BY event_idx DESC LIMIT 1 FOR UPDATE";
 
 const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, event_type, event_id, idempotency_key, event_hash, \
             producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
@@ -12363,12 +12101,6 @@ impl DatabaseRunStateStore {
                 false,
             )),
             #[cfg(test)]
-            user_intent_control_commit_ack_loss_once: std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
-            #[cfg(test)]
-            user_intent_control_commit_recovery_barrier: None,
-            #[cfg(test)]
             user_intent_apply_commit_ack_loss_once: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
@@ -12844,22 +12576,6 @@ impl DatabaseRunStateStore {
     }
 
     #[cfg(test)]
-    fn with_user_intent_control_commit_ack_loss_once(self) -> Self {
-        self.user_intent_control_commit_ack_loss_once
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self
-    }
-
-    #[cfg(test)]
-    fn with_user_intent_control_commit_recovery_barrier(
-        mut self,
-        barrier: std::sync::Arc<tokio::sync::Barrier>,
-    ) -> Self {
-        self.user_intent_control_commit_recovery_barrier = Some(barrier);
-        self
-    }
-
-    #[cfg(test)]
     fn with_user_intent_apply_commit_ack_loss_once(self) -> Self {
         self.user_intent_apply_commit_ack_loss_once
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -12947,6 +12663,15 @@ impl DatabaseRunStateStore {
                 "canonical settlement requires a terminal outcome and expected states".into(),
             );
         }
+        if request
+            .expected_statuses
+            .iter()
+            .any(|status| durable_run_status_is_terminal(status))
+        {
+            return Err("canonical terminal claim requires active expected states".into());
+        }
+        let generation = i64::try_from(request.expected_owner_generation)
+            .map_err(|_| "Run generation exceeds BIGINT")?;
         let origin = cancelled_terminal_origin(request.status, request.events)?;
         let error_code = terminal_error_code_from_transition(
             request.status,
@@ -12972,7 +12697,7 @@ impl DatabaseRunStateStore {
             .push(", owner_pod_id = NULL, owner_lease_expires_at = NULL, updated_at = NOW(6) WHERE user_id = ")
             .push_bind(request.user_id).push(" AND session_id = ").push_bind(request.expected_session_id)
             .push(" AND run_id = ").push_bind(request.run_id)
-            .push(" AND run_generation = ").push_bind(request.expected_owner_generation as i64)
+            .push(" AND run_generation = ").push_bind(generation)
             .push(" AND owner_pod_id = ").push_bind(&self.owner_pod_id)
             .push(" AND owner_lease_expires_at >= NOW(6) AND terminal_receipt_json IS NULL AND last_event_idx = ")
             .push_bind(expected_event_idx).push(" AND status IN (");
@@ -12984,19 +12709,24 @@ impl DatabaseRunStateStore {
         if origin != Some(DurableCancellationOrigin::User) {
             update.push(" AND cancellation_requested_at IS NULL");
         }
-        update.push(" RETURNING ").push(AGENT_RUN_COLUMNS);
-        let row = update
+        update.push(
+            " AND EXISTS (SELECT 1 FROM agent_session_execution_slots slot
+            WHERE slot.user_id = agent_runs.user_id AND slot.session_id = agent_runs.session_id
+              AND slot.run_id = agent_runs.run_id)",
+        );
+        let affected = update
             .build()
-            .fetch_optional(&mut **tx)
+            .execute(&mut **tx)
             .await
-            .map_err(|error| error.to_string())?;
-        row.map(|row| {
-            Ok(RunMutationAdmission {
-                run: run_record_from_row(row).map_err(|error| error.to_string())?,
-                cancellation_requested: origin == Some(DurableCancellationOrigin::User),
-            })
-        })
-        .transpose()
+            .map_err(|error| error.to_string())?
+            .rows_affected();
+        Ok((affected == 1).then(|| RunMutationAdmission {
+            user_id: request.user_id.to_owned(),
+            session_id: request.expected_session_id.to_owned(),
+            run_id: request.run_id.to_owned(),
+            generation: request.expected_owner_generation,
+            operation: RunMutationOperation::Terminal,
+        }))
     }
 
     /// A lost acknowledgement may retry only the exact terminal receipt.
@@ -13030,7 +12760,7 @@ impl DatabaseRunStateStore {
         user_id: &str,
         expected_session_id: &str,
         run_id: &str,
-    ) -> DbStoreResult<Option<RunMutationAdmission>> {
+    ) -> DbStoreResult<Option<LockedRunMutation>> {
         validate_expected_run_session_id(expected_session_id).map_err(|message| {
             db_error(
                 "admit_terminal_settlement",
@@ -13063,9 +12793,13 @@ impl DatabaseRunStateStore {
                         db_error("decode_terminal_cancellation_marker", run_id, source)
                     })?
                     != 0;
-                Ok(RunMutationAdmission {
-                    run: run_record_from_row(row)?,
+                let run = run_record_from_row(row)?;
+                let admission =
+                    RunMutationAdmission::from_record(&run, RunMutationOperation::Observed);
+                Ok(LockedRunMutation {
+                    run,
                     cancellation_requested,
+                    admission,
                 })
             })
             .transpose()
@@ -13079,7 +12813,7 @@ impl DatabaseRunStateStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         request: AtomicRunTerminalSettlementRequest<'_>,
-        admission: RunMutationAdmission,
+        admission: LockedRunMutation,
     ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
         validate_expected_run_session_id(request.expected_session_id)?;
         if request.expected_statuses.is_empty() {
@@ -13099,7 +12833,7 @@ impl DatabaseRunStateStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         request: AtomicRunTerminalSettlementRequest<'_>,
-        admission: RunMutationAdmission,
+        admission: LockedRunMutation,
     ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
         let run = admission.run;
         let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
@@ -16845,10 +16579,7 @@ impl DatabaseRunStateStore {
             participant
                 .stage(
                     &mut tx,
-                    &RunMutationAdmission {
-                        run: record.clone(),
-                        cancellation_requested: false,
-                    },
+                    &RunMutationAdmission::from_record(&record, RunMutationOperation::Opening),
                 )
                 .await
                 .map_err(CollaboratorStoreError::Persistence)?;
@@ -19826,35 +19557,6 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(AtomicRunGuidanceAdmission::Inactive { status: run.status });
         }
 
-        let latest_fence = sqlx::query(GUIDANCE_LATEST_FENCE_SELECT_SQL)
-            .bind(request.user_id)
-            .bind(request.run_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error("admit_run_guidance_load_fence", request.run_id, source).to_string()
-            })?;
-        let latest_fence_type = latest_fence
-            .as_ref()
-            .map(|row| {
-                row.try_get::<String, _>("event_type").map_err(|source| {
-                    db_error(
-                        "decode_admit_run_guidance_fence_type",
-                        request.run_id,
-                        source,
-                    )
-                    .to_string()
-                })
-            })
-            .transpose()?;
-        if latest_fence_type.as_deref() == Some("user_intent_settlement_fenced") {
-            tx.rollback().await.map_err(|source| {
-                db_error("admit_run_guidance_rollback_fenced", request.run_id, source).to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunGuidanceAdmission::SettlementFenced);
-        }
-
         let owner_lease_live: i64 = sqlx::query_scalar(
             "SELECT CAST(CASE
                  WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
@@ -19987,351 +19689,6 @@ impl RunStateStore for DatabaseRunStateStore {
             };
         }
         Ok(AtomicRunGuidanceAdmission::Committed { event_index })
-    }
-
-    async fn transition_user_intent_admission(
-        &self,
-        request: AtomicRunUserIntentAdmissionTransitionRequest<'_>,
-    ) -> Result<AtomicRunUserIntentAdmissionTransition, String> {
-        validate_expected_run_session_id(request.expected_session_id)?;
-        let expected_generation =
-            i64::try_from(request.expected_owner_generation).map_err(|_| {
-                format!(
-                    "owner generation {} exceeds the durable database range for run {}",
-                    request.expected_owner_generation, request.run_id
-                )
-            })?;
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error(
-                    "acquire_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-        let mut tx = connection.begin().await.map_err(|source| {
-            db_error(
-                "begin_user_intent_admission_transition",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_missing_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunUserIntentAdmissionTransition::Missing);
-        };
-
-        if !matches!(
-            durable_run_status_kind(&run.status),
-            DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
-        ) {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_inactive_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunUserIntentAdmissionTransition::Inactive { status: run.status });
-        }
-        if run.run_generation != request.expected_owner_generation {
-            let actual_owner_generation = run.run_generation;
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_stale_generation_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(
-                AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                    actual_owner_generation,
-                },
-            );
-        }
-        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
-            let actual_owner_pod_id = run.owner_pod_id;
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_wrong_owner_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunUserIntentAdmissionTransition::OwnerMismatch {
-                actual_owner_pod_id,
-            });
-        }
-        let lease_live: i64 = sqlx::query_scalar(
-            "SELECT CAST(CASE WHEN owner_lease_expires_at >= NOW(6) \
-                              THEN 1 ELSE 0 END AS SIGNED) \
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "check_user_intent_admission_transition_lease",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if lease_live != 1 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_expired_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired);
-        }
-
-        let latest = sqlx::query(GUIDANCE_LATEST_FENCE_SELECT_SQL)
-            .bind(request.user_id)
-            .bind(request.run_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error(
-                    "load_latest_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-        let latest = latest
-            .as_ref()
-            .map(|row| {
-                decode_user_intent_admission_gate_row(
-                    row,
-                    request.run_id,
-                    "decode_user_intent_admission_transition",
-                )
-            })
-            .transpose()?;
-        let currently_fenced = latest
-            .as_ref()
-            .is_some_and(|gate| gate.transition.desired_fenced());
-        if currently_fenced == request.transition.desired_fenced() {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_idempotent_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            let event_index = latest.map(|gate| gate.event_index);
-            return Ok(match request.transition {
-                RunUserIntentAdmissionTransition::Fence => {
-                    AtomicRunUserIntentAdmissionTransition::AlreadyInState { event_index }
-                }
-                RunUserIntentAdmissionTransition::Reopen => {
-                    AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized { event_index }
-                }
-            });
-        }
-
-        let after_event_index = run.last_event_idx;
-        let event = user_intent_admission_transition_event(
-            request.run_id,
-            request.transition,
-            after_event_index,
-        );
-        let event_index = after_event_index
-            .checked_add(1)
-            .ok_or_else(|| format!("run {} event index overflow", request.run_id))?;
-        let event_row = build_run_event_insert_row(
-            request.user_id,
-            request.run_id,
-            &run.session_id,
-            run.agent_id.as_deref(),
-            event_index,
-            &self.owner_pod_id,
-            &event,
-        )
-        .map_err(|error| error.to_string())?;
-        let updated = sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6) \
-             WHERE user_id = ? AND run_id = ? AND last_event_idx = ? \
-               AND status IN (?, ?) AND run_generation = ? AND owner_pod_id = ? \
-               AND owner_lease_expires_at >= NOW(6)",
-        )
-        .bind(event_index)
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .bind(after_event_index)
-        .bind(STATUS_RUNNING)
-        .bind(STATUS_WAITING)
-        .bind(expected_generation)
-        .bind(&self.owner_pod_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "update_user_intent_admission_transition",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if updated.rows_affected() != 1 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_lost_user_intent_admission_transition",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired);
-        }
-        Self::insert_run_event_rows_tx(
-            &mut tx,
-            request.run_id,
-            std::slice::from_ref(&event_row),
-            "insert_user_intent_admission_transition",
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        Self::upsert_event_metadata_projection_tx(
-            &mut tx,
-            &run,
-            event_index,
-            request.transition.event_type(),
-        )
-        .await?;
-
-        let commit_error = match tx.commit().await {
-            Ok(()) => {
-                connection.release();
-                #[cfg(test)]
-                {
-                    self.user_intent_control_commit_ack_loss_once
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                        .then(|| {
-                            format!(
-                                "injected user-intent admission transition commit acknowledgement loss for {}",
-                                request.run_id
-                            )
-                        })
-                }
-                #[cfg(not(test))]
-                {
-                    None
-                }
-            }
-            Err(source) => {
-                drop(connection);
-                Some(
-                    db_error(
-                        "commit_user_intent_admission_transition",
-                        request.run_id,
-                        source,
-                    )
-                    .to_string(),
-                )
-            }
-        };
-        if let Some(commit_error) = commit_error {
-            #[cfg(test)]
-            if let Some(barrier) = self.user_intent_control_commit_recovery_barrier.as_ref() {
-                barrier.wait().await;
-                barrier.wait().await;
-            }
-            return match self
-                .reconcile_user_intent_admission_transition(request, &event, &event_row)
-                .await
-                .map_err(|error| format!("{commit_error}; {error}"))?
-            {
-                UserIntentAdmissionTransitionRecovery::ThisAttempt(event_index) => {
-                    Ok(match request.transition {
-                        RunUserIntentAdmissionTransition::Fence => {
-                            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered {
-                                event_index,
-                            }
-                        }
-                        RunUserIntentAdmissionTransition::Reopen => {
-                            AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized {
-                                event_index: Some(event_index),
-                            }
-                        }
-                    })
-                }
-                UserIntentAdmissionTransitionRecovery::Equivalent(event_index) => Ok(match request
-                    .transition
-                {
-                    RunUserIntentAdmissionTransition::Fence => {
-                        AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { event_index }
-                    }
-                    RunUserIntentAdmissionTransition::Reopen => {
-                        AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized {
-                            event_index: Some(event_index),
-                        }
-                    }
-                }),
-                UserIntentAdmissionTransitionRecovery::Conflict => {
-                    Ok(AtomicRunUserIntentAdmissionTransition::IdentityConflict)
-                }
-                UserIntentAdmissionTransitionRecovery::NotCommitted => Err(commit_error),
-                UserIntentAdmissionTransitionRecovery::Inactive { status } => {
-                    Ok(AtomicRunUserIntentAdmissionTransition::Inactive { status })
-                }
-                UserIntentAdmissionTransitionRecovery::OwnerGenerationMismatch {
-                    actual_owner_generation,
-                } => Ok(
-                    AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                        actual_owner_generation,
-                    },
-                ),
-                UserIntentAdmissionTransitionRecovery::OwnerMismatch {
-                    actual_owner_pod_id,
-                } => Ok(AtomicRunUserIntentAdmissionTransition::OwnerMismatch {
-                    actual_owner_pod_id,
-                }),
-                UserIntentAdmissionTransitionRecovery::OwnerLeaseExpired => {
-                    Ok(AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired)
-                }
-                UserIntentAdmissionTransitionRecovery::Missing => {
-                    Ok(AtomicRunUserIntentAdmissionTransition::Missing)
-                }
-            };
-        }
-        Ok(AtomicRunUserIntentAdmissionTransition::Changed { event_index })
     }
 
     async fn apply_run_user_intents(
@@ -20593,10 +19950,9 @@ impl RunStateStore for DatabaseRunStateStore {
         }
 
         let mut pending = Vec::new();
-        let mut pending_source_indices = Vec::new();
         let mut existing_applied_indices = Vec::new();
         let mut returned_count = 0_usize;
-        for ((applied, returned), source_index) in expected.iter().zip(&source_indices) {
+        for (applied, returned) in &expected {
             let applied_key = extract_optional_string(applied, "idempotency_key")
                 .expect("validated applied event has an idempotency key");
             let returned_key = extract_optional_string(returned, "idempotency_key")
@@ -20654,7 +20010,6 @@ impl RunStateStore for DatabaseRunStateStore {
                         applied.clone()
                     },
                 );
-                pending_source_indices.push(*source_index);
             }
         }
 
@@ -20742,37 +20097,6 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             connection.release();
             return Ok(AtomicRunUserIntentApply::OwnerLeaseExpired);
-        }
-
-        let latest_fence = sqlx::query(GUIDANCE_LATEST_FENCE_SELECT_SQL)
-            .bind(request.user_id)
-            .bind(request.run_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error("load_user_intent_apply_fence", request.run_id, source).to_string()
-            })?;
-        let latest_fence = latest_fence
-            .as_ref()
-            .map(|row| {
-                decode_user_intent_admission_gate_row(
-                    row,
-                    request.run_id,
-                    "decode_user_intent_apply_fence",
-                )
-            })
-            .transpose()?;
-        if latest_fence
-            .map(|gate| gate.blocks_pending_sources(&pending_source_indices))
-            .transpose()?
-            .unwrap_or(false)
-            && request.purpose.dispatch_owner().is_none()
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error("rollback_fenced_user_intent_apply", request.run_id, source).to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunUserIntentApply::SettlementFenced);
         }
 
         // A committed user-intent disposition starts a new canonical semantic
@@ -21000,36 +20324,6 @@ impl RunStateStore for DatabaseRunStateStore {
                 ExactLiveRunExecutionAuthority::Missing => {
                     return Ok(AtomicRunUserIntentApply::Missing);
                 }
-            }
-            let latest_fence = sqlx::query(GUIDANCE_LATEST_FENCE_SELECT_SQL)
-                .bind(request.user_id)
-                .bind(request.run_id)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| {
-                    format!(
-                        "{commit_error}; {}",
-                        db_error("reconcile_user_intent_apply_fence", request.run_id, source)
-                    )
-                })?;
-            let latest_fence = latest_fence
-                .as_ref()
-                .map(|row| {
-                    decode_user_intent_admission_gate_row(
-                        row,
-                        request.run_id,
-                        "decode_reconciled_user_intent_apply_fence",
-                    )
-                })
-                .transpose()
-                .map_err(|error| format!("{commit_error}; {error}"))?;
-            if latest_fence
-                .map(|gate| gate.blocks_pending_sources(&pending_source_indices))
-                .transpose()
-                .map_err(|error| format!("{commit_error}; {error}"))?
-                .unwrap_or(false)
-            {
-                return Ok(AtomicRunUserIntentApply::SettlementFenced);
             }
             return Err(commit_error);
         }
@@ -25830,169 +25124,6 @@ impl DatabaseRunStateStore {
         decode_recovered_run_control_events(rows, run_id)
     }
 
-    async fn reconcile_user_intent_admission_transition(
-        &self,
-        request: AtomicRunUserIntentAdmissionTransitionRequest<'_>,
-        expected_event: &serde_json::Value,
-        expected_row: &RunEventInsertRow,
-    ) -> Result<UserIntentAdmissionTransitionRecovery, String> {
-        let key = expected_row
-            .idempotency_key
-            .as_ref()
-            .ok_or_else(|| "user-intent admission transition has no idempotency key".to_string())?;
-        if request.transition == RunUserIntentAdmissionTransition::Fence {
-            let recovered = self
-                .load_run_control_events_by_keys(
-                    &expected_row.user_id,
-                    &expected_row.run_id,
-                    std::slice::from_ref(key),
-                    "reconcile_user_intent_admission_transition",
-                )
-                .await?;
-            return Ok(classify_user_intent_admission_transition_recovery(
-                &recovered,
-                expected_event,
-                expected_row,
-            ));
-        }
-
-        // A reopen fact is not by itself execution authority. Lock and
-        // validate the exact run capability before reading the recovered fact
-        // in this same transaction, so ownership rotation cannot interleave
-        // between authorization and recovery classification.
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error(
-                    "acquire_reconcile_user_intent_reopen",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-        let mut tx = connection.begin().await.map_err(|source| {
-            db_error("begin_reconcile_user_intent_reopen", request.run_id, source).to_string()
-        })?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_missing_reconciled_user_intent_reopen",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(UserIntentAdmissionTransitionRecovery::Missing);
-        };
-        if run.run_generation != request.expected_owner_generation {
-            let actual_owner_generation = run.run_generation;
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_stale_reconciled_user_intent_reopen",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(
-                UserIntentAdmissionTransitionRecovery::OwnerGenerationMismatch {
-                    actual_owner_generation,
-                },
-            );
-        }
-        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
-            let actual_owner_pod_id = run.owner_pod_id;
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_wrong_owner_reconciled_user_intent_reopen",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(UserIntentAdmissionTransitionRecovery::OwnerMismatch {
-                actual_owner_pod_id,
-            });
-        }
-        if !matches!(run.status.as_str(), STATUS_RUNNING | STATUS_WAITING) {
-            let status = run.status;
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_inactive_reconciled_user_intent_reopen",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(UserIntentAdmissionTransitionRecovery::Inactive { status });
-        }
-        let lease_live: i64 = sqlx::query_scalar(
-            "SELECT CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "check_reconciled_user_intent_reopen_lease",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if lease_live != 1 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_expired_reconciled_user_intent_reopen",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(UserIntentAdmissionTransitionRecovery::OwnerLeaseExpired);
-        }
-        let recovered = self
-            .load_run_control_events_by_keys_tx(
-                &mut tx,
-                request.user_id,
-                request.run_id,
-                std::slice::from_ref(key),
-                "reconcile_live_user_intent_reopen",
-            )
-            .await?;
-        let recovery = classify_user_intent_admission_transition_recovery(
-            &recovered,
-            expected_event,
-            expected_row,
-        );
-        tx.rollback().await.map_err(|source| {
-            db_error(
-                "rollback_completed_reconciled_user_intent_reopen",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        connection.release();
-        Ok(recovery)
-    }
-
     async fn reconcile_user_intent_apply(
         &self,
         request: AtomicRunUserIntentApplyRequest<'_>,
@@ -26903,18 +26034,6 @@ fn run_guidance_event_matches(existing: &serde_json::Value, requested: &serde_js
         && existing.get("data") == requested.get("data")
 }
 
-fn run_guidance_admission_is_fenced(events: &[serde_json::Value]) -> bool {
-    events
-        .iter()
-        .rev()
-        .find_map(|event| match extract_event_type(event).as_str() {
-            "user_intent_settlement_fenced" => Some(true),
-            "user_intent_admission_reopened" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(false)
-}
-
 fn run_event_data_or_self(
     event: &serde_json::Value,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -27524,40 +26643,6 @@ struct RecoveredRunControlEvent {
     payload_json: String,
     payload: serde_json::Value,
     invocation_supersession_scope_key: Option<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum UserIntentAdmissionTransitionRecovery {
-    ThisAttempt(i64),
-    Equivalent(i64),
-    Conflict,
-    NotCommitted,
-    Inactive { status: String },
-    OwnerGenerationMismatch { actual_owner_generation: u64 },
-    OwnerMismatch { actual_owner_pod_id: Option<String> },
-    OwnerLeaseExpired,
-    Missing,
-}
-
-fn classify_user_intent_admission_transition_recovery(
-    recovered: &[RecoveredRunControlEvent],
-    expected_event: &serde_json::Value,
-    expected_row: &RunEventInsertRow,
-) -> UserIntentAdmissionTransitionRecovery {
-    let Some(recovered) = recovered.first() else {
-        return UserIntentAdmissionTransitionRecovery::NotCommitted;
-    };
-    let Some(key) = expected_row.idempotency_key.as_deref() else {
-        return UserIntentAdmissionTransitionRecovery::Conflict;
-    };
-    if !recovered_run_control_event_is_equivalent(recovered, expected_event, key) {
-        return UserIntentAdmissionTransitionRecovery::Conflict;
-    }
-    if recovered_run_control_event_is_exact(recovered, expected_row) {
-        UserIntentAdmissionTransitionRecovery::ThisAttempt(recovered.event_idx)
-    } else {
-        UserIntentAdmissionTransitionRecovery::Equivalent(recovered.event_idx)
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -36819,7 +35904,7 @@ mod tests {
             ) -> Result<(), String> {
                 self.staged += 1;
                 sqlx::query("UPDATE agent_sessions SET event_count = event_count + 1 WHERE user_id = ? AND session_id = ?")
-                    .bind(&admission.run.user_id).bind(&admission.run.session_id)
+                    .bind(&admission.user_id).bind(&admission.session_id)
                     .execute(&mut **tx).await.map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -39994,6 +39079,18 @@ mod tests {
             .insert_run(run)
             .await
             .expect("insert guidance ACK run");
+        // Establish an older non-locking snapshot before the late guidance
+        // commit. Terminal admission must still observe its actual custody.
+        let mut earlier = pool.get().begin().await.unwrap();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(&mut *earlier)
+        .await
+        .unwrap();
+        assert_eq!(before, 0);
         let event = json!({
             "event_type": "user_intent",
             "idempotency_key": "user_intent:guidance-ack",
@@ -40031,6 +39128,29 @@ mod tests {
                 .expect("exact retry remains idempotent after settlement changes"),
             AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         );
+        let admitted = store
+            .admit_mutation_in_transaction(&mut earlier, &user_id, &session_id, &run_id)
+            .await
+            .unwrap()
+            .expect("current Run admission");
+        assert_eq!(admitted.run.last_event_idx, 1);
+        let returns = store
+            .terminal_user_intent_return_events_tx(
+                &mut earlier,
+                &user_id,
+                &run_id,
+                true,
+                "test_late_guidance_return",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            returns.len(),
+            1,
+            "an earlier transaction cannot strand accepted guidance"
+        );
+        assert_eq!(returns[0]["data"]["intent_id"], "guidance-ack");
+        earlier.rollback().await.unwrap();
         let durable = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(
             durable
@@ -40093,301 +39213,6 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup guidance ACK execution slot");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_user_intent_control_commit_ack_loss_recovers_bounded_facts_on_matrixone() {
-        let (_, pool) = setup_database_run_state_store_it().await;
-        let user_id = format!("intent-control-ack-u-{}", Uuid::new_v4());
-        let run_id = format!("intent-control-ack-r-{}", Uuid::new_v4());
-        let session_id = format!("intent-control-ack-s-{}", Uuid::new_v4());
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-
-        let store = DatabaseRunStateStore::new(pool.clone())
-            .with_owner_pod_id("intent-control-ack-owner")
-            .with_user_intent_control_commit_ack_loss_once();
-        let mut run = durable_run_record(&run_id);
-        run.user_id = user_id.clone();
-        run.session_id = session_id.clone();
-        store.insert_run(run).await.expect("insert control ACK run");
-        let foreign_owner = DatabaseRunStateStore::new(pool.clone())
-            .with_owner_pod_id("intent-control-foreign-owner");
-        assert!(matches!(
-            foreign_owner
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 0,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .expect("foreign owner is a typed rejection"),
-            AtomicRunUserIntentAdmissionTransition::OwnerMismatch { .. }
-        ));
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 1,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .expect("rotated generation is a typed rejection"),
-            AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                actual_owner_generation: 0
-            }
-        );
-        sqlx::query(
-            "UPDATE agent_runs SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) \
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .execute(pool.get())
-        .await
-        .expect("expire control ACK owner lease");
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 0,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .expect("expired lease is a typed rejection"),
-            AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired
-        );
-        sqlx::query(
-            "UPDATE agent_runs SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 45 SECOND) \
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .execute(pool.get())
-        .await
-        .expect("restore control ACK owner lease");
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 0,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .expect("lost fence commit ACK must reconcile"),
-            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { event_index: 1 }
-        );
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 0,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .expect("fence retry is semantic-idempotent"),
-            AtomicRunUserIntentAdmissionTransition::AlreadyInState {
-                event_index: Some(1)
-            }
-        );
-        let reopen_store = store
-            .clone()
-            .with_user_intent_control_commit_ack_loss_once();
-        assert_eq!(
-            reopen_store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 0,
-                    transition: RunUserIntentAdmissionTransition::Reopen,
-                })
-                .await
-                .expect("lost reopen commit ACK must revalidate live authority"),
-            AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized {
-                event_index: Some(2)
-            }
-        );
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 0,
-                    transition: RunUserIntentAdmissionTransition::Reopen,
-                })
-                .await
-                .expect("idempotent reopen must retain live authority"),
-            AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized {
-                event_index: Some(2)
-            }
-        );
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup control ACK execution slot");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_reopen_ack_recovery_requires_live_exact_authority_on_matrixone() {
-        #[derive(Clone, Copy, Debug)]
-        enum AuthorityLoss {
-            Generation,
-            Pod,
-            Lease,
-            Terminal,
-        }
-
-        let (_, pool) = setup_database_run_state_store_it().await;
-        for loss in [
-            AuthorityLoss::Generation,
-            AuthorityLoss::Pod,
-            AuthorityLoss::Lease,
-            AuthorityLoss::Terminal,
-        ] {
-            let suffix = format!("{:?}-{}", loss, Uuid::new_v4());
-            let user_id = format!("reopen-ack-u-{suffix}");
-            let run_id = format!("reopen-ack-r-{suffix}");
-            let session_id = format!("reopen-ack-s-{suffix}");
-            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-            let owner_pod_id = format!("reopen-ack-owner-{suffix}");
-            let store =
-                DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(owner_pod_id.clone());
-            let mut run = durable_run_record(&run_id);
-            run.user_id = user_id.clone();
-            run.session_id = session_id.clone();
-            store.insert_run(run).await.expect("insert reopen ACK run");
-            assert!(matches!(
-                store
-                    .transition_user_intent_admission(
-                        AtomicRunUserIntentAdmissionTransitionRequest {
-                            user_id: &user_id,
-                            run_id: &run_id,
-                            expected_session_id: &session_id,
-                            expected_owner_generation: 0,
-                            transition: RunUserIntentAdmissionTransition::Fence,
-                        },
-                    )
-                    .await
-                    .expect("fence before reopen ACK test"),
-                AtomicRunUserIntentAdmissionTransition::Changed { .. }
-            ));
-
-            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-            let attempt_store = store
-                .clone()
-                .with_user_intent_control_commit_ack_loss_once()
-                .with_user_intent_control_commit_recovery_barrier(barrier.clone());
-            let task_user_id = user_id.clone();
-            let task_run_id = run_id.clone();
-            let reopen = tokio::spawn(async move {
-                attempt_store
-                    .transition_user_intent_admission(
-                        AtomicRunUserIntentAdmissionTransitionRequest {
-                            user_id: &task_user_id,
-                            run_id: &task_run_id,
-                            expected_session_id: &session_id,
-                            expected_owner_generation: 0,
-                            transition: RunUserIntentAdmissionTransition::Reopen,
-                        },
-                    )
-                    .await
-            });
-            barrier.wait().await;
-            match loss {
-                AuthorityLoss::Generation => {
-                    sqlx::query(
-                        "UPDATE agent_runs SET run_generation = 1
-                         WHERE user_id = ? AND run_id = ?",
-                    )
-                    .bind(&user_id)
-                    .bind(&run_id)
-                    .execute(pool.get())
-                    .await
-                    .unwrap();
-                }
-                AuthorityLoss::Pod => {
-                    sqlx::query(
-                        "UPDATE agent_runs SET owner_pod_id = 'reopen-ack-new-owner'
-                         WHERE user_id = ? AND run_id = ?",
-                    )
-                    .bind(&user_id)
-                    .bind(&run_id)
-                    .execute(pool.get())
-                    .await
-                    .unwrap();
-                }
-                AuthorityLoss::Lease => {
-                    sqlx::query(
-                        "UPDATE agent_runs
-                         SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)
-                         WHERE user_id = ? AND run_id = ?",
-                    )
-                    .bind(&user_id)
-                    .bind(&run_id)
-                    .execute(pool.get())
-                    .await
-                    .unwrap();
-                }
-                AuthorityLoss::Terminal => {
-                    sqlx::query(
-                        "UPDATE agent_runs SET status = 'completed'
-                         WHERE user_id = ? AND run_id = ?",
-                    )
-                    .bind(&user_id)
-                    .bind(&run_id)
-                    .execute(pool.get())
-                    .await
-                    .unwrap();
-                }
-            }
-            barrier.wait().await;
-            let outcome = reopen
-                .await
-                .expect("reopen recovery task")
-                .expect("authority loss is a typed outcome");
-            match loss {
-                AuthorityLoss::Generation => assert_eq!(
-                    outcome,
-                    AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                        actual_owner_generation: 1
-                    }
-                ),
-                AuthorityLoss::Pod => assert_eq!(
-                    outcome,
-                    AtomicRunUserIntentAdmissionTransition::OwnerMismatch {
-                        actual_owner_pod_id: Some("reopen-ack-new-owner".to_string())
-                    }
-                ),
-                AuthorityLoss::Lease => assert_eq!(
-                    outcome,
-                    AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired
-                ),
-                AuthorityLoss::Terminal => assert_eq!(
-                    outcome,
-                    AtomicRunUserIntentAdmissionTransition::Inactive {
-                        status: STATUS_COMPLETED.to_string()
-                    }
-                ),
-            }
-            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        }
     }
 
     #[tokio::test]
@@ -43322,6 +42147,7 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                admitted_at: std::time::Instant::now(),
                 price_snapshot: None,
                 offering_id: "offer-gpt-4".to_string(),
                 source_identity: None,
@@ -43864,7 +42690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_guidance_duplicate_precedes_fence_and_binds_immutable_payload() {
+    async fn atomic_guidance_duplicate_precedes_terminal_status_and_binds_immutable_payload() {
         let store = InMemoryRunStateStore::new();
         store
             .insert_run(durable_run_record("guidance-duplicate"))
@@ -43884,14 +42710,12 @@ mod tests {
             AtomicRunGuidanceAdmission::Committed { event_index: 0 }
         );
         store
-            .append_event(
-                "u1",
-                "s1",
-                "guidance-duplicate",
-                make_event("user_intent_settlement_fenced", json!({})),
-            )
+            .runs
+            .write()
             .await
-            .unwrap();
+            .get_mut("guidance-duplicate")
+            .unwrap()
+            .status = STATUS_COMPLETED.into();
         assert_eq!(
             store
                 .admit_run_guidance(guidance_admission_request(
@@ -43948,96 +42772,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(run.events.is_empty());
-    }
-
-    #[tokio::test]
-    async fn concurrent_guidance_and_settlement_fence_have_a_valid_linearized_order() {
-        for attempt in 0..32 {
-            let store = std::sync::Arc::new(InMemoryRunStateStore::new());
-            let run_id = format!("guidance-fence-race-{attempt}");
-            store.insert_run(durable_run_record(&run_id)).await.unwrap();
-            let event = user_intent_event("intent-race");
-            let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
-            let guidance = {
-                let store = store.clone();
-                let run_id = run_id.clone();
-                let event = event.clone();
-                let start = start.clone();
-                tokio::spawn(async move {
-                    start.wait().await;
-                    store
-                        .admit_run_guidance(guidance_admission_request(
-                            &run_id,
-                            "intent-race",
-                            &event,
-                            true,
-                        ))
-                        .await
-                        .unwrap()
-                })
-            };
-            let fence = {
-                let store = store.clone();
-                let run_id = run_id.clone();
-                let start = start.clone();
-                tokio::spawn(async move {
-                    start.wait().await;
-                    store
-                        .transition_user_intent_admission(
-                            AtomicRunUserIntentAdmissionTransitionRequest {
-                                user_id: "u1",
-                                run_id: &run_id,
-                                expected_session_id: "s1",
-                                expected_owner_generation: 0,
-                                transition: RunUserIntentAdmissionTransition::Fence,
-                            },
-                        )
-                        .await
-                        .unwrap()
-                })
-            };
-            start.wait().await;
-            let outcome = guidance.await.unwrap();
-            assert!(matches!(
-                fence.await.unwrap(),
-                AtomicRunUserIntentAdmissionTransition::Changed { .. }
-            ));
-            let run = store.load_run("u1", &run_id).await.unwrap().unwrap();
-            let intent_position = run
-                .events
-                .iter()
-                .position(|event| extract_event_type(event) == "user_intent");
-            let fence_position = run
-                .events
-                .iter()
-                .position(|event| extract_event_type(event) == "user_intent_settlement_fenced")
-                .unwrap();
-            match outcome {
-                AtomicRunGuidanceAdmission::Committed { event_index } => {
-                    assert!(intent_position.is_some_and(|index| index < fence_position));
-                    assert!(matches!(
-                        store
-                            .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
-                                purpose: UserIntentApplyPurpose::ModelBoundary,
-                                invocation_identity: None,
-
-                                user_id: "u1",
-                                run_id: &run_id,
-                                expected_session_id: "s1",
-                                expected_owner_generation: 0,
-                                source_event_indices: &[event_index],
-                            })
-                            .await
-                            .unwrap(),
-                        AtomicRunUserIntentApply::Applied { .. }
-                    ));
-                }
-                AtomicRunGuidanceAdmission::SettlementFenced => {
-                    assert!(intent_position.is_none())
-                }
-                other => panic!("unexpected race outcome: {other:?}"),
-            }
-        }
     }
 
     fn edge_tool_request_event(request_id: &str, tool: &str) -> serde_json::Value {
@@ -48840,7 +47574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_user_intent_apply_retry_survives_later_fence_and_terminal_state() {
+    async fn committed_user_intent_apply_retry_preserves_identity_through_terminal_state() {
         let store = InMemoryRunStateStore::new();
         let mut fenced_run = durable_run_record("intent-apply-ack-lost-fence");
         fenced_run.run_generation = 17;
@@ -48872,19 +47606,7 @@ mod tests {
         ));
         // Model a lost caller acknowledgement: the durable commit is authoritative,
         // even when settlement linearizes before the exact retry.
-        assert!(matches!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: "u1",
-                    run_id: "intent-apply-ack-lost-fence",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 17,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .unwrap(),
-            AtomicRunUserIntentAdmissionTransition::Changed { .. }
-        ));
+
         assert!(matches!(
             store.apply_run_user_intents(fenced_request).await.unwrap(),
             AtomicRunUserIntentApply::AlreadyApplied { .. }
@@ -49034,229 +47756,6 @@ mod tests {
             Some(1)
         );
         assert_eq!(terminal.status, STATUS_CANCELLED);
-    }
-
-    #[tokio::test]
-    async fn atomic_user_intent_apply_drains_pre_cutoff_and_rejects_post_cutoff_sources() {
-        let store = InMemoryRunStateStore::new();
-        let mut run = durable_run_record("intent-apply-authority");
-        run.run_generation = 11;
-        run.events.push(json!({
-            "event_type": "user_intent",
-            "idempotency_key": "user_intent:intent-authority",
-            "data": {
-                "intent_id": "intent-authority",
-                "delivery": "guide_current_run",
-                "input": {"content": "authority"}
-            }
-        }));
-        run.last_event_idx = 0;
-        store.insert_run(run).await.unwrap();
-
-        let stale = store
-            .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
-                purpose: UserIntentApplyPurpose::ModelBoundary,
-                invocation_identity: None,
-
-                user_id: "u1",
-                run_id: "intent-apply-authority",
-                expected_session_id: "s1",
-                expected_owner_generation: 10,
-                source_event_indices: &[0],
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            stale,
-            AtomicRunUserIntentApply::OwnerGenerationMismatch {
-                actual_owner_generation: 11
-            }
-        );
-
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: "u1",
-                    run_id: "intent-apply-authority",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 11,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .unwrap(),
-            AtomicRunUserIntentAdmissionTransition::Changed { event_index: 1 }
-        );
-        assert_eq!(
-            store
-                .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
-                    purpose: UserIntentApplyPurpose::ModelBoundary,
-                    invocation_identity: None,
-
-                    user_id: "u1",
-                    run_id: "intent-apply-authority",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 11,
-                    source_event_indices: &[0],
-                })
-                .await
-                .unwrap(),
-            AtomicRunUserIntentApply::Applied {
-                event_indices: vec![2]
-            }
-        );
-        assert_eq!(
-            store
-                .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
-                    purpose: UserIntentApplyPurpose::ModelBoundary,
-                    invocation_identity: None,
-
-                    user_id: "foreign",
-                    run_id: "intent-apply-authority",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 11,
-                    source_event_indices: &[0],
-                })
-                .await
-                .unwrap(),
-            AtomicRunUserIntentApply::Missing
-        );
-        let mut post_cutoff = durable_run_record("intent-apply-post-cutoff");
-        post_cutoff.session_id = "sess-intent-apply-post-cutoff".to_string();
-        post_cutoff.run_generation = 11;
-        post_cutoff.events = vec![
-            json!({
-                "index": 0,
-                "event_type": "user_intent",
-                "idempotency_key": "user_intent:intent-before-cutoff",
-                "data": {
-                    "intent_id": "intent-before-cutoff",
-                    "delivery": "guide_current_run",
-                    "input": {"content": "before"}
-                }
-            }),
-            json!({
-                "index": 1,
-                "event_type": "user_intent_settlement_fenced",
-                "idempotency_key": "user_intent_settlement_fenced:intent-apply-post-cutoff:0",
-                "data": {"after_event_index": 0}
-            }),
-            json!({
-                "index": 2,
-                "event_type": "user_intent",
-                "idempotency_key": "user_intent:intent-after-cutoff",
-                "data": {
-                    "intent_id": "intent-after-cutoff",
-                    "delivery": "guide_current_run",
-                    "input": {"content": "after"}
-                }
-            }),
-        ];
-        post_cutoff.last_event_idx = 2;
-        store.insert_run(post_cutoff).await.unwrap();
-        assert_eq!(
-            store
-                .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
-                    purpose: UserIntentApplyPurpose::ModelBoundary,
-                    invocation_identity: None,
-
-                    user_id: "u1",
-                    run_id: "intent-apply-post-cutoff",
-                    expected_session_id: "sess-intent-apply-post-cutoff",
-                    expected_owner_generation: 11,
-                    source_event_indices: &[0, 2],
-                })
-                .await
-                .unwrap(),
-            AtomicRunUserIntentApply::SettlementFenced,
-            "a mixed pre/post-cutoff batch must fail atomically"
-        );
-        let runs = store.runs.read().await;
-        assert!(
-            runs["intent-apply-post-cutoff"]
-                .events
-                .iter()
-                .all(|event| { extract_event_type(event) != "user_intent_applied" })
-        );
-    }
-
-    #[tokio::test]
-    async fn atomic_user_intent_apply_and_settlement_fence_have_one_ordered_winner() {
-        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
-        let mut run = durable_run_record("intent-apply-fence-race");
-        run.run_generation = 3;
-        run.events.push(json!({
-            "event_type": "user_intent",
-            "idempotency_key": "user_intent:intent-race",
-            "data": {
-                "intent_id": "intent-race",
-                "delivery": "guide_current_run",
-                "input": {"content": "race"}
-            }
-        }));
-        run.last_event_idx = 0;
-        store.insert_run(run).await.unwrap();
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
-
-        let apply_store = store.clone();
-        let apply_barrier = barrier.clone();
-        let apply = tokio::spawn(async move {
-            apply_barrier.wait().await;
-            apply_store
-                .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
-                    purpose: UserIntentApplyPurpose::ModelBoundary,
-                    invocation_identity: None,
-
-                    user_id: "u1",
-                    run_id: "intent-apply-fence-race",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 3,
-                    source_event_indices: &[0],
-                })
-                .await
-                .unwrap()
-        });
-        let fence_store = store.clone();
-        let fence_barrier = barrier.clone();
-        let fence = tokio::spawn(async move {
-            fence_barrier.wait().await;
-            fence_store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: "u1",
-                    run_id: "intent-apply-fence-race",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 3,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                })
-                .await
-                .unwrap()
-        });
-        barrier.wait().await;
-        let apply = apply.await.unwrap();
-        let fence = fence.await.unwrap();
-        assert!(matches!(
-            fence,
-            AtomicRunUserIntentAdmissionTransition::Changed { .. }
-        ));
-        assert!(matches!(apply, AtomicRunUserIntentApply::Applied { .. }));
-        let runs = store.runs.read().await;
-        let events = &runs["intent-apply-fence-race"].events;
-        let applied_position = events
-            .iter()
-            .position(|event| extract_event_type(event) == "user_intent_applied");
-        let fence_position = events
-            .iter()
-            .position(|event| extract_event_type(event) == "user_intent_settlement_fenced")
-            .unwrap();
-        let applied_position = applied_position.expect("the pre-cutoff intent must be drained");
-        assert_ne!(applied_position, fence_position);
-        let fence = &events[fence_position];
-        assert!(
-            fence
-                .pointer("/data/after_event_index")
-                .and_then(serde_json::Value::as_i64)
-                .is_some_and(|cutoff| cutoff >= 0),
-            "the linearized fence must cover the already accepted source"
-        );
     }
 
     #[tokio::test]
@@ -49499,19 +47998,7 @@ mod tests {
             AtomicRunUserIntentApply::AckRecovered { ref event_indices }
                 if event_indices.len() == 1
         ));
-        assert!(matches!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_owner_generation: 9,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .unwrap(),
-            AtomicRunUserIntentAdmissionTransition::Changed { .. }
-        ));
+
         assert!(matches!(
                     store
                         .apply_run_user_intents(AtomicRunUserIntentApplyRequest { purpose: UserIntentApplyPurpose::ModelBoundary,
@@ -49523,7 +48010,7 @@ mod tests {
                         .await
                         .unwrap(),
                     AtomicRunUserIntentApply::Applied { ref event_indices }
-                        if event_indices == &[5]
+                        if event_indices == &[4]
                 ));
         assert!(matches!(
             store.apply_run_user_intents(request).await.unwrap(),
@@ -49711,125 +48198,9 @@ mod tests {
 
     #[test]
     fn user_intent_control_queries_use_bounded_index_shapes() {
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("user_id = ? AND run_id = ?"));
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("event_type IN"));
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("ORDER BY event_idx DESC LIMIT 1"));
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("FOR UPDATE"));
-        assert!(!GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("SELECT *"));
-
         assert!(RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX.contains("user_id ="));
         assert!(RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX.contains("idempotency_key"));
         assert!(!RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX.contains("SELECT *"));
-    }
-
-    #[tokio::test]
-    async fn user_intent_admission_transition_avoids_large_history_hydration() {
-        let store = InMemoryRunStateStore::new();
-        let mut run = durable_run_record("intent-gate-large-tail");
-        run.run_generation = 7;
-        run.events = (0..34_000)
-            .map(|index| make_event("agent_progress", json!({"index": index})))
-            .collect();
-        run.last_event_idx = 33_999;
-        store.insert_run(run).await.unwrap();
-        assert_eq!(store.load_run_call_count(), 0);
-
-        let fence = store
-            .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                user_id: "u1",
-                run_id: "intent-gate-large-tail",
-                expected_session_id: "s1",
-                expected_owner_generation: 7,
-                transition: RunUserIntentAdmissionTransition::Fence,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            fence,
-            AtomicRunUserIntentAdmissionTransition::Changed {
-                event_index: 34_000
-            }
-        );
-        let stale_duplicate = store
-            .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                user_id: "u1",
-                run_id: "intent-gate-large-tail",
-                expected_session_id: "s1",
-                expected_owner_generation: 6,
-                transition: RunUserIntentAdmissionTransition::Fence,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            stale_duplicate,
-            AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                actual_owner_generation: 7
-            }
-        );
-        let duplicate = store
-            .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                user_id: "u1",
-                run_id: "intent-gate-large-tail",
-                expected_session_id: "s1",
-                expected_owner_generation: 7,
-                transition: RunUserIntentAdmissionTransition::Fence,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            duplicate,
-            AtomicRunUserIntentAdmissionTransition::AlreadyInState {
-                event_index: Some(34_000)
-            }
-        );
-        let stale_reopen = store
-            .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                user_id: "u1",
-                run_id: "intent-gate-large-tail",
-                expected_session_id: "s1",
-                expected_owner_generation: 6,
-                transition: RunUserIntentAdmissionTransition::Reopen,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            stale_reopen,
-            AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                actual_owner_generation: 7
-            }
-        );
-        let reopen = store
-            .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                user_id: "u1",
-                run_id: "intent-gate-large-tail",
-                expected_session_id: "s1",
-                expected_owner_generation: 7,
-                transition: RunUserIntentAdmissionTransition::Reopen,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            reopen,
-            AtomicRunUserIntentAdmissionTransition::Changed {
-                event_index: 34_001
-            }
-        );
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: "u1",
-                    run_id: "intent-gate-large-tail",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 7,
-                    transition: RunUserIntentAdmissionTransition::Reopen,
-                })
-                .await
-                .unwrap(),
-            AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized {
-                event_index: Some(34_001)
-            }
-        );
-        assert_eq!(store.load_run_call_count(), 0);
     }
 
     #[tokio::test]
@@ -49889,103 +48260,6 @@ mod tests {
             RunExecutionBoundaryAuthorization::Missing
         );
         assert_eq!(store.load_run_call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn user_intent_admission_fence_and_reopen_have_one_serial_order() {
-        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
-        store
-            .insert_run(durable_run_record("intent-gate-race"))
-            .await
-            .unwrap();
-        let fence_store = store.clone();
-        let reopen_store = store.clone();
-        let (fence, reopen) = tokio::join!(
-            async move {
-                fence_store
-                    .transition_user_intent_admission(
-                        AtomicRunUserIntentAdmissionTransitionRequest {
-                            user_id: "u1",
-                            run_id: "intent-gate-race",
-                            expected_session_id: "s1",
-                            expected_owner_generation: 0,
-                            transition: RunUserIntentAdmissionTransition::Fence,
-                        },
-                    )
-                    .await
-            },
-            async move {
-                reopen_store
-                    .transition_user_intent_admission(
-                        AtomicRunUserIntentAdmissionTransitionRequest {
-                            user_id: "u1",
-                            run_id: "intent-gate-race",
-                            expected_session_id: "s1",
-                            expected_owner_generation: 0,
-                            transition: RunUserIntentAdmissionTransition::Reopen,
-                        },
-                    )
-                    .await
-            }
-        );
-        assert!(fence.unwrap() != AtomicRunUserIntentAdmissionTransition::IdentityConflict);
-        assert!(reopen.unwrap() != AtomicRunUserIntentAdmissionTransition::IdentityConflict);
-        let run = store
-            .load_run("u1", "intent-gate-race")
-            .await
-            .unwrap()
-            .unwrap();
-        let transitions = run
-            .events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    extract_event_type(event).as_str(),
-                    "user_intent_settlement_fenced" | "user_intent_admission_reopened"
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!((1..=2).contains(&transitions.len()));
-        if transitions.len() == 2 {
-            assert_eq!(
-                extract_event_type(transitions[0]),
-                "user_intent_settlement_fenced"
-            );
-            assert_eq!(
-                extract_event_type(transitions[1]),
-                "user_intent_admission_reopened"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_user_intent_admission_control_is_rejected() {
-        let store = InMemoryRunStateStore::new();
-        let mut terminal = durable_run_record("terminal-gate");
-        terminal.status = STATUS_FAILED.to_string();
-        terminal.events.push(json!({
-            "event_type": "user_intent_settlement_fenced",
-            "idempotency_key": "user_intent_settlement_fenced:terminal-gate:-1",
-            "index": 0,
-            "data": {"after_event_index": -1}
-        }));
-        terminal.last_event_idx = 0;
-        store.insert_run(terminal).await.unwrap();
-        assert_eq!(
-            store
-                .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                    user_id: "u1",
-                    run_id: "terminal-gate",
-                    expected_session_id: "s1",
-                    expected_owner_generation: 0,
-                    transition: RunUserIntentAdmissionTransition::Fence,
-                },)
-                .await
-                .unwrap(),
-            AtomicRunUserIntentAdmissionTransition::Inactive {
-                status: STATUS_FAILED.to_string()
-            }
-        );
     }
 
     #[tokio::test]

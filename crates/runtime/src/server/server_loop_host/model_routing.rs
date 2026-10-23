@@ -473,7 +473,6 @@ impl ServerAgenticLoopHost {
                 serde_json::to_value(&decision).map_err(|error| invalid(error.to_string()))?;
         }
         self.admitted_model_execution = Some(execution);
-        self.admitted_model_execution_at = Some(std::time::Instant::now());
         self.clear_resolved_llm_config();
         let routing = self.model_routing.as_mut().expect("Auto context");
         routing.decision = Some(decision);

@@ -662,6 +662,29 @@ mode refreshes the next provider request and the host permission gate. Trusted
 approval clears the complete plan hint, including its multiline guidance, while
 other turn-start facts remain fixed. Model tool arguments cannot approve a plan.
 
+A live Server control watcher owns cross-pod pause/cancel polling and updates
+shared execution flags. Model boundaries consume those observations without
+another status query. If the watcher exits, boundaries restore the ordinary
+control read. Permission choices use the existing control wake watermark to
+refresh a round-local snapshot; the exact durable owner must still acknowledge
+every newly applied choice. A failed read or closed notification channel keeps
+authoritative refresh available.
+
+Root message inboxes activate when an admitted `agent` or `agent_fanout` call
+needs messaging/delegation. Ordinary chat and unrelated read tools create no
+mailbox subscription, empty poll, or mailbox cleanup writes. Late child messages
+retain their existing transport identity and are consumed by a later messaging
+turn; they do not inject unsolicited context into an unrelated ordinary turn.
+Existing child result/status readers remain available.
+
+Guidance admission is owned by the active Run and its execution lease. There
+is no separate input closing/reopening journal. A final boundary applies input
+already observed through the existing wake path; the atomic terminal
+transaction returns any later accepted but unapplied input to its submitting
+client. The client keeps its original identity and can queue it for the next
+turn. A terminal Run rejects new guidance while exact retries still reconcile
+an earlier committed acceptance.
+
 ## Cancellation
 
 Cancellation is a state transition with cleanup obligations:
@@ -897,8 +920,7 @@ admission. Cancellation and completion use the same slot as task startup.
 
 The source-only turn core/tool event writers, activity writer, and reflection
 state/lesson writer assembly are retired. Canonical loop append and atomic
-terminal settlement own the transcript, accepted trace-event projections, and
-the terminal display projection in one authoritative transaction; a terminal
+terminal settlement own raw conversation history and the terminal display projection in one authoritative transaction; a terminal
 projection must preserve the latest committed checkpoint metadata. The
 resolution path rereads the committed projection hash after a lost commit
 acknowledgement instead of synthesizing one.
@@ -922,9 +944,12 @@ payloads because agent execution no longer produces them. Existing permit-drop
 and expiry handling recover an interrupted capacity release.
 
 The Explain Analyze graph is produced only for a root run that explicitly
-requested it. Ordinary runs keep their lifecycle, transcript, trace, and
-recovery events; they do not create the second product graph stream, persist
-its typed graph facts, or publish a graph artifact. Resume carries the run's
+requested it. Ordinary runs retain canonical Context, raw conversation history,
+Run lifecycle/recovery events and real effect receipts. Optional database model,
+tool and Context diagnostics use the existing ingestion owner only for explicit
+root Explain; ordinary execution and children do not capture duplicate rows or
+run a separate diagnostic repair transaction. They do not create the product
+graph stream, persist its typed facts, or publish a graph artifact. Resume carries the run's
 durable Explain request so recovery cannot accidentally change that capture
 policy. Delegated child runs do not inherit the root's Explain request.
 hook DB writes, observer extraction, and auxiliary events keep their existing

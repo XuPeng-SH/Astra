@@ -62,10 +62,6 @@ pub enum WorkRecoveryPointBlocker {
         "the branch plan basis is behind the current Work plan; refresh before saving progress"
     )]
     BranchBasisChanged,
-    #[error("the Work Session execution slot has no canonical Run")]
-    DanglingRunSlot,
-    #[error("the Work Session Run is missing its status")]
-    RunStatusMissing,
     #[error("the Work Run is still active; finish or pause it before saving progress")]
     ActiveRun,
     #[error("the Work Session still has an active turn reservation")]

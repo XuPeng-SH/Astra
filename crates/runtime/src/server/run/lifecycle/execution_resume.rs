@@ -711,7 +711,6 @@ impl AgenticRunLifecycleService {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             agent_id: run.agent_id.clone(),
-            model_name: run.resolved_model_name.clone(),
             user_message: handoff.original_user_message.clone(),
             #[cfg(feature = "e2e-hooks")]
             test_post_loop_settlement_delay_ms: 0,

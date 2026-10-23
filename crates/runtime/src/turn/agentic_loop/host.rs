@@ -2421,12 +2421,76 @@ pub struct MessagingState {
     /// When set, incoming messages are drained at each turn start and
     /// progress updates are sent to the parent at turn end.
     pub mailbox: Option<astra_messaging::router::AgentMailbox>,
+    pub(crate) root_registration: Option<RootMailboxRegistration>,
     /// Run-owned question obligations shared with the sending tool. These
     /// remain empty for ordinary turns and never trigger a database read.
     pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
+}
+
+/// Request-local wiring only. Registering a durable inbox is deferred until
+/// an admitted messaging/delegation call needs it; ordinary reads never poll it.
+pub(crate) struct RootMailboxRegistration {
+    router: Arc<astra_messaging::router::AgentMailboxRouter>,
+    address: astra_messaging::AgentAddress,
+    run_id: String,
+    agent_id: String,
+}
+
+impl MessagingState {
+    pub(crate) fn configure_root_mailbox(
+        &mut self,
+        router: Arc<astra_messaging::router::AgentMailboxRouter>,
+        address: astra_messaging::AgentAddress,
+        run_id: String,
+        agent_id: String,
+    ) {
+        self.root_registration = Some(RootMailboxRegistration {
+            router,
+            address,
+            run_id,
+            agent_id,
+        });
+    }
+
+    pub(crate) async fn ensure_mailbox_for_tools(&mut self, calls: &[Value]) -> Result<(), String> {
+        if calls.iter().any(|call| {
+            matches!(
+                astra_turn_core::tool_call_shape::tool_call_name(call),
+                Some("agent" | "agent_fanout")
+            )
+        }) {
+            self.ensure_mailbox().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_mailbox(&mut self) -> Result<(), String> {
+        if self.mailbox.is_some() {
+            return Ok(());
+        }
+        let Some(registration) = self.root_registration.as_ref() else {
+            return Ok(());
+        };
+        let mailbox = registration
+            .router
+            .register(registration.address.clone(), None)
+            .await
+            .map_err(|error| format!("messaging inbox registration failed: {error}"))?;
+        registration
+            .router
+            .record_parent_delivery_alias(
+                &registration.run_id,
+                &registration.address,
+                &registration.agent_id,
+            )
+            .await;
+        self.mailbox = Some(mailbox);
+        self.root_registration = None;
+        Ok(())
+    }
 }
 
 /// Completion verification state for the agentic loop.
@@ -2693,8 +2757,6 @@ pub(crate) struct OriginalLoopExecutionFacts {
     pub canonical_turn_chain_id: Option<String>,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub root_user_query_event_id: Option<String>,
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    pub canonical_turn_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub total_prompt: u64,
     pub total_completion: u64,
     pub total_cache_read: u64,
@@ -2757,7 +2819,6 @@ impl OriginalLoopExecutionFacts {
             session_turn: state.session_turn,
             canonical_turn_chain_id: state.canonical_turn_chain_id.clone(),
             root_user_query_event_id: state.root_user_query_event_id.clone(),
-            canonical_turn_started_at: state.canonical_turn_started_at.get().copied(),
             total_prompt: state.total_prompt,
             total_completion: state.total_completion,
             total_cache_read: state.total_cache_read,
@@ -3633,6 +3694,10 @@ pub struct AgenticLoopState {
     pub current_run_owner_generation: Option<u64>,
     /// In-memory projection of the durable permission revision selected for this round.
     pub applied_permission_mode: Option<astra_turn_types::RunPermissionModeSelection>,
+    pub(crate) permission_mode_observation: super::permission_boundary::PermissionModeObservation,
+    /// The sender lives inside the Server watcher task. A closed channel
+    /// restores synchronous control observation if that task exits or panics.
+    pub(crate) durable_control_watcher: Option<tokio::sync::watch::Receiver<()>>,
     /// Why this loop is allowed to consume model capacity. This is set by the
     /// run owner before execution and remains stable for the lifetime of the
     /// loop; provider, access source, and model selection are separate facts.
@@ -3943,12 +4008,6 @@ pub struct AgenticLoopState {
     pub root_user_query_event_id: Option<String>,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
-    /// Frozen before the first durable root event write. The loop may create
-    /// its event buffer later, but canonical replay must retain this envelope.
-    pub canonical_turn_started_at: std::sync::OnceLock<chrono::DateTime<chrono::Utc>>,
-    /// Frozen on first post-loop capture; persistence retries must not generate
-    /// new event timestamps for the same completed execution.
-    pub canonical_trace_time_bounds: std::sync::OnceLock<(chrono::DateTime<chrono::Utc>, u64)>,
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::super::harness_adapter::HarnessSlot,
@@ -3980,6 +4039,12 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    pub(crate) fn has_durable_control_watcher(&self) -> bool {
+        self.durable_control_watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.has_changed().is_ok())
+    }
+
     /// Common empty loop state. Callers install identity, authority, context and
     /// restored frontiers explicitly; this never admits, restores or performs I/O.
     /// Reuse the caller's transport rather than constructing an unused client.
@@ -4011,6 +4076,8 @@ impl AgenticLoopState {
             current_run_id: None,
             current_run_owner_generation: None,
             applied_permission_mode: None,
+            permission_mode_observation: Default::default(),
+            durable_control_watcher: None,
             inference_purpose,
             context_manifest_pool: None,
             context_manifest_user_id: None,
@@ -4110,8 +4177,6 @@ impl AgenticLoopState {
             canonical_turn_chain_id: None,
             root_user_query_event_id: None,
             turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
             harness: super::super::harness_adapter::HarnessSlot::empty(),
         }
     }
