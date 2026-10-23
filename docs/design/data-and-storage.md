@@ -51,6 +51,11 @@ MatrixOne is the platform state store and analytic substrate. It should support:
 - analytic/evaluation workloads;
 - optional MatrixOne-native value such as time travel or hybrid search when appropriate.
 
+SQLx TCP connections enable `TCP_NODELAY` before the MySQL handshake and TLS
+negotiation. Consecutive small protocol messages, including prepared-statement
+close and execute packets, must not incur Nagle/delayed-ACK stalls. This is a
+transport setting; persistence and transaction boundaries remain unchanged.
+
 ## Schema bootstrap
 
 Bootstrap supports a fresh database or the current schema contract. Canonical
