@@ -1774,7 +1774,6 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
-const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 fn should_restore_prior_prompt_history(
     request_targets_existing_session: bool,
     session_has_prior_prompt_history: bool,
@@ -4428,10 +4427,8 @@ async fn configure_runtime_controllers(
     loop_state.telemetry.trace_ingestion = trace_ingestion;
     let context_trace_persistence = shared_pool.map(|pool| ContextTracePersistenceContext {
         user_id: user_id.to_string(),
-        event_service: build_runtime_event_service(matrixone, pool),
         artifact_store: astra_services::DatabaseSessionArtifactStore::new(matrixone.clone())
             .with_pool(pool.clone()),
-        agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.to_string(),
     });
     initialize_runtime_controllers(loop_state, user_id, session_id, context_trace_persistence).await
 }
@@ -4519,8 +4516,8 @@ pub(crate) use persistence::{
     TranscriptPersistItem, TranscriptPersistPayload,
     append_session_transcript_items_admitted_in_tx,
     build_run_turn_complete_event_with_interruption, materialize_server_run_transcript_evidence,
-    persist_server_loop_canonical_append, persist_server_loop_canonical_terminal_settlement,
-    persist_session_transcript_items, restore_session_state_compact,
+    persist_root_turn_input, persist_server_loop_canonical_append,
+    persist_server_loop_canonical_terminal_settlement, restore_session_state_compact,
     restore_step_checkpoint_runtime_state, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
@@ -5285,7 +5282,6 @@ struct LoopEnvironment {
 /// same background runner only after their respective authority checks.
 /// These are live resources, not a second durable execution-state record.
 struct OwnedBackgroundExecution {
-    resumed: bool,
     user_id: String,
     session_id: String,
     run_id: String,
@@ -15510,7 +15506,6 @@ fn work_subject_invalidation_response(
 impl AgenticRunLifecycleService {
     async fn launch_owned_background_execution(&self, execution: OwnedBackgroundExecution) {
         let OwnedBackgroundExecution {
-            resumed,
             user_id,
             session_id,
             run_id,
@@ -15636,14 +15631,6 @@ impl AgenticRunLifecycleService {
                     bg_progress_channels.lock().await.remove(&bg_run_id);
                     drop(event_tx);
                     return;
-                }
-                if !resumed && let Err(error) = persist_ctx.persist_turn_start(&state).await {
-                    tracing::warn!(
-                        session_id = %bg_session_id,
-                        run_id = %bg_run_id,
-                        error = %error,
-                        "accepted turn audit projection could not be persisted"
-                    );
                 }
                 // Keep the global FIFO semaphore: it is the multi-user
                 // fairness boundary.  Crucially, wait here rather than in the
@@ -17733,31 +17720,50 @@ impl AgenticRunLifecycleService {
                     }
                 }
             }
-            let transcript_turn = state.session_turn;
-            let persist_user_transcript = async {
+            let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
+            let turn_started_at = *state.canonical_turn_started_at.get_or_init(|| {
+                state
+                    .turn_event_buffer
+                    .as_ref()
+                    .map(astra_services::session_journal::TurnEventBuffer::turn_started_at)
+                    .unwrap_or_else(chrono::Utc::now)
+            });
+            let input_event = persistence::server_loop_user_query_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                None,
+                None,
+                request.agent_id.as_deref(),
+                None,
+                &trace,
+                &request.message,
+                turn_started_at,
+            );
+            let persist_user_input = async {
                 let Some(pool) = &self.shared_pool else {
                     return;
                 };
-                let trace = server_trace_context(&user_id, &session_id, &run_id, transcript_turn);
-                let user_transcript = TranscriptPersistItem {
-                    run_id: Some(run_id.clone()),
-                    role: "user",
-                    content: request.message.clone(),
-                    payload: None,
-                    source_event_id: trace.root_event_id,
-                };
-                if let Err(error) = persist_session_transcript_items(
+                let result = persist_root_turn_input(
                     pool,
                     &user_id,
                     &session_id,
-                    &[user_transcript],
+                    TranscriptPersistItem {
+                        run_id: Some(run_id.clone()),
+                        role: "user",
+                        content: request.message.clone(),
+                        payload: None,
+                        source_event_id: trace.root_event_id,
+                    },
+                    input_event,
                 )
-                .await
-                {
+                .await;
+                if let Err(error) = result {
                     tracing::warn!(
                         %session_id,
+                        %run_id,
                         %error,
-                        "user intent transcript item was not committed"
+                        "accepted turn audit and transcript could not be persisted"
                     );
                 }
             };
@@ -17777,7 +17783,7 @@ impl AgenticRunLifecycleService {
                 &session_id,
                 self.trace_ingestion.clone(),
             );
-            tokio::join!(persist_user_transcript, configure_controllers);
+            tokio::join!(persist_user_input, configure_controllers);
 
             // Wire the server-side runtime tool owner whenever the host exposes the
             // server tool catalog. For edge-bound runs this uses an internal
@@ -17997,7 +18003,6 @@ impl AgenticRunLifecycleService {
                 user_id: user_id.clone(),
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
-                resumed: false,
                 explain: request.explain,
                 agent_id: request.agent_id,
                 model_name: request.model,

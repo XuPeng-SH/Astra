@@ -717,7 +717,6 @@ impl AgenticRunLifecycleService {
                 .set(Arc::downgrade(executor));
         }
         Ok(OwnedBackgroundExecution {
-            resumed: true,
             user_id: run.user_id.clone(),
             session_id: run.session_id.clone(),
             run_id: run.run_id.clone(),

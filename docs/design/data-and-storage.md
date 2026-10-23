@@ -151,6 +151,20 @@ Retention is a product contract:
   rows, including terminal settlement and trace repair. Replay contributes no
   insertion delta; a lost commit acknowledgement must not trigger a separate
   counter update.
+- Fresh root input commits its `user_query` audit fact, transcript projection,
+  and inserted-only session counter in one transaction under one session
+  admission. Replay reuses the immutable identity; collisions retain their
+  receipt without projecting conflicting text. Structured intents without a
+  prompt retain transcript-only capture. Resume does not admit a second input.
+- Context display publication follows canonical terminal settlement in the
+  existing tracked cleanup task. Workspace projections no longer block model
+  completion; `context_trace_signal` uses the bounded ingestion worker and its
+  batching, retry and shutdown drain instead of a synchronous event API
+  transaction. Failed canonical settlement does not publish derived context.
+- Trace capture and asynchronous ingestion share an all-inserted batch proof:
+  exact affected-row count plus distinct, bounded identities avoids rereading
+  newly inserted rows. Partial insertion, duplicate identities, replay and
+  possible truncation retain owner-scoped hash/write-marker classification.
 - Terminal capture batches core conversation events and LLM/tool trace events
   through the same writer, sharing session admission and insertion readback.
 - The existing asynchronous ingestion worker combines eligible session heads
