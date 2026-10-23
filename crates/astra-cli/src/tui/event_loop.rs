@@ -4365,6 +4365,33 @@ fn handle_task_surface_refresh_shortcut(
     true
 }
 
+/// Edit the latest semantic user message as a fresh turn. Keep the prior
+/// transcript intact and leave overlays and in-flight drafts in control.
+fn handle_edit_last_shortcut(
+    key: &crossterm::event::KeyEvent,
+    chat_widget: &chat_widget::ChatWidget,
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    if key.code != crossterm::event::KeyCode::Char('r')
+        || !key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        || bottom_pane.has_active_view()
+        || !bottom_pane.composer.is_empty()
+    {
+        return false;
+    }
+    let Some(prev) = chat_widget.last_user_text() else {
+        return false;
+    };
+    bottom_pane
+        .composer
+        .set_text(&slash_dispatch::conversation_for_composer(&prev));
+    frame_requester.schedule_frame();
+    true
+}
+
 fn handle_agent_monitor_shortcut(
     key: &crossterm::event::KeyEvent,
     chat_widget: &mut chat_widget::ChatWidget,
@@ -8682,23 +8709,12 @@ pub(crate) async fn run_tui_session(
                         ) {
                             continue;
                         }
-                        // Ctrl+R: edit last — pull the most recent user
-                        // message back into the composer so the user can
-                        // re-word and resubmit without retyping. Works only
-                        // when idle (no overlay, composer empty) so it
-                        // doesn't clobber in-flight drafts. The prior
-                        // scrollback stays visible: the retry runs as a
-                        // fresh turn below, and the model sees the earlier
-                        // attempt + its reply as context (which is the point
-                        // — "try again, differently").
-                        if key.code == crossterm::event::KeyCode::Char('r')
-                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                            && !bottom_pane.has_active_view()
-                            && bottom_pane.composer.is_empty()
-                            && let Some(prev) = chat_widget.last_user_text()
-                        {
-                            bottom_pane.composer.set_text(&prev);
-                            frame_requester.schedule_frame();
+                        if handle_edit_last_shortcut(
+                            &key,
+                            &chat_widget,
+                            &mut bottom_pane,
+                            &frame_requester,
+                        ) {
                             continue;
                         }
                         if handle_agent_monitor_shortcut(
@@ -22853,6 +22869,120 @@ mod tests {
                 ..
             }) if text == "Opened session reflection"
         ));
+    }
+
+    #[test]
+    fn edit_last_shortcut_resubmits_semantic_slash_text_without_local_actions() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (raw, semantic) in [
+            ("//exit", "/exit"),
+            ("//stop", "/stop"),
+            ("//tmp/project inspect this", "/tmp/project inspect this"),
+            ("///tmp/project", "//tmp/project"),
+            ("//", "/"),
+            ("ordinary message", "ordinary message"),
+        ] {
+            let mut pane = BottomPane::new();
+            pane.set_slash_items(
+                crate::cli::command_registry::tui_commands()
+                    .filter(|meta| !meta.name.contains(' '))
+                    .map(|meta| slash_menu::SlashItem::simple(meta.name, meta.description))
+                    .collect(),
+            );
+            let mut widget = chat_widget::ChatWidget::new("edit-session");
+            for ch in raw.chars() {
+                pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            let BottomPaneAction::SubmitInput(text) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("initial message must submit: {raw}");
+            };
+            commit_submission_projection(&mut widget, &text);
+            assert_eq!(widget.last_user_text().as_deref(), Some(semantic));
+            widget.handle_event(chat_widget::AppEvent::wire(
+                chat_widget::WireEvent::AnswerDelta {
+                    model_item_id: None,
+                    text: "Completed reply".into(),
+                },
+            ));
+            widget.handle_event(chat_widget::AppEvent::wire(
+                chat_widget::WireEvent::TurnComplete(Box::default()),
+            ));
+
+            // Repeated editing must not consume another slash or change the
+            // canonical transcript into composer syntax.
+            for _ in 0..2 {
+                assert!(handle_edit_last_shortcut(
+                    &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                    &widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                ));
+                let BottomPaneAction::SubmitInput(retry) =
+                    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                else {
+                    panic!("edited conversation must submit: {raw}");
+                };
+                assert_eq!(
+                    submission_projection(&retry),
+                    SubmissionProjection::Conversation(semantic),
+                    "edit last must preserve conversation meaning: {raw}",
+                );
+                assert!(slash_dispatch::immediate_control(&retry).is_none());
+                assert!(!slash_dispatch::parse_submission(&retry).is_command());
+                commit_submission_projection(&mut widget, &retry);
+                assert_eq!(widget.last_user_text().as_deref(), Some(semantic));
+            }
+            let user_texts: Vec<_> = widget
+                .history()
+                .iter()
+                .filter_map(|cell| match cell.to_persist() {
+                    Some(crate::tui::turn_event::TurnEvent::User { text, .. }) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(user_texts, vec![semantic; 3]);
+        }
+    }
+
+    #[test]
+    fn edit_last_shortcut_preserves_drafts_overlays_and_empty_session() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let edit = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let frame = FrameRequester::test_dummy();
+        let mut widget = chat_widget::ChatWidget::new("edit-session");
+        commit_submission_projection(&mut widget, "//exit");
+        let mut pane = BottomPane::new();
+        pane.composer.set_text("existing draft");
+        assert!(!handle_edit_last_shortcut(
+            &edit, &widget, &mut pane, &frame
+        ));
+        assert_eq!(pane.composer.text(), "existing draft");
+        pane.composer.set_text("");
+        pane.push_view(Box::new(bottom_pane::info_view::InfoView::from_plain(
+            "Details",
+            vec!["Keep this view".into()],
+        )));
+        assert!(!handle_edit_last_shortcut(
+            &edit, &widget, &mut pane, &frame
+        ));
+        assert!(pane.has_active_view());
+        assert!(pane.composer.is_empty());
+
+        let mut pane = BottomPane::new();
+        let other = chat_widget::ChatWidget::new("empty-other-session");
+        assert!(!handle_edit_last_shortcut(&edit, &other, &mut pane, &frame));
+        assert!(pane.composer.is_empty());
+        assert!(!handle_edit_last_shortcut(
+            &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &widget,
+            &mut pane,
+            &frame,
+        ));
+        assert!(pane.composer.is_empty());
     }
 
     #[tokio::test]

@@ -543,6 +543,26 @@ async fn empty_canonical_wal_recovery_reuses_its_physical_connection() {
     let run_id = format!("empty-wal-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
+    // Cancel while the new snapshot preflight waits for the only pool slot.
+    // Releasing that slot must still permit an independent query and recovery.
+    let held = pool.acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            load_inference_canonical_transitions_for_session(
+                &shared_pool,
+                &user_id,
+                &session_id,
+                0,
+            ),
+        )
+        .await
+        .is_err(),
+        "recovery must wait for the occupied snapshot checkout"
+    );
+    drop(held);
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+
     let connection_id_before: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
         .fetch_one(pool)
         .await
@@ -640,6 +660,12 @@ async fn empty_canonical_wal_recovery_reuses_its_physical_connection() {
             .expect_err("empty recovery cannot bypass a lifecycle fence");
     assert_eq!(deleted.kind, ServiceErrorKind::NotFound);
     cleanup(pool, &user_id, &session_id, &run_id).await;
+    pool.close().await;
+    let unavailable =
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 0)
+            .await
+            .expect_err("preflight acquisition failure must not look like empty recovery");
+    assert_eq!(unavailable.kind, ServiceErrorKind::Persistence);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
