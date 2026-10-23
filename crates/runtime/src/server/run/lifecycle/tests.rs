@@ -11711,7 +11711,7 @@ async fn terminal_test_service() -> (AgenticRunLifecycleService, TerminalTestLlm
         "terminal-fixture-executor",
     )
     .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
-    service.test_inference_ledger = Some(Default::default());
+    service.provider_observations = Some(Default::default());
     (service, llm)
 }
 
@@ -15685,7 +15685,7 @@ async fn child_and_grandchild_execute_with_their_own_frozen_workspace_contracts(
     let llm = spawn_gated_terminal_test_llm().await;
     let store = Arc::new(InMemoryWorkspaceRecordStore::new());
     let mut service = test_service().with_workspace_record_store(store);
-    service.test_inference_ledger = Some(Default::default());
+    service.provider_observations = Some(Default::default());
     let provider = service.selected_server_workspace_provider.as_ref().unwrap();
     let workspace = provider.provision("session-1").unwrap();
     ok(service
@@ -24785,7 +24785,7 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
         "fanout-fixture-executor",
     )
     .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
-    owner.test_inference_ledger = Some(Default::default());
+    owner.provider_observations = Some(Default::default());
     let observer = AgenticRunLifecycleService::new(
         test_settings(),
         test_encryptor(),
@@ -24894,7 +24894,7 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
     );
     assert_eq!(llm.requests.load(Ordering::SeqCst), 1);
     owner
-        .test_inference_ledger
+        .provider_observations
         .as_ref()
         .unwrap()
         .assert_quiescent();
@@ -24938,7 +24938,7 @@ async fn production_fanout_flushes_sparse_event_before_terminal() {
         "fanout-timer-fixture",
     )
     .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
-    owner.test_inference_ledger = Some(Default::default());
+    owner.provider_observations = Some(Default::default());
     let mut request = test_request("sparse live run");
     request.execution_policy.turn_intent =
         astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
@@ -24982,7 +24982,7 @@ async fn production_fanout_flushes_sparse_event_before_terminal() {
     .await
     .unwrap();
     owner
-        .test_inference_ledger
+        .provider_observations
         .as_ref()
         .unwrap()
         .assert_quiescent();
@@ -34598,7 +34598,7 @@ async fn durable_create_run_eventually_persists_terminal_event() {
     assert!(svc.user_prompt_channels.lock().await.is_empty());
     assert!(svc.progress_channels.lock().await.is_empty());
     assert!(llm.requests.load(Ordering::SeqCst) > 0);
-    svc.test_inference_ledger
+    svc.provider_observations
         .as_ref()
         .unwrap()
         .assert_quiescent();
@@ -34632,7 +34632,7 @@ async fn interactive_provider_failure_cleans_run_channels() {
     assert!(svc.user_prompt_channels.lock().await.is_empty());
     assert!(svc.progress_channels.lock().await.is_empty());
     assert!(llm.requests.load(Ordering::SeqCst) > 0);
-    svc.test_inference_ledger
+    svc.provider_observations
         .as_ref()
         .unwrap()
         .assert_quiescent();

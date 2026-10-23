@@ -525,36 +525,97 @@ pub(crate) fn eventstream_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Reuse the real inference ledger's existing test persistence implementation.
-/// This supplies invocation/attempt settlement, never a simulated host loop.
+/// Observations of the production transport. This fixture provides no model
+/// admission, storage, lease or settlement implementation.
 #[derive(Clone, Default)]
-pub struct InferenceLedgerFixture {
-    pub(crate) persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
+pub struct ProviderObservationsFixture {
+    calls: Arc<Mutex<std::collections::BTreeMap<String, ObservedCall>>>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
-impl InferenceLedgerFixture {
-    #[cfg(feature = "e2e-hooks")]
-    pub fn admissions(
+struct ObservedCall {
+    scope: astra_turn_types::InferenceInvocationScope,
+    authority: astra_services::InferenceRunAdmissionAuthority,
+    attempts: Vec<crate::turn::llm::client::ProviderAttemptObservation>,
+    finished: bool,
+}
+
+impl ProviderObservationsFixture {
+    pub(crate) fn record(
+        &self,
+        id: &str,
+        scope: &astra_turn_types::InferenceInvocationScope,
+        authority: &astra_services::InferenceRunAdmissionAuthority,
+        attempts: Vec<crate::turn::llm::client::ProviderAttemptObservation>,
+        finished: bool,
+    ) {
+        if attempts.is_empty() {
+            return;
+        }
+        self.calls.lock().unwrap().insert(
+            id.to_string(),
+            ObservedCall {
+                scope: scope.clone(),
+                authority: authority.clone(),
+                attempts,
+                finished,
+            },
+        );
+        self.changed.notify_one();
+    }
+
+    pub fn requests(
         &self,
     ) -> Vec<(
         astra_turn_types::InferenceInvocationScope,
         Option<astra_services::InferenceRunAdmissionAuthority>,
     )> {
-        self.persistence.admissions()
+        self.calls
+            .lock()
+            .unwrap()
+            .values()
+            .map(|call| (call.scope.clone(), Some(call.authority.clone())))
+            .collect()
     }
-    /// Await the existing settlement owner without closing provider admission.
-    /// Cancellation returns after handoff; logical ledger settlement may follow.
-    pub async fn wait_for_settlements(&self, timeout: std::time::Duration) -> bool {
-        crate::turn::llm::durable::wait_for_provider_settlement_coordinator(timeout).await
+
+    pub async fn wait_for_completion(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let changed = self.changed.notified();
+                if self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|call| call.finished)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .is_ok()
     }
+
     pub fn assert_quiescent(&self) {
-        self.persistence.assert_quiescent();
+        assert!(
+            self.calls
+                .lock()
+                .unwrap()
+                .values()
+                .all(|call| call.finished),
+            "provider transport still has an active request"
+        );
     }
+
     pub fn attempt_count(&self) -> usize {
-        self.persistence.attempt_count()
-    }
-    pub fn canonical_transition_hashes(&self) -> Vec<String> {
-        self.persistence.canonical_transition_hashes()
+        self.calls
+            .lock()
+            .unwrap()
+            .values()
+            .map(|call| call.attempts.len())
+            .sum()
     }
 }
 
@@ -598,7 +659,7 @@ pub fn admitted_execution(
 /// these defaults exercise primary request/response execution only.
 pub fn server_host_builder(
     gateway: &ProviderGateway,
-    ledger: &InferenceLedgerFixture,
+    ledger: &ProviderObservationsFixture,
     session_id: &str,
     provider: &str,
     model: &str,
@@ -627,7 +688,7 @@ pub fn server_host_builder(
         "provider-fixture-user".into(),
         session_id.into(),
     )
-    .with_test_inference_ledger(ledger.persistence.clone())
+    .with_provider_observations(ledger.clone())
     .with_model_service(Some(Arc::new(OfferingCatalogFixture {
         execution: execution.clone(),
     })))
@@ -833,7 +894,7 @@ mod tests {
                 vec![response],
             )])
             .await;
-            let ledger = InferenceLedgerFixture::default();
+            let ledger = ProviderObservationsFixture::default();
             let session = format!("child-read-{}", uuid::Uuid::new_v4());
             let mut host =
                 server_host_builder(&gateway, &ledger, &session, "openai", "fixture-model", None)
@@ -994,7 +1055,7 @@ mod tests {
             ),
         ])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = format!("memory-refresh-{}", uuid::Uuid::new_v4());
         let memory = Arc::new(RefreshingSessionMemory {
             session_id: session.clone(),

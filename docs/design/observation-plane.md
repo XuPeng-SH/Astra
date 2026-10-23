@@ -245,7 +245,13 @@ accepted the request or consumed a particular reasoning level. Actual request
 and usage attribution remains with inference evidence; absent evidence is
 unknown, not zero.
 
-The inference ledger stores content-free accepted/terminal request diagnostics
+Agent model calls emit request-local wire/dispatch/terminal observations through
+the existing trace projection. They do not synchronously insert accepted and
+terminal request-context rows. A process crash may lose uncommitted observations;
+missing evidence remains unknown. Trace failure does not reject a completed model
+response.
+
+Standalone inference accounting stores content-free accepted/terminal request diagnostics
 in `model_request_context_events`. These records complement `agent_events` and
 are exposed through the existing owner-scoped request queries and session
 observability projection. They do not require full prompt capture.

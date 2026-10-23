@@ -4349,21 +4349,6 @@ impl AgenticLoopState {
             .recover_provider_wal_replacement(durable_base, transition, recovered_messages)
     }
 
-    pub(crate) fn acknowledge_provider_canonical_replacement(
-        &mut self,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
-    ) -> Result<(), String> {
-        let durable_base = self
-            .provider_canonical_wal_base
-            .as_ref()
-            .ok_or_else(|| "provider WAL admission has no admitted durable base".to_string())?;
-        self.canonical_rewrite_state
-            .proof
-            .as_mut()
-            .ok_or_else(|| "provider WAL replacement has no admitted rewrite proof".to_string())?
-            .acknowledge_provider_wal_replacement(durable_base, transition)
-    }
-
     pub(crate) fn begin_canonical_rewrite(
         &self,
     ) -> Option<crate::turn::canonical_commit::CanonicalRewritePermit> {

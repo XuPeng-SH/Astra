@@ -906,20 +906,19 @@ Terminal evidence admission reads exact run metadata and its cancellation
 marker under the session/execution/run locks once. Settlement consumes those
 transaction-owned facts; a root's already-locked marker is its complete
 cancellation lineage, while children still validate and lock their ancestors.
-Provider admission likewise needs no later-guidance lookup when its admitted
-control epoch equals the current locked run event frontier. Event append and
-frontier advance remain atomic; a lagging epoch retains the indexed guidance
-query and all owner/generation/lease/cancellation checks still apply.
+Agent model requests reuse the Run's local cancellation, pause, execution-lease
+loss and original deadline controls. They do not create a durable per-request
+owner, provider WAL or settlement debt. Main and auxiliary calls use the same
+transport observations. Offering authorization and durable tool invocation
+admission remain mandatory; losing model output on a process crash may require
+a user to resend or continue.
 
 The completed stream follows the durable terminal, canonical conversation
-commit and exact writer release. After its remaining projections and hooks, the
-owning run task drops the resident context and its interaction sender handles,
-then releases distributed capacity and retires absorbed provider WAL payloads.
-Until that cleanup completes, capacity is conservatively reserved. Existing
-permit-drop and expiry handling recover an
-interrupted release, while a later session boundary retries WAL retirement.
-An empty retirement on a writable owned session needs no child-write transaction;
-nonempty or unavailable snapshots retain the canonical lifecycle lock and checks.
+commit and exact writer release. After remaining projections and hooks, the
+owning task drops its resident context and interaction senders, then releases
+distributed capacity. Agent cleanup does not query or retire per-model WAL
+payloads because agent execution no longer produces them. Existing permit-drop
+and expiry handling recover an interrupted capacity release.
 
 The Explain Analyze graph is produced only for a root run that explicitly
 requested it. Ordinary runs keep their lifecycle, transcript, trace, and

@@ -60,10 +60,11 @@ configuration concurrency fence.
 ## Execution attribution
 
 Routing evaluation must join selection evidence to actual inference execution.
-The canonical inference ledger owns the admitted route, logical invocation,
-physical provider attempts, and their terminal outcomes. Request diagnostics
-project that attribution through `ModelRequestContextEvent.route`; they must
-not construct a second route or credential authority.
+Offering admission owns route and credential authority. Agent physical requests
+are observed in process under their existing Run authority; standalone completion
+and background-accounting requests retain the inference ledger. Diagnostics may
+project those facts, but must not become another route or execution authority.
+Agent request observations and usage are not guaranteed to survive process failure.
 
 A route identifier belongs to a logical invocation, not a whole user turn or
 an adaptive routing decision. Physical retries share its route and invocation
