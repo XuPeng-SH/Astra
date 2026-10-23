@@ -109,6 +109,14 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             "{body}"
         );
         assert!(body.contains("Discovery complete."), "{body}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "tool_call_end")
+                .count(),
+            readonly_rounds,
+            "tool outcomes must be delivered exactly once: {body}"
+        );
         assert!(
             !events.iter().any(|event| event["type"] == "error"),
             "{body}"
@@ -120,6 +128,18 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .await
         );
         let statements = capture.0.lock().unwrap().take().unwrap();
+        let diagnostic_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type IN ('trace_span', 'llm_round')",
+        )
+        .bind(&b.ctx.user_id)
+        .bind(&b.ctx.session_id)
+        .fetch_one(&b.ctx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            diagnostic_rows.0, 0,
+            "ordinary chat must not persist optional diagnostic copies"
+        );
         assert!(
             !statements.is_empty(),
             "the SQL observer must capture real database work"
@@ -166,4 +186,65 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         "ordinary chat used {baseline} SQL statements including transactions and drained background work:\n{}",
         budgets[0].1.join("\n")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
+async fn explicit_explain_keeps_diagnostic_ingestion_after_complete_drain() {
+    require_system_e2e_env();
+    let b = bootstrap().await;
+    let model = format!("mock-{}", b.ctx.suffix);
+    b.ctx
+        .install_native_provider(
+            &b.auth_header,
+            vec![ProviderScript::new(
+                "explicit diagnostic recording",
+                move |request| request.body["model"] == model && request.body["stream"] == true,
+                vec![answer(
+                    json!({"role": "assistant", "content": "Observed."}),
+                    "stop",
+                )],
+            )],
+        )
+        .await;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/chat/stream")
+        .header("authorization", &b.auth_header)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({
+                "message": "Reply briefly.",
+                "session_id": b.ctx.session_id,
+                "model_selection": seeded_model_selection(&b.ctx),
+                "explain": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, body) = collect_full_sse_stream(&b.ctx.app, request, 30).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert!(
+        parse_sse_events(&body)
+            .iter()
+            .any(|event| { event["type"] == "run_finished" && event["status"] == "completed" }),
+        "{body}"
+    );
+    assert!(
+        b.ctx
+            .app_state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
+    );
+    let recorded: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type IN ('trace_span', 'llm_round')",
+    )
+    .bind(&b.ctx.user_id)
+    .bind(&b.ctx.session_id)
+    .fetch_one(&b.ctx.pool)
+    .await
+    .unwrap();
+    assert!(recorded.0 > 0, "explicit diagnostics must remain available");
+    assert_eq!(b.ctx.native_provider_requests().await.len(), 1);
+    b.ctx.close().await;
 }

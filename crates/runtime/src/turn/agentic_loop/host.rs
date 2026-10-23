@@ -3842,9 +3842,6 @@ pub struct AgenticLoopState {
     /// canonical coordinator admitted the turn; local/subrun histories must
     /// not invent this authority.
     pub provider_canonical_wal_base: Option<astra_turn_types::ProviderCanonicalWalBaseV2>,
-    /// Atomic database-owned WAL head. Identity and capacity accounting move
-    /// together so a half-initialized lineage cannot be represented.
-    pub provider_canonical_wal_head: Option<ProviderCanonicalWalHead>,
     /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
     /// hybrid enforcement: the first such round triggers a physical lockout
     /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
@@ -3955,75 +3952,6 @@ pub struct AgenticLoopState {
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::super::harness_adapter::HarnessSlot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderCanonicalWalHead {
-    pub(crate) transition_id: String,
-    pub(crate) result: astra_turn_types::ProviderCanonicalHistoryIdentityV2,
-    pub(crate) chain_length: u32,
-    pub(crate) chain_payload_bytes: u64,
-}
-
-impl ProviderCanonicalWalHead {
-    pub(crate) fn from_chain(
-        transitions: &[astra_turn_types::ProviderCanonicalTransitionV2],
-    ) -> Result<Option<Self>, astra_turn_types::ProviderCanonicalTransitionError> {
-        let Some(last) = transitions.last() else {
-            return Ok(None);
-        };
-        let mut chain_payload_bytes = 0_u64;
-        for transition in transitions {
-            chain_payload_bytes = chain_payload_bytes
-                .checked_add(transition.durable_payload_bytes()?)
-                .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes)?;
-        }
-        Ok(Some(Self {
-            transition_id: last.transition_id.clone(),
-            result: last.result.clone(),
-            chain_length: u32::try_from(transitions.len()).map_err(|_| {
-                astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries
-            })?,
-            chain_payload_bytes,
-        }))
-    }
-
-    pub(crate) fn advanced(
-        &self,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
-    ) -> Result<Self, astra_turn_types::ProviderCanonicalTransitionError> {
-        let payload_bytes = transition.durable_payload_bytes()?;
-        let (chain_length, chain_payload_bytes) = if transition.recovery_mode
-            == astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
-        {
-            (
-                self.chain_length
-                    .checked_add(1)
-                    .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries)?,
-                self.chain_payload_bytes
-                    .checked_add(payload_bytes)
-                    .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes)?,
-            )
-        } else {
-            (1, payload_bytes)
-        };
-        Ok(Self {
-            transition_id: transition.transition_id.clone(),
-            result: transition.result.clone(),
-            chain_length,
-            chain_payload_bytes,
-        })
-    }
-
-    pub(crate) fn would_exceed_with_limits(
-        &self,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
-        max_entries: u32,
-        max_bytes: u64,
-    ) -> Result<bool, astra_turn_types::ProviderCanonicalTransitionError> {
-        let next = self.advanced(transition)?;
-        Ok(next.chain_length > max_entries || next.chain_payload_bytes > max_bytes)
-    }
 }
 
 /// Build the stable runtime manifest carried through context metadata.
@@ -4166,7 +4094,6 @@ impl AgenticLoopState {
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
             provider_canonical_wal_base: None,
-            provider_canonical_wal_head: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
@@ -4306,7 +4233,6 @@ impl AgenticLoopState {
     pub(crate) fn initialize_provider_canonical_wal_base(&mut self, durable_prefix: &[Value]) {
         self.provider_canonical_wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(durable_prefix).ok();
-        self.provider_canonical_wal_head = None;
     }
 
     pub(crate) fn canonical_rewrite_proof(
@@ -4529,16 +4455,6 @@ impl AgenticLoopState {
     #[must_use]
     pub fn owns_session_composite_snapshot(&self) -> bool {
         self.recursion_depth == 0 && self.delegation_chain.is_empty()
-    }
-
-    /// Whether this loop owns provider-attempt write-ahead transitions for
-    /// the canonical session conversation. Subagents and delegated loops may
-    /// share a session id for tool/evidence custody, but their private prompt
-    /// histories must never hydrate from or write into the root transcript.
-    #[must_use]
-    pub fn owns_provider_canonical_transition_wal(&self) -> bool {
-        self.owns_session_composite_snapshot()
-            && self.inference_purpose == astra_turn_types::InferencePurpose::PrimaryAgent
     }
 
     /// Provider-reported total tokens consumed by this loop.
@@ -6354,21 +6270,17 @@ pub(crate) mod tests {
     fn only_root_loop_owns_session_composite_snapshot() {
         let mut state = make_state();
         assert!(state.owns_session_composite_snapshot());
-        assert!(state.owns_provider_canonical_transition_wal());
 
         state.recursion_depth = 1;
         assert!(!state.owns_session_composite_snapshot());
-        assert!(!state.owns_provider_canonical_transition_wal());
 
         state.recursion_depth = 0;
         state.delegation_chain = vec!["orchestrator".to_string()];
         assert!(!state.owns_session_composite_snapshot());
-        assert!(!state.owns_provider_canonical_transition_wal());
 
         state.delegation_chain.clear();
         state.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
         assert!(state.owns_session_composite_snapshot());
-        assert!(!state.owns_provider_canonical_transition_wal());
     }
 
     fn structured_task_profile(

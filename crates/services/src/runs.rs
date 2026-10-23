@@ -5277,10 +5277,6 @@ impl RunMutationAdmission {
     pub(crate) fn owns_session(&self, user_id: &str, session_id: &str) -> bool {
         self.run.user_id == user_id && self.run.session_id == session_id
     }
-
-    pub(crate) fn run(&self) -> &DurableRunRecord {
-        &self.run
-    }
 }
 
 /// Authoritative read result for an atomic terminal settlement.
@@ -16737,45 +16733,9 @@ impl DatabaseRunStateStore {
             }
             stage_receipt = Some(receipt);
         }
-        let existing_session: Option<String> = sqlx::query_scalar(
-            "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
-        )
-        .bind(&record.user_id)
-        .bind(&record.run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "lock_existing_run_identity_for_create",
-                &record.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if let Some(existing_session) = existing_session {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_existing_run_identity_for_create",
-                    &record.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            if claim_existing {
-                return self
-                    .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
-                    .await
-                    .map(|claim| (claim, None))
-                    .map_err(Into::into);
-            }
-            return Err(format!(
-                "run identity {} is already bound to session {existing_session}",
-                record.run_id
-            )
-            .into());
-        }
-
+        // The unique Run key is the authority for creation. The INSERT below
+        // handles duplicate identities and exact replay after rollback; a
+        // preceding existence read repeats that work and cannot prove absence.
         if !run_requires_session_execution_slot(&record) {
             crate::session_context_coordinator::ensure_run_execution_binding_ready_in_tx(
                 &mut tx,

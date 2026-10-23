@@ -526,3 +526,13 @@ calling the full cross-surface E2E verified. Activity polling and multi-user
 capacity targets remain unmeasured. Server Run-owner crash recovery remains
 unsupported until its production recovery consumer and separate lifecycle E2E
 exist.
+
+## Raw conversation history
+
+Work transcript pages return available committed raw messages bounded by the
+canonical Context cursor. They do not maintain or certify a second transcript
+projection head. The response cursor identifies the canonical snapshot; it is
+not an independent assertion that every historical diagnostic has been copied
+into transcript storage. Uncommitted active-turn rows are excluded. Ordinary
+Run completion commits original conversation rows and Context together;
+reasoning and interaction diagnostics retain their own trace/event surfaces.

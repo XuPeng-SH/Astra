@@ -339,7 +339,6 @@ fn assert_field_absent(value: &Value, forbidden: &str) {
 
 async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
     for (table, owner_column) in [
-        ("session_transcript_projection_heads", "user_id"),
         ("session_transcript_items", "user_id"),
         ("session_context_operation_receipts", "owner_user_id"),
         ("session_context_authority_events", "owner_user_id"),
@@ -3924,25 +3923,6 @@ async fn work_transcript_is_bounded_committed_owner_scoped_and_causally_honest()
     let session_id = binding.session_id.as_str();
     let first_cursor = commit_test_conversation_turn(&pool, &owner_id, session_id, None, 1).await;
 
-    sqlx::query(
-        "INSERT INTO session_transcript_projection_heads
-         (user_id, session_id, completed_turn, journal_event_seq, conversation_seq,
-          canonical_root_hash, projection_schema, compaction_generation,
-          config_version_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(&owner_id)
-    .bind(session_id)
-    .bind(i64::from(first_cursor.completed_turn))
-    .bind(i64::try_from(first_cursor.journal_event_seq).unwrap())
-    .bind(i64::try_from(first_cursor.conversation_seq).unwrap())
-    .bind(&first_cursor.canonical_root_hash)
-    .bind(i64::from(first_cursor.projection_schema))
-    .bind(i64::try_from(first_cursor.compaction_generation).unwrap())
-    .bind(&first_cursor.config_version_id)
-    .execute(pool.get())
-    .await
-    .expect("insert transcript projection head");
     let large_content = "x".repeat(9_000);
     let large_payload = serde_json::json!({"detail": "y".repeat(17_000)}).to_string();
     for (item_seq, content, payload, committed_turn) in [
@@ -4015,9 +3995,9 @@ async fn work_transcript_is_bounded_committed_owner_scoped_and_causally_honest()
     let (stale_status, stale, _) =
         get_work_transcript(app.clone(), &owner_id, work_id, branch_id, "?limit=10").await;
     assert_eq!(stale_status, StatusCode::OK);
-    assert_eq!(stale["sync"], "projection_stale");
+    assert_eq!(stale["sync"], "current");
     assert_eq!(stale["canonical_head"]["completed_turn"], 2);
-    assert_eq!(stale["transcript_cursor"]["completed_turn"], 1);
+    assert_eq!(stale["transcript_cursor"]["completed_turn"], 2);
     assert_eq!(
         stale["canonical_head"]["canonical_root_hash"],
         second_cursor.canonical_root_hash

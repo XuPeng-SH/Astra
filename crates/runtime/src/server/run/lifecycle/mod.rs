@@ -501,11 +501,11 @@ struct PendingLiveEvent {
 }
 
 #[derive(Clone, Default)]
-struct DurableToolTerminalTracker {
-    committed_occurrences: Arc<StdMutex<HashMap<[u8; 32], usize>>>,
+struct EmittedToolTerminalTracker {
+    emitted_occurrences: Arc<StdMutex<HashMap<[u8; 32], usize>>>,
 }
 
-impl DurableToolTerminalTracker {
+impl EmittedToolTerminalTracker {
     fn fingerprint(event: &Value) -> Option<[u8; 32]> {
         (event.get("type").and_then(Value::as_str) == Some("tool_call_end")).then(|| {
             let encoded = serde_json::to_vec(event).unwrap_or_default();
@@ -513,41 +513,41 @@ impl DurableToolTerminalTracker {
         })
     }
 
-    fn record_committed(&self, events: &[Value]) {
-        let mut committed = self
-            .committed_occurrences
+    fn record_emitted(&self, events: &[Value]) {
+        let mut emitted = self
+            .emitted_occurrences
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for event in events {
             if let Some(fingerprint) = Self::fingerprint(event) {
-                *committed.entry(fingerprint).or_default() += 1;
+                *emitted.entry(fingerprint).or_default() += 1;
             }
         }
     }
 
-    fn mark_committed_retained_copies(&self, events: &mut [Value]) {
-        let mut committed = self
-            .committed_occurrences
+    fn mark_emitted_retained_copies(&self, events: &mut [Value]) {
+        let mut emitted = self
+            .emitted_occurrences
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for event in events {
             let Some(fingerprint) = Self::fingerprint(event) else {
                 continue;
             };
-            let Some(remaining) = committed.get_mut(&fingerprint) else {
+            let Some(remaining) = emitted.get_mut(&fingerprint) else {
                 continue;
             };
             if *remaining > 0 {
                 *remaining -= 1;
                 if let Some(object) = event.as_object_mut() {
                     object.insert(
-                        TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD.to_string(),
+                        TOOL_TERMINAL_LIVE_EMITTED_FIELD.to_string(),
                         Value::Bool(true),
                     );
                 }
             }
         }
-        committed.retain(|_, count| *count > 0);
+        emitted.retain(|_, count| *count > 0);
     }
 }
 
@@ -966,7 +966,7 @@ async fn flush_durable_live_events(
     run_id: &str,
     live_tx: &broadcast::Sender<Value>,
     client_event_tx: &mut AttachedStreamDelivery,
-    durable_tool_terminals: &DurableToolTerminalTracker,
+    emitted_tool_terminals: &EmittedToolTerminalTracker,
 ) -> Result<(), String> {
     if pending.is_empty() {
         return Ok(());
@@ -980,16 +980,16 @@ async fn flush_durable_live_events(
     run_engine
         .append_events_batch(user_id, expected_session_id, run_id, &durable_events)
         .await?;
-    durable_tool_terminals.record_committed(&durable_events);
     {
         let mut runs = runs.write().await;
         if let Some(run) = runs.get_mut(run_id) {
-            for event in &durable_events {
-                push_active_run_live_event(run, event.clone());
+            for entry in &events {
+                push_active_run_live_event(run, entry.event.clone());
             }
         }
     }
     for entry in events {
+        emitted_tool_terminals.record_emitted(std::slice::from_ref(&entry.event));
         deliver_live_fanout_event(live_tx, client_event_tx, run_id, entry.event).await;
     }
     Ok(())
@@ -1047,12 +1047,12 @@ async fn process_ordered_live_fanout_event(
     run_id: &str,
     live_tx: &broadcast::Sender<Value>,
     client_event_tx: &mut AttachedStreamDelivery,
-    durable_tool_terminals: &DurableToolTerminalTracker,
+    emitted_tool_terminals: &EmittedToolTerminalTracker,
 ) -> Result<(), LiveFanoutPersistenceError> {
     if let Some(object) = event.as_object_mut() {
-        // Defense in depth for direct event_tx producers: the durable
-        // acknowledgement watermark is lifecycle-private and never wire data.
-        object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
+        // The live delivery watermark is lifecycle-private, never a durable
+        // receipt or public protocol field.
+        object.remove(TOOL_TERMINAL_LIVE_EMITTED_FIELD);
     }
     let durable_event_committed = event
         .as_object_mut()
@@ -1082,7 +1082,7 @@ async fn process_ordered_live_fanout_event(
             run_id,
             live_tx,
             client_event_tx,
-            durable_tool_terminals,
+            emitted_tool_terminals,
         )
         .await
         .map_err(|detail| LiveFanoutPersistenceError {
@@ -1120,7 +1120,7 @@ async fn process_ordered_live_fanout_event(
             run_id,
             live_tx,
             client_event_tx,
-            durable_tool_terminals,
+            emitted_tool_terminals,
         )
         .await
         .map_err(|detail| LiveFanoutPersistenceError {
@@ -1150,7 +1150,7 @@ async fn process_ordered_live_fanout_event(
                 run_id,
                 live_tx,
                 client_event_tx,
-                durable_tool_terminals,
+                emitted_tool_terminals,
             )
             .await
             .map_err(|detail| LiveFanoutPersistenceError {
@@ -1162,7 +1162,12 @@ async fn process_ordered_live_fanout_event(
         return Ok(());
     }
 
-    // A live-only event with no earlier pending fact remains immediate.
+    // Live tool presentation has no database dependency. Keep only the bounded
+    // outcome replay and emission watermark; effects have their own ledger.
+    if let Some(run) = runs.write().await.get_mut(run_id) {
+        push_active_run_live_event(run, event.clone());
+    }
+    emitted_tool_terminals.record_emitted(std::slice::from_ref(&event));
     deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
     Ok(())
 }
@@ -4950,7 +4955,7 @@ struct OwnedBackgroundExecution {
 struct OwnedStreamDelivery {
     event_tx: mpsc::Sender<Value>,
     fanout_control_tx: mpsc::Sender<DurableLiveFanoutControl>,
-    durable_tool_terminals: DurableToolTerminalTracker,
+    emitted_tool_terminals: EmittedToolTerminalTracker,
     host_event_bridge: tokio::task::JoinHandle<()>,
     host_event_gap: server_loop_host::HostEventGapTracker,
     progress_bridge: AgentProgressStreamBridge,
@@ -8343,7 +8348,7 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
         request: &ChatRequestData,
-        execution_bindings: Option<&ExecutionBindingSnapshot>,
+        initial_execution: Option<&(ExecutionBindingSnapshot, LoopExecutionFacts)>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         work_binding: Option<&ValidatedWorkRuntimeBinding>,
         start_request_fingerprint: Option<&str>,
@@ -8352,11 +8357,21 @@ impl AgenticRunLifecycleService {
     ) -> Result<DurableRunStartClaim, (StatusCode, Json<ErrorResponse>)> {
         Self::validate_resolved_model_selection(request)?;
         self.validate_runtime_profile_shape(request)?;
+        let execution_bindings = initial_execution.map(|(snapshot, _)| snapshot);
         let mut context = run_start_context_from_request(
             request,
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
+        context.initial_execution_contract = initial_execution.map(|(snapshot, facts)| {
+            (
+                snapshot.clone(),
+                astra_turn_types::StopHookObligations {
+                    declarations: facts.hooks.declarations.clone(),
+                    phase: facts.hooks.phase,
+                },
+            )
+        });
         context.generation_controls = Some(
             Self::root_generation_controls(request)
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?,
@@ -15088,7 +15103,7 @@ impl AgenticRunLifecycleService {
         let (
             event_tx,
             fanout_control_tx,
-            durable_tool_terminals,
+            emitted_tool_terminals,
             mut host_event_bridge,
             host_event_gap,
             mut progress_bridge,
@@ -15096,7 +15111,7 @@ impl AgenticRunLifecycleService {
             Some(delivery) => (
                 Some(delivery.event_tx),
                 Some(delivery.fanout_control_tx),
-                Some(delivery.durable_tool_terminals),
+                Some(delivery.emitted_tool_terminals),
                 Some(delivery.host_event_bridge),
                 Some(delivery.host_event_gap),
                 Some(delivery.progress_bridge),
@@ -15129,7 +15144,7 @@ impl AgenticRunLifecycleService {
         let bg_workspace_provider_guard = self.selected_server_workspace_provider.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let bg_shared_pool = self.shared_pool.clone();
-        let bg_trace_ingestion = self.trace_ingestion.clone();
+        let bg_trace_ingestion = explain.then(|| self.trace_ingestion.clone()).flatten();
         let bg_explain = explain;
         let missing_lifecycle_spawner = descendant_spawner;
         let bg_metrics_registry = self.metrics_registry.clone();
@@ -15697,13 +15712,12 @@ impl AgenticRunLifecycleService {
                             "ordered live-event writer did not acknowledge its terminal watermark"
                         );
                     }
-                    // Only the durable fanout watermark can suppress settlement
-                    // repair. First-hop host queue admission is insufficient: the
-                    // bridge may be aborted while blocked on its second hop.
-                    durable_tool_terminals
+                    // Only actual fanout emission suppresses duplicate live
+                    // repair. Host queue admission alone does not prove delivery.
+                    emitted_tool_terminals
                         .as_ref()
                         .expect("stream execution owns its terminal tracker")
-                        .mark_committed_retained_copies(&mut final_events);
+                        .mark_emitted_retained_copies(&mut final_events);
                     // In streaming mode, host-emitted `type` events have already gone
                     // through the fanout persistence path. Include terminal recovery
                     // facts with the synthesized terminal events so a stalled bridge
@@ -15729,13 +15743,9 @@ impl AgenticRunLifecycleService {
                             &bg_run_id,
                             streaming_final_events.clone(),
                         );
-                    // These convergence events are a live repair of an attached
-                    // observer, not a second durable history. Their source facts
-                    // were already persisted on the ordered live lane (tool
-                    // terminals) or in the terminal CAS batch (run markers).
-                    // Without this marker the fanout writer appends tool endings
-                    // after `run_finished`, creating duplicate audit facts that
-                    // every later restore must reject.
+                    // Convergence copies are attached-stream repairs. Tool
+                    // outcomes and run markers are saved in the terminal CAS
+                    // batch below, never through another live append transaction.
                     for event in &mut streamed_final_events {
                         if let Some(object) = event.as_object_mut() {
                             object.insert(
@@ -15756,18 +15766,33 @@ impl AgenticRunLifecycleService {
                                     .get("event_id")
                                     .and_then(Value::as_str)
                                     .unwrap_or_default(),
-                            ) || !live_delta_event_for_persistence(event)
-                                || tool_terminal_requires_settlement_repair(event))
+                            ) || (!live_delta_event_for_persistence(event)
+                                && !matches!(
+                                    durable_event_type(event),
+                                    Some(
+                                        "tool_call"
+                                            | "tool_call_start"
+                                            | "tool_routing_decision"
+                                            | "tool_transport_started"
+                                            | "tool_transport_completed"
+                                            | "tool_transport_failed"
+                                    )
+                                )))
+                    })
+                    .map(|mut event| {
+                        if let Some(object) = event.as_object_mut() {
+                            object.remove(TOOL_TERMINAL_LIVE_EMITTED_FIELD);
+                        }
+                        event
                     })
                     .collect();
                     let streaming_events_for_durable =
                         enforce_durable_run_event_batch_budget(terminal_persistence_events);
-                    // Process-local replay already received tool terminals from
-                    // the ordered live lane. Only terminal run markers belong in
-                    // the final state merge; convergence copies are client-only.
+                    // Keep final run markers and any outcomes the live bridge
+                    // missed. Outcomes already retained locally are not duplicated.
                     let terminal_state_events = final_events
                         .iter()
-                        .filter(|event| streaming_final_event_for_replay(event))
+                        .filter(|event| streaming_convergence_event_for_replay(event))
                         .cloned()
                         .collect();
 
@@ -16564,13 +16589,16 @@ impl AgenticRunLifecycleService {
                             "post-loop persistence failed"
                         );
                     }
-                    if let Err(e) = persist_ctx
-                        .materialize_run_transcript_evidence(
-                            &state,
-                            terminal_assistant_source_event_id.as_deref(),
-                            canonical_context_cursor.as_ref(),
-                        )
-                        .await
+                    // Atomic settlement already persisted original history and
+                    // its Context cursor. Do not rebuild it from event traces.
+                    if !atomic_terminal_committed
+                        && let Err(e) = persist_ctx
+                            .materialize_run_transcript_evidence(
+                                &state,
+                                terminal_assistant_source_event_id.as_deref(),
+                                canonical_context_cursor.as_ref(),
+                            )
+                            .await
                     {
                         tracing::warn!(
                             session_id = %bg_session_id,
@@ -16609,6 +16637,29 @@ impl AgenticRunLifecycleService {
 }
 
 impl AgenticRunLifecycleService {
+    fn complete_execution_binding(
+        request: &ChatRequestData,
+        capabilities: &PreparedRuntimeCapabilities,
+        mut bindings: Option<ExecutionBindingSnapshot>,
+    ) -> Result<Option<ExecutionBindingSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(discovery) = capabilities.authenticated_edge_discovery.as_ref()
+            && let Some(snapshot) = bindings.as_mut()
+        {
+            snapshot.physical_workspace_id = Some(discovery.physical_workspace_id.clone());
+        }
+        if let Some(generation) = request.execution_binding_generation {
+            let snapshot = bindings.as_mut().ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Work execution provider could not be materialized",
+                    "execution_binding_unavailable",
+                )
+            })?;
+            snapshot.execution_binding_generation = Some(generation);
+        }
+        Ok(bindings)
+    }
+
     async fn prepare_new_owned_execution(
         &self,
         user_id: String,
@@ -16705,6 +16756,41 @@ impl AgenticRunLifecycleService {
         let cloud_provision_request =
             cloud_workspace_provision_request_from_request(&request, &run_id)?;
 
+        // No-file Server control and authenticated remote bindings are already
+        // known. Capture their exact contract in the opening transaction instead
+        // of claiming the Run and opening a second transaction to repeat it.
+        let initial_execution =
+            if cloud_provision_request.is_none() && !request_uses_server_workspace(&request) {
+                let bindings = Self::complete_execution_binding(
+                    &request,
+                    &runtime_capabilities,
+                    resolve_request_execution_bindings_without_server_workspace(
+                        &request,
+                        &edge_context.edge_profile,
+                    )
+                    .map(|(workspace, executor)| {
+                        ExecutionBindingSnapshot::inferred(workspace, executor)
+                    }),
+                )?;
+                match bindings {
+                    Some(bindings) => {
+                        let facts = self.prepare_initial_execution_facts(
+                            &user_id,
+                            &request,
+                            &session_id,
+                            &run_id,
+                            None,
+                            Some(&bindings),
+                            &request_constraints,
+                        )?;
+                        Some((bindings, facts))
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
         let mut root_start = self.shared_pool.as_ref().map(|_| RootTurnStartParticipant {
             service: self,
             user_id: &user_id,
@@ -16724,7 +16810,7 @@ impl AgenticRunLifecycleService {
                 &user_id,
                 &session_id,
                 &request,
-                None,
+                initial_execution.as_ref(),
                 runtime_capabilities.agent_binding.as_ref(),
                 work_runtime_binding.as_ref(),
                 start_identity
@@ -16895,58 +16981,51 @@ impl AgenticRunLifecycleService {
                 } else {
                     None
                 };
-            let mut execution_bindings = cloud_execution_bindings
-                .or_else(|| {
-                    server_workspace.as_deref().map(|workspace| {
-                        let (workspace, executor) =
-                            resolve_request_execution_bindings(&request, workspace);
-                        ExecutionBindingSnapshot::inferred(workspace, executor)
+            let bindings_committed_at_start = initial_execution.is_some();
+            let (execution_bindings, facts) = if let Some((bindings, facts)) = initial_execution {
+                (Some(bindings), facts)
+            } else {
+                let bindings = cloud_execution_bindings
+                    .or_else(|| {
+                        server_workspace.as_deref().map(|workspace| {
+                            let (workspace, executor) =
+                                resolve_request_execution_bindings(&request, workspace);
+                            ExecutionBindingSnapshot::inferred(workspace, executor)
+                        })
                     })
-                })
-                .or_else(|| {
-                    resolve_request_execution_bindings_without_server_workspace(
-                        &request,
-                        &edge_context.edge_profile,
-                    )
-                    .map(|(workspace, executor)| {
-                        ExecutionBindingSnapshot::inferred(workspace, executor)
-                    })
-                });
-            if let Some(discovery) = runtime_capabilities.authenticated_edge_discovery.as_ref()
-                && let Some(snapshot) = execution_bindings.as_mut()
-            {
-                snapshot.physical_workspace_id = Some(discovery.physical_workspace_id.clone());
-            }
-            if let Some(generation) = request.execution_binding_generation {
-                let Some(snapshot) = execution_bindings.as_mut() else {
-                    return Err(error_response_coded(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Work execution provider could not be materialized",
-                        "execution_binding_unavailable",
-                    ));
-                };
-                snapshot.execution_binding_generation = Some(generation);
-            }
+                    .or_else(|| {
+                        resolve_request_execution_bindings_without_server_workspace(
+                            &request,
+                            &edge_context.edge_profile,
+                        )
+                        .map(|(workspace, executor)| {
+                            ExecutionBindingSnapshot::inferred(workspace, executor)
+                        })
+                    });
+                let execution_bindings =
+                    Self::complete_execution_binding(&request, &runtime_capabilities, bindings)?;
+                let facts = self.prepare_initial_execution_facts(
+                    &user_id,
+                    &request,
+                    &session_id,
+                    &run_id,
+                    cloud_workspace.as_deref().or(server_workspace.as_deref()),
+                    execution_bindings.as_ref(),
+                    &request_constraints,
+                )?;
+                (execution_bindings, facts)
+            };
             self.validate_optional_tool_availability(
                 &user_id,
                 &request_constraints,
                 execution_bindings.as_ref(),
             )
             .await?;
-            let facts = self.prepare_initial_execution_facts(
-                &user_id,
-                &request,
-                &session_id,
-                &run_id,
-                cloud_workspace.as_deref().or(server_workspace.as_deref()),
-                execution_bindings.as_ref(),
-                &request_constraints,
-            )?;
             let completion_checks = astra_turn_types::StopHookObligations {
                 declarations: facts.hooks.declarations.clone(),
                 phase: facts.hooks.phase,
             };
-            if let Some(snapshot) = execution_bindings.as_ref() {
+            if !bindings_committed_at_start && let Some(snapshot) = execution_bindings.as_ref() {
                 let binding_events =
                     binding_snapshot_events(&run_id, &session_id, snapshot, &completion_checks);
                 let owner_generation = execution_owner_generation;
@@ -17306,11 +17385,11 @@ impl AgenticRunLifecycleService {
             );
             configure_runtime_controllers(
                 &self.matrixone,
-                self.shared_pool.as_ref(),
+                self.shared_pool.as_ref().filter(|_| request.explain),
                 &mut state,
                 &user_id,
                 &session_id,
-                self.trace_ingestion.clone(),
+                self.trace_ingestion.clone().filter(|_| request.explain),
             )
             .await;
 
@@ -21396,7 +21475,7 @@ fn durable_subrun_host_terminal_events(
                 _ => return None,
             };
             if let Some(object) = event.as_object_mut() {
-                object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
+                object.remove(TOOL_TERMINAL_LIVE_EMITTED_FIELD);
                 object.remove(DURABLE_EVENT_COMMITTED_FIELD);
                 if let Some(generation) = execution_owner_generation {
                     object.remove("idempotency_key");

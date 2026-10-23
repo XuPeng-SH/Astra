@@ -594,3 +594,39 @@ effect outcomes and uncertainty. Explicit large artifacts continue to use the
 existing owner-checked artifact store and its reference/retention lifecycle.
 There is no second per-batch payload transaction or synthetic `tool_output://`
 artifact scheme.
+
+Bindings known before provisioning are included in the Run opening event batch,
+alongside the original admission event. The loop uses those same prepared facts;
+it does not open a second transaction to append an unchanged workspace/executor
+pair. Capacity that must be provisioned after claiming the Run publishes its
+binding only after that provisioning succeeds. Run identity conflicts are
+resolved by the unique insert and existing exact-replay path, rather than an
+additional existence query before every creation.
+
+An atomic root terminal binds raw transcript rows to the Context cursor in that
+same transaction. Raw history keeps the original messages independently of
+Context compaction. The successful terminal does not subsequently reconstruct
+or certify the conversation from diagnostic events or a transcript projection
+head. Reasoning and interaction diagnostics remain available through their
+own event/trace surface rather than an extra copy in ordinary root history.
+
+### Tool progress and outcome storage
+
+Tool starts, routing and transport progress are live presentation. They do not
+open Run event transactions. The process-local replay buffer retains bounded
+outcomes for attached observers; another process may lag during execution.
+Tool outcomes are saved with the terminal event batch. A private live delivery
+watermark only suppresses duplicate attached-stream events and is never stored,
+exposed, or accepted as effect-settlement evidence. Approval requests and actual
+side effects retain their existing canonical admission and ledger boundaries.
+
+Root runs persist optional model-round diagnostic traces only when the existing
+`explain` request is enabled. Resumed roots retain that original choice. Ordinary
+conversation still has canonical Run, Context and effect evidence, plus local
+best-effort observability; it does not enqueue database diagnostic writes after
+HTTP completion. The final flusher uses the same admitted diagnostic choice.
+
+Handoff captures one self-contained canonical continuation from the admitted
+Context base. Normal model rounds maintain no runtime WAL head, linked chain or
+rollup state. Existing credential redaction, rewrite authorization, snapshot
+identity and payload bounds still apply at checkpoint creation.

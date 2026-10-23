@@ -521,3 +521,9 @@ the dashboard and can receive reviewed outcomes; recovery cannot dispatch them.
 The decision also pins the review rubric. Delayed outcomes and identical retries
 remain valid after deployment replacement, using the original run's deployment
 and rubric. A historical critical report never stops a replacement deployment.
+
+Ordinary provider requests reuse their admitted model without loading or
+embedding the complete authorized model catalog in the prompt. Catalog
+observation is explicit through `model_catalog`; selecting an actual named
+child model uses the existing authorized selector at that admission boundary.
+Unused catalog services do not become dependencies of ordinary model rounds.

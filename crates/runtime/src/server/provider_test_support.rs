@@ -959,7 +959,7 @@ mod tests {
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
-    async fn execute_turn_replans_tier_after_compaction_memory_refresh() {
+    async fn execute_turn_refreshes_memory_only_during_real_compaction() {
         use crate::session_memory::runner::{SESSION_MEMORY_PREFIX, encode_session_memory_entry};
         use crate::turn::agentic_loop::host::AgenticLoopHost;
         use astra_memoria::{MemoriaMemory, MemoriaOperationError, MemoriaPort};
@@ -1068,7 +1068,7 @@ mod tests {
         let history = (0..12)
             .map(|index| json!({
                 "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(8_000)),
+                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(if index < 4 { 30_000 } else { 32 })),
             }))
             .collect();
         let mut state = loop_state(&session, history, "Summarize the review evidence.");
@@ -1078,13 +1078,9 @@ mod tests {
             .await
             .expect("refreshed turn must finish");
 
-        // Compaction retrieves only at a non-Normal initial tier. Ending at
-        // Normal proves the real execute_turn rerun crossed the old assertion.
+        // A real history compaction owns the only memory read; ordinary
+        // preparation does not fetch a session snapshot before it.
         assert_eq!(*memory.snapshot_reads.lock().unwrap(), [false]);
-        assert_eq!(
-            state.last_llm_context_manifest_trace.as_ref().unwrap()["compaction_tier"],
-            "Normal"
-        );
         assert_eq!(state.compact_tier_applied, CompactionTier::AggressivePrune);
         assert_eq!(result.accum.full_text, "Review complete.");
         assert_eq!(result.accum.finish_reason.as_deref(), Some("stop"));

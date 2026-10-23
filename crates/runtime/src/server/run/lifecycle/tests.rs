@@ -1036,13 +1036,29 @@ async fn run_admission_preserves_mixed_capabilities_and_resolved_executor() {
         };
         let bindings =
             ExecutionBindingSnapshot::inferred(WorkspaceBinding::none(), executor.clone());
+        let constraints = service
+            .validate_request_constraints("u1", &request)
+            .await
+            .unwrap();
+        let facts = service
+            .prepare_initial_execution_facts(
+                "u1",
+                &request,
+                "mixed-session",
+                "mixed-source-run",
+                None,
+                Some(&bindings),
+                &constraints,
+            )
+            .unwrap();
+        let initial = (bindings, facts);
         service
             .persist_run_start(
                 "mixed-source-run",
                 "u1",
                 "mixed-session",
                 &request,
-                Some(&bindings),
+                Some(&initial),
                 None,
                 None,
                 None,
@@ -21934,7 +21950,7 @@ fn streaming_terminal_convergence_replays_tool_outcomes_but_not_transient_progre
         json!({"type": "run_blocked", "call_id": "call-3", "reason": "route_mismatch"}),
         json!({"event_type": "text_done", "data": {"full_text": "hi"}}),
         json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
-        json!({"type": "tool_call_end", "call_id": "call-2", "result": "ok", "_astra_tool_terminal_durably_fanned_out": true}),
+        json!({"type": "tool_call_end", "call_id": "call-2", "result": "ok", "_astra_tool_terminal_live_emitted": true}),
     ];
 
     let replay: Vec<_> = events
@@ -21948,12 +21964,12 @@ fn streaming_terminal_convergence_replays_tool_outcomes_but_not_transient_progre
     assert_eq!(replay[0]["call_id"], "call-1");
     assert_eq!(replay[1]["event_type"], "text_done");
     assert_eq!(replay[2]["event_type"], "run_finished");
-    assert!(tool_terminal_requires_settlement_repair(&events[3]));
-    assert!(!tool_terminal_requires_settlement_repair(&events[11]));
+    assert!(tool_terminal_requires_live_repair(&events[3]));
+    assert!(!tool_terminal_requires_live_repair(&events[11]));
     assert!(!live_delta_event_for_persistence(&events[0]));
     assert!(!live_delta_event_for_persistence(&events[1]));
-    assert!(live_delta_event_for_persistence(&events[2]));
-    assert!(live_delta_event_for_persistence(&events[3]));
+    assert!(!live_delta_event_for_persistence(&events[2]));
+    assert!(!live_delta_event_for_persistence(&events[3]));
     assert!(
         !live_delta_event_for_persistence(&events[4]),
         "transient agent activity is live transport, not durable product truth"
@@ -21980,11 +21996,10 @@ fn streaming_durable_persistence_keeps_semantic_events_before_terminal() {
         .cloned()
         .collect();
 
-    assert_eq!(persisted.len(), 4);
-    assert_eq!(persisted[0]["type"], "tool_call");
-    assert_eq!(persisted[1]["type"], "tool_call_end");
-    assert_eq!(persisted[2]["event_type"], "text_done");
-    assert_eq!(persisted[3]["event_type"], "run_finished");
+    assert_eq!(persisted.len(), 3);
+    assert_eq!(persisted[0]["type"], "tool_call_end");
+    assert_eq!(persisted[1]["event_type"], "text_done");
+    assert_eq!(persisted[2]["event_type"], "run_finished");
 }
 
 #[test]
@@ -24512,7 +24527,7 @@ async fn ordered_fanout_delivers_progress_live_without_persisting_it() {
     let (live_tx, mut live_rx) = broadcast::channel(8);
     let mut client_event_tx = AttachedStreamDelivery::detached();
     let mut pending = PendingDurableLiveEvents::default();
-    let durable_tool_terminals = DurableToolTerminalTracker::default();
+    let emitted_tool_terminals = EmittedToolTerminalTracker::default();
     let progress = json!({
         "type": "agent_progress",
         "agent_id": "agent-1",
@@ -24530,7 +24545,7 @@ async fn ordered_fanout_delivers_progress_live_without_persisting_it() {
         "run-1",
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await;
     assert!(result.is_ok(), "live-only progress delivery failed");
@@ -24552,7 +24567,7 @@ async fn ordered_fanout_delivers_progress_live_without_persisting_it() {
         "run-1",
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await;
     assert!(result.is_ok(), "durable lifecycle admission failed");
@@ -24569,7 +24584,7 @@ async fn ordered_fanout_delivers_progress_live_without_persisting_it() {
         "run-1",
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await
     .expect("persist lifecycle boundary");
@@ -24591,13 +24606,13 @@ async fn ordered_fanout_delivers_progress_live_without_persisting_it() {
         "run-1",
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await;
-    assert!(terminal_admission.is_ok(), "admit durable tool terminal");
+    assert!(terminal_admission.is_ok(), "emit live tool terminal");
     assert!(
-        tool_terminal_requires_settlement_repair(&retained_terminal),
-        "queue admission alone must not suppress settlement repair"
+        tool_terminal_requires_live_repair(&retained_terminal),
+        "retained copy is marked only during convergence"
     );
     flush_durable_live_events(
         &mut pending,
@@ -24608,20 +24623,75 @@ async fn ordered_fanout_delivers_progress_live_without_persisting_it() {
         "run-1",
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await
-    .expect("commit durable tool terminal");
+    .expect("flush any remaining lifecycle facts");
     assert_eq!(
         live_rx.recv().await.expect("live tool terminal"),
         retained_terminal
     );
-    durable_tool_terminals
-        .mark_committed_retained_copies(std::slice::from_mut(&mut retained_terminal));
+    emitted_tool_terminals
+        .mark_emitted_retained_copies(std::slice::from_mut(&mut retained_terminal));
     assert!(
-        !tool_terminal_requires_settlement_repair(&retained_terminal),
-        "only the durable fanout watermark may suppress settlement repair"
+        !tool_terminal_requires_live_repair(&retained_terminal),
+        "emitted tool terminal must not be duplicated during convergence"
     );
+}
+
+#[tokio::test]
+async fn tool_progress_and_outcomes_stream_without_a_durable_run() {
+    // No run exists: any accidental persistence lookup or append would fail.
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
+    let runs = Arc::new(RwLock::new(HashMap::new()));
+    let (live_tx, mut live_rx) = broadcast::channel(16);
+    let (attached_tx, mut attached_rx) = mpsc::channel(16);
+    let mut delivery = AttachedStreamDelivery::new(attached_tx);
+    let mut pending = PendingDurableLiveEvents::default();
+    let tracker = EmittedToolTerminalTracker::default();
+    for kind in [
+        "tool_call",
+        "tool_call_start",
+        "tool_routing_decision",
+        "tool_transport_started",
+        "tool_transport_completed",
+        "tool_transport_failed",
+        "tool_call_end",
+    ] {
+        let event = json!({"type": kind, "call_id": "read-1", "result": "observed"});
+        assert!(
+            process_ordered_live_fanout_event(
+                event.clone(),
+                &mut pending,
+                &engine,
+                &runs,
+                "user-1",
+                "session-1",
+                "run-absent",
+                &live_tx,
+                &mut delivery,
+                &tracker,
+            )
+            .await
+            .is_ok(),
+            "{kind} must not require database authority"
+        );
+        assert_eq!(live_rx.try_recv().unwrap(), event);
+        assert_eq!(attached_rx.try_recv().unwrap(), event);
+        assert!(pending.is_empty());
+    }
+    assert!(store.appended_batches().is_empty());
+    let mut retained = [json!({"type":"tool_call_end", "call_id":"read-1", "result":"observed"})];
+    tracker.mark_emitted_retained_copies(&mut retained);
+    assert!(!tool_terminal_requires_live_repair(&retained[0]));
+    let durable = terminal_events_for_persistence(&retained);
+    assert_eq!(
+        durable.len(),
+        1,
+        "live delivery does not replace final persistence"
+    );
+    assert!(durable[0].get(TOOL_TERMINAL_LIVE_EMITTED_FIELD).is_none());
 }
 
 #[tokio::test]
@@ -24636,7 +24706,7 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
     let (live_tx, mut live_rx) = broadcast::channel(8);
     let mut client_event_tx = AttachedStreamDelivery::detached();
     let mut pending = PendingDurableLiveEvents::default();
-    let durable_tool_terminals = DurableToolTerminalTracker::default();
+    let emitted_tool_terminals = EmittedToolTerminalTracker::default();
     let first = json!({"type": "explain_analyze", "stage": "context"});
     let second = json!({"type": "explain_analyze", "stage": "model"});
 
@@ -24651,7 +24721,7 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
             "run-1",
             &live_tx,
             &mut client_event_tx,
-            &durable_tool_terminals,
+            &emitted_tool_terminals,
         )
         .await;
         assert!(result.is_ok(), "admit structural explain event");
@@ -24676,7 +24746,7 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
         "run-1",
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await
     .expect("flush structural explain microbatch");
@@ -24701,7 +24771,7 @@ async fn committed_interactions_remain_immediate_delivery_boundaries() {
     let (live_tx, mut live_rx) = broadcast::channel(8);
     let mut client_event_tx = AttachedStreamDelivery::detached();
     let mut pending = PendingDurableLiveEvents::default();
-    let durable_tool_terminals = DurableToolTerminalTracker::default();
+    let emitted_tool_terminals = EmittedToolTerminalTracker::default();
 
     pending.push(json!({"type": "agent_spawned", "agent_id": "agent-1"}));
     let committed_interaction = json!({
@@ -24721,7 +24791,7 @@ async fn committed_interactions_remain_immediate_delivery_boundaries() {
         "run-1",
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await;
     assert!(
@@ -24903,7 +24973,7 @@ async fn ordered_microbatch_keeps_transient_frames_behind_the_durable_commit() {
         let (live_tx, mut live_rx) = broadcast::channel(8);
         let mut delivery = AttachedStreamDelivery::detached();
         let mut pending = PendingDurableLiveEvents::default();
-        let tracker = DurableToolTerminalTracker::default();
+        let tracker = EmittedToolTerminalTracker::default();
         let first = json!({"type": "agent_spawned", "agent_id": "agent-1"});
         let progress = json!({"type": "agent_progress", "agent_id": "agent-1"});
         let second = json!({"type": "tool_call_end", "call_id": "call-1", "status": "completed"});
@@ -24950,14 +25020,11 @@ async fn ordered_microbatch_keeps_transient_frames_behind_the_durable_commit() {
                 Err(broadcast::error::TryRecvError::Empty)
             );
             let mut retained = [second];
-            tracker.mark_committed_retained_copies(&mut retained);
-            assert!(tool_terminal_requires_settlement_repair(&retained[0]));
+            tracker.mark_emitted_retained_copies(&mut retained);
+            assert!(tool_terminal_requires_live_repair(&retained[0]));
         } else {
             result.unwrap();
-            assert_eq!(
-                store.appended_batches(),
-                vec![vec![first.clone(), second.clone()]]
-            );
+            assert_eq!(store.appended_batches(), vec![vec![first.clone()]]);
             for expected in [first, progress, second] {
                 assert_eq!(live_rx.try_recv().unwrap(), expected);
             }
@@ -24986,15 +25053,15 @@ fn ordered_microbatch_bounds_include_transient_frames() {
 }
 
 #[test]
-fn durable_tool_terminal_tracker_matches_exact_occurrences_not_only_call_ids() {
-    let tracker = DurableToolTerminalTracker::default();
+fn emitted_tool_terminal_tracker_matches_exact_occurrences_not_only_call_ids() {
+    let tracker = EmittedToolTerminalTracker::default();
     let committed = json!({
         "type": "tool_call_end",
         "call_id": "call-reused",
         "status": "completed",
         "result": "first",
     });
-    tracker.record_committed(std::slice::from_ref(&committed));
+    tracker.record_emitted(std::slice::from_ref(&committed));
 
     let mut retained = vec![
         committed.clone(),
@@ -25006,15 +25073,15 @@ fn durable_tool_terminal_tracker_matches_exact_occurrences_not_only_call_ids() {
             "result": "conflicting second round",
         }),
     ];
-    tracker.mark_committed_retained_copies(&mut retained);
+    tracker.mark_emitted_retained_copies(&mut retained);
 
-    assert!(!tool_terminal_requires_settlement_repair(&retained[0]));
+    assert!(!tool_terminal_requires_live_repair(&retained[0]));
     assert!(
-        tool_terminal_requires_settlement_repair(&retained[1]),
-        "one durable occurrence must not acknowledge an identical second occurrence"
+        tool_terminal_requires_live_repair(&retained[1]),
+        "one emitted occurrence must not acknowledge an identical second occurrence"
     );
     assert!(
-        tool_terminal_requires_settlement_repair(&retained[2]),
+        tool_terminal_requires_live_repair(&retained[2]),
         "a prior round with the same call_id must not acknowledge a conflicting outcome"
     );
 }
@@ -25028,7 +25095,7 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
                 "type": "tool_call_end",
                 "call_id": "child-call-1",
                 "status": "completed",
-                "_astra_tool_terminal_durably_fanned_out": true,
+                "_astra_tool_terminal_live_emitted": true,
                 "_astra_durable_event_committed": true,
             }),
             json!({"type": "agent_progress", "status": "working"}),
@@ -28497,7 +28564,10 @@ async fn create_run_persists_edge_binding_before_execution_launch() {
         .expect("load run")
         .expect("run exists");
     assert_eq!(durable.events[0]["event_type"], "run_started");
-    assert!(durable.events[0]["data"].get("workspace").is_none());
+    assert_eq!(
+        durable.events[0]["data"]["workspace"]["kind"],
+        "edge_workspace"
+    );
     let binding = durable
         .events
         .iter()
@@ -33781,7 +33851,7 @@ async fn db_live_microbatches_are_complete_and_precede_terminal() {
     let (live_tx, _) = broadcast::channel(8);
     let mut client_event_tx = AttachedStreamDelivery::detached();
     let mut pending = PendingDurableLiveEvents::default();
-    let durable_tool_terminals = DurableToolTerminalTracker::default();
+    let emitted_tool_terminals = EmittedToolTerminalTracker::default();
     for index in 0..600_u64 {
         pending.push(json!({
             "type": "agent_spawned",
@@ -33798,7 +33868,7 @@ async fn db_live_microbatches_are_complete_and_precede_terminal() {
                 &run_id,
                 &live_tx,
                 &mut client_event_tx,
-                &durable_tool_terminals,
+                &emitted_tool_terminals,
             )
             .await
             .expect("flush bounded live microbatch");
@@ -33813,7 +33883,7 @@ async fn db_live_microbatches_are_complete_and_precede_terminal() {
         &run_id,
         &live_tx,
         &mut client_event_tx,
-        &durable_tool_terminals,
+        &emitted_tool_terminals,
     )
     .await
     .expect("flush terminal watermark");

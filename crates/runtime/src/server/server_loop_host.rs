@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 mod model_routing;
 
 use crate::orchestration::{AgentProgressEvent, CancellationOrigin, ProgressEventType};
-use crate::server::run::lifecycle::run_state::TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD;
+use crate::server::run::lifecycle::run_state::TOOL_TERMINAL_LIVE_EMITTED_FIELD;
 use crate::server::tool_admission::{
     ToolAdmissionContext, has_explicit_runtime_executor_provider,
     resolve_tool_admission_for_binding_with_context,
@@ -3149,132 +3149,48 @@ fn resolve_llm_model_for_turn(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ProviderCanonicalWalLimits {
-    max_entries: u32,
-    max_bytes: u64,
-}
-
-impl ProviderCanonicalWalLimits {
-    const PRODUCTION: Self = Self {
-        max_entries: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES,
-        max_bytes: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES,
-    };
-}
-
-#[derive(Debug)]
-struct ProviderCanonicalWalPlan {
-    transition: astra_turn_types::ProviderCanonicalTransitionV2,
-    head: crate::turn::agentic_loop::host::ProviderCanonicalWalHead,
-}
-
-/// Plan one durable provider-owned transition from the current atomic WAL
-/// head. Normal rounds hash and persist only the delta since the prior head.
-/// A bounded, lossless checkpoint is emitted before the service-side hard
-/// limit is reached; canonical replacement remains a separate operation that
-/// requires explicit rewrite authority.
-fn plan_provider_canonical_wal_transition(
+/// Build the self-contained canonical continuation saved at a real handoff.
+/// Normal provider rounds have no durable WAL head or chain to maintain.
+fn build_handoff_continuation(
     durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
-    head: Option<&crate::turn::agentic_loop::host::ProviderCanonicalWalHead>,
     predecessor_messages: &[Value],
-    appended_messages: Vec<Value>,
     replacement_authorization: Option<
         &crate::turn::canonical_commit::ProviderWalReplacementAuthorization,
     >,
-    limits: ProviderCanonicalWalLimits,
-) -> Result<ProviderCanonicalWalPlan, astra_turn_types::ProviderCanonicalTransitionError> {
-    let durable_appended =
-        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(appended_messages);
-
-    let mut transition = if let Some(authorization) = replacement_authorization {
-        let durable_predecessor =
-            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-                durable_base,
-                predecessor_messages,
-            );
+) -> Result<
+    astra_turn_types::ProviderCanonicalTransitionV2,
+    astra_turn_types::ProviderCanonicalTransitionError,
+> {
+    let durable_predecessor =
+        crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+            durable_base,
+            predecessor_messages,
+        );
+    let transition = if let Some(authorization) = replacement_authorization {
         let transition =
             astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-                head.map(|head| head.transition_id.clone()),
+                None,
                 durable_base.clone(),
                 authorization.generation,
                 &durable_predecessor,
-                durable_appended.clone(),
+                Vec::new(),
             )?;
         if transition.predecessor != authorization.durable_predecessor {
             return Err(astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch);
         }
         transition
-    } else if let Some(head) = head {
-        let parent_count = usize::try_from(head.result.message_count).map_err(|_| {
-            astra_turn_types::ProviderCanonicalTransitionError::MessageCountOverflow
-        })?;
-        if predecessor_messages.len() < parent_count {
-            return Err(
-                astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor,
-            );
-        }
-        let recovery_delta = astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
-            predecessor_messages[parent_count..].to_vec(),
-        );
-        astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
-            head.transition_id.clone(),
-            head.result.clone(),
-            durable_base.clone(),
-            recovery_delta,
-            durable_appended.clone(),
-        )?
     } else {
-        let durable_predecessor =
-            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-                durable_base,
-                predecessor_messages,
-            );
         astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
             &durable_predecessor,
-            durable_appended.clone(),
+            Vec::new(),
         )?
     };
-
-    if replacement_authorization.is_none()
-        && head.is_some_and(|head| {
-            head.would_exceed_with_limits(&transition, limits.max_entries, limits.max_bytes)
-                .unwrap_or(true)
-        })
-    {
-        let head = head.expect("the capacity predicate requires a WAL head");
-        let durable_predecessor =
-            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-                durable_base,
-                predecessor_messages,
-            );
-        transition = astra_turn_types::ProviderCanonicalTransitionV2::new_checkpoint_from_parent(
-            head.transition_id.clone(),
-            head.result.clone(),
-            durable_base.clone(),
-            &durable_predecessor,
-            durable_appended,
-        )?;
-    }
-
-    let planned_head = match head {
-        Some(head) => head.advanced(&transition)?,
-        None => crate::turn::agentic_loop::host::ProviderCanonicalWalHead::from_chain(
-            std::slice::from_ref(&transition),
-        )?
-        .expect("a one-entry transition chain always has a head"),
-    };
-    if planned_head.chain_length > limits.max_entries {
-        return Err(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries);
-    }
-    if planned_head.chain_payload_bytes > limits.max_bytes {
+    if transition.durable_payload_bytes()? > astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES {
         return Err(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes);
     }
-    Ok(ProviderCanonicalWalPlan {
-        transition,
-        head: planned_head,
-    })
+    Ok(transition)
 }
 
 /// Server-side host for the runtime agentic loop.
@@ -4386,7 +4302,6 @@ impl ServerAgenticLoopHost {
             ));
         }
         state.provider_canonical_wal_base = Some(handoff.continuation.durable_base.clone());
-        state.provider_canonical_wal_head = None;
         let replacement = if handoff.continuation.recovery_mode
             == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
         {
@@ -7078,40 +6993,6 @@ impl ServerAgenticLoopHost {
             .list_models(self.user_id.clone(), false)
             .await
             .ok()
-    }
-
-    pub(crate) async fn model_catalog_context(&self) -> Option<Value> {
-        use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page, unavailable_page};
-        let reader = self.model_catalog_reader.as_ref()?;
-        let mut page = match reader.read_snapshot().await {
-            Ok(items) => catalog_page(items, &ModelCatalogRequest::default(), reader.scope())
-                .unwrap_or_else(|error| unavailable_page(error, reader.scope())),
-            Err((status, _)) => unavailable_page(
-                super::tool_model_catalog::catalog_read_error(status),
-                reader.scope(),
-            ),
-        };
-        // A changing wall clock is not a new catalog generation. Keep the
-        // request/descendant observation byte-stable outside the system prefix.
-        page.observed_at = None;
-        let child_model_selection_allowed =
-            crate::server::run::lifecycle::ensure_child_model_selection_scope(
-                Some(reader),
-                self.provider_scope_bound,
-            )
-            .is_ok();
-        // This is an observation, not a second model-selection instruction.
-        // Execution-vs-content interpretation belongs to the tool contract.
-        let context = json!({
-            "catalog": page,
-            "child_model_selection_allowed": child_model_selection_allowed,
-        })
-        .to_string();
-        crate::turn::wire_assembly::required_runtime_preamble_message(
-            &context,
-            crate::turn::wire_assembly::RuntimeAuthorityKind::AuthorizedModelCatalog,
-            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-        )
     }
 
     async fn judge_delegation_scope_binding(
@@ -12928,9 +12809,9 @@ impl ServerAgenticLoopHost {
         self.start_explain_analyze_tool_call(&event);
         self.finish_explain_analyze_tool_call(&event);
         if let Some(object) = event.as_object_mut() {
-            // Settlement authority is lifecycle-owned. Never trust or expose
-            // a producer-supplied copy of its private durable watermark.
-            object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
+            // Live delivery accounting is lifecycle-owned. Never trust or
+            // expose a producer-supplied private delivery watermark.
+            object.remove(TOOL_TERMINAL_LIVE_EMITTED_FIELD);
         }
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
@@ -18686,15 +18567,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         let authorization =
             state.provider_canonical_replacement_authorization(base, &state.messages);
-        let plan = plan_provider_canonical_wal_transition(
-            base,
-            state.provider_canonical_wal_head.as_ref(),
-            &state.messages,
-            Vec::new(),
-            authorization.as_ref(),
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .map_err(|error| classify(error.to_string()))?;
+        let plan = build_handoff_continuation(base, &state.messages, authorization.as_ref())
+            .map_err(|error| classify(error.to_string()))?;
         let durable = crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
             base,
             &heavy.messages,
@@ -18702,7 +18576,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let identity =
             astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(&durable)
                 .map_err(|error| classify(error.to_string()))?;
-        if identity != plan.head.result {
+        if identity != plan.result {
             return Err(classify(
                 "handoff snapshot and canonical continuation differ".to_string(),
             ));
@@ -18823,7 +18697,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     .map_err(|error| classify(error.to_string()))?,
                 heavy,
                 reservation: context.reservation.clone(),
-                continuation: plan.transition,
+                continuation: plan,
                 execution_deadline: self.execution_time_budget.map(|deadline| deadline.snapshot()),
             },
         };
@@ -20020,7 +19894,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Runtime no longer re-derives any of these.
         let context_assembly_node_id =
             self.start_explain_analyze_context_assembly(state, Instant::now());
-        let model_catalog_context = self.model_catalog_context().await;
         let turn_pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             context_tool_surface,
@@ -20067,9 +19940,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut final_context_assembly = initial_context_assembly;
         let mut final_system_messages = system_messages;
         let mut final_volatile_preamble = volatile_preamble;
-        if let Some(context) = model_catalog_context.as_ref() {
-            final_volatile_preamble.push(context.clone());
-        }
         let mut final_system_prompt_breakdown = system_prompt_breakdown;
         let mut final_pipeline_tool_schemas = pipeline_tool_schemas;
         let mut final_manifest_trace = manifest_trace;
@@ -20182,9 +20052,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             final_system_messages = rerun.system_messages;
             final_volatile_preamble = rerun.volatile_preamble;
-            if let Some(context) = model_catalog_context {
-                final_volatile_preamble.push(context);
-            }
             final_system_prompt_breakdown = rerun.breakdown;
             final_pipeline_tool_schemas = rerun.tool_schemas;
             final_manifest_trace = rerun.manifest_trace;
@@ -33769,29 +33636,36 @@ mod tests {
                         .any(|message| message.to_string().contains("account-read-complete"))
                 );
             }
-            let identities = state
+            let records = state
                 .stall
                 .tool_call_records
                 .iter()
-                .filter_map(|record| record.invocation_identity.as_ref())
+                .filter(|record| record.invocation_identity.is_some())
                 .collect::<Vec<_>>();
-            assert_eq!(identities.len(), if skill { 1 } else { 3 });
-            for identity in identities {
+            assert_eq!(records.len(), if skill { 1 } else { 3 });
+            for call in records {
+                let identity = call.invocation_identity.as_ref().unwrap();
                 assert_eq!(identity.user_id, fixture.scope.user_id);
                 assert_eq!(identity.session_id, fixture.scope.session_id);
                 assert_eq!(identity.run_id, fixture.scope.run_id);
                 assert_eq!(identity.turn_chain_id, "source-turn");
-                let record = ledger
-                    .get(identity)
-                    .await
-                    .unwrap()
-                    .expect("canonical invocation receipt");
-                assert_eq!(
-                    record.state,
-                    astra_turn_types::ToolInvocationState::Succeeded,
-                    "{record:?}"
-                );
-                assert_eq!(record.attempt_count, 1);
+                let receipt = ledger.get(identity).await.unwrap();
+                if call.name == "tool_search" {
+                    assert!(receipt.is_none(), "discovery has no durable effect receipt");
+                    assert!(call.execution_completion.is_none());
+                    assert_eq!(
+                        call.work_attribution,
+                        Some(astra_services::runs::WorkInvocationAttribution::Control)
+                    );
+                } else {
+                    let record = receipt.expect("canonical effect invocation receipt");
+                    assert_eq!(
+                        record.state,
+                        astra_turn_types::ToolInvocationState::Succeeded,
+                        "{record:?}"
+                    );
+                    assert_eq!(record.attempt_count, 1);
+                }
             }
             if !skill {
                 let activation = state
@@ -35688,149 +35562,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_wal_planner_persists_only_the_delta_after_its_atomic_head() {
-        let durable = vec![json!({"role": "user", "content": "do the work"})];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let authority = |text| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let first = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &durable,
-            vec![authority("first")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-        let mut predecessor = durable;
-        predecessor.extend(first.transition.appended_messages.iter().cloned());
-        let provider_response = json!({"role": "assistant", "content": "intermediate"});
-        predecessor.push(provider_response.clone());
-
-        let second = plan_provider_canonical_wal_transition(
-            &durable_base,
-            Some(&first.head),
-            &predecessor,
-            vec![authority("second")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-
-        assert_eq!(
-            second.transition.recovery_mode,
-            astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
-        );
-        assert_eq!(second.transition.recovery_messages, vec![provider_response]);
-        assert_eq!(second.head.chain_length, 2);
-        assert_eq!(second.head.result, second.transition.result);
-    }
-
-    #[test]
-    fn provider_wal_planner_rolls_up_before_the_hard_entry_limit() {
-        let durable = vec![json!({"role": "user", "content": "do the work"})];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let authority = |text| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let first = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &durable,
-            vec![authority("first")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-        let mut predecessor = durable.clone();
-        predecessor.extend(first.transition.appended_messages.iter().cloned());
-        predecessor.push(json!({"role": "assistant", "content": "intermediate"}));
-
-        let checkpoint = plan_provider_canonical_wal_transition(
-            &durable_base,
-            Some(&first.head),
-            &predecessor,
-            vec![authority("second")],
-            None,
-            ProviderCanonicalWalLimits {
-                max_entries: 1,
-                max_bytes: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            checkpoint.transition.recovery_mode,
-            astra_turn_types::ProviderCanonicalRecoveryModeV2::CheckpointFromParent
-        );
-        assert_eq!(checkpoint.head.chain_length, 1);
-        assert_eq!(
-            checkpoint.transition.replacement_compaction_generation,
-            None
-        );
-
-        let mut recovered = durable;
-        astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(
-            std::slice::from_ref(&checkpoint.transition),
-            &mut recovered,
-        )
-        .unwrap();
-        predecessor.extend(checkpoint.transition.appended_messages.iter().cloned());
-        assert_eq!(recovered, predecessor);
-    }
-
-    #[test]
-    fn provider_wal_planner_rejects_history_shorter_than_its_durable_head() {
-        let durable = vec![json!({"role": "user", "content": "do the work"})];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-            "first",
-            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-        )
-        .unwrap()
-        .unwrap();
-        let first = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &durable,
-            vec![authority],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-
-        assert_eq!(
-            plan_provider_canonical_wal_transition(
-                &durable_base,
-                Some(&first.head),
-                &[],
-                Vec::new(),
-                None,
-                ProviderCanonicalWalLimits::PRODUCTION,
-            )
-            .unwrap_err(),
-            astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor
-        );
-    }
-
-    #[test]
-    fn provider_wal_planner_binds_rewrite_authority_to_the_exact_durable_snapshot() {
+    fn handoff_continuation_binds_rewrite_authority_to_the_exact_durable_snapshot() {
         let base_secret = "hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
         let suffix_secret = "hf_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210";
         let durable = vec![json!({
@@ -35858,31 +35590,21 @@ mod tests {
             .provider_wal_replacement_authorization(&durable_base, &rewritten)
             .expect("the admitted rewrite has exact replacement authority");
 
-        let plan = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &rewritten,
-            Vec::new(),
-            Some(&authorization),
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
+        let plan =
+            build_handoff_continuation(&durable_base, &rewritten, Some(&authorization)).unwrap();
         assert_eq!(
-            plan.transition.recovery_mode,
+            plan.recovery_mode,
             astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
         );
-        assert_eq!(
-            plan.transition.predecessor,
-            authorization.durable_predecessor
-        );
+        assert_eq!(plan.predecessor, authorization.durable_predecessor);
         assert!(
-            serde_json::to_string(&plan.transition.recovery_messages)
+            serde_json::to_string(&plan.recovery_messages)
                 .unwrap()
                 .contains(base_secret),
             "an already-persisted WAL base must remain byte-identical"
         );
         assert!(
-            !serde_json::to_string(&plan.transition.recovery_messages)
+            !serde_json::to_string(&plan.recovery_messages)
                 .unwrap()
                 .contains(suffix_secret),
             "the not-yet-persisted suffix must be sanitized"
@@ -35892,15 +35614,7 @@ mod tests {
         tampered.durable_predecessor =
             astra_turn_types::ProviderCanonicalHistoryIdentityV2::empty();
         assert_eq!(
-            plan_provider_canonical_wal_transition(
-                &durable_base,
-                None,
-                &rewritten,
-                Vec::new(),
-                Some(&tampered),
-                ProviderCanonicalWalLimits::PRODUCTION,
-            )
-            .unwrap_err(),
+            build_handoff_continuation(&durable_base, &rewritten, Some(&tampered)).unwrap_err(),
             astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch
         );
     }
@@ -37280,16 +36994,13 @@ mod tests {
                                 &state.messages,
                             )
                             .unwrap();
-                        let plan = plan_provider_canonical_wal_transition(
+                        let plan = build_handoff_continuation(
                             durable_base,
-                            None,
                             &state.messages,
-                            Vec::new(),
                             Some(&authorization),
-                            ProviderCanonicalWalLimits::PRODUCTION,
                         )
                         .unwrap();
-                        assert!(plan.transition.replacement_compaction_generation.is_some());
+                        assert!(plan.replacement_compaction_generation.is_some());
                         assert!(result.boundary.is_some());
                         assert_eq!(state.last_request_message_count, Some(state.messages.len()));
                         assert!(
@@ -37526,143 +37237,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_compaction_without_rewrite_authority_preserves_provider_wal() {
+    async fn request_compaction_without_rewrite_authority_preserves_handoff_history() {
         for stale_proof in [false, true] {
-            for prior_wal in [true, false] {
-                let memory = Arc::new(CompactionMemoryFixture::default());
-                let mut host = test_host_builder("first-turn-owner", "first-turn-session")
-                    .with_memoria_client(Some(memory))
-                    .build();
-                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-                host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
-                    requests: requests.clone(),
-                }));
-                let mut state = create_test_state();
-                state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
-                // A first canonical admission can contain populated request
-                // history, without a previously persisted summary or head.
-                state.messages.remove(0);
-                state.messages[1]["content"] = json!(CONTINUITY_FACT);
-                let original = state.messages.clone();
-                let durable = if stale_proof {
-                    original[..2].to_vec()
-                } else {
-                    Vec::new()
-                };
-                state.initialize_provider_canonical_wal_base(&durable);
-                if stale_proof {
-                    let mut foreign = durable.clone();
-                    foreign[0]["content"] = json!("different admitted prefix");
-                    state.initialize_canonical_rewrite_proof(
-                        &foreign,
-                        &astra_turn_types::canonical_conversation_root(&foreign),
-                        0,
-                    );
-                    assert!(state.begin_canonical_rewrite().is_some());
-                } else {
-                    assert!(state.begin_canonical_rewrite().is_none());
-                    assert_eq!(
-                        state
-                            .provider_canonical_wal_base
-                            .as_ref()
-                            .unwrap()
-                            .canonical
-                            .message_count,
-                        0,
-                    );
-                }
-                let durable_base = state.provider_canonical_wal_base.clone().unwrap();
-                if prior_wal {
-                    // An earlier provider attempt has already admitted this
-                    // prefix during the first canonical turn. New history
-                    // follows it, before request preparation compacts again.
-                    let first = plan_provider_canonical_wal_transition(
-                        &durable_base,
-                        None,
-                        &original[..original.len() - 2],
-                        Vec::new(),
-                        None,
-                        ProviderCanonicalWalLimits::PRODUCTION,
-                    )
-                    .unwrap();
-                    state.provider_canonical_wal_head = Some(first.head);
-                }
-                let original_head = state.provider_canonical_wal_head.clone();
-                state.last_request_message_count = Some(original.len());
-                let config = compaction_reuse_config(true);
-                let result = host
-                    .compact_messages_via_memoria(
-                        &mut state,
-                        &original,
-                        &[],
-                        &[],
-                        CompactionTier::AggressivePrune,
-                        &config,
-                    )
-                    .await;
-
-                // This is the planner used by execute_turn before provider
-                // dispatch. Installing an unauthorized shorter history used
-                // to fail here with MissingLinkedPredecessor.
-                let next = plan_provider_canonical_wal_transition(
-                    &durable_base,
-                    state.provider_canonical_wal_head.as_ref(),
-                    &state.messages,
-                    Vec::new(),
-                    None,
-                    ProviderCanonicalWalLimits::PRODUCTION,
-                )
-                .expect("request-local fallback must preserve the linked provider predecessor");
-                assert!(next.transition.replacement_compaction_generation.is_none());
-                assert_eq!(state.messages, original);
-                assert_eq!(state.last_request_message_count, Some(original.len()));
+            let memory = Arc::new(CompactionMemoryFixture::default());
+            let mut host = test_host_builder("first-turn-owner", "first-turn-session")
+                .with_memoria_client(Some(memory))
+                .build();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                requests: requests.clone(),
+            }));
+            let mut state = create_test_state();
+            state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+            // A first canonical admission can contain populated request
+            // history, without a previously persisted summary or head.
+            state.messages.remove(0);
+            state.messages[1]["content"] = json!(CONTINUITY_FACT);
+            let original = state.messages.clone();
+            let durable = if stale_proof {
+                original[..2].to_vec()
+            } else {
+                Vec::new()
+            };
+            state.initialize_provider_canonical_wal_base(&durable);
+            if stale_proof {
+                let mut foreign = durable.clone();
+                foreign[0]["content"] = json!("different admitted prefix");
+                state.initialize_canonical_rewrite_proof(
+                    &foreign,
+                    &astra_turn_types::canonical_conversation_root(&foreign),
+                    0,
+                );
+                assert!(state.begin_canonical_rewrite().is_some());
+            } else {
+                assert!(state.begin_canonical_rewrite().is_none());
                 assert_eq!(
                     state
-                        .provider_canonical_wal_head
+                        .provider_canonical_wal_base
                         .as_ref()
-                        .map(|head| &head.transition_id),
-                    original_head.as_ref().map(|head| &head.transition_id),
-                );
-                assert_eq!(
-                    state
-                        .provider_canonical_wal_head
-                        .as_ref()
-                        .map(|head| &head.result),
-                    original_head.as_ref().map(|head| &head.result),
-                );
-                assert_eq!(requests.lock().unwrap().len(), 1);
-                assert!(result.boundary.is_some());
-                assert!(result.messages.len() < original.len());
-                assert!(
-                    result
-                        .history_summary
-                        .as_deref()
                         .unwrap()
-                        .contains(CONTINUITY_FACT)
+                        .canonical
+                        .message_count,
+                    0,
                 );
-                assert!(
-                    crate::turn::cloud::compaction::prepare_request_summary(
-                        &original, &original, &result,
-                    )
-                    .is_some(),
-                    "the fixture must offer a useful candidate that lacks rewrite authority",
-                );
-                let mut terminal = state.messages.clone();
-                terminal.push(
-                    json!({"role":"assistant", "content":"completed with request-local context"}),
-                );
-                let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
-                    &durable,
-                    stale_proof,
-                    &terminal,
-                    state.canonical_rewrite_proof(),
-                    false,
-                )
-                .unwrap()
-                .unwrap();
-                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
-                astra_turn_types::validate_canonical_tool_pairing(&terminal).unwrap();
             }
+            let durable_base = state.provider_canonical_wal_base.clone().unwrap();
+            state.last_request_message_count = Some(original.len());
+            let config = compaction_reuse_config(true);
+            let result = host
+                .compact_messages_via_memoria(
+                    &mut state,
+                    &original,
+                    &[],
+                    &[],
+                    CompactionTier::AggressivePrune,
+                    &config,
+                )
+                .await;
+
+            // Request-local compaction must preserve the canonical history
+            // that a later handoff or terminal Context commit will consume.
+            let next = build_handoff_continuation(&durable_base, &state.messages, None)
+                .expect("request-local fallback must preserve the handoff predecessor");
+            assert!(next.replacement_compaction_generation.is_none());
+            assert_eq!(state.messages, original);
+            assert_eq!(state.last_request_message_count, Some(original.len()));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(result.boundary.is_some());
+            assert!(result.messages.len() < original.len());
+            assert!(
+                result
+                    .history_summary
+                    .as_deref()
+                    .unwrap()
+                    .contains(CONTINUITY_FACT)
+            );
+            assert!(
+                crate::turn::cloud::compaction::prepare_request_summary(
+                    &original, &original, &result,
+                )
+                .is_some(),
+                "the fixture must offer a useful candidate that lacks rewrite authority",
+            );
+            let mut terminal = state.messages.clone();
+            terminal.push(
+                json!({"role":"assistant", "content":"completed with request-local context"}),
+            );
+            let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+                &durable,
+                stale_proof,
+                &terminal,
+                state.canonical_rewrite_proof(),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+            astra_turn_types::validate_canonical_tool_pairing(&terminal).unwrap();
         }
     }
 
@@ -52234,25 +51905,19 @@ mod tests {
     }
 
     #[test]
-    fn producer_cannot_spoof_tool_terminal_durable_watermark() {
+    fn producer_cannot_spoof_tool_terminal_live_watermark() {
         let mut host = test_host_builder("user1", "sess1").build();
         host.emit_progress_event(json!({
             "type": "tool_call_end",
             "call_id": "call-spoofed",
             "status": "completed",
-            "_astra_tool_terminal_durably_fanned_out": true,
+            "_astra_tool_terminal_live_emitted": true,
         }));
 
         let retained = host.emitted_events.last().expect("retained terminal");
+        assert!(retained.get(TOOL_TERMINAL_LIVE_EMITTED_FIELD).is_none());
         assert!(
-            retained
-                .get(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD)
-                .is_none()
-        );
-        assert!(
-            crate::server::run::lifecycle::run_state::tool_terminal_requires_settlement_repair(
-                retained
-            )
+            crate::server::run::lifecycle::run_state::tool_terminal_requires_live_repair(retained)
         );
     }
 
