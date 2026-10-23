@@ -129,7 +129,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         );
         let statements = capture.0.lock().unwrap().take().unwrap();
         let diagnostic_rows: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type IN ('trace_span', 'llm_round')",
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
         )
         .bind(&b.ctx.user_id)
         .bind(&b.ctx.session_id)
@@ -140,6 +140,31 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             diagnostic_rows.0, 0,
             "ordinary chat must not persist optional diagnostic copies"
         );
+        let (history_status, history) = get_json(
+            &b.ctx.app,
+            &format!(
+                "/sessions/{}/transcript?scope=root_conversation&limit=20",
+                b.ctx.session_id
+            ),
+            Some(b.auth_header.as_str()),
+            &[],
+        )
+        .await;
+        assert_eq!(history_status, axum::http::StatusCode::OK, "{history}");
+        let items = history["items"]
+            .as_array()
+            .expect("refreshed history items");
+        assert!(
+            items.iter().any(|item| item["role"] == "user"
+                && item["content"]
+                    == if readonly_rounds == 0 {
+                        "hi"
+                    } else {
+                        "Discover the agent tool without invoking it."
+                    }),
+            "{history}"
+        );
+        assert!(items.iter().any(|item| item["role"] == "assistant" && item["content"] == "Discovery complete."), "{history}");
         assert!(
             !statements.is_empty(),
             "the SQL observer must capture real database work"

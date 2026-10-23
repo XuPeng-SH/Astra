@@ -1850,3 +1850,282 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
         .expect("clean staged manifest fixture");
     }
 }
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_lists_derive_activity_from_committed_context_with_stable_seek_pages() {
+    use astra_services::auth::session::SessionCreateRequestData;
+    use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
+    use astra_services::{DatabaseSessionService, SessionListFilter};
+
+    async fn commit(
+        coordinator: &DatabaseSessionContextCoordinator,
+        key: &SessionKeyV1,
+    ) -> (astra_turn_types::TurnReservationV1, CanonicalTurnDeltaV1) {
+        let actor = ActorContextV1::owner_user(
+            &key.owner_user_id,
+            "activity-reader-test",
+            ActorKindV1::Server,
+            SessionSurfaceV1::Server,
+            None,
+            AuthorityEpochsV1::default(),
+        );
+        let reservation = match coordinator
+            .acquire_writer_and_reserve_turn(
+                key,
+                None,
+                &actor,
+                Duration::from_secs(120),
+                "activity-writer",
+                "activity-turn",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => reservation,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let delta = CanonicalTurnDeltaV1 {
+            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            compaction_generation: 0,
+            config_version_id: None,
+            mode: CanonicalDeltaModeV1::Append,
+            logical_segments: vec![vec![
+                serde_json::json!({"role":"user","content":"committed conversation"}),
+            ]],
+        };
+        coordinator
+            .commit_turn(&reservation, delta.clone(), "activity-commit")
+            .await
+            .unwrap();
+        (reservation, delta)
+    }
+
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let owner = format!("activity-owner-{}", Uuid::new_v4());
+    let service = DatabaseSessionService::new(settings.clone()).with_pool(pool.clone());
+    let mut ids = Vec::new();
+    for _ in 0..23 {
+        ids.push(
+            service
+                .create_session(
+                    owner.clone(),
+                    SessionCreateRequestData {
+                        title: Some("activity fixture".into()),
+                        agent_id: None,
+                        metadata: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .session_id,
+        );
+    }
+    ids.sort();
+    let target = ids.last().unwrap();
+    let tie = &ids[ids.len() - 2];
+    let earlier = &ids[ids.len() - 3];
+    let noise = &ids[0];
+    sqlx::query("UPDATE agent_sessions SET created_at='2020-01-01', updated_at='2024-01-01' WHERE user_id=?")
+        .bind(&owner).execute(pool.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_sessions SET updated_at='2021-01-01' WHERE user_id=? AND session_id=?",
+    )
+    .bind(&owner)
+    .bind(target)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let restore = HybridRestoreService::new(pool.get().clone());
+    assert!(
+        !restore
+            .list_resumable_sessions(&owner)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| &s.session_id == target),
+        "aged session starts below the resumable 20-row cutoff"
+    );
+
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let key = SessionKeyV1::owner_session(
+        "server",
+        &owner,
+        target,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let (reservation, delta) = commit(&coordinator, &key).await;
+    sqlx::query("UPDATE conversation_manifest_nodes SET created_at='2026-05-01 12:00:00.000002' WHERE owner_user_id=? AND session_id=?")
+        .bind(&owner).bind(target).execute(pool.get()).await.unwrap();
+    for (id, ts) in [
+        (tie, "2026-05-01 12:00:00.000002"),
+        (earlier, "2026-05-01 12:00:00.000001"),
+    ] {
+        sqlx::query("UPDATE agent_sessions SET updated_at=? WHERE user_id=? AND session_id=?")
+            .bind(ts)
+            .bind(&owner)
+            .bind(id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+    // Neither another domain/branch nor another owner's same session can promote noise.
+    let foreign = format!("activity-foreign-{}", Uuid::new_v4());
+    for other_key in [
+        SessionKeyV1::owner_session("other-domain", &owner, noise, "main"),
+        SessionKeyV1::owner_session("server", &owner, noise, "other-branch"),
+        SessionKeyV1::owner_session("server", &foreign, noise, "main"),
+    ] {
+        commit(&coordinator, &other_key).await;
+    }
+    // Existing and empty controller operations change mutable head timestamps only.
+    let cursor = coordinator.load_head(&key).await.unwrap().unwrap().cursor;
+    let actor = ActorContextV1::owner_user(
+        &owner,
+        "activity-reader-test",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let lease = coordinator.load_active_writer(&key).await.unwrap().unwrap();
+    coordinator.release_writer(&lease).await.unwrap();
+    let (lease, next) = match coordinator
+        .acquire_writer_and_reserve_turn(
+            &key,
+            Some(&cursor),
+            &actor,
+            Duration::from_secs(120),
+            "activity-next-writer",
+            "activity-next-turn",
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } => (lease, reservation),
+        other => panic!("unexpected controller admission: {other:?}"),
+    };
+    let renewed = coordinator
+        .renew_turn_authority(&lease, &next, Duration::from_secs(120))
+        .await
+        .unwrap();
+    coordinator
+        .commit_turn(&reservation, delta.clone(), "activity-commit")
+        .await
+        .unwrap();
+    let mut invalid = delta;
+    invalid.completed_turn += 1;
+    assert!(
+        coordinator
+            .commit_turn(&reservation, invalid, "rejected-activity")
+            .await
+            .is_err()
+    );
+    coordinator
+        .release_writer(&renewed.writer_lease)
+        .await
+        .unwrap();
+    let empty_key = SessionKeyV1::owner_session("server", &owner, noise, "main");
+    let lease = match coordinator
+        .acquire_writer(&empty_key, None, &actor, Duration::from_secs(120), "empty")
+        .await
+        .unwrap()
+    {
+        AcquireWriterOutcome::Acquired(lease) => lease,
+        other => panic!("unexpected empty controller: {other:?}"),
+    };
+    coordinator.release_writer(&lease).await.unwrap();
+
+    // Recreate readers to exclude process-local state. Seek with exact ties and microseconds.
+    let service = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    let mut after = None;
+    let mut observed = Vec::new();
+    loop {
+        let page = service
+            .list_sessions(SessionListFilter {
+                user_id: owner.clone(),
+                agent_id: None,
+                status: None,
+                limit: 2,
+                cursor: after,
+            })
+            .await
+            .unwrap();
+        for session in page.sessions {
+            if &session.session_id == target {
+                assert_eq!(session.updated_at.as_deref(), Some("2026-05-01T12:00:00"));
+            }
+            observed.push(session.session_id);
+        }
+        after = page.next_cursor;
+        if after.is_none() {
+            break;
+        }
+    }
+    let mut expected = ids
+        .iter()
+        .rev()
+        .filter(|id| *id != target && *id != tie && *id != earlier)
+        .cloned()
+        .collect::<Vec<_>>();
+    expected.splice(0..0, [target.clone(), tie.clone(), earlier.clone()]);
+    assert_eq!(
+        observed, expected,
+        "complete seek traversal must have no duplicates or gaps"
+    );
+    let detail = service
+        .get_session(target.clone(), owner.clone())
+        .await
+        .unwrap();
+    assert_eq!(detail.updated_at.as_deref(), Some("2026-05-01T12:00:00"));
+    let restored = HybridRestoreService::new(pool.get().clone())
+        .list_resumable_sessions(&owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        &restored[0].session_id, target,
+        "canonical activity crosses the 20-row cutoff"
+    );
+    let stored: String=sqlx::query_scalar("SELECT DATE_FORMAT(updated_at,'%Y-%m-%dT%H:%i:%s') FROM agent_sessions WHERE user_id=? AND session_id=?")
+        .bind(&owner).bind(target).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(
+        stored, "2021-01-01T00:00:00",
+        "recency reads must not repair metadata or create diagnostics"
+    );
+    for table in [
+        "conversation_manifest_segments",
+        "conversation_manifest_nodes",
+        "conversation_segments",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE owner_user_id IN (?, ?)"
+        )))
+        .bind(&owner)
+        .bind(&foreign)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+    for table in [
+        "agent_sessions",
+        "agent_session_lifecycle_fences",
+        "auth_audit_logs",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id IN (?, ?)"
+        )))
+        .bind(&owner)
+        .bind(&foreign)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+}

@@ -1092,96 +1092,6 @@ fn enforce_terminal_completion_disposition_before_success(
     true
 }
 
-/// Durable settlement closes current-run guidance before the last boundary
-/// poll. A non-terminal branch may continue the same run only by consuming
-/// this exact capability through [`continue_after_user_intent_settlement_fence`].
-enum UserIntentSettlementFence {
-    NotApplicable,
-    Committed {
-        run_control: std::sync::Arc<dyn RunControlProvider>,
-        user_id: String,
-        expected_session_id: String,
-        run_id: String,
-        authority: UserIntentAdmissionAuthority,
-    },
-}
-
-async fn commit_user_intent_settlement_fence(
-    state: &AgenticLoopState,
-) -> Result<UserIntentSettlementFence, astra_core::ClassifiedError> {
-    let (Some(run_control), Some(user_id), Some(run_id)) = (
-        state.run_control.as_ref(),
-        state.context_manifest_user_id.as_deref(),
-        state.current_run_id.as_deref(),
-    ) else {
-        return Ok(UserIntentSettlementFence::NotApplicable);
-    };
-    let authority = state
-        .current_run_owner_generation
-        .map(UserIntentAdmissionAuthority::DurableOwnerGeneration)
-        .unwrap_or(UserIntentAdmissionAuthority::ProcessLocal);
-    let expected_session_id = state.current_session_id.as_deref().ok_or_else(|| {
-        astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            format!("run {run_id} is missing its immutable session identity"),
-        )
-    })?;
-    run_control
-        .fence_user_intent_submissions(user_id, expected_session_id, run_id, authority)
-        .await
-        .map_err(|error| {
-            astra_core::ClassifiedError::new(
-                match authority {
-                    UserIntentAdmissionAuthority::ProcessLocal => {
-                        astra_core::ErrorKind::ContractViolation
-                    }
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(_) => {
-                        astra_core::ErrorKind::Unknown
-                    }
-                },
-                format!("failed to fence final user intent settlement: {error}"),
-            )
-        })?;
-    Ok(UserIntentSettlementFence::Committed {
-        run_control: run_control.clone(),
-        user_id: user_id.to_string(),
-        expected_session_id: expected_session_id.to_string(),
-        run_id: run_id.to_string(),
-        authority,
-    })
-}
-
-async fn continue_after_user_intent_settlement_fence(
-    fence: UserIntentSettlementFence,
-) -> Result<TurnExecutionControl, astra_core::ClassifiedError> {
-    if let UserIntentSettlementFence::Committed {
-        run_control,
-        user_id,
-        expected_session_id,
-        run_id,
-        authority,
-    } = fence
-    {
-        run_control
-            .reopen_user_intent_submissions(
-                &user_id,
-                &expected_session_id,
-                &run_id,
-                authority,
-            )
-            .await
-            .map_err(|error| {
-                astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::Unknown,
-                    format!(
-                        "failed to reopen user intent admission before continuing run {run_id}: {error}"
-                    ),
-                )
-            })?;
-    }
-    Ok(TurnExecutionControl::ContinueLoop)
-}
-
 pub(crate) async fn authorize_provider_boundary(
     state: &mut AgenticLoopState,
 ) -> Result<ProviderBoundaryGate, astra_core::ClassifiedError> {
@@ -3881,12 +3791,10 @@ pub(crate) async fn runtime_input_boundary<H: AgenticLoopHost>(
 ) -> Result<RuntimeInputOutcome, astra_core::ClassifiedError> {
     // Run admission and the existing timed watcher own durable control reads.
     // No changed watermark means no new guidance to fetch at another model or
-    // tool boundary. Settlement still drains the authoritative lane, and
+    // tool boundary. The terminal transaction returns late, unapplied inputs;
     // pending local deliveries/acknowledgements retain their existing owner.
-    let guidance_ready = matches!(
-        boundary,
-        RuntimeInputBoundary::Settlement | RuntimeInputBoundary::IntentReady
-    ) || state.user_intents.input_wake_is_pending().unwrap_or(true)
+    let guidance_ready = matches!(boundary, RuntimeInputBoundary::IntentReady)
+        || state.user_intents.input_wake_is_pending().unwrap_or(true)
         || state
             .user_intents
             .should_retry_apply_ack(tokio::time::Instant::now())
@@ -6047,16 +5955,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Ok(TurnExecutionControl::WaitForInput);
             }
 
-            let user_intent_settlement_fence = commit_user_intent_settlement_fence(state).await?;
-
-            // Close the last-model-boundary race for remotely accepted user
-            // guidance. The ordinary poll at loop entry is cadence-limited;
-            // without this forced durable poll, an intent accepted while the
-            // final response was in flight could be acknowledged by the
-            // server after that poll and then stranded by terminal settlement.
-            // If authoritative guidance or another semantic runtime input
-            // arrived, this response is intermediate and the same run makes
-            // another normally accounted decision.
+            // Observed guidance still continues through the shared input owner.
+            // A later arrival is returned by the atomic Run terminal transaction
+            // so accepting it never creates a second closing/reopening protocol.
             if inject_polled_user_intents_before_settlement(host, state).await? {
                 record_early_exit_llm_round(
                     state,
@@ -6065,15 +5966,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     Some("runtime_input_arrived_before_settlement"),
                 );
                 state.step_recorder.end_turn(false);
-                return continue_after_user_intent_settlement_fence(user_intent_settlement_fence)
-                    .await;
+                return Ok(TurnExecutionControl::ContinueLoop);
             }
 
-            // The final user-intent fence above proves that this run still
-            // owns its current generation and that no accepted intent is
-            // stranded behind the response. Re-read canonical Work now so a
-            // crash, correction, or successor assignment cannot borrow
-            // process-local presentation state as completion authority.
+            // Canonical Work owns completion authorization independently of
+            // Run presentation. Re-read it so a correction or successor cannot
+            // borrow process-local presentation as completion authority.
             let committed_work_synthesis_authorized = if committed_work_synthesis_candidate {
                 let authorized = match host.committed_work_synthesis_authorized(state).await {
                     Ok(authorized) => authorized,
@@ -6139,10 +6037,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                                 "run was cancelled while paused after a provider response",
                             ));
                         }
-                        return continue_after_user_intent_settlement_fence(
-                            user_intent_settlement_fence,
-                        )
-                        .await;
+                        return Ok(TurnExecutionControl::ContinueLoop);
                     }
                     Err(error) => {
                         // The response was produced by an owner that no
@@ -6214,8 +6109,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 );
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
-                return continue_after_user_intent_settlement_fence(user_intent_settlement_fence)
-                    .await;
+                return Ok(TurnExecutionControl::ContinueLoop);
             }
 
             match enforce_completion_action_window_before_text_completion(state) {
@@ -6229,10 +6123,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                     state.step_recorder.end_turn(false);
                     try_write_heavy_checkpoint(state);
-                    return continue_after_user_intent_settlement_fence(
-                        user_intent_settlement_fence,
-                    )
-                    .await;
+                    return Ok(TurnExecutionControl::ContinueLoop);
                 }
                 CompletionActionBoundary::TerminalIncomplete => {
                     // The typed action window is terminal authority. Do not
@@ -6270,8 +6161,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 );
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
-                return continue_after_user_intent_settlement_fence(user_intent_settlement_fence)
-                    .await;
+                return Ok(TurnExecutionControl::ContinueLoop);
             }
 
             if state.interruption.is_none()
@@ -6286,8 +6176,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 );
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
-                return continue_after_user_intent_settlement_fence(user_intent_settlement_fence)
-                    .await;
+                return Ok(TurnExecutionControl::ContinueLoop);
             }
 
             let round_slice_incomplete = enforce_terminal_completion_disposition_before_success(
@@ -17911,11 +17800,6 @@ mod tests {
         apply_outcomes: Mutex<VecDeque<crate::turn::run_control::UserIntentApplyAck>>,
         provider_authorization_calls: std::sync::atomic::AtomicUsize,
         provider_authorizations: Mutex<VecDeque<ProviderBoundaryAuthorization>>,
-        fence_calls: std::sync::atomic::AtomicUsize,
-        reopen_calls: std::sync::atomic::AtomicUsize,
-        fence_generations: Mutex<Vec<u64>>,
-        reopen_generations: Mutex<Vec<u64>>,
-        reopen_error: Option<String>,
     }
 
     impl StubRunControlProvider {
@@ -17930,11 +17814,6 @@ mod tests {
                 apply_outcomes: Mutex::new(VecDeque::new()),
                 provider_authorization_calls: std::sync::atomic::AtomicUsize::new(0),
                 provider_authorizations: Mutex::new(VecDeque::new()),
-                fence_calls: std::sync::atomic::AtomicUsize::new(0),
-                reopen_calls: std::sync::atomic::AtomicUsize::new(0),
-                fence_generations: Mutex::new(Vec::new()),
-                reopen_generations: Mutex::new(Vec::new()),
-                reopen_error: None,
             }
         }
 
@@ -17951,13 +17830,6 @@ mod tests {
                 .get_mut()
                 .push_back(crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned);
             provider
-        }
-
-        fn with_reopen_error(polls: Vec<UserIntentPoll>, error: &str) -> Self {
-            Self {
-                reopen_error: Some(error.to_string()),
-                ..Self::new(polls)
-            }
         }
 
         fn with_provider_authorizations(
@@ -18129,49 +18001,6 @@ mod tests {
                 .await
                 .pop_front()
                 .unwrap_or(ProviderBoundaryAuthorization::Authorized))
-        }
-
-        async fn fence_user_intent_submissions(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            authority: UserIntentAdmissionAuthority,
-        ) -> Result<(), String> {
-            let UserIntentAdmissionAuthority::DurableOwnerGeneration(expected_owner_generation) =
-                authority
-            else {
-                return Err("stub durable provider requires exact owner generation".to_string());
-            };
-            self.fence_calls.fetch_add(1, Ordering::SeqCst);
-            self.fence_generations
-                .lock()
-                .await
-                .push(expected_owner_generation);
-            Ok(())
-        }
-
-        async fn reopen_user_intent_submissions(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            authority: UserIntentAdmissionAuthority,
-        ) -> Result<(), String> {
-            let UserIntentAdmissionAuthority::DurableOwnerGeneration(expected_owner_generation) =
-                authority
-            else {
-                return Err("stub durable provider requires exact owner generation".to_string());
-            };
-            self.reopen_calls.fetch_add(1, Ordering::SeqCst);
-            self.reopen_generations
-                .lock()
-                .await
-                .push(expected_owner_generation);
-            match self.reopen_error.as_ref() {
-                Some(error) => Err(error.clone()),
-                None => Ok(()),
-            }
         }
 
         async fn poll_user_intents(
@@ -22392,7 +22221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_run_engine_drains_fenced_intent_before_typed_reopen() {
+    async fn real_run_engine_drains_accepted_intent_without_a_separate_admission_gate() {
         let engine = Arc::new(RunEngine::new(Arc::new(InMemoryRunStateStore::new())));
         engine
             .start_run("run-real-fence-drain", "user-real", "session-real")
@@ -22421,15 +22250,6 @@ mod tests {
                 .unwrap(),
             AtomicRunGuidanceAdmission::Committed { event_index: 1 }
         );
-        engine
-            .fence_user_intent_submissions(
-                "user-real",
-                "session-real",
-                "run-real-fence-drain",
-                UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-            )
-            .await
-            .unwrap();
 
         let mut state = make_state();
         state.current_run_id = Some("run-real-fence-drain".into());
@@ -22445,18 +22265,6 @@ mod tests {
             "the forced boundary must ingest the accepted pre-cutoff intent"
         );
         assert_eq!(state.message, "drain this accepted guidance");
-
-        let control =
-            continue_after_user_intent_settlement_fence(UserIntentSettlementFence::Committed {
-                run_control: engine.clone(),
-                user_id: "user-real".into(),
-                expected_session_id: "session-real".into(),
-                run_id: "run-real-fence-drain".into(),
-                authority: UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(control, TurnExecutionControl::ContinueLoop));
 
         let after_reopen = serde_json::json!({
             "event_type": "user_intent",
@@ -22486,12 +22294,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(run.events[2]["data"]["after_event_index"], 1);
-        assert_eq!(run.events[3]["event_type"], "user_intent_applied");
-        assert_eq!(
-            run.events[4]["event_type"],
-            "user_intent_admission_reopened"
-        );
+        assert_eq!(run.events[2]["event_type"], "user_intent_applied");
+        assert_eq!(run.events[3]["event_type"], "user_intent");
     }
 
     #[tokio::test]
@@ -23196,28 +23000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_settlement_without_exact_owner_generation_fails_closed() {
-        let mut state = make_state();
-        state.current_run_id = Some("run-missing-generation".into());
-        state.context_manifest_user_id = Some("user-missing-generation".into());
-        let provider = Arc::new(StubRunControlProvider::new(vec![
-            UserIntentPoll::default(),
-            UserIntentPoll::default(),
-        ]));
-        state.run_control = Some(provider.clone());
-        let mut host = MockHost::new(vec![text_result("final", 5, 2, None)]);
-
-        let error = run_agentic_loop_with_host(&mut host, &mut state)
-            .await
-            .expect_err("durable settlement cannot reconstruct owner authority");
-
-        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
-        assert_eq!(provider.fence_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(provider.reopen_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn every_nonterminal_post_fence_guard_reopens_the_exact_durable_run() {
+    async fn nonterminal_completion_guards_continue_the_same_owned_run() {
         #[derive(Clone, Copy, Debug)]
         enum ContinuationCase {
             WorkSettlement,
@@ -23296,57 +23079,17 @@ mod tests {
                 },
             )
             .await
-            .unwrap_or_else(|error| panic!("{case:?} must continue after reopening: {error}"));
+            .unwrap_or_else(|error| panic!("{case:?} must continue the same owned Run: {error}"));
 
             assert!(
                 matches!(control, TurnExecutionControl::ContinueLoop),
                 "{case:?} must be nonterminal"
             );
-            assert_eq!(
-                provider.fence_calls.load(Ordering::SeqCst),
-                1,
-                "{case:?} must commit one fence"
-            );
-            assert_eq!(
-                provider.reopen_calls.load(Ordering::SeqCst),
-                1,
-                "{case:?} must close its committed fence"
-            );
-            assert_eq!(*provider.fence_generations.lock().await, vec![17]);
-            assert_eq!(*provider.reopen_generations.lock().await, vec![17]);
         }
     }
 
     #[tokio::test]
-    async fn post_fence_reopen_failure_fails_closed_before_another_provider_round() {
-        let mut state = make_state();
-        state.current_run_id = Some("run-reopen-failure".into());
-        state.current_run_owner_generation = Some(23);
-        state.context_manifest_user_id = Some("user-reopen-failure".into());
-        state.hooks.completion_settlement.work_settlement_only = true;
-        let provider = Arc::new(StubRunControlProvider::with_reopen_error(
-            vec![UserIntentPoll::default(); 3],
-            "durable reopen unavailable",
-        ));
-        state.run_control = Some(provider.clone());
-        let mut host = MockHost::new(vec![
-            text_result("candidate", 5, 2, None),
-            text_result("must not execute", 5, 2, None),
-        ]);
-
-        let error = run_agentic_loop_with_host(&mut host, &mut state)
-            .await
-            .expect_err("failed reopen cannot authorize the next provider boundary");
-
-        assert_eq!(error.kind, astra_core::ErrorKind::Unknown);
-        assert!(error.message.contains("durable reopen unavailable"));
-        assert_eq!(host.turn_count(), 1);
-        assert_eq!(provider.fence_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.reopen_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn terminal_completion_after_fence_does_not_reopen_admission() {
+    async fn terminal_completion_after_workspace_retry_preserves_incomplete_outcome() {
         let mut state = make_state();
         state.current_run_id = Some("run-terminal-after-fence".into());
         state.current_run_owner_generation = Some(29);
@@ -23376,12 +23119,10 @@ mod tests {
             control,
             TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
         ));
-        assert_eq!(provider.fence_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.reopen_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn guidance_at_settlement_reopens_admission_for_the_continuing_run() {
+    async fn guidance_observed_at_settlement_continues_the_same_run() {
         let mut state = make_state();
         state.current_run_id = Some("run-continuing".into());
         state.current_run_owner_generation = Some(7);
@@ -23389,8 +23130,8 @@ mod tests {
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll::default(),
             // The post-provider action fence observes no guidance. The next
-            // poll is the final-settlement fence, which must still close the
-            // race and reopen submissions for the continuing run.
+            // poll observes guidance before the final response is committed.
+            // Applying it continues the same Run without a separate gate.
             UserIntentPoll::default(),
             UserIntentPoll {
                 next_cursor: 2,
@@ -23421,13 +23162,10 @@ mod tests {
 
         assert!(
             matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
-            "continuing run failed after reopening admission: {outcome:?}"
+            "continuing run failed while applying guidance: {outcome:?}"
         );
         assert_eq!(state.llm_rounds_completed, 2);
-        assert_eq!(provider.reopen_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.fence_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(*provider.fence_generations.lock().await, vec![7, 7]);
-        assert_eq!(*provider.reopen_generations.lock().await, vec![7]);
+
         assert_eq!(*provider.released.lock().await, vec![1]);
         assert_eq!(
             provider.provider_authorization_calls.load(Ordering::SeqCst),
@@ -24104,8 +23842,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             provider.poll_call_count().await,
-            3,
-            "settlement still reconciles unobserved remote input"
+            2,
+            "quiet settlement delegates late input to the atomic terminal transaction"
         );
     }
 

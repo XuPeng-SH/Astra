@@ -251,16 +251,6 @@ fn map_recovery_point_blocker(
             false,
             vec![WorkApiActionHint::RefreshWork],
         ),
-        Blocker::DanglingRunSlot | Blocker::RunStatusMissing => {
-            tracing::error!(work_id, blocker = ?reason, "Work recovery point found corrupt Run slot");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "recovery_point_repair_required",
-                WorkApiErrorCategory::Degraded,
-                false,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        }
         Blocker::ActiveRun => work_error(
             StatusCode::CONFLICT,
             "recovery_point_run_active",
@@ -10433,15 +10423,6 @@ mod tests {
                 WorkApiActionHint::ReviewEffects,
                 WorkApiActionHint::RefreshWork
             ]
-        ));
-
-        let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::RunStatusMissing);
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.code, "recovery_point_repair_required");
-        assert!(!error.retryable);
-        assert!(matches!(
-            error.action_hints.as_slice(),
-            [WorkApiActionHint::RetryRead]
         ));
 
         let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::BasisChanged);

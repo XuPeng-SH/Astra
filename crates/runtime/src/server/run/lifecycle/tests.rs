@@ -568,8 +568,7 @@ fn typed_subrun_workspace_intent_and_completion_profile_cannot_contradict() {
 }
 
 use crate::server::run::lifecycle::persistence::{
-    build_tool_trace_events, extract_session_state_compact, messages_for_csl_persist,
-    redact_trace_value,
+    extract_session_state_compact, messages_for_csl_persist,
 };
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
@@ -4618,32 +4617,6 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
 // ── implicit feedback wiring ──
 
 #[test]
-fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
-    let redacted = redact_trace_value(&json!({
-        "Authorization": "Bearer secret",
-        "nested": {
-            "api_key": "abc123",
-            "safe": "visible"
-        },
-        "items": [
-            {"cookie": "session=abc"},
-            {"text": "x".repeat(2_050)}
-        ]
-    }));
-
-    assert_eq!(redacted["Authorization"], "[REDACTED]");
-    assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
-    assert_eq!(redacted["nested"]["safe"], "visible");
-    assert_eq!(redacted["items"][0]["cookie"], "[REDACTED]");
-    assert!(
-        redacted["items"][1]["text"]
-            .as_str()
-            .expect("string")
-            .ends_with("...")
-    );
-}
-
-#[test]
 fn format_run_events_adds_index() {
     let events = AgenticRunLifecycleService::format_run_events(
         &[
@@ -4680,186 +4653,6 @@ fn run_status_as_str_matches_durable_status_constants() {
     assert_eq!(RunStatus::Completed.as_str(), STATUS_COMPLETED);
     assert_eq!(RunStatus::Failed.as_str(), STATUS_FAILED);
     assert_eq!(RunStatus::Cancelled.as_str(), STATUS_CANCELLED);
-}
-
-#[test]
-fn tool_trace_events_populate_columns_and_redacted_payloads() {
-    let turn_started_at = chrono::Utc::now();
-    let trace = TraceContext {
-        session_id: "session-1".to_string(),
-        user_id: "user-1".to_string(),
-        turn_id: "turn-1".to_string(),
-        turn_seq: 7,
-        causal_chain_id: "chain-1".to_string(),
-        root_event_id: "trace:root".to_string(),
-    };
-    let record = ToolCallRecord {
-        tool_call_id: Some("tool-call-1".to_string()),
-        name: "agent".to_string(),
-        ok: true,
-        ms: 42,
-        args_preview: Some("agent(action='spawn'): child".to_string()),
-        result_preview: Some("launched child".to_string()),
-        result_class: Some("success".into()),
-        exit_semantics: Some("success".into()),
-        round: Some(2),
-        args_full: Some(r#"{"action":"spawn","token":"secret"}"#.to_string()),
-        result_full: Some(
-            r#"{"agent_id":"child@run","run_id":"child-run","result":"ok"}"#.to_string(),
-        ),
-        start_offset_ms: Some(1_000),
-        ..Default::default()
-    };
-
-    let events = build_tool_trace_events(
-        &trace,
-        turn_started_at,
-        "root-run",
-        None,
-        Some("root-agent"),
-        None,
-        &[record],
-    );
-
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_type, "tool_call_started");
-    assert_eq!(events[0].tool_call_id.as_deref(), Some("tool-call-1"));
-    assert_eq!(events[0].round_index, Some(2));
-    assert_eq!(events[0].meta_tool_name.as_deref(), Some("agent"));
-    assert_eq!(
-        events[0].metadata["tool_args_json_redacted"]["token"],
-        "[REDACTED]"
-    );
-    assert_eq!(events[1].event_type, "tool_call_completed");
-    assert_eq!(events[1].meta_duration_ms, Some(42));
-    assert_eq!(events[1].metadata["action"], "spawn");
-    assert_eq!(events[1].metadata["result_class"], "success");
-    assert_eq!(events[1].metadata["exit_semantics"], "success");
-    assert_eq!(events[1].metadata["child_run_id"], "child-run");
-    assert_eq!(
-        events[0].created_at,
-        turn_started_at + chrono::Duration::milliseconds(1_000)
-    );
-    assert_eq!(
-        events[1].created_at,
-        turn_started_at + chrono::Duration::milliseconds(1_042)
-    );
-}
-
-#[test]
-fn failed_tool_trace_event_persists_searchable_error_content() {
-    let turn_started_at = chrono::Utc::now();
-    let trace = TraceContext {
-        session_id: "session-1".to_string(),
-        user_id: "user-1".to_string(),
-        turn_id: "turn-1".to_string(),
-        turn_seq: 7,
-        causal_chain_id: "chain-1".to_string(),
-        root_event_id: "trace:root".to_string(),
-    };
-    let record = ToolCallRecord {
-        tool_call_id: Some("tool-call-failed".to_string()),
-        name: "bash".to_string(),
-        ok: false,
-        ms: 9,
-        error: Some("unknown_tool: bash".to_string()),
-        result_class: Some("env_failure".into()),
-        exit_semantics: Some("execution_error".into()),
-        ..Default::default()
-    };
-
-    let events = build_tool_trace_events(
-        &trace,
-        turn_started_at,
-        "root-run",
-        None,
-        Some("root-agent"),
-        None,
-        &[record],
-    );
-
-    assert_eq!(events[1].event_type, "tool_call_failed");
-    assert_eq!(events[1].metadata["result_class"], "env_failure");
-    assert_eq!(events[1].metadata["exit_semantics"], "execution_error");
-    assert_eq!(events[1].content.as_deref(), Some("unknown_tool: bash"));
-}
-
-#[test]
-fn unexecuted_tool_trace_events_preserve_canonical_terminal_dispositions() {
-    let turn_started_at = chrono::Utc::now();
-    let trace = TraceContext {
-        session_id: "session-1".to_string(),
-        user_id: "user-1".to_string(),
-        turn_id: "turn-1".to_string(),
-        turn_seq: 7,
-        causal_chain_id: "chain-1".to_string(),
-        root_event_id: "trace:root".to_string(),
-    };
-    let records = vec![
-        ToolCallRecord {
-            tool_call_id: Some("call-rejected".into()),
-            name: "bash".into(),
-            ok: false,
-            disposition: Some(ToolCallDisposition::Rejected),
-            result_class: Some(astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.into()),
-            ..Default::default()
-        },
-        ToolCallRecord {
-            tool_call_id: Some("call-reused".into()),
-            name: "read_file".into(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Reused),
-            result_class: Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.into()),
-            ..Default::default()
-        },
-        ToolCallRecord {
-            tool_call_id: Some("call-suppressed".into()),
-            name: "write_file".into(),
-            ok: false,
-            disposition: Some(ToolCallDisposition::Suppressed),
-            surgically_removed: Some(true),
-            ..Default::default()
-        },
-        ToolCallRecord {
-            tool_call_id: Some("call-deferred".into()),
-            name: "agent".into(),
-            ok: false,
-            disposition: Some(ToolCallDisposition::Deferred),
-            ..Default::default()
-        },
-    ];
-
-    let events = build_tool_trace_events(
-        &trace,
-        turn_started_at,
-        "root-run",
-        None,
-        Some("root-agent"),
-        None,
-        &records,
-    );
-
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "tool_call_started",
-            "tool_call_rejected",
-            "tool_call_started",
-            "tool_call_reused",
-            "tool_call_started",
-            "tool_call_suppressed",
-            "tool_call_started",
-            "tool_call_deferred",
-        ]
-    );
-    assert!(events.iter().all(|event| event.meta_duration_ms.is_none()));
-    assert_eq!(events[1].metadata["disposition"], "rejected");
-    assert_eq!(events[3].metadata["disposition"], "reused");
-    assert_eq!(events[5].metadata["disposition"], "suppressed");
-    assert_eq!(events[7].metadata["disposition"], "deferred");
 }
 
 #[test]
@@ -10194,13 +9987,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .await
     }
 
-    async fn transition_user_intent_admission(
-        &self,
-        request: astra_services::runs::AtomicRunUserIntentAdmissionTransitionRequest<'_>,
-    ) -> Result<astra_services::runs::AtomicRunUserIntentAdmissionTransition, String> {
-        self.inner.transition_user_intent_admission(request).await
-    }
-
     async fn reconcile_execution_handoff(
         &self,
         claim: &astra_services::runs::RecoveryClaim,
@@ -12549,7 +12335,6 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             session_id: &session,
             run_id: &run,
             request: &request,
-            started_at: chrono::Utc::now(),
             admission: None,
             prepared: None,
             rejection: None,
@@ -30018,8 +29803,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     facts.original.session_turn = 7;
     facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
     facts.original.root_user_query_event_id = Some("original-query".to_string());
-    let original_turn_started_at = chrono::DateTime::from_timestamp(1_700_000_000, 123).unwrap();
-    facts.original.canonical_turn_started_at = Some(original_turn_started_at);
     facts.original.total_prompt = 11;
     facts.original.total_completion = 13;
     facts.original.total_cache_read = 101;
@@ -30141,10 +29924,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(
         state.root_user_query_event_id.as_deref(),
         Some("original-query")
-    );
-    assert_eq!(
-        state.canonical_turn_started_at.get(),
-        Some(&original_turn_started_at)
     );
     assert_eq!(
         (
@@ -35811,207 +35590,6 @@ async fn submit_run_user_intent_rejects_reused_identity_with_different_facts() {
 }
 
 #[tokio::test]
-async fn settlement_fence_serializes_before_new_intents_and_keeps_retries_idempotent() {
-    let svc = test_service();
-    svc.run_engine
-        .start_run("run-settlement-fence", "user-1", "session-1")
-        .await
-        .unwrap();
-    install_live_run_state(
-        &svc,
-        "user-1",
-        "run-settlement-fence",
-        "session-1",
-        RunStatus::Running,
-        None,
-    )
-    .await;
-    let first_input = RunUserIntentData {
-        intent_id: "intent-before-fence".into(),
-        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-        input: json!({"content": "apply before settlement"}),
-    };
-    ok(svc
-        .submit_run_user_intent(
-            "run-settlement-fence".into(),
-            "user-1".into(),
-            first_input.clone(),
-        )
-        .await);
-
-    svc.run_engine
-        .fence_user_intent_submissions(
-            "user-1",
-            "session-1",
-            "run-settlement-fence",
-            crate::turn::run_control::UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-        )
-        .await
-        .unwrap();
-
-    let rejected = svc
-        .submit_run_user_intent(
-            "run-settlement-fence".into(),
-            "user-1".into(),
-            RunUserIntentData {
-                intent_id: "intent-after-fence".into(),
-                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                input: json!({"content": "must become a next turn"}),
-            },
-        )
-        .await
-        .expect_err("new intent cannot cross the durable settlement fence");
-    assert_eq!(
-        rejected.1.0.error_code.as_deref(),
-        Some("run_intent_settlement_fenced")
-    );
-
-    let duplicate = ok(svc
-        .submit_run_user_intent("run-settlement-fence".into(), "user-1".into(), first_input)
-        .await);
-    assert!(
-        duplicate.duplicate,
-        "pre-fence retry keeps its stable identity"
-    );
-
-    svc.run_engine
-        .reopen_user_intent_submissions(
-            "user-1",
-            "session-1",
-            "run-settlement-fence",
-            crate::turn::run_control::UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-        )
-        .await
-        .unwrap();
-    let after_reopen = ok(svc
-        .submit_run_user_intent(
-            "run-settlement-fence".into(),
-            "user-1".into(),
-            RunUserIntentData {
-                intent_id: "intent-after-reopen".into(),
-                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                input: json!({"content": "second steering boundary"}),
-            },
-        )
-        .await);
-    assert!(!after_reopen.duplicate);
-
-    svc.run_engine
-        .fence_user_intent_submissions(
-            "user-1",
-            "session-1",
-            "run-settlement-fence",
-            crate::turn::run_control::UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-        )
-        .await
-        .unwrap();
-    let second_rejection = svc
-        .submit_run_user_intent(
-            "run-settlement-fence".into(),
-            "user-1".into(),
-            RunUserIntentData {
-                intent_id: "intent-after-second-fence".into(),
-                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                input: json!({"content": "must wait for next turn"}),
-            },
-        )
-        .await
-        .expect_err("a later model settlement must close admission again");
-    assert_eq!(
-        second_rejection.1.0.error_code.as_deref(),
-        Some("run_intent_settlement_fenced")
-    );
-}
-
-#[tokio::test]
-async fn concurrent_settlement_fence_and_intent_have_one_durable_order() {
-    let svc = Arc::new(test_service());
-    svc.run_engine
-        .start_run("run-settlement-race", "user-1", "session-1")
-        .await
-        .unwrap();
-    install_live_run_state(
-        &svc,
-        "user-1",
-        "run-settlement-race",
-        "session-1",
-        RunStatus::Running,
-        None,
-    )
-    .await;
-
-    let fence_svc = svc.clone();
-    let submit_svc = svc.clone();
-    let (fence, submit) = tokio::join!(
-        async move {
-            fence_svc
-                .run_engine
-                .fence_user_intent_submissions(
-                    "user-1",
-                    "session-1",
-                    "run-settlement-race",
-                    crate::turn::run_control::UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        0,
-                    ),
-                )
-                .await
-        },
-        async move {
-            submit_svc
-                .submit_run_user_intent(
-                    "run-settlement-race".into(),
-                    "user-1".into(),
-                    RunUserIntentData {
-                        intent_id: "intent-racing-fence".into(),
-                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                        input: json!({"content": "race with settlement"}),
-                    },
-                )
-                .await
-        }
-    );
-    fence.unwrap();
-
-    let durable = svc
-        .run_engine
-        .load_run("user-1", "run-settlement-race")
-        .await
-        .unwrap()
-        .unwrap();
-    let fence_index = durable
-        .events
-        .iter()
-        .position(|event| {
-            event.get("event_type").and_then(Value::as_str) == Some("user_intent_settlement_fenced")
-        })
-        .expect("settlement fence must be durable");
-    let intent_index = durable.events.iter().position(|event| {
-        event
-            .get("data")
-            .and_then(|data| data.get("intent_id"))
-            .and_then(Value::as_str)
-            == Some("intent-racing-fence")
-    });
-
-    match submit {
-        Ok(record) => {
-            assert!(!record.duplicate);
-            assert!(
-                intent_index.is_some_and(|index| index < fence_index),
-                "an accepted intent must serialize before the settlement fence"
-            );
-        }
-        Err(error) => {
-            assert_eq!(
-                error.1.0.error_code.as_deref(),
-                Some("run_intent_settlement_fenced")
-            );
-            assert!(intent_index.is_none());
-        }
-    }
-}
-
-#[tokio::test]
 async fn concurrent_submit_run_user_intent_commits_one_durable_event() {
     let svc = Arc::new(test_service());
     svc.run_engine
@@ -38266,13 +37844,44 @@ async fn server_root_mailbox_survives_profile_change_between_turns() {
         Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
     ));
     let mut first = crate::turn::agentic_loop::host::make_test_loop_state();
-    install_server_root_mailbox(&mut first, &router, "session", "turn-plan", "planner").await;
+    first.messaging.configure_root_mailbox(
+        Arc::clone(&router),
+        astra_messaging::AgentAddress::new("session", "root-agent"),
+        "turn-plan".into(),
+        "planner".into(),
+    );
+    first
+        .messaging
+        .ensure_mailbox_for_tools(&[json!({"function":{"name":"agent"}})])
+        .await
+        .unwrap();
     let stable = first.messaging.mailbox.as_ref().unwrap().address.clone();
     assert_eq!(stable.agent_id, "root-agent");
     park_server_root_mailbox(&mut first).await;
+    let late_message = astra_messaging::AgentMessage::new(
+        astra_messaging::AgentAddress::new("child-run", "worker"),
+        astra_messaging::MessageTarget::Direct {
+            address: stable.clone(),
+        },
+        astra_messaging::MessagePayload::Text {
+            content: "late child result".into(),
+            summary: None,
+        },
+    );
+    router.send(late_message.clone()).await.unwrap();
 
     let mut second = crate::turn::agentic_loop::host::make_test_loop_state();
-    install_server_root_mailbox(&mut second, &router, "session", "turn-review", "reviewer").await;
+    second.messaging.configure_root_mailbox(
+        Arc::clone(&router),
+        astra_messaging::AgentAddress::new("session", "root-agent"),
+        "turn-review".into(),
+        "reviewer".into(),
+    );
+    second
+        .messaging
+        .ensure_mailbox_for_tools(&[json!({"function":{"name":"agent"}})])
+        .await
+        .unwrap();
     assert_eq!(second.messaging.mailbox.as_ref().unwrap().address, stable);
     assert_eq!(
         router.sender_address("turn-plan", "planner").await,
@@ -38282,7 +37891,46 @@ async fn server_root_mailbox_survives_profile_change_between_turns() {
         router.sender_address("turn-review", "reviewer").await,
         Some(stable)
     );
+    let mailbox = second.messaging.mailbox.as_mut().unwrap();
+    let delivered = mailbox
+        .try_recv()
+        .expect("deferred activation must retain the late result");
+    assert_eq!(delivered.id, late_message.id);
+    mailbox.acknowledge_received(&[delivered]).await.unwrap();
     park_server_root_mailbox(&mut second).await;
+}
+
+#[tokio::test]
+async fn ordinary_root_reads_do_not_register_a_mailbox() {
+    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+        Arc::new(astra_messaging::InProcessTransport::new()),
+        Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+    ));
+    let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+    state.messaging.configure_root_mailbox(
+        Arc::clone(&router),
+        astra_messaging::AgentAddress::new("quiet-session", "root-agent"),
+        "quiet-run".into(),
+        "root".into(),
+    );
+    state
+        .messaging
+        .ensure_mailbox_for_tools(&[
+            json!({"function":{"name":"read_file"}}),
+            json!({"function":{"name":"web_fetch"}}),
+        ])
+        .await
+        .unwrap();
+    assert!(state.messaging.mailbox.is_none());
+    assert!(router.registered_address("quiet-session").await.is_none());
+    state
+        .messaging
+        .ensure_mailbox_for_tools(&[json!({"function":{"name":"agent_fanout"}})])
+        .await
+        .unwrap();
+    assert!(state.messaging.mailbox.is_some());
+    assert!(router.sender_address("quiet-run", "root").await.is_some());
+    park_server_root_mailbox(&mut state).await;
 }
 
 /// Admission with timeout: `acquire_owned` + `timeout` rejects after

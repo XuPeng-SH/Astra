@@ -3550,38 +3550,6 @@ async fn run_agentic_loop_with_host_panic_safe<H: AgenticLoopHost>(
     }
 }
 
-/// Bind a turn-scoped Server root run to one session-stable mailbox. Child
-/// runs can report checkpoints and terminal results while the parent is
-/// active, or queue them for the next turn after it settles.
-async fn install_server_root_mailbox(
-    state: &mut AgenticLoopState,
-    router: &Arc<astra_messaging::router::AgentMailboxRouter>,
-    session_id: &str,
-    run_id: &str,
-    agent_id: &str,
-) {
-    if state.messaging.mailbox.is_some() {
-        return;
-    }
-    let address = astra_messaging::AgentAddress::new(session_id, "root-agent");
-    match router.register(address.clone(), None).await {
-        Ok(mailbox) => {
-            router
-                .record_parent_delivery_alias(run_id, &address, agent_id)
-                .await;
-            state.messaging.mailbox = Some(mailbox);
-        }
-        Err(error) => tracing::warn!(
-            target: "astra_runtime::messaging",
-            session_id,
-            run_id,
-            agent_id,
-            error = %error,
-            "server root mailbox registration failed; child delivery will remain observable only through lifecycle events"
-        ),
-    }
-}
-
 /// End the root turn without acknowledging messages that arrived after its
 /// final model boundary. The transport or existing volatile parent backlog
 /// retains their original identities for the next registration.
@@ -4621,7 +4589,6 @@ impl LoopExecutionFacts {
                 session_turn: 0,
                 canonical_turn_chain_id,
                 root_user_query_event_id: None,
-                canonical_turn_started_at: None,
                 total_prompt: 0,
                 total_completion: 0,
                 total_cache_read: 0,
@@ -4927,7 +4894,6 @@ struct OwnedBackgroundExecution {
     run_id: String,
     explain: bool,
     agent_id: Option<String>,
-    model_name: Option<String>,
     user_message: String,
     #[cfg(feature = "e2e-hooks")]
     test_post_loop_settlement_delay_ms: u64,
@@ -5428,6 +5394,7 @@ fn descendant_cancellation_scheduler() -> &'static Arc<DescendantCancellationSch
 }
 
 struct ActiveRunControlWatcher {
+    alive: tokio::sync::watch::Receiver<()>,
     stop_tx: Option<oneshot::Sender<()>>,
     join: tokio::task::JoinHandle<()>,
 }
@@ -5455,7 +5422,9 @@ fn start_active_run_control_watcher(
 ) -> Option<ActiveRunControlWatcher> {
     let run_control = run_control?;
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let (watcher_lifetime, alive) = tokio::sync::watch::channel(());
     let join = tokio::spawn(async move {
+        let _watcher_lifetime = watcher_lifetime;
         let mut poll = tokio::time::interval_at(
             tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
             ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
@@ -5518,6 +5487,7 @@ fn start_active_run_control_watcher(
         }
     });
     Some(ActiveRunControlWatcher {
+        alive,
         stop_tx: Some(stop_tx),
         join,
     })
@@ -5616,7 +5586,6 @@ struct RootTurnStartParticipant<'a> {
     session_id: &'a str,
     run_id: &'a str,
     request: &'a ChatRequestData,
-    started_at: chrono::DateTime<chrono::Utc>,
     admission: Option<CanonicalTurnAdmission>,
     prepared: Option<PreparedRootContextAdmission>,
     rejection: Option<(StatusCode, Json<ErrorResponse>)>,
@@ -5671,22 +5640,10 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
         };
         let turn = admission.reservation.reserved_turn;
         let trace = server_trace_context(self.user_id, self.session_id, self.run_id, turn);
-        let audit = persistence::server_loop_user_query_event(
-            self.user_id,
-            self.session_id,
-            self.run_id,
-            None,
-            None,
-            self.request.agent_id.as_deref(),
-            None,
-            &trace,
-            &self.request.message,
-            self.started_at,
-        );
         // Retain lease custody even on error. The caller drops it only after
         // the Run transaction has rolled back (release must not race its lock).
         self.admission = Some(admission);
-        if !persistence::persist_root_turn_input_admitted(
+        persistence::persist_root_turn_input_admitted(
             tx,
             self.user_id,
             self.session_id,
@@ -5697,12 +5654,8 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
                 payload: None,
                 source_event_id: trace.root_event_id,
             },
-            audit,
         )
-        .await?
-        {
-            return Err("root input event identity collided; run was not admitted".into());
-        }
+        .await?;
         Ok(())
     }
 }
@@ -13517,10 +13470,6 @@ impl AgenticRunLifecycleService {
             session_turn: facts.original.session_turn,
             canonical_turn_chain_id: facts.original.canonical_turn_chain_id,
             root_user_query_event_id: facts.original.root_user_query_event_id,
-            canonical_turn_started_at: facts
-                .original
-                .canonical_turn_started_at
-                .map_or_else(Default::default, std::sync::OnceLock::from),
             harness,
             ..AgenticLoopState::fresh(
                 facts.step_recorder,
@@ -15079,7 +15028,6 @@ impl AgenticRunLifecycleService {
             run_id,
             explain,
             agent_id,
-            model_name,
             user_message,
             #[cfg(feature = "e2e-hooks")]
             test_post_loop_settlement_delay_ms,
@@ -15157,7 +15105,7 @@ impl AgenticRunLifecycleService {
         let bg_test_post_loop_settlement_delay_ms = test_post_loop_settlement_delay_ms;
         let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
         let bg_root_mailbox_agent_id = agent_id.clone().unwrap_or_else(|| "root-agent".to_string());
-        let mut persist_ctx = PostLoopPersistContext {
+        let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
             user_id: user_id.clone(),
@@ -15168,8 +15116,6 @@ impl AgenticRunLifecycleService {
             terminal_authority: owner_lease_heartbeat
                 .as_ref()
                 .map(|heartbeat| heartbeat.terminal_authority()),
-            agent_id,
-            model_name,
             user_message,
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
@@ -15417,14 +15363,12 @@ impl AgenticRunLifecycleService {
                         return;
                     }
                 }
-                install_server_root_mailbox(
-                    &mut state,
-                    &bg_root_mailbox_router,
-                    &bg_session_id,
-                    &bg_run_id,
-                    &bg_root_mailbox_agent_id,
-                )
-                .await;
+                state.messaging.configure_root_mailbox(
+                    Arc::clone(&bg_root_mailbox_router),
+                    astra_messaging::AgentAddress::new(&bg_session_id, "root-agent"),
+                    bg_run_id.clone(),
+                    bg_root_mailbox_agent_id.clone(),
+                );
                 let input_wake = runs
                     .read()
                     .await
@@ -15432,6 +15376,9 @@ impl AgenticRunLifecycleService {
                     .map(|run| run.input_wake.clone())
                     .unwrap_or_else(|| tokio::sync::watch::channel(-1).0);
                 state.user_intents.bind_wake(Some(input_wake.subscribe()));
+                state
+                    .permission_mode_observation
+                    .bind_wake(input_wake.subscribe());
                 let _control_watcher = start_active_run_control_watcher(
                     state.run_control.clone(),
                     bg_user_id.clone(),
@@ -15444,13 +15391,13 @@ impl AgenticRunLifecycleService {
                     bg_execution_lease_lost.clone(),
                     input_wake,
                 );
+                state.durable_control_watcher = _control_watcher
+                    .as_ref()
+                    .map(|watcher| watcher.alive.clone());
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 let settlement_timing_started = Instant::now();
                 host.release_execution_capacity_for_wait();
-                if let Some(model) = state.current_model_identity() {
-                    persist_ctx.model_name = Some(model.to_owned());
-                }
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                     run.settlement_in_progress = true;
                 }
@@ -15631,7 +15578,7 @@ impl AgenticRunLifecycleService {
                     data.insert("turn_evaluation".into(), json!(&turn_evaluation));
                 }
 
-                let mut core_trace_result = Err(
+                let mut canonical_result = Err(
                     "canonical terminal settlement did not acquire durable authority".to_string(),
                 );
                 let mut terminal_assistant_source_event_id = None;
@@ -16006,7 +15953,7 @@ impl AgenticRunLifecycleService {
                             }
                             terminal_assistant_source_event_id =
                                 commit.terminal_assistant_source_event_id;
-                            core_trace_result = Ok(());
+                            canonical_result = Ok(());
                             durable_status_committed = true;
                             owner_terminal_committed = true;
                             atomic_terminal_committed = true;
@@ -16032,13 +15979,16 @@ impl AgenticRunLifecycleService {
                         }
                         Ok(None) => {
                             let persistence = persist_ctx
-                                .persist_core_and_trace_in_transaction(&state)
+                                .persist_canonical_transcript_in_transaction(
+                                    &state,
+                                    !persisted_status.is_resumable(),
+                                )
                                 .await;
                             if let Ok(source_event_id) = &persistence {
                                 terminal_assistant_source_event_id = source_event_id.clone();
                             }
-                            core_trace_result = persistence.map(|_| ());
-                            if core_trace_result.is_ok() {
+                            canonical_result = persistence.map(|_| ());
+                            if canonical_result.is_ok() {
                                 match run_engine
                                     .commit_terminal_status_with_events_if_current_owner(
                                         &bg_user_id,
@@ -16137,7 +16087,7 @@ impl AgenticRunLifecycleService {
                             } else {
                                 persist_streaming_events = false;
                                 publish_stream_terminal = false;
-                                terminal_persistence_failure = core_trace_result.clone().err();
+                                terminal_persistence_failure = canonical_result.clone().err();
                             }
                         }
                         Err(error) => {
@@ -16172,7 +16122,7 @@ impl AgenticRunLifecycleService {
                                 "atomic streaming settlement lost to an exact-generation control terminal; repairing trace and accounting"
                             );
                         } else {
-                            core_trace_result = Err(error.clone());
+                            canonical_result = Err(error.clone());
                             if let Some(control) = fanout_control_tx.as_ref() {
                                 let (ack, received) = oneshot::channel();
                                 if control
@@ -16239,27 +16189,15 @@ impl AgenticRunLifecycleService {
                     );
                 }
 
-                if let Some(status) = preexisting_terminal_status {
+                if preexisting_terminal_status.is_some() {
                     terminal_assistant_source_event_id = None;
-                    core_trace_result = persist_ctx
-                        .persist_trace_after_authoritative_terminal(&state, status.as_str())
-                        .await;
-                    if let Err(error) = core_trace_result.as_ref() {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id = %bg_run_id,
-                            status = status.as_str(),
-                            error = %error,
-                            "failed to retain streaming observations after an independently committed terminal"
-                        );
-                    }
                 }
 
                 if bg_explain
                     && owner_terminal_committed
                     && explain_artifact_publishable_status(persisted_status)
                 {
-                    let events = if core_trace_result.is_ok() {
+                    let events = if canonical_result.is_ok() {
                         explain_events_for_artifact.as_deref().unwrap_or_default()
                     } else {
                         &[]
@@ -16282,7 +16220,7 @@ impl AgenticRunLifecycleService {
                 }
 
                 if owner_terminal_committed
-                    && core_trace_result.is_ok()
+                    && canonical_result.is_ok()
                     && !atomic_terminal_committed
                 {
                     match Self::commit_canonical_turn(
@@ -16577,7 +16515,7 @@ impl AgenticRunLifecycleService {
                         .run_after_core(
                             &state,
                             loop_success,
-                            core_trace_result,
+                            canonical_result,
                             canonical_context_cursor.is_some(),
                         )
                         .await
@@ -16797,7 +16735,6 @@ impl AgenticRunLifecycleService {
             session_id: &session_id,
             run_id: &run_id,
             request: &request,
-            started_at: chrono::Utc::now(),
             admission: None,
             prepared: None,
             rejection: None,
@@ -16836,7 +16773,6 @@ impl AgenticRunLifecycleService {
             }
         };
         let mut canonical_turn = root_start.as_mut().and_then(|p| p.admission.take());
-        let admitted_started_at = root_start.as_ref().map(|p| p.started_at);
         drop(root_start);
         let execution_start_authority = match start_claim {
             DurableRunStartClaim::Started { authority } => authority,
@@ -17372,9 +17308,6 @@ impl AgenticRunLifecycleService {
                     }
                 }
             }
-            if let Some(started_at) = admitted_started_at {
-                state.canonical_turn_started_at = OnceLock::from(started_at);
-            }
 
             self.configure_loop_state_runtime_controls(
                 &mut state,
@@ -17613,7 +17546,6 @@ impl AgenticRunLifecycleService {
                 run_id: run_id.clone(),
                 explain: request.explain,
                 agent_id: request.agent_id,
-                model_name: request.model,
                 user_message: request.message,
                 #[cfg(feature = "e2e-hooks")]
                 test_post_loop_settlement_delay_ms: request
@@ -18563,7 +18495,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         request: astra_services::runs::RunPermissionModeRequest,
     ) -> Result<astra_services::runs::RunPermissionModeSelection, (StatusCode, Json<ErrorResponse>)>
     {
-        self.run_engine
+        let selection = self
+            .run_engine
             .request_permission_mode(&user_id, &run_id, &request)
             .await
             .map_err(|e| {
@@ -18578,7 +18511,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     _ => StatusCode::SERVICE_UNAVAILABLE,
                 };
                 error_response(status, &e)
-            })
+            })?;
+        if let Some(run) = self.runs.read().await.get(&run_id) {
+            run.input_wake.send_if_modified(|current| {
+                let changed = selection.revision > *current;
+                *current = (*current).max(selection.revision);
+                changed
+            });
+        }
+        Ok(selection)
     }
     async fn permission_mode_snapshot(
         &self,
@@ -18713,13 +18654,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 return Err(Self::run_state_conflict("submit input to", &status));
             }
-            AtomicRunGuidanceAdmission::SettlementFenced => {
-                return Err(error_response_coded(
-                    StatusCode::CONFLICT,
-                    "This run is settling and no longer accepts current-run guidance. Submit it as the next session turn instead.",
-                    "run_intent_settlement_fenced",
-                ));
-            }
+
             AtomicRunGuidanceAdmission::ConsumerNotLive {
                 run,
                 process_local_recovery_safe,
@@ -23570,6 +23505,7 @@ impl ServerSubRunExecutor {
         let can_pump_provider = self.edge_connection_pool.is_some();
         let mut guidance_disposition_unconfirmed = false;
         let deferred = if can_pump_provider {
+            state.messaging.ensure_mailbox().await.map_err(invalid)?;
             let mut mailbox = state.messaging.mailbox.take();
             let pool = self
                 .edge_connection_pool
@@ -24748,54 +24684,6 @@ impl ServerSubRunExecutor {
             "failed to persist generation-fenced durable sub-run tool terminals: {}",
             last_error.unwrap_or_else(|| "unknown append failure".to_string())
         ))
-    }
-
-    async fn persist_subrun_trace_after_control_authority(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        agent_id: &str,
-        task: &str,
-        child_model_name: Option<&str>,
-        execution_owner_generation: u64,
-        loop_state: &AgenticLoopState,
-        authority: DurableSubrunControlAuthority,
-    ) {
-        let context = PostLoopPersistContext {
-            matrixone: self.matrixone.clone(),
-            shared_pool: self.shared_pool.clone(),
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            expected_owner_generation: Some(execution_owner_generation),
-            owner_lease_duration: self
-                .durable_run_engine()
-                .and_then(|engine| engine.owner_lease_duration()),
-            terminal_authority: None,
-            agent_id: Some(agent_id.to_string()),
-            model_name: child_model_name.map(ToString::to_string),
-            user_message: task.to_string(),
-            hook_db_writer: None,
-            observer_worker: None,
-            metrics_registry: None,
-            csl_manager: None,
-        };
-        if let Err(error) = context
-            .persist_trace_after_authoritative_terminal(loop_state, authority.status())
-            .await
-        {
-            tracing::warn!(
-                target: "astra_runtime::subrun",
-                user_id,
-                session_id,
-                run_id,
-                status = authority.status(),
-                execution_owner_generation,
-                error = %error,
-                "failed to retain sub-run trace after control authority won settlement"
-            );
-        }
     }
 
     async fn persist_durable_subrun_status(
@@ -26281,16 +26169,17 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         configure_runtime_controllers(
             &self.matrixone,
-            self.shared_pool.as_ref(),
+            None,
             &mut loop_state,
             &config.user_id,
             &config.session_id,
-            self.trace_ingestion.clone(),
+            None,
         )
         .await;
 
         let (input_wake, input_ready) = tokio::sync::watch::channel(-1);
         loop_state.user_intents.bind_wake(Some(input_ready));
+        loop_state.permission_mode_observation.bind_wake(input_wake.subscribe());
         let durable_control_watcher = start_active_run_control_watcher(
             durable_run_control,
             config.user_id.clone(),
@@ -26303,6 +26192,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             local_execution_lease_lost.clone(),
             input_wake,
         );
+
+        loop_state.durable_control_watcher = durable_control_watcher.as_ref().map(|watcher| watcher.alive.clone());
 
         if self.native_execution.is_some()
             && let Some(executor) = loop_state.runtime_tool_executor.as_deref()
@@ -26482,21 +26373,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         };
         atomic_terminal_attempted = terminal_settlement.is_some();
         let committed_assistant = if let Some(canonical_pool) = self.shared_pool.as_ref() {
-            if let (Some(authority), Some(generation)) =
-                (control_authority, execution_owner_generation)
-            {
-                self.persist_subrun_trace_after_control_authority(
-                    &config.user_id,
-                    &config.session_id,
-                    &config.run_id,
-                    &config.agent_profile.agent_id,
-                    &config.task,
-                    child_model_name.as_deref(),
-                    generation,
-                    &loop_state,
-                    authority,
-                )
-                .await;
+            if control_authority.is_some() {
                 None
             } else {
             let trace_context = trace_context_from_subrun_context(&config.context, &config.run_id);
@@ -26509,20 +26386,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 owner_lease_duration: durable_run_engine
                     .as_ref()
                     .and_then(|engine| engine.owner_lease_duration()),
-                parent_run_id: Some(config.parent_run_id.as_str()),
-                parent_event_id: config
-                    .context
-                    .get("trace_parent_event_id")
-                    .and_then(Value::as_str),
-                agent_id: Some(config.agent_profile.agent_id.as_str()),
-                parent_agent_id: config
-                    .context
-                    .get("parent_agent_id")
-                    .and_then(Value::as_str),
                 trace_context,
                 user_message: &config.task,
-                model_name: child_model_name.as_deref(),
-                include_terminal_assistant: true,
+                include_terminal_assistant: durable_run_status_is_terminal(durable_status),
             };
             let terminal_authority = owner_lease_heartbeat
                 .as_ref()
@@ -26572,20 +26438,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     if let Some((authority, frontier)) = reconciled_control {
                         control_authority = Some(authority);
                         committed_frontier = Some(frontier);
-                        if let Some(generation) = execution_owner_generation {
-                            self.persist_subrun_trace_after_control_authority(
-                                &config.user_id,
-                                &config.session_id,
-                                &config.run_id,
-                                &config.agent_profile.agent_id,
-                                &config.task,
-                                child_model_name.as_deref(),
-                                generation,
-                                &loop_state,
-                                authority,
-                            )
-                            .await;
-                        }
                         tracing::info!(
                             target: "astra_runtime::subrun",
                             run_id = %durable_run_id,
@@ -26803,7 +26655,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         }
         flush_turn_observability(&mut loop_state, &config.user_id, &config.session_id,
             control_authority == Some(DurableSubrunControlAuthority::Cancelled),
-            self.trace_ingestion.as_ref(), execution_owner_generation);
+            None, execution_owner_generation);
 
         if let Some(pool) = self.shared_pool.as_ref()
             && let Err(error) = materialize_server_run_transcript_evidence(

@@ -678,12 +678,109 @@ pub struct DatabaseSessionContextCoordinator {
     pool: SharedPool,
 }
 
+/// Frozen opening facts, not an execution grant. Context mutation additionally
+/// requires the store's exact Run/generation terminal admission in the same Tx.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunContextAuthority {
+    pub key: SessionKeyV1,
+    pub run_id: String,
+    pub generation: u64,
+    pub row_exists: bool,
+    pub base_head: Option<SessionContextHeadV1>,
+    pub turn: u32,
+    pub writer_epoch: u64,
+    pub authority_epochs: AuthorityEpochsV1,
+    pub binding: RunContextBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunContextBinding {
+    Absent,
+    Present { generation: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "owner", content = "facts", rename_all = "snake_case")]
+pub enum ContextCommitAuthority {
+    Run(Box<RunContextAuthority>),
+    Controller(Box<TurnReservationV1>),
+}
+
+impl RunContextAuthority {
+    fn validate(&self) -> Result<(), SessionContextCoordinatorError> {
+        let invalid = |detail: &str| SessionContextCoordinatorError::Invalid(detail.into());
+        self.key
+            .validate()
+            .map_err(|error| invalid(&error.to_string()))?;
+        if self.key.isolation_domain != "server"
+            || self.key.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
+            || self.run_id.is_empty()
+            || self.generation == 0
+            || self.generation > i64::MAX as u64
+            || self.base_head.is_some() && !self.row_exists
+        {
+            return Err(invalid("invalid Server Run context identity"));
+        }
+        if let Some(head) = &self.base_head {
+            validate_head(head)?;
+            if head.key != self.key || head.writer_epoch > self.writer_epoch {
+                return Err(invalid("Run context base belongs to another authority"));
+            }
+        } else if !self.row_exists
+            && (self.writer_epoch != 0 || self.authority_epochs != AuthorityEpochsV1::default())
+        {
+            return Err(invalid("absent context row cannot carry authority epochs"));
+        }
+        let expected = self
+            .base_head
+            .as_ref()
+            .map_or(Some(1), |head| head.cursor.completed_turn.checked_add(1));
+        if expected != Some(self.turn) {
+            return Err(invalid(
+                "Run context turn does not advance its admitted base",
+            ));
+        }
+        for epoch in [
+            self.writer_epoch,
+            self.authority_epochs.authorization_epoch,
+            self.authority_epochs.device_trust_epoch,
+            self.authority_epochs.permission_epoch,
+        ] {
+            i64_from_u64("Run context epoch", epoch)?;
+        }
+        if let RunContextBinding::Present { generation } = self.binding {
+            if generation == 0 {
+                return Err(invalid("binding generation must be positive"));
+            }
+            i64_from_u64("Run context binding generation", generation)?;
+        }
+        Ok(())
+    }
+}
+
+impl ContextCommitAuthority {
+    fn key(&self) -> &SessionKeyV1 {
+        match self {
+            Self::Run(authority) => &authority.key,
+            Self::Controller(reservation) => &reservation.key,
+        }
+    }
+    fn base_cursor(&self) -> Option<&SessionCursorV1> {
+        match self {
+            Self::Run(authority) => authority.base_head.as_ref().map(|head| &head.cursor),
+            Self::Controller(reservation) => reservation.expected_cursor.as_ref(),
+        }
+    }
+}
+
 /// Immutable, validated input to one canonical Context commit. Preparing it
 /// performs no I/O and grants no authority. Its cursor and request identity can
 /// be bound to the Run terminal receipt before either is written.
 #[derive(Debug)]
 pub struct PreparedSessionContextCommit {
-    reservation: TurnReservationV1,
+    authority: ContextCommitAuthority,
     delta: CanonicalTurnDeltaV1,
     idempotency_key: String,
     release_writer: bool,
@@ -699,33 +796,75 @@ impl PreparedSessionContextCommit {
         idempotency_key: &str,
         release_writer: bool,
     ) -> Result<Self, SessionContextCoordinatorError> {
+        Self::prepare(
+            ContextCommitAuthority::Controller(Box::new(reservation.clone())),
+            delta,
+            idempotency_key,
+            release_writer,
+        )
+    }
+
+    pub fn for_run(
+        authority: &RunContextAuthority,
+        delta: CanonicalTurnDeltaV1,
+    ) -> Result<Self, SessionContextCoordinatorError> {
+        authority.validate()?;
+        validate_delta_advance(authority.base_head.as_ref(), authority.turn, &delta)?;
+        let key = format!("run:{}:{}:terminal", authority.run_id, authority.generation);
+        Self::prepare(
+            ContextCommitAuthority::Run(Box::new(authority.clone())),
+            delta,
+            &key,
+            false,
+        )
+    }
+
+    fn prepare(
+        authority: ContextCommitAuthority,
+        delta: CanonicalTurnDeltaV1,
+        idempotency_key: &str,
+        release_writer: bool,
+    ) -> Result<Self, SessionContextCoordinatorError> {
         delta
             .validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         validate_idempotency_key(idempotency_key)?;
+        let key = authority.key();
         let segments = delta
             .logical_segments
             .iter()
             .cloned()
-            .map(|messages| ConversationSegmentV1::new(&reservation.key, messages))
+            .map(|messages| ConversationSegmentV1::new(key, messages))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         let node = manifest_node_for_delta(
-            &reservation.key,
-            reservation
-                .expected_cursor
-                .as_ref()
+            key,
+            authority
+                .base_cursor()
                 .map(|cursor| cursor.canonical_root_hash.clone()),
             &delta,
             &segments,
         )
         .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let request_hash = match &authority {
+            ContextCommitAuthority::Controller(reservation) => {
+                commit_request_hash(reservation, &delta)
+            }
+            ContextCommitAuthority::Run(_) => {
+                let value = serde_json::to_value((&authority, &delta))
+                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+                format!(
+                    "{:x}",
+                    Sha256::digest(astra_core::canonical_json_string(&value).as_bytes())
+                )
+            }
+        };
         Ok(Self {
-            request_hash: commit_request_hash(reservation, &delta),
-            reservation: reservation.clone(),
+            authority,
             delta,
             idempotency_key: idempotency_key.to_owned(),
             release_writer,
+            request_hash,
             segments,
             node,
         })
@@ -803,7 +942,12 @@ impl DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_commit_turn", source))?;
-        admit_session_lifecycle_write(&mut tx, &prepared.reservation.key).await?;
+        if matches!(&prepared.authority, ContextCommitAuthority::Run(_)) {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Run Context commit requires its terminal transaction proof".into(),
+            ));
+        }
+        admit_session_lifecycle_write(&mut tx, prepared.authority.key()).await?;
         let outcome = self.stage_turn_commit(&mut tx, prepared).await?;
         tx.commit()
             .await
@@ -821,12 +965,17 @@ impl DatabaseSessionContextCoordinator {
         admission: &crate::runs::RunMutationAdmission,
     ) -> Result<SessionCursorV1, SessionContextCoordinatorError> {
         if !admission.owns_session(
-            &prepared.reservation.key.owner_user_id,
-            &prepared.reservation.key.session_id,
+            &prepared.authority.key().owner_user_id,
+            &prepared.authority.key().session_id,
         ) {
             return Err(SessionContextCoordinatorError::Invalid(
                 "terminal admission does not own the canonical context".into(),
             ));
+        }
+        if let ContextCommitAuthority::Run(authority) = &prepared.authority {
+            return self
+                .stage_run_context_commit(tx, prepared, authority, admission)
+                .await;
         }
         match self.stage_turn_commit(tx, prepared).await?.into_result()? {
             CoordinatorMutationV1::Applied { cursor }
@@ -840,13 +989,233 @@ impl DatabaseSessionContextCoordinator {
         }
     }
 
+    async fn stage_run_context_commit(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        prepared: &PreparedSessionContextCommit,
+        authority: &RunContextAuthority,
+        admission: &crate::runs::RunMutationAdmission,
+    ) -> Result<SessionCursorV1, SessionContextCoordinatorError> {
+        authority.validate()?;
+        let key = &authority.key;
+        if !admission.authorizes_context_terminal(
+            &key.owner_user_id,
+            &key.session_id,
+            &authority.run_id,
+            authority.generation,
+        ) {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Context requires the exact Run terminal claim".into(),
+            ));
+        }
+        validate_delta_advance(
+            authority.base_head.as_ref(),
+            authority.turn,
+            &prepared.delta,
+        )?;
+        let (bytes, messages) = next_head_totals(
+            authority.base_head.as_ref(),
+            &prepared.segments,
+            prepared.delta.mode,
+        )?;
+        self.persist_database_immutables_in_tx(
+            tx,
+            key,
+            &prepared.segments,
+            &prepared.node,
+            bytes,
+            messages,
+        )
+        .await?;
+        let head = SessionContextHeadV1 {
+            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+            key: key.clone(),
+            cursor: prepared.node.cursor(),
+            latest_manifest_root: prepared.node.manifest_root.clone(),
+            total_canonical_bytes: bytes,
+            total_message_count: messages,
+            writer_epoch: authority.writer_epoch,
+        };
+        let head_json = database_to_json("Run context head", &head)?;
+        let mut write = if authority.row_exists {
+            let mut write =
+                QueryBuilder::<MySql>::new("UPDATE session_context_heads SET head_json = ");
+            write
+                .push_bind(&head_json)
+                .push(", canonical_root_hash = ")
+                .push_bind(&head.cursor.canonical_root_hash)
+                .push(", latest_manifest_root = ")
+                .push_bind(&head.latest_manifest_root)
+                .push(", total_canonical_bytes = ")
+                .push_bind(i64_from_u64("canonical bytes", bytes)?)
+                .push(", total_message_count = ")
+                .push_bind(i64_from_u64("message count", messages)?)
+                .push(", completed_turn = ")
+                .push_bind(i64::from(head.cursor.completed_turn))
+                .push(", journal_event_seq = ")
+                .push_bind(i64_from_u64(
+                    "journal sequence",
+                    head.cursor.journal_event_seq,
+                )?)
+                .push(", conversation_seq = ")
+                .push_bind(i64_from_u64(
+                    "conversation sequence",
+                    head.cursor.conversation_seq,
+                )?)
+                .push(", projection_schema = ")
+                .push_bind(i64::from(head.cursor.projection_schema))
+                .push(", compaction_generation = ")
+                .push_bind(i64_from_u64(
+                    "compaction generation",
+                    head.cursor.compaction_generation,
+                )?)
+                .push(", updated_at = NOW(6) WHERE isolation_domain = ")
+                .push_bind(&key.isolation_domain)
+                .push(" AND owner_user_id = ")
+                .push_bind(&key.owner_user_id)
+                .push(" AND session_id = ")
+                .push_bind(&key.session_id)
+                .push(" AND branch_id = ")
+                .push_bind(&key.branch_id)
+                .push(" AND writer_epoch = ")
+                .push_bind(i64_from_u64("writer epoch", authority.writer_epoch)?)
+                .push(" AND authorization_epoch = ")
+                .push_bind(i64_from_u64(
+                    "authorization epoch",
+                    authority.authority_epochs.authorization_epoch,
+                )?)
+                .push(" AND device_trust_epoch = ")
+                .push_bind(i64_from_u64(
+                    "device epoch",
+                    authority.authority_epochs.device_trust_epoch,
+                )?)
+                .push(" AND permission_epoch = ")
+                .push_bind(i64_from_u64(
+                    "permission epoch",
+                    authority.authority_epochs.permission_epoch,
+                )?)
+                .push(" AND active_writer_json IS NULL AND active_reservation_json IS NULL");
+            if let Some(base) = &authority.base_head {
+                write
+                    .push(" AND head_json IS NOT NULL AND canonical_root_hash = ")
+                    .push_bind(&base.cursor.canonical_root_hash)
+                    .push(" AND latest_manifest_root = ")
+                    .push_bind(&base.latest_manifest_root)
+                    .push(" AND completed_turn = ")
+                    .push_bind(i64::from(base.cursor.completed_turn))
+                    .push(" AND journal_event_seq = ")
+                    .push_bind(i64_from_u64(
+                        "base journal sequence",
+                        base.cursor.journal_event_seq,
+                    )?)
+                    .push(" AND conversation_seq = ")
+                    .push_bind(i64_from_u64(
+                        "base conversation sequence",
+                        base.cursor.conversation_seq,
+                    )?)
+                    .push(" AND compaction_generation = ")
+                    .push_bind(i64_from_u64(
+                        "base compaction generation",
+                        base.cursor.compaction_generation,
+                    )?)
+                    .push(" AND projection_schema = ")
+                    .push_bind(i64::from(base.cursor.projection_schema))
+                    .push(" AND total_canonical_bytes = ")
+                    .push_bind(i64_from_u64("base bytes", base.total_canonical_bytes)?)
+                    .push(" AND total_message_count = ")
+                    .push_bind(i64_from_u64("base messages", base.total_message_count)?);
+            } else {
+                write.push(
+                    " AND head_json IS NULL AND canonical_root_hash IS NULL
+                    AND completed_turn = 0 AND journal_event_seq = 0 AND conversation_seq = 0
+                    AND total_canonical_bytes = 0 AND total_message_count = 0",
+                );
+            }
+            write
+        } else {
+            let mut write = QueryBuilder::<MySql>::new("INSERT INTO session_context_heads
+                (isolation_domain,owner_user_id,session_id,branch_id,head_json,canonical_root_hash,latest_manifest_root,
+                 total_canonical_bytes,total_message_count,completed_turn,journal_event_seq,conversation_seq,
+                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch)
+                 SELECT ");
+            let mut fields = write.separated(", ");
+            fields
+                .push_bind(&key.isolation_domain)
+                .push_bind(&key.owner_user_id)
+                .push_bind(&key.session_id)
+                .push_bind(&key.branch_id)
+                .push_bind(&head_json)
+                .push_bind(&head.cursor.canonical_root_hash)
+                .push_bind(&head.latest_manifest_root)
+                .push_bind(i64_from_u64("canonical bytes", bytes)?)
+                .push_bind(i64_from_u64("message count", messages)?)
+                .push_bind(i64::from(head.cursor.completed_turn))
+                .push_bind(i64_from_u64(
+                    "journal sequence",
+                    head.cursor.journal_event_seq,
+                )?)
+                .push_bind(i64_from_u64(
+                    "conversation sequence",
+                    head.cursor.conversation_seq,
+                )?)
+                .push_bind(i64::from(head.cursor.projection_schema))
+                .push_bind(i64_from_u64(
+                    "compaction generation",
+                    head.cursor.compaction_generation,
+                )?)
+                .push_bind(i64_from_u64("writer epoch", authority.writer_epoch)?)
+                .push_bind(i64_from_u64(
+                    "authorization epoch",
+                    authority.authority_epochs.authorization_epoch,
+                )?)
+                .push_bind(i64_from_u64(
+                    "device epoch",
+                    authority.authority_epochs.device_trust_epoch,
+                )?)
+                .push_bind(i64_from_u64(
+                    "permission epoch",
+                    authority.authority_epochs.permission_epoch,
+                )?);
+            write.push(" WHERE NOT EXISTS (SELECT 1 FROM session_context_heads existing WHERE isolation_domain = ")
+                .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
+                .push(" AND session_id = ").push_bind(&key.session_id).push(" AND branch_id = ").push_bind(&key.branch_id).push(")");
+            write
+        };
+        let present = matches!(authority.binding, RunContextBinding::Present { .. });
+        write.push(if present {" AND EXISTS (SELECT 1 FROM session_execution_bindings binding WHERE isolation_domain = "}
+            else {" AND NOT EXISTS (SELECT 1 FROM session_execution_bindings binding WHERE isolation_domain = "})
+            .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
+            .push(" AND session_id = ").push_bind(&key.session_id).push(" AND branch_id = ").push_bind(&key.branch_id);
+        if let RunContextBinding::Present { generation } = authority.binding {
+            write
+                .push(" AND generation = ")
+                .push_bind(i64_from_u64("binding generation", generation)?)
+                .push(" AND JSON_UNQUOTE(JSON_EXTRACT(binding_json, '$.state')) = 'ready'");
+        }
+        write.push(")");
+        let affected = write
+            .build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| database_error("advance_Run_context_head", source))?
+            .rows_affected();
+        if affected != 1 {
+            return Err(SessionContextCoordinatorError::Fenced);
+        }
+        Ok(head.cursor)
+    }
+
     async fn stage_turn_commit(
         &self,
         tx: &mut Transaction<'_, MySql>,
         prepared: &PreparedSessionContextCommit,
     ) -> Result<StagedCoordinatorMutation<CoordinatorMutationV1>, SessionContextCoordinatorError>
     {
-        let reservation = &prepared.reservation;
+        let ContextCommitAuthority::Controller(reservation) = &prepared.authority else {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "controller commit requires its real reservation".into(),
+            ));
+        };
         let delta = &prepared.delta;
         let idempotency_key = prepared.idempotency_key.as_str();
         let request_hash = &prepared.request_hash;
@@ -958,7 +1327,7 @@ impl DatabaseSessionContextCoordinator {
                 },
             ));
         }
-        validate_delta_advance(state.head.as_ref(), reservation, delta)?;
+        validate_delta_advance(state.head.as_ref(), reservation.reserved_turn, delta)?;
         let node = &prepared.node;
         let (total_canonical_bytes, total_message_count) =
             next_head_totals(state.head.as_ref(), segments, delta.mode)?;
@@ -987,7 +1356,7 @@ impl DatabaseSessionContextCoordinator {
         state.last_commit = Some(CommitReceiptV1 {
             idempotency_key: idempotency_key.to_owned(),
             reservation_id: reservation.reservation_id.clone(),
-            reservation: reservation.clone(),
+            reservation: reservation.as_ref().clone(),
             delta_hash: turn_delta_hash(delta),
             cursor: cursor.clone(),
         });
@@ -4857,31 +5226,24 @@ async fn clear_writer_authority_in_tx(
     update_database_state(tx, state).await
 }
 
-/// One owner-scoped current-read proof for cancellation and provider handoff.
-/// A physical workspace is intentionally absent from this proof: independent
-/// Sessions may share it, while each Session's own execution state remains
-/// fenced by its Session head, Run slot, and binding generation.
-async fn locked_execution_reuse_blocker(
-    tx: &mut Transaction<'_, MySql>,
+/// Inspect actual Run occupancy under the existing Session/slot admission.
+/// Writer absence is not idle proof: Server Runs own execution independently
+/// of Controller leases. Reuse the already locked slot instead of reading it
+/// again, then include children and terminal executors still unwinding.
+pub(crate) async fn lock_session_run_execution_blocker<T>(
+    tx: &mut T,
     key: &SessionKeyV1,
-) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError> {
-    match crate::storage::admit_session_execution_write(tx, &key.session_id, &key.owner_user_id)
-        .await
-    {
-        Ok(()) => {}
-        Err(sqlx::Error::RowNotFound) => {
-            return Ok(Some(SessionExecutionBlocker::OwnerUnavailable));
-        }
-        Err(source) => return Err(database_error("fence_idle_workspace_session", source)),
+    facts: &crate::storage::SessionExecutionAdmissionFacts,
+) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError>
+where
+    T: crate::cancellation_safe_db::TransactionConnection,
+{
+    if !facts.belongs_to(&key.owner_user_id, &key.session_id) {
+        return Err(SessionContextCoordinatorError::Unauthorized);
     }
-    let slot = sqlx::query("SELECT 1 FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE")
-        .bind(&key.owner_user_id).bind(&key.session_id).fetch_optional(&mut **tx).await
-        .map_err(|source| database_error("lock_idle_workspace_slot", source))?;
-    if slot.is_some() {
+    if facts.slot().is_some() {
         return Ok(Some(SessionExecutionBlocker::ExecutionSlot));
     }
-    // Terminal executors may still be unwinding. Their owner lease remains
-    // relevant even though active-status discovery no longer includes them.
     let running = sqlx::query(
         "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ?
          AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL)
@@ -4892,9 +5254,33 @@ async fn locked_execution_reuse_blocker(
     .bind(&key.session_id)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|source| database_error("lock_idle_workspace_runs", source))?;
-    if running.is_some() {
-        return Ok(Some(SessionExecutionBlocker::ActiveRun));
+    .map_err(|source| database_error("lock_session_active_runs", source))?;
+    Ok(running.map(|_| SessionExecutionBlocker::ActiveRun))
+}
+
+/// One owner-scoped current-read proof for cancellation and provider handoff.
+/// A physical workspace is intentionally absent from this proof: independent
+/// Sessions may share it, while each Session's own execution state remains
+/// fenced by its Session head, Run slot, and binding generation.
+async fn locked_execution_reuse_blocker(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError> {
+    let facts = match crate::storage::admit_session_execution_write_with_facts(
+        tx,
+        &key.session_id,
+        &key.owner_user_id,
+    )
+    .await
+    {
+        Ok(facts) => facts,
+        Err(sqlx::Error::RowNotFound) => {
+            return Ok(Some(SessionExecutionBlocker::OwnerUnavailable));
+        }
+        Err(source) => return Err(database_error("fence_idle_workspace_session", source)),
+    };
+    if let Some(blocker) = lock_session_run_execution_blocker(tx, key, &facts).await? {
+        return Ok(Some(blocker));
     }
     // An executor may release its lease after failed closure. The durable
     // generation-scoped fence survives pod loss and is still execution debt.
@@ -5032,6 +5418,7 @@ async fn lock_database_state_at_now(
 pub(crate) struct RecoveryContextFactsV1 {
     pub(crate) head: SessionContextHeadV1,
     pub(crate) execution_binding: Option<SessionExecutionBindingV1>,
+    pub(crate) execution_blocker: Option<SessionExecutionBlocker>,
     pub(crate) has_active_reservation: bool,
     pub(crate) has_unresolved_invocations: bool,
 }
@@ -5039,9 +5426,11 @@ pub(crate) struct RecoveryContextFactsV1 {
 pub(crate) async fn lock_recovery_context_in_transaction(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
+    admission: &crate::storage::SessionExecutionAdmissionFacts,
 ) -> Result<RecoveryContextFactsV1, SessionContextCoordinatorError> {
     key.validate()
         .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+    let execution_blocker = lock_session_run_execution_blocker(tx, key, admission).await?;
     let (state, now) = lock_database_state_at_now(tx, key).await?;
     let head = state.head.ok_or_else(|| {
         SessionContextCoordinatorError::NeedsRepair(
@@ -5056,6 +5445,7 @@ pub(crate) async fn lock_recovery_context_in_transaction(
     let execution_binding = load_execution_binding_in_tx(tx, key, true).await?;
     Ok(RecoveryContextFactsV1 {
         head,
+        execution_blocker,
         execution_binding,
         has_active_reservation,
         has_unresolved_invocations,
@@ -6535,11 +6925,11 @@ fn validate_active_reservation(
 
 fn validate_delta_advance(
     head: Option<&SessionContextHeadV1>,
-    reservation: &TurnReservationV1,
+    reserved_turn: u32,
     delta: &CanonicalTurnDeltaV1,
 ) -> Result<(), SessionContextCoordinatorError> {
     if delta.schema_version != CANONICAL_TURN_DELTA_SCHEMA_VERSION
-        || delta.completed_turn != reservation.reserved_turn
+        || delta.completed_turn != reserved_turn
     {
         return Err(SessionContextCoordinatorError::Invalid(
             "turn delta does not match its reservation".into(),

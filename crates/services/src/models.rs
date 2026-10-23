@@ -938,6 +938,9 @@ impl RuntimeModelReasoningControl {
 /// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
+    /// Completion time of the trusted admission that produced this material.
+    /// Cloning or installing it in another execution must not renew the grant.
+    pub admitted_at: Instant,
     pub price_snapshot: Option<InferencePriceSnapshot>,
     pub offering_id: String,
     pub source_identity: Option<ResolvedModelSourceIdentity>,
@@ -992,6 +995,7 @@ impl AdmittedModelExecution {
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
+            admitted_at: Instant::now(),
             price_snapshot: offering.model.price_snapshot,
             offering_id: offering.offering_id,
             source_identity: Some(ResolvedModelSourceIdentity {
@@ -1029,6 +1033,7 @@ impl AdmittedModelExecution {
         context_window: u32,
     ) -> Self {
         Self {
+            admitted_at: Instant::now(),
             price_snapshot: None,
             offering_id,
             source_identity: None,
@@ -2105,6 +2110,7 @@ fn admitted_user_model_from_row(
     let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
     Ok(AdmittedModelExecution {
+        admitted_at: std::time::Instant::now(),
         price_snapshot: None,
         offering_id: offering_id.to_string(),
         source_identity: Some(ResolvedModelSourceIdentity {

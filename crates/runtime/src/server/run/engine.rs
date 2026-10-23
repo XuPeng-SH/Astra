@@ -48,19 +48,17 @@ use std::{
 use astra_services::runs::{
     AtomicOrphanRunCancellationRequest, AtomicRunActionAdmissionRequest,
     AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
-    AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest,
-    AtomicRunUserIntentAdmissionTransition, AtomicRunUserIntentAdmissionTransitionRequest,
-    AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, DurableCancellationOrigin,
-    DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
-    DurableRunInteractionAttachmentGuard, DurableRunInteractionKind,
-    DurableRunInteractionProjection, DurableRunInteractionResolveOutcome, DurableRunListPage,
-    DurableRunObservation, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
-    DurableRunStatusSnapshot, DurableRunUserIntentControlDelta, DurableRunWorkScope,
-    DurableWorkItemRunBinding, DurableWorkRunBinding, GuardedRunStatusTransition,
-    GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode,
-    ResolvedModelSelection, RunExecutionBoundaryAuthorization,
-    RunExecutionBoundaryAuthorizationRequest, RunListCursor, RunStateStore, RunStatusCasRequest,
-    RunUsageOwnerUpdateRequest, RunUserIntentAdmissionTransition, RuntimeProfileRequest,
+    AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest, AtomicRunUserIntentApply,
+    AtomicRunUserIntentApplyRequest, DurableCancellationOrigin, DurableRunCheckpointRecord,
+    DurableRunDisplayProjectionRecord, DurableRunEventDelta, DurableRunInteractionAttachmentGuard,
+    DurableRunInteractionKind, DurableRunInteractionProjection,
+    DurableRunInteractionResolveOutcome, DurableRunListPage, DurableRunObservation,
+    DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
+    DurableRunUserIntentControlDelta, DurableRunWorkScope, DurableWorkItemRunBinding,
+    DurableWorkRunBinding, GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
+    RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
+    RunExecutionBoundaryAuthorization, RunExecutionBoundaryAuthorizationRequest, RunListCursor,
+    RunStateStore, RunStatusCasRequest, RunUsageOwnerUpdateRequest, RuntimeProfileRequest,
     SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy, USER_INTENT_CONTROL_DELTA_PAGE_SIZE,
     durable_run_status_is_terminal, durable_run_status_kind,
 };
@@ -4525,74 +4523,6 @@ fn user_intent_indices_with_disposition(
         .collect()
 }
 
-impl RunEngine {
-    async fn transition_user_intent_admission(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_owner_generation: u64,
-        transition: RunUserIntentAdmissionTransition,
-    ) -> Result<(), String> {
-        match self
-            .store
-            .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                user_id,
-                run_id,
-                expected_session_id,
-                expected_owner_generation,
-                transition,
-            })
-            .await?
-        {
-            AtomicRunUserIntentAdmissionTransition::Changed { .. } => Ok(()),
-            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { .. }
-                if transition == RunUserIntentAdmissionTransition::Fence =>
-            {
-                Ok(())
-            }
-            AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized { .. }
-                if transition == RunUserIntentAdmissionTransition::Reopen =>
-            {
-                Ok(())
-            }
-            AtomicRunUserIntentAdmissionTransition::AlreadyInState { .. }
-                if transition == RunUserIntentAdmissionTransition::Fence =>
-            {
-                Ok(())
-            }
-            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { .. }
-            | AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized { .. }
-            | AtomicRunUserIntentAdmissionTransition::AlreadyInState { .. } => Err(format!(
-                "user-intent admission transition returned authority for the wrong operation on run {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::Inactive { status } => Err(format!(
-                "run became {status} before user-intent admission transition: {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                actual_owner_generation,
-            } => Err(format!(
-                "stale execution generation {expected_owner_generation} cannot change user-intent admission for run {run_id}; current generation is {actual_owner_generation}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::OwnerMismatch {
-                actual_owner_pod_id,
-            } => Err(format!(
-                "this executor no longer owns user-intent admission for run {run_id}; current owner is {}",
-                actual_owner_pod_id.as_deref().unwrap_or("none")
-            )),
-            AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired => Err(format!(
-                "execution owner lease expired before user-intent admission transition for run {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::IdentityConflict => Err(format!(
-                "user-intent admission transition identity conflict for run {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::Missing => Err(format!(
-                "run not found while changing user-intent admission: {run_id}"
-            )),
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl RunStatusProvider for RunEngine {
     async fn permission_mode_snapshot(
@@ -4756,55 +4686,6 @@ impl UserIntentProvider for RunEngine {
                 }
             }
         })
-    }
-
-    async fn fence_user_intent_submissions(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        let UserIntentAdmissionAuthority::DurableOwnerGeneration(expected_owner_generation) =
-            authority
-        else {
-            return Err(
-                "durable user-intent admission fencing requires exact owner generation".to_string(),
-            );
-        };
-        self.transition_user_intent_admission(
-            user_id,
-            expected_session_id,
-            run_id,
-            expected_owner_generation,
-            RunUserIntentAdmissionTransition::Fence,
-        )
-        .await
-    }
-
-    async fn reopen_user_intent_submissions(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        let UserIntentAdmissionAuthority::DurableOwnerGeneration(expected_owner_generation) =
-            authority
-        else {
-            return Err(
-                "durable user-intent admission reopening requires exact owner generation"
-                    .to_string(),
-            );
-        };
-        self.transition_user_intent_admission(
-            user_id,
-            expected_session_id,
-            run_id,
-            expected_owner_generation,
-            RunUserIntentAdmissionTransition::Reopen,
-        )
-        .await
     }
 
     async fn poll_user_intents(
@@ -5030,9 +4911,6 @@ impl UserIntentProvider for RunEngine {
                 );
                 Ok(UserIntentApplyAck::RunTerminalReturned)
             }
-            AtomicRunUserIntentApply::SettlementFenced => Err(format!(
-                "user-intent apply was fenced by settlement for run {run_id}"
-            )),
             AtomicRunUserIntentApply::Inactive { status } if status == STATUS_PAUSED => {
                 Ok(UserIntentApplyAck::Paused)
             }
@@ -11062,7 +10940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fenced_pre_cutoff_intent_is_polled_applied_and_reopened() {
+    async fn accepted_guidance_is_polled_applied_and_followed_by_later_guidance() {
         let engine = test_engine();
         engine
             .start_run("run-fence-drain", "user-1", "sess-fence-drain")
@@ -11092,15 +10970,6 @@ mod tests {
             AtomicRunGuidanceAdmission::Committed { event_index: 1 }
         );
 
-        engine
-            .fence_user_intent_submissions(
-                "user-1",
-                "sess-fence-drain",
-                "run-fence-drain",
-                UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-            )
-            .await
-            .unwrap();
         let poll = engine
             .poll_user_intents("user-1", "run-fence-drain", 0)
             .await;
@@ -11125,15 +10994,6 @@ mod tests {
                 .unwrap(),
             UserIntentApplyAck::Applied
         );
-        engine
-            .reopen_user_intent_submissions(
-                "user-1",
-                "sess-fence-drain",
-                "run-fence-drain",
-                UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-            )
-            .await
-            .unwrap();
 
         let after_reopen = serde_json::json!({
             "event_type": "user_intent",
@@ -11172,13 +11032,11 @@ mod tests {
             vec![
                 "run_started",
                 "user_intent",
-                "user_intent_settlement_fenced",
                 "user_intent_applied",
-                "user_intent_admission_reopened",
                 "user_intent",
             ]
         );
-        assert_eq!(run.events[2]["data"]["after_event_index"], 1);
+        assert_eq!(run.events[2]["event_type"], "user_intent_applied");
     }
 
     #[tokio::test]

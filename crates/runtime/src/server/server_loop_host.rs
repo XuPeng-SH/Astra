@@ -3474,7 +3474,6 @@ pub struct ServerAgenticLoopHost {
         Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
-    admitted_model_execution_at: Option<Instant>,
     inference_owner_pod_id: Option<String>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
@@ -4173,7 +4172,6 @@ impl RuntimeExecutionHandoff {
             || producer_owner_generation != receipt.producer_generation
             || payload.reservation != receipt.source
             || payload.original_facts.session_turn != receipt.source.reserved_turn
-            || payload.original_facts.canonical_turn_started_at.is_none()
         {
             return Err(invalid(
                 "execution facts do not belong to the adopted producer",
@@ -5287,7 +5285,6 @@ pub struct ServerAgenticLoopHostBuilder {
         Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
-    admitted_model_execution_at: Option<Instant>,
     inference_owner_pod_id: Option<String>,
     execution_time_budget: Option<ExecutionDeadlineAuthority>,
     edge_tools: Vec<Value>,
@@ -5384,7 +5381,6 @@ impl ServerAgenticLoopHostBuilder {
             provider_observations: None,
             model_override: None,
             admitted_model_execution: None,
-            admitted_model_execution_at: None,
             inference_owner_pod_id: None,
             execution_time_budget: None,
             edge_tools: Vec::new(),
@@ -5522,7 +5518,6 @@ impl ServerAgenticLoopHostBuilder {
         mut self,
         execution: Option<astra_services::AdmittedModelExecution>,
     ) -> Self {
-        self.admitted_model_execution_at = execution.as_ref().map(|_| Instant::now());
         self.admitted_model_execution = execution;
         self
     }
@@ -5992,7 +5987,6 @@ impl ServerAgenticLoopHostBuilder {
             preserve_thinking: self.preserve_thinking,
             initial_output_limit: self.initial_output_limit,
             admitted_model_execution: self.admitted_model_execution,
-            admitted_model_execution_at: self.admitted_model_execution_at,
             inference_owner_pod_id: self.inference_owner_pod_id,
             resolved_model_name: None,
             resolved_context_window: None,
@@ -11365,14 +11359,16 @@ impl ServerAgenticLoopHost {
         // invalidating the route cache before every lookup. The timestamp is
         // admission-owned: resolving a cached config cannot extend its life.
         if self
-            .admitted_model_execution_at
-            .is_some_and(|admitted_at| admitted_at.elapsed() < RESOLVED_TURN_LLM_CONFIG_CACHE_TTL)
+            .admitted_model_execution
+            .as_ref()
+            .is_some_and(|execution| {
+                execution.admitted_at.elapsed() < RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+            })
         {
             return Ok(());
         }
         if let Some(execution) = self.revalidate_auto_execution().await? {
             self.admitted_model_execution = Some(execution);
-            self.admitted_model_execution_at = Some(Instant::now());
             self.clear_resolved_llm_config();
             return Ok(());
         }
@@ -11421,7 +11417,6 @@ impl ServerAgenticLoopHost {
             );
         }
         self.admitted_model_execution = Some(execution);
-        self.admitted_model_execution_at = Some(Instant::now());
         self.clear_resolved_llm_config();
         Ok(())
     }
@@ -24672,8 +24667,6 @@ mod tests {
                 7,
             ),
         );
-        let original_turn_started_at = state.turn_event_buffer.as_ref().unwrap().turn_started_at();
-        state.canonical_turn_started_at = std::sync::OnceLock::from(original_turn_started_at);
         state.initialize_provider_canonical_wal_base(&[]);
         state.message = "subsequent steering guidance".into();
         state.messages = vec![
@@ -24878,19 +24871,11 @@ mod tests {
                 // A committed custody proof is not permission to dispatch an
                 // incomplete runtime checkpoint. Test missing and explicit-null
                 // original inputs through the actual adoption boundary.
-                for (field, missing) in [
-                    ("canonical_turn_started_at", true),
-                    ("canonical_turn_started_at", false),
-                    ("original_user_message", true),
-                    ("original_user_message", false),
-                ] {
+                for missing in [true, false] {
+                    let field = "original_user_message";
                     let mut malformed: Value =
                         serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
-                    let facts = if field == "original_user_message" {
-                        &mut malformed["heavy"]
-                    } else {
-                        &mut malformed["heavy"]["original_facts"]
-                    };
+                    let facts = &mut malformed["heavy"];
                     if missing {
                         facts.as_object_mut().unwrap().remove(field);
                     } else {
@@ -24939,10 +24924,6 @@ mod tests {
                 "subsequent steering guidance"
             );
             assert_eq!(recovered.journal_next_round, Some(7));
-            assert_eq!(
-                recovered.original_facts.canonical_turn_started_at,
-                Some(original_turn_started_at)
-            );
             assert_eq!(
                 adopted.checkpoint().checkpoint_json.as_str(),
                 checkpoint.checkpoint_json.as_str()
@@ -48726,8 +48707,8 @@ mod tests {
             .await
             .expect("the admitted route remains valid within its bounded grant");
         assert_eq!(cached.api_key, "initial-secret");
-        host.admitted_model_execution_at =
-            Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL);
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
         let second = host
             .resolve_llm_config_for_state(&state)
             .await
@@ -48741,8 +48722,8 @@ mod tests {
             .execute(pool)
             .await
             .expect("change the selected Offering's upstream model");
-        host.admitted_model_execution_at =
-            Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL);
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
         let drift_result = host.resolve_llm_config_for_state(&state).await;
 
         sqlx::query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
@@ -48758,8 +48739,8 @@ mod tests {
             .execute(pool)
             .await
             .expect("disable catalog Offering");
-        host.admitted_model_execution_at =
-            Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL);
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
         let inactive_result = host.resolve_llm_config_for_state(&state).await;
 
         sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
@@ -48844,12 +48825,20 @@ mod tests {
                 None,
             )))
             .build();
-        let admitted_at = host.admitted_model_execution_at;
+        let admitted_at = host
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.admitted_at);
         for _ in 0..3 {
             host.resolve_llm_config_for_state(&state)
                 .await
                 .expect("admitted model");
-            assert_eq!(host.admitted_model_execution_at, admitted_at);
+            assert_eq!(
+                host.admitted_model_execution
+                    .as_ref()
+                    .map(|execution| execution.admitted_at),
+                admitted_at
+            );
         }
     }
 
@@ -48983,6 +48972,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn constructing_a_host_cannot_refresh_an_expired_catalog_admission() {
+        let mut execution = server_gateway_execution();
+        execution.admitted_at = Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
+        let admitted_at = execution.admitted_at;
+        let mut host = test_host_builder("owner", "session")
+            .with_model_service(Some(Arc::new(GenesisReadinessCatalog {
+                ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })))
+            .with_admitted_model_execution(Some(execution.clone()))
+            .build();
+        assert_eq!(
+            host.admitted_model_execution.as_ref().unwrap().admitted_at,
+            admitted_at
+        );
+        let error = host
+            .resolve_llm_config_for_state(&create_test_state())
+            .await
+            .expect_err("an expired source grant must revalidate even in a new host");
+        let failure = model_resolution_failure(&error);
+        assert_eq!(failure.kind, astra_core::ErrorKind::ServerError);
+        assert!(
+            failure.message.contains("[genesis_not_ready]"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[tokio::test]
     async fn later_round_revalidation_keeps_genesis_dependency_classification() {
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut host = test_host_builder("user-genesis", "session-genesis")
@@ -49002,8 +49019,8 @@ mod tests {
         host.resolve_llm_config_for_state(&state)
             .await
             .expect("the bounded grant remains usable");
-        host.admitted_model_execution_at =
-            Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1));
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1);
         let error = host
             .resolve_llm_config_for_state(&state)
             .await
