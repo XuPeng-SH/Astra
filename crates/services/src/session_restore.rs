@@ -48,6 +48,7 @@ pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
          AND r.run_id = sti.run_id \
         WHERE sti.session_id = ? \
           AND sti.user_id = ? \
+          AND (sti.run_id IS NULL OR sti.run_id <> ?) \
           AND sti.role IN ('user', 'assistant', 'system') \
           AND TRIM(sti.content) <> '' \
           AND ( \
@@ -108,6 +109,7 @@ pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
      AND r.run_id = sti.run_id \
     WHERE sti.session_id = ? \
       AND sti.user_id = ? \
+          AND (sti.run_id IS NULL OR sti.run_id <> ?) \
           AND sti.role IN ('user', 'assistant', 'system') \
           AND TRIM(sti.content) <> '' \
       AND ( \

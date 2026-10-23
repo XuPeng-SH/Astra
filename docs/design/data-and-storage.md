@@ -157,11 +157,13 @@ Retention is a product contract:
   rows, including terminal settlement and trace repair. Replay contributes no
   insertion delta; a lost commit acknowledgement must not trigger a separate
   counter update.
-- Fresh root input commits its `user_query` audit fact, transcript projection,
-  and inserted-only session counter in one transaction under one session
-  admission. Replay reuses the immutable identity; collisions retain their
-  receipt without projecting conflicting text. Structured intents without a
-  prompt retain transcript-only capture. Resume does not admit a second input.
+- Fresh root admission commits the Run identity and execution slot, Context
+  writer/turn reservation, `user_query` audit, transcript, and inserted-only
+  event counter in one transaction. The original Run opening-event receipt
+  proves the batch after a lost acknowledgement. A collision rolls back the
+  entire admission. Standalone capture retains its collision receipt without
+  projecting conflicting text. Structured intents without a prompt retain
+  transcript-only capture. Resume does not admit a second input.
 - Root execution commits canonical Context (segments, manifest, head, operation
   receipt and owned writer release) with Run terminal, semantic usage, audit
   and transcript in one transaction. Context rejection leaves the Run active;

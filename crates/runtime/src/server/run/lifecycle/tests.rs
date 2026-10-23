@@ -653,6 +653,7 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
                     None,
                     None,
                     mode,
+                    None,
                 )
                 .await
                 .is_err()
@@ -676,6 +677,7 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
                 None,
                 None,
                 mode,
+                None,
             )
             .await
             .expect("persist through actual admission boundary");
@@ -708,6 +710,7 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
                 None,
                 None,
                 mode,
+                None,
             )
             .await
             .expect("persist explicit root generation controls");
@@ -754,6 +757,7 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
                     None,
                     None,
                     mode,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -879,6 +883,7 @@ async fn run_admission_records_trusted_catalog_source_without_execution_material
                 None,
                 None,
                 RunStartPersistenceMode::Insert,
+                None,
             )
             .await
             .is_err()
@@ -902,6 +907,7 @@ async fn run_admission_records_trusted_catalog_source_without_execution_material
             None,
             None,
             RunStartPersistenceMode::Insert,
+            None,
         )
         .await
         .unwrap();
@@ -1041,6 +1047,7 @@ async fn run_admission_preserves_mixed_capabilities_and_resolved_executor() {
                 None,
                 None,
                 RunStartPersistenceMode::Insert,
+                None,
             )
             .await
             .unwrap();
@@ -12954,6 +12961,209 @@ fn db_backed_test_service(
 
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything() {
+    struct RejectAfterInput<'a>(RootTurnStartParticipant<'a>);
+    #[async_trait]
+    impl astra_services::runs::RunStartTransactionParticipant for RejectAfterInput<'_> {
+        async fn prepare(&mut self) -> Result<(), String> {
+            astra_services::runs::RunStartTransactionParticipant::prepare(&mut self.0).await
+        }
+        async fn stage(
+            &mut self,
+            tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+            admission: &astra_services::runs::RunMutationAdmission,
+        ) -> Result<(), String> {
+            astra_services::runs::RunStartTransactionParticipant::stage(&mut self.0, tx, admission)
+                .await?;
+            Err("injected failure after canonical input".into())
+        }
+    }
+    let pool = setup_lifecycle_run_db_it().await;
+    for reject in [false, true] {
+        let suffix = Uuid::new_v4();
+        let user = format!("atomic-start-user-{suffix}");
+        let session = format!("atomic-start-session-{suffix}");
+        let run = format!("atomic-start-run-{suffix}");
+        crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+        let service = db_backed_test_service(&pool, "atomic-start-owner");
+        let request = prepared_test_request("accepted input is durable before workspace setup");
+        let make_participant = || RootTurnStartParticipant {
+            service: &service,
+            user_id: &user,
+            session_id: &session,
+            run_id: &run,
+            request: &request,
+            attempt_id: Uuid::new_v4().to_string(),
+            started_at: chrono::Utc::now(),
+            admission: None,
+            prepared: None,
+            rejection: None,
+        };
+        let mut participant = RejectAfterInput(make_participant());
+        let result = service
+            .run_engine
+            .admit_run_with_context(
+                &run,
+                &user,
+                &session,
+                Some(&session),
+                Default::default(),
+                true,
+                if reject {
+                    &mut participant
+                } else {
+                    &mut participant.0
+                },
+            )
+            .await;
+        if reject {
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("injected failure after canonical input")
+            );
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                DurableRunStartClaim::Started { .. }
+            ));
+            let mut replay = make_participant();
+            assert!(matches!(
+                service
+                    .run_engine
+                    .admit_run_with_context(
+                        &run,
+                        &user,
+                        &session,
+                        Some(&session),
+                        Default::default(),
+                        true,
+                        &mut replay,
+                    )
+                    .await
+                    .unwrap(),
+                DurableRunStartClaim::Existing { .. }
+            ));
+            assert!(
+                replay.admission.is_none(),
+                "replay cannot acquire or release the winner's permits"
+            );
+            let mut loser = make_participant();
+            let blocked = service
+                .run_engine
+                .admit_run_with_context(
+                    &format!("other-{run}"),
+                    &user,
+                    &session,
+                    Some(&session),
+                    Default::default(),
+                    true,
+                    &mut loser,
+                )
+                .await
+                .unwrap_err();
+            assert!(blocked.contains("session already has an active run"));
+            assert!(loser.admission.is_none());
+            loser
+                .prepared
+                .as_ref()
+                .unwrap()
+                .distributed_permit
+                .release()
+                .await
+                .unwrap();
+            drop(loser);
+            let winner_permit = &participant
+                .0
+                .admission
+                .as_ref()
+                .unwrap()
+                .distributed_permit
+                .reservation()
+                .reservation_id;
+            let winner_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE reservation_id = ?")
+                .bind(winner_permit).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                winner_count, 1,
+                "a lost claim must not release the winner's capacity"
+            );
+            let prior = service
+                .restore_transcript_prompt_messages(&user, &session, &run, "atomic-start-test")
+                .await;
+            assert!(
+                prior.is_empty(),
+                "the accepted input is not prior-turn history"
+            );
+            let visible = service
+                .restore_transcript_prompt_messages(
+                    &user,
+                    &session,
+                    "next-run",
+                    "atomic-start-test",
+                )
+                .await;
+            assert_eq!(visible[0]["content"], request.message);
+        }
+        for table in [
+            "agent_runs",
+            "agent_run_events",
+            "run_display_projections",
+            "session_transcript_items",
+            "agent_events",
+        ] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+            )))
+            .bind(&user)
+            .bind(&session)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(count, i64::from(!reject), "{table}: reject={reject}");
+        }
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? AND active_writer_json IS NOT NULL AND active_reservation_json IS NOT NULL")
+            .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(active, i64::from(!reject));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(count, i64::from(!reject));
+        if let Some(admission) = participant.0.admission.as_ref() {
+            let _ = admission.distributed_permit.release().await;
+            let _ = admission.coordinator.release_writer(&admission.lease).await;
+            admission.release_started.store(true, Ordering::Release);
+        }
+        drop(participant);
+        for (table, column) in [
+            ("session_context_authority_events", "owner_user_id"),
+            ("session_context_heads", "owner_user_id"),
+            ("agent_session_execution_slots", "user_id"),
+            ("session_transcript_items", "user_id"),
+            ("agent_events", "user_id"),
+            ("run_display_projections", "user_id"),
+            ("agent_run_events", "user_id"),
+            ("agent_runs", "user_id"),
+            ("agent_sessions", "user_id"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE {column} = ? AND session_id = ?"
+            )))
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn transcript_prompt_hydration_preserves_lineage_budget_and_owner_on_matrixone() {
     let pool = setup_lifecycle_run_db_it().await;
     let suffix = Uuid::new_v4();
@@ -13035,13 +13245,14 @@ async fn transcript_prompt_hydration_preserves_lineage_budget_and_owner_on_matri
     let rows = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
         .bind(&session_id)
         .bind(&user_id)
+        .bind("fresh-reader")
         .bind(astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
         .fetch_all(pool.get())
         .await
         .expect("load provider-safe durable transcript rows");
     let service = db_backed_test_service(&pool, "transcript-reader");
     let messages = service
-        .restore_transcript_prompt_messages(&user_id, &session_id, &root_run_id, "test")
+        .restore_transcript_prompt_messages(&user_id, &session_id, "fresh-reader", "test")
         .await;
     let foreign = service
         .restore_transcript_prompt_messages(
@@ -14154,6 +14365,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
             Some(&validated),
             None,
             RunStartPersistenceMode::Insert,
+            None,
         )
         .await
         .expect("persist exact Work graph cut with run start");

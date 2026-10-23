@@ -5247,15 +5247,33 @@ pub struct AtomicRunTerminalSettlementCommit {
     pub projection_hash: String,
 }
 
+/// Additional canonical facts committed by the Run creation transaction.
+/// Existing opening-event row identities and hashes prove this entire batch
+/// during lost-acknowledgement reconciliation. No additional receipt is stored.
+#[async_trait]
+pub trait RunStartTransactionParticipant: Send + Sync {
+    /// Read immutable inputs and acquire request-local capacity before holding
+    /// a Session transaction. This phase must not mutate canonical Run/Context.
+    async fn prepare(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn stage(
+        &mut self,
+        tx: &mut Transaction<'_, MySql>,
+        admission: &RunMutationAdmission,
+    ) -> Result<(), String>;
+}
+
 /// Exact run facts read under session/execution/run locks. This value may only
 /// be consumed in its admitting transaction, before that transaction changes
 /// run metadata or appends run events. It is not a cache or execution grant.
-pub struct AtomicRunTerminalSettlementAdmission {
+pub struct RunMutationAdmission {
     run: DurableRunRecord,
     cancellation_requested: bool,
 }
 
-impl AtomicRunTerminalSettlementAdmission {
+impl RunMutationAdmission {
     pub(crate) fn owns_session(&self, user_id: &str, session_id: &str) -> bool {
         self.run.user_id == user_id && self.run.session_id == session_id
     }
@@ -5872,6 +5890,16 @@ pub trait RunStateStore: Send + Sync {
         &self,
         record: DurableRunRecord,
     ) -> Result<DurableRunStartAuthority, String>;
+
+    async fn insert_run_with_participant(
+        &self,
+        _record: DurableRunRecord,
+        _claim_existing: bool,
+        _requested_session_id: Option<&str>,
+        _participant: &mut dyn RunStartTransactionParticipant,
+    ) -> Result<DurableRunStartClaim, String> {
+        Err("this run store does not support database admission participants".into())
+    }
 
     /// Derive correlation from the real dispatched invocation and original
     /// Run admission, never from a client's generation or decision snapshot.
@@ -12997,7 +13025,7 @@ impl DatabaseRunStateStore {
             return Ok(None);
         }
         let Some(admission) = self
-            .admit_terminal_settlement_in_transaction(
+            .admit_mutation_in_transaction(
                 tx,
                 request.user_id,
                 request.expected_session_id,
@@ -13014,13 +13042,13 @@ impl DatabaseRunStateStore {
 
     /// Admit terminal settlement once, returning the exact locked run facts for
     /// a caller that appends canonical evidence before settling the terminal.
-    pub async fn admit_terminal_settlement_in_transaction(
+    pub async fn admit_mutation_in_transaction(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         user_id: &str,
         expected_session_id: &str,
         run_id: &str,
-    ) -> DbStoreResult<Option<AtomicRunTerminalSettlementAdmission>> {
+    ) -> DbStoreResult<Option<RunMutationAdmission>> {
         validate_expected_run_session_id(expected_session_id).map_err(|message| {
             db_error(
                 "admit_terminal_settlement",
@@ -13053,7 +13081,7 @@ impl DatabaseRunStateStore {
                         db_error("decode_terminal_cancellation_marker", run_id, source)
                     })?
                     != 0;
-                Ok(AtomicRunTerminalSettlementAdmission {
+                Ok(RunMutationAdmission {
                     run: run_record_from_row(row)?,
                     cancellation_requested,
                 })
@@ -13069,7 +13097,7 @@ impl DatabaseRunStateStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         request: AtomicRunTerminalSettlementRequest<'_>,
-        admission: AtomicRunTerminalSettlementAdmission,
+        admission: RunMutationAdmission,
     ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
         validate_expected_run_session_id(request.expected_session_id)?;
         if request.expected_statuses.is_empty() {
@@ -13089,7 +13117,7 @@ impl DatabaseRunStateStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         request: AtomicRunTerminalSettlementRequest<'_>,
-        admission: AtomicRunTerminalSettlementAdmission,
+        admission: RunMutationAdmission,
     ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
         let run = admission.run;
         let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
@@ -15425,9 +15453,28 @@ impl DatabaseRunStateStore {
                     "run identity conflict was reported but the existing run is unavailable: {run_id}"
                 )
             })?;
+        if requested_session_id.is_some_and(|session| session != existing.session_id) {
+            return Ok(DurableRunStartClaim::SessionMismatch {
+                bound_session_id: existing.session_id,
+            });
+        }
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
+        let admitted = self
+            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, &existing.session_id, run_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("existing run or its active Session is no longer available")?;
+        tx.rollback().await.map_err(|error| error.to_string())?;
+        connection.release();
         Ok(existing_durable_run_start_claim(
-            &existing.session_id,
-            existing.start_request_fingerprint.as_deref(),
+            &admitted.session_id,
+            admitted.start_request_fingerprint.as_deref(),
             requested_session_id,
         ))
     }
@@ -15528,6 +15575,42 @@ impl DatabaseRunStateStore {
             )
             .execute(&mut **tx)
             .await
+    }
+
+    async fn insert_run_record_with_participant(
+        &self,
+        mut record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+        participant: &mut dyn RunStartTransactionParticipant,
+    ) -> Result<DurableRunStartClaim, String> {
+        if claim_existing
+            && let Some(_) = self
+                .load_run_metadata_for_user(&record.user_id, &record.run_id)
+                .await
+                .map_err(|e| e.to_string())?
+        {
+            return self
+                .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
+                .await;
+        }
+        participant.prepare().await?;
+        let initial_rows = self.prepare_initial_run_event_rows(&mut record)?;
+        self.insert_run_record_transaction_with_collaborator(
+            record,
+            claim_existing,
+            requested_session_id,
+            &initial_rows,
+            None,
+            Some(participant),
+        )
+        .await
+        .map(|(claim, _)| claim)
+        .map_err(|error| match error {
+            CollaboratorStoreError::SessionUnavailable => "session is not active".to_owned(),
+            CollaboratorStoreError::Persistence(reason) => reason,
+            error => error.to_string(),
+        })
     }
 
     async fn insert_run_record(
@@ -16588,6 +16671,7 @@ impl DatabaseRunStateStore {
             requested_session_id,
             initial_event_rows,
             None,
+            None,
         )
         .await
         .map(|(claim, _)| claim)
@@ -16689,6 +16773,7 @@ impl DatabaseRunStateStore {
         requested_session_id: Option<&str>,
         initial_event_rows: &[RunEventInsertRow],
         collaborator: Option<&CollaboratorStageAdmission>,
+        mut participant: Option<&mut dyn RunStartTransactionParticipant>,
     ) -> Result<(DurableRunStartClaim, Option<CollaboratorStageReceipt>), CollaboratorStoreError>
     {
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
@@ -16929,6 +17014,18 @@ impl DatabaseRunStateStore {
             })?;
             connection.release();
             return Err("session already has an active run".to_string().into());
+        }
+        if let Some(participant) = participant.as_mut() {
+            participant
+                .stage(
+                    &mut tx,
+                    &RunMutationAdmission {
+                        run: record.clone(),
+                        cancellation_requested: false,
+                    },
+                )
+                .await
+                .map_err(CollaboratorStoreError::Persistence)?;
         }
         Self::insert_run_event_rows_tx(
             &mut tx,
@@ -18368,6 +18465,7 @@ impl RunStateStore for DatabaseRunStateStore {
             None,
             &initial_rows,
             Some(&admission),
+            None,
         );
         let result = if let Some(deadline) = deadline {
             match tokio::time::timeout_at(deadline, creation).await {
@@ -18602,6 +18700,22 @@ impl RunStateStore for DatabaseRunStateStore {
 
     fn execution_owner_pod_id(&self) -> Option<&str> {
         Some(&self.owner_pod_id)
+    }
+
+    async fn insert_run_with_participant(
+        &self,
+        record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+        participant: &mut dyn RunStartTransactionParticipant,
+    ) -> Result<DurableRunStartClaim, String> {
+        self.insert_run_record_with_participant(
+            record,
+            claim_existing,
+            requested_session_id,
+            participant,
+        )
+        .await
     }
 
     async fn insert_run(
@@ -37241,6 +37355,85 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_start_participant_ack_loss_and_replay_use_exact_opening_receipt() {
+        struct Participant {
+            staged: usize,
+        }
+        #[async_trait]
+        impl RunStartTransactionParticipant for Participant {
+            async fn stage(
+                &mut self,
+                tx: &mut Transaction<'_, MySql>,
+                admission: &RunMutationAdmission,
+            ) -> Result<(), String> {
+                self.staged += 1;
+                sqlx::query("UPDATE agent_sessions SET event_count = event_count + 1 WHERE user_id = ? AND session_id = ?")
+                    .bind(&admission.run.user_id).bind(&admission.run.session_id)
+                    .execute(&mut **tx).await.map_err(|e| e.to_string())?;
+                Ok(())
+            }
+        }
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let user = format!("participant-user-{suffix}");
+        let session = format!("participant-session-{suffix}");
+        let run_id = format!("participant-run-{suffix}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let store = DatabaseRunStateStore::new(pool.clone()).with_run_create_commit_ack_loss_once();
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        run.events = vec![json!({"event_type":"run_started", "data":{"run_id":run_id}})];
+        let mut participant = Participant { staged: 0 };
+        assert!(matches!(
+            store
+                .insert_run_with_participant(run.clone(), true, Some(&session), &mut participant)
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Started { .. }
+        ));
+        let mut replay = Participant { staged: 0 };
+        assert!(matches!(
+            store
+                .insert_run_with_participant(run, true, Some(&session), &mut replay)
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Existing { .. }
+        ));
+        assert_eq!((participant.staged, replay.staged), (1, 0));
+        let durable = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            durable.events.len(),
+            1,
+            "the batch uses the existing opening event"
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "lost acknowledgement and replay cannot duplicate staged writes"
+        );
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
+        for table in ["agent_session_execution_slots", "agent_sessions"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            )))
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_create_commit_ack_loss_recovers_exact_run_slot_and_initial_events_on_matrixone()
      {
         let (_, pool) = setup_database_run_state_store_it().await;
@@ -39064,7 +39257,7 @@ mod tests {
             };
             let mut tx = pool.get().begin().await.expect("begin terminal admission");
             let admission = store
-                .admit_terminal_settlement_in_transaction(&mut tx, &user_id, &session_id, run_id)
+                .admit_mutation_in_transaction(&mut tx, &user_id, &session_id, run_id)
                 .await
                 .expect("admit exact run")
                 .expect("run exists");
@@ -39081,7 +39274,7 @@ mod tests {
                 .expect_err("admission cannot cross session identity");
             assert!(error.contains("admission does not match"));
             let admission = store
-                .admit_terminal_settlement_in_transaction(&mut tx, &user_id, &session_id, run_id)
+                .admit_mutation_in_transaction(&mut tx, &user_id, &session_id, run_id)
                 .await
                 .expect("read same locked facts")
                 .expect("run exists");

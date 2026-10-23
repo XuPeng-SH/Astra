@@ -2077,6 +2077,26 @@ impl RunEngine {
             .await
     }
 
+    pub(crate) async fn admit_run_with_context(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        requested_session_id: Option<&str>,
+        context: RunStartContext,
+        claim_existing: bool,
+        participant: &mut dyn astra_services::runs::RunStartTransactionParticipant,
+    ) -> Result<DurableRunStartClaim, String> {
+        let record = self
+            .build_run_start_record(
+                run_id, user_id, session_id, None, None, None, None, context, true,
+            )
+            .await?;
+        self.store
+            .insert_run_with_participant(record, claim_existing, requested_session_id, participant)
+            .await
+    }
+
     async fn build_run_start_record(
         &self,
         run_id: &str,

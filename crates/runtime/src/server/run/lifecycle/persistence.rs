@@ -1040,7 +1040,7 @@ async fn persist_server_loop_canonical_append_inner(
     let terminal_admission = if settlement.is_some() {
         Some(
             DatabaseRunStateStore::new(pool.clone())
-                .admit_terminal_settlement_in_transaction(
+                .admit_mutation_in_transaction(
                     &mut tx,
                     append.user_id,
                     append.session_id,
@@ -2142,6 +2142,7 @@ async fn persist_server_loop_transcript_items_in_tx(
 
 /// Commit the accepted input's audit fact and user-visible transcript together.
 /// Both projections share the same session admission and insertion receipt.
+#[cfg(test)]
 pub(crate) async fn persist_root_turn_input(
     pool: &SharedPool,
     user_id: &str,
@@ -2149,7 +2150,6 @@ pub(crate) async fn persist_root_turn_input(
     item: TranscriptPersistItem,
     audit: Option<TraceEvent>,
 ) -> Result<(), String> {
-    let has_audit = audit.is_some();
     let mut connection = CancellationSafePoolConnection::acquire(pool.get())
         .await
         .map_err(|error| error.to_string())?;
@@ -2160,8 +2160,26 @@ pub(crate) async fn persist_root_turn_input(
     admit_session_event_write(&mut tx, session_id, user_id, false)
         .await
         .map_err(|error| error.to_string())?;
+    let accepted =
+        persist_root_turn_input_admitted(&mut tx, user_id, session_id, item, audit).await?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+    connection.release();
+    if !accepted {
+        return Err("root input event identity collided; transcript was not projected".into());
+    }
+    Ok(())
+}
+
+pub(super) async fn persist_root_turn_input_admitted(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    item: TranscriptPersistItem,
+    audit: Option<TraceEvent>,
+) -> Result<bool, String> {
+    let has_audit = audit.is_some();
     let outcome = DatabaseTraceEventWriter::write_many_in_admitted_tx(
-        &mut tx,
+        tx,
         user_id,
         session_id,
         audit.into_iter().collect(),
@@ -2170,7 +2188,7 @@ pub(crate) async fn persist_root_turn_input(
     .map_err(|error| error.to_string())?;
     let accepted = !has_audit || outcome.accepts_projection(&item.source_event_id);
     if accepted {
-        append_session_transcript_items_admitted_in_tx(&mut tx, user_id, session_id, &[item])
+        append_session_transcript_items_admitted_in_tx(tx, user_id, session_id, &[item])
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -2179,7 +2197,7 @@ pub(crate) async fn persist_root_turn_input(
         .get(&(user_id.to_owned(), session_id.to_owned()))
     {
         crate::data_layer::storage::bump_agent_session_event_count(
-            &mut *tx,
+            &mut **tx,
             session_id,
             user_id,
             *delta,
@@ -2188,12 +2206,7 @@ pub(crate) async fn persist_root_turn_input(
         .await
         .map_err(|error| error.to_string())?;
     }
-    tx.commit().await.map_err(|error| error.to_string())?;
-    connection.release();
-    if !accepted {
-        return Err("root input event identity collided; transcript was not projected".into());
-    }
-    Ok(())
+    Ok(accepted)
 }
 
 #[cfg(test)]
