@@ -12111,6 +12111,7 @@ pub(crate) mod tests {
         status: &str,
     ) -> astra_services::runs::DurableRunRecord {
         astra_services::runs::DurableRunRecord {
+            terminal_receipt_json: None,
             run_id: run_id.into(),
             user_id: "user-1".into(),
             session_id: "session-1".into(),

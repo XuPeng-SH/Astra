@@ -2166,8 +2166,31 @@ pub(crate) struct ObservedUserIntents {
 }
 
 impl UserIntentState {
-    pub fn bind_wake(&mut self, wake: Option<tokio::sync::watch::Receiver<i64>>) {
+    pub fn bind_wake(&mut self, mut wake: Option<tokio::sync::watch::Receiver<i64>>) {
+        // One initial snapshot covers input accepted during preparation or
+        // before a recovered executor attached its readiness observer.
+        if let Some(wake) = wake.as_mut() {
+            wake.mark_changed();
+        }
         self.wake = wake;
+    }
+
+    pub(crate) fn input_wake_is_pending(&self) -> Option<bool> {
+        self.wake
+            .as_ref()
+            .map(|wake| wake.has_changed().unwrap_or(true))
+    }
+
+    pub(crate) fn note_input_poll_started(&mut self) {
+        if let Some(wake) = self.wake.as_mut() {
+            let _ = wake.borrow_and_update();
+        }
+    }
+
+    pub(crate) fn retry_input_wake(&mut self) {
+        if let Some(wake) = self.wake.as_mut() {
+            wake.mark_changed();
+        }
     }
 
     pub(crate) fn durable_continuation(&self) -> DurableUserIntentState {
@@ -2193,7 +2216,8 @@ impl UserIntentState {
             .next_user_intent_poll_at
             .map(|next| now >= next)
             .unwrap_or(true);
-        regular_poll_due || self.should_retry_apply_ack(now)
+        (regular_poll_due && self.input_wake_is_pending().unwrap_or(true))
+            || self.should_retry_apply_ack(now)
     }
 
     pub(crate) fn note_user_intent_poll_finished(

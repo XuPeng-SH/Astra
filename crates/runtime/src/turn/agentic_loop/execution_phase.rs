@@ -3879,13 +3879,29 @@ pub(crate) async fn runtime_input_boundary<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
     boundary: RuntimeInputBoundary,
 ) -> Result<RuntimeInputOutcome, astra_core::ClassifiedError> {
-    let guidance = if matches!(
+    // Run admission and the existing timed watcher own durable control reads.
+    // No changed watermark means no new guidance to fetch at another model or
+    // tool boundary. Settlement still drains the authoritative lane, and
+    // pending local deliveries/acknowledgements retain their existing owner.
+    let guidance_ready = matches!(
         boundary,
-        RuntimeInputBoundary::Provider
-            | RuntimeInputBoundary::Action
-            | RuntimeInputBoundary::Settlement
-            | RuntimeInputBoundary::IntentReady
-    ) {
+        RuntimeInputBoundary::Settlement | RuntimeInputBoundary::IntentReady
+    ) || state.user_intents.input_wake_is_pending().unwrap_or(true)
+        || state
+            .user_intents
+            .should_retry_apply_ack(tokio::time::Instant::now())
+        || state
+            .run_control
+            .as_ref()
+            .is_some_and(|control| control.has_pending_inputs());
+    let guidance = if guidance_ready
+        && matches!(
+            boundary,
+            RuntimeInputBoundary::Provider
+                | RuntimeInputBoundary::Action
+                | RuntimeInputBoundary::Settlement
+                | RuntimeInputBoundary::IntentReady
+        ) {
         inject_polled_user_intents_inner(host, state, true).await?
     } else {
         false
@@ -3939,6 +3955,9 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
         return Ok(false);
     }
 
+    // Consume readiness before taking the snapshot. A notification arriving
+    // during the read remains changed for the next boundary.
+    state.user_intents.note_input_poll_started();
     let mut pages = 0_usize;
     let mut inspected_facts = 0_usize;
     let mut applied_model_guidance = false;
@@ -3948,6 +3967,7 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
             .poll_user_intents(&user_id, &run_id, page_start_cursor)
             .await;
         if let Some(error) = &poll.error {
+            state.user_intents.retry_input_wake();
             state
                 .user_intents
                 .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
@@ -24028,6 +24048,97 @@ mod tests {
         assert_eq!(provider.poll_call_count().await, 2);
         assert_eq!(state.message, "arrived after quiet poll");
         assert_eq!(*provider.released.lock().await, vec![1]);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn quiet_rounds_do_not_poll_but_notified_guidance_applies_before_the_next_provider() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-watched-guidance".into());
+        state.context_manifest_user_id = Some("owner".into());
+        state.current_session_id = Some("session".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll::default(),
+            UserIntentPoll {
+                next_cursor: 2,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "revised-goal".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": "use the revised document"}),
+                }],
+                ..UserIntentPoll::default()
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let (wake, receiver) = tokio::sync::watch::channel(-1);
+        state.user_intents.bind_wake(Some(receiver));
+        let mut host = MockHost::new(vec![]);
+        runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Provider)
+            .await
+            .unwrap();
+        for boundary in [
+            RuntimeInputBoundary::Action,
+            RuntimeInputBoundary::Provider,
+            RuntimeInputBoundary::Provider,
+        ] {
+            runtime_input_boundary(&mut host, &mut state, boundary)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            provider.poll_call_count().await,
+            1,
+            "quiet model/tool boundaries do no durable input reads"
+        );
+        wake.send(1).unwrap();
+        let outcome = runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Provider)
+            .await
+            .unwrap();
+        assert!(outcome.durable_guidance_applied);
+        assert_eq!(state.message, "use the revised document");
+        assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(provider.poll_call_count().await, 2);
+        runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Settlement)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.poll_call_count().await,
+            3,
+            "settlement still reconciles unobserved remote input"
+        );
+    }
+
+    #[tokio::test]
+    async fn guidance_notification_during_a_snapshot_remains_ready() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-read-race".into());
+        state.context_manifest_user_id = Some("owner".into());
+        state.current_session_id = Some("session".into());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut provider = StubRunControlProvider::new(vec![UserIntentPoll::default()]);
+        provider.poll_gate = Some((entered.clone(), release.clone()));
+        let provider = Arc::new(provider);
+        state.run_control = Some(provider.clone());
+        let (wake, receiver) = tokio::sync::watch::channel(-1);
+        state.user_intents.bind_wake(Some(receiver));
+        let mut host = MockHost::new(vec![]);
+        let (result, ()) = tokio::join!(
+            runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Provider),
+            async {
+                entered.notified().await;
+                wake.send(1).unwrap();
+                release.notify_one();
+            },
+        );
+        result.unwrap();
+        assert_eq!(provider.poll_call_count().await, 1);
+        assert_eq!(
+            state.user_intents.input_wake_is_pending(),
+            Some(true),
+            "an input committed after the snapshot began must trigger another safe boundary"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

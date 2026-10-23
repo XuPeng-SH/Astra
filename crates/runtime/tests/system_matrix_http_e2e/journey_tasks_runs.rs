@@ -27,6 +27,7 @@ async fn seed_orphan_cancel_race_run(
         .with_owner_pod_id(fixture_owner.clone());
     store
         .insert_run(DurableRunRecord {
+            terminal_receipt_json: None,
             run_id: run_id.clone(),
             user_id: ctx.user_id.clone(),
             session_id: ctx.session_id.clone(),
@@ -906,6 +907,7 @@ pub async fn run_paused_accounting_generation_fence_http() {
         .with_owner_pod_id("different-from-draining-executor");
     store
         .insert_run(DurableRunRecord {
+            terminal_receipt_json: None,
             run_id: run_id.clone(),
             user_id: ctx.user_id.clone(),
             session_id: ctx.session_id.clone(),

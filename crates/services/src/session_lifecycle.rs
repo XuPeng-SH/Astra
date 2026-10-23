@@ -414,20 +414,6 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
              LIMIT ?",
     },
     SessionBatchDeleteStatement {
-        label: "session_tool_outputs",
-        sql: "DELETE FROM session_tool_outputs
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY created_at ASC, output_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "session_tool_output_batches",
-        sql: "DELETE FROM session_tool_output_batches
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY created_at ASC, batch_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
         label: "conversation_log",
         sql: "DELETE FROM conversation_log
              WHERE session_id = ? AND user_id = ?
@@ -668,30 +654,6 @@ async fn verify_core_session_tables_deleted(
     if unpinned_manifests > 0 {
         return Err(format!(
             "delete_session.verify.conversation_manifest_nodes: {unpinned_manifests} unpinned rows remain after delete"
-        ));
-    }
-    Ok(())
-}
-
-async fn verify_session_admission_reservations_deleted(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    let remaining: i64 = query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_reservations
-         WHERE session_id = ? AND owner_user_id = ?",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|source| {
-        format!("delete_session.verify.session_weighted_admission_reservations: {source}")
-    })?;
-    if remaining > 0 {
-        return Err(format!(
-            "delete_session.verify.session_weighted_admission_reservations: {remaining} rows remain for session/user after delete"
         ));
     }
     Ok(())
@@ -1065,59 +1027,7 @@ pub(crate) async fn hard_delete_session_rows(
     .await?;
     record_table_delete(&mut outcome, "agent_event_edges", rows_deleted)?;
 
-    // Verify all unrelated session tables before acquiring the admission gate.
-    // This keeps the global gate out of the long residual-check phase.
     verify_core_session_tables_deleted(tx, session_id, user_id).await?;
-
-    // Admission release and expiry cleanup lock the durable gate before they
-    // touch reservation rows. Take that same lock before the session delete so
-    // a release cannot form a reservation -> gate / gate -> reservation cycle.
-    // The gate is held only for the reservation delete, the materialized-usage
-    // invalidation, the reservation-specific check, and the final fence.
-    query(
-        "SELECT 1 FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
-    )
-    .bind(crate::weighted_admission::distributed_admission_scope(
-        crate::weighted_admission::distributed_admission_partition(user_id),
-    ))
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|source| format!("delete_session.lock_admission_gate: {source}"))?;
-    let rows_deleted = query(
-        "DELETE FROM session_weighted_admission_reservations
-         WHERE scope_name = ? AND session_id = ? AND owner_user_id = ?",
-    )
-    .bind(crate::weighted_admission::distributed_admission_scope(
-        crate::weighted_admission::distributed_admission_partition(user_id),
-    ))
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await
-    .map(|result| result.rows_affected())
-    .map_err(|source| {
-        format!("delete_session.session_weighted_admission_reservations: {source}")
-    })?;
-    record_table_delete(
-        &mut outcome,
-        "session_weighted_admission_reservations",
-        rows_deleted,
-    )?;
-    if rows_deleted != 0 {
-        query(
-            "UPDATE session_weighted_admission_gates
-             SET usage_initialized = 0, updated_at = NOW(6)
-             WHERE scope_name = ?",
-        )
-        .bind(crate::weighted_admission::distributed_admission_scope(
-            crate::weighted_admission::distributed_admission_partition(user_id),
-        ))
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| format!("delete_session.invalidate_admission_usage: {source}"))?;
-    }
-    verify_session_admission_reservations_deleted(tx, session_id, user_id).await?;
 
     query(COMPLETE_SESSION_DELETE_FENCE_SQL)
         .bind(session_id)
@@ -1640,8 +1550,6 @@ mod tests {
                 "model_request_context_events",
                 "prompt_deltas",
                 "prompt_request_records",
-                "session_tool_output_batches",
-                "session_tool_outputs",
             ])
         );
         for statement in statements {

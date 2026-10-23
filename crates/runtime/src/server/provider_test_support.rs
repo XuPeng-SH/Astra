@@ -968,7 +968,6 @@ mod tests {
 
         struct RefreshingSessionMemory {
             session_id: String,
-            initial: String,
             refreshed: String,
             snapshot_reads: Mutex<Vec<bool>>,
         }
@@ -996,19 +995,16 @@ mod tests {
             ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
                 assert_eq!(session_id, Some(self.session_id.as_str()));
                 assert!(filter_session);
-                // Initial prompt recall and snapshot loading run concurrently.
-                // Identify the canonical snapshot query, never their call order.
-                let initial = query.starts_with(SESSION_MEMORY_PREFIX);
-                self.snapshot_reads.lock().unwrap().push(initial);
+                assert!(
+                    !query.starts_with(SESSION_MEMORY_PREFIX),
+                    "ordinary preparation must not load an implicit memory snapshot"
+                );
+                self.snapshot_reads.lock().unwrap().push(false);
                 Ok(vec![MemoriaMemory {
                     memory_id: "session-snapshot".into(),
                     session_id: Some(self.session_id.clone()),
                     memory_type: "working".into(),
-                    content: if initial {
-                        self.initial.clone()
-                    } else {
-                        self.refreshed.clone()
-                    },
+                    content: self.refreshed.clone(),
                     ..Default::default()
                 }])
             }
@@ -1059,15 +1055,6 @@ mod tests {
         let session = format!("memory-refresh-{}", uuid::Uuid::new_v4());
         let memory = Arc::new(RefreshingSessionMemory {
             session_id: session.clone(),
-            // The initial bound snapshot alone exceeds the Offering's input
-            // window; the refreshed snapshot leaves this fixed history small.
-            initial: encode_session_memory_entry(
-                &session,
-                &format!(
-                    "## Current State\n- Initial snapshot: {}",
-                    "earlier detail ".repeat(40_000)
-                ),
-            ),
             refreshed: encode_session_memory_entry(
                 &session,
                 "## Current State\n- Refreshed snapshot: review remains active.",
@@ -1081,7 +1068,7 @@ mod tests {
         let history = (0..12)
             .map(|index| json!({
                 "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(200)),
+                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(8_000)),
             }))
             .collect();
         let mut state = loop_state(&session, history, "Summarize the review evidence.");
@@ -1093,7 +1080,7 @@ mod tests {
 
         // Compaction retrieves only at a non-Normal initial tier. Ending at
         // Normal proves the real execute_turn rerun crossed the old assertion.
-        assert_eq!(*memory.snapshot_reads.lock().unwrap(), [true, false]);
+        assert_eq!(*memory.snapshot_reads.lock().unwrap(), [false]);
         assert_eq!(
             state.last_llm_context_manifest_trace.as_ref().unwrap()["compaction_tier"],
             "Normal"

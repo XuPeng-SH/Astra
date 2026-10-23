@@ -1932,71 +1932,73 @@ async fn revalidate_admitted_model_executions_with_access(
         .filter(|offering_id| seen.insert(*offering_id))
         .collect();
 
-    let mut personal_query = QueryBuilder::<sqlx::MySql>::new(
-        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
-         context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
+    // Resolve the exact requested IDs and their deployment eligibility in one
+    // database snapshot. The personal row retains precedence, including an
+    // inactive personal row; neither discovery nor a cached catalog grants
+    // access to a deployment credential.
+    let shared_enabled = match deployment_access {
+        Some(allowed) => allowed,
+        None => deployment_mode_allows_shared_models(
+            configured_deployment_mode()
+                .map_err(ModelOfferingResolutionError::Backend)?
+                .as_deref(),
+        )
+        .map_err(ModelOfferingResolutionError::Backend)?,
+    };
+    let mut query = QueryBuilder::<sqlx::MySql>::new(
+        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url,
+                context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
+                NULL AS configuration_updated_at, NULL AS quirks_json, NULL AS pricing_json,
+                NULL AS tags_json, NULL AS max_completion_tokens, 1 AS personal
          FROM user_llm_models WHERE user_id = ",
     );
-    personal_query.push_bind(user_id).push(" AND model_id IN (");
+    query.push_bind(user_id).push(" AND model_id IN (");
     {
-        let mut separated = personal_query.separated(", ");
-        for offering_id in &unique {
-            separated.push_bind(*offering_id);
+        let mut ids = query.separated(", ");
+        for id in &unique {
+            ids.push_bind(*id);
         }
     }
-    personal_query.push(')');
+    query.push(") UNION ALL
+         SELECT model_id, model_name AS model_alias, model_name, provider, api_key_encrypted, base_url,
+                context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
+                CAST(updated_at AS CHAR) AS configuration_updated_at,
+                CAST(quirks AS CHAR) AS quirks_json, CAST(pricing AS CHAR) AS pricing_json,
+                CAST(tags AS CHAR) AS tags_json, max_completion_tokens, 0 AS personal
+         FROM infra_llm_models WHERE model_id IN (");
+    {
+        let mut ids = query.separated(", ");
+        for id in &unique {
+            ids.push_bind(*id);
+        }
+    }
+    query.push(") AND ").push_bind(shared_enabled);
+    if deployment_access.is_none() {
+        query
+            .push(
+                " AND NOT EXISTS (SELECT 1 FROM auth_external_identities
+                       WHERE astra_user_id = ",
+            )
+            .push_bind(user_id)
+            .push(" AND (provider_id LIKE 'memoria:%' OR provider_id LIKE 'uc:%'))");
+    }
     let mut personal = HashMap::new();
-    for row in personal_query
+    let mut deployment = HashMap::new();
+    for row in query
         .build()
         .fetch_all(&pool)
         .await
-        .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?
+        .map_err(|error| deployment_batch_query_error(matrixone, &unique, error))?
     {
         let id: String = row.try_get("model_id").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.model_id: {error}"
-            ))
+            ModelOfferingResolutionError::Backend(format!("invalid Offering model_id: {error}"))
         })?;
-        personal.insert(id, row);
-    }
-
-    let unresolved: Vec<&str> = unique
-        .iter()
-        .copied()
-        .filter(|id| !personal.contains_key(*id))
-        .collect();
-    let deployment_allowed = if unresolved.is_empty() {
-        false
-    } else if let Some(allowed) = deployment_access {
-        allowed
-    } else {
-        deployment_models_allowed(&pool, user_id)
-            .await
-            .map_err(ModelOfferingResolutionError::Backend)?
-    };
-    let mut deployment = HashMap::new();
-    if deployment_allowed {
-        let mut deployment_query = QueryBuilder::<sqlx::MySql>::new(format!(
-            "SELECT model_id, {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_id IN ("
-        ));
-        {
-            let mut separated = deployment_query.separated(", ");
-            for offering_id in &unresolved {
-                separated.push_bind(*offering_id);
-            }
-        }
-        deployment_query.push(')');
-        let deployment_rows = deployment_query
-            .build()
-            .fetch_all(&pool)
-            .await
-            .map_err(|error| deployment_batch_query_error(matrixone, &unresolved, error))?;
-        for row in deployment_rows {
-            let id: String = row.try_get("model_id").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid infra_llm_models.model_id: {error}"
-                ))
-            })?;
+        let is_personal: i64 = row.try_get("personal").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!("invalid Offering source: {error}"))
+        })?;
+        if is_personal != 0 {
+            personal.insert(id, row);
+        } else {
             deployment.insert(id, row);
         }
     }

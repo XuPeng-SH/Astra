@@ -12533,7 +12533,6 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             session_id: &session,
             run_id: &run,
             request: &request,
-            attempt_id: Uuid::new_v4().to_string(),
             started_at: chrono::Utc::now(),
             admission: None,
             prepared: None,
@@ -12604,28 +12603,11 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
                 .unwrap_err();
             assert!(blocked.contains("session already has an active run"));
             assert!(loser.admission.is_none());
-            loser
-                .prepared
-                .as_ref()
-                .unwrap()
-                .distributed_permit
-                .release()
-                .await
-                .unwrap();
             drop(loser);
-            let winner_permit = &participant
-                .0
-                .admission
-                .as_ref()
-                .unwrap()
-                .distributed_permit
-                .reservation()
-                .reservation_id;
-            let winner_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE reservation_id = ?")
-                .bind(winner_permit).fetch_one(pool.get()).await.unwrap();
             assert_eq!(
-                winner_count, 1,
-                "a lost claim must not release the winner's capacity"
+                service.weighted_admission.usage(&user).1.provider_slots,
+                1,
+                "a lost claim must release only its own resident capacity"
             );
             let prior = service
                 .restore_transcript_prompt_messages(&user, &session, &run, "atomic-start-test")
@@ -12674,7 +12656,6 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
         .unwrap();
         assert_eq!(count, i64::from(!reject));
         if let Some(admission) = participant.0.admission.as_ref() {
-            let _ = admission.distributed_permit.release().await;
             let _ = admission.coordinator.release_writer(&admission.lease).await;
             admission.release_started.store(true, Ordering::Release);
         }
@@ -12929,8 +12910,11 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         db_backed_test_service(&pool, &format!("capacity-it-owner-pod-{}", Uuid::new_v4()));
     service.provider_observations = Some(Default::default());
     assert!(
-        service.admission_limits.global.provider_slots >= 3
-            && service.admission_limits.per_owner.provider_slots >= 2,
+        canonical_session_admission_limits().global.provider_slots >= 3
+            && canonical_session_admission_limits()
+                .per_owner
+                .provider_slots
+                >= 2,
         "the configured deployment capacity must allow one owner to run two sessions while another owner runs one"
     );
     let llm = spawn_gated_terminal_test_llm().await;
@@ -13117,19 +13101,10 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         blocked_status.status, STATUS_RUNNING,
         "the blocked provider run must remain active until cancellation"
     );
-    let active_reservation_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)
-         FROM session_weighted_admission_reservations
-         WHERE owner_user_id = ? AND session_id = ?",
-    )
-    .bind(&owner_a)
-    .bind(&blocked_session)
-    .fetch_one(pool.get())
-    .await
-    .expect("read active blocked run admission reservation");
     assert_eq!(
-        active_reservation_count, 1,
-        "the blocked run must hold exactly one durable provider reservation before cancellation"
+        service.weighted_admission.usage(&owner_a).1.provider_slots,
+        1,
+        "the blocked run holds its process-local provider capacity"
     );
 
     let owner_a_status_before_cancel = ok(service
@@ -13158,27 +13133,13 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         "cancellation must produce the canonical cancelled terminal event: {blocked_events:?}"
     );
 
-    let reservation_released = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*)
-                 FROM session_weighted_admission_reservations
-                 WHERE owner_user_id = ? AND session_id = ?",
-            )
-            .bind(&owner_a)
-            .bind(&blocked_session)
-            .fetch_one(pool.get())
-            .await
-            .expect("read blocked run admission reservation");
-            if count == 0 {
-                break true;
-            }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.weighted_admission.usage(&owner_a).1.provider_slots != 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("cancelled run admission reservation should be released");
-    assert!(reservation_released);
+    .expect("cancelled run releases its process-local capacity");
     // The gate is already closed from the cancellation assertion above. This
     // notification is cleanup only, after the lifecycle has converged, in
     // case the loopback server still owns a response-body future.
@@ -29534,6 +29495,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         .map(|i| json!({"event_type": "tool_call_end", "data": {"seq": i}}))
         .collect();
     let mut run = DurableRunRecord {
+        terminal_receipt_json: None,
         run_id: "run-long".to_string(),
         user_id: "user-1".to_string(),
         session_id: "session-1".to_string(),
@@ -34220,117 +34182,6 @@ async fn stream_chat_explain_mode_finishes_a_short_turn() {
         }),
         "short Explain turn did not emit run_finished: {events:?}"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost mock"]
-async fn db_stream_terminal_precedes_blocked_quota_cleanup() {
-    let pool = setup_lifecycle_run_db_it().await;
-    let owner = format!("cleanup-owner-{}", Uuid::new_v4());
-    let session = format!("cleanup-session-{}", Uuid::new_v4());
-    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session).await;
-    let llm = spawn_terminal_test_llm().await;
-    let mut service = db_backed_test_service(&pool, "cleanup-test");
-    service
-        .distributed_weighted_admission
-        .as_mut()
-        .unwrap()
-        .with_admission_wait_timeout(Duration::from_secs(60));
-    let mut request = prepared_test_request("hello");
-    request.session_id = Some(session.clone());
-    request.provider_runtime_authorized = true;
-    request.admitted_model_execution = None;
-    request.runtime_auth = Some(RuntimeAuthRequest {
-        authorization: "Bearer fake-cleanup".into(),
-    });
-    request.capability_descriptors =
-        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
-            model_gateway: Some(test_runtime_descriptor(
-                "cleanup-gateway",
-                "model_gateway",
-                &format!("{}/chat/completions", llm.base_url),
-            )),
-            ..Default::default()
-        });
-    request.execution_policy.skill_auto_route =
-        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
-    let mut stream = ok(service.stream_chat(owner.clone(), request).await);
-    let run_id = stream.run_id.clone();
-    let admission_scope: String = sqlx::query_scalar(
-        "SELECT scope_name FROM session_weighted_admission_reservations WHERE owner_user_id = ? LIMIT 1",
-    ).bind(&owner).fetch_one(pool.get()).await.unwrap();
-    let mut gate = pool.get().begin().await.unwrap();
-    sqlx::query(
-        "SELECT scope_name FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
-    )
-    .bind(admission_scope)
-    .fetch_one(&mut *gate)
-    .await
-    .unwrap();
-
-    let mut events = stream.events;
-    let closed = tokio::time::timeout(Duration::from_secs(20), async {
-        while let Some(event) = stream.event_rx.as_mut().unwrap().recv().await {
-            events.push(event);
-        }
-    })
-    .await;
-    assert!(
-        closed.is_ok(),
-        "quota cleanup held the stream open: provider_requests={}, events={:?}",
-        llm.requests.load(Ordering::SeqCst),
-        events
-            .iter()
-            .map(|event| (replay_event_type(event), chat_stream_event_status(event)))
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        events.iter().any(|event| {
-            replay_event_type(event) == Some("run_finished")
-                && chat_stream_event_status(event) == Some(STATUS_COMPLETED)
-        }),
-        "{events:?}"
-    );
-    let (completed_turn, writer): (i64, Option<String>) = sqlx::query_as(
-        "SELECT completed_turn, active_writer_json FROM session_context_heads
-         WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
-    )
-    .bind(&owner)
-    .bind(&session)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(completed_turn, 1);
-    assert!(
-        writer.is_none(),
-        "canonical writer must be released before terminal delivery"
-    );
-    let count = || async {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM session_weighted_admission_reservations
-             WHERE owner_user_id = ? AND session_id = ?",
-        )
-        .bind(&owner)
-        .bind(&session)
-        .fetch_one(pool.get())
-        .await
-        .unwrap()
-    };
-    assert_eq!(
-        count().await,
-        1,
-        "the blocked quota remains conservatively reserved"
-    );
-    gate.rollback().await.unwrap();
-    assert!(
-        service
-            .drain_background_tasks(Duration::from_secs(20))
-            .await
-    );
-    assert_eq!(count().await, 0, "the owning run must finish quota cleanup");
-    cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
-    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -51,8 +51,10 @@ The design does not require one physical backend. Vector, fulltext, graph, tabul
 ## Credential authority and admission
 
 Extraction and remote session-end maintenance are Server-owned and run at
-explicit Session close/finalize boundaries. Ordinary turns do not refresh
-long-term memory; prompt recall and explicit memory tools remain available. CLI
+explicit Session close/finalize boundaries. Ordinary model rounds neither recall nor refresh long-term memory, and do not
+load the current-session memory snapshot. Explicit memory tools and HTTP recall
+remain available. This removes implicit credential resolution and remote reads
+from every model preparation; users request memory when the task needs it. CLI
 exit hands off through `POST /sessions/{session_id}/memory/finalize` using the
 selected profile's fresh access token; it preserves the resumable Session and
 never falls back to a client-side purge if the handoff fails. Explicit session
@@ -62,11 +64,11 @@ Without a bound memory provider and session identity, CLI exit skips maintenance
 The CLI memory inference adapter remains available for lesson relevance checks;
 it does not introduce a second extraction service or lesson synthesizer.
 
-The Server composes one per-user memory authority policy. Prompt recall, background extraction, explicit `memory` tools, HTTP memory routes and session-end governance must use that same policy.
+The Server composes one per-user memory authority policy. Explicit `memory` tools, HTTP memory routes, compaction and session-end governance must use that same policy.
 
 Hosted or browser-login deployments use the application-scoped credential resolver owned by authentication. Each operation resolves the current owner binding and generation; no master-key fallback is inferred by a generic pool builder.
 
-- Missing binding or `none`: normal disabled state. Prompt recall reports `NotAttempted` and does not contact Memoria.
+- Missing binding or `none`: normal disabled state. Optional memory operations report `NotAttempted` and do not contact Memoria.
 - `read_only`: recall is allowed; write-oriented extraction, reflection and session-end cleanup are not admitted.
 - `read_write`: read and write operations are allowed. Transport checks remain in place to catch revocation or changes after admission.
 
@@ -80,9 +82,8 @@ MOI native UC uses the same resolver and consumers with an explicitly enabled
 product-owned authority, not the local-password fallback or a second Memoria
 login. Current UC status and canonical issuer mapping are checked for every
 operation. Its bounded owner namespace and server-only credential are described
-in [MOI native login](../guides/moi-native-login.md#built-in-memory). Automatic
-prompt recall budgets both authorization and retrieval together; one successful
-session-start lane remains usable if the other lane times out.
+in [MOI native login](../guides/moi-native-login.md#built-in-memory). Ordinary
+model rounds do not initiate memory operations, even when this authority is enabled.
 
 Optional reads report admission through the existing `MemoriaPort` read
 operation, with one fresh authority resolution per operation and no discarded
@@ -205,27 +206,11 @@ Memoria erasure. Memoria retention and explicit memory deletion still govern the
 remote records. Successful consolidation is tracked durably per generation,
 rather than relying on a process-local 15-minute debounce timer.
 
-Session-start recall applies
-each profile/episode cap only after typed prompt admission, so invalid or
-inactive rows cannot displace valid evidence already returned by the backend.
-
-The bounded admitted authority-resolution counts are message recall 2 → 1,
-session-start recall 3 → 2, snapshot loading 2 → 1, and applicable compaction
-2 → 1. Independent session-start lanes deliberately resolve twice even when
-disabled (previously one shared preflight), with zero backend requests. No
-grant/client cache is shared between lanes or operations. These are source-level
-operation counts, not predictions for whole-chat SQL totals.
-
-Automatic prompt recall does not reuse candidates across primary-model request
-preparations solely because the turn number and user message are unchanged.
-Each preparation uses the existing current-authority admission and bounded
-retrieval path; denial, lookup failure or timeout must not restore candidates
-from an earlier preparation. Within one preparation, context-budget assembly and physical
-provider retries may reuse its local retrieval result without starting another
-retrieval. This avoids an unversioned cross-request cache; it does not promise atomic authorization
-between an in-flight retrieval and the eventual model dispatch. Any future
-asynchronous candidate selector must address that boundary explicitly before
-retaining or reusing authorized snapshots.
+The interactive Server no longer runs session-start or semantic prompt prefetch.
+The shared memory-read helpers remain available to explicit memory workflows;
+current credential and owner checks belong to each actual operation. Compaction
+may still return memory produced by that explicit context-maintenance boundary.
+Web session switching and archiving do not imply memory finalization.
 
 ## Learning boundary
 

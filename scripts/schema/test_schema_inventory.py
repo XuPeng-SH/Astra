@@ -369,8 +369,6 @@ fn char_literal() { let slash = '/'; }
             "run_display_projections",
             "conversation_log",
             "session_transcript_items",
-            "session_tool_output_batches",
-            "session_tool_outputs",
             "tool_invocation_ledger",
             "semantic_read_observations",
         }
@@ -401,10 +399,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "do not merge into agent_events",
             self.tables["agent_run_events"]["merge_guidance"],
-        )
-        self.assertIn(
-            "large payload",
-            self.tables["session_tool_outputs"]["state_class"],
         )
         self.assertIn(
             "owner lease recovery",
@@ -748,7 +742,6 @@ fn char_literal() { let slash = '/'; }
             "agent_run_events",
             "run_checkpoints",
             "conversation_log",
-            "session_tool_outputs",
             "prompt_request_records",
             "prompt_deltas",
             "agent_message_queue",
@@ -935,26 +928,17 @@ fn char_literal() { let slash = '/'; }
         for table in [
             "agent_events",
             "agent_run_events",
-            "session_tool_output_batches",
-            "session_tool_outputs",
         ]:
             with self.subTest(table=table):
                 policy = self.tables[table]["retention_policy"]
                 self.assertIn("session hard delete", policy)
                 self.assertIn("ordered bounded batches", policy)
 
-    def test_replay_and_tool_output_tables_do_not_have_independent_age_ttl(self) -> None:
+    def test_replay_tables_do_not_have_independent_age_ttl(self) -> None:
         run_events = self.tables["agent_run_events"]
         self.assertIn("no independent age-based TTL", run_events["retention_policy"])
         self.assertIn("projection repair", run_events["retention_policy"])
         self.assertIn("not rebuildable", run_events["rebuildability"])
-
-        batches = self.tables["session_tool_output_batches"]
-        outputs = self.tables["session_tool_outputs"]
-        self.assertIn("no independent age-based TTL", batches["retention_policy"])
-        self.assertIn("no independent age-based TTL", outputs["retention_policy"])
-        self.assertIn("artifact refs", outputs["retention_policy"])
-        self.assertIn("not rebuildable", outputs["rebuildability"])
 
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [

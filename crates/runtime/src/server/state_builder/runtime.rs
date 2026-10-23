@@ -112,7 +112,7 @@ pub(super) async fn build_runtime_wiring(
     }
     let resource_governor = initialize_resource_governor(shared_pool).await?;
     let capacity = crate::capacity_model::CapacityInput::from_env();
-    let admission_limits = capacity.distributed_admission_limits();
+    let admission_limits = capacity.process_admission_limits();
     let run_concurrency_limit = capacity.run_concurrency_limit();
     let mut run_lifecycle = AgenticRunLifecycleService::new(
         settings.matrixone.clone(),

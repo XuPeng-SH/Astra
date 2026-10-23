@@ -383,10 +383,9 @@ struct RunOwnerLeaseKey {
 
 /// Process-local mirror of the exact durable owner-lease safety window.
 ///
-/// Heartbeat renewal and provider-boundary authorization both extend this
-/// deadline after their exact durable lease update succeeds. Their shared
-/// operation mutex prevents the two paths from contending on the same run row
-/// or interpreting each other's in-flight update as lost authority.
+/// Only successful heartbeat renewal extends this deadline. Model boundaries
+/// consume the confirmed window locally; terminal persistence shares the
+/// heartbeat operation mutex to coordinate retirement without another lease.
 struct RunOwnerLeaseAuthority {
     state: tokio::sync::watch::Sender<RunOwnerLeaseState>,
     operation: tokio::sync::Mutex<()>,
@@ -1366,17 +1365,11 @@ impl RunEngine {
                     "run {run_id} has no active process-local owner-lease authority at generation {expected_owner_generation}"
                 )
             })?;
-        let state = authority.current_state();
-        if !state.active {
-            return Err(format!(
-                "run {run_id} owner-lease authority is no longer active at generation {expected_owner_generation}"
-            ));
-        }
-        if state.deadline <= tokio::time::Instant::now() {
-            return Err(format!(
-                "run {run_id} owner-lease authority expired before provider-boundary authorization at generation {expected_owner_generation}"
-            ));
-        }
+        Self::validate_owner_lease_state(
+            run_id,
+            expected_owner_generation,
+            authority.current_state(),
+        )?;
         Ok(authority)
     }
 
@@ -1417,12 +1410,6 @@ impl RunEngine {
             ));
         }
         Ok(())
-    }
-
-    fn owner_lease_deadline_error(run_id: &str, expected_owner_generation: u64) -> String {
-        format!(
-            "provider-boundary execution authorization reached the owner-lease safety deadline for run {run_id} at generation {expected_owner_generation}"
-        )
     }
 
     /// Start renewing the store owner's active-run lease until the returned
@@ -2149,6 +2136,7 @@ impl RunEngine {
             .map(str::to_string);
         let run_started_data = run_started_event_data(&context);
         let record = DurableRunRecord {
+            terminal_receipt_json: None,
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
@@ -4690,131 +4678,32 @@ impl UserIntentProvider for RunEngine {
                     .to_string(),
             );
         };
-        let outcome = if let Some(policy) = self.owner_lease_policy() {
+        if self.owner_lease_policy().is_some() {
+            // The opening transaction and successful heartbeat already proved
+            // this exact owner/generation until a conservative local deadline.
+            // Model rounds consume that live authority; only the heartbeat
+            // renews it. Remote controls arrive through the existing watcher,
+            // while effectful tools retain their transactional dispatch fence.
             let authority = self.owner_lease_authority(
                 user_id,
                 expected_session_id,
                 run_id,
                 expected_owner_generation,
             )?;
-            let mut lease_updates = authority.subscribe();
-            let _operation_guard = loop {
-                let state = *lease_updates.borrow_and_update();
-                Self::validate_owner_lease_state(run_id, expected_owner_generation, state)?;
-                tokio::select! {
-                    biased;
-                    changed = lease_updates.changed() => {
-                        changed.map_err(|_| {
-                            format!(
-                                "run {run_id} owner-lease authority closed during provider-boundary authorization at generation {expected_owner_generation}"
-                            )
-                        })?;
-                    }
-                    _ = tokio::time::sleep_until(state.deadline) => {
-                        let current = authority.current_state();
-                        if !current.active || current.deadline <= state.deadline {
-                            return Err(Self::owner_lease_deadline_error(
-                                run_id,
-                                expected_owner_generation,
-                            ));
-                        }
-                    }
-                    guard = authority.operation.lock() => break guard,
-                }
-            };
-
-            let mut last_error = None;
-            let mut outcome = None;
-            for attempt in 1..=OWNER_LEASE_MAX_ATTEMPTS {
-                let authorization_started_at = tokio::time::Instant::now();
-                let state = authority.current_state();
-                Self::validate_owner_lease_state(run_id, expected_owner_generation, state)?;
-                if !policy.attempt_fits(authorization_started_at, state.deadline) {
-                    return Err(Self::owner_lease_deadline_error(
-                        run_id,
-                        expected_owner_generation,
-                    ));
-                }
-                let authorization = self.store.authorize_execution_boundary(
-                    RunExecutionBoundaryAuthorizationRequest {
-                        user_id,
-                        run_id,
-                        expected_session_id,
-                        expected_owner_generation,
-                    },
-                );
-                let result = tokio::select! {
-                    biased;
-                    changed = lease_updates.changed() => {
-                        changed.map_err(|_| {
-                            format!(
-                                "run {run_id} owner-lease authority closed during provider-boundary authorization at generation {expected_owner_generation}"
-                            )
-                        })?;
-                        Self::validate_owner_lease_state(
-                            run_id,
-                            expected_owner_generation,
-                            *lease_updates.borrow_and_update(),
-                        )?;
-                        continue;
-                    }
-                    result = tokio::time::timeout(policy.attempt_wait, authorization) => result,
-                };
-                match result {
-                    Ok(Ok(RunExecutionBoundaryAuthorization::Authorized { lease_renewed })) => {
-                        if lease_renewed {
-                            authority.refresh(policy.fence_deadline(authorization_started_at));
-                        }
-                        outcome =
-                            Some(RunExecutionBoundaryAuthorization::Authorized { lease_renewed });
-                        break;
-                    }
-                    Ok(Ok(resolved)) => {
-                        outcome = Some(resolved);
-                        break;
-                    }
-                    Ok(Err(error)) => {
-                        last_error = Some(error);
-                        tracing::warn!(
-                            target: "astra_runtime::run_engine",
-                            run_id,
-                            expected_owner_generation,
-                            attempt,
-                            "provider-boundary execution authorization failed"
-                        );
-                    }
-                    Err(_) => {
-                        last_error = Some(format!(
-                            "provider-boundary execution authorization attempt timed out after {}ms",
-                            policy.attempt_wait.as_millis()
-                        ));
-                        tracing::warn!(
-                            target: "astra_runtime::run_engine",
-                            run_id,
-                            expected_owner_generation,
-                            attempt,
-                            timeout_ms = policy.attempt_wait.as_millis() as u64,
-                            "provider-boundary execution authorization timed out"
-                        );
-                    }
-                }
+            if authority.current_state().terminal_in_progress {
+                return Err("provider dispatch cannot overlap terminal settlement".into());
             }
-            outcome.ok_or_else(|| {
-                format!(
-                    "provider-boundary execution authorization failed after {OWNER_LEASE_MAX_ATTEMPTS} attempts for run {run_id}: {}",
-                    last_error.unwrap_or_else(|| "unknown authorization failure".to_string())
-                )
-            })?
-        } else {
-            self.store
-                .authorize_execution_boundary(RunExecutionBoundaryAuthorizationRequest {
-                    user_id,
-                    run_id,
-                    expected_session_id,
-                    expected_owner_generation,
-                })
-                .await?
-        };
+            return Ok(ProviderBoundaryAuthorization::Authorized);
+        }
+        let outcome = self
+            .store
+            .authorize_execution_boundary(RunExecutionBoundaryAuthorizationRequest {
+                user_id,
+                run_id,
+                expected_session_id,
+                expected_owner_generation,
+            })
+            .await?;
         Ok(match outcome {
             RunExecutionBoundaryAuthorization::Authorized { .. } => {
                 ProviderBoundaryAuthorization::Authorized
@@ -5736,271 +5625,133 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_boundary_refreshes_heartbeat_without_competing_renewal() {
+    async fn model_rounds_reuse_exact_owner_without_store_calls_or_extending_the_lease() {
         let store = Arc::new(
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_provider_authorization_delay(Duration::from_secs(25)),
+                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120)),
         );
         let engine = RunEngine::new(store.clone());
         let execution = engine
             .start_run("run-1", "user-1", "session-1")
             .await
-            .expect("run start");
+            .unwrap();
         let guard = engine
             .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "run-1".to_string(),
+                "user-1".into(),
+                "session-1".into(),
+                "run-1".into(),
                 execution.owner_generation,
                 test_confirmed_execution_authority(&engine),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio_util::sync::CancellationToken::new()),
             )
-            .expect("heartbeat-enabled store");
-        let initial_deadline = engine
+            .unwrap();
+        let authority = engine
             .owner_lease_authority("user-1", "session-1", "run-1", execution.owner_generation)
-            .expect("active lease authority")
-            .current_state()
-            .deadline;
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
+            .unwrap();
+        let deadline = authority.current_state().deadline;
+        let identity =
+            UserIntentAdmissionAuthority::DurableOwnerGeneration(execution.owner_generation);
+        for _ in 0..4 {
+            assert_eq!(
                 UserIntentProvider::authorize_provider_boundary(
                     &engine,
                     "user-1",
                     "session-1",
                     "run-1",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
+                    identity,
                 )
                 .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(25)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            authorization.await.expect("authorization task").unwrap(),
-            ProviderBoundaryAuthorization::Authorized
-        );
-        let refreshed_deadline = engine
-            .owner_lease_authority("user-1", "session-1", "run-1", execution.owner_generation)
-            .expect("refreshed lease authority")
-            .current_state()
-            .deadline;
-        assert!(refreshed_deadline > initial_deadline);
-        assert_eq!(
-            store.lease_renewals(),
-            0,
-            "the heartbeat must not issue a competing lease update while provider authorization owns the lease operation"
-        );
-        drop(guard);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn provider_live_authority_reread_does_not_fabricate_a_new_lease_window() {
-        let store = Arc::new(
-            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_lease_renewal_behavior(LeaseRenewalBehavior::Pending)
-                .with_first_provider_authorization_delay(Duration::from_secs(31))
-                .with_provider_authorization_delay(Duration::from_secs(20))
-                .with_provider_authorization_live_reread(),
-        );
-        let engine = RunEngine::new(store.clone());
-        let execution = engine
-            .start_run("provider-live-reread", "user-1", "session-1")
-            .await
-            .expect("run start");
-        let lease_lost = Arc::new(AtomicBool::new(false));
-        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = engine
-            .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "provider-live-reread".to_string(),
-                execution.owner_generation,
-                test_confirmed_execution_authority(&engine),
-                lease_lost.clone(),
-                cancel.clone(),
-            )
-            .expect("heartbeat-enabled store");
-        let initial_deadline = engine
-            .owner_lease_authority(
+                .unwrap(),
+                ProviderBoundaryAuthorization::Authorized
+            );
+            assert_eq!(authority.current_state().deadline, deadline);
+        }
+        assert_eq!(store.provider_authorizations(), 0);
+        assert_eq!(store.lease_renewals(), 0);
+        for (user, session, generation) in [
+            ("other-user", "session-1", execution.owner_generation),
+            ("user-1", "other-session", execution.owner_generation),
+            ("user-1", "session-1", execution.owner_generation + 1),
+        ] {
+            assert!(
+                UserIntentProvider::authorize_provider_boundary(
+                    &engine,
+                    user,
+                    session,
+                    "run-1",
+                    UserIntentAdmissionAuthority::DurableOwnerGeneration(generation)
+                )
+                .await
+                .is_err()
+            );
+        }
+        let terminal = RunOwnerLeaseTerminalAuthority(Arc::clone(&authority));
+        let operation = terminal.begin().await.unwrap();
+        assert!(
+            UserIntentProvider::authorize_provider_boundary(
+                &engine,
                 "user-1",
                 "session-1",
-                "provider-live-reread",
-                execution.owner_generation,
+                "run-1",
+                identity,
             )
-            .expect("active lease authority")
-            .current_state()
-            .deadline;
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
-                UserIntentProvider::authorize_provider_boundary(
-                    &engine,
-                    "user-1",
-                    "session-1",
-                    "provider-live-reread",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
-                )
-                .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 1);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 2);
-        tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            authorization.await.expect("authorization task").unwrap(),
-            ProviderBoundaryAuthorization::Authorized
+            .await
+            .unwrap_err()
+            .contains("terminal settlement")
         );
-        assert_eq!(
-            engine
-                .owner_lease_authority(
-                    "user-1",
-                    "session-1",
-                    "provider-live-reread",
-                    execution.owner_generation,
-                )
-                .expect("live reread keeps existing authority")
-                .current_state()
-                .deadline,
-            initial_deadline,
-            "a live-authority reread must not claim that durable expiry advanced"
-        );
-
-        tokio::task::yield_now().await;
-        assert_eq!(store.lease_renewals(), 1);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert!(tokio::time::Instant::now() < initial_deadline);
-        assert!(lease_lost.load(Ordering::Acquire));
-        assert!(cancel.is_cancelled());
-        assert_eq!(
-            store.lease_renewals(),
-            1,
-            "the old fence must reject a second attempt that cannot finish safely"
-        );
+        drop(operation);
         drop(guard);
+        assert!(
+            UserIntentProvider::authorize_provider_boundary(
+                &engine,
+                "user-1",
+                "session-1",
+                "run-1",
+                identity,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_boundary_wait_fails_closed_when_heartbeat_stops() {
+    async fn expired_confirmed_owner_cannot_dispatch_even_before_the_watcher_runs() {
         let store = Arc::new(
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_provider_authorization_delay(Duration::from_secs(25)),
-        );
-        let engine = RunEngine::new(store);
-        let execution = engine
-            .start_run("run-1", "user-1", "session-1")
-            .await
-            .expect("run start");
-        let guard = engine
-            .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "run-1".to_string(),
-                execution.owner_generation,
-                test_confirmed_execution_authority(&engine),
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(tokio_util::sync::CancellationToken::new()),
-            )
-            .expect("heartbeat-enabled store");
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
-                UserIntentProvider::authorize_provider_boundary(
-                    &engine,
-                    "user-1",
-                    "session-1",
-                    "run-1",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
-                )
-                .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        drop(guard);
-        let error = authorization
-            .await
-            .expect("authorization task")
-            .expect_err("stopped heartbeat must fence provider authorization");
-        assert!(error.contains("no longer active"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn each_provider_boundary_attempt_receives_an_independent_thirty_second_budget() {
-        let store = Arc::new(
-            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_provider_authorization_delay(Duration::from_secs(31)),
+                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120)),
         );
         let engine = RunEngine::new(store.clone());
-        let execution = engine
-            .start_run("provider-timeout", "user-1", "session-1")
-            .await
-            .expect("run start");
         let guard = engine
             .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "provider-timeout".to_string(),
-                execution.owner_generation,
+                "user-1".into(),
+                "session-1".into(),
+                "run-1".into(),
+                7,
                 test_confirmed_execution_authority(&engine),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio_util::sync::CancellationToken::new()),
             )
-            .expect("heartbeat-enabled store");
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
-                UserIntentProvider::authorize_provider_boundary(
-                    &engine,
-                    "user-1",
-                    "session-1",
-                    "provider-timeout",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
-                )
-                .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 1);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 2);
-        assert!(!authorization.is_finished());
-
-        tokio::time::advance(Duration::from_secs(29)).await;
-        tokio::task::yield_now().await;
-        assert!(!authorization.is_finished());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let error = authorization
+            .unwrap();
+        let authority = engine
+            .owner_lease_authority("user-1", "session-1", "run-1", 7)
+            .unwrap();
+        authority
+            .state
+            .send_modify(|state| state.deadline = tokio::time::Instant::now());
+        assert!(
+            UserIntentProvider::authorize_provider_boundary(
+                &engine,
+                "user-1",
+                "session-1",
+                "run-1",
+                UserIntentAdmissionAuthority::DurableOwnerGeneration(7),
+            )
             .await
-            .expect("authorization task")
-            .expect_err("both bounded attempts must time out");
-        assert!(error.contains("failed after 2 attempts"));
+            .unwrap_err()
+            .contains("expired")
+        );
+        assert_eq!(store.provider_authorizations(), 0);
         drop(guard);
     }
 
@@ -7222,9 +6973,6 @@ mod tests {
         lease_duration: Option<Duration>,
         lease_renewal_behavior: LeaseRenewalBehavior,
         lease_release_behavior: LeaseReleaseBehavior,
-        provider_authorization_first_delay: Option<Duration>,
-        provider_authorization_delay: Option<Duration>,
-        provider_authorization_renews_lease: bool,
         terminal_transition_delay: Option<Duration>,
         provider_authorizations: AtomicUsize,
         lease_renewals: AtomicUsize,
@@ -7274,9 +7022,6 @@ mod tests {
                 lease_duration: None,
                 lease_renewal_behavior: LeaseRenewalBehavior::Renew,
                 lease_release_behavior: LeaseReleaseBehavior::Succeed,
-                provider_authorization_first_delay: None,
-                provider_authorization_delay: None,
-                provider_authorization_renews_lease: true,
                 terminal_transition_delay: None,
                 provider_authorizations: AtomicUsize::new(0),
                 lease_renewals: AtomicUsize::new(0),
@@ -7334,21 +7079,6 @@ mod tests {
 
         fn with_lease_release_behavior(mut self, behavior: LeaseReleaseBehavior) -> Self {
             self.lease_release_behavior = behavior;
-            self
-        }
-
-        fn with_provider_authorization_delay(mut self, delay: Duration) -> Self {
-            self.provider_authorization_delay = Some(delay);
-            self
-        }
-
-        fn with_first_provider_authorization_delay(mut self, delay: Duration) -> Self {
-            self.provider_authorization_first_delay = Some(delay);
-            self
-        }
-
-        fn with_provider_authorization_live_reread(mut self) -> Self {
-            self.provider_authorization_renews_lease = false;
             self
         }
 
@@ -7897,25 +7627,8 @@ mod tests {
             &self,
             request: astra_services::runs::RunExecutionBoundaryAuthorizationRequest<'_>,
         ) -> Result<astra_services::runs::RunExecutionBoundaryAuthorization, String> {
-            let attempt = self.provider_authorizations.fetch_add(1, Ordering::SeqCst);
-            let delay = if attempt == 0 {
-                self.provider_authorization_first_delay
-                    .or(self.provider_authorization_delay)
-            } else {
-                self.provider_authorization_delay
-            };
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            }
-            let outcome = self.inner.authorize_execution_boundary(request).await?;
-            Ok(match outcome {
-                astra_services::runs::RunExecutionBoundaryAuthorization::Authorized { .. } => {
-                    astra_services::runs::RunExecutionBoundaryAuthorization::Authorized {
-                        lease_renewed: self.provider_authorization_renews_lease,
-                    }
-                }
-                outcome => outcome,
-            })
+            self.provider_authorizations.fetch_add(1, Ordering::SeqCst);
+            self.inner.authorize_execution_boundary(request).await
         }
 
         async fn release_owner_lease(

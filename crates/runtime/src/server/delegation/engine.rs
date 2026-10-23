@@ -9753,6 +9753,7 @@ mod tests {
 
         let records = vec![
             DurableRunRecord {
+                terminal_receipt_json: None,
                 run_id: "sub-1".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9790,6 +9791,7 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                terminal_receipt_json: None,
                 run_id: "sub-2".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9827,6 +9829,7 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                terminal_receipt_json: None,
                 run_id: "sub-3".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9865,6 +9868,7 @@ mod tests {
             },
             // Root run — should be skipped
             DurableRunRecord {
+                terminal_receipt_json: None,
                 run_id: "root-run".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),

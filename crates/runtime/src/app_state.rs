@@ -756,10 +756,15 @@ impl AppState {
     /// Passively drain server-owned run tasks before removing their durable
     /// resources or closing database pools.
     pub async fn drain_background_runs(&self, timeout: std::time::Duration) -> bool {
-        self.execution
+        let drained = self
+            .execution
             .run_lifecycle_service
             .drain_background_tasks(timeout)
-            .await
+            .await;
+        if drained && let Some(runtime) = self.matrix_cloud_runtime.as_ref() {
+            runtime.shutdown_ingestion_and_wait().await;
+        }
+        drained
     }
 
     /// Abort server-owned run tasks after a preceding passive drain could not
