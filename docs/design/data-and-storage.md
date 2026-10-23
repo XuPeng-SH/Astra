@@ -94,6 +94,12 @@ does not silently add the journal to an old completion marker. Database
 replacement and preservation of existing data require an operator-owned rollout;
 this memory change performs no automatic reset or migration.
 
+The CLI's composite checkpoint index is committed atomically with its local
+checkpoint. It is not mirrored into `session_artifacts`: Server recovery uses
+canonical Run checkpoints and conversation state, and CLI debug reads the local
+index. Checkpoint finalization performs no remote index merge or duplicate
+projection write.
+
 ## Transcript persistence
 
 Fresh schema contract `2026-10-08-v101` stores transcript items and their

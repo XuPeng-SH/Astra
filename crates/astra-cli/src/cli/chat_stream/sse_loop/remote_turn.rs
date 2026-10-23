@@ -236,7 +236,6 @@ impl RemoteTurnState {
             session_id,
             self.session_turn.max(1),
             checkpoint,
-            None,
         ) {
             self.stall.last_heavy_checkpoint = Some(checkpoint);
         }
