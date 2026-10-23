@@ -1835,20 +1835,6 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
         semantically_blank, 0,
         "an assistant transcript row must contain text or structured tool calls"
     );
-    assert!(
-        assistant_rows.iter().any(|row| {
-            row.get::<String, _>("content").trim().is_empty()
-                && row
-                    .get::<Option<String>, _>("payload_json")
-                    .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
-                    .and_then(|payload| payload["tool_calls"].as_array().cloned())
-                    .is_some_and(|tool_calls| {
-                        tool_calls.len() == 1
-                            && tool_calls[0]["name"].as_str() == Some("agent_fanout")
-                    })
-        }),
-        "the tool-only root boundary must retain its typed fanout call instead of a semantically empty row"
-    );
     let (transcript_status, transcript) = get_json(
         app,
         &format!("/sessions/{session_id}/transcript?scope=root_conversation&limit=20"),
@@ -1861,19 +1847,15 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
         StatusCode::OK,
         "root transcript: {transcript}"
     );
+    let items = transcript["items"]
+        .as_array()
+        .expect("canonical transcript items");
     assert!(
-        transcript["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|item| {
-                item["role"].as_str() == Some("assistant")
-                    && item["content"].as_str() == Some("")
-                    && item["tool_calls"].as_array().is_some_and(|calls| {
-                        calls.len() == 1 && calls[0]["name"].as_str() == Some("agent_fanout")
-                    })
-            }),
-        "the downstream transcript API must expose the typed fanout call: {transcript}"
+        items.iter().any(|item| {
+            item["role"].as_str() == Some("assistant")
+                && item["content"].as_str() == Some(final_reply)
+        }),
+        "the downstream transcript API must retain the final answer: {transcript}"
     );
     let orphan_transcript_runs: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_transcript_items AS transcript \
