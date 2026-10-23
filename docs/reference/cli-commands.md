@@ -314,6 +314,9 @@ Returned conversation can merge with an existing conversation draft. Commands
 and shell drafts stay separate: “Unsent drafts” shows retained input, which
 moves into the composer after the current draft is sent or cleared. Each draft
 requires a new submission gesture; restoration never sends it automatically.
+Navigation also preserves the draft suspended while browsing history, including
+pasted content. An unchanged recalled message remains in history; edited recall
+and distinct original drafts return for editing through the same unsent list.
 These editable drafts remain local to the running client.
 Ctrl+R also restores the latest conversation with its slash escape, so editing
 and resending `/exit` text keeps it a message. The transcript shows the original

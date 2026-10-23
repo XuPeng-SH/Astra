@@ -2288,9 +2288,8 @@ impl BottomPane {
 
     /// A command/view starts another draft without discarding ongoing editing.
     pub(crate) fn start_composer_draft(&mut self, text: &str) {
-        let existing = self.composer.take_draft();
-        if !existing.trim().is_empty() {
-            self.restored_drafts.push_front(existing);
+        for draft in self.composer.take_recoverable_drafts().into_iter().rev() {
+            self.restored_drafts.push_front(draft);
         }
         self.replace_composer_text(text);
     }

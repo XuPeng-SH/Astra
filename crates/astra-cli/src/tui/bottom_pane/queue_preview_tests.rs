@@ -778,3 +778,96 @@ fn clearing_a_paste_keeps_a_trailing_newline_from_submitting_recovery() {
         }
     }
 }
+
+#[test]
+fn picker_navigation_transfers_suspended_history_drafts_and_pastes() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer, info_view::InfoView};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for (original, recalled_edit) in [
+        ("original draft".to_owned(), None),
+        (
+            "original draft".to_owned(),
+            Some("edited history".to_owned()),
+        ),
+        ("same".to_owned(), Some("same".to_owned())),
+        (String::new(), None),
+        (
+            "original paste\n".repeat(100),
+            Some("edited paste\n".repeat(100)),
+        ),
+    ] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        pane.handle_paste("previous message");
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BottomPaneAction::SubmitInput(_)
+        ));
+        pane.handle_paste(&original);
+        pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        if let Some(edit) = &recalled_edit {
+            pane.composer.set_text("");
+            pane.handle_paste(edit);
+        }
+        pane.push_view(Box::new(InfoView::from_plain(
+            "Memory Stats",
+            vec!["ready".into()],
+        )));
+        pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(!pane.has_active_view());
+        assert_eq!(pane.composer.text(), "/");
+        let mut expected = Vec::new();
+        if let Some(edit) = recalled_edit {
+            expected.push(edit);
+        }
+        if !original.is_empty() && !expected.contains(&original) {
+            expected.push(original);
+        }
+        assert_eq!(
+            pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        if expected.is_empty() {
+            assert!(pane.composer.is_empty());
+        } else {
+            let BottomPaneAction::SubmitInput(raw) =
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("fresh gesture submits retained editing");
+            };
+            assert_eq!(
+                raw,
+                expected
+                    .iter()
+                    .map(|s| s.trim_end())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+                    + if expected.last().is_some_and(|s| s.ends_with('\n')) {
+                        "\n"
+                    } else {
+                        ""
+                    }
+            );
+        }
+    }
+}
+
+#[test]
+fn history_suspension_transfers_pending_paste_bytes_before_up() {
+    use super::chat_composer::ChatComposer;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.composer.set_text("previous");
+    pane.composer.clear_and_submit();
+    pane.composer.set_text("original ");
+    pane.composer
+        .force_pending_paste_burst_for_test("pending bytes", Instant::now());
+    pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    pane.start_composer_draft("/help");
+    assert_eq!(
+        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        vec!["original pending bytes"]
+    );
+}

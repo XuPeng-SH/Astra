@@ -150,14 +150,27 @@ impl ChatComposer {
         expanded
     }
 
-    /// Move editable content without creating history or submission feedback.
-    pub(crate) fn take_draft(&mut self) -> String {
+    /// Transfer all unsent editing content before clearing its history/paste
+    /// state. An unchanged recalled entry remains available in history.
+    pub(crate) fn take_recoverable_drafts(&mut self) -> Vec<String> {
         let raw = self.textarea.take_text();
-        let text = self.expand_pastes(&raw);
+        let visible = self.expand_pastes(&raw);
+        let mut drafts = Vec::with_capacity(2);
+        let unchanged_recall = self
+            .history_index
+            .is_some_and(|i| self.history[i] == visible);
+        if !unchanged_recall && !visible.trim().is_empty() {
+            drafts.push(visible);
+        }
+        if let Some(raw) = self.draft.take() {
+            let suspended = self.expand_pastes(&raw);
+            if !suspended.trim().is_empty() && !drafts.contains(&suspended) {
+                drafts.push(suspended);
+            }
+        }
         self.history_index = None;
-        self.draft = None;
         self.pasted_blobs.clear();
-        text
+        drafts
     }
 
     pub fn clear_draft(&mut self) {
@@ -451,7 +464,7 @@ impl ChatComposer {
         }
         match self.history_index {
             None => {
-                self.draft = Some(self.textarea.text().to_string());
+                self.draft = Some(self.textarea.take_text());
                 self.history_index = Some(self.history.len() - 1);
             }
             Some(0) => return,
