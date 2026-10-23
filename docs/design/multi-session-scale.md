@@ -260,6 +260,14 @@ retaining only the refill semaphore. Refills do not acquire owner-local permits
 or spend capacity from local state. Every attempt uses the
 same transaction implementation, repairs due/dirty partitions and checks exact
 replay and owner/global limits.
+Due or dirty gates already locked by an attempt are repaired as one bounded
+batch: expire their reservations, aggregate their remaining usage, rebuild
+their owner counters only when needed, and publish their gate totals together.
+An early expiry frontier with no expired rows refreshes only the frontier.
+Configuration changes and donor credit transfers likewise publish their
+already-validated allocation plan in one statement. Gate acquisition remains
+in ascending order; batching does not add a cache or change transaction custody.
+
 It transfers only unused donor credit and grants atomically. Per deficient
 resource, the transfer targets the greater of the exact deficit and one
 sixteenth of global capacity, capped by available donor credit. Fragmentation
@@ -283,7 +291,7 @@ original deadline and cancellation-safe transaction. Release needs no clock.
 Exact logical identities and generation UUIDs fence stale renewals and releases.
 
 A future expiry frontier avoids a reservation scan. Due/dirty repair rebuilds
-only the locked partition and parses wide decimal sums without signed overflow.
+only affected locked partitions and parses wide decimal sums without signed overflow.
 Successful cleanup commits even when admission is rejected. Replays remain
 valid at full capacity without a provisional INSERT; changed work is a mismatch.
 

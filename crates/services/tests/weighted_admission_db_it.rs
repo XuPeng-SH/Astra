@@ -705,12 +705,33 @@ async fn expired_reservations_are_cleaned_before_capacity_rotation() {
         .try_reserve(
             &key("expired-owner"),
             work(),
-            Duration::from_millis(10),
+            Duration::from_secs(30),
             "expired-turn",
         )
         .await
-        .expect("short-lived reservation");
-    tokio::time::sleep(Duration::from_millis(40)).await;
+        .expect("original reservation");
+    let second_key = key(&(0..)
+        .map(|index| format!("other-expired-owner-{index}"))
+        .find(|owner| owner_scope(owner) != owner_scope("expired-owner"))
+        .unwrap());
+    let second_permit = old
+        .try_reserve(
+            &second_key,
+            work(),
+            Duration::from_secs(30),
+            "second-expired-turn",
+        )
+        .await
+        .expect("a second partition holds independent capacity");
+    // Expire both reservations deterministically, including their conservative
+    // gate frontiers. Rotation must repair both owners in one transaction.
+    sqlx::query("UPDATE session_weighted_admission_reservations SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE reservation_id IN (?, ?)")
+        .bind(&old_permit.reservation().reservation_id)
+        .bind(&second_permit.reservation().reservation_id)
+        .execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE session_weighted_admission_gates SET earliest_expiry_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name IN (?, ?)")
+        .bind(owner_scope("expired-owner")).bind(owner_scope(&second_key.owner_user_id))
+        .execute(pool.get()).await.unwrap();
 
     let new_permit = changed
         .try_reserve(
@@ -721,6 +742,20 @@ async fn expired_reservations_are_cleaned_before_capacity_rotation() {
         )
         .await
         .expect("expired reservation should no longer fence rotation");
+    assert_partition_capacity(&pool, limits(4).global).await;
+    let stale_owners: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_weighted_admission_owner_usage WHERE owner_user_id IN (?, ?)",
+    )
+    .bind("expired-owner")
+    .bind(&second_key.owner_user_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(stale_owners, 0, "rotation must reclaim both expired owners");
+    second_permit
+        .release()
+        .await
+        .expect("second expired release remains idempotent");
     new_permit
         .release()
         .await
