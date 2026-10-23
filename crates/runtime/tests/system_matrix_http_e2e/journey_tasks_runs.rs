@@ -516,7 +516,6 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
     use astra_services::runs::{CheckpointWriteAuthority, RunCheckpointWriteRequest};
     use futures_util::FutureExt;
     use serde_json::Value;
-    use sha2::{Digest, Sha256};
     use sqlx::Row;
     use std::{panic::AssertUnwindSafe, sync::Arc, task::Poll, time::Duration};
     use tokio::sync::Notify;
@@ -747,8 +746,8 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let saved_result = saved_messages.iter()
             .find(|m| m["role"] == "tool" && m["tool_call_id"] == *saved_id).unwrap();
         assert_eq!(results[0]["content"], saved_result["content"], "restore exact settled tool output");
-        // Run accounting settles independently of the canonical turn. Hold
-        // its actual head so this ordering cannot depend on database timing.
+        // Run terminal and Context commit atomically. Hold the actual head:
+        // terminal accounting must not escape before that commit can succeed.
         let canonical_key: astra_turn_types::SessionKeyV1 =
             serde_json::from_value(source["key"].clone()).unwrap();
         let mut canonical_head = ctx.pool.begin().await.unwrap();
@@ -759,7 +758,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
             .bind(&canonical_key.session_id).bind(&canonical_key.branch_id)
             .fetch_one(&mut *canonical_head).await.unwrap();
         gates.0[1].notify_one();
-        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+        let await_terminal = || async {
             loop {
                 let terminal = store.load_run(&ctx.user_id, &run_id).await?
                     .ok_or_else(|| "resumed run disappeared before settlement".to_string())?;
@@ -769,11 +768,13 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await;
-        // Release even when the bounded observation failed, before unwrapping
-        // it, so fixture teardown cannot wait on our own projection lock.
+        };
+        let blocked_terminal = tokio::time::timeout(Duration::from_millis(200), await_terminal()).await;
+        // Always release the barrier before assertions and fixture teardown.
         canonical_head.rollback().await.expect("release canonical commit barrier");
-        let terminal = terminal.expect("run accounting settles while canonical commit is blocked")
+        assert!(blocked_terminal.is_err(), "Run terminal cannot precede the atomic Context commit");
+        let terminal = tokio::time::timeout(Duration::from_secs(15), await_terminal()).await
+            .expect("atomic terminal settles after releasing Context head")
             .expect("read exact-generation terminal settlement");
         assert_eq!(blocked_turn + 1, turn as i64,
             "the reserved canonical turn was still uncommitted at run settlement");
@@ -839,42 +840,23 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(final_budget["remaining_iterations"], 2);
         assert_eq!(final_budget["effective_hard_turn_limit"], 4);
 
-        // Correlate each physical call with its canonical inference and route
-        // instead of accepting aggregate run totals as provider evidence.
-        let attempts = sqlx::query(
-            "SELECT a.attempt_id, a.status, a.usage_status, a.input_tokens, a.output_tokens,
-                    a.session_id, a.run_id, a.provider_wire_bytes, a.provider_wire_hash,
-                    i.invocation_id, i.turn_index, i.round_index,
-                    i.session_id AS invocation_session, i.run_id AS invocation_run,
-                    r.session_id AS route_session, r.run_id AS route_run,
-                    r.offering_id, r.resolved_model_name
-             FROM inference_provider_attempts a
-             JOIN inference_invocations i ON i.user_id = a.user_id AND i.invocation_id = a.invocation_id
-             JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id
-             WHERE a.user_id = ? AND a.run_id = ? AND i.purpose = 'primary_agent'
-             ORDER BY i.round_index, a.attempt_index"
-        ).bind(&ctx.user_id).bind(&run_id).fetch_all(&ctx.pool).await.unwrap();
-        assert_eq!(attempts.len(), 2);
-        for (index, row) in attempts.iter().enumerate() {
-            for column in ["session_id", "invocation_session", "route_session"] {
-                assert_eq!(row.get::<String, _>(column), ctx.session_id);
-            }
-            for column in ["run_id", "invocation_run", "route_run"] {
-                assert_eq!(row.get::<String, _>(column), run_id);
-            }
-            assert_eq!(row.get::<String, _>("offering_id"), ctx.model_offering_id);
-            assert_eq!(row.get::<String, _>("resolved_model_name"), format!("mock-{}", ctx.suffix));
-            assert_eq!(row.get::<String, _>("status"), "succeeded");
-            assert_eq!(row.get::<String, _>("usage_status"), "provider_exact");
-            assert_eq!(row.get::<i64, _>("turn_index"), turn as i64);
-            assert_eq!((row.get::<i64, _>("input_tokens"), row.get::<i64, _>("output_tokens")), [(42, 7), (52, 11)][index]);
-            assert_eq!(row.get::<i64, _>("provider_wire_bytes"), requests[index].raw_body.len() as i64);
-            assert_eq!(row.get::<String, _>("provider_wire_hash"), format!("{:x}", Sha256::digest(&requests[index].raw_body)),
-                "database attempt identifies the exact captured provider body");
+        // Actual HTTP requests above prove both dispatches and exact restored
+        // input; Run accounting above preserves cumulative usage across restart.
+        // Round trace is process-local diagnostic history, not a second durable
+        // execution ledger: only the resumed round is emitted at settlement.
+        let rounds = sqlx::query(
+            "SELECT llm_model_used, CAST(token_usage AS CHAR) AS token_usage
+             FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND event_type = 'llm_round_completed' ORDER BY created_at"
+        ).bind(&ctx.user_id).bind(&ctx.session_id).bind(&run_id)
+            .fetch_all(&ctx.pool).await.unwrap();
+        assert_eq!(rounds.len(), 1);
+        for row in &rounds {
+            assert_eq!(row.get::<String, _>("llm_model_used"), format!("mock-{}", ctx.suffix));
+            let usage: Value = serde_json::from_str(&row.get::<String, _>("token_usage")).unwrap();
+            assert_eq!((usage["input_tokens"].as_u64(), usage["output_tokens"].as_u64()),
+                (Some(52), Some(11)));
         }
-        assert_ne!(attempts[0].get::<String, _>("attempt_id"), attempts[1].get::<String, _>("attempt_id"));
-        assert_ne!(attempts[0].get::<String, _>("invocation_id"), attempts[1].get::<String, _>("invocation_id"));
-        assert_eq!(attempts[1].get::<i64, _>("round_index"), attempts[0].get::<i64, _>("round_index") + 1);
         assert_eq!(store.load_latest_checkpoint(&ctx.user_id, &run_id, Some("execution_handoff"))
             .await.unwrap().unwrap(), checkpoint);
         }).await.expect("bounded public execution handoff regression");
