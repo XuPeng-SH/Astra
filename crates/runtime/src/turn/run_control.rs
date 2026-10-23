@@ -44,9 +44,10 @@ pub struct UserIntentInvocationApplication<'a> {
     pub purpose: astra_services::runs::UserIntentApplyPurpose<'a>,
 }
 
-/// Exact decision at one externally metered provider boundary. Only
-/// `Authorized` permits calling the provider; durable-store failures and lost
-/// ownership remain distinguishable from a terminal/inactive run.
+/// Decision under the admitted execution owner's live lease. Only `Authorized`
+/// permits calling the provider. Shared-store runtimes reuse their confirmed
+/// lease locally; the heartbeat and control watcher own remote observation.
+/// Tool-effect dispatch retains its separate transactional admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderBoundaryAuthorization {
     Authorized,

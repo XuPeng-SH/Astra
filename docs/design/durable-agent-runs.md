@@ -583,3 +583,14 @@ and does not claim recovery of volatile in-process envelopes after process loss.
   most one executor; deferred activation and blocking waits do not auto-start.
 - Native client release targets acquire, conflict, release, and reacquire the
   session execution authority before they are packaged.
+
+### Tool output ownership
+
+Ordinary tool batches no longer populate separate `session_tool_outputs` and
+`session_tool_output_batches` tables. Those write-only mirrors and their preview
+mapping registry are retired. The shared loop retains governed observations for
+the model and canonical transcript; durable invocation receipts retain actual
+effect outcomes and uncertainty. Explicit large artifacts continue to use the
+existing owner-checked artifact store and its reference/retention lifecycle.
+There is no second per-batch payload transaction or synthetic `tool_output://`
+artifact scheme.

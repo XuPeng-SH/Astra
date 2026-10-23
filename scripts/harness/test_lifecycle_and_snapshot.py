@@ -968,7 +968,6 @@ time.sleep(30)
         self.assertIn("ASTRA_HARNESS_SNAPSHOT_ROOT_FD", source)
         self.assertIn("crates/runtime/src/server/sweeper_lease.rs", source)
         self.assertIn("crates/runtime/src/server/tool_invocation_compactor.rs", source)
-        self.assertIn("crates/services/src/weighted_admission.rs", source)
         self.assertIn(
             "crates/services/src/work/establishment_operation.rs", source
         )

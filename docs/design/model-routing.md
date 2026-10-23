@@ -47,6 +47,22 @@ Server inference requires admitted Offering material before using a cached
 request configuration. Legacy model-name fallback metadata does not authorize
 a route change. Rate-limit waits and physical retries retain the admitted route;
 a different Offering must pass model admission before execution.
+Within a live Server execution, an admitted Offering is reused for up to
+30 seconds across model and readonly-tool rounds. Config projection and cache
+hits do not renew this grant. On expiry, canonical admission refreshes the
+pinned Offering; failure blocks dispatch and identity drift requires explicit
+reselection. Route/credential changes can therefore take up to this interval
+to affect an already admitted execution. Resume and explicit model switches
+retain fresh admission. This model-config lifetime does not grant identity,
+permission, or execution custody.
+Model dispatch consumes the existing exact Run owner's confirmed lease window
+locally. Only the heartbeat renews that window; a model round never extends it.
+Expired, retired, mismatched or settling ownership blocks another dispatch.
+Local cancellation signals remain immediate. Cross-process control is observed
+by the existing two-second watcher, subject to read latency; it is not a new
+synchronous transaction at each model round. Effectful tools continue using
+transactional dispatch admission. Unchanged input watermarks avoid empty guidance
+reads; changed notifications and final settlement still reconcile durable input.
 The shared cooldown interface records errors and wait/reject decisions only;
 it does not select another model or maintain fallback state and counters.
 

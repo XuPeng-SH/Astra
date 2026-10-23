@@ -869,6 +869,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         idem_key: Option<&IdempotencyKey>,
     ) {
         let tool_idem_key = idem_key
+            .filter(|_| self.ctx.runtime_tool_executor.is_none())
             .filter(|_| READ_ONLY_TOOLS.contains(&execution.name.as_str()))
             .map(IdempotencyKey::cache_key);
         let args_preview = safe_args_preview(&execution.name, &execution.args);

@@ -374,9 +374,8 @@ pub use verification::{
     VerificationCriterion, VerificationResult, VerificationRunner, VerifierKind,
 };
 pub use weighted_admission::{
-    AdmissionWork, DatabaseWeightedAdmissionController, DistributedAdmissionError,
-    DistributedAdmissionPermit, DistributedAdmissionReservation, WeightedAdmissionController,
-    WeightedAdmissionError, WeightedAdmissionLimits, WeightedAdmissionPermit,
+    AdmissionWork, WeightedAdmissionController, WeightedAdmissionError, WeightedAdmissionLimits,
+    WeightedAdmissionPermit,
 };
 pub use workspace_records::{
     DatabaseWorkspaceRecordStore, InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtEntry,

@@ -141,23 +141,6 @@ impl AgenticRunLifecycleService {
                     "weighted_session_admission_rejected",
                 )
             })?;
-        let distributed = self
-            .distributed_weighted_admission
-            .as_ref()
-            .ok_or_else(|| invalid_resume("distributed execution capacity is unavailable"))?;
-        let capacity = distributed
-            .try_reserve(
-                &parked.reservation.key,
-                work,
-                Duration::from_secs(15 * 60),
-                &format!("server-resume:{}:{}", durable.run_id, Uuid::new_v4()),
-            )
-            .await
-            .map_err(|error| {
-                invalid_resume(format!(
-                    "distributed execution capacity is unavailable: {error}"
-                ))
-            })?;
         let (mut tracked, cancel, pause, token, lease_lost) = Self::build_tracked_run_state(
             durable.run_id.clone(),
             durable.session_id.clone(),
@@ -227,7 +210,6 @@ impl AgenticRunLifecycleService {
             release_started: Arc::new(AtomicBool::new(false)),
             renewal_cancel: CancellationToken::new(),
             _weighted_permit: weighted,
-            distributed_permit: capacity,
         };
         let mut heartbeat = None;
         let preparation = async {

@@ -251,6 +251,7 @@ async fn insert_state_item(
 
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
+        terminal_receipt_json: None,
         run_id: run_id.to_string(),
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),

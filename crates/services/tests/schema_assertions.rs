@@ -261,8 +261,8 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     // no readiness marker, and an expired lease. It must be safe to retry.
     for sql in [
         "DELETE FROM astra_schema_contracts WHERE component = 'astra-core'",
-        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'session_weighted_admission_owner_usage'",
-        "DROP TABLE session_weighted_admission_owner_usage",
+        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'conversation_manifest_segments'",
+        "DROP TABLE conversation_manifest_segments",
         "INSERT INTO astra_schema_bootstrap_leases (component, holder_id, lease_expires_at) VALUES ('astra-core', 'crashed-owner', DATE_SUB(NOW(6), INTERVAL 1 SECOND))",
     ] {
         sqlx::query(sql).execute(pool.get()).await.unwrap();
@@ -1678,61 +1678,6 @@ async fn phase1_run_durability_schema_contract() {
         "idempotent coordinator replay must never cross a SessionKey"
     );
     assert_eq!(
-        primary_key_columns(&pool, &schema, "session_weighted_admission_reservations").await,
-        [
-            "scope_name",
-            "isolation_domain",
-            "owner_user_id",
-            "idempotency_hash"
-        ],
-        "cross-pod admission replay must use the complete logical identity"
-    );
-    assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "session_weighted_admission_reservations",
-            "uq_weighted_admission_reservation"
-        )
-        .await,
-        ["scope_name", "reservation_id"],
-        "each admitted generation must retain a unique physical identity"
-    );
-    let admission_gate_columns =
-        column_names(&pool, &schema, "session_weighted_admission_gates").await;
-    assert!(
-        admission_gate_columns
-            .iter()
-            .any(|column| column == "capacity_hash"),
-        "distributed admission gate must persist the deployment capacity snapshot"
-    );
-    for expected in [
-        "usage_initialized",
-        "earliest_expiry_at",
-        "used_resident_bytes",
-        "used_context_tokens",
-        "used_provider_slots",
-        "used_cpu_units",
-        "used_io_bytes",
-        "allocated_resident_bytes",
-        "allocated_context_tokens",
-        "allocated_provider_slots",
-        "allocated_cpu_units",
-        "allocated_io_bytes",
-    ] {
-        assert!(
-            admission_gate_columns
-                .iter()
-                .any(|column| column == expected),
-            "distributed admission gate must persist materialized usage column {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_weighted_admission_owner_usage").await,
-        ["scope_name", "isolation_domain", "owner_user_id"],
-        "per-owner materialized admission usage must be isolated by scope, domain, and owner"
-    );
-    assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_authority_events").await,
         ["isolation_domain", "owner_user_id", "event_id"],
         "authority audit identity must remain inside the owner isolation domain"
@@ -1808,22 +1753,6 @@ async fn phase1_run_durability_schema_contract() {
             "created_at"
         ],
         "authority history queries must carry the complete SessionKey prefix"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_weighted_admission_reservations",
-            "idx_weighted_admission_owner_expiry"
-        )
-        .await,
-        [
-            "scope_name",
-            "isolation_domain",
-            "owner_user_id",
-            "expires_at"
-        ],
-        "per-owner distributed admission must not require a global table scan"
     );
     assert!(
         index_columns(
@@ -1948,61 +1877,6 @@ async fn phase1_run_durability_schema_contract() {
         ["user_id", "session_id", "checkpoint_kind", "created_at"],
         "checkpoint session scans must remain owner-bound"
     );
-
-    let batch_columns = column_names(&pool, &schema, "session_tool_output_batches").await;
-    for expected in [
-        "batch_id",
-        "session_id",
-        "run_id",
-        "user_id",
-        "output_count",
-        "payload_bytes",
-    ] {
-        assert!(
-            batch_columns.iter().any(|column| column == expected),
-            "session_tool_output_batches missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_tool_output_batches").await,
-        ["user_id", "session_id", "batch_id"],
-        "tool output batch identity must be owner/session scoped"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_tool_output_batches",
-            "idx_tool_output_batches_user_run_created"
-        )
-        .await,
-        ["user_id", "run_id", "created_at", "batch_id"],
-        "tool output batch run diagnostics must be owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_tool_output_batches",
-            "idx_tool_output_batches_user_session_created"
-        )
-        .await,
-        ["user_id", "session_id", "created_at", "batch_id"],
-        "tool output batch session list must be owner-bound"
-    );
-    for removed_index in [
-        "idx_tool_output_batches_session",
-        "idx_tool_output_batches_run_status",
-        "idx_tool_output_batches_run_created",
-        "idx_tool_output_batches_session_created",
-    ] {
-        assert!(
-            index_columns(&pool, &schema, "session_tool_output_batches", removed_index)
-                .await
-                .is_empty(),
-            "session_tool_output_batches must not keep legacy ownerless index {removed_index}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -3185,93 +3059,4 @@ async fn phase6_artifact_retention_preview_schema_contract() {
         ],
         "artifact owners must resolve references without scanning payloads"
     );
-
-    let tool_outputs = column_names(&pool, &schema, "session_tool_outputs").await;
-    for expected in [
-        "preview_text",
-        "preview_status",
-        "artifact_ref",
-        "content_hash",
-        "normalize_version",
-    ] {
-        assert!(
-            tool_outputs.iter().any(|column| column == expected),
-            "session_tool_outputs missing preview column {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_tool_outputs").await,
-        ["user_id", "session_id", "output_id"],
-        "tool output row identity must be owner/session scoped"
-    );
-    assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "session_tool_outputs",
-            "uq_tool_outputs_batch_idx"
-        )
-        .await,
-        ["user_id", "session_id", "batch_id", "output_idx"],
-        "tool output batch ordering must be owner/session scoped"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_tool_outputs",
-            "idx_tool_outputs_user_run_created"
-        )
-        .await,
-        ["user_id", "run_id", "created_at", "output_id"],
-        "tool output run diagnostics must be owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_tool_outputs",
-            "idx_tool_outputs_user_session_created"
-        )
-        .await,
-        ["user_id", "session_id", "created_at", "output_id"],
-        "tool output session list must be owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_tool_outputs",
-            "idx_tool_outputs_parent"
-        )
-        .await,
-        ["user_id", "parent_output_id"],
-        "tool output parent lookup must stay owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_tool_outputs",
-            "idx_tool_outputs_artifact_ref"
-        )
-        .await,
-        ["user_id", "artifact_ref"],
-        "tool output artifact refs must stay inside the owner boundary"
-    );
-    for removed_index in [
-        "idx_tool_outputs_tool_created",
-        "idx_tool_outputs_session_tool_score",
-        "idx_tool_outputs_status_created",
-        "idx_tool_outputs_batch",
-        "idx_tool_outputs_run_created",
-        "idx_tool_outputs_session_created",
-    ] {
-        assert!(
-            index_columns(&pool, &schema, "session_tool_outputs", removed_index)
-                .await
-                .is_empty(),
-            "session_tool_outputs must not keep legacy ownerless index {removed_index}"
-        );
-    }
 }

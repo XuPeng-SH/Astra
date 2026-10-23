@@ -5,9 +5,7 @@ use astra_core::{
     error_response_coded, matrixone_null_shape_comment, matrixone_statement_with_null_shape,
 };
 use astra_turn_types::{
-    ModelSelection, SessionAttachmentV1, SessionKeyV1,
-    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
-    ToolInvocationResultPayload, UserIntentDelivery, UserIntentStatus,
+    ModelSelection, SessionAttachmentV1, SessionKeyV1, UserIntentDelivery, UserIntentStatus,
 };
 pub use astra_turn_types::{
     RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
@@ -20,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -1818,6 +1815,9 @@ pub struct DurableRunRecord {
     /// Canonical request fingerprint bound atomically to a caller-derived
     /// exact run-start identity. Ordinary runs leave this unset.
     pub start_request_fingerprint: Option<String>,
+    /// Exact canonical result committed with Context and the raw transcript.
+    /// Derived trace/display rows never participate in this proof.
+    pub terminal_receipt_json: Option<String>,
     /// Immutable declared-Work causal cut observed when this run was admitted.
     /// Branch coordinator runs do not impersonate a WorkItem execution; item
     /// and attempt ownership remain absent until typed item admission exists.
@@ -3735,7 +3735,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      checkpoint_json, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     runtime_profile, start_request_fingerprint, work_id, \
+     runtime_profile, start_request_fingerprint, terminal_receipt_json, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
 // Status, observation, event append and recovery-candidate reads need metadata,
@@ -3746,7 +3746,7 @@ const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_ru
      CAST(NULL AS CHAR) AS checkpoint_json, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     runtime_profile, start_request_fingerprint, work_id, \
+     runtime_profile, start_request_fingerprint, terminal_receipt_json, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
@@ -5276,6 +5276,10 @@ pub struct RunMutationAdmission {
 impl RunMutationAdmission {
     pub(crate) fn owns_session(&self, user_id: &str, session_id: &str) -> bool {
         self.run.user_id == user_id && self.run.session_id == session_id
+    }
+
+    pub(crate) fn run(&self) -> &DurableRunRecord {
+        &self.run
     }
 }
 
@@ -11274,97 +11278,8 @@ impl RunStateStore for InMemoryRunStateStore {
 // ─── MatrixOne-backed run state store ───────────────────────────────────────
 
 const DEFAULT_RETRY_SCOPE: &str = "node";
-const MAX_TOOL_OUTPUT_BATCH_ROWS: usize = 500;
-const MAX_TOOL_OUTPUT_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const RUN_EVENT_IDEMPOTENCY_WINDOW_KEYS: usize = 64;
 const RUN_EVENT_IDEMPOTENCY_WINDOW_BYTES: usize = 16 * 1024;
-const FALLBACK_PREVIEW_BYTES: usize = 400;
-const BUILTIN_GENERIC_PREVIEW_BYTES: usize = 1200;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolPreviewKind {
-    Recognized,
-    Fallback,
-}
-
-#[derive(Clone, Debug)]
-struct ToolPreviewContract {
-    max_preview_bytes: usize,
-    normalize_version: String,
-    kind: ToolPreviewKind,
-}
-
-// Code-owned preview labels do not dispatch normalization algorithms.
-fn tool_preview_contract(tool_name: &str) -> ToolPreviewContract {
-    let (max_preview_bytes, normalize_version) = match tool_name {
-        "bash" => (1200, "shell_v1"),
-        "run_script" => (1200, "python_stdout_v1"),
-        "read_file" => (1000, "text_v1"),
-        "write_file" => (1000, "text_v1"),
-        "str_replace" => (1000, "diff_v1"),
-        "list_dir" => (1200, "text_v1"),
-        "glob" => (1200, "text_v1"),
-        "grep" => (1200, "text_v1"),
-        "symbols" => (1200, "rust_v1"),
-        "web_search" => (1000, "search_v1"),
-        "web_fetch" => (1200, "html_v1"),
-        "tool_search" => (1000, "text_v1"),
-        "session" => (1200, "text_v1"),
-        "task_board" => (1200, "text_v1"),
-        "agent" => (1200, "text_v1"),
-        "agent_fanout" => (1600, "text_v1"),
-        "memory" => (1200, "text_v1"),
-        "mo_query" => (1200, "sql_v1"),
-        "pg_dump" => (1000, "sql_v1"),
-        "fetch_url" => (1000, "html_v1"),
-        "parse_pdf" => (1000, "pdf_v1"),
-        "SKILL.md" => (1200, "skill_md_v1"),
-        "cargo" => (1200, "rust_v1"),
-        "rustc" => (1200, "rust_v1"),
-        "clippy" => (1200, "rust_v1"),
-        "pg_schema_structurize" => (1200, "sql_v1"),
-        "slow_query_analyzer" => (1200, "sql_v1"),
-        "curl" => (1000, "text_v1"),
-        "git" => (1200, "diff_v1"),
-        "docker_logs" => (1200, "text_v1"),
-        "kubectl" => (1200, "text_v1"),
-        "python_stdout" => (1200, "text_v1"),
-        "npm_build" => (1200, "js_v1"),
-        "csv_head" => (1200, "csv_v1"),
-        "json_preview" => (1200, "json_v1"),
-        "markdown_preview" => (1200, "markdown_v1"),
-        _ if astra_runtime_env::ToolRegistry::builtins()
-            .get(tool_name)
-            .is_some() =>
-        {
-            (BUILTIN_GENERIC_PREVIEW_BYTES, "text_v1")
-        }
-        _ => {
-            return ToolPreviewContract {
-                max_preview_bytes: FALLBACK_PREVIEW_BYTES,
-                normalize_version: "raw_v1".to_string(),
-                kind: ToolPreviewKind::Fallback,
-            };
-        }
-    };
-    ToolPreviewContract {
-        max_preview_bytes,
-        normalize_version: normalize_version.to_string(),
-        kind: ToolPreviewKind::Recognized,
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ToolOutputPreviewRow {
-    payload: String,
-    preview_text: String,
-    preview_status: String,
-    artifact_ref: Option<String>,
-    content_hash: String,
-    normalize_version: String,
-    parent_output_id: Option<String>,
-}
-
 #[derive(Debug, Error)]
 pub enum DatabaseRunStateStoreError {
     #[error("execution binding admission failed: {0}")]
@@ -11378,24 +11293,12 @@ pub enum DatabaseRunStateStoreError {
     },
     #[error("invalid retry_scope for run {run_id}: {retry_scope}")]
     InvalidRetryScope { run_id: String, retry_scope: String },
-    #[error("tool output batch too large: run_id={run_id}, rows={rows}, bytes={bytes}")]
-    ToolOutputBatchTooLarge {
-        run_id: String,
-        rows: usize,
-        bytes: usize,
-    },
     #[error("JSON serialization failed: operation={operation}, entity={entity}, source={source}")]
     Json {
         operation: &'static str,
         entity: String,
         #[source]
         source: serde_json::Error,
-    },
-    #[error("invalid durable tool output: output_id={output_id}, source={source}")]
-    InvalidToolOutput {
-        output_id: String,
-        #[source]
-        source: ToolInvocationContractError,
     },
 }
 
@@ -11633,14 +11536,6 @@ enum CancellationMarkerAttempt {
     Resolved(Result<bool, String>),
     DiscardConnection(String),
     CommitAmbiguous(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolOutputBatchItem {
-    pub output_id: String,
-    pub tool_call_id: Option<String>,
-    pub tool_name: String,
-    pub result: ToolInvocationResultPayload,
 }
 
 /// MatrixOne durable run store.
@@ -13040,6 +12935,97 @@ impl DatabaseRunStateStore {
             .await
     }
 
+    /// Claim a canonical terminal under the caller's existing Session fence.
+    /// The conditional write is also the owner/control read: no projection or
+    /// diagnostic row can make an otherwise committed result disappear.
+    pub async fn claim_canonical_terminal_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        request: AtomicRunTerminalSettlementRequest<'_>,
+        expected_event_idx: i64,
+        receipt: &serde_json::Value,
+    ) -> Result<Option<RunMutationAdmission>, String> {
+        validate_expected_run_session_id(request.expected_session_id)?;
+        if request.expected_statuses.is_empty() || !durable_run_status_is_terminal(request.status) {
+            return Err(
+                "canonical settlement requires a terminal outcome and expected states".into(),
+            );
+        }
+        let origin = cancelled_terminal_origin(request.status, request.events)?;
+        let error_code = terminal_error_code_from_transition(
+            request.status,
+            request.error_message,
+            request.events,
+        );
+        let prompt =
+            i64::try_from(request.prompt_tokens).map_err(|_| "prompt usage exceeds BIGINT")?;
+        let completion = i64::try_from(request.completion_tokens)
+            .map_err(|_| "completion usage exceeds BIGINT")?;
+        let encoded = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        if encoded.len() > 256 * 1024 {
+            return Err("canonical terminal receipt exceeds its bounded size".into());
+        }
+        let mut update = QueryBuilder::<MySql>::new("UPDATE agent_runs SET status = ");
+        update.push_bind(request.status).push(", waiting_for = ").push_bind(request.waiting_for)
+            .push(", error_message = ").push_bind(request.error_message)
+            .push(", error_code = ").push_bind(error_code)
+            .push(", total_prompt_tokens = ").push_bind(prompt)
+            .push(", total_completion_tokens = ").push_bind(completion)
+            .push(", total_tool_calls = ").push_bind(i64::from(request.tool_calls))
+            .push(", terminal_receipt_json = ").push_bind(encoded)
+            .push(", owner_pod_id = NULL, owner_lease_expires_at = NULL, updated_at = NOW(6) WHERE user_id = ")
+            .push_bind(request.user_id).push(" AND session_id = ").push_bind(request.expected_session_id)
+            .push(" AND run_id = ").push_bind(request.run_id)
+            .push(" AND run_generation = ").push_bind(request.expected_owner_generation as i64)
+            .push(" AND owner_pod_id = ").push_bind(&self.owner_pod_id)
+            .push(" AND owner_lease_expires_at >= NOW(6) AND terminal_receipt_json IS NULL AND last_event_idx = ")
+            .push_bind(expected_event_idx).push(" AND status IN (");
+        let mut states = update.separated(", ");
+        for status in request.expected_statuses {
+            states.push_bind(*status);
+        }
+        states.push_unseparated(")");
+        if origin != Some(DurableCancellationOrigin::User) {
+            update.push(" AND cancellation_requested_at IS NULL");
+        }
+        update.push(" RETURNING ").push(AGENT_RUN_COLUMNS);
+        let row = update
+            .build()
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| error.to_string())?;
+        row.map(|row| {
+            Ok(RunMutationAdmission {
+                run: run_record_from_row(row).map_err(|error| error.to_string())?,
+                cancellation_requested: origin == Some(DurableCancellationOrigin::User),
+            })
+        })
+        .transpose()
+    }
+
+    /// A lost acknowledgement may retry only the exact terminal receipt.
+    /// Merely observing a completed status is never proof of this commit.
+    pub async fn canonical_terminal_receipt_matches(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        receipt: &serde_json::Value,
+    ) -> Result<bool, String> {
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT terminal_receipt_json FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        ).bind(user_id).bind(session_id).bind(run_id).fetch_optional(self.pool.get()).await.map_err(|error| error.to_string())?;
+        stored
+            .flatten()
+            .map(|stored| {
+                serde_json::from_str::<serde_json::Value>(&stored)
+                    .map(|stored| stored == *receipt)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+            .map(|stored| stored.unwrap_or(false))
+    }
+
     /// Admit terminal settlement once, returning the exact locked run facts for
     /// a caller that appends canonical evidence before settling the terminal.
     pub async fn admit_mutation_in_transaction(
@@ -14248,107 +14234,6 @@ impl DatabaseRunStateStore {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn insert_tool_output_batch(
-        &self,
-        batch_id: &str,
-        session_id: &str,
-        run_id: &str,
-        user_id: &str,
-        items: &[ToolOutputBatchItem],
-    ) -> DbStoreResult<()> {
-        let payloads = serialize_tool_output_payloads(items)?;
-        let payload_bytes = payloads.iter().map(String::len).sum::<usize>();
-        if items.len() > MAX_TOOL_OUTPUT_BATCH_ROWS || payload_bytes > MAX_TOOL_OUTPUT_BATCH_BYTES {
-            return Err(DatabaseRunStateStoreError::ToolOutputBatchTooLarge {
-                run_id: run_id.to_string(),
-                rows: items.len(),
-                bytes: payload_bytes,
-            });
-        }
-        let preview_rows = items
-            .iter()
-            .zip(payloads.iter())
-            .map(|(item, payload)| {
-                let contract = tool_preview_contract(&item.tool_name);
-                build_tool_output_preview_row(session_id, item, payload, &contract)
-            })
-            .collect::<Vec<_>>();
-
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| db_error("acquire_tool_output_batch", run_id, source))?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| db_error("begin_tool_output_batch", run_id, source))?;
-
-        // Fence the actual child-row transaction for every tool, including
-        // unknown names. Preview policy has no diagnostic or admission I/O.
-        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false)
-            .await
-            .map_err(|source| db_error("admit_tool_output_batch", run_id, source))?;
-
-        sqlx::query(
-            "INSERT INTO session_tool_output_batches
-             (batch_id, session_id, run_id, user_id, output_count, payload_bytes, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'committed', NOW(6))
-             ON DUPLICATE KEY UPDATE output_count = output_count",
-        )
-        .bind(batch_id)
-        .bind(session_id)
-        .bind(run_id)
-        .bind(user_id)
-        .bind(items.len() as i64)
-        .bind(payload_bytes as i64)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| db_error("insert_tool_output_batch", batch_id, source))?;
-
-        if !items.is_empty() {
-            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "INSERT INTO session_tool_outputs
-                 (output_id, batch_id, session_id, run_id, user_id, output_idx,
-                  parent_output_id, tool_call_id, tool_name, output_json, payload_bytes,
-                  preview_text, preview_status, artifact_ref, content_hash, normalize_version,
-                  created_at) ",
-            );
-            builder.push_values(
-                items.iter().zip(preview_rows.iter()).enumerate(),
-                |mut row, (idx, (item, preview))| {
-                    row.push_bind(&item.output_id)
-                        .push_bind(batch_id)
-                        .push_bind(session_id)
-                        .push_bind(run_id)
-                        .push_bind(user_id)
-                        .push_bind(idx as i64)
-                        .push_bind(&preview.parent_output_id)
-                        .push_bind(&item.tool_call_id)
-                        .push_bind(&item.tool_name)
-                        .push_bind(&preview.payload)
-                        .push_bind(preview.payload.len() as i64)
-                        .push_bind(&preview.preview_text)
-                        .push_bind(&preview.preview_status)
-                        .push_bind(&preview.artifact_ref)
-                        .push_bind(&preview.content_hash)
-                        .push_bind(&preview.normalize_version)
-                        .push("NOW(6)");
-                },
-            );
-            builder.push(" ON DUPLICATE KEY UPDATE payload_bytes = payload_bytes");
-            builder
-                .build()
-                .execute(&mut *tx)
-                .await
-                .map_err(|source| db_error("insert_tool_outputs_batch_rows", batch_id, source))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|source| db_error("commit_tool_output_batch", batch_id, source))?;
-        connection.release();
-        Ok(())
-    }
-
     async fn load_run_metadata_for_user(
         &self,
         user_id: &str,
@@ -15375,25 +15260,6 @@ impl DatabaseRunStateStore {
         .await;
         Ok(())
     }
-}
-
-fn serialize_tool_output_payloads(items: &[ToolOutputBatchItem]) -> DbStoreResult<Vec<String>> {
-    items
-        .iter()
-        .map(|item| {
-            item.result.validate().map_err(|source| {
-                DatabaseRunStateStoreError::InvalidToolOutput {
-                    output_id: item.output_id.clone(),
-                    source,
-                }
-            })?;
-            serde_json::to_string(&item.result).map_err(|source| DatabaseRunStateStoreError::Json {
-                operation: "serialize_tool_output",
-                entity: item.output_id.clone(),
-                source,
-            })
-        })
-        .collect()
 }
 
 fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
@@ -26668,84 +26534,6 @@ fn validate_retry_scope(run_id: &str, retry_scope: &str) -> DbStoreResult<()> {
     }
 }
 
-fn build_tool_output_preview_row(
-    session_id: &str,
-    item: &ToolOutputBatchItem,
-    payload: &str,
-    contract: &ToolPreviewContract,
-) -> ToolOutputPreviewRow {
-    let content_hash = format!("sha256:{}", sha256_hex(payload.as_bytes()));
-    let preview_source = tool_output_preview_source(&item.result, payload);
-    let preview_text = truncate_utf8_bytes(preview_source.as_ref(), contract.max_preview_bytes);
-    let explicit_artifact_ref = tool_result_artifact_ref(&item.result);
-    let large_payload_ref = (payload.len() > contract.max_preview_bytes).then(|| {
-        format!(
-            "tool_output://{session_id}/{}@{}",
-            item.output_id, content_hash
-        )
-    });
-    let preview_status = if contract.kind == ToolPreviewKind::Fallback {
-        "fallback"
-    } else if preview_source.len() > contract.max_preview_bytes {
-        "truncated"
-    } else {
-        "template"
-    }
-    .to_string();
-    ToolOutputPreviewRow {
-        payload: payload.to_string(),
-        preview_text,
-        preview_status,
-        artifact_ref: explicit_artifact_ref.or(large_payload_ref),
-        content_hash,
-        normalize_version: contract.normalize_version.clone(),
-        parent_output_id: item
-            .result
-            .metadata
-            .get("parent_output_id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string),
-    }
-}
-
-fn tool_output_preview_source<'a>(
-    result: &'a ToolInvocationResultPayload,
-    payload: &'a str,
-) -> Cow<'a, str> {
-    let output = result.output.trim();
-    if !output.is_empty() {
-        return Cow::Borrowed(output);
-    }
-    Cow::Borrowed(payload)
-}
-
-fn tool_result_artifact_ref(result: &ToolInvocationResultPayload) -> Option<String> {
-    result
-        .metadata
-        .get(TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
-        .and_then(|reference| {
-            reference
-                .as_str()
-                .map(ToString::to_string)
-                .or_else(|| extract_optional_string(reference, "artifactUri"))
-                .or_else(|| extract_optional_string(reference, "artifactId"))
-        })
-        .or_else(|| {
-            result
-                .metadata
-                .get("artifact_ref")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            result
-                .metadata
-                .get("artifact_uri")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        })
-}
-
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
@@ -26832,6 +26620,12 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
     let table = "agent_runs";
     let run_id = run_row_string(row, operation, table, "run_id")?;
     Ok(DurableRunRecord {
+        terminal_receipt_json: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "terminal_receipt_json",
+        )?,
         user_id: run_row_string(row, operation, table, "user_id")?,
         session_id: run_row_string(row, operation, table, "session_id")?,
         parent_run_id: run_row_optional_string(row, operation, table, "parent_run_id")?,
@@ -30408,6 +30202,7 @@ mod tests {
 
     fn durable_run_record(run_id: &str) -> DurableRunRecord {
         DurableRunRecord {
+            terminal_receipt_json: None,
             run_id: run_id.to_string(),
             session_id: "s1".into(),
             user_id: "u1".into(),
@@ -31786,6 +31581,7 @@ mod tests {
                 "resolved_model_name" => Some("model".to_string()),
                 "runtime_profile" => Some("default".to_string()),
                 "start_request_fingerprint" => Some("fingerprint-1".to_string()),
+                "terminal_receipt_json" => Some(r#"{"identity":"terminal-1"}"#.to_string()),
                 "work_id" => Some("work-1".to_string()),
                 "work_branch_id" => Some("branch-1".to_string()),
                 "work_item_id" => Some("root".to_string()),
@@ -33672,6 +33468,10 @@ mod tests {
             record.start_request_fingerprint.as_deref(),
             Some("fingerprint-1")
         );
+        assert_eq!(
+            record.terminal_receipt_json.as_deref(),
+            Some(r#"{"identity":"terminal-1"}"#)
+        );
         let work_binding = record.work_binding.as_ref().expect("Work binding");
         assert_eq!(work_binding.work_id().as_str(), "work-1");
         assert_eq!(work_binding.branch_id().as_str(), "branch-1");
@@ -33715,6 +33515,7 @@ mod tests {
             "resolved_model_name",
             "runtime_profile",
             "start_request_fingerprint",
+            "terminal_receipt_json",
             "work_id",
             "work_branch_id",
             "work_graph_revision",
@@ -33904,316 +33705,6 @@ mod tests {
         assert_ne!(base, usage_projection_patch_hash("run-1", 10, 5, 2));
         assert_ne!(base, usage_projection_patch_hash("run-1", 10, 4, 3));
         assert_ne!(base, usage_projection_patch_hash("run-2", 10, 4, 2));
-    }
-
-    // Phase 3/6 preview seed contracts now run offline against the policy owner.
-    #[test]
-    fn explicit_tool_preview_policy_preserves_all_36_mappings() {
-        let expected = [
-            ("bash", 1200, "shell_v1"),
-            ("run_script", 1200, "python_stdout_v1"),
-            ("read_file", 1000, "text_v1"),
-            ("write_file", 1000, "text_v1"),
-            ("str_replace", 1000, "diff_v1"),
-            ("list_dir", 1200, "text_v1"),
-            ("glob", 1200, "text_v1"),
-            ("grep", 1200, "text_v1"),
-            ("symbols", 1200, "rust_v1"),
-            ("web_search", 1000, "search_v1"),
-            ("web_fetch", 1200, "html_v1"),
-            ("tool_search", 1000, "text_v1"),
-            ("session", 1200, "text_v1"),
-            ("task_board", 1200, "text_v1"),
-            ("agent", 1200, "text_v1"),
-            ("agent_fanout", 1600, "text_v1"),
-            ("memory", 1200, "text_v1"),
-            ("mo_query", 1200, "sql_v1"),
-            ("pg_dump", 1000, "sql_v1"),
-            ("fetch_url", 1000, "html_v1"),
-            ("parse_pdf", 1000, "pdf_v1"),
-            ("SKILL.md", 1200, "skill_md_v1"),
-            ("cargo", 1200, "rust_v1"),
-            ("rustc", 1200, "rust_v1"),
-            ("clippy", 1200, "rust_v1"),
-            ("pg_schema_structurize", 1200, "sql_v1"),
-            ("slow_query_analyzer", 1200, "sql_v1"),
-            ("curl", 1000, "text_v1"),
-            ("git", 1200, "diff_v1"),
-            ("docker_logs", 1200, "text_v1"),
-            ("kubectl", 1200, "text_v1"),
-            ("python_stdout", 1200, "text_v1"),
-            ("npm_build", 1200, "js_v1"),
-            ("csv_head", 1200, "csv_v1"),
-            ("json_preview", 1200, "json_v1"),
-            ("markdown_preview", 1200, "markdown_v1"),
-        ];
-        assert_eq!(expected.len(), 36);
-        for (name, bytes, label) in expected {
-            let contract = tool_preview_contract(name);
-            assert_eq!(contract.max_preview_bytes, bytes, "{name}");
-            assert_eq!(contract.normalize_version, label, "{name}");
-            assert_eq!(contract.kind, ToolPreviewKind::Recognized, "{name}");
-        }
-    }
-
-    #[test]
-    fn generic_builtin_preview_policy_uses_text_1200() {
-        // These built-ins have no explicit preview specialization.
-        for name in ["ask_user", "introspect", "reflect"] {
-            assert!(
-                astra_runtime_env::ToolRegistry::builtins()
-                    .get(name)
-                    .is_some()
-            );
-            let contract = tool_preview_contract(name);
-            assert_eq!(contract.max_preview_bytes, 1200, "{name}");
-            assert_eq!(contract.normalize_version, "text_v1", "{name}");
-            assert_eq!(contract.kind, ToolPreviewKind::Recognized);
-        }
-    }
-
-    #[test]
-    fn builtin_preview_contract_is_generic_truth_not_a_missing_template_warning() {
-        for tool in astra_runtime_env::ToolRegistry::builtins().iter() {
-            let contract = tool_preview_contract(&tool.name);
-            assert!(
-                contract.kind == ToolPreviewKind::Recognized,
-                "built-in {} must own a preview contract",
-                tool.name
-            );
-            assert!(contract.max_preview_bytes > FALLBACK_PREVIEW_BYTES);
-        }
-
-        let unknown = tool_preview_contract("third_party_tool_without_template");
-        assert!(unknown.kind == ToolPreviewKind::Fallback);
-        assert_eq!(unknown.max_preview_bytes, FALLBACK_PREVIEW_BYTES);
-        assert_eq!(unknown.normalize_version, "raw_v1");
-    }
-
-    fn preview_contract(max_preview_bytes: usize, found: bool) -> ToolPreviewContract {
-        ToolPreviewContract {
-            max_preview_bytes,
-            normalize_version: "raw_v1".to_string(),
-            kind: if found {
-                ToolPreviewKind::Recognized
-            } else {
-                ToolPreviewKind::Fallback
-            },
-        }
-    }
-
-    fn preview_item(tool_name: &str, output_json: serde_json::Value) -> ToolOutputBatchItem {
-        let mut object = output_json.as_object().cloned().unwrap_or_default();
-        let output = [
-            "result", "output", "content", "text", "message", "error", "stderr", "stdout",
-        ]
-        .into_iter()
-        .find_map(|key| object.remove(key))
-        .map(|value| match value {
-            serde_json::Value::String(text) => text,
-            other => other.to_string(),
-        })
-        .unwrap_or_default();
-        ToolOutputBatchItem {
-            output_id: "output-1".to_string(),
-            tool_call_id: Some("call-1".to_string()),
-            tool_name: tool_name.to_string(),
-            result: ToolInvocationResultPayload::bounded_projection(
-                output,
-                object.into_iter().collect(),
-                None,
-            ),
-        }
-    }
-
-    #[test]
-    fn tool_output_serialization_rejects_forged_unbounded_payload_before_database_work() {
-        let item = ToolOutputBatchItem {
-            output_id: "forged-output".to_string(),
-            tool_call_id: Some("call-1".to_string()),
-            tool_name: "provider_read".to_string(),
-            result: ToolInvocationResultPayload {
-                output: "🦀".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES),
-                metadata: Default::default(),
-                exit_semantics: None,
-            },
-        };
-
-        let error = serialize_tool_output_payloads(&[item]).unwrap_err();
-        assert!(matches!(
-            error,
-            DatabaseRunStateStoreError::InvalidToolOutput { ref output_id, .. }
-                if output_id == "forged-output"
-        ));
-    }
-
-    #[test]
-    fn tool_output_preview_preserves_utf8_status_hash_and_reference_identity() {
-        for (name, status) in [
-            ("read_file", "truncated"),
-            ("unknown_preview_tool", "fallback"),
-        ] {
-            let contract = tool_preview_contract(name);
-            let text = format!("a{}", "🦀".repeat(400));
-            let item = preview_item(
-                name,
-                json!({"result": text, "parent_output_id": "parent-1"}),
-            );
-            let payload = serde_json::to_string(&item.result).unwrap();
-            let row = build_tool_output_preview_row("session-1", &item, &payload, &contract);
-            assert_eq!(row.payload, payload);
-            assert_eq!(
-                row.preview_text,
-                format!("a{}", "🦀".repeat((contract.max_preview_bytes - 1) / 4))
-            );
-            assert_eq!(row.preview_status, status);
-            assert_eq!(row.normalize_version, contract.normalize_version);
-            assert_eq!(
-                row.content_hash,
-                format!("sha256:{}", sha256_hex(payload.as_bytes()))
-            );
-            assert_eq!(
-                row.artifact_ref,
-                Some(format!(
-                    "tool_output://session-1/output-1@{}",
-                    row.content_hash
-                ))
-            );
-            assert_eq!(row.parent_output_id.as_deref(), Some("parent-1"));
-
-            let mut explicit = item.clone();
-            explicit
-                .result
-                .metadata
-                .insert("artifact_ref".to_string(), json!("artifact://explicit"));
-            let payload = serde_json::to_string(&explicit.result).unwrap();
-            let row = build_tool_output_preview_row("session-1", &explicit, &payload, &contract);
-            assert_eq!(row.artifact_ref.as_deref(), Some("artifact://explicit"));
-            assert_eq!(
-                row.content_hash,
-                format!("sha256:{}", sha256_hex(payload.as_bytes()))
-            );
-        }
-        for (name, status) in [
-            ("read_file", "template"),
-            ("unknown_preview_tool", "fallback"),
-        ] {
-            let item = preview_item(name, json!({"result": "short"}));
-            let payload = serde_json::to_string(&item.result).unwrap();
-            let row = build_tool_output_preview_row(
-                "session-1",
-                &item,
-                &payload,
-                &tool_preview_contract(name),
-            );
-            assert_eq!(row.preview_text, "short");
-            assert_eq!(row.preview_status, status);
-            assert!(row.artifact_ref.is_none());
-        }
-    }
-
-    #[test]
-    fn tool_output_preview_prefers_semantic_result_over_transport_metadata() {
-        let output_json = json!({
-            "capacity_provider_coverage": [
-                {
-                    "provider_id": "server-control-plane",
-                    "capabilities": ["session", "task_board", "introspect"]
-                },
-                {
-                    "provider_id": "edge-macpro.local",
-                    "capabilities": ["workspace_read", "workspace_write", "shell"]
-                }
-            ],
-            "executor": {
-                "display_name": "macpro.local",
-                "status": "online",
-            },
-            "policy": {
-                "filesystem": "read_write_workspace",
-                "network": "open",
-            },
-            "result": ".agent/\n.github/\nrust/\nweb/\n",
-        });
-        let item = preview_item("list_dir", output_json);
-        let payload = serde_json::to_string(&item.result).expect("payload serializes");
-
-        let row = build_tool_output_preview_row(
-            "session-1",
-            &item,
-            &payload,
-            &preview_contract(120, true),
-        );
-
-        assert_eq!(row.payload, payload, "audit payload must remain lossless");
-        assert_eq!(row.preview_text, ".agent/\n.github/\nrust/\nweb/");
-        assert_eq!(row.preview_status, "template");
-        assert!(
-            !row.preview_text.contains("capacity_provider_coverage"),
-            "preview should show the tool result, not transport metadata"
-        );
-        assert!(
-            row.artifact_ref.is_some(),
-            "large wrapper payload should still be addressable even when the preview is compact"
-        );
-    }
-
-    #[test]
-    fn tool_output_preview_large_result_is_borrowed_then_bounded() {
-        let large_result = format!("{}{}", "x".repeat(256 * 1024), "tail");
-        let item = preview_item(
-            "read_file",
-            json!({
-                "capacity_provider_coverage": [{"provider_id": "edge-1"}],
-                "result": large_result,
-            }),
-        );
-        let payload = serde_json::to_string(&item.result).expect("payload serializes");
-
-        let source = tool_output_preview_source(&item.result, &payload);
-        assert!(
-            matches!(source, Cow::Borrowed(_)),
-            "large string result must be borrowed before the bounded preview allocation"
-        );
-
-        let row = build_tool_output_preview_row(
-            "session-1",
-            &item,
-            &payload,
-            &preview_contract(128, true),
-        );
-
-        assert_eq!(row.preview_text.len(), 128);
-        assert!(row.preview_text.chars().all(|ch| ch == 'x'));
-        assert_eq!(row.preview_status, "truncated");
-        assert!(row.payload.len() <= astra_turn_types::TOOL_INVOCATION_RESULT_MAX_BYTES);
-        assert!(row.payload.contains("astraResultProjection"));
-        assert!(row.payload.contains("capacity_provider_coverage"));
-    }
-
-    #[test]
-    fn tool_output_preview_uses_canonical_json_text_for_structured_result() {
-        let item = preview_item(
-            "custom_tool",
-            json!({
-                "result": {"nested": "not a scalar preview"},
-                "data": ["also", "not", "scalar"],
-            }),
-        );
-        let payload = serde_json::to_string(&item.result).expect("payload serializes");
-
-        let row = build_tool_output_preview_row(
-            "session-1",
-            &item,
-            &payload,
-            &preview_contract(64, false),
-        );
-
-        assert_eq!(
-            row.preview_text,
-            truncate_utf8_bytes(&item.result.output, 64)
-        );
-        assert_eq!(row.preview_status, "fallback");
     }
 
     #[test]
@@ -44266,6 +43757,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             for i in 0..max + 10 {
                 let record = DurableRunRecord {
+                    terminal_receipt_json: None,
                     run_id: format!("run-{i}"),
                     session_id: "s1".into(),
                     user_id: "u1".into(),

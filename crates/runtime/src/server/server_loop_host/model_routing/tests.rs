@@ -444,6 +444,12 @@ async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
     );
 
     catalog.models.write().unwrap().remove("economy");
+    restored.revalidate_catalog_execution().await.unwrap();
+    restored.admitted_model_execution_at = Some(
+        Instant::now()
+            - super::super::RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+            - std::time::Duration::from_secs(1),
+    );
     assert!(restored.revalidate_catalog_execution().await.is_err());
 }
 
@@ -557,6 +563,16 @@ async fn changed_contract_is_rejected_but_rotated_credentials_are_reauthorized()
     host.revalidate_catalog_execution().await.unwrap();
     assert_eq!(
         host.admitted_model_execution.as_ref().unwrap().api_key,
+        "provider-secret"
+    );
+    host.admitted_model_execution_at = Some(
+        Instant::now()
+            - super::super::RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+            - std::time::Duration::from_secs(1),
+    );
+    host.revalidate_catalog_execution().await.unwrap();
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().api_key,
         "rotated"
     );
     catalog
@@ -566,6 +582,11 @@ async fn changed_contract_is_rejected_but_rotated_credentials_are_reauthorized()
         .get_mut("economy")
         .unwrap()
         .wire_model_name = Some("different-revision".into());
+    host.admitted_model_execution_at = Some(
+        Instant::now()
+            - super::super::RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+            - std::time::Duration::from_secs(1),
+    );
     assert!(host.revalidate_catalog_execution().await.is_err());
     let mut restored = self::host(catalog, engine);
     assert!(

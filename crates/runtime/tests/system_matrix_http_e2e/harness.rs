@@ -862,6 +862,7 @@ pub async fn seed_pending_approval(
     let store = DatabaseRunStateStore::new(ctx.shared_pool.clone()).with_owner_pod_id(owner_pod_id);
     store
         .insert_run(DurableRunRecord {
+            terminal_receipt_json: None,
             run_id: run_id.to_string(),
             user_id: ctx.user_id.clone(),
             session_id: ctx.session_id.clone(),
@@ -1283,9 +1284,8 @@ async fn bootstrap_in_database(database: Option<String>) -> BootstrapResult {
 }
 
 /// Reclaim only this suite's session fixtures after a developer interrupt or
-/// crashed test process. Session deletion also removes the corresponding
-/// distributed weighted-admission lease, so a stale E2E run cannot deny the
-/// next user's otherwise valid request with a 429.
+/// crashed test process. Session deletion retires stale durable Run ownership;
+/// process-local capacity is released by the execution permit's lifetime.
 async fn cleanup_interrupted_matrix_e2e_sessions(state: &astra_runtime::AppState) {
     let pool = state
         .shared_pool

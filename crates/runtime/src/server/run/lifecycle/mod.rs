@@ -5524,7 +5524,7 @@ fn start_active_run_control_watcher(
 /// Durable run state is mandatory; process-local state is limited to live
 /// control handles that cannot survive a restart.
 fn canonical_session_admission_limits() -> astra_services::WeightedAdmissionLimits {
-    crate::capacity_model::CapacityInput::from_env().distributed_admission_limits()
+    crate::capacity_model::CapacityInput::from_env().process_admission_limits()
 }
 
 fn fresh_request_admission_bytes(request: &ChatRequestData) -> Result<u64, serde_json::Error> {
@@ -5563,7 +5563,6 @@ struct CanonicalTurnAdmission {
     release_started: Arc<AtomicBool>,
     renewal_cancel: CancellationToken,
     _weighted_permit: astra_services::WeightedAdmissionPermit,
-    distributed_permit: astra_services::DistributedAdmissionPermit,
 }
 
 fn canonical_turn_admission_error(
@@ -5602,7 +5601,6 @@ struct PreparedRootContextAdmission {
     key: astra_turn_types::SessionKeyV1,
     prior_messages: Vec<Value>,
     weighted_permit: astra_services::WeightedAdmissionPermit,
-    distributed_permit: astra_services::DistributedAdmissionPermit,
 }
 
 /// Owns only request-local preparation. Run creation invokes it after winning
@@ -5613,7 +5611,6 @@ struct RootTurnStartParticipant<'a> {
     session_id: &'a str,
     run_id: &'a str,
     request: &'a ChatRequestData,
-    attempt_id: String,
     started_at: chrono::DateTime<chrono::Utc>,
     admission: Option<CanonicalTurnAdmission>,
     prepared: Option<PreparedRootContextAdmission>,
@@ -5625,13 +5622,7 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
     async fn prepare(&mut self) -> Result<(), String> {
         match self
             .service
-            .prepare_canonical_turn(
-                self.user_id,
-                self.session_id,
-                self.run_id,
-                self.request,
-                &self.attempt_id,
-            )
+            .prepare_canonical_turn(self.user_id, self.session_id, self.request)
             .await
         {
             Ok(prepared) => {
@@ -5888,8 +5879,6 @@ pub struct AgenticRunLifecycleService {
     /// admission.  Re-reading environment variables in `with_pool` could
     /// otherwise make the local semaphore and the cross-pod budget disagree
     /// during test/deployment composition.
-    admission_limits: astra_services::WeightedAdmissionLimits,
-    distributed_weighted_admission: Option<astra_services::DatabaseWeightedAdmissionController>,
     /// Shared metrics registry for capacity/admission signals exposed via /metrics.
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
     /// Harness sink registry for server-side harness observation (Phase 2A).
@@ -6004,8 +5993,6 @@ impl AgenticRunLifecycleService {
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
             weighted_admission: astra_services::WeightedAdmissionController::new(admission_limits)
                 .expect("per-owner weighted admission limits fit global limits"),
-            admission_limits,
-            distributed_weighted_admission: None,
             metrics_registry: None,
             #[cfg(feature = "harness")]
             harness_registry: None,
@@ -6019,9 +6006,7 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         session_id: &str,
-        run_id: &str,
         request: &ChatRequestData,
-        attempt_id: &str,
     ) -> Result<PreparedRootContextAdmission, (StatusCode, Json<ErrorResponse>)> {
         let pool = self
             .shared_pool
@@ -6076,19 +6061,6 @@ impl AgenticRunLifecycleService {
                     "weighted_session_admission_rejected",
                 )
             })?;
-        let distributed_admission =
-            self.distributed_weighted_admission
-                .as_ref()
-                .ok_or_else(|| {
-                    error_response_coded(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "cross-pod weighted session admission is unavailable",
-                        "distributed_session_admission_unavailable",
-                    )
-                })?;
-        let admission_ttl = Duration::from_secs(15 * 60);
-        let distributed_reservation_id =
-            format!("server-run:{run_id}:weighted-admission:{attempt_id}");
         let materialize_prior_messages = async {
             match head {
                 Some(head) => coordinator
@@ -6105,50 +6077,13 @@ impl AgenticRunLifecycleService {
                 None => Ok(Vec::new()),
             }
         };
-        let map_distributed_error = |error: astra_services::DistributedAdmissionError| {
-            let (status, code) = match &error {
-                astra_services::DistributedAdmissionError::Capacity(_) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "distributed_session_admission_capacity_exhausted",
-                ),
-                astra_services::DistributedAdmissionError::ConfigurationMismatch { .. } => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "distributed_session_admission_configuration_mismatch",
-                ),
-                astra_services::DistributedAdmissionError::AdmissionTimeout { .. } => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "distributed_session_admission_timeout",
-                ),
-                _ => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "distributed_session_admission_rejected",
-                ),
-            };
-            error_response_coded(
-                status,
-                format!("distributed weighted session admission rejected this turn: {error}"),
-                code,
-            )
-        };
-
-        let (distributed_permit, prior_messages) = tokio::join!(
-            distributed_admission.try_reserve(
-                &key,
-                weighted_work,
-                admission_ttl,
-                &distributed_reservation_id
-            ),
-            materialize_prior_messages,
-        );
-        let distributed_permit = distributed_permit.map_err(map_distributed_error)?;
-        let prior_messages = prior_messages?;
+        let prior_messages = materialize_prior_messages.await?;
         Ok(PreparedRootContextAdmission {
             coordinator,
             snapshot: admission_snapshot,
             key,
             prior_messages,
             weighted_permit,
-            distributed_permit,
         })
     }
 
@@ -6168,7 +6103,6 @@ impl AgenticRunLifecycleService {
             key,
             prior_messages,
             weighted_permit,
-            distributed_permit,
         } = prepared;
         let head = snapshot.head;
         let admission_ttl = Duration::from_secs(15 * 60);
@@ -6288,7 +6222,6 @@ impl AgenticRunLifecycleService {
             release_started: Arc::new(AtomicBool::new(false)),
             renewal_cancel: CancellationToken::new(),
             _weighted_permit: weighted_permit,
-            distributed_permit,
         })
     }
 
@@ -6300,18 +6233,8 @@ impl AgenticRunLifecycleService {
         let heartbeat_cancel = admission.renewal_cancel.clone();
         let heartbeat_run_cancel = authority_loss_cancel;
         let heartbeat_coordinator = Arc::clone(&admission.coordinator);
-        let heartbeat_distributed_admission =
-            self.distributed_weighted_admission.clone().ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cross-pod weighted session admission is unavailable",
-                    "distributed_session_admission_unavailable",
-                )
-            })?;
         let mut heartbeat_lease = admission.lease.clone();
         let mut heartbeat_reservation = admission.reservation.clone();
-        let mut heartbeat_distributed_reservation =
-            admission.distributed_permit.reservation().clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -6339,24 +6262,6 @@ impl AgenticRunLifecycleService {
                 };
                 heartbeat_lease = renewed.writer_lease;
                 heartbeat_reservation = renewed.turn_reservation;
-                heartbeat_distributed_reservation = match heartbeat_distributed_admission
-                    .renew(
-                        &heartbeat_distributed_reservation,
-                        Duration::from_secs(15 * 60),
-                    )
-                    .await
-                {
-                    Ok(reservation) => reservation,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "astra_runtime::session_authority",
-                            error = %error,
-                            "distributed weighted admission renewal failed; late work will be fenced"
-                        );
-                        heartbeat_run_cancel.cancel();
-                        break;
-                    }
-                };
             }
         });
         Ok(())
@@ -6477,19 +6382,6 @@ impl AgenticRunLifecycleService {
         })
     }
 
-    async fn finish_canonical_turn_cleanup(admission: &CanonicalTurnAdmission) {
-        if let Err(error) = admission.distributed_permit.release().await {
-            tracing::warn!(
-                target: "astra_runtime::canonical_wal",
-                user_id = %admission.lease.key.owner_user_id,
-                session_id = %admission.lease.key.session_id,
-                turn = admission.reservation.reserved_turn,
-                %error,
-                "distributed admission release is pending; the permit will retry on drop"
-            );
-        }
-    }
-
     pub fn with_memory_extraction_service(
         mut self,
         svc: Arc<crate::session_memory::MemoryExtractionService>,
@@ -6525,37 +6417,18 @@ impl AgenticRunLifecycleService {
                 ));
             }
         }
-        let mut distributed_weighted_admission =
-            astra_services::DatabaseWeightedAdmissionController::new(
-                pool.clone(),
-                self.admission_limits,
-            )
-            .expect("per-owner distributed admission limits fit global limits");
-        // Use the existing run admission budget for both the local durable
-        // gate queue and the database-pool acquire. This keeps a burst from
-        // waiting forever before the run-level admission timeout can act.
-        distributed_weighted_admission.with_admission_wait_timeout(run_admission_timeout());
-        self.distributed_weighted_admission = Some(distributed_weighted_admission);
         self.shared_pool = Some(pool);
         self
     }
 
-    /// Install one capacity snapshot for both process-local and cross-pod
-    /// admission. Production composition calls this before [`Self::with_pool`]
-    /// so every service built from the same settings observes identical
-    /// limits.
+    /// Bound resident work with one process-owned capacity controller.
+    /// Cross-pod usage statistics do not serialize ordinary turn admission.
     pub fn with_admission_limits(
         mut self,
         limits: astra_services::WeightedAdmissionLimits,
     ) -> Self {
         self.weighted_admission = astra_services::WeightedAdmissionController::new(limits)
             .expect("per-owner weighted admission limits fit global limits");
-        self.admission_limits = limits;
-        if let Some(distributed) = self.distributed_weighted_admission.as_mut() {
-            distributed
-                .with_limits(limits)
-                .expect("per-owner distributed admission limits fit global limits");
-        }
         self
     }
 
@@ -16728,9 +16601,6 @@ impl AgenticRunLifecycleService {
                 // Release resident capacity after dropping the resident
                 // context and its interaction sender clones. This run task
                 // retains cleanup custody without keeping the stream open.
-                if let Some(admission) = canonical_turn.as_ref() {
-                    Self::finish_canonical_turn_cleanup(admission).await;
-                }
             },
             "agentic_loop_owned_execution",
         );
@@ -16841,7 +16711,6 @@ impl AgenticRunLifecycleService {
             session_id: &session_id,
             run_id: &run_id,
             request: &request,
-            attempt_id: Uuid::new_v4().to_string(),
             started_at: chrono::Utc::now(),
             admission: None,
             prepared: None,

@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-17-v105";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v106";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -168,6 +168,7 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     resolved_model_name VARCHAR(255) NULL,
     runtime_profile VARCHAR(64) NULL,
     start_request_fingerprint VARCHAR(64) NULL,
+    terminal_receipt_json LONGTEXT NULL,
     work_id VARCHAR(64) NULL,
     work_branch_id VARCHAR(64) NULL,
     work_graph_revision BIGINT NULL,
@@ -210,6 +211,7 @@ const AGENT_RUNS_RUNTIME_AUTHORITY_COLUMNS: &[&str] = &[
     "model_offering_id",
     "resolved_model_name",
     "start_request_fingerprint",
+    "terminal_receipt_json",
 ];
 const AGENT_RUNS_WORK_BINDING_COLUMNS: &[&str] =
     &["work_id", "work_branch_id", "work_graph_revision"];
@@ -1872,55 +1874,6 @@ async fn existing_table_columns(
     .collect::<Result<BTreeSet<_>, _>>()
 }
 
-#[derive(Clone, Debug)]
-struct WeightedAdmissionColumnShape {
-    data_type: String,
-    numeric_precision: Option<i64>,
-    numeric_scale: Option<i64>,
-    nullable: bool,
-}
-
-async fn weighted_admission_table_shapes(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-    table: &str,
-) -> Result<BTreeMap<String, WeightedAdmissionColumnShape>, sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    validate_schema_identifier(table, "matrixone table")?;
-    let rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            let name: String = row.try_get("COLUMN_NAME")?;
-            let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-                "YES" => true,
-                "NO" => false,
-                value => {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
-                    )));
-                }
-            };
-            Ok((
-                name,
-                WeightedAdmissionColumnShape {
-                    data_type: row.try_get("DATA_TYPE")?,
-                    numeric_precision: row.try_get("NUMERIC_PRECISION")?,
-                    numeric_scale: row.try_get("NUMERIC_SCALE")?,
-                    nullable,
-                },
-            ))
-        })
-        .collect()
-}
-
 async fn table_exists(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -1937,153 +1890,6 @@ async fn table_exists(
     .fetch_optional(pool)
     .await
     .map(|row| row.is_some())
-}
-
-/// The current admission protocol stores materialized usage beside the
-/// durable gate. `CREATE TABLE IF NOT EXISTS` cannot add those columns to a
-/// database created by an older contract, and this branch intentionally has
-/// no compatibility migration. Refuse that physical schema explicitly before
-/// publishing a new readiness marker; operators must recreate the database
-/// with the current contract instead.
-async fn reject_obsolete_weighted_admission_schema(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    const GATE: &str = "session_weighted_admission_gates";
-    const OWNER_USAGE: &str = "session_weighted_admission_owner_usage";
-    const REQUIRED_GATE_COLUMNS: &[&str] = &[
-        "usage_initialized",
-        "earliest_expiry_at",
-        "used_resident_bytes",
-        "used_context_tokens",
-        "used_provider_slots",
-        "used_cpu_units",
-        "used_io_bytes",
-        "allocated_resident_bytes",
-        "allocated_context_tokens",
-        "allocated_provider_slots",
-        "allocated_cpu_units",
-        "allocated_io_bytes",
-    ];
-
-    if !table_exists(pool, database, GATE).await? {
-        // A brand-new database has no admission tables yet; the bootstrap DDL
-        // below will create the complete current shape.
-        return Ok(());
-    }
-
-    let gate_columns = weighted_admission_table_shapes(pool, database, GATE).await?;
-    let missing = REQUIRED_GATE_COLUMNS
-        .iter()
-        .filter(|column| !gate_columns.contains_key(**column))
-        .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema does not match the current contract; missing {}. Recreate database {database} with the current schema",
-            missing.join(", ")
-        )));
-    }
-    if !table_exists(pool, database, OWNER_USAGE).await? {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is incomplete; missing table {OWNER_USAGE}. Recreate database {database} with the current schema"
-        )));
-    }
-
-    let mut mismatches = Vec::new();
-    if let Some(column) = gate_columns.get("earliest_expiry_at")
-        && (!column.data_type.eq_ignore_ascii_case("datetime") || !column.nullable)
-    {
-        mismatches.push(format!(
-            "{GATE}.earliest_expiry_at must be nullable DATETIME"
-        ));
-    }
-    if let Some(column) = gate_columns.get("usage_initialized")
-        && (!column.data_type.eq_ignore_ascii_case("tinyint") || column.nullable)
-    {
-        mismatches.push(format!(
-            "{GATE}.usage_initialized must be NOT NULL TINYINT (found {}{})",
-            column.data_type,
-            if column.nullable { " NULL" } else { "" }
-        ));
-    }
-    for name in [
-        "used_resident_bytes",
-        "used_context_tokens",
-        "used_provider_slots",
-        "used_cpu_units",
-        "used_io_bytes",
-        "allocated_resident_bytes",
-        "allocated_context_tokens",
-        "allocated_provider_slots",
-        "allocated_cpu_units",
-        "allocated_io_bytes",
-    ] {
-        if let Some(column) = gate_columns.get(name)
-            && (!column.data_type.eq_ignore_ascii_case("decimal")
-                || column.numeric_precision != Some(20)
-                || column.numeric_scale != Some(0)
-                || column.nullable)
-        {
-            mismatches.push(format!(
-                "{GATE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
-                column.data_type,
-                column.numeric_precision,
-                column.numeric_scale,
-                if column.nullable { " NULL" } else { "" }
-            ));
-        }
-    }
-
-    let owner_columns = weighted_admission_table_shapes(pool, database, OWNER_USAGE).await?;
-    for name in [
-        "resident_bytes",
-        "context_tokens",
-        "provider_slots",
-        "cpu_units",
-        "io_bytes",
-    ] {
-        match owner_columns.get(name) {
-            None => mismatches.push(format!("{OWNER_USAGE}.{name} is missing")),
-            Some(column)
-                if !column.data_type.eq_ignore_ascii_case("decimal")
-                    || column.numeric_precision != Some(20)
-                    || column.numeric_scale != Some(0)
-                    || column.nullable =>
-            {
-                mismatches.push(format!(
-                    "{OWNER_USAGE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
-                    column.data_type,
-                    column.numeric_precision,
-                    column.numeric_scale,
-                    if column.nullable { " NULL" } else { "" }
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    if !mismatches.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema does not match the current physical shape: {}. Recreate database {database} with the current schema",
-            mismatches.join(", ")
-        )));
-    }
-    let reservation_columns =
-        weighted_admission_table_shapes(pool, database, "session_weighted_admission_reservations")
-            .await?;
-    // Interrupted fresh bootstrap may not have created this table yet.
-    if !reservation_columns.is_empty()
-        && !reservation_columns
-            .get("idempotency_hash")
-            .is_some_and(|column| {
-                column.data_type.eq_ignore_ascii_case("varchar") && !column.nullable
-            })
-    {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission idempotency_hash must be NOT NULL VARCHAR; recreate database {database} with the current schema"
-        )));
-    }
-    Ok(())
 }
 
 fn agent_runs_canonical_columns() -> BTreeSet<String> {
@@ -4181,91 +3987,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_owner_usage",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_owner_usage (
-            scope_name VARCHAR(64) NOT NULL,
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
-            resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, isolation_domain, owner_user_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Both admission tables must validate before readiness is published.
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_gates",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_gates (
-            scope_name VARCHAR(64) NOT NULL,
-            capacity_hash CHAR(64) NULL,
-            usage_initialized TINYINT NOT NULL DEFAULT 0,
-            earliest_expiry_at DATETIME(6) NULL,
-            used_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    let mut gates = sqlx::QueryBuilder::<MySql>::new(
-        "INSERT IGNORE INTO session_weighted_admission_gates (scope_name) ",
-    );
-    gates.push_values(
-        0..crate::weighted_admission::DISTRIBUTED_ADMISSION_PARTITIONS,
-        |mut row, partition| {
-            row.push_bind(crate::weighted_admission::distributed_admission_scope(
-                partition,
-            ));
-        },
-    );
-    gates.build().execute(&pool).await?;
-
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_reservations",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_reservations (
-            scope_name VARCHAR(64) NOT NULL,
-            reservation_id CHAR(36) NOT NULL,
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            idempotency_hash VARCHAR(64) NOT NULL,
-            resident_bytes BIGINT NOT NULL,
-            context_tokens BIGINT NOT NULL,
-            provider_slots BIGINT NOT NULL,
-            cpu_units BIGINT NOT NULL,
-            io_bytes BIGINT NOT NULL,
-            expires_at DATETIME(6) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, isolation_domain, owner_user_id, idempotency_hash),
-            UNIQUE KEY uq_weighted_admission_reservation (scope_name, reservation_id),
-            INDEX idx_weighted_admission_expiry (scope_name, expires_at),
-            INDEX idx_weighted_admission_owner_expiry
-                (scope_name, isolation_domain, owner_user_id, expires_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "agent_run_events",
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) NOT NULL,
@@ -4343,56 +4064,6 @@ async fn ensure_core_schema_while_leased(
             PRIMARY KEY (user_id, run_id),
             INDEX idx_run_display_projections_owner_session_updated (user_id, session_id, updated_at),
             INDEX idx_run_display_projections_user_updated (user_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "session_tool_output_batches",
-        "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
-            batch_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            output_count INT NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'committed',
-            request_id VARCHAR(64) NULL,
-            trace_id VARCHAR(64) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, batch_id),
-            INDEX idx_tool_output_batches_user_run_created (user_id, run_id, created_at, batch_id),
-            INDEX idx_tool_output_batches_user_session_created (user_id, session_id, created_at, batch_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "session_tool_outputs",
-        "CREATE TABLE IF NOT EXISTS session_tool_outputs (
-            output_id VARCHAR(64) NOT NULL,
-            batch_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            output_idx INT NOT NULL,
-            parent_output_id VARCHAR(64) NULL,
-            tool_call_id VARCHAR(128) NULL,
-            tool_name VARCHAR(128) NOT NULL,
-            output_json LONGTEXT NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            preview_text LONGTEXT NULL,
-            preview_status VARCHAR(32) NOT NULL DEFAULT 'template',
-            artifact_ref VARCHAR(255) NULL,
-            content_hash VARCHAR(128) NULL,
-            normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, output_id),
-            UNIQUE KEY uq_tool_outputs_batch_idx (user_id, session_id, batch_id, output_idx),
-            INDEX idx_tool_outputs_user_run_created (user_id, run_id, created_at, output_id),
-            INDEX idx_tool_outputs_user_session_created (user_id, session_id, created_at, output_id),
-            INDEX idx_tool_outputs_parent (user_id, parent_output_id),
-            INDEX idx_tool_outputs_artifact_ref (user_id, artifact_ref)
         )",
     )
     .execute(&pool)
@@ -6111,7 +5782,6 @@ async fn verify_core_schema_shape(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<(), sqlx::Error> {
-    reject_obsolete_weighted_admission_schema(pool, database).await?;
     validate_schema_identifier(database, "matrixone database")?;
     // CREATE IF NOT EXISTS does not validate existing tables. Reject missing
     // runtime fields without restoring the historical ALTER/repair path.
@@ -6177,7 +5847,6 @@ async fn verify_core_schema_shape(
                 "compaction_generation",
             ][..],
         ),
-        ("session_weighted_admission_gates", &["capacity_hash"][..]),
         (
             "agent_run_events",
             &[
@@ -6275,23 +5944,6 @@ async fn verify_core_schema_shape(
         &["uq_auth_user_roles_user_role"],
     )
     .await?;
-    ensure_index_shape(
-        &indexes,
-        "session_weighted_admission_reservations",
-        "PRIMARY",
-        &[
-            "scope_name",
-            "isolation_domain",
-            "owner_user_id",
-            "idempotency_hash",
-        ],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_weighted_admission_reservations",
-        "uq_weighted_admission_reservation",
-        &["scope_name", "reservation_id"],
-    )?;
     ensure_index_shape(
         &indexes,
         "auth_user_roles",
@@ -6557,61 +6209,6 @@ async fn verify_core_schema_shape(
         "idx_run_display_projections_owner_session_updated",
         &["user_id", "session_id", "updated_at"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "session_tool_output_batches",
-        "PRIMARY",
-        &["user_id", "session_id", "batch_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_tool_output_batches_user_run_created",
-            &["user_id", "run_id", "created_at", "batch_id"][..],
-        ),
-        (
-            "idx_tool_output_batches_user_session_created",
-            &["user_id", "session_id", "created_at", "batch_id"][..],
-        ),
-    ] {
-        ensure_index_shape(
-            &indexes,
-            "session_tool_output_batches",
-            index,
-            expected_columns,
-        )?;
-    }
-    ensure_index_shape(
-        &indexes,
-        "session_tool_outputs",
-        "PRIMARY",
-        &["user_id", "session_id", "output_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_tool_outputs",
-        "uq_tool_outputs_batch_idx",
-        &["user_id", "session_id", "batch_id", "output_idx"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_tool_outputs_user_run_created",
-            &["user_id", "run_id", "created_at", "output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_user_session_created",
-            &["user_id", "session_id", "created_at", "output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_parent",
-            &["user_id", "parent_output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_artifact_ref",
-            &["user_id", "artifact_ref"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "session_tool_outputs", index, expected_columns)?;
-    }
     fail_if_required_columns_missing_or_nullable(
         pool,
         database,

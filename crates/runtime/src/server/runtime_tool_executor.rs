@@ -4071,8 +4071,26 @@ impl RuntimeToolExecutor {
                 .invocation_admission_snapshot(&request)
                 .await,
         );
+        // Readonly execution is repeatable. The shared loop owns observations;
+        // there is no second replay cache or persistent dispatch state here.
+        let route = self.tool_execution_service.routing_decision(&request);
+        request.policy.work_attribution = self.work_invocation_attribution(&request, route);
+        let is_observation = request.policy.resolved_provider_policy.is_none()
+            && request.policy.delegation_model_admission.is_none()
+            && delegation_preparation.is_none()
+            && matches!(
+                route,
+                ToolExecutionRouteKind::ServerLocal
+                    | ToolExecutionRouteKind::ServerControlPlane
+                    | ToolExecutionRouteKind::ServerRuntime
+            )
+            && self
+                .tool_execution_service
+                .tool_registry()
+                .get(&request.tool_name)
+                .is_some_and(astra_runtime_env::ToolSpec::is_run_observation);
         let mut dispatch_rejection = None;
-        let durable_invocation = if request.policy.permission_grant.is_some() {
+        let durable_invocation = if request.policy.permission_grant.is_some() && !is_observation {
             let identity = match astra_turn_types::ToolInvocationIdentity::new(
                 &request.user_id,
                 &request.session_id,
