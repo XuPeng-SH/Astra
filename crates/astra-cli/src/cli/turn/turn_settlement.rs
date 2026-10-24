@@ -200,7 +200,7 @@ mod tests {
         );
     }
 
-    /// The actual SSE-to-settlement boundary for a `session_execution_occupied`
+    /// The actual SSE-to-settlement boundary for a `session_execution_slot_occupied`
     /// start-rejection: `admission_rejected` here is exactly what
     /// `is_pre_admission_rejection` computes from the server's `error_code`/
     /// `error_metadata`/`run_id` on the wire (see
@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn settle_failed_turn_restores_draft_without_advancing_cursor_for_session_admission_rejections()
      {
-        for rejected_code in ["session_execution_occupied", "session_unavailable"] {
+        for rejected_code in ["session_execution_slot_occupied", "session_unavailable"] {
             let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
             let ctx = TurnContext {
                 api: &api,
