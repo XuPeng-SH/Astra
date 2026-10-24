@@ -172,9 +172,10 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     if judger_unavailable {
         return FailureClass::InfraVerificationUnavailable;
     }
-    if criteria_results.iter().any(|result| {
-        !result.passed && crate::criteria::execution_verification_unavailable(result, outcome)
-    }) {
+    if criteria_results
+        .iter()
+        .any(|result| !result.passed && crate::criteria::execution_verification_unavailable(result))
+    {
         return FailureClass::InfraVerificationUnavailable;
     }
     if criteria_results.iter().any(|result| {

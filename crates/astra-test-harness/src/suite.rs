@@ -1208,7 +1208,12 @@ impl<'a> SuiteRunner<'a> {
 
         let semantic_evidence =
             crate::criteria::semantic_child_adoption(&criteria).map(|adoption| {
-                crate::judger::semantic_child_evidence(&case.prompt, &outcome, adoption)
+                crate::judger::semantic_child_evidence(
+                    &case.prompt,
+                    &outcome,
+                    adoption,
+                    session.as_ref(),
+                )
             });
 
         let local_failure = attempts
@@ -5331,6 +5336,20 @@ mod tests {
         outcome
     }
 
+    struct SemanticSessionLoader;
+    impl SessionLoader for SemanticSessionLoader {
+        fn load(&self, session_id: &str) -> Option<SessionCapture> {
+            let mut trace = crate::execution_capture::tests::trace(&bound_semantic_capture());
+            trace.session_id = session_id.into();
+            trace.events.push(crate::session_capture::JournalEvent {
+                event_type: "turn".into(),
+                raw: serde_json::json!({"type":"turn", "turn":1,
+                    "ts":chrono::Utc::now().to_rfc3339(), "metadata":{"run_id":"root"}}),
+            });
+            Some(trace)
+        }
+    }
+
     fn semantic_runner<'a>(
         executor: &'a dyn CaseExecutor,
         judger: &'a dyn Judger,
@@ -5405,7 +5424,7 @@ mod tests {
             semantic_outcome(Some(bound_semantic_capture())),
         );
         let judger = SemanticCaptureJudger::new();
-        let loader = NoopSessionLoader;
+        let loader = SemanticSessionLoader;
         let runner = semantic_runner(&exec, &judger, &loader);
 
         let report = runner.run_all(&[semantic_case("semantic-intact")]).await;
@@ -5448,7 +5467,7 @@ mod tests {
             let exec = FakeExecutor::new();
             exec.seed(name, "m", semantic_outcome(capture));
             let judger = SemanticCaptureJudger::new();
-            let loader = NoopSessionLoader;
+            let loader = SemanticSessionLoader;
             let runner = semantic_runner(&exec, &judger, &loader);
 
             let report = runner.run_all(&[semantic_case(name)]).await;
@@ -5499,7 +5518,7 @@ mod tests {
                 };
                 let mut judger = SemanticCaptureJudger::new();
                 judger.accepted = fault != "rejected";
-                let loader = NoopSessionLoader;
+                let loader = SemanticSessionLoader;
                 let mut runner = semantic_runner(&exec, &judger, &loader);
                 runner.suite_cfg.retry_on_429 = true;
                 let mut case = semantic_case("semantic-retry");

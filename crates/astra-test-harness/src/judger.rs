@@ -33,6 +33,7 @@ pub(crate) fn semantic_child_evidence(
     task: &str,
     outcome: &RunOutcome,
     adoption: &Criterion,
+    session: Option<&crate::session_capture::SessionCapture>,
 ) -> Result<Option<SemanticJudgerEvidence>, &'static str> {
     let Criterion::ExecutionChildResultsAdopted {
         children,
@@ -53,27 +54,29 @@ pub(crate) fn semantic_child_evidence(
         .as_ref()
         .ok_or("Server execution not captured")?;
     let root = outcome.run_id.as_deref().ok_or("root not captured")?;
-    let Some(verified) = capture.verified_children(root, children, fanout_group.as_ref())? else {
+    let Some(verified) =
+        capture.verified_children(root, children, fanout_group.as_ref(), session)?
+    else {
         return Ok(None);
     };
     if task.trim().is_empty() || outcome.text.trim().is_empty() {
         return Err("complete semantic evidence is empty");
     }
-    let tools = capture.tools(root)?;
+    let tools = capture.tools(root, session)?;
     let requests = tools
         .iter()
-        .filter(|call| call.run_id == root)
+        .filter(|call| call.run_id.as_deref() == Some(root))
         .map(|call| {
             serde_json::json!({"tool":call.name,"arguments":call.arguments,
-            "request_seq":call.request_seq,"terminal_seq":call.terminal_seq,"ok":call.ok})
+            "round":call.round,"ok":call.ok})
         })
         .collect::<Vec<_>>();
     let child_tools = tools.iter()
-        .filter(|call| verified.iter().any(|child| child.run_id == call.run_id))
+        .filter(|call| verified.iter().any(|child| Some(child.run_id) == call.run_id.as_deref()))
         .map(|call| {
             serde_json::json!({"run_id":call.run_id,"tool":call.name,"arguments":call.arguments,
-            "result":call.result.as_ref().cloned().unwrap_or_else(|| serde_json::Value::String(call.raw_result.into())),
-            "request_seq":call.request_seq,"terminal_seq":call.terminal_seq,"ok":call.ok})
+            "result":call.result.as_ref().cloned().unwrap_or_else(|| serde_json::Value::String(call.raw_result().to_owned())),
+            "round":call.round,"ok":call.ok})
         })
         .collect::<Vec<_>>();
     let evidence = serde_json::json!({"parent_run_id":root,"fanout_group":fanout_group,
@@ -1384,10 +1387,23 @@ mod tests {
         (outcome, adoption)
     }
 
+    fn semantic_fixture_evidence(
+        task: &str,
+        outcome: &RunOutcome,
+        adoption: &Criterion,
+    ) -> Result<Option<SemanticJudgerEvidence>, &'static str> {
+        let trace = outcome
+            .stream_capture
+            .as_ref()
+            .and_then(|s| s.execution.as_ref())
+            .map(crate::execution_capture::tests::trace);
+        super::semantic_child_evidence(task, outcome, adoption, trace.as_ref())
+    }
+
     #[tokio::test]
     async fn semantic_request_keeps_wrong_child_even_when_parent_is_correct() {
         let (mut outcome, adoption) = semantic_fixture();
-        let evidence = semantic_child_evidence("Compute six times seven", &outcome, &adoption)
+        let evidence = semantic_fixture_evidence("Compute six times seven", &outcome, &adoption)
             .unwrap()
             .unwrap();
         let request =
@@ -1411,7 +1427,7 @@ mod tests {
         );
 
         outcome.stream_capture.as_mut().unwrap().identity_verified = false;
-        assert!(semantic_child_evidence("task", &outcome, &adoption).is_err());
+        assert!(semantic_fixture_evidence("task", &outcome, &adoption).is_err());
         outcome.stream_capture.as_mut().unwrap().identity_verified = true;
         outcome.text = "x".repeat(JUDGER_TEXT_CAP + 1);
         use sha2::{Digest, Sha256};
@@ -1434,7 +1450,7 @@ mod tests {
                 .as_mut()
                 .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
                 serde_json::json!(format!("{:x}", Sha256::digest(content.as_bytes())));
-            let evidence = semantic_child_evidence("task", &outcome, &adoption)
+            let evidence = semantic_fixture_evidence("task", &outcome, &adoption)
                 .unwrap()
                 .unwrap();
             let request = build_judger_request(&hard_criterion(1.0), &outcome, Some(&evidence));
@@ -1469,7 +1485,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_external_judger_receives_child_and_parent_separately() {
         let (outcome, adoption) = semantic_fixture();
-        let evidence = semantic_child_evidence("Compute six times seven", &outcome, &adoption)
+        let evidence = semantic_fixture_evidence("Compute six times seven", &outcome, &adoption)
             .unwrap()
             .unwrap();
         let script = r#"

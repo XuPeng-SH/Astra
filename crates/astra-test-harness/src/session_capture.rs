@@ -622,6 +622,122 @@ impl SessionCapture {
         calls_by_run
     }
 
+    /// Exact tool records from the existing authorized, invocation-scoped trace.
+    /// Unlike display/journal queries, execution assertions cannot infer legacy
+    /// dispositions or substitute previews for missing documents.
+    pub(crate) fn execution_tool_calls(
+        &self,
+    ) -> Result<Vec<(JournalToolCall, &str, &str)>, &'static str> {
+        use astra_services::session_journal::ToolCallDisposition;
+        if self.skipped_lines != 0 || self.dropped_lines != 0 || self.has_integrity_errors() {
+            return Err("execution trace is incomplete or conflicting");
+        }
+        let mut documents = std::collections::HashMap::new();
+        for event in &self.events {
+            if !matches!(event.event_type.as_str(), "turn" | "llm_round") {
+                continue;
+            }
+            let Some(records) = event
+                .raw
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            if records.is_empty() {
+                continue;
+            }
+            let run = event_run_id(&event.raw).ok_or("tool trace producer identity unavailable")?;
+            for record in records {
+                record
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .ok_or("tool name unavailable")?;
+                if event.event_type == "llm_round" {
+                    let (_, round, _, _) =
+                        tool_occurrence(event, record).ok_or("tool producer round unavailable")?;
+                    if event.raw.get("round").and_then(serde_json::Value::as_u64)
+                        != Some(u64::from(round))
+                    {
+                        return Err("tool round contradicts producer round");
+                    }
+                }
+                let call = record
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or("tool call identity unavailable")?;
+                let arguments = record
+                    .get("args_full")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("complete tool arguments unavailable")?;
+                let result = record
+                    .get("result_full")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("complete tool result unavailable")?;
+                let ok = record
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or("tool outcome unavailable")?;
+                let disposition = serde_json::from_value::<ToolCallDisposition>(
+                    record.get("disposition").cloned().unwrap_or_default(),
+                )
+                .map_err(|_| "explicit tool disposition unavailable")?;
+                if disposition == ToolCallDisposition::Rejected && ok {
+                    return Err("rejection contradicts tool success");
+                }
+                if documents
+                    .insert((run, call), (arguments, result))
+                    .is_some_and(|previous| previous != (arguments, result))
+                {
+                    return Err("tool documents conflict across trace records");
+                }
+            }
+        }
+        let calls = self.journal_tool_calls();
+        if calls.len() != documents.len() {
+            return Err("tool trace coverage unavailable");
+        }
+        calls
+            .into_iter()
+            .map(|mut call| {
+                let key = (
+                    call.run_id
+                        .as_deref()
+                        .ok_or("tool run identity unavailable")?,
+                    call.call_id
+                        .as_deref()
+                        .ok_or("tool call identity unavailable")?,
+                );
+                let &(arguments, result) = documents
+                    .get(&key)
+                    .ok_or("complete tool documents unavailable")?;
+                let disposition = serde_json::from_value::<ToolCallDisposition>(
+                    call.runtime_metadata["disposition"].clone(),
+                )
+                .map_err(|_| "explicit tool disposition unavailable")?;
+                if matches!(
+                    disposition,
+                    ToolCallDisposition::Reused
+                        | ToolCallDisposition::Suppressed
+                        | ToolCallDisposition::Deferred
+                ) || call.runtime_metadata["error_kind"] == "tool_outcome_unknown"
+                {
+                    call.ok = None;
+                }
+                // Preserve opaque text for exact diagnostics; it cannot become a JSON predicate document.
+                if matches!(call.arguments, Some(serde_json::Value::String(_))) {
+                    call.arguments = serde_json::from_str(arguments).ok();
+                }
+                if matches!(call.result, Some(serde_json::Value::String(_))) {
+                    call.result = serde_json::from_str(result).ok();
+                }
+                Ok((call, arguments, result))
+            })
+            .collect()
+    }
+
     /// Complete, de-duplicated tool calls persisted in turn records.
     pub fn journal_tool_calls(&self) -> Vec<JournalToolCall> {
         if self.has_integrity_errors() {
@@ -780,11 +896,13 @@ impl SessionCapture {
             {
                 let (&(turn, round), (batch, parallel, positions)) =
                     known.first_key_value().unwrap();
-                call.turn = Some(turn);
-                call.round = Some(round);
-                call.batch_id = batch.clone();
-                call.parallel = *parallel;
+                // Aggregate round numbers alone do not witness an invocation's
+                // actual provider round or its order relative to other calls.
                 if positions.len() == 1 {
+                    call.turn = Some(turn);
+                    call.round = Some(round);
+                    call.batch_id = batch.clone();
+                    call.parallel = *parallel;
                     canonical_order[index] = Some((turn, round, *positions.first().unwrap()));
                 }
             }
@@ -1132,8 +1250,7 @@ fn materialize_persisted_tool_results(
                 MAX_STRUCTURED_TOOL_RESULT_BYTES as u64,
             ) {
                 Ok(full) => {
-                    record[result_key] =
-                        serde_json::from_str(&full).unwrap_or(serde_json::Value::String(full));
+                    record[result_key] = serde_json::Value::String(full);
                 }
                 Err(_) => errors = errors.saturating_add(1),
             }
@@ -1974,6 +2091,68 @@ pub fn load_session_from_path_with_caps(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn execution_records_require_names_and_actual_round_witnesses() {
+        let record = serde_json::json!({
+            "tool_call_id":"a","name":"bash","args_full":"{}",
+            "result_full":"{}","ok":true,"disposition":"executed","round":0
+        });
+        let event = JournalEvent {
+            event_type: "llm_round".into(),
+            raw: serde_json::json!({
+                "turn":1,"round":0,"producer_scope":{"run_id":"root"},"tool_calls":[record]
+            }),
+        };
+        let valid = SessionCapture {
+            events: vec![event],
+            ..Default::default()
+        };
+        assert_eq!(valid.execution_tool_calls().unwrap()[0].0.round, Some(0));
+        for name in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.events[0].raw["tool_calls"][0]["name"] = name;
+            assert!(invalid.execution_tool_calls().is_err());
+        }
+        let mut missing = valid.clone();
+        missing.events[0].raw["tool_calls"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        assert!(missing.execution_tool_calls().is_err());
+        let mut forged = valid.clone();
+        let mut second = forged.events[0].raw["tool_calls"][0].clone();
+        second["tool_call_id"] = "b".into();
+        second["round"] = 1.into();
+        forged.events[0].raw["tool_calls"]
+            .as_array_mut()
+            .unwrap()
+            .push(second.clone());
+        assert!(forged.execution_tool_calls().is_err());
+        let mut aggregate = valid.clone();
+        aggregate.events[0].event_type = "turn".into();
+        assert_eq!(aggregate.execution_tool_calls().unwrap()[0].0.round, None);
+        let mut serial = valid.clone();
+        let mut next = serial.events[0].clone();
+        next.raw["round"] = 1.into();
+        next.raw["tool_calls"] = serde_json::json!([second]);
+        serial.events.push(next);
+        let calls = serial.execution_tool_calls().unwrap();
+        assert_eq!(
+            calls.iter().map(|c| c.0.round).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+        assert!(
+            SessionCapture::default()
+                .execution_tool_calls()
+                .unwrap()
+                .is_empty()
+        );
+    }
     use super::*;
     use tempfile::tempdir;
 
@@ -3950,7 +4129,7 @@ mod tests {
 
     #[test]
     fn evidence_projection_distinguishes_same_turn_serial_and_parallel_calls() {
-        let capture = SessionCapture {
+        let mut capture = SessionCapture {
             events: vec![JournalEvent {
                 event_type: "turn".into(),
                 raw: serde_json::json!({
@@ -3967,6 +4146,26 @@ mod tests {
             }],
             ..Default::default()
         };
+        // Turn aggregates alone cannot establish serial/parallel provenance.
+        assert!(
+            capture
+                .journal_tool_calls()
+                .iter()
+                .all(|call| call.round.is_none())
+        );
+        let records = capture.events[0].raw["tool_calls"]
+            .as_array()
+            .unwrap()
+            .clone();
+        for round in [0, 1] {
+            capture.events.push(JournalEvent {
+                event_type: "llm_round".into(),
+                raw: serde_json::json!({
+                    "turn":1,"round":round,"producer_scope":{"run_id":"root-run"},
+                    "tool_calls":records.iter().filter(|call| call["round"]==round).collect::<Vec<_>>()
+                }),
+            });
+        }
         let value: serde_json::Value =
             serde_json::from_str(&capture.render_tool_evidence(4096)).unwrap();
         let calls = value["calls"].as_array().unwrap();

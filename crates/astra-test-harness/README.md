@@ -885,15 +885,14 @@ missing gaps do not prove complete delivery. Review/redact sidecars before shari
 before cleanup, using the same binary, environment, account and profile as the
 run. The private sidecar also retains the typed Server run tree and Reflect
 response. Its `children` list specifies the complete direct-child set. Every
-child requires an exact model and offering with successful physical provider
-evidence, and its result bytes adopted before the same parent finalization.
+child requires an exact model and offering on its completed canonical Run,
+and its result bytes adopted before the same parent finalization.
 Bounded notifications and explicit result reads record byte ranges and hashes
 through the same dependency boundary. Explicit reads count only when present in
 the final request of a successful provider turn. The harness verifies each range
 against the canonical child result and requires gap-free coverage; overlap and
 out-of-order pages are allowed, while a preview alone cannot prove a full read.
-It never falls back to local journal
-events. The run tree must be complete; partial reflection can prove positive
+The run tree and canonical child result must be complete; partial reflection can prove positive
 facts but cannot prove absence. Capture is bounded to 5 MiB and one total
 20-second observation window. Because trace ingestion is asynchronous, a
 completed root/children snapshot without the root's finalization fact is sampled
@@ -903,22 +902,33 @@ is retained and classified as verification unavailable. Each snapshot's two
 Server reads are not transactional and do not enter model usage; unrelated
 cases and normal conversations do not pay this observation cost.
 
-`execution_tool_count` and `execution_tool_sequence` additionally request
-`--transcript`. They join typed requests and terminal results by exact run and
-call identity, and reconcile the count with the authoritative run tree. The
-explicit inspection reads at most 4,096 transcript items and 2 MiB across pages,
-within the same CLI inspection deadline. Missing pages, conflicting identities,
-unknown statuses and count mismatches fail verification; an empty local journal
-cannot prove that a tool was not called. JSON predicates inspect the retained
-Server projection, not a reconstructed legacy journal or model-authored prose.
-Runtime advisories travel separately in the typed tool receipt; TUI rendering
-adds them to a disposable display copy, never to the result document. Truncated
-or malformed result documents remain unavailable to JSON predicates.
-Negative JSON-document predicates require raw evidence and are rejected here;
-display projection cannot certify that a field was absent from the original.
+`execution_tool_count` and `execution_tool_sequence` use the existing authorized
+session trace, scoped to the current invocation's Run IDs and start time. They
+reconcile complete `turn`/`llm_round` tool records with the canonical run tree;
+they do not request the retired per-tool raw transcript mirrors. Arguments and
+results must be complete, dispositions explicit, and every selected Run's exact
+call count accounted for. Previews, missing/corrupt records, identity conflicts,
+unknown outcomes and unverified artifacts cannot prove success or absence.
+Artifact reads retain their existing owner, Run, call, size and digest checks.
+A rejected call needs its complete typed record, not a generic executor-completed
+event for execution that never happened. Reused, suppressed and deferred records
+do not become successful physical executions.
+
+Tool sequence checks use known serial provider-round boundaries. Same-round
+parallel slots do not establish an order; a required order without evidence is
+unavailable. These observations prove the captured Run's behavior, not current
+lease authority or settlement of uncertain external effects. Canonical Run/C0
+and the effect ledger retain those responsibilities. Remote or restarted runs
+without the authorized trace remain unverifiable; this adds no general cold
+readonly-tool replay or access to another Server's private filesystem.
+
+Runtime advisories remain separate from result documents. Opaque non-JSON text
+is retained for exact error diagnostics but cannot satisfy JSON predicates.
+Negative JSON-document predicates remain unsupported; redacted projections do
+not prove the absence of a field in original input.
 `execution_child_count` uses the complete run tree to prove admission cardinality.
 `execution_tool_count.error_contains` checks a positive diagnostic substring
-only in that exact joined call's failed/rejected result body. It requires
+only in that exact recorded call's failed/rejected result body. It requires
 `ok: false`, a positive minimum and a nonempty needle of at most 4,096 bytes.
 Arguments, runtime advisories, successful results and another call's output
 cannot satisfy it. This accepts plain-text errors without fabricating JSON;

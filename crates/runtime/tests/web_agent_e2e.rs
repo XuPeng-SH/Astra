@@ -5752,64 +5752,44 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .expect("stream timed out")
         .expect("reader task failed");
     let wire = String::from_utf8(raw_wire.lock().unwrap().clone()).unwrap();
-    let interrupted = events
+    let failed = events
         .iter()
-        .position(|event| event["type"] == "run_interrupted")
-        .expect("typed interruption");
+        .position(|event| event["type"] == "run_error")
+        .expect("typed terminal failure");
     let finished = events
         .iter()
         .position(|event| event["type"] == "run_finished")
         .expect("durable terminal");
-    let complete = events
-        .iter()
-        .position(|event| event["type"] == "turn_complete")
-        .expect("authoritative completion");
-    assert!(interrupted < finished && finished < complete);
-    assert_eq!(events[interrupted]["kind"], "budget_exhausted");
-    assert_eq!(events[complete]["continuation_owner"], "server");
-    assert_eq!(events[complete]["interruption"]["kind"], "budget_exhausted");
+    assert!(failed < finished);
+    assert_eq!(events[failed]["error_kind"], "budget_exhausted");
+    assert!(!events.iter().any(|event| matches!(
+        event["type"].as_str(),
+        Some("run_interrupted" | "turn_complete")
+    )));
     assert_eq!(wire.matches("data: [DONE]\n\n").count(), 1);
     let mut accum = ChatTurnSseAccum::default();
     let mut edge_pending = Vec::new();
     for block in wire.split("\n\n").filter(|block| !block.is_empty()) {
         dispatch_chat_turn_sse_event_block(block, &mut accum, &mut edge_pending);
     }
-    assert!(accum.server_loop_terminal);
-    assert_eq!(accum.error_kind, None);
-    let summary = accum
-        .server_execution_summary
-        .expect("CLI accepts the actual paused summary");
-    assert_eq!(summary.llm_rounds, 3);
-    let feedback = summary
-        .runtime_feedback
-        .expect("actual provider execution supplies runtime feedback");
+    assert!(accum.has_authoritative_failed_terminal());
     assert_eq!(
-        feedback.identity.run_id,
-        find_event(&events, "session_info").unwrap()["run_id"]
-            .as_str()
-            .unwrap()
+        accum.error_kind,
+        Some(astra_core::ErrorKind::BudgetExhausted)
     );
-    assert_eq!(feedback.progress.llm_rounds_completed, 3);
-    assert_eq!(feedback.progress.slice_rounds_remaining, 0);
-    assert_eq!(feedback.progress.absolute_round_ceiling, Some(2));
-    let accounted = feedback
-        .run_usage
-        .expect("settled provider attempts retain their usage");
-    assert_eq!(accounted.prompt, 126);
-    assert_eq!(accounted.completion, 21);
+    assert!(accum.server_interruption.is_none());
     let root = find_event(&events, "session_info").unwrap()["run_id"]
         .as_str()
         .unwrap();
     let (status, durable) = get_run_status(&app, root).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(durable["status"], "paused");
-    let text: String = find_events(&events, "text_delta")
-        .into_iter()
-        .filter_map(|event| event["content"].as_str().map(str::to_string))
-        .collect();
+    assert_eq!(durable["status"], "failed");
     assert!(
-        text.contains("Final answer after the hard limit."),
-        "hard limit should preserve the text-only settlement boundary, got: {text}"
+        accum
+            .full_text
+            .contains("Final answer after the hard limit."),
+        "failure must preserve the text-only settlement output: {}",
+        accum.full_text
     );
     let tool_requests = find_events(&events, "tool_request");
     assert_eq!(
@@ -5817,42 +5797,26 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         1,
         "hard limit must dispatch exactly one tool request before text-only settlement"
     );
-    assert_eq!(
-        tool_requests[0]["request_id"].as_str(),
-        first["request_id"].as_str()
-    );
+    assert_eq!(tool_requests[0]["request_id"], first["request_id"]);
     let rejected = find_events(&events, "tool_call_end")
         .into_iter()
         .find(|event| event["tool"] == "glob")
         .expect("the denied second provider attempt must have one terminal projection");
     assert_eq!(rejected["status"], "rejected");
     assert_eq!(rejected["success"], false);
-
-    let terminal = find_events(&events, "turn_complete")
-        .into_iter()
-        .next()
-        .expect("bounded synthesis must emit one terminal aggregate");
-    assert_eq!(terminal["tool_calls_count"], 2);
-    assert_eq!(terminal["tool_ledger_receipt"]["attempted"], 2);
-    assert_eq!(terminal["tool_ledger_receipt"]["terminal"], 2);
+    let terminal = &events[finished];
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["error_kind"], "budget_exhausted");
+    assert_ne!(terminal.get("resumable"), Some(&json!(true)));
+    let evaluation = &terminal["turn_evaluation"]["metadata"];
+    assert_eq!(evaluation["llm_rounds"], 3);
+    assert_eq!(evaluation["tool_call_count"], 2);
+    assert_eq!(evaluation["tool_execution_count"], 1);
+    assert_eq!(evaluation["tool_rejected_count"], 1);
     assert_eq!(
-        terminal["tool_ledger_receipt"]["result_classes"]["rejected"],
-        1
+        evaluation["execution_owner_generation"],
+        terminal["owner_generation"]
     );
-    assert_eq!(terminal["tool_ledger_receipt"]["unresolved"], 0);
-    assert_eq!(terminal["tool_ledger_receipt"]["consistent"], true);
-    let run_finished = find_events(&events, "run_finished")
-        .into_iter()
-        .next()
-        .expect("run terminal");
-    assert_eq!(terminal["execution_state"]["status"], "interrupted");
-    assert_eq!(
-        terminal["execution_state"]["interruption_kind"],
-        "budget_exhausted"
-    );
-    assert_eq!(run_finished["status"], "paused");
-    assert_eq!(run_finished["interruption_kind"], "budget_exhausted");
-    assert_eq!(run_finished["resumable"], true);
 
     gateway.assert_complete();
     inference.assert_quiescent();
