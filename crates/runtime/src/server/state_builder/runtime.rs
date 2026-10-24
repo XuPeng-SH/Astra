@@ -130,7 +130,6 @@ pub(super) async fn build_runtime_wiring(
     .with_edge_registry_service(state.execution.edge_registry_service.clone())
     .with_workspace_record_store(workspace_record_store)
     .with_selected_workspace_provider(selected_workspace_provider)
-    .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
     .with_model_service(state.model_service.clone())
     .with_auth_service(state.auth_service.clone())

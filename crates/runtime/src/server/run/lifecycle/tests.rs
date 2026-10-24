@@ -3740,7 +3740,7 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
         spawner: Arc::clone(&touched_spawner),
         executor: Arc::clone(&base_entry.executor),
         active_work_registry: Arc::clone(&base_entry.active_work_registry),
-        durable_restore: Arc::clone(&base_entry.durable_restore),
+
         last_access: Arc::new(std::sync::Mutex::new(old_access)),
         access_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
@@ -3756,7 +3756,7 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
         spawner: Arc::clone(&pending_spawner),
         executor: Arc::clone(&base_entry.executor),
         active_work_registry: Arc::clone(&base_entry.active_work_registry),
-        durable_restore: Arc::clone(&base_entry.durable_restore),
+
         last_access: Arc::new(std::sync::Mutex::new(old_access)),
         access_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
@@ -3889,7 +3889,7 @@ async fn shutdown_fence_reports_pending_session_child_reconciliation_after_root_
             spawner: spawner.clone(),
             executor: base_entry.executor,
             active_work_registry: base_entry.active_work_registry,
-            durable_restore: base_entry.durable_restore,
+
             last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
             access_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
@@ -3977,7 +3977,7 @@ async fn shutdown_stays_bounded_while_stalled_child_control_remains_pending() {
             spawner: Arc::clone(&spawner),
             executor: base_entry.executor,
             active_work_registry: base_entry.active_work_registry,
-            durable_restore: base_entry.durable_restore,
+
             last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
             access_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
@@ -5613,9 +5613,6 @@ async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
         let entry = service
             .server_agent_spawner_for_session("user-a", "session-1")
             .await;
-        let durable_restore = service
-            .restore_server_dynamic_agents(&entry, "user-a", "session-1")
-            .await;
         let mut request = test_request("must not execute");
         if invalid_constraints {
             request.context = Some(Map::from_iter([(
@@ -5626,7 +5623,6 @@ async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
         let error = match service
             .wire_server_dynamic_agent_tools(
                 &entry,
-                durable_restore,
                 &mut executor,
                 "user-a",
                 "session-1",
@@ -5711,13 +5707,9 @@ async fn closed_root_publication_fence_returns_before_installing_the_agent_provi
         None,
         None,
     );
-    let durable_restore = service
-        .restore_server_dynamic_agents(&entry, "user-a", "session-1")
-        .await;
     let error = match service
         .wire_server_dynamic_agent_tools(
             &entry,
-            durable_restore,
             &mut executor,
             "user-a",
             "session-1",
@@ -5816,7 +5808,6 @@ async fn stale_root_wiring_preserves_the_current_owner_publication() {
     let result = service
         .wire_server_dynamic_agent_tools(
             &entry,
-            Ok(()),
             &mut executor,
             "user-a",
             "session-1",
@@ -10377,52 +10368,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
                 }))
         } else {
             Ok(false)
-        }
-    }
-}
-
-struct DenyTokenBudgetGovernor;
-
-#[async_trait]
-impl astra_services::resource_governor::ResourceGovernor for DenyTokenBudgetGovernor {
-    async fn get_limits(
-        &self,
-        _user_id: &str,
-    ) -> astra_services::resource_governor::ResourceLimits {
-        astra_services::resource_governor::ResourceLimits::default()
-    }
-
-    async fn set_limits(
-        &self,
-        _user_id: &str,
-        _limits: astra_services::resource_governor::ResourceLimits,
-    ) {
-    }
-
-    async fn get_usage(&self, _user_id: &str) -> astra_services::resource_governor::ResourceUsage {
-        astra_services::resource_governor::ResourceUsage::default()
-    }
-
-    async fn check_session_create(
-        &self,
-        _user_id: &str,
-    ) -> astra_services::resource_governor::LimitCheck {
-        astra_services::resource_governor::LimitCheck::Allowed
-    }
-
-    async fn record_session_created(&self, _user_id: &str) {}
-
-    async fn record_tool_calls(&self, _user_id: &str, _count: u64) {}
-
-    async fn record_tokens(&self, _user_id: &str, _tokens: u64) {}
-
-    async fn check_token_budget(
-        &self,
-        _user_id: &str,
-    ) -> astra_services::resource_governor::LimitCheck {
-        astra_services::resource_governor::LimitCheck::Denied {
-            limit: astra_services::resource_governor::ResourceLimitKind::DailyTokens,
-            reason: "daily token budget exhausted (1000/1000)".to_string(),
         }
     }
 }
@@ -32626,16 +32571,18 @@ async fn db_long_running_fanout_survives_observer_restart_and_partial_completion
             .expect("fail second child")
     );
 
-    let spawner = test_dynamic_agent_spawner();
-    let initial_reconciler = Arc::new(ServerDurableAgentReconciler {
-        run_engine: observer.run_engine.clone(),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
-    });
-    spawner
-        .set_durable_agent_reconciler(initial_reconciler)
-        .await;
+    // Use the actual cold Server factory: ordinary setup installs only the
+    // observation source; explicit recovery below reconstructs remote children.
+    let spawner = observer
+        .server_agent_spawner_for_session(&user_id, &session_id)
+        .await
+        .spawner;
+    assert!(
+        spawner
+            .fanout_group_for_agent(children[0].1)
+            .await
+            .is_none()
+    );
     assert_eq!(
         spawner.reconcile_durable_agent_runs().await.unwrap(),
         children.len(),
@@ -36451,165 +36398,6 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
 }
 
 #[tokio::test]
-async fn create_run_token_budget_reject_persists_terminal_events() {
-    let svc = test_service()
-        .with_resource_governor(Arc::new(DenyTokenBudgetGovernor))
-        .with_run_concurrency_limit(1);
-    let mut request = test_request("over budget");
-    request.interactive_client = true;
-    let run = ok(svc.create_run("user-1".into(), request).await);
-
-    assert!(
-        svc.drain_background_tasks(Duration::from_secs(1)).await,
-        "budget rejection task should finish promptly"
-    );
-    assert!(svc.approval_channels.lock().await.is_empty());
-    assert!(svc.user_prompt_channels.lock().await.is_empty());
-    assert!(svc.progress_channels.lock().await.is_empty());
-    let durable = svc
-        .run_engine
-        .load_run("user-1", &run.run_id)
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(durable.status, STATUS_FAILED);
-    assert_eq!(
-        durable.error_code.as_deref(),
-        Some("per_user_daily_token_quota")
-    );
-    assert!(
-        durable
-            .events
-            .iter()
-            .any(
-                |event| event.get("event_type").and_then(Value::as_str) == Some("run_error")
-                    && event
-                        .get("data")
-                        .and_then(Value::as_object)
-                        .and_then(|data| data.get("error_code"))
-                        .and_then(Value::as_str)
-                        == Some("per_user_daily_token_quota")
-            ),
-        "durable run_error must explain the quota failure"
-    );
-    assert!(
-        durable
-            .events
-            .iter()
-            .any(
-                |event| event.get("event_type").and_then(Value::as_str) == Some("run_finished")
-                    && event
-                        .get("data")
-                        .and_then(Value::as_object)
-                        .and_then(|data| data.get("error_kind"))
-                        .and_then(Value::as_str)
-                        == Some("budget_exhausted")
-            ),
-        "durable run_finished must preserve the terminal quota code"
-    );
-}
-
-#[tokio::test]
-async fn token_budget_reject_transition_failure_does_not_commit_status_or_events() {
-    let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1, 2, 3]));
-    let svc = test_service_with_store(store);
-    let engine = &svc.run_engine;
-    engine
-        .start_run("run-quota-fail", "user-1", "session-1")
-        .await
-        .unwrap();
-
-    let committed_events = AgenticRunLifecycleService::persist_started_run_quota_rejection(
-        engine,
-        &svc.runs_handle(),
-        "user-1",
-        "session-1",
-        "run-quota-fail",
-        0,
-        astra_services::resource_governor::ResourceLimitKind::DailyTokens,
-        "daily token budget exhausted (1000/1000)",
-    )
-    .await;
-
-    assert!(
-        committed_events.is_none(),
-        "injected transition failure must not report committed events"
-    );
-    let durable = engine
-        .load_run("user-1", "run-quota-fail")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(durable.status, STATUS_RUNNING);
-    assert!(durable.error_code.is_none());
-    assert!(
-        durable.events.iter().all(|event| {
-            !matches!(
-                event.get("event_type").and_then(Value::as_str),
-                Some("run_error" | "run_finished")
-            )
-        }),
-        "failed quota transition must not leave partial terminal events"
-    );
-}
-
-#[tokio::test]
-async fn stream_chat_token_budget_reject_sends_sse_terminal_events() {
-    let svc = test_service()
-        .with_resource_governor(Arc::new(DenyTokenBudgetGovernor))
-        .with_run_concurrency_limit(1);
-    let mut request = test_request("over budget");
-    request.interactive_client = true;
-    let mut stream = ok(svc.stream_chat("user-1".into(), request).await);
-    let mut rx = stream.event_rx.take().expect("stream event receiver");
-    let events = tokio::time::timeout(Duration::from_secs(1), async move {
-        let mut events = Vec::new();
-        while let Some(event) = rx.recv().await {
-            events.push(event);
-        }
-        events
-    })
-    .await
-    .expect("budget rejection stream should close promptly");
-
-    assert!(
-        svc.drain_background_tasks(Duration::from_secs(1)).await,
-        "budget rejection task should finish promptly"
-    );
-    assert!(svc.approval_channels.lock().await.is_empty());
-    assert!(svc.user_prompt_channels.lock().await.is_empty());
-    assert!(svc.progress_channels.lock().await.is_empty());
-    assert!(
-        events.iter().any(|event| {
-            event.get("type").and_then(Value::as_str) == Some("run_error")
-                && event.get("error_code").and_then(Value::as_str)
-                    == Some("per_user_daily_token_quota")
-        }),
-        "SSE stream must include a structured run_error: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| {
-            event.get("type").and_then(Value::as_str) == Some("run_finished")
-                && event.get("status").and_then(Value::as_str) == Some(STATUS_FAILED)
-        }),
-        "SSE stream must include failed run_finished: {events:?}"
-    );
-
-    let durable = svc
-        .run_engine
-        .load_run("user-1", &stream.run_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(durable.status, STATUS_FAILED);
-    assert_eq!(
-        durable.error_code.as_deref(),
-        Some("per_user_daily_token_quota")
-    );
-}
-
-#[tokio::test]
 async fn interactive_create_run_admission_failure_settles_asynchronously_and_cleans_ws_channels() {
     let svc = test_service().with_run_concurrency_limit(1);
     svc.test_run_semaphore().close();
@@ -37480,22 +37268,6 @@ fn run_admission_timeout_ignores_legacy_env_knob() {
         run_admission_timeout(),
         Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
     );
-}
-
-#[test]
-fn per_user_run_quota_response_uses_quota_error_code() {
-    let response = per_user_run_quota_response(
-        astra_services::resource_governor::ResourceLimitKind::ConcurrentSessions,
-        "concurrent session limit reached (5/5)".to_string(),
-    );
-
-    assert_eq!(response.0, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        response.1.error_code.as_deref(),
-        Some("per_user_concurrent_session_quota")
-    );
-    assert!(response.1.detail.contains("Per-user run quota exceeded"));
-    assert!(response.1.detail.contains("concurrent_sessions"));
 }
 
 #[test]

@@ -1,8 +1,7 @@
-//! Run admission control, quota gating, and durable event metrics.
+//! Run capacity admission and durable event metrics.
 //!
 //! This module handles:
 //! - Run admission timeouts and capacity errors
-//! - Per-user run quota enforcement
 //! - Metrics registration for admission and durable events
 
 use std::sync::Arc;
@@ -98,44 +97,6 @@ pub(super) fn pre_spawn_failure_terminal_events(
                 "error": message,
                 "error_code": error_code,
                 "error_kind": "server_error",
-            },
-        }),
-    ]
-}
-
-pub(super) fn per_user_run_quota_response(
-    limit: astra_services::resource_governor::ResourceLimitKind,
-    reason: String,
-) -> (StatusCode, Json<ErrorResponse>) {
-    error_response_coded(
-        StatusCode::TOO_MANY_REQUESTS,
-        format!("Per-user run quota exceeded ({}): {reason}", limit.as_str()),
-        limit.error_code(),
-    )
-}
-
-pub(super) fn per_user_run_quota_terminal_events(
-    limit: astra_services::resource_governor::ResourceLimitKind,
-    reason: &str,
-) -> [Value; 2] {
-    let error_code = limit.error_code();
-    [
-        json!({
-            "event_type": "run_error",
-            "data": {
-                "error": reason,
-                "error_code": error_code,
-                "error_kind": "budget_exhausted",
-            },
-        }),
-        json!({
-            "event_type": "run_finished",
-            "data": {
-                "total_prompt_tokens": 0,
-                "total_completion_tokens": 0,
-                "error": reason,
-                "error_code": error_code,
-                "error_kind": "budget_exhausted",
             },
         }),
     ]

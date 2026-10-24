@@ -1004,3 +1004,11 @@ measures a duplicate display frontier or projection lag. Its report contract is
 `astra.history_work.production_baseline.v5`; process captures use
 `astra.history_work.production_process_capture.v4`. Older report shapes are
 rejected rather than interpreted as current evidence.
+
+Ordinary Server Run admission uses process capacity, weighted resident-work
+admission, and the selected model/provider's existing authorization. It does not
+consult or update the daily `resource_usage` token mirror. Qualified usage is
+committed on Run with its canonical terminal. A global daily token quota is not
+a Server chat admission guarantee. The resource governor remains the owner of
+explicit Session-creation limits; per-turn budgets, provider admission, policy,
+approval, and side-effect custody are unchanged.

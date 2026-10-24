@@ -190,6 +190,12 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         );
         assert!(items.iter().any(|item| item["role"] == "assistant" && item["content"] == "Discovery complete."), "{history}");
         assert!(
+            statements
+                .iter()
+                .all(|sql| !sql.contains("resource_usage") && !sql.contains("resource_limits")),
+            "ordinary Run usage belongs to its canonical terminal, not a synchronous daily quota mirror"
+        );
+        assert!(
             !statements.is_empty(),
             "the SQL observer must capture real database work"
         );
