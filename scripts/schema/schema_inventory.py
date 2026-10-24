@@ -293,26 +293,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / inference_execution",
         product_owner="inference durability, usage attribution, billing, and recovery",
     ),
-    "inference_canonical_transition_heads": TableMetadata(
-        semantic_owner="astra_services::inference_execution",
-        state_class="durable per-turn canonical provider transition lineage head",
-        primary_query="lock or load the single current head, result identity, chain length, and byte budget by user_id, session_id, and turn_index",
-        retention_policy="retain until the canonical coordinator absorbs the turn; retirement removes the head and its dedicated WAL rows through the absorbed turn",
-        rebuildability="not safely rebuildable while an unabsorbed provider delivery exists because message values and provider responses do not identify the sole recoverable lineage leaf",
-        merge_guidance="keep separate from immutable provider attempts; the composite primary key serializes one mutable head per session turn while the unique attempt key prevents ambiguous lineage",
-        migration_owner="astra_services::storage / inference_execution",
-        product_owner="provider canonical context durability, crash recovery, and fork prevention",
-    ),
-    "inference_canonical_transition_wal": TableMetadata(
-        semantic_owner="astra_services::inference_execution",
-        state_class="bounded append-only per-turn provider canonical recovery WAL",
-        primary_query="load one owner/session/turn chain by transition identity and walk parent links from the authoritative head",
-        retention_policy="retain only until canonical commit absorbs the turn; replacement checkpoints atomically truncate preceding deltas",
-        rebuildability="not safely rebuildable after provider delivery because the exact admitted canonical append is the crash-recovery authority",
-        merge_guidance="keep payloads out of provider-attempt audit rows; immutable deltas make hot-path write volume linear while the separate head serializes lineage",
-        migration_owner="astra_services::storage / inference_execution",
-        product_owner="provider canonical context durability, bounded recovery, and multi-session isolation",
-    ),
     "inference_provider_attempts": TableMetadata(
         semantic_owner="astra_services::inference_execution",
         state_class="durable upstream inference delivery attempt fact",
@@ -1670,14 +1650,14 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="session_history_chunks",
         decision="removed",
         current_read_paths=[
-            "none; history page/search/around now use session_transcript_items as the canonical history source"
+            "none; the secondary chunk reader and optional model-facing history actions are retired"
         ],
         current_write_paths=[
             "none in production; repository writes were confined to ignored fixtures and obsolete benchmarks"
         ],
         user_api_impact=(
-            "history tools retain canonical transcript paging, root-run filtering, search, and around-turn "
-            "behavior; obsolete chunk-only rows are not part of the supported history API"
+            "model-facing session history actions are retired; local journal commands and authenticated "
+            "Run reads retain their existing owners"
         ),
         migration_backfill=(
             "no compatibility backfill; the current schema contract excludes this unsupported "
@@ -1689,8 +1669,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ),
         test_evidence=[
             "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
-            "crates/runtime/src/server/tool_session_history.rs::history_search",
-            "crates/runtime/src/server/tool_session_history.rs::session_history_tools_filter_child_agent_rows_on_matrixone",
+            "crates/astra-tools/src/session_tool_contract.rs::action_contract_is_schema_surface_only",
         ],
         rationale=(
             "the chunk projection had a production reader but no production population path; it added a "

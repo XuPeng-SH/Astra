@@ -57,6 +57,12 @@ negotiation. Consecutive small protocol messages, including prepared-statement
 close and execute packets, must not incur Nagle/delayed-ACK stalls. This is a
 transport setting; persistence and transaction boundaries remain unchanged.
 
+Settled execution continuation belongs to the Run checkpoint. Provider attempts
+retain their exact wire hash, byte count and admission identity; uncertain
+admission reconciles those facts before transport. The unused database canonical
+transition head/WAL, Session recovery API and through-turn retirement protocol
+are retired. In-flight model recovery remains unsupported.
+
 ## Schema bootstrap
 
 Bootstrap supports a fresh database or the current schema contract. Canonical
@@ -115,8 +121,8 @@ Model thinking observations use only the configuration-bound snapshot; obsolete
 capability and error mirror columns are absent.
 The retired tool-result projection decision/receipt tables and special event
 field are absent. Agent provider observations are request-local; they create no
-inference invocation/attempt rows, accepted/terminal context pairs, canonical
-provider WAL or settlement debts. Standalone completion and background accounting
+inference invocation/attempt rows, accepted/terminal context pairs or settlement
+debts. Standalone completion and background accounting
 retain their inference ledger. Durable tool custody remains independent.
 The retired session-level physical-workspace claim, unexecuted workflow-trigger
 and plan-step attempt tables are not part of this contract. The unused cloud
@@ -404,6 +410,11 @@ and terminal authority path is installed.
 
 
 ## Ordinary conversation admission and finish
+
+The model-facing `session` tool exposes configuration and sleep only. Its
+optional global history paging, search and around-item actions are retired,
+together with their database reader and CLI tool variants. Local CLI journal
+commands and authenticated Run reads retain their existing owners.
 
 Existing Server sessions are authenticated and checked for current status in
 transactional Run admission. They do not require a preceding display-record

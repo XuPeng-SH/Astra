@@ -6119,7 +6119,6 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::server::tool_execution_result::agent_tool_result_from_output;
-    use crate::server::tool_session_history::session_history_match_score;
     use crate::server::tool_transport::{ExecutorStatus, ToolTransportKind};
     use crate::tool_sandbox::extract_local_workspace_path_mentions;
     use astra_plan::PlanRepository;
@@ -9067,7 +9066,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn session_history_actions_are_advertised_on_session_tool() {
+    fn session_tool_advertises_supported_actions() {
         let names: std::collections::HashSet<String> =
             crate::capabilities::server_builtin_tool_schemas(
                 &crate::capabilities::full_server_capabilities_for_tests(),
@@ -9101,12 +9100,7 @@ pub(crate) mod tests {
             .pointer("/function/parameters/properties/action/enum")
             .and_then(Value::as_array)
             .expect("session action enum should exist");
-        for action in ["history_page", "history_search", "history_around"] {
-            assert!(
-                actions.iter().any(|value| value.as_str() == Some(action)),
-                "session action {action} must be advertised for web-agent history recall"
-            );
-        }
+        assert_eq!(actions, &[json!("config"), json!("sleep")]);
     }
 
     #[tokio::test]
@@ -9126,20 +9120,6 @@ pub(crate) mod tests {
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine session errors should still receive execution metadata"
         );
-    }
-
-    #[test]
-    fn session_history_search_scores_exact_and_fuzzy_hits() {
-        let exact = session_history_match_score(
-            "payment offset storm",
-            "We debugged a payment offset storm and saved the SQL fix.",
-        );
-        let fuzzy = session_history_match_score("payment lag", "payment consumer lag root cause");
-        let miss = session_history_match_score("lunar seed base", "unrelated rustfmt output");
-
-        assert!(exact > fuzzy, "exact phrase should outrank token overlap");
-        assert!(fuzzy > 0, "token overlap should still be searchable");
-        assert_eq!(miss, 0, "unrelated content must not match");
     }
 
     #[cfg(unix)]

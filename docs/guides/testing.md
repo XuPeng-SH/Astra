@@ -511,22 +511,18 @@ and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
 
-The collision-receipt and canonical-WAL tests separate database contracts from
-full-scale diagnostics. The normal collision contract still processes 1,024
-distinct conflicting payloads through the bounded batch writer, plus concurrent
-single-receipt checks. The normal WAL contract runs 32 rounds with the same
-retry ownership, stale-parent rollback, linear payload, recovery, and retirement
-assertions. To retain the original 1,024 **independent transactions contending
-on one identity** and 300-round WAL workload, opt in explicitly:
+The collision-receipt test separates the normal database contract from scale
+diagnostics. Its normal workload processes 1,024 distinct conflicting payloads
+through the bounded batch writer, plus concurrent single-receipt checks. To run
+1,024 independent transactions contending on one identity, opt in explicitly:
 
 ```bash
 # Use a dedicated test database and credentials from your environment/.env.
 ASTRA_TEST_DB_IT=1 ASTRA_TEST_STORAGE_SCALE=1 \
-cargo nextest run -p astra-services \
-  --test observation_capture_db_it --test inference_execution_db_it \
+cargo nextest run -p astra-services --test observation_capture_db_it \
   --run-ignored all --profile strict-online-ci --test-threads 1 \
   --success-output immediate \
-  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners) | test(canonical_transition_wal_is_linear_and_recoverable_across_many_rounds)'
+  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners)'
 ```
 
 The scale mode retains the same 60-second online hard deadline and fails on timeout;

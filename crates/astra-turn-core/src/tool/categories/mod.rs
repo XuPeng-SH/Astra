@@ -183,9 +183,6 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("memory_search", RO, ME),
     tool("memory_retrieve", RO, ME),
     tool("memory_profile", RO, ME),
-    tool("session_history_page", RO, ME),
-    tool("session_history_search", RO, ME),
-    tool("session_history_around", RO, ME),
     // ── Memory (action-aware) ────────────────────────────────────────
     //
     // Single consolidated entry. The `action` arg determines read vs write.
