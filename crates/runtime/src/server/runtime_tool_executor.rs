@@ -3065,13 +3065,66 @@ impl RuntimeToolExecutor {
 
     pub(super) fn set_work_binding(&mut self, binding: WorkRuntimeBinding) {
         self.install_work_binding(binding)
-            .expect("RuntimeToolExecutor Work binding may only be installed once");
+            .expect("RuntimeToolExecutor Work binding identity must remain unchanged");
     }
 
     pub(super) fn install_work_binding(&self, binding: WorkRuntimeBinding) -> Result<(), String> {
-        self.work_binding
-            .set(binding)
-            .map_err(|_| "canonical Work binding is already installed".to_string())
+        match self.work_binding.set(binding) {
+            Ok(()) => Ok(()),
+            Err(binding) => {
+                let current = self.work_binding.get().expect("installed Work binding");
+                if current.owner_id == binding.owner_id
+                    && current.session_id == binding.session_id
+                    && current.work_id == binding.work_id
+                    && current.branch_id == binding.branch_id
+                {
+                    Ok(())
+                } else {
+                    Err("canonical Work binding conflicts with the installed identity".to_string())
+                }
+            }
+        }
+    }
+
+    /// Resolve only on explicit Work control. Ordinary chat has no Work lookup.
+    /// This identity is a selection hint; repository revisions and attempts still
+    /// authorize each operation, including after another Server changes the graph.
+    pub(super) async fn resolve_work_binding(
+        &self,
+    ) -> Result<Option<&WorkRuntimeBinding>, astra_tools::ToolResult> {
+        use astra_services::work::{
+            InternalSessionId, WorkOwnerId, WorkRepository, WorkRepositoryError,
+        };
+        if let Some(binding) = self.work_binding.get() {
+            return Ok(Some(binding));
+        }
+        let Some(pool) = self.context_manifest_pool.clone() else {
+            return Ok(None);
+        };
+        let resolve = async {
+            let owner = WorkOwnerId::parse(self.user_id.clone()).map_err(|e| e.to_string())?;
+            let session =
+                InternalSessionId::parse(self.session_id.clone()).map_err(|e| e.to_string())?;
+            let repository = astra_services::work::DatabaseWorkRepository::new(pool.clone());
+            let binding = match repository.load_session_plan_binding(&owner, &session).await {
+                Ok(binding) => binding,
+                Err(WorkRepositoryError::NotFound) => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            self.install_work_binding(WorkRuntimeBinding::new(
+                pool,
+                owner,
+                session,
+                binding.work_id,
+                binding.branch_id,
+            ))?;
+            Ok(self.work_binding.get())
+        };
+        resolve.await.map_err(|error: String| {
+            astra_tools::ToolResult::error(format!(
+                "canonical Work binding could not be resolved: {error}"
+            ))
+        })
     }
 
     /// Attach the shared dynamic-agent tool context.

@@ -904,7 +904,7 @@ cases and normal conversations do not pay this observation cost.
 
 `execution_tool_count` and `execution_tool_sequence` use the existing authorized
 session trace, scoped to the current invocation's Run IDs and start time. They
-reconcile complete `turn`/`llm_round` tool records with the canonical run tree;
+reconcile complete `llm_round` tool records with the canonical run tree;
 they do not request the retired per-tool raw transcript mirrors. Arguments and
 results must be complete, dispositions explicit, and every selected Run's exact
 call count accounted for. Previews, missing/corrupt records, identity conflicts,
@@ -912,7 +912,17 @@ unknown outcomes and unverified artifacts cannot prove success or absence.
 Artifact reads retain their existing owner, Run, call, size and digest checks.
 A rejected call needs its complete typed record, not a generic executor-completed
 event for execution that never happened. Reused, suppressed and deferred records
-do not become successful physical executions.
+do not become successful physical executions. A `turn` summary may mix child
+observations under the parent; it remains a journal/display summary and cannot
+assign per-call Run ownership or replace a missing round witness.
+
+The former live Bash-to-Session-artifact recovery case is retired: Bash saves
+complete stdout/stderr locally and advertises paths, lengths and digests, rather
+than promising an immutable Session artifact. This removes that live coverage;
+it does not certify its historical failure as a pass. Existing CLI saved-output,
+cancellation/capture-failure tests and generic artifact authorization/read tests
+remain the relevant deterministic coverage. `introspect` still rejects physical
+paths; no duplicate artifact or larger inline result is introduced.
 
 Tool sequence checks use known serial provider-round boundaries. Same-round
 parallel slots do not establish an order; a required order without evidence is

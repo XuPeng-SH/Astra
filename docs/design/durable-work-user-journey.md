@@ -42,6 +42,14 @@ owned by their canonical contracts linked below.
   user's Work with another principal requires an explicit membership contract;
   matching ids or URLs never grant access.
 
+Ordinary conversation admission does not discover or load Work. On an explicit
+Work planning or execution-control tool call, a fresh executor resolves the
+canonical owner/Session binding and retains that identity for its own lifetime.
+Later operations still validate repository ownership, branch, revision and
+attempt authority. A new turn or another Server uses the same persisted
+relationship; neither a model-supplied Work id nor a cached binding grants
+permission to change the graph or execute an item.
+
 ## The user's journey
 
 ## Delivery boundary

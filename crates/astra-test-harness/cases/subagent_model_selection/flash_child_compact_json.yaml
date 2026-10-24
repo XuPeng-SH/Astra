@@ -26,14 +26,6 @@ criteria:
     min: 2
     max: 3
   - type: execution_tool_count
-    name: model_catalog
-    min: 0
-    max: 0
-  - type: execution_tool_count
-    name: tool_search
-    min: 0
-    max: 0
-  - type: execution_tool_count
     name: bash
     min: 0
     max: 0

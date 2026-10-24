@@ -1046,47 +1046,10 @@ pub(super) async fn execute_start_work(
     // changes on a bound Work go through the revision-pinned planning tools.
     // The read is only a target-selection hint for exact recovery. The
     // repository's genesis conflict/branch-binding checks remain authoritative.
-    let attached_binding = executor.work_binding.get().cloned();
-    let persisted_binding = if attached_binding.is_none() {
-        match repository
-            .load_session_plan_binding(&owner_id, &session_id)
-            .await
-        {
-            Ok(binding) => Some(binding),
-            Err(WorkRepositoryError::NotFound) => None,
-            Err(error) => {
-                return ToolResult::error(format!(
-                    "start_work could not resolve the session Work binding: {error}"
-                ));
-            }
-        }
-    } else {
-        None
+    let effective_binding = match executor.resolve_work_binding().await {
+        Ok(binding) => binding.cloned(),
+        Err(error) => return error,
     };
-    if let Some(binding) = persisted_binding.as_ref() {
-        if let Err(error) = executor.install_work_binding(WorkRuntimeBinding::new(
-            pool.clone(),
-            owner_id.clone(),
-            session_id.clone(),
-            binding.work_id.clone(),
-            binding.branch_id.clone(),
-        )) {
-            return ToolResult::error(format!(
-                "canonical Work exists but the current run could not bind its planning surface: {error}"
-            ));
-        }
-    }
-    let effective_binding = attached_binding.or_else(|| {
-        persisted_binding.as_ref().map(|binding| {
-            WorkRuntimeBinding::new(
-                pool.clone(),
-                owner_id.clone(),
-                session_id.clone(),
-                binding.work_id.clone(),
-                binding.branch_id.clone(),
-            )
-        })
-    });
     let operation_work_id = effective_binding
         .as_ref()
         .map(|binding| binding.work_id.clone())
@@ -1876,6 +1839,9 @@ pub(super) async fn execute_run_next_work_item(
             "run_next_work_item requires the exact current tool-call identity".to_string(),
         );
     };
+    if let Err(error) = executor.resolve_work_binding().await {
+        return error;
+    }
     if let Some(active) = executor.active_primary_work_attempt() {
         let (task_board_update, applied_admission_mutations) =
             match load_canonical_task_board_with_admission_mutations(executor).await {

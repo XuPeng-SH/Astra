@@ -634,7 +634,7 @@ impl SessionCapture {
         }
         let mut documents = std::collections::HashMap::new();
         for event in &self.events {
-            if !matches!(event.event_type.as_str(), "turn" | "llm_round") {
+            if event.event_type != "llm_round" {
                 continue;
             }
             let Some(records) = event
@@ -695,7 +695,7 @@ impl SessionCapture {
                 }
             }
         }
-        let calls = self.journal_tool_calls();
+        let calls = self.collect_tool_calls(false);
         if calls.len() != documents.len() {
             return Err("tool trace coverage unavailable");
         }
@@ -740,6 +740,12 @@ impl SessionCapture {
 
     /// Complete, de-duplicated tool calls persisted in turn records.
     pub fn journal_tool_calls(&self) -> Vec<JournalToolCall> {
+        self.collect_tool_calls(true)
+    }
+
+    // Turn summaries may include child observations without per-call ownership.
+    // Keep them for journal display, but only round witnesses certify execution.
+    fn collect_tool_calls(&self, include_turn_summaries: bool) -> Vec<JournalToolCall> {
         if self.has_integrity_errors() {
             return Vec::new();
         }
@@ -749,7 +755,9 @@ impl SessionCapture {
             std::collections::HashMap::<_, std::collections::BTreeMap<_, _>>::new();
         let mut turns = std::collections::HashMap::<_, std::collections::BTreeSet<u32>>::new();
         for event in &self.events {
-            if event.event_type != "turn" && event.event_type != "llm_round" {
+            if event.event_type != "llm_round"
+                && !(include_turn_summaries && event.event_type == "turn")
+            {
                 continue;
             }
             let Some(records) = event
@@ -2135,7 +2143,8 @@ mod tests {
         assert!(forged.execution_tool_calls().is_err());
         let mut aggregate = valid.clone();
         aggregate.events[0].event_type = "turn".into();
-        assert_eq!(aggregate.execution_tool_calls().unwrap()[0].0.round, None);
+        assert!(aggregate.execution_tool_calls().unwrap().is_empty());
+        assert_eq!(aggregate.journal_tool_calls().len(), 1);
         let mut serial = valid.clone();
         let mut next = serial.events[0].clone();
         next.raw["round"] = 1.into();

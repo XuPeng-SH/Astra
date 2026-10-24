@@ -2488,6 +2488,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn execution_counts_use_round_owners_instead_of_mixed_turn_summaries() {
+        let mut snapshot = tool_capture();
+        snapshot.run_tree.runs[1].total_tool_calls = 1;
+        let mut trace = trace(&snapshot);
+        let mut child = trace.events[0].clone();
+        child.raw["producer_scope"]["run_id"] = "child".into();
+        child.raw["tool_calls"][0]["tool_call_id"] = "child-call".into();
+        child.raw["tool_calls"][0]["ok"] = false.into();
+        child.raw["tool_calls"][0]["disposition"] = "rejected".into();
+        let mut summary = trace.events[0].clone();
+        summary.event_type = "turn".into();
+        summary.raw["tool_calls"]
+            .as_array_mut()
+            .unwrap()
+            .push(child.raw["tool_calls"][0].clone());
+        // This real CLI shape includes child observations under the root
+        // summary without independent per-call owner identity.
+        trace.events.push(summary);
+        trace.events.push(child);
+        let calls = snapshot.tools("root", Some(&trace)).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].run_id.as_deref(), Some("child"));
+        assert_eq!(calls[1].ok, Some(false));
+        assert_eq!(
+            calls[1].execution_disposition(),
+            Some(ToolCallDisposition::Rejected)
+        );
+        assert_eq!(trace.journal_tool_calls().len(), 3);
+        trace.events.pop();
+        assert!(
+            snapshot.tools("root", Some(&trace)).is_err(),
+            "the turn summary cannot replace a missing child round"
+        );
+    }
+
+    #[test]
     fn trace_scope_ignores_other_valid_roots_and_rejects_document_drift() {
         let mut snapshot = tool_capture();
         let mut other = snapshot.run_tree.runs[0].clone();
