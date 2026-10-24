@@ -1234,7 +1234,6 @@ pub struct ChatRequestData {
     pub explain: bool,
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: bool,
-    pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
 
 fn redacted_forward_header_names(headers: &std::collections::HashMap<String, String>) -> Vec<&str> {
@@ -1311,18 +1310,6 @@ impl std::fmt::Debug for ChatRequestData {
             .field("edge_executor_id", &self.edge_executor_id)
             .field("capabilities", &self.capabilities)
             .field("provider_run_owner", &self.provider_run_owner)
-            .field(
-                "conversation_authority",
-                &self.conversation_authority.as_ref().map(|authority| {
-                    (
-                        &authority.key,
-                        authority.writer_epoch,
-                        &authority.run_id,
-                        authority.run_generation,
-                        authority.provider_generation,
-                    )
-                }),
-            )
             .field(
                 "forward_headers",
                 &RedactedForwardHeadersDebug(&self.forward_headers),
@@ -1751,6 +1738,211 @@ impl DurableWorkItemRunBinding {
     }
 }
 
+/// Immutable admission facts stored with a Run, rather than as event rows.
+/// The existing public formatter renders these facts as the opening frames.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableRunOpening {
+    schema_version: u32,
+    events: Vec<serde_json::Value>,
+    root_context: Option<RunContextOpening>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunContextOpening {
+    pub authority: crate::session_context_coordinator::RunContextAuthority,
+    pub original_input: String,
+}
+
+fn is_run_opening_fact(event: &serde_json::Value) -> bool {
+    matches!(
+        extract_event_type(event).as_str(),
+        "run_started" | "workspace_bound" | "executor_bound"
+    )
+}
+
+impl DurableRunOpening {
+    pub fn new(events: Vec<serde_json::Value>) -> Result<Self, String> {
+        let opening = Self {
+            schema_version: 1,
+            events,
+            root_context: None,
+        };
+        opening.validate()?;
+        Ok(opening)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut kinds = HashSet::new();
+        if self.schema_version != 1
+            || self
+                .events
+                .first()
+                .is_none_or(|event| extract_event_type(event) != "run_started")
+            || self.events.len() > 3
+            || self.events.iter().any(|event| {
+                !is_run_opening_fact(event) || !kinds.insert(extract_event_type(event))
+            })
+        {
+            return Err("Run opening contains conflicting immutable admission facts".into());
+        }
+        Ok(())
+    }
+
+    pub fn capture(events: &[serde_json::Value]) -> Result<Option<Self>, String> {
+        if events
+            .first()
+            .is_none_or(|event| extract_event_type(event) != "run_started")
+        {
+            return Ok(None);
+        }
+        let facts: Vec<_> = events
+            .iter()
+            .take_while(|event| is_run_opening_fact(event))
+            .map(logical_run_event)
+            .collect();
+        if facts.is_empty() {
+            Ok(None)
+        } else {
+            Self::new(facts).map(Some)
+        }
+    }
+
+    fn context_fingerprint(&self) -> Option<String> {
+        self.root_context
+            .as_ref()
+            .map(|context| context.authority.admission_fingerprint())
+    }
+
+    fn indexed_events(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
+        self.events.iter().enumerate().map(|(index, event)| {
+            let mut event = event.clone();
+            event["index"] = serde_json::json!(index);
+            event
+        })
+    }
+
+    pub fn bind_root_context(&mut self, context: RunContextOpening) -> Result<(), String> {
+        if self.root_context.is_some() {
+            return Err("Run opening Context has already been admitted".into());
+        }
+        self.root_context = Some(context);
+        Ok(())
+    }
+
+    pub fn root_context(&self) -> Option<&RunContextOpening> {
+        self.root_context.as_ref()
+    }
+
+    pub fn events(&self) -> &[serde_json::Value] {
+        &self.events
+    }
+
+    fn encode(&self) -> Result<EncodedRunOpening, String> {
+        self.validate()?;
+        let events = serde_json::to_value(&self.events).map_err(|error| error.to_string())?;
+        let events_json = astra_core::canonical_json_string(&events);
+        let context_json = self
+            .root_context
+            .as_ref()
+            .map(|context| {
+                serde_json::to_value(context)
+                    .map(|value| astra_core::canonical_json_string(&value))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let context = context_json.as_deref().unwrap_or("null");
+        let parts = [
+            "{\"events\":",
+            &events_json,
+            ",\"root_context\":",
+            context,
+            ",\"schema_version\":1}",
+        ];
+        let size = parts
+            .iter()
+            .try_fold(0usize, |total, part| total.checked_add(part.len()))
+            .ok_or("Run opening size overflow")?;
+        if size > MAX_RUN_CHECKPOINT_BYTES {
+            return Err("Run opening exceeds the bounded snapshot size".into());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"astra.run-opening.v1\0");
+        for part in parts {
+            digest.update(part.as_bytes());
+        }
+        Ok(EncodedRunOpening {
+            events_json,
+            context_json,
+            hash: format!("{:x}", digest.finalize()),
+        })
+    }
+
+    fn admission_data(
+        &self,
+    ) -> Result<&serde_json::Map<String, serde_json::Value>, serde_json::Error> {
+        let invalid = <serde_json::Error as serde::de::Error>::custom;
+        self.events
+            .iter()
+            .find(|event| extract_event_type(event) == "run_started")
+            .and_then(|event| event.get("data"))
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| invalid("Run opening has no original admission data"))
+    }
+}
+
+// Keep the finalized opening and genuine initial event tail together for the
+// existing Run creation transaction, without copying their buffers.
+struct RunInsertData<'a> {
+    events: &'a [RunEventInsertRow],
+    opening: Option<EncodedRunOpening>,
+}
+
+struct EncodedRunOpening {
+    events_json: String,
+    context_json: Option<String>,
+    hash: String,
+}
+
+fn finalize_run_opening(
+    record: &mut DurableRunRecord,
+) -> Result<Option<EncodedRunOpening>, String> {
+    let encoded = record
+        .opening
+        .as_ref()
+        .map(DurableRunOpening::encode)
+        .transpose()?;
+    record.opening_hash = encoded.as_ref().map(|opening| opening.hash.clone());
+    record.context_admission_hash = record
+        .opening
+        .as_ref()
+        .and_then(DurableRunOpening::context_fingerprint);
+    Ok(encoded)
+}
+
+// No await: retain receipt identity without cloning the potentially large
+// opening body. Exact ACK resolution compares its final hashes, never this view.
+fn run_start_receipt_metadata(record: &mut DurableRunRecord) -> DurableRunRecord {
+    let opening = record.opening.take();
+    let checkpoint = record.checkpoint_json.take();
+    let metadata = record.clone();
+    record.opening = opening;
+    record.checkpoint_json = checkpoint;
+    metadata
+}
+
+fn decode_opening_frames(json: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+    let Some(json) = json else {
+        return Ok(Vec::new());
+    };
+    validate_run_checkpoint_size(json).map_err(str::to_owned)?;
+    let events = serde_json::from_str(json)
+        .map_err(|error| format!("invalid Run opening frames: {error}"))?;
+    let opening = DurableRunOpening::new(events)?;
+    Ok(opening.indexed_events().collect())
+}
+
 /// Persistent record for a durable agent run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DurableRunRecord {
@@ -1802,6 +1994,10 @@ pub struct DurableRunRecord {
     /// Exact canonical result committed with Context and the raw transcript.
     /// Derived trace/display rows never participate in this proof.
     pub terminal_receipt_json: Option<String>,
+    /// Immutable original admission. Compact control projections omit its body.
+    pub opening: Option<DurableRunOpening>,
+    pub opening_hash: Option<String>,
+    pub context_admission_hash: Option<String>,
     /// Immutable declared-Work causal cut observed when this run was admitted.
     /// Branch coordinator runs do not impersonate a WorkItem execution; item
     /// and attempt ownership remain absent until typed item admission exists.
@@ -1820,6 +2016,19 @@ pub struct DurableRunWorkScope {
     pub session_id: String,
     pub parent_run_id: Option<String>,
     pub work_binding: Option<DurableWorkRunBinding>,
+}
+
+/// Canonical stored admission for fresh authentication before an execution
+/// claim. Only a Run store constructs it; it grants no execution or mutation.
+#[derive(Debug)]
+pub struct StoredRunAdmission {
+    run: DurableRunRecord,
+}
+
+impl StoredRunAdmission {
+    pub fn run(&self) -> &DurableRunRecord {
+        &self.run
+    }
 }
 
 /// Attachment and Work identity checked inside the same transaction as an
@@ -2396,11 +2605,19 @@ pub(crate) async fn lock_execution_resume_tx(
     .fetch_all(&mut **tx)
     .await
     .map_err(|error| Unavailable(error.to_string()))?;
-    run.events = facts
-        .iter()
-        .map(|json| serde_json::from_str(json))
-        .collect::<Result<_, _>>()
-        .map_err(|error| Unavailable(error.to_string()))?;
+    run.events = run
+        .opening
+        .as_ref()
+        .into_iter()
+        .flat_map(DurableRunOpening::indexed_events)
+        .collect();
+    run.events.extend(
+        facts
+            .iter()
+            .map(|json| serde_json::from_str::<serde_json::Value>(json))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| Unavailable(error.to_string()))?,
+    );
     let mut kinds = std::collections::HashSet::new();
     if run.events.len() > 3
         || run.events.iter().any(|event| {
@@ -2419,7 +2636,7 @@ pub(crate) async fn lock_execution_resume_tx(
 }
 
 /// Stage ownership, slot and custody in the caller's existing transaction.
-/// Nothing is committed until the coordinator also restores turn authority.
+/// Nothing is committed until the coordinator verifies the admitted Context base.
 pub(crate) async fn activate_execution_resume_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     run: &mut DurableRunRecord,
@@ -2709,6 +2926,22 @@ impl DurableRunRecord {
     pub fn original_admission_data(
         &self,
     ) -> Result<&serde_json::Map<String, serde_json::Value>, serde_json::Error> {
+        if let Some(opening) = &self.opening {
+            if self
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "run_started")
+                .count()
+                > 1
+            {
+                return Err(<serde_json::Error as serde::de::Error>::custom(
+                    "durable run has conflicting start events",
+                ));
+            }
+            return opening.admission_data();
+        }
+        // Process-local stores and bounded read projections carry the same
+        // canonical facts as frames. They never reconstruct a missing DB opening.
         let invalid = <serde_json::Error as serde::de::Error>::custom;
         let mut starts = self
             .events
@@ -3625,7 +3858,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      checkpoint_json, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     runtime_profile, start_request_fingerprint, terminal_receipt_json, work_id, \
+     runtime_profile, start_request_fingerprint, opening_events_json, opening_context_json, 1 AS opening_body_loaded, opening_hash, context_admission_hash, terminal_receipt_json, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
 // Status, observation, event append and recovery-candidate reads need metadata,
@@ -3636,7 +3869,7 @@ const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_ru
      CAST(NULL AS CHAR) AS checkpoint_json, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     runtime_profile, start_request_fingerprint, terminal_receipt_json, work_id, \
+     runtime_profile, start_request_fingerprint, CAST(NULL AS TEXT) AS opening_events_json, CAST(NULL AS TEXT) AS opening_context_json, 0 AS opening_body_loaded, opening_hash, context_admission_hash, terminal_receipt_json, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
@@ -5142,10 +5375,17 @@ pub trait RunStartTransactionParticipant: Send + Sync {
         Ok(())
     }
 
+    /// The store serialized the immutable opening once. This metadata grants
+    /// nothing until the enclosing Run creation returns its committed claim.
+    fn prepared_opening(&mut self, _opening_hash: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn stage(
         &mut self,
         tx: &mut Transaction<'_, MySql>,
         admission: &RunMutationAdmission,
+        opening: Option<&mut DurableRunOpening>,
     ) -> Result<(), String>;
 }
 
@@ -5157,6 +5397,8 @@ pub struct RunMutationAdmission {
     session_id: String,
     run_id: String,
     generation: u64,
+    opening_hash: Option<String>,
+    context_admission_hash: Option<String>,
     operation: RunMutationOperation,
 }
 
@@ -5174,12 +5416,31 @@ impl RunMutationAdmission {
             session_id: run.session_id.clone(),
             run_id: run.run_id.clone(),
             generation: run.run_generation,
+            opening_hash: run.opening_hash.clone(),
+            context_admission_hash: run.context_admission_hash.clone(),
             operation,
         }
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn owns_session(&self, user_id: &str, session_id: &str) -> bool {
         self.user_id == user_id && self.session_id == session_id
+    }
+
+    pub(crate) fn authorizes_context_opening(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.operation == RunMutationOperation::Opening
+            && self.owns_session(user_id, session_id)
+            && self.run_id == run_id
+            && self.generation == generation
     }
 
     pub(crate) fn authorizes_context_terminal(
@@ -5188,11 +5449,15 @@ impl RunMutationAdmission {
         session_id: &str,
         run_id: &str,
         generation: u64,
+        context_admission_hash: &str,
+        opening_hash: &str,
     ) -> bool {
         self.operation == RunMutationOperation::Terminal
             && self.owns_session(user_id, session_id)
             && self.run_id == run_id
             && self.generation == generation
+            && self.opening_hash.as_deref() == Some(opening_hash)
+            && self.context_admission_hash.as_deref() == Some(context_admission_hash)
     }
 }
 
@@ -5930,6 +6195,18 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String>;
+
+    /// Load a canonical immutable admission, without granting execution.
+    async fn load_run_admission(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<StoredRunAdmission>, String> {
+        Ok(self
+            .load_run(user_id, run_id)
+            .await?
+            .map(|run| StoredRunAdmission { run }))
+    }
 
     /// Order a no-row terminal receipt against child creation under the same
     /// session execution fence. An absence read outside this method cannot
@@ -6957,6 +7234,11 @@ impl InMemoryRunStateStore {
         claim_existing: bool,
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
+        record.opening = DurableRunOpening::capture(&record.events)?;
+        if let Some(opening) = &record.opening {
+            record.opening_hash = Some(opening.encode()?.hash);
+            record.context_admission_hash = opening.context_fingerprint();
+        }
         let authority = DurableRunStartAuthority::before_creation(
             record.run_generation,
             self.owner_lease_duration(),
@@ -10975,8 +11257,8 @@ const RUN_STATUS_FACTS_SELECT_SQL: &str = "WITH selected AS (
 
 const RUN_OBSERVATION_EVENTS_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
-        WHERE user_id = ? AND run_id = ? AND event_idx <= ?
-        ORDER BY event_idx ASC LIMIT ?)
+        WHERE user_id = ? AND run_id = ? AND event_idx <= ? AND event_idx < ?
+        ORDER BY event_idx ASC)
        UNION
        (SELECT payload_json, event_idx FROM agent_run_events
         WHERE user_id = ? AND run_id = ? AND event_idx >= ? AND event_idx <= ?
@@ -11691,15 +11973,26 @@ impl DatabaseRunStateStore {
             // The recovery consumer needs no private profile/model snapshot.
             builder
                 .push(
-                    " UNION ALL SELECT run_id, event_idx,
+                    " UNION ALL SELECT run_id, 0 AS event_idx,
                     CAST(JSON_OBJECT('event_type', 'run_started', 'data',
                         JSON_OBJECT('child_runtime_id',
-                            JSON_EXTRACT(payload_json, '$.data.child_runtime_id'))) AS CHAR) AS payload_json
-                    FROM agent_run_events WHERE user_id = ",
+                            JSON_EXTRACT(opening_events_json, '$[0].data.child_runtime_id'))) AS TEXT) AS payload_json
+                    FROM agent_runs WHERE user_id = ",
                 )
                 .push_bind(user_id)
                 .push(" AND session_id = ")
                 .push_bind(session_id)
+                .push(" AND opening_events_json IS NOT NULL AND run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &recovery_event_run_ids {
+                    ids.push_bind(*run_id);
+                }
+            }
+            builder.push(")");
+            builder
+                .push(" UNION ALL SELECT run_id, event_idx, CAST(JSON_OBJECT('event_type', 'run_started', 'data', JSON_OBJECT('child_runtime_id', JSON_EXTRACT(payload_json, '$.data.child_runtime_id'))) AS TEXT) AS payload_json FROM agent_run_events WHERE user_id = ")
+                .push_bind(user_id).push(" AND session_id = ").push_bind(session_id)
                 .push(" AND event_type = 'run_started' AND run_id IN (");
             {
                 let mut ids = builder.separated(",");
@@ -12089,7 +12382,16 @@ impl DatabaseRunStateStore {
         request: AtomicRunTerminalSettlementRequest<'_>,
         expected_event_idx: i64,
         receipt: &serde_json::Value,
+        opening_hash: &str,
+        context_admission_hash: &str,
     ) -> Result<Option<RunMutationAdmission>, String> {
+        for hash in [opening_hash, context_admission_hash] {
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(
+                    "canonical terminal requires exact immutable Run admission hashes".into(),
+                );
+            }
+        }
         validate_expected_run_session_id(request.expected_session_id)?;
         if request.expected_statuses.is_empty() || !durable_run_status_is_terminal(request.status) {
             return Err(
@@ -12142,6 +12444,11 @@ impl DatabaseRunStateStore {
         if origin != Some(DurableCancellationOrigin::User) {
             update.push(" AND cancellation_requested_at IS NULL");
         }
+        update
+            .push(" AND opening_hash = ")
+            .push_bind(opening_hash)
+            .push(" AND context_admission_hash = ")
+            .push_bind(context_admission_hash);
         update.push(
             " AND EXISTS (SELECT 1 FROM agent_session_execution_slots slot
             WHERE slot.user_id = agent_runs.user_id AND slot.session_id = agent_runs.session_id
@@ -12158,6 +12465,8 @@ impl DatabaseRunStateStore {
             session_id: request.expected_session_id.to_owned(),
             run_id: request.run_id.to_owned(),
             generation: request.expected_owner_generation,
+            opening_hash: Some(opening_hash.to_owned()),
+            context_admission_hash: Some(context_admission_hash.to_owned()),
             operation: RunMutationOperation::Terminal,
         }))
     }
@@ -13381,12 +13690,56 @@ impl DatabaseRunStateStore {
         .await
         .map_err(|source| db_error("load_run_events", &run.run_id, source).to_string())?;
 
-        run.events = rows
+        run.events = run
+            .opening
+            .as_ref()
             .into_iter()
-            .map(|row| decode_run_event_payload(&row, &run.run_id))
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
+            .flat_map(DurableRunOpening::indexed_events)
+            .filter(|event| {
+                event["index"]
+                    .as_i64()
+                    .is_some_and(|index| index <= run.last_event_idx)
+            })
+            .collect();
+        run.events.extend(
+            rows.into_iter()
+                .map(|row| decode_run_event_payload(&row, &run.run_id))
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?,
+        );
         Ok(())
+    }
+
+    async fn load_run_metadata_with_opening_frames(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<DurableRunRecord>> {
+        let sql = format!(
+            "SELECT {AGENT_RUN_RECOVERY_COLUMNS}, opening_events_json AS opening_frames FROM agent_runs WHERE user_id = ? AND run_id = ?"
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_run_opening_frames", run_id, source))?;
+        row.map(|row| {
+            let frames: Option<String> = row
+                .try_get("opening_frames")
+                .map_err(|source| db_error("decode_run_opening_frames", run_id, source))?;
+            let mut run = run_record_from_row(row)?;
+            run.events = decode_opening_frames(frames.as_deref()).map_err(|error| {
+                invalid_database_value_error(
+                    "decode_run_opening_frames",
+                    "agent_runs",
+                    "opening_events_json",
+                    &error,
+                )
+            })?;
+            Ok(run)
+        })
+        .transpose()
     }
 
     async fn load_run_metadata_with_columns(
@@ -13889,6 +14242,8 @@ fn durable_run_start_receipt_matches(
         && expected.model_offering_id == actual.model_offering_id
         && expected.resolved_model_name == actual.resolved_model_name
         && expected.runtime_profile == actual.runtime_profile
+        && expected.opening_hash == actual.opening_hash
+        && expected.context_admission_hash == actual.context_admission_hash
         && expected.start_request_fingerprint == actual.start_request_fingerprint
         && expected.work_binding == actual.work_binding
 }
@@ -13941,6 +14296,7 @@ impl DatabaseRunStateStore {
         record: &DurableRunRecord,
         retry_scope: &str,
         null_shape: &[bool],
+        opening: Option<&EncodedRunOpening>,
     ) -> Result<sqlx::mysql::MySqlQueryResult, sqlx::Error> {
         let insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO agent_runs
@@ -13951,11 +14307,11 @@ impl DatabaseRunStateStore {
               total_prompt_tokens, total_completion_tokens, total_tool_calls,
               agent_binding_id, agent_binding_name, agent_binding_schema_version,
               model_offering_id, resolved_model_name,
-              runtime_profile, start_request_fingerprint,
+              runtime_profile, start_request_fingerprint, opening_events_json, opening_context_json, opening_hash, context_admission_hash,
               work_id, work_branch_id, work_graph_revision,
               work_item_id, work_item_revision, work_item_attempt_id,
               created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             null_shape.iter().copied(),
         );
         sqlx::query(insert_sql)
@@ -13990,6 +14346,10 @@ impl DatabaseRunStateStore {
             .bind(&record.resolved_model_name)
             .bind(&record.runtime_profile)
             .bind(&record.start_request_fingerprint)
+            .bind(opening.map(|opening| opening.events_json.as_str()))
+            .bind(opening.and_then(|opening| opening.context_json.as_deref()))
+            .bind(&record.opening_hash)
+            .bind(&record.context_admission_hash)
             .bind(
                 record
                     .work_binding
@@ -14040,23 +14400,16 @@ impl DatabaseRunStateStore {
         requested_session_id: Option<&str>,
         participant: &mut dyn RunStartTransactionParticipant,
     ) -> Result<DurableRunStartClaim, String> {
-        if claim_existing
-            && let Some(_) = self
-                .load_run_metadata_for_user(&record.user_id, &record.run_id)
-                .await
-                .map_err(|e| e.to_string())?
-        {
-            return self
-                .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
-                .await;
-        }
         participant.prepare().await?;
         let initial_rows = self.prepare_initial_run_event_rows(&mut record)?;
         self.insert_run_record_transaction_with_collaborator(
             record,
             claim_existing,
             requested_session_id,
-            &initial_rows,
+            RunInsertData {
+                events: &initial_rows,
+                opening: None,
+            },
             None,
             Some(participant),
         )
@@ -14092,12 +14445,14 @@ impl DatabaseRunStateStore {
         let initial_event_rows = self.prepare_initial_run_event_rows(&mut record)?;
         let admission_authority =
             DurableRunStartAuthority::before_creation(record.run_generation, Some(self.lease_ttl));
-        let receipt_record = deadline.map(|_| record.clone());
+        let encoded_opening = finalize_run_opening(&mut record)?;
+        let receipt_record = deadline.map(|_| run_start_receipt_metadata(&mut record));
         let transaction = self.insert_run_record_transaction(
             record,
             claim_existing,
             requested_session_id,
             &initial_event_rows,
+            encoded_opening,
         );
         let claim = match deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, transaction).await {
@@ -14134,9 +14489,9 @@ impl DatabaseRunStateStore {
             None => transaction.await?,
         };
 
-        // Creation commits the run, slot, initial events and display projection
-        // atomically. Exact receipt reconciliation proves that same transaction;
-        // neither outcome needs a second transaction to rebuild its projection.
+        // Creation commits the Run, its opening, execution slot and genuine
+        // initial events atomically. Exact receipt reconciliation proves that
+        // same transaction without another write or repair step.
         Ok(claim)
     }
 
@@ -14144,6 +14499,7 @@ impl DatabaseRunStateStore {
         &self,
         record: &mut DurableRunRecord,
     ) -> Result<Vec<RunEventInsertRow>, String> {
+        record.opening = DurableRunOpening::capture(&record.events)?;
         let mut events = std::mem::take(&mut record.events);
         if events.is_empty() {
             events.push(run_created_receipt_event(
@@ -14151,9 +14507,16 @@ impl DatabaseRunStateStore {
                 &record.session_id,
             ));
         }
+        let opening_count = record
+            .opening
+            .as_ref()
+            .map_or(0, |opening| opening.events.len());
+        record.last_event_idx =
+            i64::try_from(events.len()).map_err(|_| "Run opening event frontier exceeds i64")? - 1;
         let rows = events
             .iter()
             .enumerate()
+            .skip(opening_count)
             .map(|(event_idx, event)| {
                 build_run_event_insert_row(
                     &record.user_id,
@@ -14167,7 +14530,6 @@ impl DatabaseRunStateStore {
             })
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        record.last_event_idx = rows.last().map_or(-1, |event| event.event_idx);
         Ok(rows)
     }
 
@@ -14619,9 +14981,8 @@ impl DatabaseRunStateStore {
         }
         let control_epoch = grant_control_epoch;
         let started: Option<String> = sqlx::query_scalar(
-            "SELECT payload_json FROM agent_run_events
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_started'
-             ORDER BY event_idx ASC LIMIT 1",
+            "SELECT CAST(JSON_EXTRACT(opening_events_json, '$[0]') AS TEXT) FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND opening_events_json IS NOT NULL",
         )
         .bind(&identity.user_id)
         .bind(&identity.session_id)
@@ -15120,12 +15481,16 @@ impl DatabaseRunStateStore {
         claim_existing: bool,
         requested_session_id: Option<&str>,
         initial_event_rows: &[RunEventInsertRow],
+        encoded_opening: Option<EncodedRunOpening>,
     ) -> Result<DurableRunStartClaim, String> {
         self.insert_run_record_transaction_with_collaborator(
             record,
             claim_existing,
             requested_session_id,
-            initial_event_rows,
+            RunInsertData {
+                events: initial_event_rows,
+                opening: encoded_opening,
+            },
             None,
             None,
         )
@@ -15227,11 +15592,15 @@ impl DatabaseRunStateStore {
         mut record: DurableRunRecord,
         claim_existing: bool,
         requested_session_id: Option<&str>,
-        initial_event_rows: &[RunEventInsertRow],
+        initial: RunInsertData<'_>,
         collaborator: Option<&CollaboratorStageAdmission>,
         mut participant: Option<&mut dyn RunStartTransactionParticipant>,
     ) -> Result<(DurableRunStartClaim, Option<CollaboratorStageReceipt>), CollaboratorStoreError>
     {
+        let RunInsertData {
+            events: initial_event_rows,
+            opening: encoded_opening,
+        } = initial;
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
             && let Some(parent) = self
@@ -15316,7 +15685,7 @@ impl DatabaseRunStateStore {
                         &record.run_id,
                         &record.session_id,
                         record.agent_id.as_deref(),
-                        (initial_event_rows.len() + collaborator_event_rows.len()) as i64,
+                        record.last_event_idx + 1 + collaborator_event_rows.len() as i64,
                         &self.owner_pod_id,
                         &event,
                     )?);
@@ -15340,6 +15709,28 @@ impl DatabaseRunStateStore {
             .map_err(|error| error.to_string())?;
         }
 
+        if let Some(participant) = participant.as_mut() {
+            participant
+                .stage(
+                    &mut tx,
+                    &RunMutationAdmission::from_record(&record, RunMutationOperation::Opening),
+                    record.opening.as_mut(),
+                )
+                .await
+                .map_err(CollaboratorStoreError::Persistence)?;
+        }
+        let encoded_opening = if participant.is_some() {
+            finalize_run_opening(&mut record)?
+        } else {
+            encoded_opening
+        };
+        if let (Some(participant), Some(hash)) =
+            (participant.as_mut(), record.opening_hash.as_deref())
+        {
+            participant
+                .prepared_opening(hash)
+                .map_err(CollaboratorStoreError::Persistence)?;
+        }
         let work_binding_present = record.work_binding.is_some();
         let work_item_present = record
             .work_binding
@@ -15363,6 +15754,12 @@ impl DatabaseRunStateStore {
             record.resolved_model_name.is_some(),
             record.runtime_profile.is_some(),
             record.start_request_fingerprint.is_some(),
+            encoded_opening.is_some(),
+            encoded_opening
+                .as_ref()
+                .is_some_and(|opening| opening.context_json.is_some()),
+            record.opening_hash.is_some(),
+            record.context_admission_hash.is_some(),
             work_binding_present,
             work_binding_present,
             work_binding_present,
@@ -15381,7 +15778,13 @@ impl DatabaseRunStateStore {
         let authority =
             DurableRunStartAuthority::before_creation(record.run_generation, Some(self.lease_ttl));
         let insert_result = match self
-            .insert_run_row_tx(&mut tx, &record, &retry_scope, &run_insert_null_shape)
+            .insert_run_row_tx(
+                &mut tx,
+                &record,
+                &retry_scope,
+                &run_insert_null_shape,
+                encoded_opening.as_ref(),
+            )
             .await
         {
             Ok(result) => result,
@@ -15434,15 +15837,6 @@ impl DatabaseRunStateStore {
             })?;
             connection.release();
             return Err("session already has an active run".to_string().into());
-        }
-        if let Some(participant) = participant.as_mut() {
-            participant
-                .stage(
-                    &mut tx,
-                    &RunMutationAdmission::from_record(&record, RunMutationOperation::Opening),
-                )
-                .await
-                .map_err(CollaboratorStoreError::Persistence)?;
         }
         Self::insert_run_event_rows_tx(
             &mut tx,
@@ -16805,11 +17199,16 @@ impl RunStateStore for DatabaseRunStateStore {
         }
         validate_collaborator_admission(&record, &admission)?;
         let initial_rows = self.prepare_initial_run_event_rows(&mut record)?;
+        let encoded_opening = finalize_run_opening(&mut record)?;
+        let receipt_record = run_start_receipt_metadata(&mut record);
         let creation = self.insert_run_record_transaction_with_collaborator(
-            record.clone(),
+            record,
             false,
             None,
-            &initial_rows,
+            RunInsertData {
+                events: &initial_rows,
+                opening: encoded_opening,
+            },
             Some(&admission),
             None,
         );
@@ -16821,7 +17220,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     // transaction from being returned to the pool. Read the
                     // exact source receipt, never infer success from run ID.
                     return self
-                        .reconcile_collaborator_admission(&record, &admission)
+                        .reconcile_collaborator_admission(&receipt_record, &admission)
                         .await;
                 }
             }
@@ -16834,7 +17233,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 anchor_run_id: admission.anchor_run_id,
             }),
             Err(CollaboratorStoreError::CommitUnknown { .. }) => {
-                self.reconcile_collaborator_admission(&record, &admission)
+                self.reconcile_collaborator_admission(&receipt_record, &admission)
                     .await
             }
             Err(error) => Err(error),
@@ -17720,6 +18119,19 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(Some(run))
     }
 
+    async fn load_run_admission(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<StoredRunAdmission>, String> {
+        // Full physical-pair decode verifies the immutable opening hash. Event
+        // history is not needed to authenticate the original admission.
+        self.load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map(|record| record.map(|run| StoredRunAdmission { run }))
+            .map_err(|error| error.to_string())
+    }
+
     async fn load_run_observation(
         &self,
         user_id: &str,
@@ -17727,7 +18139,7 @@ impl RunStateStore for DatabaseRunStateStore {
         event_limit: usize,
     ) -> Result<Option<DurableRunObservation>, String> {
         let Some(mut run) = self
-            .load_run_metadata_with_columns(user_id, run_id, AGENT_RUN_RECOVERY_COLUMNS)
+            .load_run_metadata_with_opening_frames(user_id, run_id)
             .await
             .map_err(|e| e.to_string())?
         else {
@@ -17742,6 +18154,15 @@ impl RunStateStore for DatabaseRunStateStore {
             .saturating_add(1)
             .saturating_sub(i64::try_from(tail_limit).unwrap_or(i64::MAX))
             .max(0);
+        run.events.retain(|event| {
+            event["index"].as_i64().is_some_and(|index| {
+                index <= last_event_idx && (index < head_limit as i64 || index >= tail_start)
+            }) && astra_turn_types::json_serialized_fits(
+                event,
+                (MAX_RUN_OBSERVATION_BYTES / event_limit) as u64,
+            )
+            .unwrap_or(false)
+        });
         let rows = sqlx::query(RUN_OBSERVATION_EVENTS_SELECT_SQL)
             .bind(user_id)
             .bind(run_id)
@@ -17758,11 +18179,14 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("load_run_observation_events", run_id, source).to_string()
             })?;
-        run.events = rows
-            .into_iter()
-            .map(|row| decode_run_event_payload(&row, run_id))
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
+        run.events.extend(
+            rows.into_iter()
+                .map(|row| decode_run_event_payload(&row, run_id))
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?,
+        );
+        run.events
+            .sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
         Ok(Some(DurableRunObservation {
             total_event_count: run_event_count(&run),
             run,
@@ -18013,14 +18437,17 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         after_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
-        let Some((session_id, status, last_event_idx, execution_live)) =
-            sqlx::query_as::<_, (String, String, i64, i64)>(
+        let Some((session_id, status, last_event_idx, execution_live, opening_frames)) =
+            sqlx::query_as::<_, (String, String, i64, i64, Option<String>)>(
                 "SELECT session_id, status, last_event_idx,
                  CAST(CASE WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
                    AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
-                 THEN 1 ELSE 0 END AS SIGNED)
+                 THEN 1 ELSE 0 END AS SIGNED),
+                 CASE WHEN ? < 2 AND ? < last_event_idx THEN opening_events_json ELSE NULL END
                  FROM agent_runs WHERE user_id = ? AND run_id = ?",
             )
+            .bind(after_event_idx)
+            .bind(after_event_idx)
             .bind(user_id)
             .bind(run_id)
             .fetch_optional(self.pool.get())
@@ -18029,7 +18456,13 @@ impl RunStateStore for DatabaseRunStateStore {
         else {
             return Ok(None);
         };
-        let events = if after_event_idx < last_event_idx {
+        let mut events = decode_opening_frames(opening_frames.as_deref())?;
+        events.retain(|event| {
+            event["index"]
+                .as_i64()
+                .is_some_and(|index| index > after_event_idx && index <= last_event_idx)
+        });
+        if after_event_idx < last_event_idx {
             let rows = sqlx::query(
                 "SELECT payload_json, event_idx FROM agent_run_events
                  WHERE user_id = ? AND run_id = ? AND event_idx > ? AND event_idx <= ?
@@ -18042,13 +18475,13 @@ impl RunStateStore for DatabaseRunStateStore {
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
-            rows.into_iter()
-                .map(|row| decode_run_event_payload(&row, run_id))
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?
-        } else {
-            Vec::new()
-        };
+            events.extend(
+                rows.into_iter()
+                    .map(|row| decode_run_event_payload(&row, run_id))
+                    .collect::<DbStoreResult<Vec<_>>>()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
         Ok(Some(DurableRunEventDelta {
             session_id,
             status,
@@ -19093,7 +19526,7 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
     ) -> Result<Option<DurableRunStatusSnapshot>, String> {
         let Some(mut run) = self
-            .load_run_metadata_with_columns(user_id, run_id, AGENT_RUN_RECOVERY_COLUMNS)
+            .load_run_metadata_with_opening_frames(user_id, run_id)
             .await
             .map_err(|error| error.to_string())?
         else {
@@ -19111,11 +19544,14 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("load_run_status_facts", run_id, source).to_string())?;
         connection.release();
-        run.events = rows
-            .iter()
-            .map(|row| decode_run_event_payload(row, run_id))
-            .collect::<DbStoreResult<_>>()
-            .map_err(|error| error.to_string())?;
+        run.events.extend(
+            rows.iter()
+                .map(|row| decode_run_event_payload(row, run_id))
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?,
+        );
+        run.events
+            .sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
         Ok(Some(run_status_snapshot_from_run(&run)))
     }
 
@@ -24326,7 +24762,64 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
     let operation = "decode_run_row";
     let table = "agent_runs";
     let run_id = run_row_string(row, operation, table, "run_id")?;
+    let opening_hash = run_row_optional_string(row, operation, table, "opening_hash")?;
+    let context_admission_hash =
+        run_row_optional_string(row, operation, table, "context_admission_hash")?;
+    let events_json = run_row_optional_string(row, operation, table, "opening_events_json")?;
+    let context_json = run_row_optional_string(row, operation, table, "opening_context_json")?;
+    let loaded = run_row_i64(row, operation, table, "opening_body_loaded")?;
+    let invalid = |message: &str| {
+        invalid_database_value_error(operation, table, "opening_events_json", message)
+    };
+    let opening = match loaded {
+        0 if events_json.is_none() && context_json.is_none() => {
+            if context_admission_hash.is_some() && opening_hash.is_none() {
+                return Err(invalid("Context identity has no Run opening identity"));
+            }
+            None
+        }
+        1 => match (events_json, context_json) {
+            (None, None) if opening_hash.is_none() && context_admission_hash.is_none() => None,
+            (Some(events), context) if opening_hash.is_some() => {
+                let stored_bytes = events
+                    .len()
+                    .checked_add(context.as_ref().map_or(4, String::len))
+                    .ok_or_else(|| invalid("Run opening size overflow"))?;
+                if stored_bytes > MAX_RUN_CHECKPOINT_BYTES {
+                    return Err(invalid("Run opening exceeds the bounded snapshot size"));
+                }
+                let events = serde_json::from_str(&events)
+                    .map_err(|_| invalid("invalid Run opening events"))?;
+                let root_context = context
+                    .as_deref()
+                    .map(|json| {
+                        serde_json::from_str::<RunContextOpening>(json)
+                            .map_err(|_| invalid("invalid Run opening Context"))
+                    })
+                    .transpose()?;
+                let opening = DurableRunOpening {
+                    schema_version: 1,
+                    events,
+                    root_context,
+                };
+                let encoded = opening.encode().map_err(|message| invalid(&message))?;
+                if opening_hash.as_deref() != Some(encoded.hash.as_str())
+                    || context_admission_hash != opening.context_fingerprint()
+                {
+                    return Err(invalid(
+                        "immutable Run opening does not match its admitted identity",
+                    ));
+                }
+                Some(opening)
+            }
+            _ => return Err(invalid("partial immutable Run opening columns")),
+        },
+        _ => return Err(invalid("invalid or conflicting Run opening projection")),
+    };
     Ok(DurableRunRecord {
+        opening,
+        opening_hash,
+        context_admission_hash,
         terminal_receipt_json: run_row_optional_string(
             row,
             operation,
@@ -27810,6 +28303,9 @@ mod tests {
 
     fn durable_run_record(run_id: &str) -> DurableRunRecord {
         DurableRunRecord {
+            opening: None,
+            opening_hash: None,
+            context_admission_hash: None,
             terminal_receipt_json: None,
             run_id: run_id.to_string(),
             session_id: "s1".into(),
@@ -27848,6 +28344,97 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    fn opening_context_fixture(input: String) -> RunContextOpening {
+        RunContextOpening {
+            authority: crate::session_context_coordinator::RunContextAuthority {
+                key: SessionKeyV1::owner_session("server", "owner", "session", "main"),
+                run_id: "run".into(),
+                generation: 0,
+                row_exists: false,
+                base_head: None,
+                turn: 1,
+                writer_epoch: 0,
+                authority_epochs: Default::default(),
+                binding: crate::session_context_coordinator::RunContextBinding::Absent,
+            },
+            original_input: input,
+        }
+    }
+
+    #[test]
+    fn split_opening_hash_preserves_whole_canonical_identity_and_total_byte_limit() {
+        for context in [
+            None,
+            Some(opening_context_fixture("中文🙂\n\t\"\\\0".into())),
+        ] {
+            let mut opening = DurableRunOpening::new(vec![json!({
+                "event_type":"run_started", "data":{"z":[null,true,1.0],"a":{"z":2,"a":"中文🙂\n\0"}}
+            })]).unwrap();
+            opening.root_context = context;
+            let whole = astra_core::canonical_json_string(&serde_json::to_value(&opening).unwrap());
+            let mut expected = Sha256::new();
+            expected.update(b"astra.run-opening.v1\0");
+            expected.update(whole.as_bytes());
+            let encoded = opening.encode().unwrap();
+            assert_eq!(encoded.hash, format!("{:x}", expected.finalize()));
+            assert_eq!(
+                serde_json::from_str::<Vec<serde_json::Value>>(&encoded.events_json).unwrap(),
+                opening.events
+            );
+            assert_eq!(
+                encoded
+                    .context_json
+                    .as_deref()
+                    .map(serde_json::from_str::<RunContextOpening>)
+                    .transpose()
+                    .unwrap(),
+                opening.root_context
+            );
+        }
+        let mut opening =
+            DurableRunOpening::new(vec![make_event("run_started", json!({"text":""}))]).unwrap();
+        let overhead =
+            astra_core::canonical_json_string(&serde_json::to_value(&opening).unwrap()).len();
+        opening.events[0]["data"]["text"] = json!("x".repeat(MAX_RUN_CHECKPOINT_BYTES - overhead));
+        assert!(
+            opening.encode().is_ok(),
+            "exact aggregate byte limit is supported"
+        );
+        opening.events[0]["data"]["text"] =
+            json!("x".repeat(MAX_RUN_CHECKPOINT_BYTES - overhead + 1));
+        assert!(
+            opening.encode().is_err(),
+            "canonical framing counts toward the byte limit"
+        );
+        opening.events[0]["data"]["text"] = json!("x".repeat(MAX_RUN_CHECKPOINT_BYTES / 2));
+        opening.root_context = Some(opening_context_fixture(
+            "x".repeat(MAX_RUN_CHECKPOINT_BYTES / 2),
+        ));
+        assert!(
+            opening.encode().is_err(),
+            "two individually bounded columns cannot exceed the one aggregate budget"
+        );
+    }
+
+    #[test]
+    fn run_opening_projection_scope_is_explicit() {
+        for scope in [-1, 2] {
+            assert!(
+                decode_run_record_from_row(&FakeRunStateRow::with_i64(
+                    "opening_body_loaded",
+                    scope
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            decode_run_record_from_row(&FakeRunStateRow::with_i64("opening_body_loaded", 0))
+                .unwrap()
+                .opening
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -29084,6 +29671,10 @@ mod tests {
                 "resolved_model_name" => Some("model".to_string()),
                 "runtime_profile" => Some("default".to_string()),
                 "start_request_fingerprint" => Some("fingerprint-1".to_string()),
+                "opening_events_json"
+                | "opening_context_json"
+                | "opening_hash"
+                | "context_admission_hash" => None,
                 "terminal_receipt_json" => Some(r#"{"identity":"terminal-1"}"#.to_string()),
                 "work_id" => Some("work-1".to_string()),
                 "work_branch_id" => Some("branch-1".to_string()),
@@ -29103,6 +29694,7 @@ mod tests {
                 return Ok(*value);
             }
             Ok(match column {
+                "opening_body_loaded" => 1,
                 "depth" => 2,
                 "run_generation" => 3,
                 "last_event_idx" => 4,
@@ -29329,6 +29921,182 @@ mod tests {
             });
     }
 
+    struct RunContextOpeningFixture {
+        coordinator: crate::session_context_coordinator::DatabaseSessionContextCoordinator,
+        key: SessionKeyV1,
+        run_id: String,
+        original_input: String,
+        authority: Option<crate::session_context_coordinator::RunContextAuthority>,
+        hash: Option<String>,
+    }
+
+    impl RunContextOpeningFixture {
+        fn new(
+            pool: astra_core::SharedPool,
+            user: &str,
+            session: &str,
+            run_id: &str,
+            original_input: String,
+        ) -> Self {
+            Self {
+                coordinator:
+                    crate::session_context_coordinator::DatabaseSessionContextCoordinator::new(pool),
+                key: SessionKeyV1::owner_session("server", user, session, "main"),
+                run_id: run_id.into(),
+                original_input,
+                authority: None,
+                hash: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RunStartTransactionParticipant for RunContextOpeningFixture {
+        async fn stage(
+            &mut self,
+            tx: &mut Transaction<'_, MySql>,
+            admission: &RunMutationAdmission,
+            opening: Option<&mut DurableRunOpening>,
+        ) -> Result<(), String> {
+            let authority = self
+                .coordinator
+                .capture_run_opening_in_transaction(
+                    tx,
+                    admission,
+                    &self.key,
+                    &self.run_id,
+                    admission.generation(),
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            opening
+                .ok_or("missing Run opening")?
+                .bind_root_context(RunContextOpening {
+                    authority: authority.clone(),
+                    original_input: self.original_input.clone(),
+                })?;
+            self.authority = Some(authority);
+            Ok(())
+        }
+        fn prepared_opening(&mut self, hash: &str) -> Result<(), String> {
+            self.hash = Some(hash.into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_opening_retires_only_expired_controller_authority() {
+        use crate::session_context_coordinator::{
+            AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator,
+        };
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("expired-controller-u-{nonce}");
+        let session = format!("expired-controller-s-{nonce}");
+        let run_id = format!("expired-controller-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut participant = RunContextOpeningFixture::new(
+            pool.clone(),
+            &user,
+            &session,
+            &run_id,
+            "original input".into(),
+        );
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            &user,
+            "independent-controller",
+            astra_turn_types::ActorKindV1::Cli,
+            astra_turn_types::SessionSurfaceV1::Cli,
+            None,
+            Default::default(),
+        );
+        let AcquireWriterAndReserveTurnOutcome::Ready {
+            mut lease,
+            mut reservation,
+        } = participant
+            .coordinator
+            .acquire_writer_and_reserve_turn(
+                &participant.key,
+                None,
+                &actor,
+                Duration::from_secs(60),
+                "writer",
+                "turn",
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Controller admission must succeed")
+        };
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        run.events = vec![json!({"event_type":"run_started", "data":{}})];
+        assert!(
+            store
+                .insert_run_with_participant(run.clone(), true, Some(&session), &mut participant)
+                .await
+                .is_err()
+        );
+        assert!(store.load_run(&user, &run_id).await.unwrap().is_none());
+        assert_eq!(
+            participant
+                .coordinator
+                .load_active_writer(&participant.key)
+                .await
+                .unwrap(),
+            Some(lease.clone())
+        );
+        // Move this genuine persisted grant into the past without wall-clock
+        // sleeps; both JSON and its indexed expiry describe the same grant.
+        lease.acquired_at_unix_ms = 0;
+        lease.expires_at_unix_ms = 1;
+        reservation.created_at_unix_ms = 0;
+        reservation.expires_at_unix_ms = 1;
+        sqlx::query("UPDATE session_context_heads SET active_writer_json = ?, active_writer_expires_at_ms = 1, active_reservation_json = ?, active_reservation_expires_at_ms = 1 WHERE owner_user_id = ? AND session_id = ?")
+            .bind(serde_json::to_string(&lease).unwrap()).bind(serde_json::to_string(&reservation).unwrap())
+            .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+        assert!(matches!(
+            store
+                .insert_run_with_participant(run, true, Some(&session), &mut participant)
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Started { .. }
+        ));
+        let opened = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        let authority = &opened
+            .opening
+            .as_ref()
+            .unwrap()
+            .root_context()
+            .unwrap()
+            .authority;
+        assert!(authority.row_exists);
+        assert_eq!(
+            authority.writer_epoch, lease.writer_epoch,
+            "Run never issues a new writer epoch"
+        );
+        assert!(authority.base_head.is_none());
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? AND (active_writer_json IS NOT NULL OR active_reservation_json IS NOT NULL)")
+            .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            remaining, 0,
+            "expired residue cannot poison the later Context head CAS"
+        );
+        assert!(
+            participant
+                .coordinator
+                .load_active_writer(&participant.key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        cleanup_execution_resume_fixture(&pool, &user, &run_id).await;
+    }
+
     async fn parked_execution_resume_fixture(
         store: &DatabaseRunStateStore,
         pool: &astra_core::SharedPool,
@@ -29337,24 +30105,15 @@ mod tests {
         run_id: &str,
     ) -> (
         crate::session_context_coordinator::DatabaseSessionContextCoordinator,
-        astra_turn_types::TurnReservationV1,
+        crate::session_context_coordinator::RunContextAuthority,
         astra_turn_types::ActorContextV1,
         RunCheckpointReceipt,
     ) {
-        use crate::session_context_coordinator::{
-            AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator,
-        };
         insert_active_database_session_fixture(pool, user, session).await;
         let coordinator =
             crate::session_context_coordinator::DatabaseSessionContextCoordinator::new(
                 pool.clone(),
             );
-        let key = SessionKeyV1::owner_session(
-            "server",
-            user,
-            session,
-            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
-        );
         let actor = astra_turn_types::ActorContextV1::owner_user(
             user,
             format!("server-run:{run_id}"),
@@ -29363,27 +30122,26 @@ mod tests {
             None,
             Default::default(),
         );
-        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = coordinator
-            .acquire_writer_and_reserve_turn(
-                &key,
-                None,
-                &actor,
-                Duration::from_secs(60),
-                &format!("server-run:{run_id}:writer"),
-                &format!("server-run:{run_id}:turn"),
-                Some(0),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("fixture admission must succeed")
-        };
+        let mut participant = RunContextOpeningFixture::new(
+            pool.clone(),
+            user,
+            session,
+            run_id,
+            "original user input".into(),
+        );
         let mut run = durable_run_record(run_id);
         run.user_id = user.into();
         run.session_id = session.into();
         run.last_event_idx = 0;
         run.events = vec![json!({"event_type":"run_started", "data":{}})];
-        store.insert_run(run).await.unwrap();
+        assert!(matches!(
+            store
+                .insert_run_with_participant(run, true, Some(session), &mut participant)
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Started { .. }
+        ));
+        let source = participant.authority.unwrap();
         let generation = store
             .load_run(user, run_id)
             .await
@@ -29391,7 +30149,7 @@ mod tests {
             .unwrap()
             .run_generation;
         let payload = json!({"version":"execution_handoff_v1", "producer_run_id":run_id,
-            "producer_owner_generation":generation, "heavy":{"reservation":reservation, "retained":"original"}}).to_string();
+            "producer_owner_generation":generation, "heavy":{"context_authority":source, "retained":"original"}}).to_string();
         let checkpoint = store
             .save_checkpoint(RunCheckpointWriteRequest {
                 user_id: user,
@@ -29427,8 +30185,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        coordinator.release_writer(&lease).await.unwrap();
-        (coordinator, reservation, actor, checkpoint)
+        (coordinator, source, actor, checkpoint)
     }
 
     async fn cleanup_execution_resume_fixture(
@@ -29470,7 +30227,7 @@ mod tests {
         let user = format!("resume-atomic-u-{nonce}");
         let session = format!("resume-atomic-s-{nonce}");
         let run_id = format!("resume-atomic-r-{nonce}");
-        let (coordinator, source, actor, checkpoint) =
+        let (coordinator, source, _actor, checkpoint) =
             parked_execution_resume_fixture(&store, &pool, &user, &session, &run_id).await;
         // Startup recovery retains a live custody lease while parking the
         // checkpoint. Its own owner may resume, but not bypass a live writer.
@@ -29493,16 +30250,15 @@ mod tests {
             .await
             .unwrap();
         let before = store.load_run(&user, &run_id).await.unwrap().unwrap();
-        let request = |actor| ResumedExecutionTurnRequest {
+        let request = || ResumedExecutionTurnRequest {
             user_id: &user,
             session_id: &session,
             run_id: &run_id,
             expected_owner_generation: before.run_generation,
             checkpoint_id: &checkpoint.checkpoint_id,
             source: &source,
-            actor,
+            opening_hash: before.opening_hash.as_deref().unwrap(),
             owner_pod_id: "resume-atomic-owner",
-            ttl: Duration::from_secs(60),
         };
         // A fourth authority fact must not hide a duplicate start or binding
         // behind the query limit. Rejection must leave custody unchanged.
@@ -29512,12 +30268,7 @@ mod tests {
                 .bind(&user).bind(&run_id).bind(before.last_event_idx)
                 .execute(pool.get()).await.unwrap();
             let conflicting = store.load_run(&user, &run_id).await.unwrap().unwrap();
-            assert!(
-                coordinator
-                    .resume_execution_turn(request(&actor))
-                    .await
-                    .is_err()
-            );
+            assert!(coordinator.resume_execution_turn(request()).await.is_err());
             assert_eq!(
                 store.load_run(&user, &run_id).await.unwrap().unwrap(),
                 conflicting
@@ -29526,25 +30277,47 @@ mod tests {
         sqlx::query("UPDATE agent_run_events SET event_type = 'agent_progress', payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
             .bind(before.events.last().unwrap().to_string()).bind(&user).bind(&run_id)
             .bind(before.last_event_idx).execute(pool.get()).await.unwrap();
-        // Authority epochs are checked under lock; no stale actor may resume.
-        let mut stale_actor = actor.clone();
-        stale_actor.authority_epochs.permission_epoch += 1;
-        assert!(
-            coordinator
-                .resume_execution_turn(request(&stale_actor))
-                .await
-                .is_err()
-        );
+        // The checkpoint cannot substitute a different Context authority.
+        let mut stale_source = source.clone();
+        stale_source.authority_epochs.permission_epoch += 1;
+        let mut rejected = request();
+        rejected.source = &stale_source;
+        assert!(coordinator.resume_execution_turn(rejected).await.is_err());
         assert_eq!(
             store.load_run(&user, &run_id).await.unwrap().unwrap(),
             before
         );
 
-        // A current but independent writer must reject after run/slot staging;
-        // the transaction rolls all staged custody changes back.
-        let competing = coordinator
+        // A real Controller intervention changes the immutable admitted base.
+        // Use another parked Run: even after release, its original snapshot
+        // must stay fenced rather than silently adopting the new writer epoch.
+        let other_user = format!("resume-controller-u-{nonce}");
+        let other_session = format!("resume-controller-s-{nonce}");
+        let other_run = format!("resume-controller-r-{nonce}");
+        let (other_coordinator, other_source, actor, other_checkpoint) =
+            parked_execution_resume_fixture(&store, &pool, &other_user, &other_session, &other_run)
+                .await;
+        let other_before = store
+            .load_run(&other_user, &other_run)
+            .await
+            .unwrap()
+            .unwrap();
+        let other_request = || ResumedExecutionTurnRequest {
+            user_id: &other_user,
+            session_id: &other_session,
+            run_id: &other_run,
+            expected_owner_generation: other_before.run_generation,
+            checkpoint_id: &other_checkpoint.checkpoint_id,
+            source: &other_source,
+            opening_hash: other_before.opening_hash.as_deref().unwrap(),
+            owner_pod_id: "resume-controller-owner",
+        };
+        let crate::session_context_coordinator::AcquireWriterAndReserveTurnOutcome::Ready {
+            lease,
+            ..
+        } = other_coordinator
             .acquire_writer_and_reserve_turn(
-                &source.key,
+                &other_source.key,
                 None,
                 &actor,
                 Duration::from_secs(60),
@@ -29553,42 +30326,41 @@ mod tests {
                 Some(0),
             )
             .await
-            .unwrap();
-        let crate::session_context_coordinator::AcquireWriterAndReserveTurnOutcome::Ready {
-            lease,
-            reservation: _,
-        } = competing
+            .unwrap()
         else {
             panic!("independent writer fixture must acquire")
         };
-        assert!(
-            coordinator
-                .resume_execution_turn(request(&actor))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            store.load_run(&user, &run_id).await.unwrap().unwrap(),
-            before
-        );
-        assert_eq!(
-            coordinator.load_active_writer(&source.key).await.unwrap(),
-            Some(lease.clone())
-        );
-        let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
-            .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
-        assert_eq!(slots, 0, "failed restore must roll back the acquired slot");
-        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_operation_receipts WHERE owner_user_id = ? AND operation_kind = 'resume_execution'")
-            .bind(&user).fetch_one(pool.get()).await.unwrap();
-        assert_eq!(
-            receipts, 0,
-            "failed restore must not leave a success receipt"
-        );
-        coordinator.release_writer(&lease).await.unwrap();
-        let proof = coordinator
-            .resume_execution_turn(request(&actor))
-            .await
-            .unwrap();
+        for released in [false, true] {
+            if released {
+                other_coordinator.release_writer(&lease).await.unwrap();
+            }
+            assert!(
+                other_coordinator
+                    .resume_execution_turn(other_request())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .load_run(&other_user, &other_run)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                other_before
+            );
+            let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+                .bind(&other_user).bind(&other_session).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(slots, 0, "failed restore rolls back Run and slot together");
+            assert_eq!(
+                other_coordinator
+                    .load_active_writer(&other_source.key)
+                    .await
+                    .unwrap(),
+                if released { None } else { Some(lease.clone()) }
+            );
+        }
+        cleanup_execution_resume_fixture(&pool, &other_user, &other_run).await;
+        let proof = coordinator.resume_execution_turn(request()).await.unwrap();
         assert_eq!(proof.run().run_id, run_id);
         assert_eq!(proof.run().status, STATUS_RUNNING);
         assert_eq!(proof.run().run_generation, before.run_generation + 1);
@@ -29617,38 +30389,36 @@ mod tests {
         );
         assert_eq!(proof.receipt().source, source);
         assert_eq!(
-            proof.receipt().turn_reservation.reserved_turn,
-            source.reserved_turn
+            proof.receipt().authority.generation,
+            before.run_generation + 1
         );
+        assert_eq!(proof.receipt().authority.turn, source.turn);
+        assert_eq!(proof.receipt().authority.base_head, source.base_head);
         assert_eq!(
-            proof.receipt().turn_reservation.expected_cursor,
-            source.expected_cursor
+            proof.receipt().authority.admission_fingerprint(),
+            source.admission_fingerprint()
         );
-        assert_ne!(proof.receipt().writer_lease.lease_id, source.lease_id);
-        let replay = coordinator
-            .resume_execution_turn(request(&actor))
-            .await
-            .unwrap();
+        let replay = coordinator.resume_execution_turn(request()).await.unwrap();
         assert_eq!(
             replay.receipt(),
             proof.receipt(),
-            "exact retry cannot mint new authority"
+            "retry cannot mint authority"
         );
-        let renewed = coordinator
-            .renew_turn_authority(
-                &proof.receipt().writer_lease,
-                &proof.receipt().turn_reservation,
-                Duration::from_secs(120),
-            )
+        // Run recovery neither creates a Controller head nor grants or receipts.
+        for table in [
+            "session_context_heads",
+            "session_context_operation_receipts",
+            "session_context_authority_events",
+        ] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE owner_user_id = ?"
+            )))
+            .bind(&user)
+            .fetch_one(pool.get())
             .await
             .unwrap();
-        let replay = coordinator
-            .resume_execution_turn(request(&actor))
-            .await
-            .unwrap();
-        assert_eq!(replay.receipt().writer_lease, renewed.writer_lease);
-        assert_eq!(replay.receipt().turn_reservation, renewed.turn_reservation);
-        assert_eq!(replay.run().run_generation, proof.run().run_generation);
+            assert_eq!(count, 0, "resume must not create {table} state");
+        }
         assert!(
             store
                 .append_events_if_current_generation_and_status(
@@ -29665,7 +30435,7 @@ mod tests {
         let progressed = store.load_run(&user, &run_id).await.unwrap().unwrap();
         assert!(
             matches!(
-                coordinator.resume_execution_turn(request(&actor)).await,
+                coordinator.resume_execution_turn(request()).await,
                 Err(crate::session_context_coordinator::SessionContextCoordinatorError::Fenced)
             ),
             "a progressed execution cannot be restored again from its old receipt"
@@ -29676,7 +30446,7 @@ mod tests {
         );
         assert_eq!(
             coordinator.load_active_writer(&source.key).await.unwrap(),
-            Some(renewed.writer_lease)
+            None
         );
         cleanup_execution_resume_fixture(&pool, &user, &run_id).await;
     }
@@ -29692,7 +30462,7 @@ mod tests {
         let user = format!("resume-fenced-u-{nonce}");
         let session = format!("resume-fenced-s-{nonce}");
         let run_id = format!("resume-fenced-r-{nonce}");
-        let (coordinator, source, actor, checkpoint) =
+        let (coordinator, source, _actor, checkpoint) =
             parked_execution_resume_fixture(&store, &pool, &user, &session, &run_id).await;
         let before = store.load_run(&user, &run_id).await.unwrap().unwrap();
         let request = |owner| ResumedExecutionTurnRequest {
@@ -29702,9 +30472,8 @@ mod tests {
             expected_owner_generation: before.run_generation,
             checkpoint_id: &checkpoint.checkpoint_id,
             source: &source,
-            actor: &actor,
+            opening_hash: before.opening_hash.as_deref().unwrap(),
             owner_pod_id: owner,
-            ttl: Duration::from_secs(60),
         };
         for variant in 0..5 {
             let mut rejected = request("resume-owner-a");
@@ -29722,7 +30491,7 @@ mod tests {
             );
         }
         let mut mismatched_source = source.clone();
-        mismatched_source.reservation_id = "different-reservation".into();
+        mismatched_source.turn += 1;
         let mut rejected = request("resume-owner-a");
         rejected.source = &mismatched_source;
         assert!(coordinator.resume_execution_turn(rejected).await.is_err());
@@ -30998,6 +31767,11 @@ mod tests {
             "resolved_model_name",
             "runtime_profile",
             "start_request_fingerprint",
+            "opening_events_json",
+            "opening_context_json",
+            "opening_body_loaded",
+            "opening_hash",
+            "context_admission_hash",
             "terminal_receipt_json",
             "work_id",
             "work_branch_id",
@@ -34212,6 +34986,230 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_opening_frames_share_run_storage_and_logical_cursors() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let user = format!("opening-user-{suffix}");
+        let session = format!("opening-session-{suffix}");
+        let run_id = format!("opening-run-{suffix}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        run.events = vec![
+            json!({"event_type":"run_started", "data":{"run_id":run_id, "child_runtime_id":"root", "explain_analyze_requested":true, "private_profile": "中文🙂\n\t\"\\\0".repeat(40 * 1024)}}),
+            json!({"type":"workspace_bound", "workspace":{"kind":"none"}}),
+            json!({"type":"executor_bound", "executor":{"kind":"server_local"}, "transport":"server_local"}),
+        ];
+        let expected_opening = run.events.clone();
+        let mut participant = RunContextOpeningFixture::new(
+            pool.clone(),
+            &user,
+            &session,
+            &run_id,
+            "x".repeat(6 * 1024 * 1024),
+        );
+        let store = store.with_run_create_commit_ack_loss_once();
+        assert!(matches!(
+            store
+                .insert_run_with_participant(run, true, Some(&session), &mut participant)
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Started { .. }
+        ));
+        let physical_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            physical_count, 0,
+            "opening belongs to Run, with no mirrored event rows"
+        );
+        let mut opened = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert_eq!(opened.last_event_idx, 2);
+        assert_eq!(opened.events.len(), 3);
+        assert_eq!(
+            opened.opening_hash, participant.hash,
+            "ACK proof and terminal preparation use the one finalized participant hash"
+        );
+        assert_eq!(
+            opened
+                .opening
+                .as_ref()
+                .unwrap()
+                .root_context()
+                .unwrap()
+                .original_input
+                .len(),
+            6 * 1024 * 1024
+        );
+        let compact = store
+            .load_run_metadata_with_columns(&user, &run_id, AGENT_RUN_RECOVERY_COLUMNS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(compact.opening.is_none());
+        assert_eq!(compact.opening_hash, opened.opening_hash);
+        let mut expected_receipt = run_start_receipt_metadata(&mut opened);
+        assert_eq!(
+            store
+                .read_run_start_receipt(&expected_receipt, &[])
+                .await
+                .unwrap(),
+            Some(opened.run_generation)
+        );
+        expected_receipt.opening_hash = Some("a".repeat(64));
+        assert!(
+            store
+                .read_run_start_receipt(&expected_receipt, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for (expected, actual) in expected_opening.iter().zip(&opened.events) {
+            assert_eq!(
+                logical_run_event(actual),
+                *expected,
+                "large Unicode admission must round-trip without truncation or changed escaping"
+            );
+        }
+        assert_eq!(opened.original_admission_data().unwrap()["run_id"], run_id);
+        let status = store
+            .load_run_status_snapshot(&user, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.explain_requested);
+        assert_eq!(status.workspace.unwrap()["kind"], "none");
+        assert_eq!(status.executor.unwrap()["kind"], "server_local");
+        let first = store
+            .load_run_event_delta(&user, &run_id, -1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.events, opened.events);
+        let client = transform_run_event_for_client(first.events[0].clone());
+        assert_eq!(client["type"], "run_started");
+        assert_eq!(client["run_id"], run_id);
+        store
+            .append_events_batch(
+                &user,
+                &session,
+                &run_id,
+                &[
+                    make_event("agent_progress", json!({"progress":"working"})),
+                    make_event("agent_progress", json!({"progress":"done"})),
+                ],
+            )
+            .await
+            .unwrap();
+        let completed = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert_eq!(completed.last_event_idx, 4);
+        for (index, event) in completed.events.iter().enumerate() {
+            assert_eq!(event["index"], index);
+        }
+        for cursor in -1..=5 {
+            let delta = store
+                .load_run_event_delta(&user, &run_id, cursor)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected: Vec<_> = completed
+                .events
+                .iter()
+                .filter(|event| event["index"].as_i64().unwrap() > cursor)
+                .cloned()
+                .collect();
+            assert_eq!(
+                delta.events, expected,
+                "resume cursor {cursor} must span virtual and physical facts exactly once"
+            );
+        }
+        for limit in [1, 2, 3, 4, 5, 6, MAX_RUN_OBSERVATION_EVENTS] {
+            let observation = store
+                .load_run_observation(&user, &run_id, limit)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observation.total_event_count, 5);
+            assert_eq!(
+                observation.run.events,
+                bounded_run_event_window(&completed.events, limit)
+            );
+            assert!(
+                observation.run.opening.is_none(),
+                "bounded display reads never load original input or Context custody"
+            );
+        }
+        assert!(
+            store
+                .load_run_event_delta("foreign", &run_id, -1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_run_observation("foreign", &run_id, 4)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let encoded = opened.opening.as_ref().unwrap().encode().unwrap();
+        for (column, invalid) in [
+            ("opening_events_json", None),
+            ("opening_events_json", Some("[]")),
+            ("opening_events_json", Some("null")),
+            ("opening_context_json", None),
+            ("opening_context_json", Some("null")),
+            ("opening_context_json", Some("{}")),
+            ("opening_context_json", Some("[]")),
+        ] {
+            let sql = match invalid {
+                Some(_) => {
+                    format!("UPDATE agent_runs SET {column} = ? WHERE user_id = ? AND run_id = ?")
+                }
+                None => format!(
+                    "UPDATE agent_runs SET {column} = NULL WHERE user_id = ? AND run_id = ?"
+                ),
+            };
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            if let Some(invalid) = invalid {
+                query = query.bind(invalid);
+            }
+            query
+                .bind(&user)
+                .bind(&run_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            assert!(
+                store.load_run(&user, &run_id).await.is_err(),
+                "full decode must reject {column}={invalid:?}"
+            );
+            sqlx::query("UPDATE agent_runs SET opening_events_json = ?, opening_context_json = ? WHERE user_id = ? AND run_id = ?")
+                .bind(&encoded.events_json).bind(encoded.context_json.as_deref().unwrap()).bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+        }
+        assert!(store.load_run(&user, &run_id).await.unwrap().is_some());
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
+        for table in ["agent_session_execution_slots", "agent_sessions"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            )))
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_start_participant_ack_loss_and_replay_use_exact_opening_receipt() {
         struct Participant {
             staged: usize,
@@ -34222,6 +35220,7 @@ mod tests {
                 &mut self,
                 tx: &mut Transaction<'_, MySql>,
                 admission: &RunMutationAdmission,
+                _opening: Option<&mut DurableRunOpening>,
             ) -> Result<(), String> {
                 self.staged += 1;
                 sqlx::query("UPDATE agent_sessions SET event_count = event_count + 1 WHERE user_id = ? AND session_id = ?")
@@ -34257,7 +35256,7 @@ mod tests {
                 .unwrap(),
             DurableRunStartClaim::Existing { .. }
         ));
-        assert_eq!((participant.staged, replay.staged), (1, 0));
+        assert_eq!((participant.staged, replay.staged), (1, 1));
         let durable = store.load_run(&user, &run_id).await.unwrap().unwrap();
         assert_eq!(
             durable.events.len(),
@@ -40312,7 +41311,6 @@ mod tests {
             interactive_client: false,
             provider_run_owner: None,
             provider_workspace_id: None,
-            conversation_authority: None,
         };
 
         let rendered = format!("{request:?}");
@@ -40506,7 +41504,6 @@ mod tests {
             interactive_client: false,
             provider_run_owner: None,
             provider_workspace_id: None,
-            conversation_authority: None,
         };
 
         let rendered = format!("{request:?}");
@@ -40627,7 +41624,6 @@ mod tests {
                     interactive_client: false,
                     provider_run_owner: None,
                     provider_workspace_id: None,
-                    conversation_authority: None,
                 },
             )
             .await
@@ -40652,6 +41648,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             for i in 0..max + 10 {
                 let record = DurableRunRecord {
+                    opening: None,
+                    opening_hash: None,
+                    context_admission_hash: None,
                     terminal_receipt_json: None,
                     run_id: format!("run-{i}"),
                     session_id: "s1".into(),

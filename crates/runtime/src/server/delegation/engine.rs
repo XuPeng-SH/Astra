@@ -9753,6 +9753,9 @@ mod tests {
 
         let records = vec![
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
                 terminal_receipt_json: None,
                 run_id: "sub-1".into(),
                 user_id: "u1".into(),
@@ -9791,6 +9794,9 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
                 terminal_receipt_json: None,
                 run_id: "sub-2".into(),
                 user_id: "u1".into(),
@@ -9829,6 +9835,9 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
                 terminal_receipt_json: None,
                 run_id: "sub-3".into(),
                 user_id: "u1".into(),
@@ -9868,6 +9877,9 @@ mod tests {
             },
             // Root run — should be skipped
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
                 terminal_receipt_json: None,
                 run_id: "root-run".into(),
                 user_id: "u1".into(),

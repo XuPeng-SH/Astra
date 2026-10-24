@@ -376,3 +376,23 @@ Conversation history and resume use canonical Context and raw transcript, and
 execution/usage use Run. Audit turn views over explicitly ingested client roots
 can therefore be empty for Server-only sessions; they do not certify whether a
 conversation or execution occurred.
+
+The immutable Run opening uses two canonical `LONGTEXT` columns on the same
+`agent_runs` row: `opening_events_json` holds admission facts and
+`opening_context_json` holds the optional original input and admitted Context
+base. Each part is stored once, in the same Run INSERT. One opening hash covers
+the complete logical value, with an aggregate 8 MiB UTF-8 limit including JSON
+framing. Status, observation and opening replay read the event column directly;
+they do not extract it from a large Context document. Compact metadata reads
+explicitly omit both bodies and cannot prove full opening identity. Full reads
+reject partial, malformed or hash-mismatched parts. Opening frames retain their
+logical cursors without separate event-row writes; late binding and control
+facts remain in their existing event owner.
+
+Schema contract `2026-10-24-v108` makes non-null raw transcript source identity
+unique within `(user_id, session_id)` using the database column collation. NULL
+source identities remain available for imported history. Startup rejects a
+non-unique replacement for this constraint. This fresh-schema prerequisite does
+not authorize a Run or replace generic immutable-content validation; admitted
+Run writes can omit source membership probes only after their complete opening
+and terminal authority path is installed.

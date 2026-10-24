@@ -331,37 +331,3 @@ pub(super) fn record_durable_run_event_batch_metrics(
             .unwrap_or(u64::MAX),
     );
 }
-
-/// A canonical writer acquisition conflict. A live lease is an active run.
-/// A missing lease is only a cursor mismatch: the previous writer already
-/// released, so cancelling the Session would be unnecessary.
-pub(super) fn session_writer_conflict_response(
-    session_id: &str,
-    active_lease_expires_at_unix_ms: Option<i64>,
-) -> (StatusCode, Json<ErrorResponse>) {
-    if active_lease_expires_at_unix_ms.is_some() {
-        error_response_coded_with_metadata(
-            StatusCode::CONFLICT,
-            format!(
-                "another run still owns session {session_id}; wait for it to finish, or stop it with `astra session cancel {session_id}`, then run `astra --resume {session_id}` before sending another message"
-            ),
-            "session_writer_conflict",
-            json!({
-                "admission_state": "rejected",
-                "recovery_action": "wait_or_cancel_session",
-                "session_id": session_id,
-            }),
-        )
-    } else {
-        error_response_coded_with_metadata(
-            StatusCode::CONFLICT,
-            "the canonical session cursor changed before this turn was admitted; retry the message",
-            "session_writer_conflict",
-            json!({
-                "admission_state": "rejected",
-                "recovery_action": "retry_session",
-                "session_id": session_id,
-            }),
-        )
-    }
-}

@@ -105,24 +105,55 @@ impl AgenticRunLifecycleService {
         let coordinator = Arc::new(astra_services::DatabaseSessionContextCoordinator::new(
             pool.clone(),
         ));
-        let snapshot = coordinator
-            .load_admission_snapshot(&parked.reservation.key)
-            .await
-            .map_err(|error| {
-                invalid_resume(format!("canonical authority is unavailable: {error}"))
-            })?;
         let owner = self
             .run_engine
             .execution_owner_pod_id()
             .ok_or_else(|| invalid_resume("execution owner identity is unavailable"))?;
-        let actor = astra_turn_types::ActorContextV1::owner_user(
-            &durable.user_id,
-            format!("server-run:{}:resume", durable.run_id),
-            astra_turn_types::ActorKindV1::Server,
-            astra_turn_types::SessionSurfaceV1::Server,
-            None,
-            snapshot.authority_epochs,
-        );
+        // This store-created view owns canonical provenance, but grants no
+        // execution. Fresh authentication and model admission precede custody.
+        let admission_view = self
+            .run_engine
+            .load_run_admission(&durable.user_id, &durable.run_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("load execution admission", error))?
+            .ok_or_else(|| invalid_resume("original execution admission is missing"))?;
+        let admitted_run = admission_view.run();
+        if admitted_run.session_id != durable.session_id
+            || admitted_run.run_generation != durable.run_generation
+            || admitted_run.opening_hash != durable.opening_hash
+        {
+            return Err(invalid_resume(
+                "execution admission changed before recovery",
+            ));
+        }
+        let opening_hash = admitted_run
+            .opening_hash
+            .as_deref()
+            .ok_or_else(|| invalid_resume("original Run opening is missing"))?;
+        let principal = self
+            .auth_service
+            .reauthorize_execution_handoff(&admission_view)
+            .await?;
+        let admission = admitted_run
+            .original_admission_data()
+            .map_err(|_| invalid_resume("invalid original admission"))?;
+        let selection: ModelSelection = admission_field(admission, "model_selection")?;
+        let resolved: ResolvedModelSelection =
+            admission_field(admission, "resolved_model_selection")?;
+        let execution = self
+            .model_service
+            .admit_model_offering(admitted_run.user_id.clone(), selection.offering_id.clone())
+            .await?;
+        if admitted_run.model_offering_id.as_deref() != Some(selection.offering_id.as_str())
+            || admitted_run.resolved_model_name.as_deref() != Some(execution.model_name.as_str())
+            || resolved.offering_id != execution.offering_id
+            || resolved.model_name != execution.model_name
+            || resolved.source_identity != execution.source_identity
+        {
+            return Err(invalid_resume(
+                "the original model identity is no longer available",
+            ));
+        }
         let bytes = checkpoint.checkpoint_json.len() as u64;
         let work = astra_services::AdmissionWork {
             resident_bytes: bytes.saturating_mul(2),
@@ -165,10 +196,9 @@ impl AgenticRunLifecycleService {
                 run_id: &durable.run_id,
                 expected_owner_generation: durable.run_generation,
                 checkpoint_id: &checkpoint.checkpoint_id,
-                source: &parked.reservation,
-                actor: &actor,
+                source: &parked.context_authority,
+                opening_hash,
                 owner_pod_id: owner,
-                ttl: Duration::from_secs(15 * 60),
             };
         let mut acquired = coordinator.resume_execution_turn(resume_request()).await;
         if matches!(
@@ -201,19 +231,14 @@ impl AgenticRunLifecycleService {
         let generation = proof.run().run_generation;
         let mut canonical = CanonicalTurnAdmission {
             coordinator,
-            inference_pool: pool.clone(),
-            lease: proof.receipt().writer_lease.clone(),
-            reservation: proof.receipt().turn_reservation.clone(),
+            authority: proof.receipt().authority.clone(),
+            opening_hash: proof.run().opening_hash.clone(),
             prior_messages: Vec::new(),
-            had_canonical_head: snapshot.head.is_some(),
-            release_writer_on_finish: true,
-            release_started: Arc::new(AtomicBool::new(false)),
-            renewal_cancel: CancellationToken::new(),
+            had_canonical_head: proof.receipt().authority.base_head.is_some(),
             _weighted_permit: weighted,
         };
         let mut heartbeat = None;
         let preparation = async {
-            self.start_canonical_turn_renewal(&canonical, (*token).clone())?;
             let confirmed = self
                 .run_engine
                 .confirm_execution_authority(
@@ -240,10 +265,7 @@ impl AgenticRunLifecycleService {
                 lease_lost.clone(),
                 token.clone(),
             );
-            if let Some(head) = snapshot.head.as_ref() {
-                if Some(&head.cursor) != canonical.reservation.expected_cursor.as_ref() {
-                    return Err(invalid_resume("canonical base changed before recovery"));
-                }
+            if let Some(head) = canonical.authority.base_head.as_ref() {
                 canonical.prior_messages = canonical
                     .coordinator
                     .materialize(head)
@@ -251,8 +273,17 @@ impl AgenticRunLifecycleService {
                     .map_err(|error| invalid_resume(error.to_string()))?
                     .messages;
             }
-            self.prepare_resumed_execution(&proof, &canonical, &cancel, &pause, &token, &lease_lost)
-                .await
+            self.prepare_resumed_execution(
+                &proof,
+                &canonical,
+                principal,
+                execution,
+                &cancel,
+                &pause,
+                &token,
+                &lease_lost,
+            )
+            .await
         }
         .await;
         let mut execution = match preparation {
@@ -300,36 +331,19 @@ impl AgenticRunLifecycleService {
         &self,
         proof: &astra_services::session_context_coordinator::ResumedExecutionTurn,
         canonical: &CanonicalTurnAdmission,
+        principal: astra_services::auth::AuthPrincipal,
+        execution: astra_services::models::AdmittedModelExecution,
         cancel: &Arc<AtomicBool>,
         pause: &Arc<AtomicBool>,
         token: &Arc<CancellationToken>,
         lease_lost: &Arc<AtomicBool>,
     ) -> Result<OwnedBackgroundExecution, (StatusCode, Json<ErrorResponse>)> {
         let run = proof.run();
-        let principal = self
-            .auth_service
-            .reauthorize_execution_handoff(proof)
-            .await?;
+        // Reuse the pre-claim admission material without extending its clock.
         let admission = run
             .original_admission_data()
             .map_err(|_| invalid_resume("invalid original admission"))?;
         let selection: ModelSelection = admission_field(admission, "model_selection")?;
-        let resolved: ResolvedModelSelection =
-            admission_field(admission, "resolved_model_selection")?;
-        let execution = self
-            .model_service
-            .admit_model_offering(run.user_id.clone(), selection.offering_id.clone())
-            .await?;
-        if run.model_offering_id.as_deref() != Some(selection.offering_id.as_str())
-            || run.resolved_model_name.as_deref() != Some(execution.model_name.as_str())
-            || resolved.offering_id != execution.offering_id
-            || resolved.model_name != execution.model_name
-            || resolved.source_identity != execution.source_identity
-        {
-            return Err(invalid_resume(
-                "the original model identity is no longer available",
-            ));
-        }
         let catalog = Some(
             astra_services::models::AuthorizedModelCatalogReader::with_cache(
                 self.model_service.clone(),
@@ -524,7 +538,12 @@ impl AgenticRunLifecycleService {
         let mut state = Self::assemble_loop_state(environment, facts);
         state.skills.client_pipeline_skills = handoff.client_pipeline_skills.clone();
         bind_execution_owner_generation(&mut state, run.run_generation);
-        if let Some(cursor) = canonical.reservation.expected_cursor.as_ref() {
+        if let Some(cursor) = canonical
+            .authority
+            .base_head
+            .as_ref()
+            .map(|head| &head.cursor)
+        {
             state.initialize_canonical_rewrite_proof(
                 &canonical.prior_messages,
                 &cursor.canonical_root_hash,
@@ -537,8 +556,7 @@ impl AgenticRunLifecycleService {
         host.bind_execution_handoff(
             self.execution_handoff_requested.clone(),
             self.run_engine.clone(),
-            canonical.reservation.clone(),
-            handoff.original_user_message.clone(),
+            canonical.authority.clone(),
         );
         self.configure_host_approval_audit_context(
             &mut host,
@@ -711,7 +729,13 @@ impl AgenticRunLifecycleService {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             agent_id: run.agent_id.clone(),
-            user_message: handoff.original_user_message.clone(),
+            user_message: run
+                .opening
+                .as_ref()
+                .and_then(astra_services::runs::DurableRunOpening::root_context)
+                .ok_or_else(|| invalid_resume("original user input is missing"))?
+                .original_input
+                .clone(),
             #[cfg(feature = "e2e-hooks")]
             test_post_loop_settlement_delay_ms: 0,
             host,

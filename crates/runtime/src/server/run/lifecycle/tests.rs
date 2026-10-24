@@ -257,37 +257,6 @@ fn authenticated_edge_discovery_merges_with_mcp_without_overwriting_or_impersona
 }
 
 #[test]
-fn session_writer_conflict_tells_the_caller_to_wait_or_cancel() {
-    let (status, Json(body)) = session_writer_conflict_response("sess-active", Some(1));
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body.error_code.as_deref(), Some("session_writer_conflict"));
-    assert_eq!(
-        body.detail,
-        "another run still owns session sess-active; wait for it to finish, or stop it with `astra session cancel sess-active`, then run `astra --resume sess-active` before sending another message"
-    );
-    let metadata = body.metadata.expect("writer conflict metadata");
-    assert_eq!(metadata["admission_state"], "rejected");
-    assert_eq!(metadata["recovery_action"], "wait_or_cancel_session");
-    assert_eq!(metadata["session_id"], "sess-active");
-}
-
-#[test]
-fn cursor_conflict_without_a_live_writer_asks_for_retry() {
-    let (status, Json(body)) = session_writer_conflict_response("sess-active", None);
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body.error_code.as_deref(), Some("session_writer_conflict"));
-    assert_eq!(
-        body.detail,
-        "the canonical session cursor changed before this turn was admitted; retry the message"
-    );
-    assert!(!body.detail.contains("astra session cancel"));
-    let metadata = body.metadata.expect("cursor conflict metadata");
-    assert_eq!(metadata["admission_state"], "rejected");
-    assert_eq!(metadata["recovery_action"], "retry_session");
-    assert_eq!(metadata["session_id"], "sess-active");
-}
-
-#[test]
 fn model_admission_errors_keep_safe_messages_and_known_codes() {
     let hidden = safe_model_service_error_with_code(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -11801,7 +11770,7 @@ fn db_backed_test_service(
 
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything() {
+async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failures() {
     struct RejectAfterInput<'a>(RootTurnStartParticipant<'a>);
     #[async_trait]
     impl astra_services::runs::RunStartTransactionParticipant for RejectAfterInput<'_> {
@@ -11812,9 +11781,15 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             &mut self,
             tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
             admission: &astra_services::runs::RunMutationAdmission,
+            opening: Option<&mut astra_services::runs::DurableRunOpening>,
         ) -> Result<(), String> {
-            astra_services::runs::RunStartTransactionParticipant::stage(&mut self.0, tx, admission)
-                .await?;
+            astra_services::runs::RunStartTransactionParticipant::stage(
+                &mut self.0,
+                tx,
+                admission,
+                opening,
+            )
+            .await?;
             Err("injected failure after canonical input".into())
         }
     }
@@ -11882,15 +11857,19 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
                     .unwrap(),
                 DurableRunStartClaim::Existing { .. }
             ));
-            assert!(
-                replay.admission.is_none(),
-                "replay cannot acquire or release the winner's permits"
-            );
-            let mut loser = make_participant();
+            // Unique-INSERT replay may stage this attempt's snapshot and
+            // capacity before rolling back. It grants no execution and owns
+            // only its own permit, released when this attempt is discarded.
+            drop(replay);
+            let other_run = format!("other-{run}");
+            let mut loser = RootTurnStartParticipant {
+                run_id: &other_run,
+                ..make_participant()
+            };
             let blocked = service
                 .run_engine
                 .admit_run_with_context(
-                    &format!("other-{run}"),
+                    &other_run,
                     &user,
                     &session,
                     Some(&session),
@@ -11901,7 +11880,6 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
                 .await
                 .unwrap_err();
             assert!(blocked.contains("session already has an active run"));
-            assert!(loser.admission.is_none());
             drop(loser);
             assert_eq!(
                 service.weighted_admission.usage(&user).1.provider_slots,
@@ -11918,13 +11896,24 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
                     .is_empty(),
                 "the accepted input is not prior canonical history"
             );
-            let visible: Vec<String> = sqlx::query_scalar(
-                "SELECT content FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND run_id = ? AND role = 'user'",
-            ).bind(&user).bind(&session).bind(&run).fetch_all(pool.get()).await.unwrap();
+            let stored = service
+                .run_engine
+                .load_run(&user, &run)
+                .await
+                .unwrap()
+                .unwrap();
+            let opening = stored.opening.as_ref().unwrap().root_context().unwrap();
             assert_eq!(
-                visible,
-                vec![request.message.clone()],
-                "opening must durably retain the original submitted input"
+                opening.original_input, request.message,
+                "original input must survive before workspace/provider work"
+            );
+            assert_eq!(
+                opening.authority,
+                participant.0.admission.as_ref().unwrap().authority
+            );
+            assert_eq!(
+                stored.opening_hash,
+                participant.0.admission.as_ref().unwrap().opening_hash
             );
         }
         for table in [
@@ -11943,13 +11932,13 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             .unwrap();
             assert_eq!(
                 count,
-                i64::from(!reject && table != "agent_events"),
+                i64::from(!reject && table == "agent_runs"),
                 "{table}: reject={reject}"
             );
         }
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? AND active_writer_json IS NOT NULL AND active_reservation_json IS NOT NULL")
             .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
-        assert_eq!(active, i64::from(!reject));
+        assert_eq!(active, 0, "Run start never creates a Controller grant");
         let count: i64 = sqlx::query_scalar(
             "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
         )
@@ -11962,10 +11951,6 @@ async fn db_root_start_commits_input_and_context_once_or_rolls_back_everything()
             count, 0,
             "ordinary opening does not create diagnostic events"
         );
-        if let Some(admission) = participant.0.admission.as_ref() {
-            let _ = admission.coordinator.release_writer(&admission.lease).await;
-            admission.release_started.store(true, Ordering::Release);
-        }
         drop(participant);
         for (table, column) in [
             ("session_context_authority_events", "owner_user_id"),
@@ -12774,7 +12759,7 @@ fn test_request(message: &str) -> ChatRequestData {
         completion_checks: None,
         model_catalog_reader: None,
         message: message.to_string(),
-        conversation_authority: None,
+
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
@@ -28732,6 +28717,9 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         .map(|i| json!({"event_type": "tool_call_end", "data": {"seq": i}}))
         .collect();
     let mut run = DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
         terminal_receipt_json: None,
         run_id: "run-long".to_string(),
         user_id: "user-1".to_string(),
@@ -28813,7 +28801,7 @@ fn extract_edge_tools_from_context() {
         completion_checks: None,
         model_catalog_reader: None,
         message: "hi".into(),
-        conversation_authority: None,
+
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
@@ -28907,7 +28895,7 @@ fn extract_edge_profile_from_context() {
         completion_checks: None,
         model_catalog_reader: None,
         message: "hi".into(),
-        conversation_authority: None,
+
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),

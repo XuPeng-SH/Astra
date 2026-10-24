@@ -1976,15 +1976,15 @@ async fn phase2_web_hydration_schema_contract() {
         "transcript run lookups must be owner-bound"
     );
     assert_eq!(
-        index_columns(
+        unique_key_columns(
             &pool,
             &schema,
             "session_transcript_items",
-            "idx_transcript_owner_session_source_event"
+            "uq_transcript_owner_session_source_event"
         )
         .await,
         ["user_id", "session_id", "source_event_id"],
-        "transcript source-event idempotency lookups must be owner/session-bound"
+        "transcript source identity must be unique within its owner/session under database collation"
     );
     let ctx_snapshot_columns = column_names(&pool, &schema, "ctx_snapshots").await;
     assert!(
@@ -2276,6 +2276,76 @@ async fn phase2_web_hydration_schema_contract() {
         ["user_id", "session_id", "state", "last_accessed_at"],
         "capacity and deterministic LRU operations require one session/state/access index"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn transcript_source_identity_is_collation_unique_and_owner_session_scoped() {
+    use sha2::Digest;
+    let pool = common::setup_pool().await;
+    let owner = uuid::Uuid::new_v4().to_string();
+    let other_owner = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let other_session = uuid::Uuid::new_v4().to_string();
+    let hash = format!("{:x}", sha2::Sha256::digest(b"assistant\0fixture\0"));
+    for (user, sid, seq, source) in [
+        (
+            owner.as_str(),
+            session.as_str(),
+            1_i64,
+            Some("Trace-Identity"),
+        ),
+        (owner.as_str(), session.as_str(), 2, Some("Trace-Identity")),
+        (owner.as_str(), session.as_str(), 3, Some("trace-identity")),
+        (owner.as_str(), session.as_str(), 4, Some("Trace-Identity ")),
+        (
+            other_owner.as_str(),
+            session.as_str(),
+            20,
+            Some("Trace-Identity"),
+        ),
+        (
+            owner.as_str(),
+            other_session.as_str(),
+            1,
+            Some("Trace-Identity"),
+        ),
+        (owner.as_str(), session.as_str(), 5, None),
+        (owner.as_str(), session.as_str(), 6, None),
+    ] {
+        // Uniqueness must agree with this real column's equality, rather than
+        // assuming a case fold. MO 4.2.5 reports utf8_bin for VARCHAR here.
+        let matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
+        ).bind(user).bind(sid).bind(source).fetch_one(pool.get()).await.unwrap();
+        assert!(matches <= 1);
+        let duplicate = source.is_some() && matches == 1;
+        let result = sqlx::query(
+            "INSERT INTO session_transcript_items
+             (user_id, session_id, item_seq, role, content, source_event_id, content_hash)
+             VALUES (?, ?, ?, 'assistant', 'fixture', ?, ?)",
+        )
+        .bind(user)
+        .bind(sid)
+        .bind(seq)
+        .bind(source)
+        .bind(&hash)
+        .execute(pool.get())
+        .await;
+        if duplicate {
+            assert!(astra_core::is_duplicate_key_error(&result.expect_err(
+                "unique index must reject a SQL-equal source identity"
+            )));
+        } else {
+            result.unwrap();
+        }
+    }
+    sqlx::query("DELETE FROM session_transcript_items WHERE user_id IN (?, ?)")
+        .bind(&owner)
+        .bind(&other_owner)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
