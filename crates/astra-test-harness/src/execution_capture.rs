@@ -1220,29 +1220,16 @@ impl SessionExecutionCapture {
             .transcript
             .as_ref()
             .ok_or("communication transcript unavailable")?;
-        // Root-owned durable send observations bind its canonical mailbox.
-        // That mailbox can differ from the execution run ID. Never reconstruct
-        // recipient aliases from raw tool arguments in the verifier.
-        let mut parent = None;
-        for item in &transcript.items {
-            let Some(AgentTranscriptEvidence::AgentCommunication { event }) = &item.evidence else {
-                continue;
-            };
-            if event.direction != Direction::Sent
-                || event.payload_kind != Kind::Response
-                || event.observed_by.run_id != root
-            {
-                continue;
-            }
-            // Select by the claimed canonical party, then validate the full
-            // correlated observations below. A known contradiction must not
-            // be hidden by another observation's missing provenance.
-            if parent.is_some_and(|previous| previous != &event.from) {
-                return Ok(false);
-            }
-            parent = Some(&event.from);
-        }
-        let parent = parent.ok_or("parent sender observation unavailable")?;
+        // Bind the chain by actual root-owned answer calls, not by a second
+        // transcript mirror of their send. Stable mailbox identity comes from
+        // the question's canonical PendingReply and the child's delivery fact.
+        let answered_requests: std::collections::HashSet<_> = tools
+            .iter()
+            .filter(|call| call.run_id.as_deref() == Some(root) && call.name == "agent")
+            .filter_map(|call| call.arguments.as_ref())
+            .filter(|args| args["action"] == "send_message" && args["message_type"] == "answer")
+            .filter_map(|args| args["request_id"].as_str().filter(|id| !id.is_empty()))
+            .collect();
         let mut selected = None;
         for question in tools.iter().filter(|call| {
             call.run_id.as_deref() == Some(child.run_id.as_str())
@@ -1260,12 +1247,16 @@ impl SessionExecutionCapture {
                 .result
                 .as_ref()
                 .ok_or("question receipt unavailable")?;
+            let request = receipt["message_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or("question identity unavailable")?;
+            if !answered_requests.contains(request) {
+                continue;
+            }
             let obligation: astra_turn_types::PendingReply =
                 serde_json::from_value(receipt["reply_obligation"].clone())
                     .map_err(|_| "question responder unavailable")?;
-            if &obligation.expected_responder != parent {
-                continue;
-            }
             if selected.replace((question, obligation)).is_some() {
                 return Ok(false);
             }
@@ -1287,7 +1278,10 @@ impl SessionExecutionCapture {
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or("question identity unavailable")?;
-        if obligation.request_id != request || obligation.expected_responder.run_id.is_empty() {
+        if obligation.request_id != request
+            || obligation.expected_responder.run_id.is_empty()
+            || obligation.expected_responder.agent_id.is_empty()
+        {
             return Ok(false);
         }
         let mut answers = tools.iter().filter(|call| {
@@ -1313,14 +1307,13 @@ impl SessionExecutionCapture {
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or("answer identity unavailable")?;
-        let mut sent = false;
         let mut received = false;
         let mut unavailable = false;
         for item in &transcript.items {
             let Some(AgentTranscriptEvidence::AgentCommunication { event }) = &item.evidence else {
                 continue;
             };
-            if event.message_id != message {
+            if event.message_id != message && event.message_id != request {
                 continue;
             }
             if event.schema_version != astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION
@@ -1330,6 +1323,29 @@ impl SessionExecutionCapture {
                 || item.run_id.as_deref() != Some(event.observed_by.run_id.as_str())
             {
                 unavailable = true;
+                continue;
+            }
+            if event.message_id == request {
+                let observer_matches = match event.direction {
+                    Direction::Sent => {
+                        event.observed_by.run_id == child.run_id
+                            && event.observed_by.agent_id == agent
+                    }
+                    Direction::Received => {
+                        event.observed_by.run_id == root && !event.observed_by.agent_id.is_empty()
+                    }
+                };
+                if event.from.run_id != child.run_id
+                    || event.from.agent_id != agent
+                    || event.payload_kind != Kind::Request
+                    || event.related_message_id.is_some()
+                    || event.response_accepted.is_some()
+                    || !matches!(&event.to, Target::Direct { address }
+                        if address == &obligation.expected_responder)
+                    || !observer_matches
+                {
+                    return Ok(false);
+                }
                 continue;
             }
             if event.from != obligation.expected_responder
@@ -1344,10 +1360,7 @@ impl SessionExecutionCapture {
             match event.direction {
                 Direction::Sent
                     if event.observed_by.run_id == root
-                        && !event.observed_by.agent_id.is_empty() =>
-                {
-                    sent = true
-                }
+                        && !event.observed_by.agent_id.is_empty() => {}
                 Direction::Received
                     if event.observed_by.run_id == child.run_id
                         && event.observed_by.agent_id == agent =>
@@ -1357,7 +1370,7 @@ impl SessionExecutionCapture {
                 _ => return Ok(false),
             }
         }
-        if unavailable || !sent || !received {
+        if unavailable || !received {
             return Err("answer delivery observation unavailable");
         }
         Ok(true)
@@ -2809,7 +2822,7 @@ pub(crate) mod tests {
             }
         }
         for (run, agent, direction, seq) in [
-            ("root", "parent-agent", "sent", 5),
+            ("child", "member", "sent", 5),
             ("child", "member", "received", 6),
         ] {
             items.push(serde_json::from_value(serde_json::json!({
@@ -2819,10 +2832,12 @@ pub(crate) mod tests {
                 "evidence":{"kind":"agent_communication","event":{
                     "schema_version":astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION,
                     "observed_by":{"run_id":run,"agent_id":agent},"direction":direction,
-                    "message_id":"answer-id","from":party,
-                    "to":{"kind":"direct","address":{"run_id":"child","agent_id":"member"}},
-                    "payload_kind":"response","response_accepted":true,
-                    "related_message_id":"question-id","timestamp_ms":1
+                    "message_id":if direction=="sent" {"question-id"} else {"answer-id"},
+                    "from":if direction=="sent" {serde_json::json!({"run_id":"child","agent_id":"member"})} else {party.clone()},
+                    "to":{"kind":"direct","address":if direction=="sent" {party.clone()} else {serde_json::json!({"run_id":"child","agent_id":"member"})}},
+                    "payload_kind":if direction=="sent" {"request"} else {"response"},
+                    "response_accepted":if direction=="sent" {None} else {Some(true)},
+                    "related_message_id":if direction=="sent" {None} else {Some("question-id")},"timestamp_ms":1
                 }}
             })).unwrap());
         }
@@ -2851,7 +2866,7 @@ pub(crate) mod tests {
                 let mut receipt: Value = serde_json::from_str(&page.items[1].content).unwrap();
                 receipt["reply_obligation"]["expected_responder"]["run_id"] = "root".into();
                 page.items[1].content = receipt.to_string();
-                for item in &mut page.items[4..6] {
+                for item in &mut page.items[5..6] {
                     let Some(astra_turn_types::AgentTranscriptEvidence::AgentCommunication {
                         event,
                     }) = &mut item.evidence
@@ -2860,6 +2875,16 @@ pub(crate) mod tests {
                     };
                     event.from.run_id = "root".into();
                 }
+                let Some(astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event }) =
+                    &mut page.items[4].evidence
+                else {
+                    unreachable!()
+                };
+                let astra_turn_types::AgentCommunicationTarget::Direct { address } = &mut event.to
+                else {
+                    unreachable!()
+                };
+                address.run_id = "root".into();
             }
             assert_eq!(
                 proof_failure(addressed, vec![expected.clone()], None),
@@ -2891,21 +2916,44 @@ pub(crate) mod tests {
             page.items.splice(6..6, [request, result]);
             assert_eq!(
                 proof_failure(additional, vec![expected.clone()], None),
-                (recipient == "parent").then_some(BehaviorContractViolation),
+                // A different request is not part of the verified reply chain.
+                None,
                 "additional {recipient}"
             );
         }
         let mut custom_root = original.clone();
+        let mut sent = custom_root.transcript.as_ref().unwrap().items[5].clone();
+        sent.run_id = Some("root".into());
+        sent.source_event_id = Some("optional-root-send".into());
+        sent.item_seq = 7;
         let Some(astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event }) =
-            &mut custom_root.transcript.as_mut().unwrap().items[4].evidence
+            &mut sent.evidence
         else {
             unreachable!()
         };
+        event.direction = astra_turn_types::AgentCommunicationDirection::Sent;
+        event.observed_by.run_id = "root".into();
         // A custom execution profile is distinct from its stable mailbox agent.
         event.observed_by.agent_id = "planner".into();
+        custom_root
+            .transcript
+            .as_mut()
+            .unwrap()
+            .items
+            .insert(6, sent);
+        assert_eq!(
+            proof_failure(custom_root.clone(), vec![expected.clone()], None),
+            None
+        );
+        let Some(astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event }) =
+            &mut custom_root.transcript.as_mut().unwrap().items[6].evidence
+        else {
+            unreachable!()
+        };
+        event.from.agent_id = "conflicting-parent".into();
         assert_eq!(
             proof_failure(custom_root, vec![expected.clone()], None),
-            None
+            Some(BehaviorContractViolation)
         );
         for before in [false, true] {
             let mut with_rejected_peer = original.clone();
@@ -2965,6 +3013,16 @@ pub(crate) mod tests {
         }
         for (fault, class) in [
             ("queued-only", InfraVerificationUnavailable),
+            ("sent-only", InfraVerificationUnavailable),
+            ("missing-provenance", InfraVerificationUnavailable),
+            ("wrong-schema", InfraVerificationUnavailable),
+            ("wrong-message", InfraVerificationUnavailable),
+            ("rejected-answer", BehaviorContractViolation),
+            ("unknown-answer", InfraVerificationUnavailable),
+            ("duplicate-question", BehaviorContractViolation),
+            ("duplicate-answer", BehaviorContractViolation),
+            ("accepted-false", BehaviorContractViolation),
+            ("wrong-question-sender", BehaviorContractViolation),
             ("wrong-request", BehaviorContractViolation),
             ("wrong-sender", BehaviorContractViolation),
             ("wrong-receiver", BehaviorContractViolation),
@@ -2979,6 +3037,29 @@ pub(crate) mod tests {
                     .unwrap()
                     .items
                     .retain(|item| item.role != "event");
+            } else if matches!(fault, "duplicate-question" | "duplicate-answer") {
+                let (index, run) = if fault == "duplicate-question" {
+                    (0, 1)
+                } else {
+                    (2, 0)
+                };
+                altered.run_tree.runs[run].total_tool_calls += 1;
+                let page = altered.transcript.as_mut().unwrap();
+                let mut request = page.items[index].clone();
+                let mut result = page.items[index + 1].clone();
+                request.item_seq = 7;
+                result.item_seq = 8;
+                request.source_event_id = Some("duplicate-chain-request".into());
+                result.source_event_id = Some("duplicate-chain-result".into());
+                request.tool_calls[0].tool_use_id = "duplicate-chain-call".into();
+                result.tool_result.as_mut().unwrap().tool_use_id = "duplicate-chain-call".into();
+                page.items.splice(6..6, [request, result]);
+            } else if matches!(fault, "rejected-answer" | "unknown-answer") {
+                altered.transcript.as_mut().unwrap().items[3]
+                    .tool_result
+                    .as_mut()
+                    .unwrap()
+                    .status = (fault == "rejected-answer").then(|| "rejected".into());
             } else if fault == "unfinished" {
                 altered.run_tree.runs[1].status = SessionRunLifecycleStatus::Running;
             } else if fault == "reverse-question" {
@@ -2990,16 +3071,34 @@ pub(crate) mod tests {
                     serde_json::json!({"run_id":"peer","agent_id":"peer"});
                 item.content = receipt.to_string();
             } else {
-                let evidence = altered.transcript.as_mut().unwrap().items[5]
-                    .evidence
-                    .as_mut()
-                    .unwrap();
+                let item = &mut altered.transcript.as_mut().unwrap().items[if fault
+                    == "wrong-question-sender"
+                {
+                    4
+                } else {
+                    5
+                }];
+                if fault == "missing-provenance" {
+                    item.source_event_id = None;
+                }
+                let evidence = item.evidence.as_mut().unwrap();
                 let astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event } =
                     evidence
                 else {
                     unreachable!()
                 };
                 match fault {
+                    "missing-provenance" => {}
+                    "wrong-schema" => event.schema_version = "unknown-version".into(),
+                    "wrong-message" => event.message_id = "different-answer".into(),
+                    "accepted-false" => event.response_accepted = Some(false),
+                    "wrong-question-sender" => event.from.agent_id = "peer".into(),
+                    "sent-only" => {
+                        event.direction = astra_turn_types::AgentCommunicationDirection::Sent;
+                        event.observed_by.run_id = "root".into();
+                        event.observed_by.agent_id = "parent-agent".into();
+                        item.run_id = Some("root".into());
+                    }
                     "wrong-request" => event.related_message_id = Some("other-question".into()),
                     "wrong-sender" => event.from.agent_id = "other-parent".into(),
                     "wrong-receiver" => {

@@ -1163,6 +1163,9 @@ safe diagnostic reports `root_running`, `root_waiting`, `root_paused`,
 `root_delegated`, `root_interrupted`, `root_failed`, or `root_cancelled` instead
 of implying that capture was missing. Invalid or incomplete trees remain
 `run_tree_unavailable`. Neither diagnostic certifies child adoption.
-Parent question/answer verification uses canonical reply obligations and durable
-root/child communication observations, including stable parent mailbox identity;
-it does not impose a second recipient-spelling contract on tool arguments.
+Parent question/answer verification correlates successful canonical question and
+root-answer receipts with a matching durable child Received observation and the
+child's normal Completed fence. PendingReply owns stable parent mailbox identity;
+recipient spellings and an additional root Sent transcript mirror are not proof
+requirements. Correlated Sent observations, when present, must remain consistent.
+A queued answer alone cannot prove delivery or successful model consumption.

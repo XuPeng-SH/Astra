@@ -203,8 +203,11 @@ savings.
 
 `flash_child_question_parent_answer` checks exactly one spawned child, one
 successful child-owned question and root-owned answer with the exact request
-ID, and typed durable Sent/Received evidence binding both parties and the
-answer message ID. The same child must complete, execute on GLM, and have its
+ID, and a matching typed durable child Received observation binding both parties
+and the answer message ID. Canonical reply obligations own the stable parent
+mailbox identity; an extra root Sent mirror is unnecessary. Present correlated
+observations must still agree. The same child must complete on the selected
+model and have its
 complete raw result digest adopted before parent finalization. A queued answer
 alone is insufficient. Ordinary `send_message` text (including
 `message_type=result`) is not terminal-result evidence.
