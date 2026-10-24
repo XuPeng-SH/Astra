@@ -221,12 +221,14 @@ time.sleep(60)
         )
         try:
             wait_for(
-                lambda: (root / "guardian.pid").is_file(),
+                lambda: (root / "guardian.pid").is_file()
+                and (root / "guardian.pid").read_text().strip().isdigit(),
                 process=process,
                 label="guardian.pid",
             )
             wait_for(
-                lambda: (root / "detached.pid").is_file(),
+                lambda: (root / "detached.pid").is_file()
+                and (root / "detached.pid").read_text().strip().isdigit(),
                 process=process,
                 label="detached.pid",
             )
