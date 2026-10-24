@@ -1203,7 +1203,9 @@ impl CliServerAdmissionHost<'_> {
             .extend(turn_result.core.explain_analyze_events.iter().cloned());
         state.telemetry.explain_analyze_degraded |= turn_result.core.explain_analyze_degraded;
 
-        if turn_result.core.server_loop_terminal {
+        if turn_result.core.server_loop_terminal
+            || turn_result.core.has_authoritative_failed_terminal()
+        {
             // Server-owned runs execute their tools remotely, so the thin
             // client has no local ToolCallRecord ledger to re-evaluate at the
             // final boundary. Receipt closure is the terminal integrity fact;

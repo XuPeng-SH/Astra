@@ -1471,6 +1471,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn failed_c0_projection_survives_the_shared_stream_pump() {
+        use astra_services::runs::{
+            CanonicalRunTerminalReceipt, CanonicalTerminalContext, CanonicalTerminalOutcome,
+            CanonicalTerminalTranscript,
+        };
+        use astra_turn_core::sse::stream_host::{NoopSseStreamHost, consume_sse_stream};
+        let usage =
+            astra_turn_types::CanonicalTokenUsage::new(Some(17), None, None, Some(3)).unwrap();
+        let receipt = CanonicalRunTerminalReceipt {
+            schema_version: 1,
+            user_id: "owner".into(),
+            session_id: "session".into(),
+            run_id: "partial-run".into(),
+            generation: 4,
+            opening_hash: "a".repeat(64),
+            context_admission_hash: None,
+            outcome: CanonicalTerminalOutcome::Failed,
+            error_hash: CanonicalRunTerminalReceipt::error_hash(Some("stream stopped")),
+            error_code: Some("stream_transport".into()),
+            error_metadata: None,
+            context: CanonicalTerminalContext::Unowned,
+            transcript: CanonicalTerminalTranscript {
+                item_count: 1,
+                digest: "b".repeat(64),
+                assistant_source_event_id: Some("source".into()),
+            },
+            usage: Some(usage),
+            tool_ledger: None,
+        };
+        let completion = receipt
+            .completion_events(
+                Some("  observed partial bytes\n"),
+                Some("answer-id"),
+                Some("stream stopped"),
+                Some(1),
+                -1,
+                3,
+            )
+            .unwrap();
+        let mut projected = vec![serde_json::json!({
+            "type":"session_info", "session_id":"session", "run_id":"partial-run"
+        })];
+        projected.extend(transform_stream_run_events_for_client(
+            "partial-run",
+            completion,
+        ));
+        let frames: Vec<_> = projected
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        for chunks in [
+            frames
+                .iter()
+                .map(|frame| Ok(frame.as_bytes().to_vec()))
+                .collect::<Vec<_>>(),
+            vec![Ok(frames.concat().trim_end().as_bytes().to_vec())],
+        ] {
+            let mut source = futures_util::stream::iter(chunks);
+            let (result, abort) = consume_sse_stream(
+                &mut source,
+                &mut NoopSseStreamHost,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+            assert!(result.accum.has_authoritative_failed_terminal());
+            assert_eq!(result.accum.full_text, "  observed partial bytes\n");
+            assert_eq!(result.accum.model_item_id.as_deref(), Some("answer-id"));
+            assert_eq!(result.accum.accounted_usage(), Some(usage));
+            assert!(!result.accum.stream_complete);
+            assert!(result.accum.server_execution_summary.is_none());
+            assert!(result.tool_results.is_empty());
+            let snapshot =
+                astra_turn_core::agentic::turn_ingest::agentic_turn_stream_snapshot_from_sse_accum(
+                    &result.accum,
+                    None,
+                );
+            assert_eq!(snapshot.full_text, "  observed partial bytes\n");
+            assert_eq!(snapshot.qualified_usage, Some(usage));
+        }
+    }
+
     #[test]
     fn projected_terminal_usage_is_accepted_by_the_chat_sse_consumer() {
         let projected = transform_stream_run_events_for_client(

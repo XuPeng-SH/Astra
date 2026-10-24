@@ -52,7 +52,11 @@ disposition and exact owner retirement; it adds no separate pause protocol or
 query. An explicit new user message starts a new Run. Real input/approval waits,
 debugger pauses, confirmed handoff custody and ownership fencing retain their
 existing owners. A failed Run does not confirm unknown external effects or clear
-their admission debt.
+their admission debt. Shared stream consumers retain observed partial text and
+usage only after accepting the exact root's classified Failed terminal. That
+failure closes client admission without fabricating a successful completion,
+tool receipt or another provider request; malformed or missing terminal evidence
+still fails closed.
 
 ## Source API retirement
 
