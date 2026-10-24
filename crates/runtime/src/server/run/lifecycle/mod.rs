@@ -4132,7 +4132,6 @@ struct ServerAgentSpawnerEntry {
     spawner: Arc<DynamicAgentSpawner>,
     executor: Arc<ServerSpawnAgentExecutor>,
     active_work_registry: Arc<astra_core::work_unit::ActiveWorkRegistry>,
-    durable_restore: Arc<tokio::sync::OnceCell<()>>,
     last_access: Arc<std::sync::Mutex<Instant>>,
     access_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -5766,9 +5765,6 @@ pub struct AgenticRunLifecycleService {
     server_agent_progress_broadcaster: Arc<ProgressBroadcaster>,
     /// Shared mailbox router for Web/server dynamic spawned agents.
     server_agent_mailbox_router: Arc<astra_messaging::router::AgentMailboxRouter>,
-    /// Per-user resource governor (Phase 5).
-    resource_governor:
-        Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Live edge WebSocket connection pool (Phase 6).
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Durable workspace record store for cloud workspace ownership/audit.
@@ -5911,7 +5907,6 @@ impl AgenticRunLifecycleService {
                 Arc::new(astra_messaging::InProcessTransport::new()),
                 Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
             )),
-            resource_governor: None,
             edge_connection_pool: None,
             workspace_record_store: None,
             selected_server_workspace_provider,
@@ -6489,14 +6484,6 @@ impl AgenticRunLifecycleService {
         self
     }
 
-    pub fn with_resource_governor(
-        mut self,
-        governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
-    ) -> Self {
-        self.resource_governor = Some(governor);
-        self
-    }
-
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
         self
@@ -6895,11 +6882,22 @@ impl AgenticRunLifecycleService {
         }
         spawner = spawner.with_prefix_store(self.dynamic_agent_prefix_store());
 
+        // Installing an observation source performs no durable discovery.
+        // Agent tools and remote-child waits reconcile through the spawner's
+        // existing demand-driven path; ordinary chat has no agents to recover.
+        spawner
+            .set_durable_agent_reconciler(Arc::new(ServerDurableAgentReconciler {
+                run_engine: self.run_engine.clone(),
+                user_id: user_id.to_owned(),
+                session_id: session_id.to_owned(),
+                state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+            }))
+            .await;
+
         let entry = ServerAgentSpawnerEntry {
             spawner: Arc::new(spawner),
             executor,
             active_work_registry,
-            durable_restore: Arc::new(tokio::sync::OnceCell::new()),
             last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
             access_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -7259,38 +7257,9 @@ impl AgenticRunLifecycleService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn restore_server_dynamic_agents(
-        &self,
-        entry: &ServerAgentSpawnerEntry,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<(), String> {
-        entry
-            .durable_restore
-            .get_or_try_init(|| async {
-                let reconciler = Arc::new(ServerDurableAgentReconciler {
-                    run_engine: self.run_engine.clone(),
-                    user_id: user_id.to_string(),
-                    session_id: session_id.to_string(),
-                    state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
-                });
-                entry
-                    .spawner
-                    .set_durable_agent_reconciler(reconciler.clone())
-                    .await;
-                let runs = reconciler.load_agent_recovery().await?;
-                entry.spawner.restore_durable_agent_runs(&runs).await;
-                Ok::<(), String>(())
-            })
-            .await
-            .copied()
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn wire_server_dynamic_agent_tools(
         &self,
         entry: &ServerAgentSpawnerEntry,
-        durable_restore: Result<(), String>,
         executor: &mut runtime_tool_executor::RuntimeToolExecutor,
         user_id: &str,
         session_id: &str,
@@ -7389,7 +7358,6 @@ impl AgenticRunLifecycleService {
         };
         self.wire_authorized_server_dynamic_agent_tools(
             entry,
-            durable_restore,
             executor,
             runtime_context,
             agent_context,
@@ -7406,7 +7374,6 @@ impl AgenticRunLifecycleService {
     async fn wire_authorized_server_dynamic_agent_tools(
         &self,
         entry: &ServerAgentSpawnerEntry,
-        durable_restore: Result<(), String>,
         executor: &mut runtime_tool_executor::RuntimeToolExecutor,
         mut runtime_context: ServerSpawnRuntimeContext,
         mut agent_context: AgentToolContext,
@@ -7418,14 +7385,6 @@ impl AgenticRunLifecycleService {
         let run_id = runtime_context.parent_run_id.clone();
         if agent_context.run_id != run_id {
             return Err("dynamic agent contexts identify different root runs".into());
-        }
-        if let Err(error) = durable_restore {
-            tracing::warn!(
-                %user_id,
-                %session_id,
-                %error,
-                "durable agent registry restore failed; the next turn will retry"
-            );
         }
         for observation in entry.spawner.active_fanout_work_unit_observations().await {
             entry.active_work_registry.observe(&observation);
@@ -13680,67 +13639,6 @@ impl AgenticRunLifecycleService {
                 ))
     }
 
-    async fn persist_started_run_quota_rejection(
-        run_engine: &RunEngine,
-        runs: &Arc<RwLock<HashMap<String, RunState>>>,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        execution_owner_generation: u64,
-        limit: astra_services::resource_governor::ResourceLimitKind,
-        reason: &str,
-    ) -> Option<Vec<Value>> {
-        let terminal_events = per_user_run_quota_terminal_events(limit, reason);
-        let committed = match run_engine
-            .commit_terminal_status_with_events_if_current_owner(
-                user_id,
-                expected_session_id,
-                run_id,
-                &[STATUS_RUNNING, STATUS_PAUSED, STATUS_WAITING],
-                execution_owner_generation,
-                STATUS_FAILED,
-                None,
-                Some(reason),
-                &terminal_events,
-            )
-            .await
-        {
-            Ok(TerminalTransitionOutcome::Committed(_)) => true,
-            Ok(TerminalTransitionOutcome::Superseded(_)) => {
-                tracing::warn!(
-                    target: "astra_runtime::run_lifecycle",
-                    run_id,
-                    limit = %limit.as_str(),
-                    "skipping quota rejection terminal events after stale status CAS"
-                );
-                false
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::run_lifecycle",
-                    run_id,
-                    limit = %limit.as_str(),
-                    error = %error,
-                    "failed to persist quota rejection status/events transition"
-                );
-                false
-            }
-        };
-        if !committed {
-            return None;
-        }
-
-        let terminal_events = terminal_events.to_vec();
-        if let Some(run) = runs.write().await.get_mut(run_id) {
-            if run.status.try_transition(&RunStatus::Failed).is_ok() {
-                run.status = RunStatus::Failed;
-            }
-            run.events.extend(terminal_events.iter().cloned());
-            run.live_tx = None;
-        }
-        Some(terminal_events)
-    }
-
     fn durable_recent_events(run: &DurableRunRecord, limit: u32) -> Vec<Value> {
         let capped = limit.clamp(1, MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS) as usize;
         let offset = run.events.len().saturating_sub(capped);
@@ -14503,7 +14401,6 @@ impl AgenticRunLifecycleService {
             None => (None, None, None, None, None, None),
         };
         let mut state = loop_state;
-        let execution_start_tokens = state.provider_total_tokens();
         let streaming = event_tx.is_some();
         let terminal_metric_path = if streaming {
             "streaming_terminal"
@@ -14519,7 +14416,6 @@ impl AgenticRunLifecycleService {
         let bg_run_semaphore = self.run_semaphore.clone();
         let bg_run_id = run_id.clone();
         let bg_session_id = session_id.clone();
-        let bg_resource_governor = self.resource_governor.clone();
         let bg_user_id = user_id.clone();
         let bg_work_runtime_binding = work_runtime_binding.clone();
         let bg_work_workspace = tool_runtime_workspace.clone();
@@ -14728,76 +14624,6 @@ impl AgenticRunLifecycleService {
                     (*bg_llm_cancel_token).clone(),
                     permit,
                 ));
-                if let Some(ref gov) = bg_resource_governor {
-                    use astra_services::resource_governor::LimitCheck;
-                    if let LimitCheck::Denied { limit, reason } =
-                        gov.check_token_budget(&bg_user_id).await
-                    {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            user_id = %bg_user_id,
-                            run_id = %bg_run_id,
-                            limit = %limit.as_str(),
-                            reason = %reason,
-                            "streaming run rejected: daily token budget exhausted"
-                        );
-                        let terminal_events = Self::persist_started_run_quota_rejection(
-                            &run_engine,
-                            &runs,
-                            &bg_user_id,
-                            &bg_session_id,
-                            &bg_run_id,
-                            execution_owner_generation,
-                            limit,
-                            &reason,
-                        )
-                        .await;
-                        bg_approval_channels.lock().await.remove(&bg_run_id);
-                        bg_user_prompt_channels.lock().await.remove(&bg_run_id);
-                        bg_progress_channels.lock().await.remove(&bg_run_id);
-                        if let Some(terminal_events) = terminal_events {
-                            if let Some(event_tx) = event_tx.as_ref() {
-                                for event in run_handlers::transform_stream_run_events_for_client(
-                                    &bg_run_id,
-                                    terminal_events,
-                                ) {
-                                    if event_tx.send(event).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
-                            if let Some(record) = bg_cloud_workspace_record.as_ref() {
-                                if streaming {
-                                    Self::cleanup_cloud_workspace_after_terminal_run(
-                                        bg_workspace_record_store.clone(),
-                                        &bg_user_id,
-                                        &bg_session_id,
-                                        &bg_run_id,
-                                        record,
-                                        &RunStatus::Failed,
-                                    )
-                                    .await;
-                                } else {
-                                    Self::cleanup_cloud_workspace_with_debt(
-                                        bg_workspace_record_store.clone(),
-                                        &bg_user_id,
-                                        &bg_session_id,
-                                        &bg_run_id,
-                                        record,
-                                        RuntimeCleanupReason::Failed,
-                                        format!(
-                                            "run rejected before agentic loop start: daily token budget exhausted: {reason}"
-                                        ),
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                        drop(event_tx);
-                        return;
-                    }
-                }
                 state.messaging.configure_root_mailbox(
                     Arc::clone(&bg_root_mailbox_router),
                     astra_messaging::AgentAddress::new(&bg_session_id, "root-agent"),
@@ -15295,19 +15121,6 @@ impl AgenticRunLifecycleService {
                     }
                 }
 
-                if streaming {
-                    // Record tokens consumed regardless of cancel — cancelled runs still
-                    // consumed tokens and must count toward the daily budget.
-                    if let Some(ref gov) = bg_resource_governor {
-                        let total = state
-                            .provider_total_tokens()
-                            .saturating_sub(execution_start_tokens);
-                        if total > 0 {
-                            gov.record_tokens(&bg_user_id, total).await;
-                        }
-                    }
-                }
-
                 let mut durable_status_committed = !persist_status_update && live_events_flushed;
                 let settlement_preparation_elapsed = settlement_timing_started.elapsed();
                 let mut owner_terminal_committed = false;
@@ -15707,16 +15520,6 @@ impl AgenticRunLifecycleService {
                         "owner_fenced_usage"
                     );
                 }
-                if !streaming {
-                    if let Some(ref gov) = bg_resource_governor {
-                        let total = state
-                            .provider_total_tokens()
-                            .saturating_sub(execution_start_tokens);
-                        if total > 0 {
-                            gov.record_tokens(&bg_user_id, total).await;
-                        }
-                    }
-                }
                 // Persist terminal events to durable store in a single batch.
                 if should_append_generic_terminal_batch(
                     durable_status_committed,
@@ -16042,15 +15845,6 @@ impl AgenticRunLifecycleService {
             .await?;
         let mut request = request;
         Self::install_agent_binding_runtime_forward_headers(&mut request)?;
-
-        // ── Resource governance check ────────────────────────────────
-        if let Some(ref gov) = self.resource_governor {
-            if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
-                gov.check_run_start(&user_id).await
-            {
-                return Err(per_user_run_quota_response(limit, reason));
-            }
-        }
 
         let idempotent_start = start_identity.is_some();
         let authority_run_id = request
@@ -16464,18 +16258,6 @@ impl AgenticRunLifecycleService {
                     event_tx: event_tx.clone(),
                 });
             let _fanout_admission = stream_agent_spawner_entry.spawner.fanout_parent(&run_id);
-            let mut durable_agent_restore = if server_tool_executor_workspace.is_some() {
-                Some(
-                    self.restore_server_dynamic_agents(
-                        &stream_agent_spawner_entry,
-                        &user_id,
-                        &session_id,
-                    )
-                    .await,
-                )
-            } else {
-                None
-            };
             let canonical_turn = canonical_turn.take();
             let environment = self.assemble_loop_environment(
                 &user_id,
@@ -16753,9 +16535,6 @@ impl AgenticRunLifecycleService {
                 let wiring = match self
                     .wire_server_dynamic_agent_tools(
                         &stream_agent_spawner_entry,
-                        durable_agent_restore
-                            .take()
-                            .expect("durable agent restore ran for server tool executor"),
                         &mut executor,
                         &user_id,
                         &session_id,

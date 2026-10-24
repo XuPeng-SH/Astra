@@ -587,12 +587,13 @@ impl AgenticRunLifecycleService {
         executor.set_execution_binding_snapshot(bindings.clone());
         host.set_execution_metadata(executor.binding_metadata());
         let _fanout = entry.spawner.fanout_parent(&run.run_id);
-        let restored = self
-            .restore_server_dynamic_agents(&entry, &run.user_id, &run.session_id)
-            .await;
-        restored
-            .as_ref()
-            .map_err(|error| invalid_resume(error.clone()))?;
+        // Resume actually reconstructs fan-in and must restore durable children
+        // before attaching its parent scope. Fresh chat does not take this path.
+        entry
+            .spawner
+            .reconcile_durable_agent_runs()
+            .await
+            .map_err(invalid_resume)?;
         let runtime_context = ServerSpawnRuntimeContext {
             tool_executor: Arc::new(Default::default()),
             model_catalog_reader: catalog,
@@ -674,7 +675,6 @@ impl AgenticRunLifecycleService {
         let wiring = self
             .wire_authorized_server_dynamic_agent_tools(
                 &entry,
-                restored,
                 &mut executor,
                 runtime_context,
                 agent_context,
